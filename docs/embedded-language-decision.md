@@ -1,0 +1,172 @@
+# Quirl embedded-language decision
+
+**Decision 1.2 · Accepted · 15 August 2026**
+
+> **Outcome:** Quirl’s extension language is **Lua 5.4**.
+
+Rust owns Quirl’s shell, executor, built-ins, value model, and performance-critical logic. Lua 5.4 is the deliberately small, recognizable extension language for configuration, automation, and trusted plugins. Quirl supplies a modern experience with generated annotations, completion, linting, formatting, schema validation, and strict Rust boundary checks.
+
+## 1. Outcome
+
+| Rank | Candidate | Rationale |
+| --- | --- | --- |
+| 1 · Accepted | Lua 5.4 | The smallest measured runtime, a mature Rust bridge, decades of stability, and a language already familiar from terminal tools. Quirl adds the coherent SDK and IDE experience. |
+| 2 · Technical alternative | Strict Luau | Better ahead-of-time analysis, but a less familiar language identity plus a C++ analyzer bridge and VM/analyzer revision coordination that Quirl would have to own. |
+| 3 · Rust-native alternative | Rhai | Excellent host integration and resource controls, but a Quirl user must learn a smaller language with substantially less adjacent configuration and plugin adoption. |
+
+## 2. Scope
+
+### Rust is the product language; the guest is an extension language
+
+The guest must be good at readable configuration, small automation scripts, prompt and completion extensions, typed command definitions, plugin hooks, fast reloads, capability-limited host calls, and actionable diagnostics.
+
+It does **not** need to own process-execution internals, job control, parsing, rendering, core data structures, performance-critical transforms, or the built-in command catalog. Those stay in Rust.
+
+This favors a small, deeply integrated runtime over a general application ecosystem. npm or PyPI compatibility is less valuable than predictable embedding, while familiarity still matters because users—not only Quirl maintainers—will author plugins and configuration.
+
+## 3. Complete-system architecture
+
+### QuickJS is simple. TypeScript-on-QuickJS is not.
+
+| Candidate | Shape | Complexity | Consequence |
+| --- | --- | --- | --- |
+| Lua | `config.lua` → Quirl tooling (parse, lint, complete, format) → restricted Lua 5.4 VM → schema-checked Rust capabilities through `mlua` | Low–medium | Rust host definitions generate runtime bindings, LuaLS-compatible stubs, completion metadata, docs, and AI schemas. Lua remains dynamic: Quirl promises strong boundary and configuration validation, not sound static typing of arbitrary Lua. |
+| Rhai | `config.rhai` → Rhai engine (parse, AST, execute) → Rust modules and proc-macro exports | Low | The smallest ownership surface and cleanest Rust API. Syntax checking, formatting, docs, tests, and runtime limits are feasible; static value-type checking is not. |
+| TypeScript 7 + QuickJS-NG | `config.ts` → TS 7 worker (Go checker + LSP) → JS and source maps (emit, cache, invalidate) → QuickJS-NG through `rquickjs` → Rust capabilities via `quirl.d.ts` and runtime glue | High | TypeScript cannot run directly in a JavaScript VM: types are erased first. TypeScript 7.0 lacks a stable programmatic API, making the checker/LSP a separate process boundary. The measured `rquickjs` crate embeds QuickJS-NG 0.15.1, adding another version relationship. |
+
+## 4. Measured footprint
+
+Size-optimized, thin-LTO, stripped release probes on Apple M2 Pro / arm64 macOS. Each runtime initializes and evaluates `20 + 22` once. Peak RSS includes process and system-library overhead; it is useful comparatively, not as a heap measurement.
+
+| Candidate | Runtime binary | Runtime peak RSS | Checker / compiler addition | Complete-system reading |
+| --- | ---: | ---: | --- | --- |
+| Lua 5.4 | 0.58 MiB | 1.41 MiB | None | Smallest mature baseline |
+| Fennel 1.6.1 | 0.58 MiB | 2.97 MiB | 0.29 MiB compiler source | ≈0.87 MiB shipped; dynamic |
+| QuickJS-NG / `rquickjs` | 0.85 MiB | 1.75 MiB | TypeScript distribution ≈30 MiB; native checker executable 22.56 MiB | ≈30.9 MiB installed; checker 99.05 MiB max RSS |
+| PocketPy 2.1.8 | 0.86 MiB | 2.98 MiB | Comparable static checker not included | Small, but not CPython/PyPI |
+| Rhai 1.25.1 | 1.29 MiB | 2.20 MiB | Parser/AST included; no type checker | Excellent Rust-native footprint |
+| Luau through `mlua` | 1.39 MiB | 2.72 MiB | Official analyzer 5.26 MiB stripped / 6.38 MiB RSS | ≈6.65 MiB if analyzer ships separately |
+| Steel 0.8.2 | 2.91 MiB | 43.55 MiB | Contracts and LSP, not comparable static checking | High startup and memory for this role |
+| Gluon 0.18.4 | 3.42 MiB | 5.98 MiB | Type checker and completion library included | Rust-native and static, but ecosystem risk |
+
+### Complete typed-toolchain size
+
+| Candidate | Size |
+| --- | ---: |
+| Luau | 6.65 MiB |
+| Gluon | 3.42 MiB |
+| TypeScript + QuickJS | ≈30.9 MiB |
+
+The original chart used a logarithmic scale so smaller candidates remained visible. Rhai, Lua, Fennel, and PocketPy are excluded because they do not ship a comparable static checker.
+
+## 5. Project health
+
+Prefer an active system, not merely an active repository.
+
+| System | Current release signal | 90-day public activity sample | Ownership / dependency risk | Assessment |
+| --- | --- | --- | --- | --- |
+| Luau + `mlua` | Luau 0.734 on 14 Aug; eight consecutive weekly releases observed. `mlua` 0.12.0 on 5 Jul. | Luau 47 commits / 20 authors; `mlua` capped at 79 / 3. | Roblox-backed language; Rust wrapper is smaller. `mlua` 0.12 vendors Luau 0.728, six weekly releases behind upstream. | Strong, with explicit version-sync work |
+| Rhai | 1.25.1 on 29 May; regular 1.x releases over multiple years. | 79 commits / 5 authors. | Focused Rust project; >10M crates.io downloads observed. Experimental rather than mature LSP. | Best single-crate engineering bet |
+| TypeScript + `rquickjs` + QuickJS-NG | TS 7.0.2 on 8 Jul; `rquickjs` 0.12.2 on 27 Jul; QuickJS-NG 0.16.1 on 4 Aug. | TS-Go capped at 100 / 25; `rquickjs` 39 / 4; QuickJS-NG capped at 100 / 22. | Quirl owns compatibility across three upstreams plus its Rust/JS API schema. | Healthy parts; largest integration surface |
+| Lua + `mlua` | Lua 5.5.0 on 22 Dec 2025; 5.5.1 work visible in Jul; `mlua` current in Jul. | Lua has its own release process; `mlua` capped at 79 / 3. | Thirty-plus years of longevity and a mature C API. Version changes deliberately break VM ABI across major/minor series. | Strongest longevity bet |
+| Fennel + Lua | Fennel 1.6.1 on 30 Dec 2025. | 0 commits in the sampled 90 days; last push Feb 2026. | Small stable compiler and few open issues, but a niche language and another diagnostic/source-map layer. | Stable-looking, smaller bus factor |
+| PocketPy | 2.1.8 on 18 Mar; eight releases since Jan 2025. | 35 commits / 9 authors. | Active and compact, but its Python compatibility boundary and lower-level Rust integration become Quirl obligations. | Healthy; product-expectation risk |
+| Steel | 0.8.2 on 22 Feb; repository pushed 12 Aug. | 7 commits / 3 authors. | Rust-native and active, but pre-1.0 with a small ecosystem and 125 Rust packages in the isolated dependency graph. | Promising, not yet conservative |
+| Gluon | 0.18.4 on 6 Aug after 0.18.3 in Jul; prior crate release Sep 2023. | 50 commits / 1 author. | Static, Rust-native, memory-limited, and interruptible—but recently effectively single-maintainer after a long gap. | Technically attractive; unsafe longevity bet |
+
+GitHub activity is a capped sample of the latest 100 commits since 17 May 2026; author counts are signals, not formal bus-factor calculations. Stars and open-issue counts were inspected but excluded because they are weak maintenance proxies.
+
+## 6. Scorecard
+
+The default weights reflect a Rust application whose guest is limited to configuration, scripts, and plugins. Scores are expert judgments from 1–5 anchored to the measurements and maintenance audit above; they are not survey results.
+
+### Default: Rust-product weights
+
+| Criterion | Relative weight |
+| --- | ---: |
+| Rust integration and simplicity | 30 |
+| Maintenance and longevity | 20 |
+| Familiarity and plugin/config developer experience | 25 |
+| Pre-run safety and AI tooling | 10 |
+| Footprint and performance | 10 |
+| Sandbox and capability control | 5 |
+
+| Rank | Candidate | Weighted score (out of 100) | Interpretation |
+| ---: | --- | ---: | --- |
+| 1 | Lua 5.4 | 89.3 | Accepted: familiar, tiny, mature; Rust validates boundaries. |
+| 2 | Rhai | 80.7 | Lowest Rust ownership cost; smaller user ecosystem. |
+| 3 | Luau | 77.3 | Stronger analysis; unfamiliarity and analyzer bridge remain. |
+| 4 | TypeScript + QuickJS-NG | 70.4 | Best broad familiarity; highest complete-system complexity. |
+| 5 | PocketPy | 68.9 | Familiar syntax; compatibility and checker expectations. |
+| 6 | Fennel | 67.0 | Elegant and compact; niche and dynamic with compile mapping. |
+| 7 | Gluon | 63.5 | Rust-native and static; niche, single-maintainer risk. |
+| 8 | Steel | 59.5 | Native baseline; startup, RSS, maturity, and familiarity costs. |
+
+Alternative scoring presets were: **Static safety** `[20, 20, 12, 35, 8, 5]`, **Simplicity** `[42, 18, 10, 5, 15, 10]`, and **Developer reach** `[18, 18, 32, 18, 9, 5]`, in the criteria order above. The interactive document allowed these weights to be adjusted; this Markdown record preserves its default result and source data.
+
+The product decision is broader than a numeric rank. Quirl accepts Lua’s dynamic semantics because Rust owns the trusted core and validates every host boundary. `quirl check` can parse, lint, resolve capabilities, consume annotations, and validate schemas without execution, but it must not market that as sound static typing.
+
+## 7. Developer fit
+
+### Broad popularity and terminal-user familiarity are not the same thing
+
+GitHub’s 2025 contributor data placed TypeScript first and Python second. Stack Overflow reported strong Python growth, while Rust remained the most admired language. These are strong familiarity signals, but do not establish that those ecosystems want an embedded CLI plugin language.
+
+Neovim uses Lua for configuration and plugins and recommends annotations plus LuaLS for larger plugins. WezTerm uses a Lua script as configuration. That is stronger target-adjacent evidence for Lua-family familiarity than a web-wide ranking, though it remains an inference rather than a Quirl user survey.
+
+Quirl uses Lua 5.4 source and `.lua` files, not a private dialect presented as Lua. Its restricted environment and generated `quirl` API replace ambient shell access with explicit capabilities.
+
+The first usability validation should include Rust/CLI, shell/DevOps, JavaScript/TypeScript, Python, and Neovim/Lua users. Each participant should configure a prompt segment, write a command plugin, handle a structured error, and fix a lint or schema diagnostic. Time to a correct result matters more than preference polling.
+
+## 8. Implementation complexity
+
+| Candidate | Rust host bridge | Checker / IDE | Modules and packaging | Quirl-owned risk |
+| --- | --- | --- | --- | --- |
+| Rhai | Direct crate API and procedural plugin macros | Parser/AST, formatter ecosystem, experimental LSP; no static checker | Custom module resolvers and Rust packages | Low: capability API, schemas, budgets, diagnostics |
+| Lua 5.4 | Mature `mlua` API and serde conversion | External LuaLS + annotations if desired | Mature `require` model; Quirl must restrict loaders | Low–medium: annotations and checker distribution |
+| Luau | `mlua` runtime/compiler bridge is ergonomic | Official C++ analysis/autocomplete libraries; no complete Rust wrapper | Quirl resolver over sandboxed environment | Medium–high: analyzer service, declarations, version lockstep |
+| TypeScript + QuickJS-NG | `rquickjs` is capable and async-aware | Excellent official LSP, but TS 7.0 lacks stable programmatic API | Must define a non-Node module world and audited package policy | High: worker protocol, emit/cache, source maps, dual bindings, three upstreams |
+| Fennel | `mlua` plus Fennel compiler module | Compiler diagnostics; smaller editor ecosystem | Fennel→Lua mapping and Lua resolver | Medium: compile cache and remapped errors |
+| PocketPy | Official C API; Rust wrappers trail current releases | No comparable built-in static checker | Must explicitly reject most CPython/PyPI assumptions | Medium–high: bridge and compatibility communication |
+| Steel | Native Rust API already prototyped | LSP and contracts; static story does not meet the gate | Scheme modules and Quirl packages | Medium: startup/memory optimization and pre-1.0 churn |
+| Gluon | Rust-native typed marshalling | Checker and completion library included | Functional module system | Medium: diagnostics polish plus effective ownership of a niche language |
+
+The isolated Rust probes resolved 12 packages for QuickJS alone, 24 for Lua/Fennel, 26 for Luau, 27 for Rhai, 107 for Gluon, and 125 for Steel. TypeScript’s Go toolchain and Luau’s C++ analyzer are outside those counts, so package count is only one implementation-cost signal.
+
+## 9. Accepted decision
+
+### One familiar extension language, with Rust enforcing the contract
+
+Choose Lua 5.4 for configuration, scripts, and trusted plugins. Its familiarity, tiny footprint, longevity, and mature `mlua` bridge outweigh Luau’s stronger analysis. Quirl delivers IDE-quality assistance through generated SDK annotations and metadata, while Rust schemas validate all values before state changes.
+
+1. **Implemented:** `quirl-lua` embeds pinned Lua 5.4 through `mlua` with restricted libraries, capabilities, memory/instruction/time budgets, and cancellation.
+2. **Implemented:** one Rust host definition generates LuaLS stubs, completion data, Markdown, and AI-readable JSON.
+3. **Implemented:** configuration, scripts, prompt segments, and completion providers run through the same Rust-validated API; live prompt and IDE completion consume plugin callbacks.
+4. **Implemented:** the rejected prototype runtime, CLI bridge, workspace crate, dependencies, examples, and executable benchmark paths are removed.
+5. **Current Phase 0 status:** configuration and plugins reload atomically at safe prompt boundaries; keymap, picker, prompt, and editor settings apply live; the native data surface supports typed predicates, dotted fields, sorting, and limiting. Subsequent work belongs to the preview roadmap rather than this decision’s initial implementation slice.
+
+| Concern | Contract |
+| --- | --- |
+| Developer experience | LuaLS-compatible annotations and generated metadata power completion and hover; Rust schemas remain authoritative. |
+| Security boundary | Trusted Lua receives explicit handles and budgets. Untrusted extensions remain out of process or WebAssembly. |
+| Do not default to | Keep TypeScript + QuickJS-NG as an optional runner, or revisit it only when TypeScript has a stable programmatic API and a compelling package story. |
+
+The durable record is [ADR 0001: Lua is Quirl’s extension language](decisions/0001-lua-extension-language.md). Revisit Luau only if real plugins demonstrate that annotations and schema validation are insufficient.
+
+## 10. Method and sources
+
+Footprint probes live in `spikes/footprint`. PocketPy’s official 2.1.8 amalgamated sources are checksum-verified by its runner. The Luau analyzer was built from official tag 0.734, stripped, and measured separately. TypeScript 7.0.2 was installed from its official npm package; the native arm64 checker and complete installed package were measured separately from the QuickJS-NG runtime.
+
+- [Luau overview](https://luau.org/) and [Lua compatibility](https://luau.org/compatibility/)
+- [Luau releases](https://github.com/luau-lang/luau/releases) and [`mlua`](https://github.com/mlua-rs/mlua)
+- [Rhai](https://rhai.rs/) and [Rust plugin modules](https://rhai.rs/book/plugins/)
+- [Lua version history](https://www.lua.org/versions.html)
+- [Fennel](https://fennel-lang.org/) and [release tags](https://github.com/bakpakin/Fennel/tags)
+- [TypeScript 7](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/) and [type erasure](https://www.typescriptlang.org/docs/handbook/2/basic-types.html)
+- [`rquickjs`](https://github.com/DelSkayn/rquickjs) and [QuickJS-NG releases](https://github.com/quickjs-ng/quickjs/releases)
+- [PocketPy](https://github.com/pocketpy/pocketpy), [Steel](https://github.com/mattwparas/steel), and [Gluon](https://github.com/gluon-lang/gluon)
+- [Neovim Lua plugins](https://neovim.io/doc/user/lua-plugin/) and [WezTerm Lua config](https://wezterm.org/config/files.html)
+- [GitHub Octoverse 2025](https://github.blog/news-insights/octoverse/octoverse-a-new-developer-joins-github-every-second-as-ai-leads-typescript-to-1/)
+- [Stack Overflow Developer Survey 2025](https://survey.stackoverflow.co/2025/technology/)
+
+*Observed 15 August 2026. Benchmarks are local measurements, not universal performance claims; health data changes over time.*

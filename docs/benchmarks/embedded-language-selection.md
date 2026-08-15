@@ -2,7 +2,7 @@
 
 > **Superseded recommendation:** this latency-focused spike selected
 > TypeScript/QuickJS-NG provisionally. The subsequent
-> [complete-system footprint, health, and complexity report](../embedded-language-decision.html)
+> [complete-system footprint, health, and complexity report](../embedded-language-decision.md)
 > includes the TypeScript checker/toolchain cost and the Rust-hosted plugin/config
 > scope. The final product decision selects Lua 5.4 for its familiarity,
 > longevity, footprint, and mature Rust bridge; see [ADR 0001](../decisions/0001-lua-extension-language.md).
