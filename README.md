@@ -3,9 +3,10 @@
 
   # Quirl
 
-  **Everything you need, mixed in.**
+  **A well-stirred shell.**
 
-  Your shell should feel as smart as your editor.
+  Bash muscle memory, typed data pipelines, and one Lua SDK —
+  folded into a single fast Rust binary.
 
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
   [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](rust-toolchain.toml)
@@ -14,16 +15,24 @@
 
 ---
 
-Quirl is a proposed modern shell and terminal development environment. It
-keeps the command entry you already know from Bash/Zsh, adds typed data
-pipelines for structured work, and embeds a well-tooled Lua extension
-language for configuration, automation, and trusted plugins — all in one
-fast, single-binary Rust application.
+In German, a *Quirl* is the humble wooden whisk — a simple tool that takes
+ingredients which don't naturally mix and folds them into something smooth.
+That's exactly what this shell does.
 
-Rust implements the shell, the parser, the executor, and every performance
-critical path. Lua 5.4 is the only embedded language, and Rust validates
-every value that crosses the Lua boundary, so configuration and plugins fail
-safely instead of taking the shell down with them.
+Every shell makes you choose. Keep two decades of Bash muscle memory and
+settle for grepping text. Switch to a data-first shell and relearn
+everything you know. Or script your environment and hope a misbehaving
+plugin doesn't take the whole session down with it. Quirl refuses the
+trade-off: the commands you already type keep working, an explicit data
+mode gives you typed, structured pipelines when text-wrangling isn't
+enough, and one well-tooled Lua 5.4 SDK powers configuration, scripts,
+prompts, completions, and plugins alike.
+
+Rust implements the shell, the parser, the executor, and every
+performance-critical path — and it validates every value that crosses the
+Lua boundary, so a broken extension fails safely instead of ruining the
+batter. The result is a single fast binary where your shell finally feels
+as smart as your editor.
 
 > [!IMPORTANT]
 > Quirl is in an early **prototyping phase**. It's a runnable vertical slice,
@@ -35,8 +44,9 @@ safely instead of taking the shell down with them.
 - **Familiar command mode** — ordinary Bash/Zsh-style commands run through a
   configured compatibility shell; `ls` is Quirl-native.
 - **Typed data pipelines** — an explicit `data` mode for native, structured
-  sources and transforms (`where` / `select` / `get` / `first` / `length`),
-  with a Lua bridge (`lua return 20 + 22`) when you need it.
+  sources and transforms (`where` comparisons with `and`/`or`, nested `get`,
+  `select`, `sort`, `take`, `first`, and `length`), with a Lua bridge
+  (`lua return 20 + 22`) when you need it.
 - **One Lua SDK, everywhere** — the same restricted Lua 5.4 runtime and
   Rust-validated API powers `config.lua`, scripts, prompt segments, and
   completion providers.
@@ -69,8 +79,11 @@ The first Lua vertical slice is runnable today: a pinned Lua 5.4 runtime
 through `mlua`, generated runtime bindings and LuaLS-compatible stubs, and one
 Rust-validated API powering configuration, scripts, and prompt/completion
 plugin registration. Lua prompt segments and completion providers run in
-persistent, resource-limited VMs and feed the live editor. Data mode uses
-Quirl's native Rust evaluator. The earlier Steel prototype and all of its
+persistent, resource-limited VMs and feed the live editor. Config and plugins
+reload atomically while the shell is running; invalid edits keep the complete
+last-known-good generation. Editor keymap, semantic hints, prompt composition,
+and picker settings are applied at the next safe prompt boundary. Data mode
+uses Quirl's native Rust evaluator. The earlier Steel prototype and all of its
 runtime dependencies have been removed.
 
 ## Quick start
@@ -91,7 +104,9 @@ semantic completion menu, and the current mode is always visible. Use
 `lua return 20 + 22`.
 
 Quirl discovers `config.lua` and sorted `plugins/*.lua` under
-`$QUIRL_CONFIG_DIR`, `$XDG_CONFIG_HOME/quirl`, or `~/.config/quirl`.
+`$QUIRL_CONFIG_DIR`, `$XDG_CONFIG_HOME/quirl`, or `~/.config/quirl`. It watches
+their contents during an interactive session and installs a changed config and
+plugin set only after the whole generation validates.
 
 ### Non-interactive surfaces
 
@@ -163,7 +178,7 @@ Quirl is organized as a Cargo workspace of small, focused crates:
 | ---------------- | ------------------------------------------------------------------------ |
 | `quirl-cli`      | Binary, REPL, script runner, and machine-facing commands                |
 | `quirl-core`     | Compatibility execution, native `ls`, values, and errors                |
-| `quirl-data`     | Native structured sources and `where`/`select`/`get`/`first`/`length`    |
+| `quirl-data`     | Native structured sources, predicates, projection, sorting, and limits   |
 | `quirl-lua`      | Restricted Lua 5.4 runtime, Rust schemas, resource budgets, SDK generation |
 | `quirl-syntax`   | The explicit command/data-mode interaction grammar                      |
 | `quirl-catalog`  | One schema for completion, help, docs, validation, and AI                |
