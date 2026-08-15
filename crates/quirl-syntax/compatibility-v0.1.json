@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "matrix_version": "0.1",
+  "compatibility_level": "C1-preview",
+  "scope": "native command parser and execution graph",
+  "supported": [
+    {
+      "id": "quoting",
+      "forms": ["'literal text'", "\"grouped text\"", "escaped\\ space"],
+      "limitations": "Quotes group words and are removed by the parser. Quote origin is not retained for later expansion."
+    },
+    {
+      "id": "byte_pipes",
+      "forms": ["producer | consumer"],
+      "limitations": "Each stage is a simple command; typed data pipes use data mode."
+    },
+    {
+      "id": "redirects",
+      "forms": ["command < input", "command > output", "command >> output"],
+      "limitations": "File-descriptor prefixes, descriptor duplication, here-documents, and here-strings are unsupported."
+    },
+    {
+      "id": "background_marker",
+      "forms": ["command &"],
+      "limitations": "The background marker must terminate the command list."
+    },
+    {
+      "id": "boolean_lists",
+      "forms": ["left && right", "left || right"],
+      "limitations": "Only AND/OR short-circuit connectors are supported; semicolon-separated lists are unsupported."
+    },
+    {
+      "id": "export_assignment",
+      "forms": ["export NAME=value"],
+      "limitations": "Only NAME=value assignments are accepted; shell export flags and bare-name export are unsupported."
+    }
+  ],
+  "unsupported": [
+    {
+      "id": "advanced_redirections",
+      "dialects": ["bash", "zsh"],
+      "forms": ["2> errors", "2>&1", "<<EOF", "<<<word"],
+      "diagnostic": "unsupported Bash/Zsh construct: advanced file-descriptor or here-document redirection"
+    },
+    {
+      "id": "pathname_expansion",
+      "dialects": ["bash", "zsh"],
+      "forms": ["*.rs", "file?.txt", "[ab].txt", "**/*.rs(N)"],
+      "diagnostic": "unsupported Bash/Zsh construct: pathname expansion (globbing)"
+    },
+    {
+      "id": "command_and_process_substitution",
+      "dialects": ["bash", "zsh"],
+      "forms": ["$(command)", "`command`", "<(command)", ">(command)"],
+      "diagnostic": "unsupported Bash/Zsh construct: command or process substitution"
+    },
+    {
+      "id": "compound_commands",
+      "dialects": ["bash", "zsh"],
+      "forms": ["for name in values; do command; done", "while condition; do command; done", "if condition; then command; fi", "name() { command; }"],
+      "diagnostic": "unsupported Bash/Zsh construct: compound command"
+    },
+    {
+      "id": "parameter_and_arithmetic_expansion",
+      "dialects": ["bash", "zsh"],
+      "forms": ["$NAME", "${NAME}", "${NAME:-default}", "$1", "$?", "$((1 + 2))"],
+      "diagnostic": "unsupported Bash/Zsh construct: parameter or arithmetic expansion"
+    },
+    {
+      "id": "dialect_conditionals",
+      "dialects": ["bash", "zsh"],
+      "forms": ["[[ expression ]]", "(( expression ))"],
+      "diagnostic": "unsupported Bash/Zsh construct: dialect conditional or arithmetic command"
+    }
+  ]
+}

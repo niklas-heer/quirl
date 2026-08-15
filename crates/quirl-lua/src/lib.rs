@@ -5,7 +5,7 @@ use mlua::{
     VmState,
 };
 use quirl_core::{CommandRunner, ErrorCode, ShellError};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
@@ -19,6 +19,9 @@ use std::{
 
 const HOOK_GRANULARITY: u64 = 10_000;
 const RESOURCE_LIMIT_SENTINEL: &str = "quirl resource limit exceeded";
+const DEFAULT_PROMPT_DEADLINE_MS: u64 = 8;
+const MAX_CALLBACK_DEADLINE_MS: u64 = 100;
+const COMPLETION_CALLBACK_DEADLINE: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy)]
 pub struct LuaPolicy {
@@ -136,12 +139,15 @@ impl QuirlConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PromptRegistration {
     pub name: String,
+    #[serde(default = "default_prompt_deadline_ms")]
     pub deadline_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionRegistration {
     pub command: String,
 }
@@ -230,8 +236,14 @@ struct Budget {
 
 #[derive(Debug, Default)]
 struct PluginCallbacks {
-    prompt_segments: HashMap<String, RegistryKey>,
+    prompt_segments: HashMap<String, PromptCallback>,
     completion_providers: HashMap<String, RegistryKey>,
+}
+
+#[derive(Debug)]
+struct PromptCallback {
+    function: RegistryKey,
+    deadline: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -420,23 +432,25 @@ impl LuaRuntime {
         name: &str,
         context: &serde_json::Value,
     ) -> Result<Option<String>, ShellError> {
-        let function = {
+        let (function, deadline) = {
             let callbacks = self
                 .callbacks
                 .lock()
                 .expect("plugin callback mutex poisoned");
-            let key = callbacks.prompt_segments.get(name).ok_or_else(|| {
+            let callback = callbacks.prompt_segments.get(name).ok_or_else(|| {
                 validation_error(name, format!("unknown prompt segment `{name}`"))
             })?;
-            self.lua
-                .registry_value::<Function>(key)
-                .map_err(|error| lua_error(error, None, 0))?
+            let function = self
+                .lua
+                .registry_value::<Function>(&callback.function)
+                .map_err(|error| lua_error(error, None, 0))?;
+            (function, callback.deadline)
         };
         let context = self
             .lua
             .to_value(context)
             .map_err(|error| lua_error(error, None, 0))?;
-        self.reset_budget();
+        self.reset_budget_with_deadline(deadline);
         function
             .call::<Option<String>>(context)
             .map_err(|error| lua_error(error, None, 0))
@@ -467,11 +481,13 @@ impl LuaRuntime {
             .lua
             .to_value(context)
             .map_err(|error| lua_error(error, None, 0))?;
-        self.reset_budget();
+        self.reset_budget_with_deadline(COMPLETION_CALLBACK_DEADLINE);
         let value = function
             .call::<Value>(context)
             .map_err(|error| lua_error(error, None, 0))?;
-        self.value_to_json(value, None, 0)
+        let value = self.value_to_json(value, None, 0)?;
+        validate_completion_result(&value, command)?;
+        Ok(value)
     }
 
     pub fn test_file(&self, path: &Path) -> Result<usize, ShellError> {
@@ -584,9 +600,17 @@ impl LuaRuntime {
         reason = "a poisoned Lua budget mutex may contain an inconsistent budget after a host callback panic"
     )]
     fn reset_budget(&self) {
+        self.reset_budget_with_deadline(self.policy.wall_time);
+    }
+
+    #[allow(
+        clippy::expect_used,
+        reason = "a poisoned Lua budget mutex may contain an inconsistent budget after a host callback panic"
+    )]
+    fn reset_budget_with_deadline(&self, deadline: Duration) {
         let mut budget = self.budget.lock().expect("Lua budget mutex poisoned");
         budget.remaining_instructions = self.policy.instruction_limit;
-        budget.deadline = Instant::now() + self.policy.wall_time;
+        budget.deadline = Instant::now() + deadline.min(self.policy.wall_time);
     }
 }
 
@@ -742,25 +766,40 @@ fn install_host_api(
     prompt.set(
         "add_segment",
         lua.create_function(move |lua, spec: Table| {
-            let name = spec.get::<String>("name")?;
-            let deadline_ms = spec.get::<Option<u64>>("deadline_ms")?.unwrap_or(8);
             let render = spec.get::<Function>("render").map_err(|_| {
                 mlua::Error::RuntimeError("prompt segment `render` must be a function".to_owned())
             })?;
+            let registration: PromptRegistration =
+                deserialize_registration(lua, &spec, "render", "prompt segment")?;
+            validate_registration_name("prompt segment name", &registration.name)?;
+            if !(1..=MAX_CALLBACK_DEADLINE_MS).contains(&registration.deadline_ms) {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "prompt segment `deadline_ms` must be between 1 and {MAX_CALLBACK_DEADLINE_MS}"
+                )));
+            }
             let callback = lua.create_registry_value(render)?;
+            let mut callbacks = prompt_callbacks
+                .lock()
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
+            if callbacks.prompt_segments.contains_key(&registration.name) {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "duplicate prompt segment `{}`",
+                    registration.name
+                )));
+            }
             prompt_registrations
                 .lock()
                 .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
                 .prompt_segments
-                .push(PromptRegistration {
-                    name: name.clone(),
-                    deadline_ms,
-                });
-            prompt_callbacks
-                .lock()
-                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
-                .prompt_segments
-                .insert(name, callback);
+                .push(registration.clone());
+            let deadline = Duration::from_millis(registration.deadline_ms);
+            callbacks.prompt_segments.insert(
+                registration.name,
+                PromptCallback {
+                    function: callback,
+                    deadline,
+                },
+            );
             Ok(())
         })?,
     )?;
@@ -772,30 +811,106 @@ fn install_host_api(
     completion.set(
         "add_provider",
         lua.create_function(move |lua, spec: Table| {
-            let command = spec.get::<String>("command")?;
             let complete = spec.get::<Function>("complete").map_err(|_| {
                 mlua::Error::RuntimeError(
                     "completion provider `complete` must be a function".to_owned(),
                 )
             })?;
+            let registration: CompletionRegistration =
+                deserialize_registration(lua, &spec, "complete", "completion provider")?;
+            validate_registration_name("completion provider command", &registration.command)?;
             let callback = lua.create_registry_value(complete)?;
+            let mut callbacks = completion_callbacks
+                .lock()
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
+            if callbacks
+                .completion_providers
+                .contains_key(&registration.command)
+            {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "duplicate completion provider `{}`",
+                    registration.command
+                )));
+            }
             completion_registrations
                 .lock()
                 .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
                 .completion_providers
-                .push(CompletionRegistration {
-                    command: command.clone(),
-                });
-            completion_callbacks
-                .lock()
-                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
+                .push(registration.clone());
+            callbacks
                 .completion_providers
-                .insert(command, callback);
+                .insert(registration.command, callback);
             Ok(())
         })?,
     )?;
     quirl.set("completion", completion)?;
     lua.globals().set("quirl", quirl)
+}
+
+fn default_prompt_deadline_ms() -> u64 {
+    DEFAULT_PROMPT_DEADLINE_MS
+}
+
+fn deserialize_registration<T: DeserializeOwned>(
+    lua: &Lua,
+    spec: &Table,
+    callback_field: &str,
+    description: &str,
+) -> mlua::Result<T> {
+    let metadata = lua.create_table()?;
+    for pair in spec.clone().pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        let is_callback = match &key {
+            Value::String(name) => name.to_str()?.as_bytes() == callback_field.as_bytes(),
+            _ => false,
+        };
+        if !is_callback {
+            metadata.raw_set(key, value)?;
+        }
+    }
+    lua.from_value(Value::Table(metadata)).map_err(|error| {
+        mlua::Error::RuntimeError(format!("invalid {description} registration: {error}"))
+    })
+}
+
+fn validate_registration_name(description: &str, value: &str) -> mlua::Result<()> {
+    if value.trim().is_empty() {
+        return Err(mlua::Error::RuntimeError(format!(
+            "{description} must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_completion_result(value: &serde_json::Value, command: &str) -> Result<(), ShellError> {
+    let serde_json::Value::Array(items) = value else {
+        return Err(validation_error(
+            command,
+            "completion provider must return an array",
+        ));
+    };
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            serde_json::Value::String(_) => {}
+            serde_json::Value::Object(object)
+                if object
+                    .get("value")
+                    .is_some_and(serde_json::Value::is_string)
+                    && object.iter().all(|(key, value)| match key.as_str() {
+                        "value" | "display" | "summary" | "detail" => value.is_string(),
+                        _ => false,
+                    }) => {}
+            _ => {
+                return Err(validation_error(
+                    command,
+                    format!(
+                        "completion item {index} must be a string or an object with a string `value` and optional string display fields"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn lint_source(source: &str, path: &Path) -> Result<(), ShellError> {
@@ -972,6 +1087,151 @@ mod tests {
         runtime.cancellation_token().cancel();
         let error = runtime.eval("while true do end").unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn clearing_cancellation_allows_the_persistent_vm_to_recover() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        runtime.cancellation_token().cancel();
+        assert!(runtime.eval("while true do end").is_err());
+
+        runtime.clear_cancellation();
+        assert_eq!(runtime.eval("return 42").unwrap(), 42);
+    }
+
+    #[test]
+    fn restricted_modules_are_absent_at_runtime() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        let value = runtime
+            .eval(
+                "return { io == nil, os == nil, debug == nil, package == nil, require == nil, dofile == nil, loadfile == nil }",
+            )
+            .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([true, true, true, true, true, true, true])
+        );
+    }
+
+    #[test]
+    fn plugin_registration_rejects_unknown_empty_unbounded_and_duplicate_inputs() {
+        let unknown = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let error = unknown
+            .eval(
+                r#"quirl.prompt.add_segment {
+                    name = "project", deadline_ms = 8, unexpected = true,
+                    render = function() return "project" end,
+                }"#,
+            )
+            .unwrap_err();
+        assert!(error.details.context[0].contains("unknown field"));
+
+        let empty = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let error = empty
+            .eval(
+                r#"quirl.completion.add_provider {
+                    command = "  ", complete = function() return {} end,
+                }"#,
+            )
+            .unwrap_err();
+        assert!(error.details.context[0].contains("must not be empty"));
+
+        let unbounded = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let error = unbounded
+            .eval(
+                r#"quirl.prompt.add_segment {
+                    name = "slow", deadline_ms = 101,
+                    render = function() return "slow" end,
+                }"#,
+            )
+            .unwrap_err();
+        assert!(error.details.context[0].contains("between 1 and 100"));
+
+        let duplicate = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let error = duplicate
+            .eval(
+                r#"
+                local segment = { name = "same", render = function() return "same" end }
+                quirl.prompt.add_segment(segment)
+                quirl.prompt.add_segment(segment)
+                "#,
+            )
+            .unwrap_err();
+        assert!(error.details.context[0].contains("duplicate prompt segment"));
+
+        let duplicate = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let error = duplicate
+            .eval(
+                r#"
+                local provider = { command = "same", complete = function() return {} end }
+                quirl.completion.add_provider(provider)
+                quirl.completion.add_provider(provider)
+                "#,
+            )
+            .unwrap_err();
+        assert!(error.details.context[0].contains("duplicate completion provider"));
+    }
+
+    #[test]
+    fn prompt_callbacks_obey_their_declared_deadline() {
+        let runtime = LuaRuntime::new(LuaPolicy {
+            instruction_limit: 100_000_000,
+            wall_time: Duration::from_secs(1),
+            ..LuaPolicy::config()
+        })
+        .unwrap();
+        runtime
+            .eval(
+                r#"quirl.prompt.add_segment {
+                    name = "runaway", deadline_ms = 1,
+                    render = function() while true do end end,
+                }"#,
+            )
+            .unwrap();
+
+        let started = Instant::now();
+        let error = runtime
+            .render_prompt_segment("runaway", &serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn completion_callbacks_have_a_safe_deadline_and_validate_return_shape() {
+        let runaway = LuaRuntime::new(LuaPolicy {
+            instruction_limit: 100_000_000,
+            wall_time: Duration::from_secs(1),
+            ..LuaPolicy::config()
+        })
+        .unwrap();
+        runaway
+            .eval(
+                r#"quirl.completion.add_provider {
+                    command = "runaway", complete = function() while true do end end,
+                }"#,
+            )
+            .unwrap();
+        let started = Instant::now();
+        let error = runaway
+            .complete_with_provider("runaway", &serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let malformed = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        malformed
+            .eval(
+                r#"quirl.completion.add_provider {
+                    command = "malformed", complete = function() return { 42 } end,
+                }"#,
+            )
+            .unwrap();
+        let error = malformed
+            .complete_with_provider("malformed", &serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.details.context[0].contains("completion item 0"));
     }
 
     #[test]

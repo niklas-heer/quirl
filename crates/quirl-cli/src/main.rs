@@ -1,13 +1,23 @@
+mod config;
 mod extensions;
+mod index;
+mod pick;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use config::ConfigCommand;
 use extensions::{LuaCompletionAdapter, LuaExtensionHost};
+use index::IndexCommand;
+use pick::PickCommand;
 use quirl_catalog::{Catalog, CommandSpec};
-use quirl_core::{CommandRunner, ErrorCode, ShellError};
+use quirl_core::{ErrorCode, ShellError};
 use quirl_data::DataRuntime;
 use quirl_lua::{format_file, sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig};
+use quirl_process::{JobStatus, NativeExecutor};
 use quirl_syntax::{classify, InteractiveLine, Mode};
-use quirl_ui::{editor_with_extensions_and_config, render_error, QuirlPrompt};
+use quirl_ui::{
+    editor_with_extensions_config_and_history, history_path, render_error, PromptContextScheduler,
+    QuirlPrompt, MODE_TOGGLE_HOST_COMMAND,
+};
 use reedline::Signal;
 use std::{
     io::{self, IsTerminal, Read},
@@ -39,8 +49,8 @@ enum Command {
     /// Parse a script without executing it.
     Check {
         file: PathBuf,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
+        #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
+        format: DiagnosticFormat,
     },
     /// Conservatively format a Lua file.
     Fmt {
@@ -51,8 +61,8 @@ enum Command {
     /// Parse and lint a Lua file without executing it.
     Lint {
         file: PathBuf,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
+        #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
+        format: DiagnosticFormat,
     },
     /// Run test_* functions returned by a Lua test module.
     Test { file: PathBuf },
@@ -68,34 +78,34 @@ enum Command {
     },
     /// Export the generated Lua SDK used by editors, docs, and AI.
     Sdk {
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
+        #[arg(long, value_enum, default_value_t = SdkFormat::Text)]
+        format: SdkFormat,
     },
     /// Export the semantic command catalog used by completion, docs, and AI.
     Catalog {
-        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
-        format: OutputFormat,
+        #[arg(long, value_enum, default_value_t = CatalogFormat::Json)]
+        format: CatalogFormat,
+    },
+    /// Build and inspect the attributed completion index.
+    Index {
+        #[command(subcommand)]
+        command: IndexCommand,
     },
     /// Ask the same completion engine used by the interactive IDE menu.
     Complete {
         input: String,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
+        #[arg(long, value_enum, default_value_t = CompletionFormat::Text)]
+        format: CompletionFormat,
     },
-    /// Execute one Bash/Zsh-style command through the configured compatibility shell.
+    /// Select typed history, files, actions, or input with the shared picker.
+    Pick {
+        #[command(flatten)]
+        command: PickCommand,
+    },
+    /// Execute one command through Quirl's native pipeline and job graph.
     Exec {
         #[arg(required = true, trailing_var_arg = true)]
         command: Vec<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum ConfigCommand {
-    /// Parse, evaluate under config restrictions, and validate against Rust schemas.
-    Check {
-        file: PathBuf,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
     },
 }
 
@@ -104,30 +114,53 @@ enum PluginCommand {
     /// Load a plugin under restrictions and validate its registrations.
     Check {
         file: PathBuf,
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
+        #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
+        format: DiagnosticFormat,
     },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum OutputFormat {
+enum DiagnosticFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SdkFormat {
     Text,
     Json,
     Markdown,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CatalogFormat {
+    Text,
+    Json,
+    Markdown,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CompletionFormat {
+    Text,
+    Json,
 }
 
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(status) => ExitCode::from(status.clamp(0, 255) as u8),
         Err(error) => {
-            eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
+            eprintln!("{}", render_stderr_error(&error));
             ExitCode::FAILURE
         }
     }
 }
 
 fn run(cli: Cli) -> Result<i32, ShellError> {
-    let catalog = Catalog::builtin();
+    let catalog = if matches!(&cli.command, Some(Command::Index { .. })) {
+        Catalog::builtin()
+    } else {
+        index::load_default_catalog()?
+    };
     match cli.command {
         Some(Command::Run { file, arguments }) => {
             require_lua_file(&file)?;
@@ -168,15 +201,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             println!("✓ {count} Lua tests passed in {}", file.display());
             Ok(0)
         }
-        Some(Command::Config {
-            command: ConfigCommand::Check { file, format },
-        }) => {
-            let lua = LuaRuntime::new(LuaPolicy::config())?;
-            match lua.load_config_file(&file) {
-                Ok(config) => print_config_result(&file, &config, format),
-                Err(error) => validation_failure(error, format),
-            }
-        }
+        Some(Command::Config { command }) => config::execute(command),
         Some(Command::Plugin {
             command: PluginCommand::Check { file, format },
         }) => {
@@ -184,7 +209,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             match lua.load_plugin_file(&file) {
                 Ok(registrations) => {
                     match format {
-                        OutputFormat::Json => println!(
+                        DiagnosticFormat::Json => println!(
                             "{}",
                             serde_json::to_string_pretty(&registrations).map_err(json_error)?
                         ),
@@ -202,27 +227,28 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
         }
         Some(Command::Sdk { format }) => {
             match format {
-                OutputFormat::Text => print!("{}", sdk_lua()),
-                OutputFormat::Json => println!("{}", sdk_json()?),
-                OutputFormat::Markdown => print!("{}", sdk_markdown()),
+                SdkFormat::Text => print!("{}", sdk_lua()),
+                SdkFormat::Json => println!("{}", sdk_json()?),
+                SdkFormat::Markdown => print!("{}", sdk_markdown()),
             }
             Ok(0)
         }
         Some(Command::Catalog { format }) => {
             match format {
-                OutputFormat::Json => println!(
+                CatalogFormat::Json => println!(
                     "{}",
                     serde_json::to_string_pretty(&catalog).map_err(json_error)?
                 ),
-                OutputFormat::Markdown => print!("{}", catalog.to_markdown()),
-                OutputFormat::Text => print_catalog(&catalog),
+                CatalogFormat::Markdown => print!("{}", catalog.to_markdown()),
+                CatalogFormat::Text => print_catalog(&catalog),
             }
             Ok(0)
         }
+        Some(Command::Index { command }) => index::execute(command),
         Some(Command::Complete { input, format }) => {
             let completions = catalog.complete(&input, input.len());
             match format {
-                OutputFormat::Json => println!(
+                CompletionFormat::Json => println!(
                     "{}",
                     serde_json::to_string_pretty(&completions).map_err(json_error)?
                 ),
@@ -234,8 +260,9 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             }
             Ok(0)
         }
+        Some(Command::Pick { command }) => pick::execute(command, &catalog),
         Some(Command::Exec { command }) => {
-            let outcome = CommandRunner::default().execute(&command.join(" "))?;
+            let outcome = NativeExecutor::default().execute(&command.join(" "))?;
             print_outcome(&outcome);
             Ok(outcome.status)
         }
@@ -245,9 +272,6 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
 }
 
 fn repl(catalog: Catalog) -> Result<i32, ShellError> {
-    println!(
-        "\x1b[1;32mQuirl\x1b[0m 0.1 · command mode · Tab explores · `mode data` switches grammar"
-    );
     let extensions = Arc::new(Mutex::new(LuaExtensionHost::discover()));
     let (mut active_config, mut applied_revision) = {
         let mut host = extensions.lock().map_err(|_| {
@@ -257,14 +281,18 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
         let config = host.active_config().clone();
         (config, host.config_revision())
     };
-    let mut line_editor = configured_editor(&catalog, &extensions, active_config.clone());
+    let history_path = history_path()?;
+    let mut line_editor =
+        configured_editor(&catalog, &extensions, active_config.clone(), &history_path)?;
+    print_banner();
     let mut mode = Mode::Command;
-    let runner = CommandRunner::default();
+    let mut executor = NativeExecutor::default();
     let data = DataRuntime::new();
     // Script evaluation remains lazy; extension VMs load before the first editor view.
     let mut lua = None;
     let mut last_status = 0;
     let mut last_duration: Option<Duration> = None;
+    let prompt_context = PromptContextScheduler::default();
 
     loop {
         let (extension_segments, next_config) = extensions
@@ -285,78 +313,95 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
         if let Some((config, revision)) = next_config {
             applied_revision = revision;
             if config != active_config {
+                sync_history(&mut line_editor, &history_path)?;
                 active_config = config;
-                line_editor = configured_editor(&catalog, &extensions, active_config.clone());
+                line_editor =
+                    configured_editor(&catalog, &extensions, active_config.clone(), &history_path)?;
             }
         }
         print_extension_errors(&extensions);
+        let active_jobs = executor
+            .jobs()
+            .iter()
+            .filter(|job| job.status != JobStatus::Done)
+            .count();
+        let native_context = prompt_context.sample_current_dir();
         let mut prompt = QuirlPrompt::with_config(mode, &active_config)
+            .with_native_context(native_context.context)
             .with_status(last_status)
+            .with_jobs(active_jobs)
             .with_named_extension_segments(extension_segments);
         if let Some(duration) = last_duration {
             prompt = prompt.with_duration(duration);
         }
         match line_editor.read_line(&prompt) {
-            Ok(Signal::Success(buffer)) => match classify(mode, &buffer) {
-                InteractiveLine::Empty => {}
-                InteractiveLine::Exit => return Ok(last_status),
-                InteractiveLine::ChangeMode(next) => {
-                    mode = next;
-                    println!("mode → {mode}");
-                }
-                InteractiveLine::ToggleMode => {
-                    mode = mode.toggled();
-                    println!("mode → {mode}");
-                }
-                InteractiveLine::Help(topic) => print_help(&catalog, topic),
-                InteractiveLine::Command(command) => {
-                    let started = Instant::now();
-                    match runner.execute(command) {
-                        Ok(outcome) => {
-                            last_status = outcome.status;
-                            print_outcome(&outcome);
-                        }
-                        Err(error) => {
-                            last_status = 1;
-                            eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
-                        }
+            Ok(Signal::Success(buffer)) => {
+                sync_history(&mut line_editor, &history_path)?;
+                match classify(mode, &buffer) {
+                    InteractiveLine::Empty => {}
+                    InteractiveLine::Exit => return Ok(last_status),
+                    InteractiveLine::ChangeMode(next) => {
+                        mode = next;
+                        println!("mode → {mode}");
                     }
-                    last_duration = Some(started.elapsed());
-                }
-                InteractiveLine::Data(source) => {
-                    let started = Instant::now();
-                    match data.eval(source) {
-                        Ok(value) => {
-                            last_status = 0;
-                            print_json_value(value);
-                        }
-                        Err(error) => {
-                            last_status = 1;
-                            eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
-                        }
+                    InteractiveLine::ToggleMode => {
+                        mode = mode.toggled();
+                        println!("mode → {mode}");
                     }
-                    last_duration = Some(started.elapsed());
-                }
-                InteractiveLine::Lua(source) => {
-                    let started = Instant::now();
-                    match eval_lua(&mut lua, source) {
-                        Ok(value) => {
-                            last_status = 0;
-                            print_json_value(value);
+                    InteractiveLine::Help(topic) => print_help(&catalog, topic),
+                    InteractiveLine::Command(command) => {
+                        let started = Instant::now();
+                        match executor.execute(command) {
+                            Ok(outcome) => {
+                                last_status = outcome.status;
+                                print_outcome(&outcome);
+                            }
+                            Err(error) => {
+                                last_status = 1;
+                                eprintln!("{}", render_stderr_error(&error));
+                            }
                         }
-                        Err(error) => {
-                            last_status = 1;
-                            eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
-                        }
+                        last_duration = Some(started.elapsed());
                     }
-                    last_duration = Some(started.elapsed());
+                    InteractiveLine::Data(source) => {
+                        let started = Instant::now();
+                        match data.eval(source) {
+                            Ok(value) => {
+                                last_status = 0;
+                                print_json_value(value);
+                            }
+                            Err(error) => {
+                                last_status = 1;
+                                eprintln!("{}", render_stderr_error(&error));
+                            }
+                        }
+                        last_duration = Some(started.elapsed());
+                    }
+                    InteractiveLine::Lua(source) => {
+                        let started = Instant::now();
+                        match eval_lua(&mut lua, source) {
+                            Ok(value) => {
+                                last_status = 0;
+                                print_json_value(value);
+                            }
+                            Err(error) => {
+                                last_status = 1;
+                                eprintln!("{}", render_stderr_error(&error));
+                            }
+                        }
+                        last_duration = Some(started.elapsed());
+                    }
                 }
-            },
+            }
             Ok(Signal::CtrlC) => {
                 last_status = 130;
                 println!("^C");
             }
             Ok(Signal::CtrlD) => return Ok(last_status),
+            Ok(Signal::HostCommand(command)) if command == MODE_TOGGLE_HOST_COMMAND => {
+                mode = mode.toggled();
+                println!("mode → {mode}");
+            }
             Ok(_) => {}
             Err(error) => {
                 return Err(
@@ -371,10 +416,30 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
 fn configured_editor(
     catalog: &Catalog,
     extensions: &Arc<Mutex<LuaExtensionHost>>,
-    config: QuirlConfig,
-) -> reedline::Reedline {
+    mut config: QuirlConfig,
+    history_path: &Path,
+) -> Result<reedline::Reedline, ShellError> {
+    if std::env::var_os("NO_COLOR").is_some() {
+        config.editor.semantic_hints = false;
+    }
     let completion_adapter = LuaCompletionAdapter::new(Arc::clone(extensions));
-    editor_with_extensions_and_config(catalog.clone(), Some(Box::new(completion_adapter)), config)
+    editor_with_extensions_config_and_history(
+        catalog.clone(),
+        Some(Box::new(completion_adapter)),
+        config,
+        history_path.to_path_buf(),
+    )
+}
+
+fn sync_history(editor: &mut reedline::Reedline, history_path: &Path) -> Result<(), ShellError> {
+    editor.sync_history().map_err(|error| {
+        ShellError::new(
+            ErrorCode::Io,
+            format!("could not save history to {}", history_path.display()),
+        )
+        .with_context(error.to_string())
+        .with_help("Set QUIRL_HISTORY to a writable file path")
+    })
 }
 
 fn print_extension_errors(extensions: &Arc<Mutex<LuaExtensionHost>>) {
@@ -383,8 +448,34 @@ fn print_extension_errors(extensions: &Arc<Mutex<LuaExtensionHost>>) {
         .map(|mut extensions| extensions.take_errors())
         .unwrap_or_default();
     for error in errors {
-        eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
+        eprintln!("{}", render_stderr_error(&error));
     }
+}
+
+fn print_banner() {
+    let banner = "Quirl 0.1 · command mode · Ctrl-Space switches · Ctrl-R/T/K pick · Tab completes";
+    if color_enabled(
+        io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").is_some(),
+    ) {
+        println!("\x1b[1;32mQuirl\x1b[0m{}", &banner["Quirl".len()..]);
+    } else {
+        println!("{banner}");
+    }
+}
+
+fn render_stderr_error(error: &ShellError) -> String {
+    render_error(
+        error,
+        color_enabled(
+            io::stderr().is_terminal(),
+            std::env::var_os("NO_COLOR").is_some(),
+        ),
+    )
+}
+
+fn color_enabled(terminal: bool, no_color_is_set: bool) -> bool {
+    terminal && !no_color_is_set
 }
 
 fn eval_lua(
@@ -412,23 +503,27 @@ fn run_stdin() -> Result<i32, ShellError> {
     Ok(0)
 }
 
-fn validate_file(file: &Path, format: OutputFormat) -> Result<i32, ShellError> {
+fn validate_file(file: &Path, format: DiagnosticFormat) -> Result<i32, ShellError> {
     if let Err(error) = require_lua_file(file) {
         return validation_failure(error, format);
     }
     validate_lua(file, format, "valid Lua")
 }
 
-fn validate_lua(file: &Path, format: OutputFormat, message: &str) -> Result<i32, ShellError> {
+fn validate_lua(file: &Path, format: DiagnosticFormat, message: &str) -> Result<i32, ShellError> {
     match LuaRuntime::check_file(file) {
         Ok(()) => validation_success(file, format, message),
         Err(error) => validation_failure(error, format),
     }
 }
 
-fn validation_success(file: &Path, format: OutputFormat, message: &str) -> Result<i32, ShellError> {
+fn validation_success(
+    file: &Path,
+    format: DiagnosticFormat,
+    message: &str,
+) -> Result<i32, ShellError> {
     match format {
-        OutputFormat::Json => println!(
+        DiagnosticFormat::Json => println!(
             "{{\"valid\":true,\"file\":{}}}",
             json_string(&file.display().to_string())?
         ),
@@ -437,8 +532,8 @@ fn validation_success(file: &Path, format: OutputFormat, message: &str) -> Resul
     Ok(0)
 }
 
-fn validation_failure(error: ShellError, format: OutputFormat) -> Result<i32, ShellError> {
-    if matches!(format, OutputFormat::Json) {
+fn validation_failure(error: ShellError, format: DiagnosticFormat) -> Result<i32, ShellError> {
+    if matches!(format, DiagnosticFormat::Json) {
         println!(
             "{}",
             serde_json::to_string_pretty(&error).map_err(json_error)?
@@ -447,21 +542,6 @@ fn validation_failure(error: ShellError, format: OutputFormat) -> Result<i32, Sh
     } else {
         Err(error)
     }
-}
-
-fn print_config_result(
-    file: &Path,
-    config: &QuirlConfig,
-    format: OutputFormat,
-) -> Result<i32, ShellError> {
-    match format {
-        OutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(config).map_err(json_error)?
-        ),
-        _ => println!("✓ {} is valid Lua configuration", file.display()),
-    }
-    Ok(0)
 }
 
 fn is_lua(path: &Path) -> bool {
@@ -557,4 +637,45 @@ fn json_string(value: &str) -> Result<String, ShellError> {
 
 fn json_error(error: serde_json::Error) -> ShellError {
     ShellError::new(ErrorCode::Io, "could not produce JSON").with_context(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_requires_a_terminal_and_no_color_must_be_absent() {
+        assert!(color_enabled(true, false));
+        assert!(!color_enabled(false, false));
+        assert!(!color_enabled(true, true));
+    }
+
+    #[test]
+    fn commands_reject_output_formats_they_do_not_implement() {
+        for arguments in [
+            vec!["quirl", "check", "example.lua", "--format", "markdown"],
+            vec!["quirl", "lint", "example.lua", "--format", "markdown"],
+            vec![
+                "quirl",
+                "config",
+                "check",
+                "config.lua",
+                "--format",
+                "markdown",
+            ],
+            vec![
+                "quirl",
+                "plugin",
+                "check",
+                "plugin.lua",
+                "--format",
+                "markdown",
+            ],
+            vec!["quirl", "complete", "git", "--format", "markdown"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+        assert!(Cli::try_parse_from(["quirl", "sdk", "--format", "markdown"]).is_ok());
+        assert!(Cli::try_parse_from(["quirl", "catalog", "--format", "markdown"]).is_ok());
+    }
 }

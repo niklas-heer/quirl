@@ -10,7 +10,7 @@
 
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
   [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](rust-toolchain.toml)
-  [![Status](https://img.shields.io/badge/status-prototype-informational.svg)](#status)
+  [![Status](https://img.shields.io/badge/status-0.1_preview-blue.svg)](#status)
 </div>
 
 ---
@@ -42,14 +42,15 @@ batter. The result is a single fast binary where your shell finally feels
 as smart as your editor.
 
 > [!IMPORTANT]
-> Quirl is in an early **prototyping phase**. It's a runnable vertical slice,
-> not a daily-driver shell yet — expect rapid, breaking changes while the
-> design settles. See [Status](#status) for what's actually implemented today.
+> Quirl 0.1 is a **Preview**. Its acceptance seams are runnable and tested, but
+> APIs may still break before 1.0 and Windows support remains later-phase work.
+> See [Status](#status) for the exact implemented surface.
 
 ## Features
 
-- **Familiar command mode** — ordinary Bash/Zsh-style commands run through a
-  configured compatibility shell; `ls` is Quirl-native.
+- **Familiar command mode** — quoting, redirects, byte pipes, boolean lists,
+  background jobs, and `ls` run through one native process graph; unsupported
+  Bash/Zsh forms get an explicit dialect diagnostic.
 - **Typed data pipelines** — an explicit `data` mode for native, structured
   sources and transforms (`where` comparisons with `and`/`or`, nested `get`,
   `select`, `sort`, `take`, `first`, and `length`), with a Lua bridge
@@ -59,6 +60,9 @@ as smart as your editor.
   completion providers.
 - **Semantic completions** — Tab opens a documented, IDE-style completion
   menu backed by one command catalog shared with docs, help, and AI tooling.
+- **Durable searchable history** — commands persist across sessions and
+  <kbd>Ctrl-R</kbd> opens a keyboard-first, line-oriented reverse search that
+  remains usable on simple terminals.
 - **Structured, helpful errors** — diagnostics are machine-readable (JSON)
   and human-readable, with `--format` support across the CLI.
 - **Capability-based plugins** — trusted Lua plugins run in-process with
@@ -73,9 +77,9 @@ as smart as your editor.
 ### Bash and Zsh
 
 Quirl keeps the command syntax and muscle memory of a Bourne-family shell by
-routing ordinary commands through a configured compatibility shell. Unlike
-Bash and Zsh, it also has an explicit data mode where pipelines carry typed
-values instead of requiring every structured task to become text processing.
+routing the documented C0/C1 Preview subset through a native process graph.
+Unlike Bash and Zsh, it also has an explicit data mode where pipelines carry
+typed values instead of requiring every structured task to become text processing.
 
 ### Nushell
 
@@ -90,11 +94,12 @@ Quirl shares Fish's emphasis on discoverability, rich completion, and a helpful
 interactive experience. It adds typed data pipelines and standardizes config,
 scripts, prompts, completions, and trusted plugins on exactly one sandboxed Lua
 5.4 language with a generated, Rust-validated SDK. Fish is a mature daily-driver
-shell; Quirl is still a prototype.
+shell; Quirl is still an early Preview.
 
 ## Status
 
-Quirl is a runnable vertical-slice prototype, not a daily-driver shell yet.
+Quirl 0.1 is a runnable Preview: substantially more complete than the original
+vertical slice, but not yet the frozen, cross-platform 1.0 daily-driver contract.
 The architecture and decisions behind it are documented in depth:
 
 - [Language & product design](docs/language-design.md) — the intended
@@ -121,19 +126,20 @@ runtime dependencies have been removed.
 
 ### Roadmap to a daily driver
 
-- [x] Familiar command execution through a configured compatibility shell.
+- [x] Familiar command execution through a native command graph.
 - [x] Explicit typed data mode with a focused native pipeline grammar.
 - [x] Sandboxed Lua configuration, scripts, tests, and trusted extensions.
 - [x] Semantic command catalog, completions, and atomic live config reload.
-- [ ] Native job control and background-process lifecycle management.
-- [ ] One command-mode execution graph for redirects and byte pipes across
-  native built-ins and external commands. External-only shell syntax already
-  works through the compatibility shell.
-- [ ] Durable, searchable history and a shared typed history/file/action picker.
+- [x] Attributed Fish/Bash/Zsh and supplied help/man ingestion with build and explain commands.
+- [x] Native Linux/macOS job control and background-process lifecycle management.
+- [x] One command-mode execution graph for redirects and byte pipes across
+  native built-ins and external commands.
+- [x] Durable, searchable command history with the shared typed Ctrl-R picker.
+- [x] A shared typed picker spanning history, files, palette actions, jobs, and data.
+- [x] Named end-to-end PTY performance measurements with misses recorded.
 - [ ] Complete scripting tooling: a real formatter, annotation-aware checking,
   language service, package manifests, and deterministic integration tests.
-- [ ] Linux/macOS/Windows hardening, recovery, accessibility, and performance
-  gates suitable for replacing a user's login shell.
+- [ ] Windows support plus 1.0 recovery, accessibility, and performance hardening.
 
 ## Quick start
 
@@ -146,16 +152,22 @@ cd quirl
 cargo run -p quirl-cli
 ```
 
-Inside the prompt, ordinary commands run through the configured
-compatibility shell, `ls` is Quirl-native, <kbd>Tab</kbd> opens a documented
-semantic completion menu, and the current mode is always visible. Use
-`mode data` for native structured pipelines, or bridge explicitly with
-`lua return 20 + 22`.
+Inside the prompt, ordinary commands and native `ls` share one process graph,
+<kbd>Tab</kbd> opens semantic completion, and the current mode is always visible.
+Press <kbd>Ctrl-Space</kbd> to toggle command/data mode, <kbd>Ctrl-R</kbd> for
+history, <kbd>Ctrl-T</kbd> for files, and <kbd>Ctrl-K</kbd> for catalog actions.
+The picker retains original typed values; `quirl pick` provides the same exact,
+fuzzy, and inverse query engine as a line-oriented/scriptable fallback.
 
 Quirl discovers `config.lua` and sorted `plugins/*.lua` under
 `$QUIRL_CONFIG_DIR`, `$XDG_CONFIG_HOME/quirl`, or `~/.config/quirl`. It watches
 their contents during an interactive session and installs a changed config and
 plugin set only after the whole generation validates.
+
+Interactive history is stored at `$QUIRL_HISTORY` when set, otherwise at
+`$XDG_STATE_HOME/quirl/history` or `~/.local/state/quirl/history`. Quirl honors
+`NO_COLOR` for its banner, diagnostics, and semantic highlighting; typed picker
+shortcuts and textual mode commands remain usable without color.
 
 ### Non-interactive surfaces
 
@@ -168,9 +180,23 @@ cargo run -p quirl-cli -- plugin check examples/plugin.lua --format json
 cargo run -p quirl-cli -- test examples/lua_tests.lua
 cargo run -p quirl-cli -- sdk --format text
 cargo run -p quirl-cli -- complete 'git commit --am'
+cargo run -p quirl-cli -- pick --source history --query cargo
+cargo run -p quirl-cli -- pick --source files --query src
 cargo run -p quirl-cli -- catalog --format json
+cargo run -p quirl-cli -- index build
+cargo run -p quirl-cli -- index explain git commit
 cargo run --release -p quirl-bench
 ```
+
+`quirl index build` reads standard Fish, Bash, and Zsh completion directories
+without sourcing or executing them. `--fish`, `--bash`, and `--zsh` accept
+repeatable explicit files or directories. Common static Zsh `_arguments`,
+`_describe`, and `_values` forms are translated; dynamic providers are recorded
+but never run. Repeatable `--help PATH` and `--man PATH` inputs heuristically
+ingest options from bounded, already-supplied text/files—Quirl never invokes the
+documented command or `man`. Every imported fact records its source, confidence,
+origin, and fingerprint for `quirl index explain`. Because `--help` is an input
+flag on `index build`, use `quirl index build -h` for that subcommand's usage.
 
 The main benchmark accepts an official Fennel single-file library with
 `--fennel /path/to/fennel.lua`. Isolated, reproducible spikes cover
@@ -219,6 +245,24 @@ quirl.completion.add_provider {
 Run `cargo run -p quirl-cli -- sdk --format markdown` to see the full,
 generated API reference for what's available inside `quirl.*`.
 
+The current typed configuration CLI is deliberately file-backed and
+line-oriented:
+
+```console
+cargo run -p quirl-cli -- config check examples/config.lua
+cargo run -p quirl-cli -- config get examples/config.lua editor.keymap
+cargo run -p quirl-cli -- config set examples/config.lua picker.preview false
+cargo run -p quirl-cli -- config tui examples/config.lua
+```
+
+`config set` patches only recognized literal fields under `editor` and
+`picker`, preserves surrounding Lua source, validates the complete candidate
+before activation, replaces the file atomically, and retains the prior source
+as `config.lua.bak`. Values controlled by Lua expressions must be edited in
+code. The synchronized local web configuration view described in the design is
+still future work; `config tui` is an honest accessible text view, not a fake
+browser UI.
+
 ## Workspace
 
 Quirl is organized as a Cargo workspace of small, focused crates:
@@ -226,13 +270,15 @@ Quirl is organized as a Cargo workspace of small, focused crates:
 | Crate           | Responsibility                                                          |
 | ---------------- | ------------------------------------------------------------------------ |
 | `quirl-cli`      | Binary, REPL, script runner, and machine-facing commands                |
-| `quirl-core`     | Compatibility execution, native `ls`, values, and errors                |
+| `quirl-core`     | Shared process/value DTOs, native `ls`, and serializable errors          |
 | `quirl-data`     | Native structured sources, predicates, projection, sorting, and limits   |
 | `quirl-lua`      | Restricted Lua 5.4 runtime, Rust schemas, resource budgets, SDK generation |
 | `quirl-syntax`   | The explicit command/data-mode interaction grammar                      |
 | `quirl-catalog`  | One schema for completion, help, docs, validation, and AI                |
+| `quirl-picker`   | Typed exact/fuzzy/inverse selection shared across providers              |
+| `quirl-process`  | Native command graph, pipes, redirects, process groups, and jobs         |
 | `quirl-ui`       | Semantic highlighting, IDE completion menu, prompt, diagnostics          |
-| `quirl-bench`    | Reproducible Lua/Rhai/Fennel runtime spike                               |
+| `quirl-bench`    | Runtime research plus reproducible Preview PTY performance gates         |
 | `spikes/`        | Isolated runtime, type-checking, binary-size, and peak-RSS measurements |
 
 ## Contributing

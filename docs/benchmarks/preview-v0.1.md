@@ -1,0 +1,128 @@
+# Preview v0.1 performance measurements
+
+**Measured:** 15 August 2026 at 20:01:31 UTC  
+**Source state:** uncommitted Phase 1 worktree based on
+`66d116a656921ddc13cd2854dee17dab5ee0e0df`  
+**Phase 1 measurement gate:** **accepted — 31/31 end-to-end PTY samples valid**  
+**Budget outcomes:** **one within target, two measured misses**
+
+This report records release-build measurements from the named machine below.
+The Phase 1 gate in §13 requires the three §12 budgets to be measured and
+misses to be recorded; it does not require hiding a miss or weakening a target.
+The end-to-end software path is measured through a pseudo-terminal and VT100
+terminal model. Physical terminal-emulator/GPU scheduling and monitor scanout
+are not claimed.
+
+## Reference machine
+
+| Field | Value |
+| --- | --- |
+| Hardware | Apple M2 Pro, 12 logical CPUs, 32 GiB memory |
+| Platform | macOS 15.7.9 (24G830), `aarch64` |
+| Rust | `rustc 1.88.0 (6b00bc388 2025-06-23)`, LLVM 20.1.5 |
+| Cargo | `cargo 1.88.0 (873a06493 2025-05-10)` |
+| Build | Cargo `release` profile; thin LTO; symbols stripped |
+| Quirl | `quirl 0.1.0`, 3,617,440-byte release binary |
+| PTY | 120 columns × 40 rows, `TERM=xterm-256color`, truecolor advertised |
+
+The machine was not isolated from other user processes. CPU frequency,
+thermal state, scheduler activity, and filesystem caches were not controlled.
+
+## End-to-end results
+
+Times are wall-clock milliseconds. Percentiles use nearest rank over 31
+independent fresh Quirl processes. All samples completed without timeout or
+read failure.
+
+| Measurement | Valid samples | Minimum | P50 | P95 | Maximum | §12 target | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Process start to editable prompt frame | 31/31 | 106.801 | 116.950 | 118.510 | 118.823 | P50 ≤25 ms | **Miss: P50 is 91.950 ms over budget** |
+| Final injected keystroke to corresponding frame | 31/31 | 0.110 | 0.357 | 0.499 | 0.513 | P95 ≤8 ms | **Within: 7.501 ms headroom** |
+| Process start to first prompt frame | 31/31 | 4.518 | 14.753 | 16.284 | 16.585 | ≤16 ms | **Conservative P95 miss: 0.284 ms over budget** |
+
+The first-prompt target does not assign a percentile. This report records both
+P50 and P95 and uses P95 for the conservative pass/miss label. Its P50 is within
+16 ms; its P95 is not.
+
+The cold-to-editable result deliberately requires more than seeing prompt
+bytes: after the first command prompt frame is observed, the harness injects a
+unique marker and waits until that marker appears in the reconstructed screen.
+This proves the editor accepts input and produces the corresponding frame. The
+roughly 100 ms gap between first prompt and editable-frame measurements is a
+real result of that operational definition and is the main performance miss to
+investigate.
+
+## PTY methodology
+
+Each sample creates a fresh native pseudo-terminal and an isolated temporary
+config/history/index directory, then starts the release Quirl binary. A reader
+thread forwards terminal output to the timed harness. The harness:
+
+1. feeds output into a 120×40 VT100 terminal model;
+2. answers standard and private cursor-position requests with a deterministic
+   row/column response;
+3. records process start to the first screen containing Quirl's command prompt
+   indicator;
+4. sends a sample-unique marker and records process start until the terminal
+   screen contains that marker;
+5. clears the line, enters `git commit --amen`, then starts a timer immediately
+   before sending the final `d`; and
+6. stops that timer only when the terminal screen contains
+   `git commit --amend`.
+
+Every wait is bounded by a 2,000 ms timeout. Failures remain in the JSON report
+with their sample number and terminal-screen tail; a timeout, read failure,
+fewer than 20 requested PTY samples, any unsuccessful sample, or a debug build
+keeps the measurement gate unaccepted. The default run requests 31 samples and
+this recorded run completed 31/31 for all three measurements.
+
+“Frame” here means the complete expected screen state reconstructed from bytes
+delivered through the PTY. This includes Quirl startup, Reedline input handling,
+semantic highlighting/layout, terminal output generation, PTY transport, and
+VT parsing. It excludes scheduling and rendering inside a separate graphical
+terminal emulator, GPU composition, and physical display scanout.
+
+## Supplementary probes
+
+The same run retains the original lower-bound and headless CPU probes for
+diagnosis. They are not used to accept the end-to-end measurement gate.
+
+| Measurement | Samples | P50 | P95 | Maximum | Interpretation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Fresh subprocess through `quirl --version` exit | 31 | 2.680 | 4.133 | 4.987 | Process/dynamic-loading/argument-parsing lower bound; no editor or prompt |
+| Completion + semantic-highlight proxy + prompt render | 2,000 | 0.0065 | 0.0082 | 0.0230 | Headless CPU diagnostic; no Reedline layout or terminal I/O |
+| Fresh prompt construction + string rendering | 500 | 0.0068 | 0.0080 | 0.0165 | Headless CPU diagnostic; no terminal paint |
+
+The UI highlighter is private, so the headless edit probe uses the real catalog
+completer and prompt render methods plus a benchmark-owned equivalent of the
+current command/option/quote classification. The PTY edit measurement exercises
+the product's real interactive highlighter.
+
+## Reproduce
+
+Build both binaries from the same source state and run the preview suite
+directly so Cargo compilation time is excluded:
+
+```sh
+cargo build --release -p quirl-cli -p quirl-bench
+target/release/quirl-bench preview \
+  --quirl target/release/quirl \
+  --json
+```
+
+Defaults are 31 PTY sessions with a 2,000 ms per-phase timeout, 31 version
+subprocesses, 2,000 edit proxies, and 500 prompt constructions. Diagnostic
+overrides are `--pty-samples`, `--pty-timeout-ms`, `--cold-samples`,
+`--edit-samples`, and `--prompt-samples`. At least 20 fully successful PTY
+samples from a release build are required for an accepted measurement. The JSON
+output includes the named platform, binary size, methodology, sample counts,
+failures, target result, and gate status.
+
+## Follow-up performance work
+
+The recorded misses point to two concrete investigations: the delay from first
+prompt output to the editor accepting and repainting input, and prompt-startup
+tail latency. Cross-platform release records should repeat this suite on named
+Linux hardware. A separate terminal-emulator instrumentation study would be
+needed to claim GPU/display paint latency; these PTY numbers intentionally do
+not make that claim.

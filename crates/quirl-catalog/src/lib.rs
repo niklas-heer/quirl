@@ -2,6 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
+mod import;
+
+pub use import::{
+    import_bash, import_fish, import_help, import_man, import_zsh, ImportDiagnostic, ImportReport,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Catalog {
     pub schema_version: u32,
@@ -18,7 +24,7 @@ pub struct CommandSpec {
     pub options: Vec<OptionSpec>,
     pub examples: Vec<String>,
     pub effects: Vec<Effect>,
-    pub provenance: Provenance,
+    pub provenance: ProvenanceInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,6 +32,7 @@ pub struct OptionSpec {
     pub names: Vec<String>,
     pub value: Option<String>,
     pub summary: String,
+    pub provenance: ProvenanceInfo,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +50,76 @@ pub enum Provenance {
     Builtin,
     External,
     Lua,
+    Fish,
+    Bash,
+    Zsh,
+    Help,
+    Man,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    Low,
+    Medium,
+    High,
+    Exact,
+}
+
+/// Attribution for a catalog fact. Imported command options retain their own
+/// provenance when multiple sources contribute to the same command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProvenanceInfo {
+    pub source: Provenance,
+    pub confidence: Confidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+}
+
+impl ProvenanceInfo {
+    pub fn builtin(source: Provenance) -> Self {
+        let confidence = match source {
+            Provenance::Builtin | Provenance::Lua => Confidence::Exact,
+            Provenance::External => Confidence::Medium,
+            Provenance::Fish | Provenance::Bash | Provenance::Zsh => Confidence::High,
+            Provenance::Help | Provenance::Man => Confidence::Medium,
+        };
+        Self {
+            source,
+            confidence,
+            origin: None,
+            fingerprint: None,
+        }
+    }
+
+    pub fn imported(
+        source: Provenance,
+        confidence: Confidence,
+        origin: impl Into<String>,
+        fingerprint: impl Into<String>,
+    ) -> Self {
+        Self {
+            source,
+            confidence,
+            origin: Some(origin.into()),
+            fingerprint: Some(fingerprint.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CatalogExplanation {
+    pub command: String,
+    pub facts: Vec<FactExplanation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FactExplanation {
+    pub fact: String,
+    pub value: String,
+    pub provenance: ProvenanceInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,7 +136,7 @@ pub struct Completion {
 impl Catalog {
     pub fn builtin() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 3,
             commands: vec![
                 command(
                     "help",
@@ -191,6 +268,36 @@ impl Catalog {
                     Provenance::Builtin,
                 ),
                 command(
+                    "quirl config get",
+                    "quirl config get <file> <key>",
+                    "Read one evaluated configuration value",
+                    "Evaluates the complete restricted Lua configuration, validates it through Rust schemas, and prints one recognized typed field.",
+                    vec![],
+                    &["quirl config get ~/.config/quirl/config.lua editor.keymap"],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl config set",
+                    "quirl config set <file> <key> <value>",
+                    "Safely patch one literal configuration value",
+                    "Changes only a recognized literal field in `quirl.config`, validates the complete candidate before an atomic replacement, and retains the previous source as `.bak`.",
+                    vec![],
+                    &["quirl config set ~/.config/quirl/config.lua picker.preview false"],
+                    &[Effect::ReadFilesystem, Effect::WriteFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl config tui",
+                    "quirl config tui <file>",
+                    "Inspect schema-backed configuration in the terminal",
+                    "Shows current editor and picker values, allowed values, and textual editing guidance in an accessible line-oriented view.",
+                    vec![],
+                    &["quirl config tui ~/.config/quirl/config.lua"],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
                     "quirl plugin check",
                     "quirl plugin check <file> [--format text|json]",
                     "Validate Lua plugin registrations",
@@ -222,6 +329,140 @@ impl Catalog {
                     vec![option(&["--format"], Some("json|markdown"), "Choose a stable output format")],
                     &["quirl catalog --format json"],
                     &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl eval",
+                    "quirl eval <lua-expression>",
+                    "Evaluate Lua and print the returned value",
+                    "Runs one expression in the same restricted, budgeted Lua runtime used by scripts.",
+                    vec![],
+                    &["quirl eval 'return 20 + 22'"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl complete",
+                    "quirl complete <input> [--format text|json]",
+                    "Query the semantic completion engine",
+                    "Returns the same attributed completion items used by the interactive editor.",
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose stable text or JSON output",
+                    )],
+                    &["quirl complete 'git commit --am' --format json"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl exec",
+                    "quirl exec <command...>",
+                    "Execute Quirl's native command graph",
+                    "Runs quoted commands, byte pipes, redirects, boolean lists, and background jobs without a compatibility-shell round trip.",
+                    vec![],
+                    &["quirl exec ls '|' grep Cargo", "quirl exec sleep 1 '&'"],
+                    &[Effect::SpawnProcess],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl pick",
+                    "quirl pick [--source stdin|history|files|actions] [--query text] [--multi]",
+                    "Select typed values with Quirl's shared fuzzy engine",
+                    "The same deterministic exact/fuzzy/inverse query model ranks history, files, actions, jobs, completions, and data while returning the original value.",
+                    vec![
+                        option(
+                            &["--source"],
+                            Some("stdin|history|files|actions"),
+                            "Choose the typed provider",
+                        ),
+                        option(&["--query"], Some("text"), "Set the initial fuzzy query"),
+                        option(&["--multi"], None, "Return multiple selected values"),
+                        option(&["--limit"], Some("count"), "Bound multi-selection output"),
+                        option(&["--root"], Some("path"), "Set the file provider root"),
+                        option(&["--format"], Some("text|json"), "Choose stable output"),
+                    ],
+                    &[
+                        "quirl pick --source history --query cargo",
+                        "quirl pick --source files --query src",
+                        "quirl pick --source actions --query index",
+                    ],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "jobs",
+                    "jobs",
+                    "List structured background job state",
+                    "Shows Quirl job ids, running/stopped/done state, and the original command.",
+                    vec![],
+                    &["jobs"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "fg",
+                    "fg [%job]",
+                    "Resume a job in the foreground",
+                    "Transfers terminal ownership to the selected process group and waits until it exits or stops again.",
+                    vec![],
+                    &["fg", "fg %2"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "bg",
+                    "bg [%job]",
+                    "Resume a stopped job in the background",
+                    "Sends SIGCONT to the selected process group without transferring terminal ownership.",
+                    vec![],
+                    &["bg", "bg %2"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "export",
+                    "export NAME=value...",
+                    "Set environment variables for later commands",
+                    "The Preview grammar accepts explicit NAME=value assignments without shell expansion.",
+                    vec![],
+                    &["export RUST_LOG=debug"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl index build",
+                    "quirl index build [--fish path] [--bash path] [--zsh path] [--help path] [--man path] [--output path]",
+                    "Build the attributed completion index",
+                    "Imports declarative Fish, Bash, and Zsh completions plus bounded supplied help/man text without sourcing or executing providers, commands, or man, then atomically writes a versioned catalog.",
+                    vec![
+                        option(&["--fish"], Some("path"), "Import a Fish completion file or directory"),
+                        option(&["--bash"], Some("path"), "Import a Bash completion file or directory"),
+                        option(&["--zsh"], Some("path"), "Import a Zsh completion file or directory"),
+                        option(&["--help"], Some("path"), "Parse supplied command-help text without executing its command"),
+                        option(&["--man"], Some("path"), "Parse supplied rendered/raw man text without invoking man"),
+                        option(&["--output"], Some("path"), "Write a specific index instead of the default cache"),
+                        option(&["--format"], Some("text|json"), "Choose the build report format"),
+                    ],
+                    &[
+                        "quirl index build",
+                        "quirl index build --zsh completions/_tool",
+                        "quirl index build --help captured/tool-help.txt --man docs/tool.man",
+                    ],
+                    &[Effect::ReadFilesystem, Effect::WriteFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl index explain",
+                    "quirl index explain <command> [--index path] [--format text|json]",
+                    "Explain where indexed command facts came from",
+                    "Shows source kind, confidence, origin, and fingerprint for command metadata and each retained option.",
+                    vec![
+                        option(&["--index"], Some("path"), "Read a specific catalog index"),
+                        option(&["--format"], Some("text|json"), "Choose the explanation format"),
+                    ],
+                    &["quirl index explain git", "quirl index explain cargo --format json"],
+                    &[Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
                 command(
@@ -335,6 +576,111 @@ impl Catalog {
             })
     }
 
+    /// Merge imported commands without discarding the provenance of individual
+    /// options. Existing higher-confidence facts win deterministic ties.
+    pub fn merge(&mut self, imported: impl IntoIterator<Item = CommandSpec>) {
+        for mut incoming in imported {
+            if let Some(existing) = self
+                .commands
+                .iter_mut()
+                .find(|command| command.path == incoming.path)
+            {
+                if incoming.provenance.confidence > existing.provenance.confidence {
+                    existing.signature = incoming.signature;
+                    existing.summary = incoming.summary;
+                    existing.details = incoming.details;
+                    existing.provenance = incoming.provenance;
+                }
+                for option in incoming.options.drain(..) {
+                    merge_option(&mut existing.options, option);
+                }
+                existing.options.sort_by(|left, right| {
+                    left.names
+                        .first()
+                        .cmp(&right.names.first())
+                        .then_with(|| left.names.cmp(&right.names))
+                });
+            } else {
+                incoming
+                    .options
+                    .sort_by(|left, right| left.names.cmp(&right.names));
+                self.commands.push(incoming);
+            }
+        }
+        self.commands
+            .sort_by(|left, right| left.path.cmp(&right.path));
+    }
+
+    pub fn merge_report(&mut self, report: ImportReport) -> Vec<ImportDiagnostic> {
+        self.merge(report.commands);
+        report.diagnostics
+    }
+
+    /// Explain the source of every command-level and option-level fact currently
+    /// retained in the catalog.
+    pub fn explain(&self, path: &str) -> Option<CatalogExplanation> {
+        let command = self.commands.iter().find(|command| command.path == path)?;
+        let mut facts = vec![
+            FactExplanation {
+                fact: "command_path".to_owned(),
+                value: command.path.clone(),
+                provenance: command.provenance.clone(),
+            },
+            FactExplanation {
+                fact: "signature".to_owned(),
+                value: command.signature.clone(),
+                provenance: command.provenance.clone(),
+            },
+            FactExplanation {
+                fact: "summary".to_owned(),
+                value: command.summary.clone(),
+                provenance: command.provenance.clone(),
+            },
+            FactExplanation {
+                fact: "details".to_owned(),
+                value: command.details.clone(),
+                provenance: command.provenance.clone(),
+            },
+        ];
+        for example in &command.examples {
+            facts.push(FactExplanation {
+                fact: "example".to_owned(),
+                value: example.clone(),
+                provenance: command.provenance.clone(),
+            });
+        }
+        for effect in &command.effects {
+            facts.push(FactExplanation {
+                fact: "effect".to_owned(),
+                value: format!("{effect:?}"),
+                provenance: command.provenance.clone(),
+            });
+        }
+        for option in &command.options {
+            facts.push(FactExplanation {
+                fact: "option_names".to_owned(),
+                value: option.names.join(", "),
+                provenance: option.provenance.clone(),
+            });
+            if let Some(value) = &option.value {
+                facts.push(FactExplanation {
+                    fact: "option_value".to_owned(),
+                    value: value.clone(),
+                    provenance: option.provenance.clone(),
+                });
+            }
+            facts.push(FactExplanation {
+                fact: "option_summary".to_owned(),
+                value: option.summary.clone(),
+                provenance: option.provenance.clone(),
+            });
+        }
+        Some(CatalogExplanation {
+            command: command.path.clone(),
+            facts,
+        })
+    }
+
     pub fn to_markdown(&self) -> String {
         let mut output = String::from("# Quirl command catalog\n\n");
         for command in &self.commands {
@@ -411,6 +757,31 @@ fn option(names: &[&str], value: Option<&str>, summary: &str) -> OptionSpec {
         names: names.iter().map(|name| (*name).to_owned()).collect(),
         value: value.map(str::to_owned),
         summary: summary.to_owned(),
+        provenance: ProvenanceInfo::builtin(Provenance::Builtin),
+    }
+}
+
+fn merge_option(options: &mut Vec<OptionSpec>, incoming: OptionSpec) {
+    let duplicate = options.iter_mut().find(|existing| {
+        existing
+            .names
+            .iter()
+            .any(|name| incoming.names.iter().any(|candidate| candidate == name))
+    });
+    if let Some(existing) = duplicate {
+        for name in incoming.names {
+            if !existing.names.contains(&name) {
+                existing.names.push(name);
+            }
+        }
+        existing.names.sort();
+        if incoming.provenance.confidence > existing.provenance.confidence {
+            existing.value = incoming.value;
+            existing.summary = incoming.summary;
+            existing.provenance = incoming.provenance;
+        }
+    } else {
+        options.push(incoming);
     }
 }
 
@@ -425,6 +796,14 @@ fn command(
     effects: &[Effect],
     provenance: Provenance,
 ) -> CommandSpec {
+    let provenance = ProvenanceInfo::builtin(provenance);
+    let options = options
+        .into_iter()
+        .map(|mut option| {
+            option.provenance = provenance.clone();
+            option
+        })
+        .collect();
     CommandSpec {
         path: path.to_owned(),
         signature: signature.to_owned(),
@@ -462,6 +841,40 @@ mod tests {
     fn catalog_is_machine_readable() {
         let json = serde_json::to_string(&Catalog::builtin()).unwrap();
         assert!(json.contains("schema_version"));
+        assert!(json.contains("confidence"));
         assert!(json.contains("git commit"));
+    }
+
+    #[test]
+    fn imported_options_merge_without_overwriting_exact_builtin_facts() {
+        let mut catalog = Catalog::builtin();
+        let diagnostics = catalog.merge_report(import_fish(
+            "complete -c ls -l color -d 'Colorize output'",
+            "ls.fish",
+        ));
+        assert!(diagnostics.is_empty());
+        let command = catalog.find("ls").unwrap();
+        assert_eq!(command.provenance.source, Provenance::Builtin);
+        let color = command
+            .options
+            .iter()
+            .find(|option| option.names.contains(&"--color".to_owned()))
+            .unwrap();
+        assert_eq!(color.provenance.source, Provenance::Fish);
+    }
+
+    #[test]
+    fn explain_attributes_each_retained_fact() {
+        let mut catalog = Catalog::builtin();
+        catalog.merge_report(import_bash(
+            "complete -W '--frozen --locked' cargo",
+            "cargo.bash",
+        ));
+        let explanation = catalog.explain("cargo").unwrap();
+        assert!(explanation
+            .facts
+            .iter()
+            .any(|fact| fact.value == "--frozen" && fact.provenance.source == Provenance::Bash));
+        assert!(explanation.facts.iter().all(|fact| !fact.value.is_empty()));
     }
 }

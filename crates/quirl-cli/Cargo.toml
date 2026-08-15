@@ -20,7 +20,10 @@ quirl-catalog = { path = "../quirl-catalog" }
 quirl-core = { path = "../quirl-core" }
 quirl-data = { path = "../quirl-data" }
 quirl-lua = { path = "../quirl-lua" }
+quirl-picker = { path = "../quirl-picker" }
+quirl-process = { path = "../quirl-process" }
 quirl-syntax = { path = "../quirl-syntax" }
 quirl-ui = { path = "../quirl-ui" }
 reedline.workspace = true
+serde.workspace = true
 serde_json.workspace = true

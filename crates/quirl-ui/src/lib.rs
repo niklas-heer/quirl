@@ -5,21 +5,40 @@ use nu_ansi_term::{Color, Style};
 use quirl_catalog::Catalog;
 use quirl_core::ShellError;
 use quirl_lua::QuirlConfig;
+use quirl_picker::{ItemKind, PickItem, Picker};
 use quirl_syntax::Mode;
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
-    Completer, DefaultHinter, DefaultValidator, DescriptionMode, EditMode, Emacs, Helix,
-    Highlighter, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode,
-    PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Span, StyledText,
-    Suggestion, Vi,
+    Completer, DefaultHinter, DefaultValidator, DescriptionMode, EditCommand, EditMode, Emacs,
+    FileBackedHistory, Helix, Highlighter, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Prompt,
+    PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent,
+    Span, StyledText, Suggestion, Vi,
 };
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{mpsc, Arc, Condvar, Mutex},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// Opaque Reedline host command used to switch Quirl's interactive grammar.
+pub const MODE_TOGGLE_HOST_COMMAND: &str = "quirl:mode-toggle";
+
+const HISTORY_CAPACITY: usize = 50_000;
+const HISTORY_PICKER_PREFIX: &str = "\u{e000}history ";
+const FILE_PICKER_PREFIX: &str = "\u{e000}files ";
+const ACTION_PICKER_PREFIX: &str = "\u{e000}actions ";
+
+/// Maximum time native context work is allowed to consume on the editor thread.
+///
+/// Filesystem and Git inspection run on a persistent worker. This budget is still
+/// reported with every sample so callers can detect scheduling or lock contention.
+pub const PROMPT_FIRST_PAINT_BUDGET: Duration = Duration::from_millis(8);
 
 pub fn editor(catalog: Catalog) -> Reedline {
     editor_with_config(catalog, QuirlConfig::default())
@@ -46,9 +65,59 @@ pub fn editor_with_extensions_and_config(
     extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
     config: QuirlConfig,
 ) -> Reedline {
-    let completer = Box::new(CatalogCompleter::with_extensions(
+    configured_editor(catalog, extension_completer, config, None, Vec::new(), None)
+}
+
+/// Create an editor backed by a durable, newline-delimited history file.
+///
+/// Reopening an editor with the same path reloads the prior entries. Callers that
+/// rebuild the editor while it is live should call [`Reedline::sync_history`] first
+/// so the replacement observes the newest commands.
+pub fn editor_with_extensions_config_and_history(
+    catalog: Catalog,
+    extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
+    config: QuirlConfig,
+    history_path: PathBuf,
+) -> Result<Reedline, ShellError> {
+    let history =
+        FileBackedHistory::with_file(HISTORY_CAPACITY, history_path.clone()).map_err(|error| {
+            ShellError::new(
+                quirl_core::ErrorCode::Io,
+                format!("could not open history at {}", history_path.display()),
+            )
+            .with_context(error.to_string())
+            .with_help("Set QUIRL_HISTORY to a writable file path")
+        })?;
+    let history_items = fs::read_to_string(&history_path)
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .enumerate()
+        .map(|(index, line)| picker_item(index, ItemKind::History, line, "history"))
+        .collect();
+    Ok(configured_editor(
+        catalog,
+        extension_completer,
+        config,
+        Some(history),
+        history_items,
+        Some(history_path),
+    ))
+}
+
+fn configured_editor(
+    catalog: Catalog,
+    extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
+    config: QuirlConfig,
+    history: Option<FileBackedHistory>,
+    history_items: Vec<PickItem>,
+    history_path: Option<PathBuf>,
+) -> Reedline {
+    let completer = Box::new(CatalogCompleter::with_extensions_and_picker(
         catalog.clone(),
         extension_completer,
+        picker_sources(&catalog, history_items),
+        history_path,
     ));
     let completion_menu = Box::new(configured_completion_menu(&config));
     let mut line_editor = Reedline::create()
@@ -60,10 +129,46 @@ pub fn editor_with_extensions_and_config(
         .with_validator(Box::new(DefaultValidator))
         .with_edit_mode(configured_edit_mode(&config.editor.keymap))
         .with_quick_completions(false);
+    if let Some(history) = history {
+        line_editor = line_editor.with_history(Box::new(history));
+    }
     if config.editor.semantic_hints {
         line_editor = line_editor.with_highlighter(Box::new(SemanticHighlighter::new(catalog)));
     }
     line_editor
+}
+
+/// Resolve Quirl's history path from the process environment.
+///
+/// `QUIRL_HISTORY` wins, followed by `$XDG_STATE_HOME/quirl/history`, then
+/// `$HOME/.local/state/quirl/history`.
+pub fn history_path() -> Result<PathBuf, ShellError> {
+    resolve_history_path(
+        env::var_os("QUIRL_HISTORY"),
+        env::var_os("XDG_STATE_HOME"),
+        env::var_os("HOME"),
+    )
+    .ok_or_else(|| {
+        ShellError::new(
+            quirl_core::ErrorCode::Io,
+            "could not determine a durable history path",
+        )
+        .with_help("Set QUIRL_HISTORY to a writable file path")
+    })
+}
+
+fn resolve_history_path(
+    quirl_history: Option<OsString>,
+    xdg_state_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    non_empty_path(quirl_history)
+        .or_else(|| non_empty_path(xdg_state_home).map(|path| path.join("quirl/history")))
+        .or_else(|| non_empty_path(home).map(|path| path.join(".local/state/quirl/history")))
+}
+
+fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
 fn completion_menu_event() -> ReedlineEvent {
@@ -73,49 +178,76 @@ fn completion_menu_event() -> ReedlineEvent {
     ])
 }
 
+fn picker_menu_event(prefix: &str) -> ReedlineEvent {
+    ReedlineEvent::Multiple(vec![
+        ReedlineEvent::Edit(vec![
+            EditCommand::MoveToStart { select: false },
+            EditCommand::InsertString(prefix.to_owned()),
+        ]),
+        ReedlineEvent::Menu("completion_menu".to_owned()),
+        ReedlineEvent::MenuNext,
+    ])
+}
+
 fn configured_edit_mode(keymap: &str) -> Box<dyn EditMode> {
-    match keymap {
+    let (inner, complete_tab): (Box<dyn EditMode>, bool) = match keymap {
         "vim" => {
             let mut insert = default_vi_insert_keybindings();
             let mut normal = default_vi_normal_keybindings();
             insert.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
             normal.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
-            Box::new(Vi::new(insert, normal))
+            (Box::new(Vi::new(insert, normal)), false)
         }
-        "helix" => Box::new(QuirlHelix::default()),
+        "helix" => (Box::<Helix>::default(), true),
         // Config validation rejects other values. Keep this fallback for direct Rust callers.
         "emacs" => {
             let mut keybindings = default_emacs_keybindings();
             keybindings.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
-            Box::new(Emacs::new(keybindings))
+            (Box::new(Emacs::new(keybindings)), false)
         }
         _ => {
             let mut keybindings = default_emacs_keybindings();
             keybindings.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
-            Box::new(Emacs::new(keybindings))
+            (Box::new(Emacs::new(keybindings)), false)
         }
-    }
+    };
+    Box::new(QuirlEditMode {
+        inner,
+        complete_tab,
+    })
 }
 
-/// Reedline's native Helix mode intentionally owns its modal editing behavior,
-/// but does not bind Tab to a completion menu. Keep that product-level binding
-/// at Quirl's editor boundary and delegate every other event unchanged.
-#[derive(Default)]
-struct QuirlHelix {
-    inner: Helix,
+/// Add Quirl-wide shortcuts without replacing Reedline's keymap implementations.
+struct QuirlEditMode {
+    inner: Box<dyn EditMode>,
+    complete_tab: bool,
 }
 
-impl EditMode for QuirlHelix {
+impl EditMode for QuirlEditMode {
     fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
         let event: Event = event.into();
-        if matches!(
-            event,
-            Event::Key(KeyEvent {
-                code: KeyCode::Tab,
-                modifiers: KeyModifiers::NONE,
-                ..
-            })
-        ) {
+        if is_mode_toggle(&event) {
+            return ReedlineEvent::ExecuteHostCommand(MODE_TOGGLE_HOST_COMMAND.to_owned());
+        }
+        if is_history_search(&event) {
+            return picker_menu_event(HISTORY_PICKER_PREFIX);
+        }
+        if is_file_picker(&event) {
+            return picker_menu_event(FILE_PICKER_PREFIX);
+        }
+        if is_action_picker(&event) {
+            return picker_menu_event(ACTION_PICKER_PREFIX);
+        }
+        if self.complete_tab
+            && matches!(
+                event,
+                Event::Key(KeyEvent {
+                    code: KeyCode::Tab,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                })
+            )
+        {
             return completion_menu_event();
         }
         let Ok(event) = ReedlineRawEvent::try_from(event) else {
@@ -128,6 +260,55 @@ impl EditMode for QuirlHelix {
     fn edit_mode(&self) -> PromptEditMode {
         self.inner.edit_mode()
     }
+}
+
+fn is_mode_toggle(event: &Event) -> bool {
+    match event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) => true,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('\0'),
+            modifiers,
+            ..
+        }) => matches!(*modifiers, KeyModifiers::NONE | KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+fn is_history_search(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('r'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        })
+    )
+}
+
+fn is_file_picker(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('t'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        })
+    )
+}
+
+fn is_action_picker(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('k'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        })
+    )
 }
 
 fn configured_completion_menu(config: &QuirlConfig) -> IdeMenu {
@@ -153,12 +334,362 @@ fn configured_completion_menu(config: &QuirlConfig) -> IdeMenu {
     }
 }
 
+/// Native prompt values collected without running a shell command.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NativePromptContext {
+    pub directory: String,
+    pub git_branch: Option<String>,
+    pub git_state: Option<String>,
+}
+
+/// Instrumentation for one non-blocking native prompt context lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PromptTimingSample {
+    pub elapsed: Duration,
+    pub budget: Duration,
+    pub cache_hit: bool,
+    /// The returned value was usable but a newer value is being collected.
+    pub stale: bool,
+    pub refresh_started: bool,
+}
+
+impl PromptTimingSample {
+    pub fn within_budget(self) -> bool {
+        self.elapsed <= self.budget
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptContextSample {
+    pub context: NativePromptContext,
+    pub timing: PromptTimingSample,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileStamp {
+    modified_nanos: Option<u128>,
+    len: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WorktreeStamp {
+    newest_modified_nanos: Option<u128>,
+    files: u64,
+    total_len: u64,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptDependencies {
+    git_dir: Option<PathBuf>,
+    head: Option<String>,
+    head_ref: Option<FileStamp>,
+    packed_refs: Option<FileStamp>,
+    index: Option<FileStamp>,
+    merge_head: Option<FileStamp>,
+    rebase_merge: bool,
+    rebase_apply: bool,
+    worktree: WorktreeStamp,
+}
+
+#[derive(Clone, Debug)]
+struct PromptCacheEntry {
+    context: NativePromptContext,
+    dependencies: PromptDependencies,
+}
+
+#[derive(Default)]
+struct PromptSchedulerState {
+    entries: HashMap<PathBuf, PromptCacheEntry>,
+    in_flight: HashSet<PathBuf>,
+    refresh_generation: u64,
+}
+
+struct PromptSchedulerShared {
+    state: Mutex<PromptSchedulerState>,
+    refreshed: Condvar,
+}
+
+struct RefreshRequest {
+    cwd: PathBuf,
+    previous: Option<PromptCacheEntry>,
+}
+
+type PromptContextLoader =
+    dyn Fn(PathBuf, Option<PromptCacheEntry>) -> PromptCacheEntry + Send + Sync + 'static;
+
+/// A stale-while-refresh cache for native prompt context.
+///
+/// `sample` never waits for filesystem or Git work. On a cold lookup it returns the
+/// directory immediately; on later lookups it returns the last completed snapshot
+/// while one persistent worker validates the cwd and `.git` dependencies.
+pub struct PromptContextScheduler {
+    shared: Arc<PromptSchedulerShared>,
+    requests: Option<mpsc::Sender<RefreshRequest>>,
+    worker: Option<JoinHandle<()>>,
+    first_paint_budget: Duration,
+}
+
+impl Default for PromptContextScheduler {
+    fn default() -> Self {
+        Self::new(PROMPT_FIRST_PAINT_BUDGET)
+    }
+}
+
+impl PromptContextScheduler {
+    pub fn new(first_paint_budget: Duration) -> Self {
+        Self::with_context_loader(first_paint_budget, Arc::new(load_prompt_context))
+    }
+
+    fn with_context_loader(first_paint_budget: Duration, loader: Arc<PromptContextLoader>) -> Self {
+        let shared = Arc::new(PromptSchedulerShared {
+            state: Mutex::new(PromptSchedulerState::default()),
+            refreshed: Condvar::new(),
+        });
+        let (requests, receiver) = mpsc::channel::<RefreshRequest>();
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::Builder::new()
+            .name("quirl-prompt-context".to_owned())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    let entry = loader(request.cwd.clone(), request.previous);
+                    let mut state = lock_recover(&worker_shared.state);
+                    state.entries.insert(request.cwd.clone(), entry);
+                    state.in_flight.remove(&request.cwd);
+                    state.refresh_generation = state.refresh_generation.wrapping_add(1);
+                    worker_shared.refreshed.notify_all();
+                }
+            })
+            .ok();
+        Self {
+            shared,
+            requests: Some(requests),
+            worker,
+            first_paint_budget,
+        }
+    }
+
+    pub fn sample_current_dir(&self) -> PromptContextSample {
+        let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        self.sample(&cwd)
+    }
+
+    pub fn sample(&self, cwd: &Path) -> PromptContextSample {
+        let started = Instant::now();
+        let cwd = cwd.to_path_buf();
+        let directory = display_directory(&cwd);
+        let (context, cache_hit, refresh_started, request) = {
+            let mut state = lock_recover(&self.shared.state);
+            let cached = state.entries.get(&cwd).cloned();
+            let cache_hit = cached.is_some();
+            let context = cached
+                .as_ref()
+                .map(|entry| entry.context.clone())
+                .unwrap_or(NativePromptContext {
+                    directory,
+                    ..NativePromptContext::default()
+                });
+            let refresh_started = state.in_flight.insert(cwd.clone());
+            let request = refresh_started.then_some(RefreshRequest {
+                cwd: cwd.clone(),
+                previous: cached,
+            });
+            (context, cache_hit, refresh_started, request)
+        };
+
+        if let Some(request) = request {
+            let sent = self
+                .requests
+                .as_ref()
+                .is_some_and(|requests| requests.send(request).is_ok());
+            if !sent {
+                lock_recover(&self.shared.state).in_flight.remove(&cwd);
+            }
+        }
+
+        PromptContextSample {
+            context,
+            timing: PromptTimingSample {
+                elapsed: started.elapsed(),
+                budget: self.first_paint_budget,
+                cache_hit,
+                stale: cache_hit && refresh_started,
+                refresh_started,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_until_idle(&self, timeout: Duration) -> bool {
+        let state = lock_recover(&self.shared.state);
+        if state.in_flight.is_empty() {
+            return true;
+        }
+        let waited = self
+            .shared
+            .refreshed
+            .wait_timeout_while(state, timeout, |state| !state.in_flight.is_empty());
+        match waited {
+            Ok((state, _)) => state.in_flight.is_empty(),
+            Err(poisoned) => poisoned.into_inner().0.in_flight.is_empty(),
+        }
+    }
+}
+
+impl Drop for PromptContextScheduler {
+    fn drop(&mut self) {
+        self.requests.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+const MAX_PROMPT_WORKTREE_ENTRIES: usize = 4_096;
+
+fn load_prompt_context(cwd: PathBuf, previous: Option<PromptCacheEntry>) -> PromptCacheEntry {
+    let git_dir = cwd.ancestors().find_map(resolve_git_dir);
+    let head = git_dir
+        .as_ref()
+        .and_then(|git_dir| fs::read_to_string(git_dir.join("HEAD")).ok())
+        .map(|head| head.trim().to_owned());
+    let worktree = scan_worktree(&cwd);
+    let dependencies = PromptDependencies {
+        head_ref: git_dir.as_ref().and_then(|git_dir| {
+            head.as_deref()
+                .and_then(|head| head.strip_prefix("ref: "))
+                .and_then(|head_ref| file_stamp(&git_dir.join(head_ref)))
+        }),
+        packed_refs: git_dir
+            .as_ref()
+            .and_then(|git_dir| file_stamp(&git_dir.join("packed-refs"))),
+        index: git_dir
+            .as_ref()
+            .and_then(|git_dir| file_stamp(&git_dir.join("index"))),
+        merge_head: git_dir
+            .as_ref()
+            .and_then(|git_dir| file_stamp(&git_dir.join("MERGE_HEAD"))),
+        rebase_merge: git_dir
+            .as_ref()
+            .is_some_and(|git_dir| git_dir.join("rebase-merge").is_dir()),
+        rebase_apply: git_dir
+            .as_ref()
+            .is_some_and(|git_dir| git_dir.join("rebase-apply").is_dir()),
+        git_dir: git_dir.clone(),
+        head: head.clone(),
+        worktree,
+    };
+
+    if let Some(mut previous) = previous.filter(|entry| entry.dependencies == dependencies) {
+        previous.context.directory = display_directory(&cwd);
+        return previous;
+    }
+
+    let git_branch = head.as_deref().map(|head| {
+        head.strip_prefix("ref: refs/heads/")
+            .map(str::to_owned)
+            .unwrap_or_else(|| head.chars().take(8).collect())
+    });
+    let git_state = git_dir
+        .as_ref()
+        .and_then(|_| render_native_git_state(&dependencies));
+    PromptCacheEntry {
+        context: NativePromptContext {
+            directory: display_directory(&cwd),
+            git_branch,
+            git_state,
+        },
+        dependencies,
+    }
+}
+
+fn display_directory(cwd: &Path) -> String {
+    cwd.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "/".to_owned())
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(FileStamp {
+        modified_nanos: metadata.modified().ok().and_then(system_time_nanos),
+        len: metadata.len(),
+    })
+}
+
+fn system_time_nanos(time: SystemTime) -> Option<u128> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|time| time.as_nanos())
+}
+
+fn scan_worktree(root: &Path) -> WorktreeStamp {
+    let mut stamp = WorktreeStamp::default();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if stamp.files as usize >= MAX_PROMPT_WORKTREE_ENTRIES {
+                stamp.truncated = true;
+                return stamp;
+            }
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else {
+                stamp.files = stamp.files.saturating_add(1);
+                stamp.total_len = stamp.total_len.saturating_add(metadata.len());
+                if let Some(modified) = metadata.modified().ok().and_then(system_time_nanos) {
+                    stamp.newest_modified_nanos = Some(
+                        stamp
+                            .newest_modified_nanos
+                            .map_or(modified, |newest| newest.max(modified)),
+                    );
+                }
+            }
+        }
+    }
+    stamp
+}
+
+fn render_native_git_state(dependencies: &PromptDependencies) -> Option<String> {
+    if dependencies.rebase_merge || dependencies.rebase_apply {
+        return Some("rebasing".to_owned());
+    }
+    if dependencies.merge_head.is_some() {
+        return Some("merging".to_owned());
+    }
+    let index_modified = dependencies.index.as_ref()?.modified_nanos?;
+    dependencies
+        .worktree
+        .newest_modified_nanos
+        .filter(|modified| *modified > index_modified)
+        .map(|_| "dirty".to_owned())
+}
+
 #[derive(Clone)]
 pub struct QuirlPrompt {
     mode: Mode,
     cwd: String,
     git_branch: Option<String>,
+    git_state: Option<String>,
     status: Option<i32>,
+    jobs: usize,
     duration: Option<Duration>,
     extension_segments: Vec<String>,
     configured_left: Option<Vec<String>>,
@@ -170,18 +701,16 @@ impl QuirlPrompt {
     pub fn new(mode: Mode) -> Self {
         let cwd_path = env::current_dir().ok();
         let cwd = cwd_path
-            .as_ref()
-            .and_then(|path| {
-                path.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .filter(|name| !name.is_empty())
+            .as_deref()
+            .map(display_directory)
             .unwrap_or_else(|| "/".to_owned());
         Self {
             mode,
             cwd,
-            git_branch: cwd_path.as_deref().and_then(read_git_branch),
+            git_branch: None,
+            git_state: None,
             status: None,
+            jobs: 0,
             duration: None,
             extension_segments: Vec::new(),
             configured_left: None,
@@ -207,9 +736,23 @@ impl QuirlPrompt {
         self
     }
 
+    /// Apply a snapshot returned by [`PromptContextScheduler`].
+    pub fn with_native_context(mut self, context: NativePromptContext) -> Self {
+        self.cwd = context.directory;
+        self.git_branch = context.git_branch;
+        self.git_state = context.git_state;
+        self
+    }
+
     /// Set the exit status that can be rendered by the configured `status` segment.
     pub fn with_status(mut self, status: i32) -> Self {
         self.status = Some(status);
+        self
+    }
+
+    /// Set the number of active background jobs for the configured `jobs` segment.
+    pub fn with_jobs(mut self, jobs: usize) -> Self {
+        self.jobs = jobs;
         self
     }
 
@@ -247,8 +790,8 @@ impl QuirlPrompt {
                     .filter(|status| *status != 0)
                     .map(|status| format!("status:{status}")),
                 "duration" => self.duration.map(format_duration),
-                // Job control and a cheap dirty-worktree signal land in Phase 1.
-                "jobs" | "git_state" => None,
+                "jobs" => (self.jobs > 0).then(|| format!("jobs:{}", self.jobs)),
+                "git_state" => self.git_state.as_ref().map(|state| format!("git:{state}")),
                 _ => self.named_extension_segments.get(name).cloned(),
             })
             .collect::<Vec<_>>()
@@ -264,17 +807,6 @@ fn format_duration(duration: Duration) -> String {
     } else {
         format!("{}µs", duration.as_micros())
     }
-}
-
-fn read_git_branch(cwd: &Path) -> Option<String> {
-    let git_dir = cwd.ancestors().find_map(resolve_git_dir)?;
-    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head = head.trim();
-    Some(
-        head.strip_prefix("ref: refs/heads/")
-            .map(str::to_owned)
-            .unwrap_or_else(|| head.chars().take(8).collect()),
-    )
 }
 
 fn resolve_git_dir(directory: &Path) -> Option<PathBuf> {
@@ -312,7 +844,14 @@ impl Prompt for QuirlPrompt {
     }
 
     fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
-        Cow::Owned(format!("{} ", self.mode.prompt()))
+        if env::var("TERM").is_ok_and(|term| term == "dumb") {
+            Cow::Owned(match self.mode {
+                Mode::Command => "> ".to_owned(),
+                Mode::Data => "data> ".to_owned(),
+            })
+        } else {
+            Cow::Owned(format!("{} ", self.mode.prompt()))
+        }
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
@@ -334,6 +873,8 @@ impl Prompt for QuirlPrompt {
 pub struct CatalogCompleter {
     catalog: Catalog,
     extensions: Option<Box<dyn ExtensionCompleter + Send>>,
+    picker_items: Vec<PickItem>,
+    history_path: Option<PathBuf>,
 }
 
 impl CatalogCompleter {
@@ -341,6 +882,8 @@ impl CatalogCompleter {
         Self {
             catalog,
             extensions: None,
+            picker_items: Vec::new(),
+            history_path: None,
         }
     }
 
@@ -351,6 +894,22 @@ impl CatalogCompleter {
         Self {
             catalog,
             extensions,
+            picker_items: Vec::new(),
+            history_path: None,
+        }
+    }
+
+    fn with_extensions_and_picker(
+        catalog: Catalog,
+        extensions: Option<Box<dyn ExtensionCompleter + Send>>,
+        picker_items: Vec<PickItem>,
+        history_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            catalog,
+            extensions,
+            picker_items,
+            history_path,
         }
     }
 }
@@ -371,6 +930,36 @@ pub trait ExtensionCompleter {
 
 impl Completer for CatalogCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+        if let Some((kind, prefix)) = picker_context(line) {
+            let query = line
+                .get(prefix.len()..pos.min(line.len()))
+                .unwrap_or_default();
+            let refreshed_history = (kind == ItemKind::History)
+                .then(|| {
+                    self.history_path
+                        .as_deref()
+                        .and_then(read_history_picker_items)
+                })
+                .flatten();
+            let picker_items = refreshed_history.as_ref().unwrap_or(&self.picker_items);
+            return Picker
+                .rank(picker_items, query)
+                .into_iter()
+                .filter_map(|matched| {
+                    let item = &picker_items[matched.index];
+                    (item.kind == kind).then(|| Suggestion {
+                        value: item.value.as_str().unwrap_or(&item.label).to_owned(),
+                        display_override: Some(item.label.clone()),
+                        description: Some(item.description.clone()),
+                        extra: item.preview.clone().map(|preview| vec![preview]),
+                        span: Span::new(0, pos),
+                        append_whitespace: false,
+                        match_indices: Some(matched.match_indices),
+                        ..Suggestion::default()
+                    })
+                })
+                .collect();
+        }
         let mut suggestions = self
             .catalog
             .complete(line, pos)
@@ -405,6 +994,82 @@ impl Completer for CatalogCompleter {
         let mut seen = HashSet::new();
         suggestions.retain(|suggestion| seen.insert(suggestion.value.clone()));
         suggestions
+    }
+}
+
+fn read_history_picker_items(path: &Path) -> Option<Vec<PickItem>> {
+    let source = fs::read_to_string(path).ok()?;
+    Some(
+        source
+            .lines()
+            .rev()
+            .enumerate()
+            .map(|(index, line)| picker_item(index, ItemKind::History, line, "history"))
+            .collect(),
+    )
+}
+
+fn picker_context(line: &str) -> Option<(ItemKind, &str)> {
+    [
+        (ItemKind::History, HISTORY_PICKER_PREFIX),
+        (ItemKind::File, FILE_PICKER_PREFIX),
+        (ItemKind::Action, ACTION_PICKER_PREFIX),
+    ]
+    .into_iter()
+    .find(|(_, prefix)| line.starts_with(prefix))
+}
+
+fn picker_sources(catalog: &Catalog, mut items: Vec<PickItem>) -> Vec<PickItem> {
+    let next_id = items.len();
+    items.extend(
+        catalog
+            .commands
+            .iter()
+            .enumerate()
+            .map(|(index, command)| PickItem {
+                id: format!("action-{}", next_id + index),
+                kind: ItemKind::Action,
+                label: command.path.clone(),
+                description: command.summary.clone(),
+                preview: Some(command.details.clone()),
+                value: serde_json::Value::String(command.path.clone()),
+            }),
+    );
+    let next_id = items.len();
+    if let Ok(entries) = fs::read_dir(".") {
+        items.extend(
+            entries
+                .filter_map(Result::ok)
+                .enumerate()
+                .map(|(index, entry)| {
+                    let path = entry.path();
+                    let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+                    PickItem {
+                        id: format!("file-{}", next_id + index),
+                        kind: ItemKind::File,
+                        label: path.to_string_lossy().into_owned(),
+                        description: if is_directory {
+                            "directory".to_owned()
+                        } else {
+                            "file".to_owned()
+                        },
+                        preview: None,
+                        value: serde_json::Value::String(path.to_string_lossy().into_owned()),
+                    }
+                }),
+        );
+    }
+    items
+}
+
+fn picker_item(index: usize, kind: ItemKind, value: &str, description: &str) -> PickItem {
+    PickItem {
+        id: format!("{kind:?}-{index}"),
+        kind,
+        label: value.to_owned(),
+        description: description.to_owned(),
+        preview: None,
+        value: serde_json::Value::String(value.to_owned()),
     }
 }
 
@@ -480,8 +1145,15 @@ pub fn render_error(error: &ShellError, color: bool) -> String {
     let mut rendered = format!("{heading}: {}\n", error.message);
     for label in &error.details.labels {
         let source = label.source.as_deref().unwrap_or("input");
-        rendered.push_str(&format!("  ╭─[{source}:{}..{}]\n", label.start, label.end));
-        rendered.push_str(&format!("  ╰─ {}\n", label.message));
+        if color {
+            rendered.push_str(&format!("  ╭─[{source}:{}..{}]\n", label.start, label.end));
+            rendered.push_str(&format!("  ╰─ {}\n", label.message));
+        } else {
+            rendered.push_str(&format!(
+                "  at {source}:{}..{}: {}\n",
+                label.start, label.end, label.message
+            ));
+        }
     }
     for context in &error.details.context {
         rendered.push_str(&format!("  caused by: {context}\n"));
@@ -502,6 +1174,7 @@ mod tests {
     use super::*;
     use quirl_core::ErrorCode;
     use quirl_lua::{EditorConfig, PickerConfig, PromptConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct ExampleExtension;
 
@@ -617,6 +1290,148 @@ mod tests {
     }
 
     #[test]
+    fn prompt_jobs_segment_only_renders_active_jobs() {
+        let config = QuirlConfig {
+            prompt: PromptConfig {
+                left: Vec::new(),
+                right: vec!["jobs".to_owned()],
+            },
+            ..QuirlConfig::default()
+        };
+        assert_eq!(
+            QuirlPrompt::with_config(Mode::Command, &config).render_prompt_right(),
+            ""
+        );
+        assert_eq!(
+            QuirlPrompt::with_config(Mode::Command, &config)
+                .with_jobs(2)
+                .render_prompt_right(),
+            "jobs:2"
+        );
+    }
+
+    fn test_prompt_entry(cwd: &Path, branch: &str, state: Option<&str>) -> PromptCacheEntry {
+        PromptCacheEntry {
+            context: NativePromptContext {
+                directory: display_directory(cwd),
+                git_branch: Some(branch.to_owned()),
+                git_state: state.map(str::to_owned),
+            },
+            dependencies: PromptDependencies {
+                git_dir: None,
+                head: Some(branch.to_owned()),
+                head_ref: None,
+                packed_refs: None,
+                index: None,
+                merge_head: None,
+                rebase_merge: false,
+                rebase_apply: false,
+                worktree: WorktreeStamp::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn cold_prompt_sample_does_not_wait_for_slow_git_refresh() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let (started_tx, started_rx) = mpsc::channel();
+        let loader = Arc::new(move |cwd: PathBuf, _previous: Option<PromptCacheEntry>| {
+            let _ = started_tx.send(());
+            let (lock, ready) = &*worker_gate;
+            let mut released = lock_recover(lock);
+            while !*released {
+                released = match ready.wait(released) {
+                    Ok(released) => released,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+            test_prompt_entry(&cwd, "main", None)
+        });
+        let scheduler =
+            PromptContextScheduler::with_context_loader(Duration::from_millis(250), loader);
+
+        let sample = scheduler.sample(Path::new("/tmp/quirl-first-paint"));
+        assert_eq!(sample.context.directory, "quirl-first-paint");
+        assert!(!sample.timing.cache_hit);
+        assert!(sample.timing.refresh_started);
+        assert!(sample.timing.within_budget());
+        assert!(started_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+
+        let (lock, ready) = &*gate;
+        *lock_recover(lock) = true;
+        ready.notify_all();
+        assert!(scheduler.wait_until_idle(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn cached_prompt_is_returned_stale_while_dependencies_refresh() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresh_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let loader_calls = Arc::clone(&calls);
+        let loader_gate = Arc::clone(&refresh_gate);
+        let loader = Arc::new(move |cwd: PathBuf, _previous: Option<PromptCacheEntry>| {
+            let call = loader_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 1 {
+                let (lock, ready) = &*loader_gate;
+                let mut released = lock_recover(lock);
+                while !*released {
+                    released = match ready.wait(released) {
+                        Ok(released) => released,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                }
+            }
+            test_prompt_entry(&cwd, if call == 0 { "main" } else { "topic" }, None)
+        });
+        let scheduler =
+            PromptContextScheduler::with_context_loader(Duration::from_millis(250), loader);
+        let cwd = Path::new("/tmp/quirl-stale-cache");
+
+        let _cold = scheduler.sample(cwd);
+        assert!(scheduler.wait_until_idle(Duration::from_secs(1)));
+        let stale = scheduler.sample(cwd);
+        assert_eq!(stale.context.git_branch.as_deref(), Some("main"));
+        assert!(stale.timing.cache_hit);
+        assert!(stale.timing.stale);
+
+        let (lock, ready) = &*refresh_gate;
+        *lock_recover(lock) = true;
+        ready.notify_all();
+        assert!(scheduler.wait_until_idle(Duration::from_secs(1)));
+        let refreshed = scheduler.sample(cwd);
+        assert_eq!(refreshed.context.git_branch.as_deref(), Some("topic"));
+    }
+
+    #[test]
+    fn git_state_renders_in_configured_order_with_extension_segments() {
+        let config = QuirlConfig {
+            prompt: PromptConfig {
+                left: vec![
+                    "directory".to_owned(),
+                    "git_branch".to_owned(),
+                    "git_state".to_owned(),
+                    "project".to_owned(),
+                ],
+                right: Vec::new(),
+            },
+            ..QuirlConfig::default()
+        };
+        let prompt = QuirlPrompt::with_config(Mode::Command, &config)
+            .with_native_context(NativePromptContext {
+                directory: "quirl".to_owned(),
+                git_branch: Some("main".to_owned()),
+                git_state: Some("dirty".to_owned()),
+            })
+            .with_named_extension_segments(vec![("project".to_owned(), "nsh".to_owned())]);
+
+        assert_eq!(
+            prompt.render_prompt_left(),
+            "quirl · git:main · git:dirty · nsh "
+        );
+    }
+
+    #[test]
     fn editor_accepts_all_configured_keymaps_and_picker_options() {
         for keymap in ["emacs", "vim", "helix"] {
             let config = QuirlConfig {
@@ -643,8 +1458,120 @@ mod tests {
         let event =
             ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
                 .unwrap();
-        let mut helix = QuirlHelix::default();
+        let mut helix = configured_edit_mode("helix");
 
         assert_eq!(helix.parse_event(event), completion_menu_event());
+    }
+
+    #[test]
+    fn every_keymap_exposes_mode_toggle_and_history_search() {
+        for keymap in ["emacs", "vim", "helix"] {
+            let mut edit_mode = configured_edit_mode(keymap);
+            let toggle = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+                KeyCode::Char(' '),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+            assert_eq!(
+                edit_mode.parse_event(toggle),
+                ReedlineEvent::ExecuteHostCommand(MODE_TOGGLE_HOST_COMMAND.to_owned()),
+                "mode toggle in {keymap} keymap"
+            );
+
+            let search = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+            assert_eq!(
+                edit_mode.parse_event(search),
+                picker_menu_event(HISTORY_PICKER_PREFIX),
+                "history search in {keymap} keymap"
+            );
+
+            for (key, prefix) in [('t', FILE_PICKER_PREFIX), ('k', ACTION_PICKER_PREFIX)] {
+                let picker = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+                    KeyCode::Char(key),
+                    KeyModifiers::CONTROL,
+                )))
+                .unwrap();
+                assert_eq!(edit_mode.parse_event(picker), picker_menu_event(prefix));
+            }
+        }
+    }
+
+    #[test]
+    fn typed_picker_completer_returns_original_values() {
+        let items = vec![
+            picker_item(0, ItemKind::History, "cargo test --workspace", "history"),
+            picker_item(1, ItemKind::File, "crates/quirl-ui/src/lib.rs", "file"),
+            picker_item(2, ItemKind::Action, "mode data", "action"),
+        ];
+        let mut completer =
+            CatalogCompleter::with_extensions_and_picker(Catalog::builtin(), None, items, None);
+        let line = format!("{HISTORY_PICKER_PREFIX}cts");
+        let suggestions = completer.complete(&line, line.len());
+        assert_eq!(suggestions[0].value, "cargo test --workspace");
+        assert_eq!(suggestions[0].span, Span::new(0, line.len()));
+    }
+
+    #[test]
+    fn history_path_prefers_explicit_then_xdg_then_home() {
+        assert_eq!(
+            resolve_history_path(
+                Some(OsString::from("/tmp/explicit-history")),
+                Some(OsString::from("/tmp/state")),
+                Some(OsString::from("/tmp/home")),
+            ),
+            Some(PathBuf::from("/tmp/explicit-history"))
+        );
+        assert_eq!(
+            resolve_history_path(
+                None,
+                Some(OsString::from("/tmp/state")),
+                Some(OsString::from("/tmp/home")),
+            ),
+            Some(PathBuf::from("/tmp/state/quirl/history"))
+        );
+        assert_eq!(
+            resolve_history_path(None, None, Some(OsString::from("/tmp/home"))),
+            Some(PathBuf::from("/tmp/home/.local/state/quirl/history"))
+        );
+    }
+
+    #[test]
+    fn durable_history_survives_editor_rebuilds() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            env::temp_dir().join(format!("quirl-ui-history-{}-{unique}", std::process::id()));
+        let history_path = directory.join("history");
+        let mut first = editor_with_extensions_config_and_history(
+            Catalog::builtin(),
+            None,
+            QuirlConfig::default(),
+            history_path.clone(),
+        )
+        .unwrap();
+        first
+            .history_mut()
+            .save(reedline::HistoryItem::from_command_line("echo durable"))
+            .unwrap();
+        first.sync_history().unwrap();
+
+        let second = editor_with_extensions_config_and_history(
+            Catalog::builtin(),
+            None,
+            QuirlConfig::default(),
+            history_path,
+        )
+        .unwrap();
+        assert_eq!(second.history().count_all().unwrap(), 1);
+
+        drop(first);
+        drop(second);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

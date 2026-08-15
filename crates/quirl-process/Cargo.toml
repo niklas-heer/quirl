@@ -1,0 +1,18 @@
+[package]
+name = "quirl-process"
+description = "Native command graph execution and job lifecycle for Quirl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nix.workspace = true
+os_pipe.workspace = true
+quirl-core = { path = "../quirl-core" }
+quirl-syntax = { path = "../quirl-syntax" }
+serde.workspace = true
