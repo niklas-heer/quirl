@@ -6,7 +6,8 @@ project-specific rules that generic Rust knowledge won't give you.
 
 ## Architecture: respect the layering
 
-Dependency direction is strict and one-way:
+Dependency direction is strict and one-way, codified in
+[ADR 0002](docs/decisions/0002-crate-layering.md):
 
 - Foundation crates — `quirl-core`, `quirl-catalog`, `quirl-syntax` — depend
   only on serde-level libraries. They must never depend on `quirl-ui`,
@@ -32,8 +33,9 @@ derives `Serialize` so `--format json` works for free.
 - Every error must render well both as JSON and through
   `quirl_ui::render_error`. Write the `help` text; a diagnostic without a
   suggested fix is half done.
-- `panic!`/`unwrap` are for genuine invariants and tests only. `expect` with a
-  reason is acceptable for mutex poisoning.
+- `clippy::unwrap_used` and `clippy::expect_used` are denied by workspace
+  lints (tests are exempt via `clippy.toml`). Rare true invariants such as
+  mutex poisoning may carry a targeted `#[allow]` with a reason.
 
 ## The Lua boundary is a security boundary
 
@@ -53,8 +55,9 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
 
 - The Lua SDK (LuaLS stubs, JSON schema, Markdown docs) is generated from the
   single `HOST_API` table in `quirl-lua`. To change the host API, edit
-  `HOST_API`, then regenerate `docs/quirl.lua` (a test asserts the checked-in
-  file matches `sdk_lua()` exactly). Never hand-edit `docs/quirl.lua`.
+  `HOST_API`, then run `mask sdk` to regenerate `docs/quirl.lua` (a test
+  asserts the checked-in file matches `sdk_lua()` exactly). Never hand-edit
+  `docs/quirl.lua`.
 - Command metadata (help, completions, docs, AI export) comes from
   `Catalog::builtin()` in `quirl-catalog`. New commands and flags are added
   there once — never hardcode help strings or completion lists elsewhere.
@@ -79,9 +82,9 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
   separate `tests/` directories. Follow that pattern.
 - Name tests as behavior sentences in snake_case, e.g.
   `instruction_budget_stops_runaway_code`.
-- Run `cargo test` for the workspace, plus
-  `cargo run -p quirl-cli -- test examples/lua_tests.lua` for guest-side Lua
-  tests when touching the Lua runtime or SDK.
+- `mask test` runs the workspace tests plus the guest-side Lua tests
+  (`cargo run -p quirl-cli -- test examples/lua_tests.lua`); run it for any
+  change touching the Lua runtime or SDK.
 - Sandbox changes need adversarial tests: prove the budget, limit, or
   restriction actually trips.
 
@@ -94,7 +97,10 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
   present tense, optionally scoped, e.g. `feat(lua): add completion budgets`.
 - Significant design choices go through an ADR in `docs/decisions/`.
   ADR 0001 is the standing contract: Lua is the only extension language,
-  Rust validates everything at the boundary.
+  Rust validates everything at the boundary. ADR 0002 fixes the crate
+  dependency graph. `docs/language-design.md` is the product specification;
+  its §13 delivery sequence and acceptance gates define what each phase
+  must prove.
 - Quirl is a prototype moving fast: prefer extending the existing patterns
   (`ShellError`, `HOST_API`, `Catalog::builtin`, `LuaPolicy`) over inventing
   parallel mechanisms. Breaking changes are fine; drift is not.

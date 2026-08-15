@@ -86,9 +86,10 @@ Build one vertical slice and remove the existing prototype runtime:
    slice, returning the same terminal and JSON diagnostics.
 5. Prove restricted module loading, capability denial, cancellation, instruction
    and memory budgets, last-known-good config reload, and useful stack traces.
-6. Record cold start, reload latency, host-call latency, binary delta, and peak RSS
-   in CI. The existing Lua footprint result is the baseline, not the acceptance
-   result for the complete SDK.
+6. Record cold start, reload latency, host-call latency, binary delta, and peak
+   RSS as part of the local quality gate (the project deliberately runs without
+   CI for now). The existing Lua footprint result is the baseline, not the
+   acceptance result for the complete SDK.
 
 The slice is accepted when one documented Lua API powers configuration, a script,
 and a plugin; editor completion and hover work from generated metadata; invalid

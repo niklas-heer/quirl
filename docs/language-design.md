@@ -9,7 +9,7 @@ Quirl combines familiar Bash/Zsh command entry, typed data pipelines, Rust perfo
 **Status:** Draft 0.9 · Complete toolkit · Semantic completions · Native fuzzy picker · Lua 5.4 selected · Rust implementation
 
 ```text
-quirl · ~/src/payments                         command · git: feature/typed-runners · rust 1.90
+quirl · ~/src/payments                         command · git: feature/typed-runners · rust 1.88
 > quirl run deploy.lua --env staging
   hint: incomplete value; Tab accepts `staging` declared by deploy.lua:12
 ◆ ls services | where status == "degraded" | preview
@@ -620,7 +620,7 @@ The parser boundary preserves compatibility without leaking it into the value ru
 
 | Principle | Implication |
 | --- | --- |
-| Rust core | Candidate boundaries: `quirl-syntax`, `quirl-catalog`, `quirl-compat`, `quirl-plan`, `quirl-runtime`, `quirl-process`, `quirl-builtins`, `quirl-picker`, `quirl-ui`, `quirl-config`, `quirl-docs`, `quirl-plugin`, `quirl-extension`, `quirl-lsp`. |
+| Rust core | Implemented boundaries ([ADR 0002](decisions/0002-crate-layering.md)): foundations `quirl-core`, `quirl-catalog`, `quirl-syntax`; `quirl-data` and `quirl-lua` on core only; `quirl-ui`; `quirl-cli` as sole composition root. Candidate crates as the surface grows: `quirl-compat`, `quirl-plan`, `quirl-process`, `quirl-picker`, `quirl-config`, `quirl-docs`, `quirl-plugin`, `quirl-lsp`. Adding a layer or inverting an edge requires a new ADR. |
 | Conch lesson | Compatibility and data ASTs lower to executor interfaces without the executor knowing their surface grammar. |
 | Flyline lesson | Ratatui supplies responsive prompt widgets, fuzzy suggestions, tooltips, selection, panels while preserving scrollback and a plain fallback. |
 | Nu lesson | Built-ins exchange typed streams. External commands remain byte-oriented and cross visible adapters with bounded buffering. |
@@ -649,6 +649,36 @@ These are targets, not current benchmark claims. Each release records cold/warm 
 | 2 | Scriptable | Lua scripts and computed config, `quirl run`, formatter, annotation-aware checker, linter, tests, docs, language service, agent catalog/validation formats, package manifests, generated host API, deterministic tests. |
 | 3 | Platform | Trusted-language and Wasm SDKs, permissions/lockfile, catalog/completion/UI/event extension points, Bash/Zsh runners, directory/process panels, live pipelines, Windows job control, recovery. |
 | 4 | 1.0 | Freeze versioned grammar, command catalog, completion/picker protocols, agent schema, runner/plugin APIs, config schema/migration, performance gates, security/accessibility audits, compatibility matrix. |
+
+### Phase 1 acceptance gates
+
+Phase 1 ("Preview") is the next implementation step. Like the Lua gates in
+§9, these are the conditions under which the phase is accepted — not a task
+list:
+
+- **Job control.** Background/foreground/suspend (`&`, `Ctrl-Z`, `jobs`,
+  `fg`, `bg`) work through one native lifecycle interface on Linux and
+  macOS, and structured job state is visible to the prompt and the picker.
+- **One execution graph.** Redirects and byte pipes in command mode run
+  through a single native plan across built-ins and external processes;
+  the C0 surface (`ls | grep …`, `> file`, quoting) no longer round-trips
+  through the compatibility shell.
+- **Durable history and picker.** History persists across sessions;
+  `Ctrl-R` opens the typed picker over history entries, and the same engine
+  serves files and palette actions with a plain-text fallback.
+- **Completion ingestion.** Fish declarative completions plus at least one
+  of Bash/Zsh translate into `CommandSpec` entries with provenance and
+  confidence recorded, and the index can explain every fact's source.
+- **C1 subset with evidence.** The supported interactive syntax subset is
+  listed in a machine-readable matrix backed by differential tests against
+  Bash and Zsh; unsupported constructs produce a mismatch diagnostic that
+  names the exact dialect form instead of silently reinterpreting it.
+- **Budgets measured.** Cold start, keystroke-to-frame, and first prompt
+  paint are measured against the §12 budgets on named hardware and
+  recorded — including where they currently miss.
+
+Every gate lands with catalog metadata, diagnostics, keyboard navigation,
+and accessible text output, per the release criterion in §10.
 
 ## 14. Review decisions
 
