@@ -15,6 +15,13 @@
 
 ---
 
+<!-- TODO: asciinema/VHS recording
+## Demo
+
+Add a short recording here showing the semantic completion menu and a
+structured pipeline in data mode. Do not substitute a scripted fake.
+-->
+
 In German, a *Quirl* is the humble wooden whisk — a simple tool that takes
 ingredients which don't naturally mix and folds them into something smooth.
 That's exactly what this shell does.
@@ -61,17 +68,43 @@ as smart as your editor.
   schemas are generated from the same Rust host definitions that power the
   runtime, so the SDK, editor completions, and AI context never drift apart.
 
+## How is Quirl different?
+
+### Bash and Zsh
+
+Quirl keeps the command syntax and muscle memory of a Bourne-family shell by
+routing ordinary commands through a configured compatibility shell. Unlike
+Bash and Zsh, it also has an explicit data mode where pipelines carry typed
+values instead of requiring every structured task to become text processing.
+
+### Nushell
+
+Nushell makes structured data the primary shell language. Quirl keeps familiar
+Bash-style command entry as the default and makes the typed grammar an explicit
+mode, so existing command-line habits and snippets remain useful. Quirl's data
+grammar is intentionally much smaller today.
+
+### Fish
+
+Quirl shares Fish's emphasis on discoverability, rich completion, and a helpful
+interactive experience. It adds typed data pipelines and standardizes config,
+scripts, prompts, completions, and trusted plugins on exactly one sandboxed Lua
+5.4 language with a generated, Rust-validated SDK. Fish is a mature daily-driver
+shell; Quirl is still a prototype.
+
 ## Status
 
 Quirl is a runnable vertical-slice prototype, not a daily-driver shell yet.
 The architecture and decisions behind it are documented in depth:
 
-- [Language & product design](docs/language-design.html) — the intended
+- [Language & product design](docs/language-design.md) — the intended
   product and interaction model.
-- [Embedded-language decision report](docs/embedded-language-decision.html) —
+- [Embedded-language decision report](docs/embedded-language-decision.md) —
   footprint, health, and complexity comparison across candidate runtimes.
 - [ADR 0001: Lua is Quirl's extension language](docs/decisions/0001-lua-extension-language.md) —
   the accepted decision and its implementation status.
+- [ADR 0002: one-way crate layering](docs/decisions/0002-crate-layering.md) —
+  the dependency graph and composition boundaries for the Rust workspace.
 - [Runtime selection spike](docs/benchmarks/embedded-language-selection.md) —
   the earlier latency benchmarks that fed the decision.
 
@@ -85,6 +118,22 @@ last-known-good generation. Editor keymap, semantic hints, prompt composition,
 and picker settings are applied at the next safe prompt boundary. Data mode
 uses Quirl's native Rust evaluator. The earlier Steel prototype and all of its
 runtime dependencies have been removed.
+
+### Roadmap to a daily driver
+
+- [x] Familiar command execution through a configured compatibility shell.
+- [x] Explicit typed data mode with a focused native pipeline grammar.
+- [x] Sandboxed Lua configuration, scripts, tests, and trusted extensions.
+- [x] Semantic command catalog, completions, and atomic live config reload.
+- [ ] Native job control and background-process lifecycle management.
+- [ ] One command-mode execution graph for redirects and byte pipes across
+  native built-ins and external commands. External-only shell syntax already
+  works through the compatibility shell.
+- [ ] Durable, searchable history and a shared typed history/file/action picker.
+- [ ] Complete scripting tooling: a real formatter, annotation-aware checking,
+  language service, package manifests, and deterministic integration tests.
+- [ ] Linux/macOS/Windows hardening, recovery, accessibility, and performance
+  gates suitable for replacing a user's login shell.
 
 ## Quick start
 
