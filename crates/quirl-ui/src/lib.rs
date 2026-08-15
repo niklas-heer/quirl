@@ -1,67 +1,174 @@
 //! Terminal interaction that treats completion and diagnostics as core behavior.
 
+use crossterm::event::{Event, KeyEvent};
 use nu_ansi_term::{Color, Style};
 use quirl_catalog::Catalog;
 use quirl_core::ShellError;
+use quirl_lua::QuirlConfig;
 use quirl_syntax::Mode;
 use reedline::{
-    default_emacs_keybindings, Completer, DefaultHinter, DefaultValidator, Emacs, Highlighter,
-    IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
-    Reedline, ReedlineEvent, ReedlineMenu, Span, StyledText, Suggestion,
+    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
+    Completer, DefaultHinter, DefaultValidator, DescriptionMode, EditMode, Emacs, Helix,
+    Highlighter, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode,
+    PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Span, StyledText,
+    Suggestion, Vi,
 };
-use std::{borrow::Cow, collections::HashSet, env};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    env, fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 pub fn editor(catalog: Catalog) -> Reedline {
-    editor_with_extensions(catalog, None)
+    editor_with_config(catalog, QuirlConfig::default())
 }
 
 pub fn editor_with_extensions(
     catalog: Catalog,
     extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
 ) -> Reedline {
+    editor_with_extensions_and_config(catalog, extension_completer, QuirlConfig::default())
+}
+
+/// Create an editor using the configured keymap, completion menu, and semantic hints.
+///
+/// `QuirlConfig` is passed by value so a caller can apply a newly loaded configuration
+/// atomically when it rebuilds its editor.
+pub fn editor_with_config(catalog: Catalog, config: QuirlConfig) -> Reedline {
+    editor_with_extensions_and_config(catalog, None, config)
+}
+
+/// Like [`editor_with_config`], with completions supplied by Lua extensions as well.
+pub fn editor_with_extensions_and_config(
+    catalog: Catalog,
+    extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
+    config: QuirlConfig,
+) -> Reedline {
     let completer = Box::new(CatalogCompleter::with_extensions(
         catalog.clone(),
         extension_completer,
     ));
-    let highlighter = Box::new(SemanticHighlighter::new(catalog));
-    let completion_menu = Box::new(
-        IdeMenu::default()
-            .with_name("completion_menu")
-            .with_default_border(),
-    );
-    let mut keybindings = default_emacs_keybindings();
-    keybindings.add_binding(
-        KeyModifiers::NONE,
-        KeyCode::Tab,
-        ReedlineEvent::UntilFound(vec![
-            ReedlineEvent::Menu("completion_menu".to_owned()),
-            ReedlineEvent::MenuNext,
-        ]),
-    );
-
-    Reedline::create()
+    let completion_menu = Box::new(configured_completion_menu(&config));
+    let mut line_editor = Reedline::create()
         .with_completer(completer)
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
-        .with_highlighter(highlighter)
         .with_hinter(Box::new(
             DefaultHinter::default().with_style(Style::new().italic().fg(Color::DarkGray)),
         ))
         .with_validator(Box::new(DefaultValidator))
-        .with_edit_mode(Box::new(Emacs::new(keybindings)))
-        .with_quick_completions(false)
+        .with_edit_mode(configured_edit_mode(&config.editor.keymap))
+        .with_quick_completions(false);
+    if config.editor.semantic_hints {
+        line_editor = line_editor.with_highlighter(Box::new(SemanticHighlighter::new(catalog)));
+    }
+    line_editor
+}
+
+fn completion_menu_event() -> ReedlineEvent {
+    ReedlineEvent::UntilFound(vec![
+        ReedlineEvent::Menu("completion_menu".to_owned()),
+        ReedlineEvent::MenuNext,
+    ])
+}
+
+fn configured_edit_mode(keymap: &str) -> Box<dyn EditMode> {
+    match keymap {
+        "vim" => {
+            let mut insert = default_vi_insert_keybindings();
+            let mut normal = default_vi_normal_keybindings();
+            insert.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
+            normal.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
+            Box::new(Vi::new(insert, normal))
+        }
+        "helix" => Box::new(QuirlHelix::default()),
+        // Config validation rejects other values. Keep this fallback for direct Rust callers.
+        "emacs" => {
+            let mut keybindings = default_emacs_keybindings();
+            keybindings.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
+            Box::new(Emacs::new(keybindings))
+        }
+        _ => {
+            let mut keybindings = default_emacs_keybindings();
+            keybindings.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
+            Box::new(Emacs::new(keybindings))
+        }
+    }
+}
+
+/// Reedline's native Helix mode intentionally owns its modal editing behavior,
+/// but does not bind Tab to a completion menu. Keep that product-level binding
+/// at Quirl's editor boundary and delegate every other event unchanged.
+#[derive(Default)]
+struct QuirlHelix {
+    inner: Helix,
+}
+
+impl EditMode for QuirlHelix {
+    fn parse_event(&mut self, event: ReedlineRawEvent) -> ReedlineEvent {
+        let event: Event = event.into();
+        if matches!(
+            event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            })
+        ) {
+            return completion_menu_event();
+        }
+        let event = ReedlineRawEvent::try_from(event)
+            .expect("Reedline already normalized this terminal event");
+        self.inner.parse_event(event)
+    }
+
+    fn edit_mode(&self) -> PromptEditMode {
+        self.inner.edit_mode()
+    }
+}
+
+fn configured_completion_menu(config: &QuirlConfig) -> IdeMenu {
+    let menu = IdeMenu::default()
+        .with_name("completion_menu")
+        .with_default_border();
+    let menu = match config.picker.layout.as_str() {
+        // Reedline's IDE menu is always anchored below the input. A bounded height is
+        // the closest supported equivalent to a bottom picker; the default adapts to
+        // the remaining terminal space, and `full` removes that extra cap.
+        "bottom" => menu.with_max_completion_height(10),
+        "full" | "adaptive" => menu,
+        _ => menu,
+    };
+    if config.picker.preview {
+        menu.with_description_mode(DescriptionMode::PreferRight)
+    } else {
+        // IdeMenu has no preview on/off switch. Zero-sized description bounds suppress
+        // its detail pane while retaining the IDE completion layout.
+        menu.with_min_description_width(0)
+            .with_max_description_width(0)
+            .with_max_description_height(0)
+    }
 }
 
 #[derive(Clone)]
 pub struct QuirlPrompt {
     mode: Mode,
     cwd: String,
+    git_branch: Option<String>,
+    status: Option<i32>,
+    duration: Option<Duration>,
     extension_segments: Vec<String>,
+    configured_left: Option<Vec<String>>,
+    configured_right: Vec<String>,
+    named_extension_segments: HashMap<String, String>,
 }
 
 impl QuirlPrompt {
     pub fn new(mode: Mode) -> Self {
-        let cwd = env::current_dir()
-            .ok()
+        let cwd_path = env::current_dir().ok();
+        let cwd = cwd_path
+            .as_ref()
             .and_then(|path| {
                 path.file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -71,25 +178,135 @@ impl QuirlPrompt {
         Self {
             mode,
             cwd,
+            git_branch: cwd_path.as_deref().and_then(read_git_branch),
+            status: None,
+            duration: None,
             extension_segments: Vec::new(),
+            configured_left: None,
+            configured_right: Vec::new(),
+            named_extension_segments: HashMap::new(),
         }
+    }
+
+    /// Create a prompt whose visible segments and order are selected by Lua config.
+    ///
+    /// Known native segments are `directory`, `git_branch`, and `mode`; `status` and
+    /// `duration` are available after their builder methods receive session values.
+    /// `jobs` and `git_state` are skipped until the interactive host provides them.
+    pub fn with_config(mode: Mode, config: &QuirlConfig) -> Self {
+        let mut prompt = Self::new(mode);
+        prompt.configured_left = Some(config.prompt.left.clone());
+        prompt.configured_right = config.prompt.right.clone();
+        prompt
     }
 
     pub fn with_extension_segments(mut self, segments: Vec<String>) -> Self {
         self.extension_segments = segments;
         self
     }
+
+    /// Set the exit status that can be rendered by the configured `status` segment.
+    pub fn with_status(mut self, status: i32) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    /// Set the duration of the most recently evaluated command or expression.
+    pub fn with_duration(mut self, duration: Duration) -> Self {
+        self.duration = Some(duration);
+        self
+    }
+
+    /// Supply rendered plugin segments by registration name so the prompt config can
+    /// position them on either side of the input.
+    pub fn with_named_extension_segments(
+        mut self,
+        segments: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.named_extension_segments = segments
+            .into_iter()
+            .filter(|(_, value)| !value.is_empty())
+            .collect();
+        self
+    }
+
+    fn render_segments(&self, requested: &[String]) -> String {
+        requested
+            .iter()
+            .filter_map(|name| match name.as_str() {
+                "directory" => Some(self.cwd.clone()),
+                "mode" => Some(self.mode.to_string()),
+                "git_branch" => self
+                    .git_branch
+                    .as_ref()
+                    .map(|branch| format!("git:{branch}")),
+                "status" => self
+                    .status
+                    .filter(|status| *status != 0)
+                    .map(|status| format!("status:{status}")),
+                "duration" => self.duration.map(format_duration),
+                // Job control and a cheap dirty-worktree signal land in Phase 1.
+                "jobs" | "git_state" => None,
+                _ => self.named_extension_segments.get(name).cloned(),
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() > 0 {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else if duration.as_millis() > 0 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{}µs", duration.as_micros())
+    }
+}
+
+fn read_git_branch(cwd: &Path) -> Option<String> {
+    let git_dir = cwd.ancestors().find_map(resolve_git_dir)?;
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    Some(
+        head.strip_prefix("ref: refs/heads/")
+            .map(str::to_owned)
+            .unwrap_or_else(|| head.chars().take(8).collect()),
+    )
+}
+
+fn resolve_git_dir(directory: &Path) -> Option<PathBuf> {
+    let marker = directory.join(".git");
+    if marker.is_dir() {
+        return Some(marker);
+    }
+    let contents = fs::read_to_string(marker).ok()?;
+    let path = contents.trim().strip_prefix("gitdir:")?.trim();
+    let path = PathBuf::from(path);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        directory.join(path)
+    })
 }
 
 impl Prompt for QuirlPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
+        if let Some(segments) = &self.configured_left {
+            let rendered = self.render_segments(segments);
+            return Cow::Owned(if rendered.is_empty() {
+                String::new()
+            } else {
+                format!("{rendered} ")
+            });
+        }
         let mut parts = vec![self.cwd.clone(), self.mode.to_string()];
         parts.extend(self.extension_segments.iter().cloned());
         Cow::Owned(format!("{} ", parts.join(" · ")))
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Borrowed("")
+        Cow::Owned(self.render_segments(&self.configured_right))
     }
 
     fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
@@ -282,6 +499,7 @@ pub fn render_error(error: &ShellError, color: bool) -> String {
 mod tests {
     use super::*;
     use quirl_core::ErrorCode;
+    use quirl_lua::{EditorConfig, PickerConfig, PromptConfig};
 
     struct ExampleExtension;
 
@@ -331,5 +549,100 @@ mod tests {
             .with_extension_segments(vec!["project".to_owned(), "git:main".to_owned()]);
         let rendered = prompt.render_prompt_left();
         assert!(rendered.contains("project · git:main"));
+    }
+
+    #[test]
+    fn configured_prompt_orders_native_and_named_segments() {
+        let config = QuirlConfig {
+            prompt: PromptConfig {
+                left: vec![
+                    "mode".to_owned(),
+                    "project".to_owned(),
+                    "directory".to_owned(),
+                ],
+                right: vec![
+                    "duration".to_owned(),
+                    "status".to_owned(),
+                    "region".to_owned(),
+                ],
+            },
+            ..QuirlConfig::default()
+        };
+        let prompt = QuirlPrompt::with_config(Mode::Command, &config)
+            .with_status(7)
+            .with_named_extension_segments(vec![
+                ("region".to_owned(), "eu-central".to_owned()),
+                ("project".to_owned(), "quirl".to_owned()),
+            ]);
+
+        let left = prompt.render_prompt_left();
+        assert!(left.starts_with("command · quirl · "));
+        assert_eq!(prompt.render_prompt_right(), "status:7 · eu-central");
+    }
+
+    #[test]
+    fn unavailable_configured_prompt_segments_are_omitted() {
+        let config = QuirlConfig {
+            prompt: PromptConfig {
+                left: vec![
+                    "jobs".to_owned(),
+                    "duration".to_owned(),
+                    "git_state".to_owned(),
+                ],
+                right: vec!["status".to_owned()],
+            },
+            ..QuirlConfig::default()
+        };
+        let prompt = QuirlPrompt::with_config(Mode::Command, &config);
+
+        assert_eq!(prompt.render_prompt_left(), "");
+        assert_eq!(prompt.render_prompt_right(), "");
+    }
+
+    #[test]
+    fn prompt_duration_uses_a_compact_unit() {
+        let config = QuirlConfig {
+            prompt: PromptConfig {
+                left: Vec::new(),
+                right: vec!["duration".to_owned()],
+            },
+            ..QuirlConfig::default()
+        };
+        let prompt = QuirlPrompt::with_config(Mode::Command, &config)
+            .with_duration(Duration::from_millis(42));
+
+        assert_eq!(prompt.render_prompt_right(), "42ms");
+    }
+
+    #[test]
+    fn editor_accepts_all_configured_keymaps_and_picker_options() {
+        for keymap in ["emacs", "vim", "helix"] {
+            let config = QuirlConfig {
+                editor: EditorConfig {
+                    keymap: keymap.to_owned(),
+                    semantic_hints: keymap != "vim",
+                },
+                picker: PickerConfig {
+                    layout: if keymap == "emacs" {
+                        "bottom".to_owned()
+                    } else {
+                        "full".to_owned()
+                    },
+                    preview: keymap != "helix",
+                },
+                ..QuirlConfig::default()
+            };
+            let _editor = editor_with_config(Catalog::builtin(), config);
+        }
+    }
+
+    #[test]
+    fn helix_keeps_tab_bound_to_semantic_completion() {
+        let event =
+            ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+                .unwrap();
+        let mut helix = QuirlHelix::default();
+
+        assert_eq!(helix.parse_event(event), completion_menu_event());
     }
 }

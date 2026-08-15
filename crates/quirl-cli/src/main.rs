@@ -7,13 +7,14 @@ use quirl_core::{CommandRunner, ErrorCode, ShellError};
 use quirl_data::DataRuntime;
 use quirl_lua::{format_file, sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig};
 use quirl_syntax::{classify, InteractiveLine, Mode};
-use quirl_ui::{editor_with_extensions, render_error, QuirlPrompt};
+use quirl_ui::{editor_with_extensions_and_config, render_error, QuirlPrompt};
 use reedline::Signal;
 use std::{
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Parser)]
@@ -248,23 +249,53 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
         "\x1b[1;32mQuirl\x1b[0m 0.1 · command mode · Tab explores · `mode data` switches grammar"
     );
     let extensions = Arc::new(Mutex::new(LuaExtensionHost::discover()));
-    let completion_adapter = LuaCompletionAdapter::new(Arc::clone(&extensions));
-    let mut line_editor =
-        editor_with_extensions(catalog.clone(), Some(Box::new(completion_adapter)));
+    let (mut active_config, mut applied_revision) = {
+        let mut host = extensions.lock().map_err(|_| {
+            ShellError::new(ErrorCode::Io, "the extension host lock was poisoned")
+                .with_help("Restart Quirl to create a fresh extension host")
+        })?;
+        let config = host.active_config().clone();
+        (config, host.config_revision())
+    };
+    let mut line_editor = configured_editor(&catalog, &extensions, active_config.clone());
     let mut mode = Mode::Command;
     let runner = CommandRunner::default();
     let data = DataRuntime::new();
-    // Extension VMs remain lazy so they do not delay the first prompt.
+    // Script evaluation remains lazy; extension VMs load before the first editor view.
     let mut lua = None;
     let mut last_status = 0;
+    let mut last_duration: Option<Duration> = None;
 
     loop {
-        let extension_segments = extensions
+        let (extension_segments, next_config) = extensions
             .lock()
-            .map(|mut extensions| extensions.prompt_segments(mode, last_status))
+            .map(|mut extensions| {
+                extensions.reload_if_changed();
+                let revision = extensions.config_revision();
+                let next_config = (revision != applied_revision)
+                    .then(|| (extensions.active_config().clone(), revision));
+                let segments: Vec<_> = extensions
+                    .named_prompt_segments(mode, last_status)
+                    .into_iter()
+                    .map(|segment| (segment.name, segment.value))
+                    .collect();
+                (segments, next_config)
+            })
             .unwrap_or_default();
+        if let Some((config, revision)) = next_config {
+            applied_revision = revision;
+            if config != active_config {
+                active_config = config;
+                line_editor = configured_editor(&catalog, &extensions, active_config.clone());
+            }
+        }
         print_extension_errors(&extensions);
-        let prompt = QuirlPrompt::new(mode).with_extension_segments(extension_segments);
+        let mut prompt = QuirlPrompt::with_config(mode, &active_config)
+            .with_status(last_status)
+            .with_named_extension_segments(extension_segments);
+        if let Some(duration) = last_duration {
+            prompt = prompt.with_duration(duration);
+        }
         match line_editor.read_line(&prompt) {
             Ok(Signal::Success(buffer)) => match classify(mode, &buffer) {
                 InteractiveLine::Empty => {}
@@ -278,36 +309,48 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
                     println!("mode → {mode}");
                 }
                 InteractiveLine::Help(topic) => print_help(&catalog, topic),
-                InteractiveLine::Command(command) => match runner.execute(command) {
-                    Ok(outcome) => {
-                        last_status = outcome.status;
-                        print_outcome(&outcome);
+                InteractiveLine::Command(command) => {
+                    let started = Instant::now();
+                    match runner.execute(command) {
+                        Ok(outcome) => {
+                            last_status = outcome.status;
+                            print_outcome(&outcome);
+                        }
+                        Err(error) => {
+                            last_status = 1;
+                            eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
+                        }
                     }
-                    Err(error) => {
-                        last_status = 1;
-                        eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
+                    last_duration = Some(started.elapsed());
+                }
+                InteractiveLine::Data(source) => {
+                    let started = Instant::now();
+                    match data.eval(source) {
+                        Ok(value) => {
+                            last_status = 0;
+                            print_json_value(value);
+                        }
+                        Err(error) => {
+                            last_status = 1;
+                            eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
+                        }
                     }
-                },
-                InteractiveLine::Data(source) => match data.eval(source) {
-                    Ok(value) => {
-                        last_status = 0;
-                        print_json_value(value);
+                    last_duration = Some(started.elapsed());
+                }
+                InteractiveLine::Lua(source) => {
+                    let started = Instant::now();
+                    match eval_lua(&mut lua, source) {
+                        Ok(value) => {
+                            last_status = 0;
+                            print_json_value(value);
+                        }
+                        Err(error) => {
+                            last_status = 1;
+                            eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
+                        }
                     }
-                    Err(error) => {
-                        last_status = 1;
-                        eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
-                    }
-                },
-                InteractiveLine::Lua(source) => match eval_lua(&mut lua, source) {
-                    Ok(value) => {
-                        last_status = 0;
-                        print_json_value(value);
-                    }
-                    Err(error) => {
-                        last_status = 1;
-                        eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
-                    }
-                },
+                    last_duration = Some(started.elapsed());
+                }
             },
             Ok(Signal::CtrlC) => {
                 last_status = 130;
@@ -323,6 +366,15 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
             }
         }
     }
+}
+
+fn configured_editor(
+    catalog: &Catalog,
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+    config: QuirlConfig,
+) -> reedline::Reedline {
+    let completion_adapter = LuaCompletionAdapter::new(Arc::clone(extensions));
+    editor_with_extensions_and_config(catalog.clone(), Some(Box::new(completion_adapter)), config)
 }
 
 fn print_extension_errors(extensions: &Arc<Mutex<LuaExtensionHost>>) {

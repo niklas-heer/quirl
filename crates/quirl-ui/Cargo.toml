@@ -8,8 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+crossterm.workspace = true
 nu-ansi-term.workspace = true
 quirl-catalog = { path = "../quirl-catalog" }
 quirl-core = { path = "../quirl-core" }
+quirl-lua = { path = "../quirl-lua" }
 quirl-syntax = { path = "../quirl-syntax" }
-reedline.workspace = true
+reedline = { workspace = true, features = ["helix"] }
