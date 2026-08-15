@@ -85,11 +85,12 @@ impl Catalog {
                     "quirl data",
                     "quirl data <source> [| transform ...]",
                     "Evaluate a native structured-data pipeline",
-                    "Sources are `pwd`, `ls [path]`, `open <path>`, or JSON. Initial transforms are `where`, `select`, `get`, `first`, and `length`.",
+                    "Sources are `pwd`, `ls [path]`, `open <path>`, or JSON. Transforms include typed `where` comparisons with `and`/`or`, dotted `get`, `select`, `sort`, `take`, `first`, and `length`.",
                     vec![],
                     &[
                         "mode data",
                         "ls . | select name kind size",
+                        "ls . | where kind == file and size > 1024 | sort size desc | take 10",
                         "quirl data '[1,2,3] | length'",
                     ],
                     &[Effect::ReadFilesystem],

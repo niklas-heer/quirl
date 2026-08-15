@@ -2,7 +2,7 @@
 
 use quirl_core::{directory_entries, ErrorCode, ShellError};
 use serde_json::{Map, Value};
-use std::{fs, path::PathBuf};
+use std::{cmp::Ordering, fs, path::PathBuf};
 
 #[derive(Debug, Default)]
 pub struct DataRuntime;
@@ -79,8 +79,10 @@ fn apply_transform(value: Value, stage: &str) -> Result<Value, ShellError> {
             _ => Err(data_error(stage, "first expects an array")),
         },
         Some("get") if words.len() == 2 => get_field(value, &words[1], stage),
-        Some("where") => filter_where(value, &words, stage),
+        Some("where") => filter_where(value, stage),
         Some("select") if words.len() >= 2 => select_fields(value, &words[1..], stage),
+        Some("sort") => sort_rows(value, &words, stage),
+        Some("take") => take_values(value, &words, stage),
         Some(command) => Err(data_error(
             stage,
             format!("unknown data transform `{command}`"),
@@ -91,16 +93,18 @@ fn apply_transform(value: Value, stage: &str) -> Result<Value, ShellError> {
 
 fn get_field(value: Value, field: &str, stage: &str) -> Result<Value, ShellError> {
     match value {
-        Value::Object(mut object) => object
-            .remove(field)
+        Value::Object(object) => get_path(&Value::Object(object), field)
+            .cloned()
             .ok_or_else(|| data_error(stage, format!("object has no field `{field}`"))),
         Value::Array(values) => values
             .into_iter()
-            .map(|value| match value {
-                Value::Object(mut object) => object
-                    .remove(field)
-                    .ok_or_else(|| data_error(stage, format!("row has no field `{field}`"))),
-                _ => Err(data_error(stage, "get over an array expects object rows")),
+            .map(|value| {
+                if !value.is_object() {
+                    return Err(data_error(stage, "get over an array expects object rows"));
+                }
+                get_path(&value, field)
+                    .cloned()
+                    .ok_or_else(|| data_error(stage, format!("row has no field `{field}`")))
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
@@ -111,23 +115,376 @@ fn get_field(value: Value, field: &str, stage: &str) -> Result<Value, ShellError
     }
 }
 
-fn filter_where(value: Value, words: &[String], stage: &str) -> Result<Value, ShellError> {
-    if words.len() < 4 || words[2] != "==" {
-        return Err(data_error(stage, "usage: where <field> == <JSON value>"));
-    }
-    let expected_source = words[3..].join(" ");
-    let expected = serde_json::from_str(&expected_source).unwrap_or(Value::String(expected_source));
+fn filter_where(value: Value, stage: &str) -> Result<Value, ShellError> {
+    let expression = stage
+        .strip_prefix("where")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .ok_or_else(|| {
+            data_error(
+                stage,
+                "usage: where <field> <comparison> <value> [and|or ...]",
+            )
+        })?;
+    let predicate = Predicate::parse(expression, stage)?;
     let Value::Array(values) = value else {
         return Err(data_error(stage, "where expects an array of objects"));
     };
-    Ok(Value::Array(
-        values
-            .into_iter()
-            .filter(|value| {
-                value.as_object().and_then(|object| object.get(&words[1])) == Some(&expected)
-            })
-            .collect(),
-    ))
+
+    let mut filtered = Vec::new();
+    for value in values {
+        if !value.is_object() {
+            return Err(data_error(stage, "where expects object rows"));
+        }
+        if predicate.matches(&value, stage)? {
+            filtered.push(value);
+        }
+    }
+    Ok(Value::Array(filtered))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Comparison {
+    Equal,
+    NotEqual,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+}
+
+#[derive(Debug)]
+struct Condition {
+    field: String,
+    comparison: Comparison,
+    expected: Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BooleanOperator {
+    And,
+    Or,
+}
+
+#[derive(Debug)]
+struct Predicate {
+    conditions: Vec<Condition>,
+    operators: Vec<BooleanOperator>,
+}
+
+impl Predicate {
+    fn parse(expression: &str, stage: &str) -> Result<Self, ShellError> {
+        let tokens = predicate_tokens(expression, stage)?;
+        if tokens.is_empty() {
+            return Err(data_error(stage, "where requires a predicate"));
+        }
+
+        let mut conditions = Vec::new();
+        let mut operators = Vec::new();
+        let mut index = 0;
+        loop {
+            let Some(field) = tokens.get(index) else {
+                return Err(data_error(stage, "expected a field after boolean operator"));
+            };
+            let Some(operator) = tokens.get(index + 1) else {
+                return Err(data_error(stage, "expected a comparison after field"));
+            };
+            let Some(expected) = tokens.get(index + 2) else {
+                return Err(data_error(stage, "expected a value after comparison"));
+            };
+            if field.quoted {
+                return Err(data_error(stage, "predicate fields must be bare names"));
+            }
+            let comparison = match operator.text.as_str() {
+                "==" => Comparison::Equal,
+                "!=" => Comparison::NotEqual,
+                "<" => Comparison::Less,
+                "<=" => Comparison::LessOrEqual,
+                ">" => Comparison::Greater,
+                ">=" => Comparison::GreaterOrEqual,
+                _ => {
+                    return Err(data_error(
+                        stage,
+                        format!("unsupported comparison `{}`", operator.text),
+                    ))
+                }
+            };
+            conditions.push(Condition {
+                field: field.text.clone(),
+                comparison,
+                expected: expected.as_value(),
+            });
+            index += 3;
+
+            let Some(boolean) = tokens.get(index) else {
+                break;
+            };
+            if boolean.quoted {
+                return Err(data_error(
+                    stage,
+                    "expected `and` or `or` between comparisons",
+                ));
+            }
+            operators.push(match boolean.text.as_str() {
+                "and" => BooleanOperator::And,
+                "or" => BooleanOperator::Or,
+                _ => {
+                    return Err(data_error(
+                        stage,
+                        "expected `and` or `or` between comparisons",
+                    ))
+                }
+            });
+            index += 1;
+        }
+
+        Ok(Self {
+            conditions,
+            operators,
+        })
+    }
+
+    fn matches(&self, row: &Value, stage: &str) -> Result<bool, ShellError> {
+        let mut group = evaluate_condition(&self.conditions[0], row, stage)?;
+        let mut result = false;
+        for (operator, condition) in self.operators.iter().zip(&self.conditions[1..]) {
+            match operator {
+                BooleanOperator::And => {
+                    group = group && evaluate_condition(condition, row, stage)?;
+                }
+                BooleanOperator::Or => {
+                    result = result || group;
+                    group = evaluate_condition(condition, row, stage)?;
+                }
+            }
+        }
+        Ok(result || group)
+    }
+}
+
+#[derive(Debug)]
+struct PredicateToken {
+    text: String,
+    quoted: bool,
+}
+
+impl PredicateToken {
+    fn as_value(&self) -> Value {
+        if self.quoted {
+            Value::String(self.text.clone())
+        } else {
+            serde_json::from_str(&self.text).unwrap_or_else(|_| Value::String(self.text.clone()))
+        }
+    }
+}
+
+fn predicate_tokens(expression: &str, stage: &str) -> Result<Vec<PredicateToken>, ShellError> {
+    let mut tokens = Vec::new();
+    let mut characters = expression.char_indices().peekable();
+    while let Some((_, character)) = characters.peek().copied() {
+        if character.is_whitespace() {
+            characters.next();
+            continue;
+        }
+
+        if character == '\'' || character == '"' {
+            characters.next();
+            let quote = character;
+            let mut text = String::new();
+            let mut closed = false;
+            while let Some((_, character)) = characters.next() {
+                if character == quote {
+                    closed = true;
+                    break;
+                }
+                if character == '\\' {
+                    let Some((_, escaped)) = characters.next() else {
+                        return Err(data_error(stage, "unfinished escape in quoted value"));
+                    };
+                    text.push(match escaped {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        other => other,
+                    });
+                } else {
+                    text.push(character);
+                }
+            }
+            if !closed {
+                return Err(data_error(stage, "unclosed quote in predicate"));
+            }
+            tokens.push(PredicateToken { text, quoted: true });
+            continue;
+        }
+
+        if matches!(character, '=' | '!' | '<' | '>') {
+            let (_, first) = characters.next().expect("peeked character is present");
+            let mut text = first.to_string();
+            if characters.peek().is_some_and(|(_, next)| *next == '=') {
+                text.push('=');
+                characters.next();
+            }
+            tokens.push(PredicateToken {
+                text,
+                quoted: false,
+            });
+            continue;
+        }
+
+        let mut text = String::new();
+        while let Some((_, character)) = characters.peek().copied() {
+            if character.is_whitespace() || matches!(character, '=' | '!' | '<' | '>') {
+                break;
+            }
+            text.push(character);
+            characters.next();
+        }
+        tokens.push(PredicateToken {
+            text,
+            quoted: false,
+        });
+    }
+    Ok(tokens)
+}
+
+fn evaluate_condition(condition: &Condition, row: &Value, stage: &str) -> Result<bool, ShellError> {
+    let Some(actual) = get_path(row, &condition.field) else {
+        return Ok(false);
+    };
+    match condition.comparison {
+        Comparison::Equal => Ok(actual == &condition.expected),
+        Comparison::NotEqual => Ok(actual != &condition.expected),
+        Comparison::Less => {
+            Ok(compare_values(actual, &condition.expected, stage)? == Ordering::Less)
+        }
+        Comparison::LessOrEqual => Ok(matches!(
+            compare_values(actual, &condition.expected, stage)?,
+            Ordering::Less | Ordering::Equal
+        )),
+        Comparison::Greater => {
+            Ok(compare_values(actual, &condition.expected, stage)? == Ordering::Greater)
+        }
+        Comparison::GreaterOrEqual => Ok(matches!(
+            compare_values(actual, &condition.expected, stage)?,
+            Ordering::Greater | Ordering::Equal
+        )),
+    }
+}
+
+fn compare_values(left: &Value, right: &Value, stage: &str) -> Result<Ordering, ShellError> {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            if let (Some(left), Some(right)) = (left.as_i64(), right.as_i64()) {
+                return Ok(left.cmp(&right));
+            }
+            if let (Some(left), Some(right)) = (left.as_u64(), right.as_u64()) {
+                return Ok(left.cmp(&right));
+            }
+            if let (Some(left), Some(right)) = (left.as_i64(), right.as_u64()) {
+                return Ok(if left < 0 {
+                    Ordering::Less
+                } else {
+                    (left as u64).cmp(&right)
+                });
+            }
+            if let (Some(left), Some(right)) = (left.as_u64(), right.as_i64()) {
+                return Ok(if right < 0 {
+                    Ordering::Greater
+                } else {
+                    left.cmp(&(right as u64))
+                });
+            }
+            left.as_f64()
+                .and_then(|left| right.as_f64().and_then(|right| left.partial_cmp(&right)))
+                .ok_or_else(|| data_error(stage, "numbers cannot be ordered"))
+        }
+        (Value::String(left), Value::String(right)) => Ok(left.cmp(right)),
+        (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
+        _ => Err(data_error(
+            stage,
+            format!(
+                "cannot order {} and {} values",
+                value_kind(left),
+                value_kind(right)
+            ),
+        )),
+    }
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn get_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    path.split('.')
+        .try_fold(value, |value, field| value.as_object()?.get(field))
+}
+
+fn sort_rows(value: Value, words: &[String], stage: &str) -> Result<Value, ShellError> {
+    if !(words.len() == 2 || words.len() == 3) {
+        return Err(data_error(stage, "usage: sort <field> [asc|desc]"));
+    }
+    let descending = match words.get(2).map(String::as_str) {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(_) => return Err(data_error(stage, "sort direction must be `asc` or `desc`")),
+    };
+    let Value::Array(mut values) = value else {
+        return Err(data_error(stage, "sort expects an array of objects"));
+    };
+    for value in &values {
+        if !value.is_object() {
+            return Err(data_error(stage, "sort expects object rows"));
+        }
+        if get_path(value, &words[1]).is_none() {
+            return Err(data_error(
+                stage,
+                format!("row has no field `{}`", words[1]),
+            ));
+        }
+    }
+
+    let mut comparison_error = None;
+    values.sort_by(|left, right| {
+        if comparison_error.is_some() {
+            return Ordering::Equal;
+        }
+        let left = get_path(left, &words[1]).expect("sort fields were validated");
+        let right = get_path(right, &words[1]).expect("sort fields were validated");
+        match compare_values(left, right, stage) {
+            Ok(ordering) if descending => ordering.reverse(),
+            Ok(ordering) => ordering,
+            Err(error) => {
+                comparison_error = Some(error);
+                Ordering::Equal
+            }
+        }
+    });
+    if let Some(error) = comparison_error {
+        return Err(error);
+    }
+    Ok(Value::Array(values))
+}
+
+fn take_values(value: Value, words: &[String], stage: &str) -> Result<Value, ShellError> {
+    if words.len() != 2 {
+        return Err(data_error(stage, "usage: take <count>"));
+    }
+    let count = words[1]
+        .parse::<usize>()
+        .map_err(|_| data_error(stage, "take count must be a non-negative integer"))?;
+    let Value::Array(mut values) = value else {
+        return Err(data_error(stage, "take expects an array"));
+    };
+    values.truncate(count);
+    Ok(Value::Array(values))
 }
 
 fn select_fields(value: Value, fields: &[String], stage: &str) -> Result<Value, ShellError> {
@@ -165,7 +522,7 @@ fn split_pipeline(source: &str) -> Result<Vec<&str>, ShellError> {
     let mut start = 0;
     let mut quote = None;
     let mut escaped = false;
-    let mut depth = 0_u32;
+    let mut delimiters = Vec::new();
     for (index, character) in source.char_indices() {
         if escaped {
             escaped = false;
@@ -183,9 +540,22 @@ fn split_pipeline(source: &str) -> Result<Vec<&str>, ShellError> {
         }
         match character {
             '\'' | '"' => quote = Some(character),
-            '[' | '{' | '(' => depth += 1,
-            ']' | '}' | ')' if depth > 0 => depth -= 1,
-            '|' if depth == 0 => {
+            '[' | '{' | '(' => delimiters.push(character),
+            ']' | '}' | ')' => {
+                let expected = match character {
+                    ']' => '[',
+                    '}' => '{',
+                    ')' => '(',
+                    _ => unreachable!(),
+                };
+                if delimiters.pop() != Some(expected) {
+                    return Err(data_error(
+                        source,
+                        "unmatched or mismatched closing delimiter",
+                    ));
+                }
+            }
+            '|' if delimiters.is_empty() => {
                 let stage = source[start..index].trim();
                 if stage.is_empty() {
                     return Err(data_error(source, "empty pipeline stage"));
@@ -198,6 +568,9 @@ fn split_pipeline(source: &str) -> Result<Vec<&str>, ShellError> {
     }
     if quote.is_some() {
         return Err(data_error(source, "unclosed quote"));
+    }
+    if !delimiters.is_empty() {
+        return Err(data_error(source, "unclosed delimiter"));
     }
     let final_stage = source[start..].trim();
     if !final_stage.is_empty() {
@@ -242,5 +615,97 @@ mod tests {
     fn length_preserves_a_numeric_value() {
         let runtime = DataRuntime::new();
         assert_eq!(runtime.eval("[1,2,3] | length").unwrap(), 3);
+    }
+
+    #[test]
+    fn filters_sorts_and_limits_rows_with_the_documented_grammar() {
+        let runtime = DataRuntime::new();
+        let value = runtime
+            .eval(
+                r#"[
+                    {"name":"old-small","kind":"file","size":100,"meta":{"age":40}},
+                    {"name":"new-large","kind":"file","size":900,"meta":{"age":2}},
+                    {"name":"old-large","kind":"file","size":700,"meta":{"age":35}},
+                    {"name":"directory","kind":"dir","size":1200,"meta":{"age":90}},
+                    {"name":"old-largest","kind":"file","size":1100,"meta":{"age":60}}
+                ]
+                | where kind == file and meta.age > 30
+                | select name size
+                | sort size desc
+                | take 2"#,
+            )
+            .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {"name": "old-largest", "size": 1100},
+                {"name": "old-large", "size": 700}
+            ])
+        );
+    }
+
+    #[test]
+    fn where_supports_all_comparisons_and_and_before_or_precedence() {
+        let runtime = DataRuntime::new();
+        let value = runtime
+            .eval(
+                r#"[
+                    {"name":"a","score":1,"enabled":true},
+                    {"name":"b","score":2,"enabled":false},
+                    {"name":"c","score":3,"enabled":true},
+                    {"name":"d","score":4,"enabled":true}
+                ] | where score >= 2 and score < 4 or name != "d" and enabled == true
+                  | get name"#,
+            )
+            .unwrap();
+        assert_eq!(value, serde_json::json!(["a", "b", "c"]));
+
+        assert_eq!(
+            runtime
+                .eval(r#"[{"n":1},{"n":2},{"n":3}] | where n <= 2 and n > 1"#)
+                .unwrap(),
+            serde_json::json!([{"n": 2}])
+        );
+    }
+
+    #[test]
+    fn quoted_predicate_values_remain_strings() {
+        let runtime = DataRuntime::new();
+        assert_eq!(
+            runtime
+                .eval(r#"[{"value":"42"},{"value":42}] | where value == "42""#)
+                .unwrap(),
+            serde_json::json!([{"value": "42"}])
+        );
+        assert_eq!(
+            runtime
+                .eval(r#"[{"value":"a and b"},{"value":"a"}] | where value == 'a and b'"#)
+                .unwrap(),
+            serde_json::json!([{"value": "a and b"}])
+        );
+    }
+
+    #[test]
+    fn nested_fields_work_for_get_where_and_sort() {
+        let runtime = DataRuntime::new();
+        assert_eq!(
+            runtime
+                .eval(
+                    r#"[{"user":{"name":"Ada","rank":2}},{"user":{"name":"Lin","rank":1}}]
+                       | where user.rank != 3 | sort user.rank | get user.name"#,
+                )
+                .unwrap(),
+            serde_json::json!(["Lin", "Ada"])
+        );
+    }
+
+    #[test]
+    fn malformed_predicates_and_incomparable_sorts_are_errors() {
+        let runtime = DataRuntime::new();
+        assert!(runtime.eval(r#"[{"value":1}] | where value = 1"#).is_err());
+        assert!(runtime
+            .eval(r#"[{"value":1},{"value":"one"}] | sort value"#)
+            .is_err());
+        assert!(runtime.eval("[1,2 | length").is_err());
     }
 }
