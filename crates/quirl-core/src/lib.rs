@@ -13,7 +13,9 @@ pub use extension::{
     ExtensionCapability, ExtensionEvent, ExtensionEventData, OutputStream,
     EXTENSION_PROTOCOL_VERSION, EXTENSION_SCHEMA_DESCRIPTOR, MAX_EXTENSION_DEADLINE_MS,
 };
-pub use process::{directory_entries, CommandOutcome, CommandRunner, Entry, EntryKind};
+pub use process::{
+    directory_entries, CommandOutcome, CommandRunner, Entry, EntryKind, ProcessHost, ProcessRequest,
+};
 pub use protocol::{
     schema_fingerprint, CompatibilityPolicy, VersionPolicy, COMMON_ABI_SCHEMA_DESCRIPTOR,
     COMMON_ABI_SCHEMA_VERSION, PROTOCOL_FREEZE_VERSION,

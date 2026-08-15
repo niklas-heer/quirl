@@ -2,7 +2,7 @@ use clap::ValueEnum;
 use quirl_core::{escape_json_terminal_controls, ErrorCode, ShellError};
 use quirl_data::DataRuntime;
 use quirl_lua::{format_file, LuaPolicy, LuaRuntime, MAX_LUA_SOURCE_BYTES};
-use quirl_process::{ChildProcessTree, NativeExecutor};
+use quirl_process::{sandboxed_process_host, ChildProcessTree, NativeExecutor};
 use quirl_syntax::check_script;
 use quirl_ui::render_error;
 use serde::Serialize;
@@ -24,6 +24,8 @@ use std::{
 use std::os::unix::process::CommandExt;
 
 const MAX_REFERENCE_CAPTURE_BYTES: usize = 64 * 1024;
+const QUIRL_CANONICAL_EXTENSION: &str = "qrl";
+const QUIRL_EXTENSION_ALIASES: [&str; 2] = ["quirl", "🌀"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ScriptLanguage {
@@ -192,7 +194,8 @@ pub fn test_paths(path: &Path) -> Result<i32, ShellError> {
     let mut total = 0;
     let mut failed = 0;
     for file in files {
-        let runtime = LuaRuntime::new(LuaPolicy::script())?;
+        let runtime =
+            LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
         match runtime.test_file(&file) {
             Ok(count) => {
                 total += count;
@@ -237,7 +240,7 @@ fn discover_supported_files(path: &Path) -> Result<Vec<PathBuf>, ShellError> {
             ErrorCode::InvalidArgument,
             format!("{} is not a regular file or directory", path.display()),
         )
-        .with_help("Pass a .lua/.quirl file or a directory containing scripts"));
+        .with_help("Pass a .lua, .qrl, .quirl, or .🌀 file, or a directory containing scripts"));
     }
     files.sort();
     if files.is_empty() {
@@ -245,7 +248,7 @@ fn discover_supported_files(path: &Path) -> Result<Vec<PathBuf>, ShellError> {
             ErrorCode::InvalidArgument,
             format!("no supported scripts found under {}", path.display()),
         )
-        .with_help("Add a .lua or .quirl file, or pass a different path"));
+        .with_help("Add a .lua, .qrl, .quirl, or .🌀 file, or pass a different path"));
     }
     Ok(files)
 }
@@ -288,9 +291,13 @@ fn path_error(path: &Path, error: io::Error) -> ShellError {
 fn script_language_for_path(path: &Path) -> Option<ScriptLanguage> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("lua") => Some(ScriptLanguage::Lua),
-        Some("quirl") => Some(ScriptLanguage::Quirl),
+        Some(extension) if is_quirl_extension(extension) => Some(ScriptLanguage::Quirl),
         _ => None,
     }
+}
+
+fn is_quirl_extension(extension: &str) -> bool {
+    extension == QUIRL_CANONICAL_EXTENSION || QUIRL_EXTENSION_ALIASES.contains(&extension)
 }
 
 fn check_script_file(path: &Path) -> Result<(), ShellError> {
@@ -466,7 +473,8 @@ pub fn run_source_with_cancellation(
     let language = detect_language(source, path, requested_language)?;
     match language {
         ScriptLanguage::Lua => {
-            let runtime = LuaRuntime::new(LuaPolicy::script())?;
+            let runtime =
+                LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
             let value = runtime.run_source(source, source_name, arguments)?;
             let status = structured_status(&value)?;
             Ok(ScriptRunOutput { status, value })
@@ -517,7 +525,7 @@ pub fn detect_language(
     {
         return match extension {
             "lua" => Ok(ScriptLanguage::Lua),
-            "quirl" => Ok(ScriptLanguage::Quirl),
+            extension if is_quirl_extension(extension) => Ok(ScriptLanguage::Quirl),
             "sh" | "bash" => Ok(ScriptLanguage::Bash),
             "zsh" => Ok(ScriptLanguage::Zsh),
             _ => Err(unsupported_language_error(Some(extension))),
@@ -591,7 +599,7 @@ fn unsupported_language_error(extension: Option<&str>) -> ShellError {
     )
     .with_context(context)
     .with_help(
-        "Use a .lua/.quirl/.sh/.bash/.zsh file, a recognized shebang, or pass `--lang lua|quirl|bash|zsh`",
+        "Use a .lua, .qrl, .quirl, .🌀, .sh, .bash, or .zsh file, a recognized shebang, or pass `--lang lua|quirl|bash|zsh`",
     )
 }
 
@@ -1006,6 +1014,17 @@ mod tests {
     }
 
     #[test]
+    fn native_quirl_extensions_select_the_same_language() {
+        for path in ["script.qrl", "script.quirl", "script.🌀"] {
+            assert_eq!(
+                detect_language("pwd", Some(Path::new(path)), None).unwrap(),
+                ScriptLanguage::Quirl,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
     fn reference_runners_preserve_arguments_cwd_environment_status_and_captures() {
         for (language, executable) in [(ScriptLanguage::Bash, "bash"), (ScriptLanguage::Zsh, "zsh")]
         {
@@ -1163,8 +1182,8 @@ mod tests {
     fn quirl_script_stops_at_a_failed_command() {
         let output = run_source(
             "false\nprintf should-not-run",
-            "failure.quirl",
-            Some(Path::new("failure.quirl")),
+            "failure.qrl",
+            Some(Path::new("failure.qrl")),
             None,
             &[],
         )
@@ -1177,8 +1196,8 @@ mod tests {
     fn quirl_script_executes_data_statements_separated_by_tabs() {
         let output = run_source(
             "data\t[1, 2, 3] | length",
-            "tabbed-data.quirl",
-            Some(Path::new("tabbed-data.quirl")),
+            "tabbed-data.qrl",
+            Some(Path::new("tabbed-data.qrl")),
             None,
             &[],
         )
@@ -1188,16 +1207,18 @@ mod tests {
     }
 
     #[test]
-    fn recursive_discovery_is_sorted_and_skips_git_target_and_symlink_directories() {
-        let root = test_directory("discover");
+    fn recursive_discovery_accepts_native_aliases_on_unicode_paths() {
+        let root = test_directory("discover-über-🌀");
         fs::create_dir_all(root.join("nested")).unwrap();
         fs::create_dir_all(root.join("target")).unwrap();
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join("z.lua"), "return 1").unwrap();
-        fs::write(root.join("a.quirl"), "pwd").unwrap();
+        fs::write(root.join("a.qrl"), "pwd").unwrap();
+        fs::write(root.join("readable.quirl"), "pwd").unwrap();
+        fs::write(root.join("novelty.🌀"), "pwd").unwrap();
         fs::write(root.join("nested/m.lua"), "return 2").unwrap();
         fs::write(root.join("target/ignored.lua"), "invalid(").unwrap();
-        fs::write(root.join(".git/ignored.quirl"), "echo ignored").unwrap();
+        fs::write(root.join(".git/ignored.qrl"), "echo ignored").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("nested"), root.join("linked")).unwrap();
 
@@ -1209,8 +1230,10 @@ mod tests {
         assert_eq!(
             relative,
             vec![
-                PathBuf::from("a.quirl"),
+                PathBuf::from("a.qrl"),
                 PathBuf::from("nested/m.lua"),
+                PathBuf::from("novelty.🌀"),
+                PathBuf::from("readable.quirl"),
                 PathBuf::from("z.lua")
             ]
         );
@@ -1226,7 +1249,7 @@ mod tests {
             "---@parm value string\nreturn value\n",
         )
         .unwrap();
-        fs::write(root.join("bad.quirl"), "printf ok |\n").unwrap();
+        fs::write(root.join("bad.qrl"), "printf ok |\n").unwrap();
 
         let report = analysis_report(&root, "check").unwrap();
         assert!(!report.valid);
@@ -1250,7 +1273,7 @@ mod tests {
             "return { test_ok = function() assert(true) end }\n",
         )
         .unwrap();
-        let quirl = root.join("workflow.quirl");
+        let quirl = root.join("workflow.qrl");
         let quirl_source = "printf preserved  \n";
         fs::write(&quirl, quirl_source).unwrap();
 

@@ -4,8 +4,23 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::UNIX_EPOCH,
+    sync::{atomic::AtomicBool, Arc},
+    time::{Duration, UNIX_EPOCH},
 };
+
+/// Bounded process request issued by a sandboxed host such as the Lua runtime.
+/// The composition root supplies the implementation, keeping platform process
+/// code out of the extension runtime's dependency graph.
+#[derive(Clone)]
+pub struct ProcessRequest {
+    pub command: String,
+    pub deadline: Duration,
+    pub cancelled: Arc<AtomicBool>,
+    pub max_output_bytes: usize,
+}
+
+pub type ProcessHost =
+    Arc<dyn Fn(ProcessRequest) -> Result<CommandOutcome, ShellError> + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandOutcome {

@@ -5,9 +5,10 @@ use mlua::{
     VmState,
 };
 use quirl_core::{
-    reject_json_terminal_controls, validate_contribution_set, CommandRunner, ContributionKind,
+    reject_json_terminal_controls, validate_contribution_set, ContributionKind,
     ContributionRegistration, ErrorCode, EventKind, EventSubscription, ExtensionAction,
-    ExtensionCapability, ExtensionEvent, ExtensionEventData, ShellError,
+    ExtensionCapability, ExtensionEvent, ExtensionEventData, ProcessHost, ProcessRequest,
+    ShellError,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
@@ -27,6 +28,7 @@ const RESOURCE_LIMIT_SENTINEL: &str = "quirl resource limit exceeded";
 const DEFAULT_PROMPT_DEADLINE_MS: u64 = 8;
 const MAX_CALLBACK_DEADLINE_MS: u64 = 100;
 const COMPLETION_CALLBACK_DEADLINE: Duration = Duration::from_millis(50);
+const MAX_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const CONFIG_OLDEST_READABLE_VERSION: u32 = 0;
 pub const MAX_LUA_SOURCE_BYTES: usize = 4 * 1024 * 1024;
@@ -405,25 +407,36 @@ pub struct LuaRuntime {
 
 impl LuaRuntime {
     pub fn new(policy: LuaPolicy) -> Result<Self, ShellError> {
-        let mut capabilities = vec![
-            "commands.register".to_owned(),
-            "completion.register".to_owned(),
-            "events.observe".to_owned(),
-            "extension.contribute".to_owned(),
-            "catalog.register".to_owned(),
-            "ui.panel".to_owned(),
-            "prompt.register".to_owned(),
-        ];
-        if policy.allow_process {
-            capabilities.push("process.spawn".to_owned());
-        }
-        Self::new_with_capabilities(policy, &capabilities)
+        Self::new_with_capabilities(policy, &default_capabilities(policy))
+    }
+
+    /// Construct a runtime using the standard grants plus a composed process
+    /// backend.  This is intended for the CLI composition root.
+    pub fn new_with_process_host(
+        policy: LuaPolicy,
+        process_host: ProcessHost,
+    ) -> Result<Self, ShellError> {
+        Self::new_with_capabilities_and_process_host(
+            policy,
+            &default_capabilities(policy),
+            Some(process_host),
+        )
     }
 
     /// Construct a runtime whose host handles are limited to explicit grants.
     pub fn new_with_capabilities(
         policy: LuaPolicy,
         granted_capabilities: &[String],
+    ) -> Result<Self, ShellError> {
+        Self::new_with_capabilities_and_process_host(policy, granted_capabilities, None)
+    }
+
+    /// Construct a runtime with an explicitly composed, bounded process host.
+    /// Runtimes without this host fail closed when Lua asks to spawn a process.
+    pub fn new_with_capabilities_and_process_host(
+        policy: LuaPolicy,
+        granted_capabilities: &[String],
+        process_host: Option<ProcessHost>,
     ) -> Result<Self, ShellError> {
         let libraries = StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8;
         let lua = Lua::new_with(libraries, LuaOptions::default())
@@ -444,6 +457,8 @@ impl LuaRuntime {
             &lua,
             policy,
             granted_capabilities.iter().cloned().collect(),
+            process_host,
+            Arc::clone(&cancelled),
             Arc::clone(&registrations),
             Arc::clone(&callbacks),
         )
@@ -461,7 +476,25 @@ impl LuaRuntime {
             last_event_sequence,
         })
     }
+}
 
+fn default_capabilities(policy: LuaPolicy) -> Vec<String> {
+    let mut capabilities = vec![
+        "commands.register".to_owned(),
+        "completion.register".to_owned(),
+        "events.observe".to_owned(),
+        "extension.contribute".to_owned(),
+        "catalog.register".to_owned(),
+        "ui.panel".to_owned(),
+        "prompt.register".to_owned(),
+    ];
+    if policy.allow_process {
+        capabilities.push("process.spawn".to_owned());
+    }
+    capabilities
+}
+
+impl LuaRuntime {
     pub fn eval(&self, source: &str) -> Result<serde_json::Value, ShellError> {
         validate_source_length(source, Path::new("eval"))?;
         self.reset_budget();
@@ -1398,6 +1431,8 @@ fn install_host_api(
     lua: &Lua,
     policy: LuaPolicy,
     granted_capabilities: HashSet<String>,
+    process_host: Option<ProcessHost>,
+    cancelled: Arc<AtomicBool>,
     registrations: Arc<Mutex<PluginRegistrations>>,
     callbacks: Arc<Mutex<PluginCallbacks>>,
 ) -> mlua::Result<()> {
@@ -1415,6 +1450,7 @@ fn install_host_api(
 
     let process = lua.create_table()?;
     let process_grants = granted_capabilities.clone();
+    let process_cancelled = Arc::clone(&cancelled);
     process.set(
         "run",
         lua.create_function(move |lua, command: String| {
@@ -1423,9 +1459,26 @@ fn install_host_api(
                     "capability denied: process.spawn".to_owned(),
                 ));
             }
-            let outcome = CommandRunner::default()
-                .execute_capture(&command)
-                .map_err(mlua::Error::external)?;
+            let Some(process_host) = process_host.as_ref() else {
+                return Err(mlua::Error::RuntimeError(
+                    "process host is unavailable; run Lua through the Quirl CLI or configure a process host"
+                        .to_owned(),
+                ));
+            };
+            let outcome = process_host(ProcessRequest {
+                command,
+                deadline: policy.wall_time,
+                cancelled: Arc::clone(&process_cancelled),
+                max_output_bytes: MAX_PROCESS_OUTPUT_BYTES,
+            })
+            .map_err(|error| {
+                let prefix = if error.code == ErrorCode::ResourceLimit {
+                    format!("{RESOURCE_LIMIT_SENTINEL}: ")
+                } else {
+                    String::new()
+                };
+                mlua::Error::RuntimeError(format!("{prefix}{error}"))
+            })?;
             let result = lua.create_table()?;
             result.set("ok", outcome.status == 0)?;
             result.set("status", outcome.status)?;
@@ -2193,6 +2246,7 @@ fn validation_error(source: &str, message: impl Into<String>) -> ShellError {
     )
     .with_context(message)
     .with_label(Some(source.to_owned()), 0, 0, "schema mismatch")
+    .with_help("Check the documented Lua SDK shape and remove unknown fields or invalid values")
 }
 
 #[cfg(test)]
@@ -2313,13 +2367,34 @@ mod tests {
     }
 
     #[test]
+    fn process_capability_fails_closed_without_a_composed_host() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        let error = runtime
+            .eval("return quirl.process.run('printf nope')")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Lua);
+        assert!(error.details.context[0].contains("process host is unavailable"));
+        assert!(!error.details.help.is_empty());
+    }
+
+    #[test]
     fn scoped_process_grant_cannot_smuggle_shell_operators() {
-        let runtime = LuaRuntime::new_with_capabilities(
+        let process_host: ProcessHost = Arc::new(|request| {
+            assert_eq!(request.deadline, Duration::from_millis(100));
+            assert_eq!(request.max_output_bytes, MAX_PROCESS_OUTPUT_BYTES);
+            Ok(quirl_core::CommandOutcome {
+                status: 0,
+                stdout: Some(request.command),
+                stderr: Some(String::new()),
+            })
+        });
+        let runtime = LuaRuntime::new_with_capabilities_and_process_host(
             LuaPolicy {
                 allow_process: true,
                 ..LuaPolicy::config()
             },
             &["process.spawn:printf".to_owned()],
+            Some(process_host),
         )
         .unwrap();
         let allowed = runtime
@@ -2338,6 +2413,31 @@ mod tests {
             .eval("return quirl.process.run('printf\\tsmuggled')")
             .unwrap_err();
         assert!(tab.details.context[0].contains("capability denied"));
+    }
+
+    #[test]
+    fn process_host_receives_lua_cancellation() {
+        let process_host: ProcessHost = Arc::new(|request| {
+            while !request.cancelled.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(
+                ShellError::new(ErrorCode::ResourceLimit, "process execution was cancelled")
+                    .with_help("Use a shorter-running command"),
+            )
+        });
+        let runtime = LuaRuntime::new_with_process_host(LuaPolicy::script(), process_host).unwrap();
+        let cancellation = runtime.cancellation_token();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            cancellation.cancel();
+        });
+        let error = runtime
+            .eval("return quirl.process.run('long-running-command')")
+            .unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("process execution was cancelled"));
     }
 
     #[test]

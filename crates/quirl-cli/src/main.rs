@@ -31,7 +31,7 @@ use quirl_data::DataRuntime;
 use quirl_lua::{
     sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig, MAX_LUA_SOURCE_BYTES,
 };
-use quirl_process::{JobStatus, NativeExecutor};
+use quirl_process::{sandboxed_process_host, JobStatus, NativeExecutor};
 use quirl_syntax::{classify, InteractiveLine, Mode};
 use quirl_ui::{
     editor_with_extensions_config_and_history, history_path, render_error, PromptContextScheduler,
@@ -76,7 +76,7 @@ enum Command {
     Eval { expression: String },
     /// Evaluate a native structured-data expression or pipeline.
     Data { expression: String },
-    /// Validate a Lua/.quirl file or directory without executing source.
+    /// Validate Lua or native Quirl (.qrl, .quirl, .🌀) scripts without executing source.
     Check {
         /// Script file or recursively discovered directory.
         #[arg(value_name = "PATH")]
@@ -86,13 +86,13 @@ enum Command {
     },
     /// Deterministically format Lua files under a file or directory path.
     Fmt {
-        /// Lua/.quirl file or recursively discovered directory; .quirl is unchanged.
+        /// Lua or native Quirl script/directory; native source is unchanged.
         #[arg(value_name = "PATH")]
         file: PathBuf,
         #[arg(long)]
         check: bool,
     },
-    /// Lint Lua/.quirl files under a file or directory without execution.
+    /// Lint Lua or native Quirl (.qrl, .quirl, .🌀) scripts without execution.
     Lint {
         /// Script file or recursively discovered directory.
         #[arg(value_name = "PATH")]
@@ -146,7 +146,7 @@ enum Command {
         #[command(flatten)]
         command: DocCommand,
     },
-    /// Serve deterministic Lua and .quirl editor intelligence over stdio LSP.
+    /// Serve deterministic Lua and native Quirl (.qrl, .quirl, .🌀) intelligence over stdio LSP.
     Lsp,
     /// Build and inspect the attributed completion index.
     Index {
@@ -249,7 +249,8 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             Ok(output.status)
         }
         Some(Command::Eval { expression }) => {
-            let lua = LuaRuntime::new(LuaPolicy::script())?;
+            let lua =
+                LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
             print_json_value(lua.eval(&expression)?);
             Ok(0)
         }
@@ -1094,7 +1095,10 @@ fn eval_lua(
     source: &str,
 ) -> Result<serde_json::Value, ShellError> {
     if runtime.is_none() {
-        *runtime = Some(LuaRuntime::new(LuaPolicy::script())?);
+        *runtime = Some(LuaRuntime::new_with_process_host(
+            LuaPolicy::script(),
+            sandboxed_process_host(),
+        )?);
     }
     let runtime = runtime.as_ref().ok_or_else(|| {
         ShellError::new(ErrorCode::Lua, "could not initialize the Lua runtime")
@@ -1131,7 +1135,7 @@ fn run_stdin() -> Result<i32, ShellError> {
         .with_context(error.to_string())
         .with_help("Encode Lua source as UTF-8")
     })?;
-    let lua = LuaRuntime::new(LuaPolicy::script())?;
+    let lua = LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
     print_json_value(lua.eval(&source)?);
     Ok(0)
 }
