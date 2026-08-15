@@ -23,6 +23,7 @@ pub(crate) struct NewCommand {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum NewLanguage {
     Lua,
+    Quirl,
 }
 
 #[derive(Debug, Args)]
@@ -57,6 +58,7 @@ pub(crate) fn create(command: NewCommand) -> Result<i32, ShellError> {
     validate_script_name(&command.name)?;
     let extension = match command.lang {
         NewLanguage::Lua => "lua",
+        NewLanguage::Quirl => "qrl",
     };
     let path = command
         .directory
@@ -69,7 +71,10 @@ pub(crate) fn create(command: NewCommand) -> Result<i32, ShellError> {
         .with_help("Choose a new script name or move the existing file first"));
     }
     fs::create_dir_all(&command.directory).map_err(|error| io_error("create", &path, error))?;
-    let source = lua_script_template(&command.name);
+    let source = match command.lang {
+        NewLanguage::Lua => lua_script_template(&command.name),
+        NewLanguage::Quirl => quirl_script_template(&command.name),
+    };
     write_new_file(&path, source.as_bytes())?;
     println!(
         "created {}",
@@ -135,6 +140,10 @@ fn lua_script_template(name: &str) -> String {
     format!(
         "---@module {name}\n---@param ctx table\n---@return table result\nlocal function main(ctx)\n  return {{ script = \"{name}\", arguments = ctx.args }}\nend\n\nreturn {{ main = main }}\n"
     )
+}
+
+fn quirl_script_template(name: &str) -> String {
+    format!("# Native Quirl script: {name}\ndata [\"{name}\"] | length\n")
 }
 
 fn render_catalog(catalog: &Catalog, format: DocumentationFormat) -> Result<String, ShellError> {
@@ -391,29 +400,49 @@ mod tests {
     }
 
     #[test]
-    fn new_script_creates_checks_and_runs_with_arguments_before_refusing_overwrite() {
+    fn new_lua_script_creates_checks_and_runs_with_arguments_before_refusing_overwrite() {
         let directory = temporary_directory("new");
         let command = NewCommand {
-            name: "automation".to_owned(),
+            name: "script".to_owned(),
             lang: NewLanguage::Lua,
             directory: directory.clone(),
         };
         create(command).unwrap();
-        let path = directory.join("automation.lua");
+        let path = directory.join("script.lua");
         let source = fs::read_to_string(&path).unwrap();
-        assert!(source.contains("---@module automation"));
+        assert!(source.contains("---@module script"));
         assert!(source.contains("return { main = main }"));
         quirl_lua::LuaRuntime::check_file(&path).unwrap();
         let output = crate::script::run(&path, None, &["staging".to_owned()]).unwrap();
         assert_eq!(output.status, 0);
-        assert_eq!(output.value["script"], "automation");
+        assert_eq!(output.value["script"], "script");
         assert_eq!(output.value["arguments"], serde_json::json!(["staging"]));
         let duplicate = create(NewCommand {
-            name: "automation".to_owned(),
+            name: "script".to_owned(),
             lang: NewLanguage::Lua,
             directory: directory.clone(),
         });
         assert!(duplicate.is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn new_quirl_script_uses_the_canonical_qrl_extension() {
+        let directory = temporary_directory("native-script");
+        create(NewCommand {
+            name: "script".to_owned(),
+            lang: NewLanguage::Quirl,
+            directory: directory.clone(),
+        })
+        .unwrap();
+        let path = directory.join("script.qrl");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# Native Quirl script: script\ndata [\"script\"] | length\n"
+        );
+        let output = crate::script::run(&path, None, &[]).unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.value, serde_json::json!(1));
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -43,9 +43,10 @@ this keeps `quirl-contract` independent of `quirl-lua` and prevents a reverse
 edge into the runtime.
 
 `quirl-lsp` owns deterministic protocol framing and state, generated metadata
-projections, and structural `.quirl` diagnostics. It may call the public
+projections, and structural native Quirl diagnostics (`.qrl` canonical, with
+`.quirl` and `.🌀` accepted aliases). It may call the public
 `LuaRuntime::check_source` path, which parses and validates without evaluating
-document text, and reuses `quirl-syntax` for the same structural `.quirl`
+document text, and reuses `quirl-syntax` for the same structural native Quirl
 diagnostics as the CLI. It does not depend on `quirl-ui`, `quirl-cli`,
 `quirl-process`, or `quirl-data`.
 

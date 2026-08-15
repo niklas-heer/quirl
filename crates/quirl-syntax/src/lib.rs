@@ -218,7 +218,10 @@ pub fn data_statement_expression(line: &str) -> Option<&str> {
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim_start())
 }
 
-/// Validate a line-oriented `.quirl` script without executing it.
+/// Validate a line-oriented native Quirl script without executing it.
+///
+/// `.qrl` is the canonical extension; `.quirl` and `.🌀` are accepted aliases
+/// at the CLI and language-service boundaries.
 ///
 /// Command statements use the same compatibility parser as interactive execution. `data`
 /// statements are recognized as a separate language island and require a non-empty expression.

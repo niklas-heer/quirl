@@ -74,7 +74,8 @@ as smart as your editor.
 - **Generated everything** — LuaLS-compatible stubs, Markdown docs, and
   versioned JSON metadata are generated from the same Rust host definitions that power the
   runtime, so the SDK, editor completions, and AI context never drift apart.
-- **Built-in language service** — `quirl lsp` gives Lua and `.quirl` files
+- **Built-in language service** — `quirl lsp` gives Lua and native Quirl (`.qrl`,
+  with `.quirl` and `.🌀` input aliases) files
   deterministic diagnostics, completion, hover, signatures, and generated
   module docs over stdio without evaluating the document.
 - **Explicit agent and package contracts** — versioned deny-unknown JSON,
@@ -181,7 +182,7 @@ runtime dependencies have been removed.
 - [x] Durable, searchable command history with the shared typed Ctrl-R picker.
 - [x] A shared typed picker spanning history, files, palette actions, jobs, and data.
 - [x] Named end-to-end PTY performance measurements with misses recorded.
-- [x] Deterministic Lua/`.quirl` run, format, check, lint, test, documentation,
+- [x] Deterministic Lua/native-Quirl (`.qrl`) run, format, check, lint, test, documentation,
   language-service, package, and agent-contract tooling.
 - [x] Permission-locked trusted-Lua plugins, typed events/actions, catalog,
   completion and panel contributions, and validated isolated-runtime boundaries.
@@ -230,7 +231,8 @@ shortcuts and textual mode commands remain usable without color.
 
 ```console
 cargo run -p quirl-cli -- run examples/hello.lua Codex
-cargo run -p quirl-cli -- new automation --lang lua
+cargo run -p quirl-cli -- new script
+cargo run -p quirl-cli -- new script --lang quirl
 cargo run -p quirl-cli -- check . --format json
 cargo run -p quirl-cli -- fmt . --check
 cargo run -p quirl-cli -- test
@@ -273,9 +275,10 @@ flag on `index build`, use `quirl index build -h` for that subcommand's usage.
 
 `quirl lsp` speaks standard LSP `Content-Length` framing over stdin/stdout.
 Lua editor intelligence is generated from the same `HOST_API` as the runtime;
-`.quirl` command intelligence is generated from the loaded semantic catalog.
+Native Quirl command intelligence is generated from the loaded semantic catalog.
+`.qrl` is the canonical extension; `.quirl` and `.🌀` are accepted input aliases.
 The server compiles and lints Lua but never invokes the compiled chunk or
-executes `.quirl` commands. See the [language-service protocol and editor
+executes native Quirl commands. See the [language-service protocol and editor
 contract](docs/language-service.md).
 
 The main benchmark accepts an official Fennel single-file library with

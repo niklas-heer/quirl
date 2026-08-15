@@ -1,4 +1,5 @@
-//! Deterministic, non-executing language services for Lua and `.quirl` files.
+//! Deterministic, non-executing language services for Lua and native Quirl files.
+//! `.qrl` is canonical; `.quirl` and `.🌀` are accepted aliases.
 //!
 //! The server deliberately consumes the same generated host API and command
 //! catalog as the CLI. It speaks the LSP JSON-RPC subset over standard
@@ -783,9 +784,9 @@ mod tests {
     }
 
     #[test]
-    fn quirl_documents_use_catalog_completion_and_structural_diagnostics() {
+    fn canonical_qrl_documents_use_catalog_completion_and_structural_diagnostics() {
         let mut service = LanguageService::default();
-        let messages = open(&mut service, "file:///flow.quirl", "quirl", "quirl che |");
+        let messages = open(&mut service, "file:///flow.qrl", "quirl", "quirl che |");
         assert_eq!(
             messages[0]["params"]["diagnostics"][0]["source"],
             "quirl-syntax"
@@ -795,7 +796,7 @@ mod tests {
             1,
             "textDocument/completion",
             json!({
-                "textDocument": {"uri": "file:///flow.quirl"},
+                "textDocument": {"uri": "file:///flow.qrl"},
                 "position": {"line": 0, "character": 9}
             }),
         );
@@ -804,6 +805,29 @@ mod tests {
             .unwrap()
             .iter()
             .any(|item| item["label"] == "quirl check"));
+    }
+
+    #[test]
+    fn native_alias_documents_use_quirl_language_services() {
+        for uri in ["file:///flow.quirl", "file:///flow.%F0%9F%8C%80"] {
+            let mut service = LanguageService::default();
+            let messages = open(&mut service, uri, "quirl", "quirl che |");
+            assert_eq!(
+                messages[0]["params"]["diagnostics"][0]["source"],
+                "quirl-syntax"
+            );
+            let completion = request(
+                &mut service,
+                1,
+                "textDocument/completion",
+                json!({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 9}}),
+            );
+            assert!(completion["result"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["label"] == "quirl check"));
+        }
     }
 
     #[test]
