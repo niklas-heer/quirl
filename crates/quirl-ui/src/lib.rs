@@ -118,8 +118,10 @@ impl EditMode for QuirlHelix {
         ) {
             return completion_menu_event();
         }
-        let event = ReedlineRawEvent::try_from(event)
-            .expect("Reedline already normalized this terminal event");
+        let Ok(event) = ReedlineRawEvent::try_from(event) else {
+            // Reedline intentionally rejects key-release events; they have no editor action.
+            return ReedlineEvent::None;
+        };
         self.inner.parse_event(event)
     }
 

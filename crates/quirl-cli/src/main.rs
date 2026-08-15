@@ -394,10 +394,11 @@ fn eval_lua(
     if runtime.is_none() {
         *runtime = Some(LuaRuntime::new(LuaPolicy::script())?);
     }
-    runtime
-        .as_ref()
-        .expect("Lua runtime initialized")
-        .eval(source)
+    let runtime = runtime.as_ref().ok_or_else(|| {
+        ShellError::new(ErrorCode::Lua, "could not initialize the Lua runtime")
+            .with_help("Run the command again; if this persists, report the configuration used.")
+    })?;
+    runtime.eval(source)
 }
 
 fn run_stdin() -> Result<i32, ShellError> {
@@ -480,13 +481,16 @@ fn require_lua_file(path: &Path) -> Result<(), ShellError> {
 }
 
 fn print_help(catalog: &Catalog, topic: Option<&str>) {
-    match topic.and_then(|topic| catalog.find(topic)) {
-        Some(command) => print_command_help(command),
-        None if topic.is_some() => println!(
-            "No exact catalog entry for `{}`. Press Tab to explore related commands.",
-            topic.unwrap()
-        ),
-        None => print_catalog(catalog),
+    if let Some(topic) = topic {
+        if let Some(command) = catalog.find(topic) {
+            print_command_help(command);
+        } else {
+            println!(
+                "No exact catalog entry for `{topic}`. Press Tab to explore related commands."
+            );
+        }
+    } else {
+        print_catalog(catalog);
     }
 }
 

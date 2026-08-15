@@ -360,6 +360,10 @@ impl LuaRuntime {
         Ok(config)
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a poisoned plugin registry mutex may contain inconsistent registrations after a host callback panic"
+    )]
     pub fn load_plugin_file(&self, path: &Path) -> Result<PluginRegistrations, ShellError> {
         let source = read_source(path)?;
         lint_source(&source, path)?;
@@ -396,6 +400,10 @@ impl LuaRuntime {
         Ok(registrations)
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a poisoned plugin registry mutex may contain inconsistent registrations after a host callback panic"
+    )]
     pub fn registrations(&self) -> PluginRegistrations {
         self.registrations
             .lock()
@@ -403,6 +411,10 @@ impl LuaRuntime {
             .clone()
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
+    )]
     pub fn render_prompt_segment(
         &self,
         name: &str,
@@ -430,6 +442,10 @@ impl LuaRuntime {
             .map_err(|error| lua_error(error, None, 0))
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
+    )]
     pub fn complete_with_provider(
         &self,
         command: &str,
@@ -563,6 +579,10 @@ impl LuaRuntime {
             .map_err(|error| lua_error(error, path, source_len))
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "a poisoned Lua budget mutex may contain an inconsistent budget after a host callback panic"
+    )]
     fn reset_budget(&self) {
         let mut budget = self.budget.lock().expect("Lua budget mutex poisoned");
         budget.remaining_instructions = self.policy.instruction_limit;

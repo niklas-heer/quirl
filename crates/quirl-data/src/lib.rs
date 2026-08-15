@@ -318,7 +318,12 @@ fn predicate_tokens(expression: &str, stage: &str) -> Result<Vec<PredicateToken>
         }
 
         if matches!(character, '=' | '!' | '<' | '>') {
-            let (_, first) = characters.next().expect("peeked character is present");
+            let Some((_, first)) = characters.next() else {
+                return Err(data_error(
+                    stage,
+                    "predicate operator is missing its first character",
+                ));
+            };
             let mut text = first.to_string();
             if characters.peek().is_some_and(|(_, next)| *next == '=') {
                 text.push('=');
@@ -456,8 +461,14 @@ fn sort_rows(value: Value, words: &[String], stage: &str) -> Result<Value, Shell
         if comparison_error.is_some() {
             return Ordering::Equal;
         }
-        let left = get_path(left, &words[1]).expect("sort fields were validated");
-        let right = get_path(right, &words[1]).expect("sort fields were validated");
+        let (Some(left), Some(right)) = (get_path(left, &words[1]), get_path(right, &words[1]))
+        else {
+            comparison_error = Some(data_error(
+                stage,
+                format!("row has no field `{}`", words[1]),
+            ));
+            return Ordering::Equal;
+        };
         match compare_values(left, right, stage) {
             Ok(ordering) if descending => ordering.reverse(),
             Ok(ordering) => ordering,

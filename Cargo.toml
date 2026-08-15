@@ -28,7 +28,10 @@ rhai = "1.25.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 shlex = "1.3"
-thiserror = "2"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
 
 [profile.release]
 lto = "thin"

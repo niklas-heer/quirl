@@ -25,9 +25,8 @@ All fallible cross-crate paths return `Result<T, quirl_core::ShellError>`.
 `ShellError` carries an `ErrorCode`, message, labels, context, and help, and
 derives `Serialize` so `--format json` works for free.
 
-- Do not introduce `anyhow`, new error enums, or `thiserror` derives.
-  (`thiserror` is declared in the workspace but intentionally unused — errors
-  are hand-built for serialization control.)
+- Do not introduce `anyhow`, new error enums, or `thiserror` derives. Errors are
+  hand-built for serialization control.
 - Map new failure domains onto an existing `ErrorCode`, or extend the enum in
   `crates/quirl-core/src/error.rs` if genuinely new.
 - Every error must render well both as JSON and through
