@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quirl — Embedded Language Decision 1.0</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #090c0c;
+      --panel: #111717;
+      --panel-2: #151d1c;
+      --line: #2a3734;
+      --text: #ecf4ef;
+      --muted: #9dafaa;
+      --lime: #bdf55b;
+      --mint: #62e6be;
+      --cyan: #64cfe8;
+      --amber: #f2be63;
+      --red: #ff867d;
+      --max: 1240px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 78% -10%, rgba(98, 230, 190, .13), transparent 32rem),
+        radial-gradient(circle at 18% 18%, rgba(189, 245, 91, .07), transparent 24rem),
+        var(--bg);
+      color: var(--text);
+      font: 15px/1.6 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--mint); text-underline-offset: 3px; }
+    code { font: .92em/1.4 "SFMono-Regular", Consolas, monospace; }
+    .shell { display: grid; grid-template-columns: 230px minmax(0, 1fr); min-height: 100vh; }
+    aside {
+      position: sticky; top: 0; height: 100vh; padding: 28px 22px;
+      border-right: 1px solid var(--line); background: rgba(9, 12, 12, .88); backdrop-filter: blur(18px);
+    }
+    .brand { display: flex; align-items: center; gap: 11px; margin-bottom: 36px; font-weight: 760; font-size: 18px; }
+    .mark { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid #47554f; border-radius: 9px; color: var(--lime); background: #111817; font: 800 16px monospace; }
+    .meta { color: var(--muted); font: 10px/1.6 monospace; letter-spacing: .12em; text-transform: uppercase; }
+    nav { display: grid; gap: 4px; margin-top: 24px; }
+    nav a { padding: 7px 10px; border-left: 2px solid transparent; color: var(--muted); text-decoration: none; font-size: 13px; }
+    nav a:hover { color: var(--text); border-color: var(--lime); background: rgba(189,245,91,.05); }
+    main { width: min(100%, var(--max)); padding: 64px clamp(28px, 6vw, 84px) 100px; }
+    section { margin: 0 0 92px; scroll-margin-top: 30px; }
+    .eyebrow { margin: 0 0 12px; color: var(--lime); font: 700 11px/1.4 monospace; letter-spacing: .13em; text-transform: uppercase; }
+    h1 { max-width: 930px; margin: 0; font-size: clamp(45px, 7vw, 82px); line-height: .98; letter-spacing: -.055em; }
+    h2 { margin: 0 0 14px; font-size: clamp(28px, 4vw, 46px); line-height: 1.05; letter-spacing: -.035em; }
+    h3 { margin: 0 0 8px; font-size: 18px; line-height: 1.25; }
+    p { margin: 0 0 14px; }
+    .lede { max-width: 870px; margin-top: 26px; color: #bed0ca; font-size: 19px; }
+    .status { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .tag { padding: 5px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font: 11px monospace; }
+    .tag.primary { color: #07100d; background: var(--lime); border-color: var(--lime); font-weight: 800; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .card, .callout, .architecture, .score-panel {
+      border: 1px solid var(--line); border-radius: 16px; background: linear-gradient(145deg, rgba(21,29,28,.94), rgba(14,20,19,.94));
+    }
+    .card { padding: 22px; }
+    .card .rank { display: inline-block; margin-bottom: 16px; color: var(--lime); font: 700 10px monospace; letter-spacing: .12em; }
+    .card p { color: var(--muted); }
+    .card.winner { border-color: rgba(189,245,91,.58); box-shadow: inset 0 1px 0 rgba(189,245,91,.12); }
+    .callout { padding: 22px 24px; margin: 22px 0; border-left: 4px solid var(--mint); }
+    .callout.warn { border-left-color: var(--amber); }
+    .callout strong { display: block; margin-bottom: 7px; font-size: 17px; }
+    .callout p { margin: 0; color: #bacbc6; }
+    .architecture { padding: 20px; }
+    .architecture header { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 17px; }
+    .complexity { color: var(--muted); font: 11px monospace; text-transform: uppercase; }
+    .flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; }
+    .node { min-width: 120px; flex: 1; padding: 13px; border: 1px solid #32413d; border-radius: 10px; background: #0d1212; }
+    .node small { display: block; color: var(--muted); }
+    .arrow { display: grid; place-items: center; color: var(--lime); }
+    .architecture p { margin: 14px 0 0; color: var(--muted); }
+    .stack { display: grid; gap: 13px; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; }
+    table { width: 100%; border-collapse: collapse; min-width: 820px; background: rgba(15,21,20,.82); }
+    th, td { padding: 13px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid #26322f; }
+    th { position: sticky; top: 0; background: #131b1a; color: #bed0ca; font: 700 10px monospace; letter-spacing: .08em; text-transform: uppercase; }
+    tbody tr:last-child td { border-bottom: 0; }
+    td.num { white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .good { color: var(--lime); } .middle { color: var(--amber); } .risk { color: var(--red); }
+    .bar-row { display: grid; grid-template-columns: 130px minmax(180px, 1fr) 86px; align-items: center; gap: 12px; margin: 10px 0; }
+    .track { height: 11px; overflow: hidden; border-radius: 99px; background: #1d2825; }
+    .bar { height: 100%; width: var(--w); border-radius: inherit; background: linear-gradient(90deg, var(--mint), var(--lime)); }
+    .bar-row small { color: var(--muted); text-align: right; font-family: monospace; }
+    .note { color: var(--muted); font-size: 13px; }
+    .score-layout { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 18px; align-items: start; }
+    .score-panel { padding: 20px; }
+    .control { margin-bottom: 18px; }
+    .control label { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 6px; color: #cad8d3; font-size: 13px; }
+    input[type="range"] { width: 100%; accent-color: var(--lime); }
+    .presets { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }
+    button { border: 1px solid #3a4945; border-radius: 9px; background: #111817; color: var(--text); padding: 8px 10px; cursor: pointer; }
+    button:hover, button.active { border-color: var(--lime); color: var(--lime); }
+    .score-total { margin-top: 12px; color: var(--muted); font: 11px monospace; }
+    .score-table td:first-child { font-weight: 760; }
+    .meter { min-width: 140px; }
+    .meter-line { height: 8px; border-radius: 99px; background: #202c29; overflow: hidden; margin-top: 5px; }
+    .meter-fill { height: 100%; background: linear-gradient(90deg, var(--cyan), var(--lime)); }
+    .score { color: var(--lime); font: 750 17px monospace; }
+    .position { max-width: 350px; color: var(--muted); }
+    .two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    ul.clean, ol.clean { margin: 12px 0 0; padding-left: 20px; }
+    ul.clean li, ol.clean li { margin: 8px 0; color: #bdcec8; }
+    .decision { padding: 28px; border: 1px solid rgba(189,245,91,.55); border-radius: 18px; background: linear-gradient(135deg, rgba(189,245,91,.10), rgba(98,230,190,.05)); }
+    .decision h2 { max-width: 800px; }
+    .decision .big { color: var(--lime); font: 800 clamp(40px, 7vw, 74px)/1 monospace; letter-spacing: -.05em; }
+    .sources { columns: 2; column-gap: 36px; padding-left: 20px; }
+    .sources li { break-inside: avoid; margin: 0 0 10px; color: var(--muted); }
+    footer { padding-top: 24px; border-top: 1px solid var(--line); color: var(--muted); font: 11px monospace; }
+    @media (max-width: 900px) {
+      .shell { display: block; }
+      aside { position: static; width: 100%; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      nav { grid-template-columns: repeat(3, minmax(0,1fr)); }
+      main { padding-top: 44px; }
+      .grid, .two, .score-layout { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 560px) {
+      nav { grid-template-columns: repeat(2, minmax(0,1fr)); }
+      main { padding-inline: 18px; }
+      .bar-row { grid-template-columns: 90px minmax(100px, 1fr) 72px; }
+    }
+    @media print {
+      :root { color-scheme: light; --bg:#fff; --panel:#fff; --panel-2:#fff; --line:#ccd5d1; --text:#14201c; --muted:#52635d; }
+      body { background: #fff; } .shell { display: block; } aside { display: none; } main { max-width: none; padding: 24px; }
+      section { break-inside: avoid; margin-bottom: 48px; } .card, .callout, .architecture, .score-panel, table { background: #fff; }
+    }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <aside>
+    <div class="brand"><span class="mark">q&gt;</span> Quirl</div>
+    <div class="meta">Embedded language decision<br>Decision 1.0 · 15 Aug 2026</div>
+    <nav aria-label="Report sections">
+      <a href="#outcome">01 · Outcome</a><a href="#scope">02 · Scope</a>
+      <a href="#architecture">03 · Architecture</a><a href="#footprint">04 · Footprint</a>
+      <a href="#health">05 · Health</a><a href="#score">06 · Score</a>
+      <a href="#audience">07 · Audience</a><a href="#complexity">08 · Complexity</a>
+      <a href="#decision">09 · Decision</a><a href="#method">10 · Method</a>
+    </nav>
+  </aside>
+  <main>
+    <section id="outcome">
+      <p class="eyebrow">Decision report · accepted</p>
+      <h1>Quirl’s extension language is Lua.</h1>
+      <p class="lede">Rust owns Quirl’s shell, executor, built-ins, value model, and performance-critical logic. Lua 5.4 is the deliberately small, recognizable extension language for <strong>configuration, automation, and trusted plugins</strong>. Quirl supplies the missing modern experience with generated annotations, completion, linting, formatting, schema validation, and strict Rust boundary checks.</p>
+      <div class="status"><span class="tag primary">Accepted · Lua 5.4</span><span class="tag">Implementation · Rust</span><span class="tag">One extension ecosystem</span><span class="tag">Apple M2 Pro measurements</span></div>
+      <div class="grid" style="margin-top:28px">
+        <article class="card winner"><span class="rank">01 · ACCEPTED</span><h3>Lua 5.4</h3><p>The smallest measured runtime, a mature Rust bridge, decades of stability, and a language already familiar from terminal tools. Quirl adds the coherent SDK and IDE experience.</p></article>
+        <article class="card"><span class="rank">02 · TECHNICAL ALTERNATIVE</span><h3>Strict Luau</h3><p>Better ahead-of-time analysis, but a less familiar language identity plus a C++ analyzer bridge and VM/analyzer revision coordination that Quirl would have to own.</p></article>
+        <article class="card"><span class="rank">03 · RUST-NATIVE ALTERNATIVE</span><h3>Rhai</h3><p>Excellent host integration and resource controls, but a Quirl user must learn a smaller language with substantially less adjacent configuration and plugin adoption.</p></article>
+      </div>
+    </section>
+
+    <section id="scope">
+      <p class="eyebrow">02 · What changed</p><h2>Rust is the product language. The guest is an extension language.</h2>
+      <div class="two">
+        <article class="callout"><strong>The guest must be good at</strong><p>Readable configuration, small automation scripts, prompt and completion extensions, typed command definitions, plugin hooks, fast reloads, capability-limited host calls, and actionable diagnostics.</p></article>
+        <article class="callout warn"><strong>The guest does not need to own</strong><p>Process execution internals, job control, the parser, rendering, core data structures, performance-critical transforms, or the built-in command catalog. Those stay in Rust.</p></article>
+      </div>
+      <p>This favors a small, deeply integrated runtime over a general application ecosystem. npm or PyPI compatibility is less valuable than predictable embedding, while familiarity still matters because users—not only Quirl maintainers—will author plugins and configuration.</p>
+    </section>
+
+    <section id="architecture">
+      <p class="eyebrow">03 · Complete-system architecture</p><h2>QuickJS is simple. TypeScript-on-QuickJS is not.</h2>
+      <div class="stack">
+        <article class="architecture">
+          <header><h3>Lua · one runtime and one generated Quirl SDK</h3><span class="complexity good">Low–medium</span></header>
+          <div class="flow"><div class="node"><strong>config.lua</strong><small>familiar source</small></div><span class="arrow">→</span><div class="node"><strong>Quirl tooling</strong><small>parse · lint · complete · format</small></div><span class="arrow">→</span><div class="node"><strong>Lua 5.4</strong><small>restricted VM</small></div><span class="arrow">→</span><div class="node"><strong>Rust capabilities</strong><small>schema-checked through mlua</small></div></div>
+          <p>Rust host definitions generate runtime bindings, LuaLS-compatible stubs, completion metadata, docs, and AI schemas. Lua remains dynamic: Quirl promises strong boundary and configuration validation, not sound static typing of arbitrary Lua.</p>
+        </article>
+        <article class="architecture">
+          <header><h3>Rhai · one Rust crate in the shell process</h3><span class="complexity good">Low</span></header>
+          <div class="flow"><div class="node"><strong>config.rhai</strong><small>dynamic source</small></div><span class="arrow">→</span><div class="node"><strong>Rhai Engine</strong><small>parse · AST · execute</small></div><span class="arrow">→</span><div class="node"><strong>Rust modules</strong><small>proc-macro exports</small></div></div>
+          <p>This is the smallest ownership surface and the cleanest Rust API. Syntax checking, formatting, docs, tests, and runtime limits are feasible; static value-type checking is not.</p>
+        </article>
+        <article class="architecture">
+          <header><h3>TypeScript 7 + QuickJS-NG · two toolchains and an artifact boundary</h3><span class="complexity risk">High</span></header>
+          <div class="flow"><div class="node"><strong>config.ts</strong><small>typed source</small></div><span class="arrow">→</span><div class="node"><strong>TS 7 worker</strong><small>Go checker + LSP</small></div><span class="arrow">→</span><div class="node"><strong>JS + source maps</strong><small>emit · cache · invalidate</small></div><span class="arrow">→</span><div class="node"><strong>QuickJS-NG</strong><small>through rquickjs</small></div><span class="arrow">→</span><div class="node"><strong>Rust capabilities</strong><small>quirl.d.ts + runtime glue</small></div></div>
+          <p>TypeScript cannot run directly in a JavaScript VM; its types are erased first. TypeScript 7.0 also does not yet expose a stable programmatic API, so the checker/LSP is necessarily a separate process boundary today. The measured rquickjs crate embeds QuickJS-NG 0.15.1, adding another version relationship.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="footprint">
+      <p class="eyebrow">04 · Measured footprint</p><h2>The runtime is only half the TypeScript cost.</h2>
+      <p class="note">Size-optimized, thin-LTO, stripped release probes on Apple M2 Pro / arm64 macOS. Each runtime initializes and evaluates <code>20 + 22</code> once. Peak RSS includes process and system-library overhead; it is useful comparatively, not as a heap measurement.</p>
+      <div class="table-wrap" style="margin-top:20px">
+        <table>
+          <thead><tr><th>Candidate</th><th>Runtime binary</th><th>Runtime peak RSS</th><th>Checker / compiler addition</th><th>Complete-system reading</th></tr></thead>
+          <tbody>
+            <tr><td>Lua 5.4</td><td class="num">0.58 MiB</td><td class="num">1.41 MiB</td><td>None</td><td class="good">Smallest mature baseline</td></tr>
+            <tr><td>Fennel 1.6.1</td><td class="num">0.58 MiB</td><td class="num">2.97 MiB</td><td class="num">0.29 MiB compiler source</td><td>≈0.87 MiB shipped; dynamic</td></tr>
+            <tr><td>QuickJS-NG / rquickjs</td><td class="num">0.85 MiB</td><td class="num">1.75 MiB</td><td>TypeScript distribution ≈30 MiB; native checker executable 22.56 MiB</td><td class="risk">≈30.9 MiB installed; checker 99.05 MiB max RSS</td></tr>
+            <tr><td>PocketPy 2.1.8</td><td class="num">0.86 MiB</td><td class="num">2.98 MiB</td><td>Comparable static checker not included</td><td>Small, but not CPython/PyPI</td></tr>
+            <tr><td>Rhai 1.25.1</td><td class="num">1.29 MiB</td><td class="num">2.20 MiB</td><td>Parser/AST included; no type checker</td><td class="good">Excellent Rust-native footprint</td></tr>
+            <tr><td>Luau through mlua</td><td class="num">1.39 MiB</td><td class="num">2.72 MiB</td><td class="num">Official analyzer 5.26 MiB stripped / 6.38 MiB RSS</td><td class="good">≈6.65 MiB if analyzer ships separately</td></tr>
+            <tr><td>Steel 0.8.2</td><td class="num">2.91 MiB</td><td class="num">43.55 MiB</td><td>Contracts and LSP, not comparable static checking</td><td class="risk">High startup and memory for this role</td></tr>
+            <tr><td>Gluon 0.18.4</td><td class="num">3.42 MiB</td><td class="num">5.98 MiB</td><td>Type checker and completion library included</td><td class="middle">Rust-native and static, but ecosystem risk</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3 style="margin-top:30px">Complete typed-toolchain size</h3>
+      <div aria-label="Logarithmic comparison of complete toolchain size">
+        <div class="bar-row"><span>Luau</span><div class="track"><div class="bar" style="--w:44%"></div></div><small>6.65 MiB</small></div>
+        <div class="bar-row"><span>Gluon</span><div class="track"><div class="bar" style="--w:36%"></div></div><small>3.42 MiB</small></div>
+        <div class="bar-row"><span>TS + QJS</span><div class="track"><div class="bar" style="--w:100%"></div></div><small>≈30.9 MiB</small></div>
+      </div>
+      <p class="note">Bar widths use a logarithmic scale so the smaller candidates remain visible. Rhai, Lua, Fennel, and PocketPy are excluded here because they do not ship a comparable static checker.</p>
+    </section>
+
+    <section id="health">
+      <p class="eyebrow">05 · Project health</p><h2>Prefer an active system, not merely an active repository.</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>System</th><th>Current release signal</th><th>90-day public activity sample</th><th>Ownership / dependency risk</th><th>Assessment</th></tr></thead>
+          <tbody>
+            <tr><td>Luau + mlua</td><td>Luau 0.734 on 14 Aug; eight consecutive weekly releases observed. mlua 0.12.0 on 5 Jul.</td><td>Luau 47 commits / 20 authors. mlua capped at 79 / 3.</td><td>Roblox-backed language; Rust wrapper is a smaller project. mlua 0.12 vendors Luau 0.728, six weekly releases behind upstream.</td><td class="good">Strong, with explicit version-sync work</td></tr>
+            <tr><td>Rhai</td><td>1.25.1 on 29 May; regular 1.x releases over multiple years.</td><td>79 commits / 5 authors.</td><td>Focused Rust project; more than 10M crates.io downloads observed. Experimental rather than mature LSP.</td><td class="good">Best single-crate engineering bet</td></tr>
+            <tr><td>TypeScript + rquickjs + QuickJS-NG</td><td>TS 7.0.2 on 8 Jul; rquickjs 0.12.2 on 27 Jul; QuickJS-NG 0.16.1 on 4 Aug.</td><td>TS-Go capped at 100 / 25; rquickjs 39 / 4; QuickJS-NG capped at 100 / 22.</td><td>Every component is active, but Quirl owns compatibility across three upstreams plus its Rust/JS API schema.</td><td class="middle">Healthy parts; largest integration surface</td></tr>
+            <tr><td>Lua + mlua</td><td>Lua 5.5.0 on 22 Dec 2025; 5.5.1 release work visible in Jul. mlua current in Jul.</td><td>Lua uses its own release process; mlua capped at 79 / 3.</td><td>Thirty-plus years of language longevity and a mature C API. Version changes intentionally break VM ABI across major/minor series.</td><td class="good">Strongest longevity bet</td></tr>
+            <tr><td>Fennel + Lua</td><td>Fennel 1.6.1 tag on 30 Dec 2025.</td><td>0 commits in the sampled 90 days; latest repository push Feb 2026.</td><td>Small stable compiler and few open issues, but a niche language and another diagnostic/source-map layer.</td><td>Stable-looking, smaller bus factor</td></tr>
+            <tr><td>PocketPy</td><td>2.1.8 on 18 Mar; eight releases observed since Jan 2025.</td><td>35 commits / 9 authors.</td><td>Active and compact, but its Python compatibility boundary and lower-level Rust integration become Quirl obligations.</td><td class="middle">Healthy; product-expectation risk</td></tr>
+            <tr><td>Steel</td><td>0.8.2 on 22 Feb; repository pushed 12 Aug.</td><td>7 commits / 3 authors.</td><td>Rust-native and active, but pre-1.0 with a small ecosystem and 125 Rust packages in the isolated dependency graph.</td><td class="middle">Promising, not yet conservative</td></tr>
+            <tr><td>Gluon</td><td>0.18.4 on 6 Aug after 0.18.3 in Jul; the preceding crate release was Sep 2023.</td><td>50 commits / 1 author.</td><td>Static, Rust-native, memory-limited and interruptible—but recent work is effectively single-maintainer after a long release gap.</td><td class="risk">Technically attractive; unsafe longevity bet</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="note">GitHub activity is a capped sample of the latest 100 commits since 17 May 2026; author counts are a signal, not a formal bus-factor calculation. Stars and open-issue counts were inspected but deliberately excluded from the score because they are weak maintenance proxies.</p>
+    </section>
+
+    <section id="score">
+      <p class="eyebrow">06 · Interactive scorecard</p><h2>Change the priorities and watch the answer move.</h2>
+      <p>The default weights reflect a Rust application whose guest language is limited to configuration, scripts, and plugins. Scores are expert judgments from 1–5 anchored to the measurements and maintenance audit above; they are not survey results.</p>
+      <div class="score-layout" style="margin-top:22px">
+        <div class="score-panel" id="weightControls"></div>
+        <div class="table-wrap"><table class="score-table"><thead><tr><th>Rank</th><th>Candidate</th><th>Weighted score</th><th>Interpretation</th></tr></thead><tbody id="scoreRows"></tbody></table></div>
+      </div>
+      <div class="callout warn"><strong>The product decision is broader than the numeric rank.</strong><p>Quirl accepts Lua’s dynamic semantics because Rust owns the trusted core and validates every host boundary. <code>quirl check</code> can parse, lint, resolve capabilities, consume annotations, and validate schemas without execution, but it must not market that as sound static typing.</p></div>
+    </section>
+
+    <section id="audience">
+      <p class="eyebrow">07 · Developer fit</p><h2>Broad popularity and terminal-user familiarity are not the same thing.</h2>
+      <div class="two">
+        <article class="card"><h3>What the broad data says</h3><p>GitHub’s 2025 contributor data placed TypeScript first and Python second. Stack Overflow reported strong Python growth, while Rust remained the most admired language. This makes TypeScript and Python excellent familiarity signals—but does not establish that their ecosystems want an embedded CLI plugin language.</p></article>
+        <article class="card"><h3>What adjacent terminal tools suggest</h3><p>Neovim uses Lua for configuration and plugins and explicitly recommends annotations plus LuaLS for larger plugins. WezTerm uses a Lua script as configuration. This is stronger target-adjacent evidence for Lua-family familiarity than a web-wide language ranking, although it is still an inference rather than a Quirl user survey.</p></article>
+      </div>
+      <div class="callout"><strong>Use Lua’s name and ecosystem honestly.</strong><p>Quirl uses Lua 5.4 source and <code>.lua</code> files, not a private dialect presented as Lua. The runtime environment is intentionally restricted, and the generated <code>quirl</code> API replaces ambient shell access with explicit capabilities.</p></div>
+      <p>The first usability validation should include Rust/CLI, shell/DevOps, JavaScript/TypeScript, Python, and Neovim/Lua users. Ask each participant to configure a prompt segment, write a command plugin, handle a structured error, and fix a lint or schema diagnostic. Time-to-correct-result matters more than a preference poll.</p>
+    </section>
+
+    <section id="complexity">
+      <p class="eyebrow">08 · Implementation complexity</p><h2>What Quirl would actually have to own.</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Candidate</th><th>Rust host bridge</th><th>Checker / IDE</th><th>Modules and packaging</th><th>Quirl-owned risk</th></tr></thead>
+          <tbody>
+            <tr><td>Rhai</td><td class="good">Direct crate API and procedural plugin macros</td><td>Parser/AST, formatter ecosystem, experimental LSP; no static checker</td><td>Custom module resolvers and Rust packages</td><td class="good">Low: capability API, schemas, budgets, diagnostics</td></tr>
+            <tr><td>Lua 5.4</td><td class="good">Mature mlua API and serde conversion</td><td>External LuaLS + annotations if desired</td><td>Mature require model; Quirl must restrict loaders</td><td>Low–medium: annotations and checker distribution</td></tr>
+            <tr><td>Luau</td><td class="good">mlua runtime/compiler bridge is ergonomic</td><td class="middle">Official C++ analysis/autocomplete libraries; no complete Rust wrapper</td><td>Quirl resolver over sandboxed environment</td><td class="middle">Medium–high: analyzer service, declarations, version lockstep</td></tr>
+            <tr><td>TypeScript + QuickJS-NG</td><td>rquickjs is capable and async-aware</td><td class="middle">Excellent official LSP, but TS 7.0 lacks stable programmatic API</td><td>Must define a non-Node module world and audited package policy</td><td class="risk">High: worker protocol, emit/cache, source maps, dual bindings, three upstreams</td></tr>
+            <tr><td>Fennel</td><td>mlua plus Fennel compiler module</td><td>Compiler diagnostics; smaller editor ecosystem</td><td>Fennel→Lua mapping and Lua resolver</td><td>Medium: compile cache and remapped errors</td></tr>
+            <tr><td>PocketPy</td><td>Official C API; Rust wrappers trail current releases</td><td>No comparable built-in static checker</td><td>Must explicitly reject most CPython/PyPI assumptions</td><td>Medium–high: bridge and compatibility communication</td></tr>
+            <tr><td>Steel</td><td class="good">Native Rust API already prototyped</td><td>LSP and contracts; static story does not meet gate</td><td>Scheme modules and Quirl packages</td><td>Medium: startup/memory optimization and pre-1.0 churn</td></tr>
+            <tr><td>Gluon</td><td class="good">Rust-native typed marshalling</td><td>Checker and completion library included</td><td>Functional module system</td><td class="risk">Medium: diagnostics polish plus effective ownership of a niche language</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout"><strong>Dependency-graph signal</strong><p>The isolated Rust probes resolved 12 packages for QuickJS alone, 24 for Lua/Fennel, 26 for Luau, 27 for Rhai, 107 for Gluon, and 125 for Steel. TypeScript’s Go toolchain and Luau’s C++ analyzer are outside those Rust counts, so package count is only one implementation-cost signal.</p></div>
+    </section>
+
+    <section id="decision">
+      <div class="decision">
+        <p class="eyebrow">09 · Accepted decision</p><div class="big">Lua</div>
+        <h2>One familiar extension language, with Rust enforcing the contract.</h2>
+        <p>Choose Lua 5.4 for configuration, scripts, and trusted plugins. Its familiarity, tiny footprint, longevity, and mature <code>mlua</code> bridge outweigh the stronger analysis offered by Luau. Quirl will deliver IDE-quality assistance through generated SDK annotations and metadata, while Rust schemas validate all values before state changes.</p>
+        <ol class="clean">
+          <li>Add a <code>quirl-lua</code> crate with pinned Lua 5.4 through <code>mlua</code> and a deliberately restricted standard library and module loader.</li>
+          <li>Generate runtime bindings, LuaLS-compatible stubs, completion data, documentation, and AI schemas from one Rust host definition.</li>
+          <li>Run one configuration, one script, and one prompt/completion plugin through the same capability API and structured error boundary.</li>
+          <li>Ship the vertical slice with <code>check</code>, <code>fmt</code>, <code>lint</code>, <code>test</code>, cancellation, memory/instruction budgets, and last-known-good config reload.</li>
+        </ol>
+      </div>
+      <div class="grid" style="margin-top:16px">
+        <article class="card"><span class="rank">DEVELOPER EXPERIENCE</span><h3>Typed SDK, dynamic language</h3><p>LuaLS-compatible annotations and generated metadata power completion and hover; Rust schemas remain authoritative.</p></article>
+        <article class="card"><span class="rank">SECURITY BOUNDARY</span><h3>Capabilities, not ambient access</h3><p>Trusted Lua receives explicit handles and budgets. Untrusted extensions remain out-of-process or WebAssembly.</p></article>
+        <article class="card"><span class="rank">DO NOT DEFAULT TO</span><h3>TypeScript + QuickJS-NG</h3><p>Keep it as an optional runner or revisit when TypeScript’s stable programmatic API and a compelling package story justify the complexity.</p></article>
+      </div>
+      <p class="note">The durable record is <a href="decisions/0001-lua-extension-language.md">ADR 0001: Lua is Quirl’s extension language</a>. Revisit Luau only if real plugins demonstrate that annotations and schema validation are insufficient.</p>
+    </section>
+
+    <section id="method">
+      <p class="eyebrow">10 · Method and sources</p><h2>Reproducible measurements, explicit judgment.</h2>
+      <p>Footprint probes live in <code>spikes/footprint</code>. PocketPy’s official 2.1.8 amalgamated sources are checksum-verified by its runner. The Luau analyzer was built from official tag 0.734, stripped, and measured separately. TypeScript 7.0.2 was installed from its official npm package; the native arm64 checker and complete installed package were measured separately from the QuickJS-NG runtime.</p>
+      <ul class="sources">
+        <li><a href="https://luau.org/">Luau overview</a> and <a href="https://luau.org/compatibility/">Lua compatibility</a></li>
+        <li><a href="https://github.com/luau-lang/luau/releases">Luau releases</a> and <a href="https://github.com/mlua-rs/mlua">mlua</a></li>
+        <li><a href="https://rhai.rs/">Rhai</a> and <a href="https://rhai.rs/book/plugins/">Rust plugin modules</a></li>
+        <li><a href="https://www.lua.org/versions.html">Lua version history</a></li>
+        <li><a href="https://fennel-lang.org/">Fennel</a> and <a href="https://github.com/bakpakin/Fennel/tags">release tags</a></li>
+        <li><a href="https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/">TypeScript 7</a> and <a href="https://www.typescriptlang.org/docs/handbook/2/basic-types.html">type erasure</a></li>
+        <li><a href="https://github.com/DelSkayn/rquickjs">rquickjs</a> and <a href="https://github.com/quickjs-ng/quickjs/releases">QuickJS-NG releases</a></li>
+        <li><a href="https://github.com/pocketpy/pocketpy">PocketPy</a></li>
+        <li><a href="https://github.com/mattwparas/steel">Steel</a></li>
+        <li><a href="https://github.com/gluon-lang/gluon">Gluon</a></li>
+        <li><a href="https://neovim.io/doc/user/lua-plugin/">Neovim Lua plugins</a> and <a href="https://wezterm.org/config/files.html">WezTerm Lua config</a></li>
+        <li><a href="https://github.blog/news-insights/octoverse/octoverse-a-new-developer-joins-github-every-second-as-ai-leads-typescript-to-1/">GitHub Octoverse 2025</a></li>
+        <li><a href="https://survey.stackoverflow.co/2025/technology/">Stack Overflow Developer Survey 2025</a></li>
+      </ul>
+      <footer>Observed 15 August 2026 · Benchmarks are local measurements, not universal performance claims · Health data changes over time</footer>
+    </section>
+  </main>
+</div>
+<script>
+  const criteria = [
+    { id: "rust", label: "Rust integration + simplicity", weight: 30 },
+    { id: "health", label: "Maintenance + longevity", weight: 20 },
+    { id: "dx", label: "Familiarity + plugin/config DX", weight: 25 },
+    { id: "safety", label: "Pre-run safety + AI tooling", weight: 10 },
+    { id: "footprint", label: "Footprint + performance", weight: 10 },
+    { id: "sandbox", label: "Sandbox + capability control", weight: 5 }
+  ];
+  const candidates = [
+    { name: "Lua 5.4", scores: { rust:4.8, health:4.8, dx:4.8, safety:1.5, footprint:5.0, sandbox:4.3 }, note:"Accepted: familiar, tiny, mature; Rust validates boundaries." },
+    { name: "Luau", scores: { rust:3.4, health:4.5, dx:3.3, safety:4.0, footprint:4.8, sandbox:4.8 }, note:"Stronger analysis; unfamiliarity and analyzer bridge remain." },
+    { name: "Rhai", scores: { rust:5.0, health:4.6, dx:3.0, safety:1.8, footprint:4.6, sandbox:4.5 }, note:"Lowest Rust ownership cost; smaller user ecosystem." },
+    { name: "TypeScript + QuickJS-NG", scores: { rust:2.0, health:4.2, dx:5.0, safety:4.2, footprint:2.0, sandbox:4.2 }, note:"Best broad familiarity; highest complete-system complexity." },
+    { name: "Gluon", scores: { rust:4.2, health:2.5, dx:1.5, safety:4.8, footprint:3.6, sandbox:4.0 }, note:"Rust-native and static; niche, single-maintainer risk." },
+    { name: "PocketPy", scores: { rust:2.6, health:4.0, dx:4.5, safety:1.5, footprint:4.3, sandbox:3.2 }, note:"Familiar syntax; compatibility and checker expectations." },
+    { name: "Fennel", scores: { rust:4.0, health:3.7, dx:2.3, safety:1.5, footprint:4.8, sandbox:4.1 }, note:"Elegant and compact; niche and dynamic with compile mapping." },
+    { name: "Steel", scores: { rust:4.2, health:3.2, dx:2.2, safety:2.0, footprint:1.5, sandbox:3.5 }, note:"Native baseline; startup, RSS, maturity, and familiarity costs." }
+  ];
+  const presets = {
+    "Rust product": [30,20,25,10,10,5],
+    "Static safety": [20,20,12,35,8,5],
+    "Simplicity": [42,18,10,5,15,10],
+    "Developer reach": [18,18,32,18,9,5]
+  };
+  const controls = document.getElementById("weightControls");
+  controls.innerHTML = `<h3>Decision weights</h3><p class="note">Adjust or choose a preset.</p>` + criteria.map((criterion, index) => `
+    <div class="control"><label for="weight-${criterion.id}"><span>${criterion.label}</span><output id="out-${criterion.id}">${criterion.weight}</output></label>
+    <input id="weight-${criterion.id}" type="range" min="0" max="50" value="${criterion.weight}" data-index="${index}"></div>`).join("") +
+    `<div class="presets">${Object.keys(presets).map((name, index) => `<button type="button" data-preset="${name}" class="${index === 0 ? "active" : ""}">${name}</button>`).join("")}</div><div class="score-total" id="weightTotal"></div>`;
+
+  function renderScores() {
+    const weights = criteria.map(criterion => Number(document.getElementById(`weight-${criterion.id}`).value));
+    const totalWeight = weights.reduce((sum, value) => sum + value, 0) || 1;
+    criteria.forEach((criterion, index) => document.getElementById(`out-${criterion.id}`).value = weights[index]);
+    document.getElementById("weightTotal").textContent = `Total relative weight: ${totalWeight}`;
+    const ranked = candidates.map(candidate => {
+      const total = criteria.reduce((sum, criterion, index) => sum + candidate.scores[criterion.id] * weights[index], 0) / totalWeight * 20;
+      return { ...candidate, total };
+    }).sort((a, b) => b.total - a.total);
+    document.getElementById("scoreRows").innerHTML = ranked.map((candidate, index) => `<tr>
+      <td class="num">${String(index + 1).padStart(2,"0")}</td><td>${candidate.name}</td>
+      <td class="meter"><span class="score">${candidate.total.toFixed(1)}</span><div class="meter-line"><div class="meter-fill" style="width:${candidate.total}%"></div></div></td>
+      <td class="position">${candidate.note}</td></tr>`).join("");
+  }
+  controls.addEventListener("input", event => {
+    if (event.target.matches('input[type="range"]')) {
+      controls.querySelectorAll("button").forEach(button => button.classList.remove("active"));
+      renderScores();
+    }
+  });
+  controls.addEventListener("click", event => {
+    const button = event.target.closest("button[data-preset]");
+    if (!button) return;
+    presets[button.dataset.preset].forEach((value, index) => document.getElementById(`weight-${criteria[index].id}`).value = value);
+    controls.querySelectorAll("button").forEach(item => item.classList.toggle("active", item === button));
+    renderScores();
+  });
+  renderScores();
+</script>
+</body>
+</html>
