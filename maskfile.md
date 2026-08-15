@@ -34,6 +34,7 @@ cargo test --workspace \
 
 ```sh
 cargo fmt --all -- --check \
+  && cargo run --quiet -p quirl-cli -- fmt examples --check \
   && $MASK lint \
   && $MASK test
 ```

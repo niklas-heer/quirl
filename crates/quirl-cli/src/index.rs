@@ -60,6 +60,19 @@ pub enum IndexOutputFormat {
     Json,
 }
 
+pub fn wants_json(command: &IndexCommand) -> bool {
+    matches!(
+        command,
+        IndexCommand::Build {
+            format: IndexOutputFormat::Json,
+            ..
+        } | IndexCommand::Explain {
+            format: IndexOutputFormat::Json,
+            ..
+        }
+    )
+}
+
 #[derive(Debug, Serialize)]
 struct BuildReport {
     index: PathBuf,
@@ -89,17 +102,30 @@ pub fn execute(command: IndexCommand) -> Result<i32, ShellError> {
     }
 }
 
-/// Load the default attributed index for completion/help consumers. A missing
-/// cache is normal on first launch and falls back to the compiled-in catalog.
-pub fn load_default_catalog() -> Result<Catalog, ShellError> {
+/// Load the default attributed index for completion/help consumers. Cached
+/// imported facts augment, but can never replace, the builtins compiled into
+/// this binary. A missing, unreadable, corrupt, or incompatible cache is
+/// recoverable and falls back to those builtins.
+pub fn load_default_catalog() -> Catalog {
     let Some(path) = default_index_path() else {
-        return Ok(Catalog::builtin());
+        return Catalog::builtin();
     };
-    match fs::read_to_string(&path) {
-        Ok(source) => decode_catalog(&source, &path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Catalog::builtin()),
-        Err(error) => Err(index_io_error("read", &path, error)),
+    load_catalog_at(&path)
+}
+
+fn load_catalog_at(path: &Path) -> Catalog {
+    match fs::read_to_string(path) {
+        Ok(source) => decode_catalog(&source, path)
+            .map(merge_cached_catalog)
+            .unwrap_or_else(|_| Catalog::builtin()),
+        Err(_) => Catalog::builtin(),
     }
+}
+
+fn merge_cached_catalog(cached: Catalog) -> Catalog {
+    let mut current = Catalog::builtin();
+    current.merge(cached.commands);
+    current
 }
 
 fn build_index(
@@ -545,5 +571,40 @@ mod tests {
             .join(format!(".catalog.json.{}.tmp", std::process::id()))
             .exists());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn corrupt_or_incompatible_default_cache_recovers_to_current_builtins() {
+        let corrupt = load_catalog_at(Path::new("/dev/null"));
+        assert!(corrupt.find("quirl run").is_some());
+
+        let directory = temporary_directory();
+        let path = directory.join("old-schema.json");
+        let mut incompatible = Catalog::builtin();
+        incompatible.schema_version += 1;
+        fs::write(&path, serde_json::to_string(&incompatible).unwrap()).unwrap();
+        let recovered = load_catalog_at(&path);
+        assert_eq!(recovered.schema_version, Catalog::builtin().schema_version);
+        assert!(recovered.find("quirl agent manifest").is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compatible_stale_cache_cannot_remove_or_overwrite_current_builtins() {
+        let mut stale = Catalog::builtin();
+        stale.commands.retain(|command| command.path != "quirl lsp");
+        stale
+            .commands
+            .iter_mut()
+            .find(|command| command.path == "quirl run")
+            .unwrap()
+            .summary = "stale cached summary".to_owned();
+
+        let merged = merge_cached_catalog(stale);
+        assert!(merged.find("quirl lsp").is_some());
+        assert_ne!(
+            merged.find("quirl run").unwrap().summary,
+            "stale cached summary"
+        );
     }
 }

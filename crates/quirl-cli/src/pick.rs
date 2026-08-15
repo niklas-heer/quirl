@@ -32,6 +32,12 @@ pub struct PickCommand {
     root: PathBuf,
 }
 
+impl PickCommand {
+    pub fn wants_json(&self) -> bool {
+        matches!(self.format, PickFormat::Json)
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum PickSource {
     Stdin,

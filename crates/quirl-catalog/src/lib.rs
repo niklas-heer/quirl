@@ -208,20 +208,72 @@ impl Catalog {
                     Provenance::Lua,
                 ),
                 command(
+                    "quirl new",
+                    "quirl new <name> [--lang lua] [--directory path]",
+                    "Create a checked embedded-language script",
+                    "Writes a deterministic annotated Lua template with create-new semantics, so an existing script is never overwritten.",
+                    vec![
+                        option(&["--lang"], Some("lua"), "Choose the generated embedded language"),
+                        option(&["--directory"], Some("path"), "Choose the destination directory"),
+                    ],
+                    &["quirl new automation --lang lua"],
+                    &[Effect::WriteFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl describe",
+                    "quirl describe <command> [--format text|json|markdown|html]",
+                    "Describe one installed command",
+                    "Renders one exact entry from the same semantic catalog used by completion, documentation, language services, and agents.",
+                    vec![option(
+                        &["--format"],
+                        Some("text|json|markdown|html"),
+                        "Choose a deterministic documentation view",
+                    )],
+                    &["quirl describe 'quirl run' --format markdown"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl doc",
+                    "quirl doc [--format text|json|markdown|html] [--output path] [--open]",
+                    "Generate installed command documentation",
+                    "Generates deterministic human or machine documentation from the installed catalog, writes requested files atomically, and can open an explicit output in the platform viewer.",
+                    vec![
+                        option(
+                            &["--format"],
+                            Some("text|json|markdown|html"),
+                            "Choose a deterministic documentation view",
+                        ),
+                        option(&["--output"], Some("path"), "Atomically write the generated view"),
+                        option(&["--open"], None, "Open the explicit output in the default viewer"),
+                    ],
+                    &["quirl doc --format html --output target/quirl-docs/catalog.html --open"],
+                    &[Effect::WriteFilesystem, Effect::SpawnProcess],
+                    Provenance::Builtin,
+                ),
+                command(
                     "quirl run",
-                    "quirl run <file>",
-                    "Run a Lua script in Quirl's restricted runtime",
-                    "Lua is Quirl's sole embedded language for scripts, configuration, and trusted plugins.",
-                    vec![],
-                    &["quirl run scripts/deploy.lua -- staging"],
+                    "quirl run <file|-> [--lang lua|quirl] [arguments...]",
+                    "Run a Lua or Quirl script under explicit policy",
+                    "Selects an embedded script language by explicit flag, shebang, or extension; Lua runs inside the restricted VM and line-oriented .quirl scripts use the native command/data executors.",
+                    vec![option(
+                        &["--lang"],
+                        Some("lua|quirl"),
+                        "Select the language explicitly, including for stdin",
+                    )],
+                    &[
+                        "quirl run scripts/deploy.lua -- staging",
+                        "quirl run --lang lua -",
+                    ],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
                 command(
                     "quirl check",
-                    "quirl check <file> [--format text|json]",
-                    "Validate a script without executing it",
-                    "Parses and lints Lua, validates restricted APIs, and returns structured diagnostics without running it.",
+                    "quirl check <file|directory> [--format text|json]",
+                    "Validate scripts without executing them",
+                    "Deterministically discovers Lua and Quirl scripts, checks Lua syntax, annotations, modules, and restricted APIs plus Quirl statement structure, and aggregates structured diagnostics without executing source.",
                     vec![option(&["--format"], Some("text|json"), "Choose diagnostic output")],
                     &["quirl check scripts/deploy.lua --format json"],
                     &[Effect::ReadFilesystem],
@@ -229,9 +281,9 @@ impl Catalog {
                 ),
                 command(
                     "quirl fmt",
-                    "quirl fmt <file> [--check]",
-                    "Format a Lua extension file",
-                    "Applies Quirl's deterministic Lua formatting contract or checks it in CI.",
+                    "quirl fmt <file|directory> [--check]",
+                    "Format Lua scripts deterministically",
+                    "Deterministically discovers scripts, applies Quirl's idempotent literal-safe Lua formatting contract, reports all CI drift, and leaves .quirl source unchanged.",
                     vec![option(&["--check"], None, "Report drift without writing")],
                     &["quirl fmt examples/config.lua --check"],
                     &[Effect::ReadFilesystem, Effect::WriteFilesystem],
@@ -239,9 +291,9 @@ impl Catalog {
                 ),
                 command(
                     "quirl lint",
-                    "quirl lint <file> [--format text|json]",
-                    "Lint Lua without executing it",
-                    "Checks syntax and rejects ambient APIs that bypass Quirl capabilities.",
+                    "quirl lint <file|directory> [--format text|json]",
+                    "Lint scripts without executing them",
+                    "Aggregates annotation and capability diagnostics for deterministically discovered scripts and rejects ambient APIs that bypass Quirl capabilities.",
                     vec![option(&["--format"], Some("text|json"), "Choose diagnostic output")],
                     &["quirl lint examples/plugin.lua --format json"],
                     &[Effect::ReadFilesystem],
@@ -249,11 +301,11 @@ impl Catalog {
                 ),
                 command(
                     "quirl test",
-                    "quirl test <file>",
+                    "quirl test [file|directory]",
                     "Run a Lua test module under resource limits",
-                    "Runs every returned `test_*` function in the same restricted runtime used by extensions.",
+                    "Discovers conventional Lua test modules deterministically and runs every returned `test_*` function in an isolated restricted runtime.",
                     vec![],
-                    &["quirl test examples/lua_tests.lua"],
+                    &["quirl test", "quirl test examples/lua_tests.lua"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
@@ -328,6 +380,154 @@ impl Catalog {
                     "Emits the versioned semantic catalog bundled with this binary.",
                     vec![option(&["--format"], Some("json|markdown"), "Choose a stable output format")],
                     &["quirl catalog --format json"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl agent catalog",
+                    "quirl agent catalog [--format text|json]",
+                    "Export installed commands and Lua host capabilities",
+                    "Emits a versioned deny-unknown schema with deterministic catalog and HOST_API content hashes, provenance, installed capabilities, and their versions.",
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose accessible text or stable machine JSON",
+                    )],
+                    &["quirl agent catalog --format json"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl agent context",
+                    "quirl agent context <query...> [--token-budget count] [--format markdown|json]",
+                    "Build deterministic token-budgeted agent context",
+                    "Ranks only installed command and HOST_API facts, selects the smallest relevant subtree within a documented deterministic token estimate, and records truncation and source hashes.",
+                    vec![
+                        option(
+                            &["--token-budget"],
+                            Some("count"),
+                            "Bound the canonical context payload",
+                        ),
+                        option(
+                            &["--format"],
+                            Some("markdown|json"),
+                            "Choose agent Markdown or stable machine JSON",
+                        ),
+                    ],
+                    &["quirl agent context 'deploy the billing service' --format markdown --token-budget 6000"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl agent manifest",
+                    "quirl agent manifest [--format text|json]",
+                    "Export installed tools, versions, schemas, and validators",
+                    "Lists only tools and capabilities installed in this Quirl composition, with schema/content hashes and validation commands grounded in the semantic catalog and generated Lua HOST_API.",
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose accessible text or stable machine JSON",
+                    )],
+                    &["quirl agent manifest --format json"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl agent validate",
+                    "quirl agent validate <file> --kind catalog|context|manifest [--format text|json]",
+                    "Validate a versioned agent contract without execution",
+                    "Rejects unknown fields, unsupported schema versions, tampered content hashes, nondeterministic ordering, and context payloads that exceed their declared token budget.",
+                    vec![
+                        option(
+                            &["--kind"],
+                            Some("catalog|context|manifest"),
+                            "Select the deny-unknown document schema",
+                        ),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose accessible diagnostics or stable JSON",
+                        ),
+                    ],
+                    &["quirl agent validate agent-context.json --kind context --format json"],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl package manifest",
+                    "quirl package manifest [--manifest path] [--format text|json]",
+                    "Parse a versioned project package manifest",
+                    "Reads a deny-unknown plugin.toml schema and shows normalized package identity, Quirl compatibility, requested capabilities, and contributions without loading its Lua entry.",
+                    vec![
+                        option(
+                            &["--manifest"],
+                            Some("path"),
+                            "Read a manifest other than ./plugin.toml",
+                        ),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose accessible text or stable machine JSON",
+                        ),
+                    ],
+                    &["quirl package manifest --format json"],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl package build",
+                    "quirl package build [--manifest path] [--format text|json]",
+                    "Validate and build a deterministic package contract",
+                    "Checks the entry path, Quirl version range, installed capabilities, and the public-command quality gate for summaries, argument docs and types, examples, effects, and error codes; it returns content hashes without executing Lua.",
+                    vec![
+                        option(
+                            &["--manifest"],
+                            Some("path"),
+                            "Build a manifest other than ./plugin.toml",
+                        ),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose accessible diagnostics or stable JSON",
+                        ),
+                    ],
+                    &["quirl package build --format json"],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl package publish",
+                    "quirl package publish --dry-run [--manifest path] [--format text|json]",
+                    "Preview a deterministic network-free package publication",
+                    "Runs the complete package build quality gate and emits the files, build hash, and requested permissions that would be published. Phase 2 performs no network publication.",
+                    vec![
+                        option(
+                            &["--dry-run"],
+                            None,
+                            "Require a network-free publication plan",
+                        ),
+                        option(
+                            &["--manifest"],
+                            Some("path"),
+                            "Read a manifest other than ./plugin.toml",
+                        ),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose accessible text or stable JSON",
+                        ),
+                    ],
+                    &["quirl package publish --dry-run --format json"],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl lsp",
+                    "quirl lsp",
+                    "Serve generated Lua and .quirl editor intelligence",
+                    "Speaks a deterministic LSP subset over stdio, using the generated Lua HOST_API and semantic command catalog for diagnostics, completion, hover, signatures, and module docs without evaluating documents.",
+                    vec![],
+                    &["quirl lsp"],
                     &[],
                     Provenance::Builtin,
                 ),
@@ -846,6 +1046,14 @@ mod tests {
     }
 
     #[test]
+    fn language_service_is_discoverable_from_the_catalog() {
+        let catalog = Catalog::builtin();
+        let command = catalog.find("quirl lsp").unwrap();
+        assert!(command.details.contains("without evaluating documents"));
+        assert_eq!(command.provenance.source, Provenance::Builtin);
+    }
+
+    #[test]
     fn imported_options_merge_without_overwriting_exact_builtin_facts() {
         let mut catalog = Catalog::builtin();
         let diagnostics = catalog.merge_report(import_fish(
@@ -876,5 +1084,30 @@ mod tests {
             .iter()
             .any(|fact| fact.value == "--frozen" && fact.provenance.source == Provenance::Bash));
         assert!(explanation.facts.iter().all(|fact| !fact.value.is_empty()));
+    }
+
+    #[test]
+    fn agent_and_package_surfaces_have_complete_catalog_metadata() {
+        let catalog = Catalog::builtin();
+        for path in [
+            "quirl agent catalog",
+            "quirl agent context",
+            "quirl agent manifest",
+            "quirl agent validate",
+            "quirl package manifest",
+            "quirl package build",
+            "quirl package publish",
+        ] {
+            let command = catalog
+                .commands
+                .iter()
+                .find(|command| command.path == path)
+                .unwrap();
+            assert!(!command.signature.is_empty(), "{path}");
+            assert!(!command.summary.is_empty(), "{path}");
+            assert!(!command.details.is_empty(), "{path}");
+            assert!(!command.examples.is_empty(), "{path}");
+            assert_eq!(command.provenance.confidence, Confidence::Exact);
+        }
     }
 }

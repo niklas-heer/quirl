@@ -1,6 +1,6 @@
 [package]
-name = "quirl-cli"
-description = "The Quirl shell"
+name = "quirl-lsp"
+description = "Deterministic language services for Quirl and its Lua API"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,22 +10,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-[[bin]]
-name = "quirl"
-path = "src/main.rs"
-
 [dependencies]
-clap.workspace = true
 quirl-catalog = { path = "../quirl-catalog" }
-quirl-contract = { path = "../quirl-contract" }
 quirl-core = { path = "../quirl-core" }
-quirl-data = { path = "../quirl-data" }
 quirl-lua = { path = "../quirl-lua" }
-quirl-lsp = { path = "../quirl-lsp" }
-quirl-picker = { path = "../quirl-picker" }
-quirl-process = { path = "../quirl-process" }
 quirl-syntax = { path = "../quirl-syntax" }
-quirl-ui = { path = "../quirl-ui" }
-reedline.workspace = true
 serde.workspace = true
 serde_json.workspace = true

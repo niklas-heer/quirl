@@ -201,6 +201,52 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
     })
 }
 
+/// Validate a line-oriented `.quirl` script without executing it.
+///
+/// Command statements use the same compatibility parser as interactive execution. `data`
+/// statements are recognized as a separate language island and require a non-empty expression.
+/// Every returned span is absolute within `source` and diagnostics retain source order.
+pub fn check_script(source: &str) -> Vec<CommandSyntaxError> {
+    let mut diagnostics = Vec::new();
+    let mut offset = 0;
+    for (line_index, raw_line) in source.split_inclusive('\n').enumerate() {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let trimmed = line.trim();
+        let leading = line.len().saturating_sub(line.trim_start().len());
+        if (line_index == 0 && trimmed.starts_with("#!"))
+            || trimmed.is_empty()
+            || trimmed.starts_with('#')
+        {
+            offset += raw_line.len();
+            continue;
+        }
+        if trimmed == "data"
+            || trimmed
+                .strip_prefix("data")
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        {
+            let expression = trimmed.strip_prefix("data").unwrap_or_default();
+            if expression.trim().is_empty() {
+                diagnostics.push(CommandSyntaxError {
+                    message: "data statement requires an expression".to_owned(),
+                    start: offset + leading,
+                    end: offset + leading + trimmed.len(),
+                    help: "Add a structured-data expression after `data`".to_owned(),
+                });
+            }
+            offset += raw_line.len();
+            continue;
+        }
+        if let Err(mut error) = parse_command_list(trimmed) {
+            error.start += offset + leading;
+            error.end += offset + leading;
+            diagnostics.push(error);
+        }
+        offset += raw_line.len();
+    }
+    diagnostics
+}
+
 fn reject_unsupported_constructs(input: &str) -> Result<(), CommandSyntaxError> {
     let trimmed = input.trim_start();
     let leading_whitespace = input.len() - trimmed.len();
@@ -652,6 +698,17 @@ mod tests {
         let error = parse_command_list("echo 'unfinished").unwrap_err();
         assert_eq!(error.start, 5);
         assert!(error.help.contains("Close"));
+    }
+
+    #[test]
+    fn script_checker_reuses_command_dialect_rules_with_absolute_spans() {
+        let source =
+            "#!/usr/bin/env -S quirl run\ndata {\"ok\":true}\n  echo $HOME\nprintf ok |\ndata\n";
+        let diagnostics = check_script(source);
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(&source[diagnostics[0].start..diagnostics[0].end], "$");
+        assert_eq!(&source[diagnostics[1].start..diagnostics[1].end], "|");
+        assert_eq!(&source[diagnostics[2].start..diagnostics[2].end], "data");
     }
 
     #[test]

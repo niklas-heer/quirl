@@ -7,7 +7,7 @@ use mlua::{
 use quirl_core::{CommandRunner, ErrorCode, ShellError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::Path,
     sync::{
@@ -340,12 +340,24 @@ impl LuaRuntime {
         arguments: &[String],
     ) -> Result<serde_json::Value, ShellError> {
         let source = read_source(path)?;
+        self.run_source(&source, &path.display().to_string(), arguments)
+    }
+
+    /// Run source supplied by a non-file runner, such as `quirl run --lang lua -`.
+    pub fn run_source(
+        &self,
+        source: &str,
+        source_name: &str,
+        arguments: &[String],
+    ) -> Result<serde_json::Value, ShellError> {
+        let path = Path::new(source_name);
+        let source = normalize_shebang(source);
         lint_source(&source, path)?;
         self.reset_budget();
         let value = self
             .lua
             .load(&source)
-            .set_name(path.to_string_lossy())
+            .set_name(source_name)
             .eval::<Value>()
             .map_err(|error| lua_error(error, Some(path), source.len()))?;
         let value = self.call_main_if_present(value, arguments, path, source.len())?;
@@ -492,15 +504,21 @@ impl LuaRuntime {
 
     pub fn test_file(&self, path: &Path) -> Result<usize, ShellError> {
         let source = read_source(path)?;
+        self.test_source(&source, &path.display().to_string())
+    }
+
+    pub fn test_source(&self, source: &str, source_name: &str) -> Result<usize, ShellError> {
+        let path = Path::new(source_name);
+        let source = normalize_shebang(source);
         lint_source(&source, path)?;
         self.reset_budget();
         let tests = self
             .lua
             .load(&source)
-            .set_name(path.to_string_lossy())
+            .set_name(source_name)
             .eval::<Table>()
             .map_err(|error| lua_error(error, Some(path), source.len()))?;
-        let mut count = 0;
+        let mut named_tests = Vec::new();
         for pair in tests.pairs::<String, Value>() {
             let (name, value) = pair.map_err(|error| lua_error(error, Some(path), source.len()))?;
             if !name.starts_with("test_") {
@@ -512,6 +530,11 @@ impl LuaRuntime {
                     format!("{name} must be a function"),
                 ));
             };
+            named_tests.push((name, test));
+        }
+        named_tests.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut count = 0;
+        for (name, test) in named_tests {
             self.reset_budget();
             test.call::<()>(()).map_err(|error| {
                 lua_error(error, Some(path), source.len()).with_context(format!("test: {name}"))
@@ -529,12 +552,19 @@ impl LuaRuntime {
 
     pub fn check_file(path: &Path) -> Result<(), ShellError> {
         let source = read_source(path)?;
+        Self::check_source(&source, &path.display().to_string())
+    }
+
+    /// Parse and lint Lua source without executing it.
+    pub fn check_source(source: &str, source_name: &str) -> Result<(), ShellError> {
+        let path = Path::new(source_name);
+        let source = normalize_shebang(source);
         lint_source(&source, path)?;
         let runtime = Self::new(LuaPolicy::config())?;
         runtime
             .lua
             .load(&source)
-            .set_name(path.to_string_lossy())
+            .set_name(source_name)
             .into_function()
             .map(|_| ())
             .map_err(|error| lua_error(error, Some(path), source.len()))
@@ -615,13 +645,266 @@ impl LuaRuntime {
 }
 
 pub fn format_source(source: &str) -> String {
-    let mut formatted = source
-        .lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n");
+    if contains_long_bracket(source) {
+        return format_trailing_whitespace(source);
+    }
+    let mut indentation = 0_usize;
+    let mut lines = Vec::new();
+    for (index, line) in source.lines().enumerate() {
+        let line = line.trim_end();
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        if index == 0 && trimmed.starts_with("#!") {
+            lines.push(trimmed.to_owned());
+            continue;
+        }
+
+        let shape = lua_code_shape(trimmed).trim().to_owned();
+        let closes_block = starts_with_block_closer(&shape);
+        if closes_block {
+            indentation = indentation.saturating_sub(1);
+        }
+        lines.push(format!("{}{}", "  ".repeat(indentation), trimmed));
+        if closes_block && starts_with_reopening_block(&shape) {
+            indentation = indentation.saturating_add(1);
+        } else {
+            indentation = indentation.saturating_add(blocks_opened(&shape));
+        }
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    let mut formatted = lines.join("\n");
     formatted.push('\n');
     formatted
+}
+
+fn format_trailing_whitespace(source: &str) -> String {
+    if source.ends_with('\n') {
+        source.to_owned()
+    } else {
+        format!("{source}\n")
+    }
+}
+
+fn contains_long_bracket(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    (0..bytes.len()).any(|index| long_bracket_open(bytes, index).is_some())
+}
+
+fn lua_code_shape(line: &str) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut characters = line.chars().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    while let Some(character) = characters.next() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            output.extend(std::iter::repeat_n(' ', character.len_utf8()));
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            output.push(' ');
+        } else if character == '-' && characters.peek() == Some(&'-') {
+            break;
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+#[derive(Debug)]
+struct MaskedLuaSource {
+    code: String,
+    line_comment_starts: HashSet<usize>,
+}
+
+fn mask_lua_source(source: &str) -> MaskedLuaSource {
+    #[derive(Clone, Copy)]
+    enum State {
+        Normal,
+        Quoted { quote: u8, escaped: bool },
+        Long { equals: usize, comment: bool },
+    }
+
+    let bytes = source.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut comments = HashSet::new();
+    let mut state = State::Normal;
+    let mut index = 0;
+    while index < bytes.len() {
+        match state {
+            State::Normal if matches!(bytes[index], b'\'' | b'"') => {
+                mask_string_byte(&mut masked, index);
+                state = State::Quoted {
+                    quote: bytes[index],
+                    escaped: false,
+                };
+                index += 1;
+            }
+            State::Normal if bytes[index..].starts_with(b"--") => {
+                comments.insert(index);
+                if let Some((equals, opener_len)) = long_bracket_open(bytes, index + 2) {
+                    for position in index..index + 2 + opener_len {
+                        mask_byte(&mut masked, position);
+                    }
+                    state = State::Long {
+                        equals,
+                        comment: true,
+                    };
+                    index += 2 + opener_len;
+                } else {
+                    while index < bytes.len() && bytes[index] != b'\n' {
+                        mask_byte(&mut masked, index);
+                        index += 1;
+                    }
+                }
+            }
+            State::Normal => {
+                if let Some((equals, opener_len)) = long_bracket_open(bytes, index) {
+                    for position in index..index + opener_len {
+                        mask_string_byte(&mut masked, position);
+                    }
+                    state = State::Long {
+                        equals,
+                        comment: false,
+                    };
+                    index += opener_len;
+                } else {
+                    index += 1;
+                }
+            }
+            State::Quoted { quote, escaped } => {
+                let character = bytes[index];
+                mask_string_byte(&mut masked, index);
+                state = if escaped {
+                    State::Quoted {
+                        quote,
+                        escaped: false,
+                    }
+                } else if character == b'\\' {
+                    State::Quoted {
+                        quote,
+                        escaped: true,
+                    }
+                } else if character == quote {
+                    State::Normal
+                } else {
+                    State::Quoted {
+                        quote,
+                        escaped: false,
+                    }
+                };
+                index += 1;
+            }
+            State::Long { equals, comment } => {
+                if long_bracket_close(bytes, index, equals) {
+                    let closer_len = equals + 2;
+                    for position in index..index + closer_len {
+                        if comment {
+                            mask_byte(&mut masked, position);
+                        } else {
+                            mask_string_byte(&mut masked, position);
+                        }
+                    }
+                    index += closer_len;
+                    state = State::Normal;
+                } else {
+                    if comment {
+                        mask_byte(&mut masked, index);
+                    } else {
+                        mask_string_byte(&mut masked, index);
+                    }
+                    index += 1;
+                }
+            }
+        }
+    }
+    let code = match String::from_utf8(masked) {
+        Ok(code) => code,
+        Err(_) => source.to_owned(),
+    };
+    MaskedLuaSource {
+        code,
+        line_comment_starts: comments,
+    }
+}
+
+fn long_bracket_open(bytes: &[u8], index: usize) -> Option<(usize, usize)> {
+    if bytes.get(index) != Some(&b'[') {
+        return None;
+    }
+    let mut cursor = index + 1;
+    while bytes.get(cursor) == Some(&b'=') {
+        cursor += 1;
+    }
+    (bytes.get(cursor) == Some(&b'[')).then_some((cursor - index - 1, cursor - index + 1))
+}
+
+fn long_bracket_close(bytes: &[u8], index: usize, equals: usize) -> bool {
+    bytes.get(index) == Some(&b']')
+        && bytes
+            .get(index + 1..index + 1 + equals)
+            .is_some_and(|characters| characters.iter().all(|character| *character == b'='))
+        && bytes.get(index + 1 + equals) == Some(&b']')
+}
+
+fn mask_byte(bytes: &mut [u8], index: usize) {
+    if !matches!(bytes[index], b'\n' | b'\r') {
+        bytes[index] = b' ';
+    }
+}
+
+fn mask_string_byte(bytes: &mut [u8], index: usize) {
+    if !matches!(bytes[index], b'\n' | b'\r') {
+        bytes[index] = b'_';
+    }
+}
+
+fn starts_with_block_closer(shape: &str) -> bool {
+    ["end", "else", "elseif", "until"]
+        .iter()
+        .any(|keyword| starts_with_keyword(shape, keyword))
+        || shape.starts_with('}')
+}
+
+fn starts_with_reopening_block(shape: &str) -> bool {
+    starts_with_keyword(shape, "else") || starts_with_keyword(shape, "elseif")
+}
+
+fn starts_with_keyword(source: &str, keyword: &str) -> bool {
+    source == keyword
+        || source
+            .strip_prefix(keyword)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|next| next.is_whitespace() || matches!(next, ',' | ';' | ')' | '}' | ']'))
+}
+
+fn blocks_opened(shape: &str) -> usize {
+    if shape.is_empty() || shape.ends_with(" end") || shape == "end" {
+        return 0;
+    }
+    let keyword_block = starts_with_keyword(shape, "function")
+        || shape.contains(" function(")
+        || shape.contains(" function (")
+        || starts_with_keyword(shape, "local function")
+        || starts_with_keyword(shape, "repeat")
+        || shape.ends_with(" then")
+        || shape.ends_with(" do");
+    let braces = shape.chars().filter(|character| *character == '{').count();
+    let closing_braces = shape.chars().filter(|character| *character == '}').count();
+    usize::from(keyword_block).saturating_add(braces.saturating_sub(closing_braces))
 }
 
 pub fn format_file(path: &Path, check: bool) -> Result<bool, ShellError> {
@@ -668,16 +951,54 @@ pub fn sdk_lua() -> String {
 }
 
 pub fn sdk_json() -> Result<String, ShellError> {
-    serde_json::to_string_pretty(HOST_API).map_err(|error| {
+    #[derive(Serialize)]
+    struct HostApiDocument<'a> {
+        document_type: &'static str,
+        schema_version: u32,
+        module: &'static str,
+        module_version: &'static str,
+        functions: &'a [HostApiSpec],
+    }
+    let document = HostApiDocument {
+        document_type: "quirl.host_api",
+        schema_version: 1,
+        module: "quirl",
+        module_version: env!("CARGO_PKG_VERSION"),
+        functions: HOST_API,
+    };
+    serde_json::to_string_pretty(&document).map_err(|error| {
         ShellError::new(ErrorCode::Io, "could not serialize the Lua SDK")
             .with_context(error.to_string())
     })
 }
 
 pub fn sdk_markdown() -> String {
-    let mut output = String::from("# Quirl Lua SDK\n\n");
+    let mut output = format!(
+        "# Quirl Lua SDK\n\nModule: `quirl`\n\nVersion: `{}`\n\nSchema version: `1`\n\n",
+        env!("CARGO_PKG_VERSION")
+    );
     for spec in HOST_API {
-        output.push_str(&format!("## `{}`\n\n{}\n\n", spec.path, spec.summary));
+        let parameters = spec
+            .parameters
+            .iter()
+            .map(|parameter| format!("{}: {}", parameter.name, parameter.lua_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(
+            "## `{}`\n\n`{}({parameters}) -> {}`\n\n{}\n\n",
+            spec.path, spec.path, spec.returns, spec.summary
+        ));
+        if !spec.parameters.is_empty() {
+            output.push_str("| Parameter | Type |\n| --- | --- |\n");
+            for parameter in spec.parameters {
+                output.push_str(&format!(
+                    "| `{}` | `{}` |\n",
+                    parameter.name, parameter.lua_type
+                ));
+            }
+            output.push('\n');
+        }
+        output.push_str(&format!("Returns: `{}`\n\n", spec.returns));
         if let Some(capability) = spec.capability {
             output.push_str(&format!("Capability: `{capability}`\n\n"));
         }
@@ -914,6 +1235,9 @@ fn validate_completion_result(value: &serde_json::Value, command: &str) -> Resul
 }
 
 fn lint_source(source: &str, path: &Path) -> Result<(), ShellError> {
+    let masked = mask_lua_source(source);
+    validate_annotations(source, path, &masked.line_comment_starts)?;
+    validate_host_api_references(&masked.code, path)?;
     const FORBIDDEN: &[(&str, &str)] = &[
         (
             "io.",
@@ -934,8 +1258,7 @@ fn lint_source(source: &str, path: &Path) -> Result<(), ShellError> {
     let mut error = ShellError::new(ErrorCode::Validation, "Lua validation failed")
         .with_help("Use the generated `quirl` SDK instead of ambient Lua capabilities");
     let mut offset = 0;
-    for line in source.lines() {
-        let code = line.split_once("--").map_or(line, |(code, _)| code);
+    for (line, code) in source.lines().zip(masked.code.lines()) {
         for (needle, message) in FORBIDDEN {
             if let Some(column) = code.find(needle) {
                 error = error.with_label(
@@ -955,13 +1278,254 @@ fn lint_source(source: &str, path: &Path) -> Result<(), ShellError> {
     }
 }
 
+fn validate_host_api_references(code: &str, path: &Path) -> Result<(), ShellError> {
+    let bytes = code.as_bytes();
+    let mut error = ShellError::new(ErrorCode::Validation, "Lua host API validation failed")
+        .with_help("Use a function and signature from `quirl sdk --format markdown`");
+    let mut offset = 0;
+    while offset + "quirl.".len() <= bytes.len() {
+        let Some(relative) = code[offset..].find("quirl.") else {
+            break;
+        };
+        let start = offset + relative;
+        if start > 0 && is_lua_identifier_byte(bytes[start - 1]) {
+            offset = start + "quirl.".len();
+            continue;
+        }
+        let mut end = start + "quirl.".len();
+        while end < bytes.len() && (is_lua_identifier_byte(bytes[end]) || bytes[end] == b'.') {
+            end += 1;
+        }
+        while end > start && bytes[end - 1] == b'.' {
+            end -= 1;
+        }
+        let symbol = &code[start..end];
+        let specification = HOST_API.iter().find(|spec| spec.path == symbol);
+        let namespace = HOST_API
+            .iter()
+            .any(|spec| spec.path.starts_with(&format!("{symbol}.")));
+        if specification.is_none() && !namespace {
+            error = error.with_label(
+                Some(path.display().to_string()),
+                start,
+                end,
+                format!("unknown Quirl host symbol `{symbol}`"),
+            );
+            offset = end.max(start + 1);
+            continue;
+        }
+        if let Some(specification) = specification {
+            let next = bytes[end..]
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())
+                .map(|relative| end + relative);
+            let actual_arguments =
+                match next.and_then(|next| bytes.get(next).map(|byte| (next, byte))) {
+                    Some((open, b'(')) => count_parenthesized_arguments(code, open),
+                    Some((_, b'{')) => Some(1),
+                    _ => None,
+                };
+            if let Some(actual) = actual_arguments {
+                let expected = specification.parameters.len();
+                if actual != expected {
+                    error = error.with_label(
+                        Some(path.display().to_string()),
+                        start,
+                        end,
+                        format!(
+                            "`{symbol}` expects {expected} argument(s), but this call provides {actual}"
+                        ),
+                    );
+                }
+            }
+        }
+        offset = end.max(start + 1);
+    }
+    if error.details.labels.is_empty() {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn is_lua_identifier_byte(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn count_parenthesized_arguments(code: &str, open: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let mut parentheses = 1_usize;
+    let mut braces = 0_usize;
+    let mut brackets = 0_usize;
+    let mut commas = 0_usize;
+    let mut has_argument = false;
+    let mut offset = open + 1;
+    while let Some(byte) = bytes.get(offset) {
+        match byte {
+            b'(' => parentheses += 1,
+            b')' => {
+                parentheses = parentheses.saturating_sub(1);
+                if parentheses == 0 {
+                    return Some(if has_argument { commas + 1 } else { 0 });
+                }
+            }
+            b'{' => braces += 1,
+            b'}' => braces = braces.saturating_sub(1),
+            b'[' => brackets += 1,
+            b']' => brackets = brackets.saturating_sub(1),
+            b',' if parentheses == 1 && braces == 0 && brackets == 0 => commas += 1,
+            byte if !byte.is_ascii_whitespace()
+                && parentheses == 1
+                && braces == 0
+                && brackets == 0 =>
+            {
+                has_argument = true;
+            }
+            _ => {}
+        }
+        offset += 1;
+    }
+    None
+}
+
+fn validate_annotations(
+    source: &str,
+    path: &Path,
+    line_comment_starts: &HashSet<usize>,
+) -> Result<(), ShellError> {
+    let mut error = ShellError::new(ErrorCode::Validation, "Lua annotation validation failed")
+        .with_help(
+            "Use the supported LuaLS-compatible `meta`, `module`, `class`, `field`, `param`, `return`, or `type` annotations",
+        );
+    let mut offset = 0;
+    for line in source.lines() {
+        let leading = line.len().saturating_sub(line.trim_start().len());
+        let trimmed = line.trim_start();
+        let annotation_start = offset + leading;
+        if let Some(annotation) = trimmed
+            .strip_prefix("---@")
+            .filter(|_| line_comment_starts.contains(&annotation_start))
+        {
+            let annotation = annotation.trim();
+            let (kind, body) = annotation
+                .split_once(char::is_whitespace)
+                .map_or((annotation, ""), |(kind, body)| (kind, body.trim()));
+            let problem = validate_annotation(kind, body);
+            if let Some(problem) = problem {
+                let start = offset + leading;
+                error = error.with_label(
+                    Some(path.display().to_string()),
+                    start,
+                    start + trimmed.len(),
+                    problem,
+                );
+            }
+        }
+        offset += line.len() + 1;
+    }
+    if error.details.labels.is_empty() {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn validate_annotation(kind: &str, body: &str) -> Option<String> {
+    match kind {
+        "meta" if body.is_empty() || valid_qualified_name(body) => None,
+        "module" if !body.is_empty() => validate_type_expression(body)
+            .err()
+            .map(|problem| format!("invalid `@module` name: {problem}")),
+        "class" => required_type_annotation(kind, body),
+        "return" | "type" => required_type_annotation(kind, body),
+        "field" | "param" => {
+            let Some((name, lua_type)) = body.split_once(char::is_whitespace) else {
+                return Some(format!("`@{kind}` requires a name and a type"));
+            };
+            if (kind == "param" && name == "...") || valid_annotation_name(name) {
+                validate_type_expression(lua_type.trim())
+                    .err()
+                    .map(|problem| format!("invalid `@{kind}` type: {problem}"))
+            } else {
+                Some(format!("invalid `@{kind}` name `{name}`"))
+            }
+        }
+        "" => Some("annotation name is missing".to_owned()),
+        _ => Some(format!(
+            "unsupported Lua annotation `@{kind}`; supported annotations are meta, module, class, field, param, return, and type"
+        )),
+    }
+}
+
+fn required_type_annotation(kind: &str, body: &str) -> Option<String> {
+    if body.is_empty() {
+        Some(format!("`@{kind}` requires a type"))
+    } else {
+        validate_type_expression(body)
+            .err()
+            .map(|problem| format!("invalid `@{kind}` type: {problem}"))
+    }
+}
+
+fn valid_annotation_name(name: &str) -> bool {
+    let name = name.strip_suffix('?').unwrap_or(name);
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn valid_qualified_name(name: &str) -> bool {
+    !name.is_empty() && name.split('.').all(valid_annotation_name)
+}
+
+fn validate_type_expression(expression: &str) -> Result<(), &'static str> {
+    if expression.trim().is_empty() {
+        return Err("type is empty");
+    }
+    let mut delimiters = Vec::new();
+    for character in expression.chars() {
+        match character {
+            '<' | '[' | '(' | '{' => delimiters.push(character),
+            '>' | ']' | ')' | '}' => {
+                let expected = match character {
+                    '>' => '<',
+                    ']' => '[',
+                    ')' => '(',
+                    '}' => '{',
+                    _ => return Err("unexpected delimiter"),
+                };
+                if delimiters.pop() != Some(expected) {
+                    return Err("delimiters are not balanced");
+                }
+            }
+            character
+                if character.is_ascii_alphanumeric()
+                    || character.is_ascii_whitespace()
+                    || matches!(
+                        character,
+                        '_' | '.' | '?' | '|' | ',' | ':' | '-' | '"' | '\''
+                    ) => {}
+            _ => return Err("type contains an unsupported character"),
+        }
+    }
+    if delimiters.is_empty() {
+        Ok(())
+    } else {
+        Err("delimiters are not balanced")
+    }
+}
+
 fn read_source(path: &Path) -> Result<String, ShellError> {
     let source = fs::read_to_string(path).map_err(|error| script_read_error(path, error))?;
-    Ok(if let Some(source) = source.strip_prefix("#!") {
-        format!("--{source}")
-    } else {
-        source
-    })
+    Ok(normalize_shebang(&source))
+}
+
+fn normalize_shebang(source: &str) -> String {
+    source
+        .strip_prefix("#!")
+        .map_or_else(|| source.to_owned(), |source| format!("--{source}"))
 }
 
 fn script_read_error(path: &Path, error: std::io::Error) -> ShellError {
@@ -1027,6 +1591,28 @@ mod tests {
         let config = runtime.lua.from_value::<QuirlConfig>(value).unwrap();
         config.validate("test").unwrap();
         assert_eq!(config.editor.keymap, "helix");
+    }
+
+    #[test]
+    fn computed_config_is_evaluated_before_authoritative_schema_validation() {
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let value = runtime
+            .lua
+            .load(
+                r#"local keymaps = { "vim", "helix" }
+                local selected = 1
+                return quirl.config {
+                  editor = { keymap = keymaps[selected], semantic_hints = selected == 1 },
+                  picker = { layout = "adaptive", preview = true },
+                  prompt = { left = {}, right = {} },
+                }"#,
+            )
+            .eval::<Value>()
+            .unwrap();
+        let config = runtime.lua.from_value::<QuirlConfig>(value).unwrap();
+        config.validate("computed-config.lua").unwrap();
+        assert_eq!(config.editor.keymap, "vim");
+        assert!(config.editor.semantic_hints);
     }
 
     #[test]
@@ -1236,7 +1822,104 @@ mod tests {
 
     #[test]
     fn formatter_is_conservative_and_deterministic() {
-        assert_eq!(format_source("return 42  \n\n"), "return 42\n\n");
+        let source = "local function main()  \nreturn {\nok = true,  \n}\nend\n\n";
+        let expected = "local function main()\n  return {\n    ok = true,\n  }\nend\n";
+        assert_eq!(format_source(source), expected);
+        assert_eq!(format_source(expected), expected);
+
+        let long_string = "local docs = [[\n  literal indentation  \n---@not_an_annotation\n]]\n";
+        assert_eq!(format_source(long_string), long_string);
+        for example in [
+            include_str!("../../../examples/lua_tests.lua"),
+            include_str!("../../../examples/plugin.lua"),
+        ] {
+            assert_eq!(format_source(example), example);
+        }
+    }
+
+    #[test]
+    fn checker_accepts_the_documented_luals_annotation_surface_without_execution() {
+        let source = r#"---@meta quirl
+---@class quirl.Context
+---@field args string[]
+---@param ctx quirl.Context
+---@return quirl.Result<quirl.Output, quirl.ShellError>
+local function main(ctx)
+  error("checking must not execute Lua")
+end
+---@type fun(ctx: quirl.Context): table
+local exported = main
+return { main = exported }
+"#;
+        LuaRuntime::check_source(source, "annotated.lua").unwrap();
+    }
+
+    #[test]
+    fn checker_rejects_unknown_and_malformed_annotations_with_spans() {
+        let error = LuaRuntime::check_source(
+            "---@parm ctx table\n---@return quirl.Result<table\nreturn {}\n",
+            "bad-annotations.lua",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert_eq!(error.details.labels.len(), 2);
+        assert_eq!(
+            error.details.labels[0].source.as_deref(),
+            Some("bad-annotations.lua")
+        );
+        assert!(error.details.labels[0].message.contains("unsupported"));
+        assert!(error.details.labels[1].message.contains("balanced"));
+    }
+
+    #[test]
+    fn checker_validates_known_host_symbols_modules_and_practical_arity() {
+        LuaRuntime::check_source(
+            r#"local process = quirl.process
+            local cwd = quirl.cwd()
+            local result = quirl.process.run("printf ok")
+            return quirl.config { prompt = { left = {}, right = {} } }"#,
+            "known-host.lua",
+        )
+        .unwrap();
+
+        let source = "local missing = quirl.process.missing()\nreturn quirl.cwd(1)\n";
+        let error = LuaRuntime::check_source(source, "bad-host.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert_eq!(error.details.labels.len(), 2);
+        assert_eq!(
+            &source[error.details.labels[0].start..error.details.labels[0].end],
+            "quirl.process.missing"
+        );
+        assert!(error.details.labels[0].message.contains("unknown"));
+        assert_eq!(
+            &source[error.details.labels[1].start..error.details.labels[1].end],
+            "quirl.cwd"
+        );
+        assert!(error.details.labels[1].message.contains("expects 0"));
+    }
+
+    #[test]
+    fn script_tests_run_in_lexical_name_order() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        let error = runtime
+            .test_source(
+                r#"return {
+                  test_z = function() error("z failed") end,
+                  test_a = function() error("a failed") end,
+                }"#,
+                "ordered-tests.lua",
+            )
+            .unwrap_err();
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|item| item == "test: test_a"));
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|item| item.contains("a failed")));
     }
 
     #[test]
@@ -1246,6 +1929,31 @@ mod tests {
             assert!(stub.contains(spec.path));
         }
         assert_eq!(include_str!("../../../docs/quirl.lua"), stub);
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SdkEnvelope {
+            document_type: String,
+            schema_version: u32,
+            module: String,
+            module_version: String,
+            functions: Vec<serde_json::Value>,
+        }
+        let json = sdk_json().unwrap();
+        let envelope: SdkEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope.document_type, "quirl.host_api");
+        assert_eq!(envelope.schema_version, 1);
+        assert_eq!(envelope.module, "quirl");
+        assert_eq!(envelope.module_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(envelope.functions.len(), HOST_API.len());
+        let mut unknown: serde_json::Value = serde_json::from_str(&json).unwrap();
+        unknown["unexpected"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<SdkEnvelope>(unknown).is_err());
+
+        let markdown = sdk_markdown();
+        assert!(markdown.contains("`quirl.process.run(command: string) -> quirl.Result`"));
+        assert!(markdown.contains("| `command` | `string` |"));
+        assert!(markdown.contains("Returns: `quirl.Result`"));
     }
 
     #[test]
@@ -1256,6 +1964,20 @@ mod tests {
         assert!(error.details.labels[0]
             .message
             .contains("explicit Quirl capability"));
+    }
+
+    #[test]
+    fn linter_does_not_treat_strings_or_comments_as_capability_use() {
+        lint_source(
+            "local example = 'os.execute(\\\"nope\\\")' -- io.open('also-nope')\nreturn example",
+            Path::new("docs.lua"),
+        )
+        .unwrap();
+        lint_source(
+            "local docs = [[\n---@not_an_annotation\nos.execute('still text')\n]]\nreturn docs",
+            Path::new("long-docs.lua"),
+        )
+        .unwrap();
     }
 
     #[test]

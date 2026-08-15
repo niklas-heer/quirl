@@ -35,6 +35,16 @@ pub enum ConfigOutputFormat {
     Json,
 }
 
+pub fn wants_json(command: &ConfigCommand) -> bool {
+    matches!(
+        command,
+        ConfigCommand::Check {
+            format: ConfigOutputFormat::Json,
+            ..
+        }
+    )
+}
+
 pub fn execute(command: ConfigCommand) -> Result<i32, ShellError> {
     match command {
         ConfigCommand::Check { file, format } => check(&file, format),

@@ -68,9 +68,15 @@ as smart as your editor.
 - **Capability-based plugins** — trusted Lua plugins run in-process with
   restricted module loading, instruction/time/memory budgets, and
   cancellation, so a runaway script can't take down your session.
-- **Generated everything** — LuaLS-compatible stubs, Markdown docs, and JSON
-  schemas are generated from the same Rust host definitions that power the
+- **Generated everything** — LuaLS-compatible stubs, Markdown docs, and
+  versioned JSON metadata are generated from the same Rust host definitions that power the
   runtime, so the SDK, editor completions, and AI context never drift apart.
+- **Built-in language service** — `quirl lsp` gives Lua and `.quirl` files
+  deterministic diagnostics, completion, hover, signatures, and generated
+  module docs over stdio without evaluating the document.
+- **Explicit agent and package contracts** — versioned deny-unknown JSON,
+  token-budgeted installed context, schema/content hashes, and package metadata
+  quality gates are available without executing extensions or publishing.
 
 ## How is Quirl different?
 
@@ -98,8 +104,9 @@ shell; Quirl is still an early Preview.
 
 ## Status
 
-Quirl 0.1 is a runnable Preview: substantially more complete than the original
-vertical slice, but not yet the frozen, cross-platform 1.0 daily-driver contract.
+Quirl 0.1 is a runnable Scriptable milestone: the Preview shell and Phase 2
+authoring, language-service, agent, and package contracts work end to end, but
+the platform is not yet the frozen, cross-platform 1.0 daily-driver contract.
 The architecture and decisions behind it are documented in depth:
 
 - [Language & product design](docs/language-design.md) — the intended
@@ -110,6 +117,10 @@ The architecture and decisions behind it are documented in depth:
   the accepted decision and its implementation status.
 - [ADR 0002: one-way crate layering](docs/decisions/0002-crate-layering.md) —
   the dependency graph and composition boundaries for the Rust workspace.
+- [Agent and package contracts](docs/agent-and-package-contracts.md) — stable
+  AI discovery, validation, `plugin.toml`, build, and dry-run publish formats.
+- [ADR 0004: Phase 2 product layers](docs/decisions/0004-phase-2-contract-and-language-service-layers.md) —
+  one-way boundaries for contracts and the language service.
 - [Runtime selection spike](docs/benchmarks/embedded-language-selection.md) —
   the earlier latency benchmarks that fed the decision.
 
@@ -137,8 +148,8 @@ runtime dependencies have been removed.
 - [x] Durable, searchable command history with the shared typed Ctrl-R picker.
 - [x] A shared typed picker spanning history, files, palette actions, jobs, and data.
 - [x] Named end-to-end PTY performance measurements with misses recorded.
-- [ ] Complete scripting tooling: a real formatter, annotation-aware checking,
-  language service, package manifests, and deterministic integration tests.
+- [x] Deterministic Lua/`.quirl` run, format, check, lint, test, documentation,
+  language-service, package, and agent-contract tooling.
 - [ ] Windows support plus 1.0 recovery, accessibility, and performance hardening.
 
 ## Quick start
@@ -173,6 +184,10 @@ shortcuts and textual mode commands remain usable without color.
 
 ```console
 cargo run -p quirl-cli -- run examples/hello.lua Codex
+cargo run -p quirl-cli -- new automation --lang lua
+cargo run -p quirl-cli -- check . --format json
+cargo run -p quirl-cli -- fmt . --check
+cargo run -p quirl-cli -- test
 cargo run -p quirl-cli -- data '[{"name":"api","status":"up"}] | get name'
 cargo run -p quirl-cli -- check examples/hello.lua --format json
 cargo run -p quirl-cli -- config check examples/config.lua --format json
@@ -183,6 +198,13 @@ cargo run -p quirl-cli -- complete 'git commit --am'
 cargo run -p quirl-cli -- pick --source history --query cargo
 cargo run -p quirl-cli -- pick --source files --query src
 cargo run -p quirl-cli -- catalog --format json
+cargo run -p quirl-cli -- describe 'quirl run' --format markdown
+cargo run -p quirl-cli -- doc --format html --output target/quirl-docs/catalog.html
+cargo run -p quirl-cli -- agent manifest --format json
+cargo run -p quirl-cli -- agent context 'deploy the billing service' --token-budget 6000
+cargo run -p quirl-cli -- package build --manifest examples/package/plugin.toml
+cargo run -p quirl-cli -- package publish --dry-run --manifest examples/package/plugin.toml
+cargo run -p quirl-cli -- lsp
 cargo run -p quirl-cli -- index build
 cargo run -p quirl-cli -- index explain git commit
 cargo run --release -p quirl-bench
@@ -197,6 +219,13 @@ ingest options from bounded, already-supplied text/files—Quirl never invokes t
 documented command or `man`. Every imported fact records its source, confidence,
 origin, and fingerprint for `quirl index explain`. Because `--help` is an input
 flag on `index build`, use `quirl index build -h` for that subcommand's usage.
+
+`quirl lsp` speaks standard LSP `Content-Length` framing over stdin/stdout.
+Lua editor intelligence is generated from the same `HOST_API` as the runtime;
+`.quirl` command intelligence is generated from the loaded semantic catalog.
+The server compiles and lints Lua but never invokes the compiled chunk or
+executes `.quirl` commands. See the [language-service protocol and editor
+contract](docs/language-service.md).
 
 The main benchmark accepts an official Fennel single-file library with
 `--fennel /path/to/fennel.lua`. Isolated, reproducible spikes cover
@@ -275,6 +304,8 @@ Quirl is organized as a Cargo workspace of small, focused crates:
 | `quirl-lua`      | Restricted Lua 5.4 runtime, Rust schemas, resource budgets, SDK generation |
 | `quirl-syntax`   | The explicit command/data-mode interaction grammar                      |
 | `quirl-catalog`  | One schema for completion, help, docs, validation, and AI                |
+| `quirl-contract` | Versioned agent/package schemas, budgets, hashes, and quality gates      |
+| `quirl-lsp`      | Deterministic stdio language service over catalog and Lua metadata       |
 | `quirl-picker`   | Typed exact/fuzzy/inverse selection shared across providers              |
 | `quirl-process`  | Native command graph, pipes, redirects, process groups, and jobs         |
 | `quirl-ui`       | Semantic highlighting, IDE completion menu, prompt, diagnostics          |

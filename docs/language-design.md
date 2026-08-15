@@ -645,8 +645,8 @@ These are targets, not current benchmark claims. Each release records cold/warm 
 | Phase | Status | Deliverable |
 | --- | --- | --- |
 | 0 | **Complete** | Lua runtime and generated SDK views; config validation; atomic live config/plugin reload; applied editor/prompt/picker settings; live prompt/completion callbacks; resource budgets; command graph; mode switch; focused native data grammar; C0 execution; byte pipes; built-in `ls`; error spans. |
-| 1 | Preview | Job control, redirects, indexed completions, Zsh/Bash/Fish and help/man ingestion, history/file/action picker, adaptive prompt, typed config forms with web/TUI views, C1 subset, structured core commands, plain fallbacks, Linux/macOS. |
-| 2 | Scriptable | Lua scripts and computed config, `quirl run`, formatter, annotation-aware checker, linter, tests, docs, language service, agent catalog/validation formats, package manifests, generated host API, deterministic tests. |
+| 1 | **Accepted · Preview** | Job control, redirects, indexed completions, Zsh/Bash/Fish and help/man ingestion, history/file/action picker, adaptive prompt, typed config forms with web/TUI views, C1 subset, structured core commands, plain fallbacks, Linux/macOS. |
+| 2 | **Complete · Scriptable** | Lua scripts and computed config, `quirl run`, formatter, annotation-aware checker, linter, tests, docs, language service, agent catalog/validation formats, package manifests, generated host API, deterministic tests. |
 | 3 | Platform | Trusted-language and Wasm SDKs, permissions/lockfile, catalog/completion/UI/event extension points, Bash/Zsh runners, directory/process panels, live pipelines, Windows job control, recovery. |
 | 4 | 1.0 | Freeze versioned grammar, command catalog, completion/picker protocols, agent schema, runner/plugin APIs, config schema/migration, performance gates, security/accessibility audits, compatibility matrix. |
 
@@ -679,6 +679,33 @@ list:
 
 Every gate lands with catalog metadata, diagnostics, keyboard navigation,
 and accessible text output, per the release criterion in §10.
+
+### Phase 2 acceptance evidence
+
+- **One script entry point.** `quirl run` selects Lua or the line-oriented
+  `.quirl` grammar by explicit `--lang`, shebang, or extension, accepts stdin,
+  preserves Lua resource policy, and reports labeled native command/data
+  failures. Unsupported Bash/Zsh runners remain an explicit Phase 3 surface.
+- **Deterministic authoring tools.** `fmt`, `check`, `lint`, and `test` accept
+  files or deterministic project discovery. They skip build/VCS directories
+  and symlink directories, aggregate every diagnostic, never execute checks,
+  and isolate test modules under the script policy.
+- **Generated knowledge.** `new`, `describe`, and `doc` use checked templates
+  and the semantic catalog. Lua annotations, editor completion, hover,
+  signatures, module docs, runtime bindings, and SDK output derive from the
+  same `HOST_API` definitions.
+- **Language service.** `quirl lsp` implements a bounded stdio LSP subset with
+  UTF-16 positions and deterministic document state. Lua diagnostics compile
+  and lint without invoking chunks; `.quirl` intelligence consumes the loaded
+  catalog without executing commands.
+- **Agent and package contracts.** Versioned deny-unknown documents carry
+  installed versions, named schema/content hashes, capabilities, validators,
+  and token-budgeted context. Package builds enforce public-command metadata,
+  entry/version/capability constraints, and reproducible output;
+  `publish --dry-run` proves that no registry or network action occurs.
+- **Evidence stays executable.** In-crate protocol, policy, schema,
+  determinism, traversal, quality-gate, and tamper tests run under the canonical
+  `mask check`, alongside the generated-SDK exactness and guest Lua suite.
 
 ## 14. Review decisions
 

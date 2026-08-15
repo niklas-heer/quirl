@@ -1,17 +1,25 @@
+mod agent;
+mod author;
 mod config;
 mod extensions;
 mod index;
+mod lsp;
+mod package;
 mod pick;
+mod script;
 
+use agent::AgentCommand;
+use author::{DescribeCommand, DocCommand, NewCommand};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::ConfigCommand;
 use extensions::{LuaCompletionAdapter, LuaExtensionHost};
 use index::IndexCommand;
+use package::PackageCommand;
 use pick::PickCommand;
 use quirl_catalog::{Catalog, CommandSpec};
 use quirl_core::{ErrorCode, ShellError};
 use quirl_data::DataRuntime;
-use quirl_lua::{format_file, sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig};
+use quirl_lua::{sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig};
 use quirl_process::{JobStatus, NativeExecutor};
 use quirl_syntax::{classify, InteractiveLine, Mode};
 use quirl_ui::{
@@ -19,6 +27,7 @@ use quirl_ui::{
     QuirlPrompt, MODE_TOGGLE_HOST_COMMAND,
 };
 use reedline::Signal;
+use script::ScriptLanguage;
 use std::{
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
@@ -36,9 +45,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a Lua script in-process.
+    /// Create a checked embedded-language script from Quirl's template.
+    New {
+        #[command(flatten)]
+        command: NewCommand,
+    },
+    /// Run a Lua or .quirl script under its explicit restricted policy.
     Run {
+        /// Script file, or - for standard input with --lang or a recognized shebang.
         file: PathBuf,
+        #[arg(long, value_enum)]
+        lang: Option<ScriptLanguage>,
         #[arg(trailing_var_arg = true)]
         arguments: Vec<String>,
     },
@@ -46,26 +63,36 @@ enum Command {
     Eval { expression: String },
     /// Evaluate a native structured-data expression or pipeline.
     Data { expression: String },
-    /// Parse a script without executing it.
+    /// Validate a Lua/.quirl file or directory without executing source.
     Check {
+        /// Script file or recursively discovered directory.
+        #[arg(value_name = "PATH")]
         file: PathBuf,
         #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
         format: DiagnosticFormat,
     },
-    /// Conservatively format a Lua file.
+    /// Deterministically format Lua files under a file or directory path.
     Fmt {
+        /// Lua/.quirl file or recursively discovered directory; .quirl is unchanged.
+        #[arg(value_name = "PATH")]
         file: PathBuf,
         #[arg(long)]
         check: bool,
     },
-    /// Parse and lint a Lua file without executing it.
+    /// Lint Lua/.quirl files under a file or directory without execution.
     Lint {
+        /// Script file or recursively discovered directory.
+        #[arg(value_name = "PATH")]
         file: PathBuf,
         #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
         format: DiagnosticFormat,
     },
-    /// Run test_* functions returned by a Lua test module.
-    Test { file: PathBuf },
+    /// Run discovered Lua test modules; defaults to the current directory.
+    Test {
+        /// Explicit test file or recursively discovered directory.
+        #[arg(value_name = "PATH")]
+        file: Option<PathBuf>,
+    },
     /// Validate or inspect Lua configuration.
     Config {
         #[command(subcommand)]
@@ -86,6 +113,28 @@ enum Command {
         #[arg(long, value_enum, default_value_t = CatalogFormat::Json)]
         format: CatalogFormat,
     },
+    /// Export deterministic installed context and validation contracts for agents.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+    /// Inspect, validate, build, or dry-run publication of a Quirl package.
+    Package {
+        #[command(subcommand)]
+        command: PackageCommand,
+    },
+    /// Describe one installed command from the semantic catalog.
+    Describe {
+        #[command(flatten)]
+        command: DescribeCommand,
+    },
+    /// Generate deterministic human or machine documentation.
+    Doc {
+        #[command(flatten)]
+        command: DocCommand,
+    },
+    /// Serve deterministic Lua and .quirl editor intelligence over stdio LSP.
+    Lsp,
     /// Build and inspect the attributed completion index.
     Index {
         #[command(subcommand)]
@@ -146,8 +195,17 @@ enum CompletionFormat {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let wants_json = cli.wants_json();
+    match run(cli) {
         Ok(status) => ExitCode::from(status.clamp(0, 255) as u8),
+        Err(error) if wants_json => {
+            match serde_json::to_string_pretty(&error) {
+                Ok(json) => println!("{json}"),
+                Err(_) => eprintln!("{}", render_stderr_error(&error)),
+            }
+            ExitCode::FAILURE
+        }
         Err(error) => {
             eprintln!("{}", render_stderr_error(&error));
             ExitCode::FAILURE
@@ -156,17 +214,16 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<i32, ShellError> {
-    let catalog = if matches!(&cli.command, Some(Command::Index { .. })) {
-        Catalog::builtin()
-    } else {
-        index::load_default_catalog()?
-    };
     match cli.command {
-        Some(Command::Run { file, arguments }) => {
-            require_lua_file(&file)?;
-            let lua = LuaRuntime::new(LuaPolicy::script())?;
-            print_json_value(lua.run_file(&file, &arguments)?);
-            Ok(0)
+        Some(Command::New { command }) => author::create(command),
+        Some(Command::Run {
+            file,
+            lang,
+            arguments,
+        }) => {
+            let output = script::run(&file, lang, &arguments)?;
+            print_json_value(output.value);
+            Ok(output.status)
         }
         Some(Command::Eval { expression }) => {
             let lua = LuaRuntime::new(LuaPolicy::script())?;
@@ -177,29 +234,15 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             print_json_value(DataRuntime::new().eval(&expression)?);
             Ok(0)
         }
-        Some(Command::Check { file, format }) => validate_file(&file, format),
-        Some(Command::Fmt { file, check }) => {
-            let changed = format_file(&file, check)?;
-            if check && changed {
-                return Err(ShellError::new(
-                    ErrorCode::Validation,
-                    format!("{} needs formatting", file.display()),
-                )
-                .with_help(format!("Run `quirl fmt {}`", file.display())));
-            }
-            println!(
-                "{} {}",
-                if changed { "formatted" } else { "unchanged" },
-                file.display()
-            );
-            Ok(0)
+        Some(Command::Check { file, format }) => {
+            script::analyze(&file, matches!(format, DiagnosticFormat::Json), false)
         }
-        Some(Command::Lint { file, format }) => validate_lua(&file, format, "lint clean"),
+        Some(Command::Fmt { file, check }) => script::format_paths(&file, check),
+        Some(Command::Lint { file, format }) => {
+            script::analyze(&file, matches!(format, DiagnosticFormat::Json), true)
+        }
         Some(Command::Test { file }) => {
-            let lua = LuaRuntime::new(LuaPolicy::script())?;
-            let count = lua.test_file(&file)?;
-            println!("✓ {count} Lua tests passed in {}", file.display());
-            Ok(0)
+            script::test_paths(file.as_deref().unwrap_or_else(|| Path::new(".")))
         }
         Some(Command::Config { command }) => config::execute(command),
         Some(Command::Plugin {
@@ -234,6 +277,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             Ok(0)
         }
         Some(Command::Catalog { format }) => {
+            let catalog = index::load_default_catalog();
             match format {
                 CatalogFormat::Json => println!(
                     "{}",
@@ -244,8 +288,18 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             }
             Ok(0)
         }
+        Some(Command::Agent { command }) => agent::execute(command, &index::load_default_catalog()),
+        Some(Command::Package { command }) => {
+            package::execute(command, &index::load_default_catalog())
+        }
+        Some(Command::Describe { command }) => {
+            author::describe(command, &index::load_default_catalog())
+        }
+        Some(Command::Doc { command }) => author::doc(command, &index::load_default_catalog()),
+        Some(Command::Lsp) => lsp::execute(index::load_default_catalog()),
         Some(Command::Index { command }) => index::execute(command),
         Some(Command::Complete { input, format }) => {
+            let catalog = index::load_default_catalog();
             let completions = catalog.complete(&input, input.len());
             match format {
                 CompletionFormat::Json => println!(
@@ -260,14 +314,64 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             }
             Ok(0)
         }
-        Some(Command::Pick { command }) => pick::execute(command, &catalog),
+        Some(Command::Pick { command }) => pick::execute(command, &index::load_default_catalog()),
         Some(Command::Exec { command }) => {
             let outcome = NativeExecutor::default().execute(&command.join(" "))?;
             print_outcome(&outcome);
             Ok(outcome.status)
         }
         None if !io::stdin().is_terminal() => run_stdin(),
-        None => repl(catalog),
+        None => repl(index::load_default_catalog()),
+    }
+}
+
+impl Cli {
+    fn wants_json(&self) -> bool {
+        self.command.as_ref().is_some_and(Command::wants_json)
+    }
+}
+
+impl Command {
+    fn wants_json(&self) -> bool {
+        match self {
+            Self::Check {
+                format: DiagnosticFormat::Json,
+                ..
+            }
+            | Self::Lint {
+                format: DiagnosticFormat::Json,
+                ..
+            }
+            | Self::Plugin {
+                command:
+                    PluginCommand::Check {
+                        format: DiagnosticFormat::Json,
+                        ..
+                    },
+            }
+            | Self::Sdk {
+                format: SdkFormat::Json,
+            }
+            | Self::Catalog {
+                format: CatalogFormat::Json,
+            }
+            | Self::Complete {
+                format: CompletionFormat::Json,
+                ..
+            } => true,
+            Self::Config { command } => config::wants_json(command),
+            Self::Agent { command } => agent::wants_json(command),
+            Self::Package { command } => package::wants_json(command),
+            Self::Describe { command } => {
+                matches!(command.format, author::DocumentationFormat::Json)
+            }
+            Self::Doc { command } => {
+                matches!(command.format, author::DocumentationFormat::Json)
+            }
+            Self::Index { command } => index::wants_json(command),
+            Self::Pick { command } => command.wants_json(),
+            _ => false,
+        }
     }
 }
 
@@ -503,35 +607,6 @@ fn run_stdin() -> Result<i32, ShellError> {
     Ok(0)
 }
 
-fn validate_file(file: &Path, format: DiagnosticFormat) -> Result<i32, ShellError> {
-    if let Err(error) = require_lua_file(file) {
-        return validation_failure(error, format);
-    }
-    validate_lua(file, format, "valid Lua")
-}
-
-fn validate_lua(file: &Path, format: DiagnosticFormat, message: &str) -> Result<i32, ShellError> {
-    match LuaRuntime::check_file(file) {
-        Ok(()) => validation_success(file, format, message),
-        Err(error) => validation_failure(error, format),
-    }
-}
-
-fn validation_success(
-    file: &Path,
-    format: DiagnosticFormat,
-    message: &str,
-) -> Result<i32, ShellError> {
-    match format {
-        DiagnosticFormat::Json => println!(
-            "{{\"valid\":true,\"file\":{}}}",
-            json_string(&file.display().to_string())?
-        ),
-        _ => println!("✓ {} is {message}", file.display()),
-    }
-    Ok(0)
-}
-
 fn validation_failure(error: ShellError, format: DiagnosticFormat) -> Result<i32, ShellError> {
     if matches!(format, DiagnosticFormat::Json) {
         println!(
@@ -541,22 +616,6 @@ fn validation_failure(error: ShellError, format: DiagnosticFormat) -> Result<i32
         Ok(1)
     } else {
         Err(error)
-    }
-}
-
-fn is_lua(path: &Path) -> bool {
-    path.extension().is_some_and(|extension| extension == "lua")
-}
-
-fn require_lua_file(path: &Path) -> Result<(), ShellError> {
-    if is_lua(path) {
-        Ok(())
-    } else {
-        Err(ShellError::new(
-            ErrorCode::InvalidArgument,
-            format!("{} is not a Lua script", path.display()),
-        )
-        .with_help("Quirl currently runs embedded scripts with the .lua extension"))
     }
 }
 
@@ -631,10 +690,6 @@ fn print_outcome(outcome: &quirl_core::CommandOutcome) {
     }
 }
 
-fn json_string(value: &str) -> Result<String, ShellError> {
-    serde_json::to_string(value).map_err(json_error)
-}
-
 fn json_error(error: serde_json::Error) -> ShellError {
     ShellError::new(ErrorCode::Io, "could not produce JSON").with_context(error.to_string())
 }
@@ -642,6 +697,7 @@ fn json_error(error: serde_json::Error) -> ShellError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn color_requires_a_terminal_and_no_color_must_be_absent() {
@@ -677,5 +733,69 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["quirl", "sdk", "--format", "markdown"]).is_ok());
         assert!(Cli::try_parse_from(["quirl", "catalog", "--format", "markdown"]).is_ok());
+    }
+
+    #[test]
+    fn machine_formats_own_failures_after_argument_parsing() {
+        for arguments in [
+            vec!["quirl", "check", "missing.lua", "--format", "json"],
+            vec!["quirl", "agent", "context", "deploy", "--format", "json"],
+            vec!["quirl", "package", "publish", "--format", "json"],
+            vec!["quirl", "describe", "missing", "--format", "json"],
+            vec!["quirl", "doc", "--open", "--format", "json"],
+            vec!["quirl", "index", "explain", "missing", "--format", "json"],
+            vec![
+                "quirl", "pick", "--source", "files", "--root", "missing", "--format", "json",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert!(cli.wants_json());
+        }
+    }
+
+    #[test]
+    fn lsp_is_a_leaf_stdio_command() {
+        assert!(matches!(
+            Cli::try_parse_from(["quirl", "lsp"]),
+            Ok(Cli {
+                command: Some(Command::Lsp)
+            })
+        ));
+        assert!(Cli::try_parse_from(["quirl", "lsp", "--port", "9000"]).is_err());
+    }
+
+    #[test]
+    fn every_cli_leaf_has_one_exact_catalog_contract() {
+        fn leaves(command: &clap::Command, prefix: &str, output: &mut Vec<String>) {
+            for child in command
+                .get_subcommands()
+                .filter(|child| child.get_name() != "help")
+            {
+                let path = format!("{prefix} {}", child.get_name());
+                if child
+                    .get_subcommands()
+                    .any(|grandchild| grandchild.get_name() != "help")
+                {
+                    leaves(child, &path, output);
+                } else {
+                    output.push(path);
+                }
+            }
+        }
+
+        let mut cli_leaves = Vec::new();
+        leaves(&Cli::command(), "quirl", &mut cli_leaves);
+        let catalog = Catalog::builtin();
+        for path in cli_leaves {
+            let count = catalog
+                .commands
+                .iter()
+                .filter(|command| command.path == path)
+                .count();
+            assert_eq!(
+                count, 1,
+                "CLI leaf `{path}` must have one exact catalog entry"
+            );
+        }
     }
 }

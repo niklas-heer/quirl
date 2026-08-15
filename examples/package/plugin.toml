@@ -1,0 +1,35 @@
+schema_version = 1
+
+[package]
+name = "deploy-tools"
+version = "0.1.0"
+entry = "plugin.lua"
+quirl = ">=0.1, <0.2"
+summary = "Deploy services with explicit safeguards"
+license = "MIT"
+
+[capabilities]
+request = ["process.spawn"]
+
+[contributes]
+commands = ["deploy"]
+panels = []
+indexers = []
+
+[[public_commands]]
+path = "deploy"
+signature = "deploy <environment>"
+summary = "Deploy a service"
+details = "Deploys one service after validation."
+input_type = "Nothing"
+output_type = "Result<Deployment>"
+examples = ["deploy staging"]
+effects = ["spawn_process"]
+error_codes = { "0" = "deployed", "1" = "deployment failed" }
+
+[[public_commands.arguments]]
+names = ["environment"]
+kind = "positional"
+value_type = "Environment"
+required = true
+documentation = "Target deployment environment"
