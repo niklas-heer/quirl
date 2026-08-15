@@ -13,6 +13,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
+    io::Read,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -26,6 +27,14 @@ const RESOURCE_LIMIT_SENTINEL: &str = "quirl resource limit exceeded";
 const DEFAULT_PROMPT_DEADLINE_MS: u64 = 8;
 const MAX_CALLBACK_DEADLINE_MS: u64 = 100;
 const COMPLETION_CALLBACK_DEADLINE: Duration = Duration::from_millis(50);
+pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_OLDEST_READABLE_VERSION: u32 = 0;
+pub const MAX_LUA_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@1{QuirlConfig{deny_unknown;schema_version:u32(default=1,legacy-absent=0-migrates-to-1);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default)};EditorConfig{deny_unknown;keymap:helix|emacs|vim(default=helix);semantic_hints:bool(default=true)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;left:array<string>(default=directory,git_branch);right:array<string>(default=jobs,duration,status)};migration:unversioned-table-to-v1}";
+
+pub fn config_schema_hash() -> String {
+    quirl_core::schema_fingerprint(CONFIG_SCHEMA_DESCRIPTOR)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct LuaPolicy {
@@ -61,15 +70,32 @@ impl Default for LuaPolicy {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct QuirlConfig {
+    #[serde(default = "default_config_schema_version")]
+    pub schema_version: u32,
     #[serde(default)]
     pub editor: EditorConfig,
     #[serde(default)]
     pub picker: PickerConfig,
     #[serde(default)]
     pub prompt: PromptConfig,
+}
+
+impl Default for QuirlConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            editor: EditorConfig::default(),
+            picker: PickerConfig::default(),
+            prompt: PromptConfig::default(),
+        }
+    }
+}
+
+const fn default_config_schema_version() -> u32 {
+    CONFIG_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,6 +152,15 @@ impl Default for PromptConfig {
 
 impl QuirlConfig {
     fn validate(&self, source: &str) -> Result<(), ShellError> {
+        if self.schema_version != CONFIG_SCHEMA_VERSION {
+            return Err(validation_error(
+                source,
+                format!(
+                    "config schema_version {} is unsupported; expected {CONFIG_SCHEMA_VERSION}",
+                    self.schema_version
+                ),
+            ));
+        }
         if !matches!(self.editor.keymap.as_str(), "helix" | "emacs" | "vim") {
             return Err(validation_error(
                 source,
@@ -428,6 +463,7 @@ impl LuaRuntime {
     }
 
     pub fn eval(&self, source: &str) -> Result<serde_json::Value, ShellError> {
+        validate_source_length(source, Path::new("eval"))?;
         self.reset_budget();
         let value = self
             .lua
@@ -455,6 +491,7 @@ impl LuaRuntime {
         arguments: &[String],
     ) -> Result<serde_json::Value, ShellError> {
         let path = Path::new(source_name);
+        validate_source_length(source, path)?;
         let source = normalize_shebang(source);
         lint_source(&source, path)?;
         self.reset_budget();
@@ -823,6 +860,7 @@ impl LuaRuntime {
 
     pub fn test_source(&self, source: &str, source_name: &str) -> Result<usize, ShellError> {
         let path = Path::new(source_name);
+        validate_source_length(source, path)?;
         let source = normalize_shebang(source);
         lint_source(&source, path)?;
         self.reset_budget();
@@ -872,6 +910,7 @@ impl LuaRuntime {
     /// Parse and lint Lua source without executing it.
     pub fn check_source(source: &str, source_name: &str) -> Result<(), ShellError> {
         let path = Path::new(source_name);
+        validate_source_length(source, path)?;
         let source = normalize_shebang(source);
         lint_source(&source, path)?;
         let runtime = Self::new(LuaPolicy::config())?;
@@ -1222,7 +1261,7 @@ fn blocks_opened(shape: &str) -> usize {
 }
 
 pub fn format_file(path: &Path, check: bool) -> Result<bool, ShellError> {
-    let source = fs::read_to_string(path).map_err(|error| script_read_error(path, error))?;
+    let source = read_source_bounded(path)?;
     let formatted = format_source(&source);
     let changed = source != formatted;
     if changed && !check {
@@ -1239,7 +1278,7 @@ pub fn format_file(path: &Path, check: bool) -> Result<bool, ShellError> {
 
 pub fn sdk_lua() -> String {
     let mut output = String::from(
-        "---@meta quirl\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? string\n\n---@class quirl.Config\n---@field editor table\n---@field picker table\n---@field prompt table\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
+        "---@meta quirl\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? string\n\n---@class quirl.Config\n---@field schema_version integer\n---@field editor table\n---@field picker table\n---@field prompt table\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
     );
     for spec in HOST_API {
         output.push_str(&format!("---{}\n", spec.summary));
@@ -2063,8 +2102,51 @@ fn validate_type_expression(expression: &str) -> Result<(), &'static str> {
 }
 
 fn read_source(path: &Path) -> Result<String, ShellError> {
-    let source = fs::read_to_string(path).map_err(|error| script_read_error(path, error))?;
+    let source = read_source_bounded(path)?;
     Ok(normalize_shebang(&source))
+}
+
+fn read_source_bounded(path: &Path) -> Result<String, ShellError> {
+    let file = fs::File::open(path).map_err(|error| script_read_error(path, error))?;
+    let size = file
+        .metadata()
+        .map_err(|error| script_read_error(path, error))?
+        .len();
+    if size > MAX_LUA_SOURCE_BYTES as u64 {
+        return Err(lua_source_limit_error(path, size));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(MAX_LUA_SOURCE_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| script_read_error(path, error))?;
+    if bytes.len() > MAX_LUA_SOURCE_BYTES {
+        return Err(lua_source_limit_error(path, bytes.len() as u64));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::ScriptRead,
+            format!("Lua source {} is not valid UTF-8", path.display()),
+        )
+        .with_context(error.to_string())
+        .with_help("Encode Lua source as UTF-8")
+    })
+}
+
+fn lua_source_limit_error(path: &Path, size: u64) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("Lua source {} exceeds its read limit", path.display()),
+    )
+    .with_context(format!("bytes: {size}; limit: {MAX_LUA_SOURCE_BYTES}"))
+    .with_help("Keep executable Lua source below 4 MiB and load data through bounded host APIs")
+}
+
+fn validate_source_length(source: &str, path: &Path) -> Result<(), ShellError> {
+    if source.len() > MAX_LUA_SOURCE_BYTES {
+        Err(lua_source_limit_error(path, source.len() as u64))
+    } else {
+        Ok(())
+    }
 }
 
 fn normalize_shebang(source: &str) -> String {
@@ -2136,6 +2218,35 @@ mod tests {
         let config = runtime.lua.from_value::<QuirlConfig>(value).unwrap();
         config.validate("test").unwrap();
         assert_eq!(config.editor.keymap, "helix");
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn legacy_unversioned_config_migrates_to_v1_and_future_versions_fail() {
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let legacy = runtime
+            .lua
+            .load("return quirl.config { editor = { keymap = 'vim' } }")
+            .eval::<Value>()
+            .unwrap();
+        let migrated = runtime.lua.from_value::<QuirlConfig>(legacy).unwrap();
+        assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
+        migrated.validate("legacy.lua").unwrap();
+
+        let future = runtime
+            .lua
+            .load("return quirl.config { schema_version = 2 }")
+            .eval::<Value>()
+            .unwrap();
+        let future = runtime.lua.from_value::<QuirlConfig>(future).unwrap();
+        assert!(future.validate("future.lua").is_err());
+    }
+
+    #[test]
+    fn config_schema_descriptor_has_a_stable_identity() {
+        assert_eq!(CONFIG_OLDEST_READABLE_VERSION, 0);
+        assert!(CONFIG_SCHEMA_DESCRIPTOR.contains("migration:unversioned-table-to-v1"));
+        assert!(config_schema_hash().starts_with("fnv1a64:"));
     }
 
     #[test]
@@ -2246,6 +2357,14 @@ mod tests {
         runtime.cancellation_token().cancel();
         let error = runtime.eval("while true do end").unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn oversized_source_is_rejected_before_lua_compilation() {
+        let source = " ".repeat(MAX_LUA_SOURCE_BYTES + 1);
+        let error = LuaRuntime::check_source(&source, "oversized.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("limit"));
     }
 
     #[test]

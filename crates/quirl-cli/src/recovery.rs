@@ -1,5 +1,7 @@
 use clap::{Subcommand, ValueEnum};
-use quirl_core::{CommandOutcome, ErrorCode, ShellError};
+use quirl_core::{
+    escape_json_terminal_controls, escape_terminal_controls, CommandOutcome, ErrorCode, ShellError,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,8 +13,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 const DOCUMENT_TYPE: &str = "quirl.recovery.snapshot";
-const SCHEMA_VERSION: u32 = 2;
+pub const RECOVERY_SCHEMA_VERSION: u32 = 2;
+pub const RECOVERY_OLDEST_READABLE_VERSION: u32 = 1;
+pub const RECOVERY_SCHEMA_DESCRIPTOR: &str = "quirl.recovery.snapshot@2{RecoverySnapshot{deny_unknown;document_type:string;schema_version:u32;id:string;created_unix_ms:u128;command:string;cwd:string;environment:EnvironmentDiff;output:CapturedOutput;duration_ms:u128;status:null|i32;error_chain:array<string>};EnvironmentDiff{deny_unknown;changed:map<string,string>;removed:array<string>;truncated:bool};CapturedOutput{deny_unknown;stdout:null|string;stderr:null|string;truncated:bool;stdout_discarded_bytes:u64;stderr_discarded_bytes:u64};migration:v1-to-v2-adds-unavailable-command-cwd-empty-environment-zero-discard-counts;redaction:preserved;replay:none}";
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_CONTEXT_BYTES: usize = 4 * 1024;
 const MAX_ENVIRONMENT_CHANGES: usize = 256;
@@ -56,6 +63,27 @@ pub struct RecoverySnapshot {
     pub duration_ms: u128,
     pub status: Option<i32>,
     pub error_chain: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LegacyRecoverySnapshotV1 {
+    document_type: String,
+    schema_version: u32,
+    id: String,
+    created_unix_ms: u128,
+    output: LegacyCapturedOutputV1,
+    duration_ms: u128,
+    status: Option<i32>,
+    error_chain: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LegacyCapturedOutputV1 {
+    stdout: Option<String>,
+    stderr: Option<String>,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -141,6 +169,7 @@ impl RecoveryJournal {
     ) -> Result<String, ShellError> {
         fs::create_dir_all(&self.directory)
             .map_err(|error| recovery_io_error("create", &self.directory, error))?;
+        secure_recovery_directory(&self.directory)?;
         let created_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| {
@@ -178,7 +207,7 @@ impl RecoveryJournal {
         });
         let snapshot = RecoverySnapshot {
             document_type: DOCUMENT_TYPE.to_owned(),
-            schema_version: SCHEMA_VERSION,
+            schema_version: RECOVERY_SCHEMA_VERSION,
             id: id.clone(),
             created_unix_ms,
             command: redact_text(bounded_str(&context.command, MAX_CAPTURE_BYTES), &secrets),
@@ -204,9 +233,11 @@ impl RecoveryJournal {
         if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
             return Err(oversized_snapshot_error(&snapshot.id, bytes.len() as u64));
         }
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
             .open(&temporary)
             .map_err(|error| recovery_io_error("create", &temporary, error))?;
         file.write_all(&bytes)
@@ -273,7 +304,19 @@ impl RecoveryJournal {
     fn read(&self, id: &str) -> Result<RecoverySnapshot, ShellError> {
         validate_id(id)?;
         let path = self.directory.join(format!("{id}.json"));
-        let file = File::open(&path).map_err(|error| recovery_io_error("read", &path, error))?;
+        let canonical_directory = fs::canonicalize(&self.directory)
+            .map_err(|error| recovery_io_error("resolve", &self.directory, error))?;
+        let canonical_path =
+            fs::canonicalize(&path).map_err(|error| recovery_io_error("resolve", &path, error))?;
+        if !canonical_path.starts_with(&canonical_directory) {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!("recovery snapshot `{id}` resolves outside the recovery directory"),
+            )
+            .with_help("Remove the snapshot symlink and use a regular journal file"));
+        }
+        let file = File::open(&canonical_path)
+            .map_err(|error| recovery_io_error("read", &canonical_path, error))?;
         let size = file
             .metadata()
             .map_err(|error| recovery_io_error("inspect", &path, error))?
@@ -288,25 +331,99 @@ impl RecoveryJournal {
         if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
             return Err(oversized_snapshot_error(id, bytes.len() as u64));
         }
-        let snapshot: RecoverySnapshot = serde_json::from_slice(&bytes).map_err(|error| {
+        decode_snapshot(&bytes, id)
+    }
+}
+
+#[cfg(unix)]
+fn secure_recovery_directory(path: &Path) -> Result<(), ShellError> {
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| recovery_io_error("inspect", path, error))?
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions).map_err(|error| recovery_io_error("secure", path, error))
+}
+
+#[cfg(not(unix))]
+fn secure_recovery_directory(_path: &Path) -> Result<(), ShellError> {
+    // Windows ACL inheritance is managed by the selected state directory.
+    Ok(())
+}
+
+fn decode_snapshot(bytes: &[u8], expected_id: &str) -> Result<RecoverySnapshot, ShellError> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            format!("recovery snapshot `{expected_id}` is invalid"),
+        )
+        .with_context(error.to_string())
+        .with_help("Remove or repair the invalid snapshot before retrying")
+    })?;
+    let version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| unsupported_snapshot_error(expected_id, None))?;
+    let snapshot = match version {
+        2 => serde_json::from_value::<RecoverySnapshot>(value).map_err(|error| {
             ShellError::new(
                 ErrorCode::Validation,
-                format!("recovery snapshot `{id}` is invalid"),
+                format!("recovery snapshot `{expected_id}` is invalid"),
             )
             .with_context(error.to_string())
             .with_help("Remove or repair the invalid snapshot before retrying")
-        })?;
-        if snapshot.document_type != DOCUMENT_TYPE || snapshot.schema_version != SCHEMA_VERSION {
-            return Err(ShellError::new(
-                ErrorCode::Validation,
-                format!("recovery snapshot `{id}` uses an unsupported schema"),
-            )
-            .with_help(format!(
-                "Expected {DOCUMENT_TYPE} schema version {SCHEMA_VERSION}"
-            )));
+        })?,
+        1 => {
+            let legacy =
+                serde_json::from_value::<LegacyRecoverySnapshotV1>(value).map_err(|error| {
+                    ShellError::new(
+                        ErrorCode::Validation,
+                        format!("legacy recovery snapshot `{expected_id}` is invalid"),
+                    )
+                    .with_context(error.to_string())
+                    .with_help("Repair the v1 snapshot before migrating it")
+                })?;
+            RecoverySnapshot {
+                document_type: legacy.document_type,
+                schema_version: RECOVERY_SCHEMA_VERSION,
+                id: legacy.id,
+                created_unix_ms: legacy.created_unix_ms,
+                command: "[unavailable in recovery schema v1]".to_owned(),
+                cwd: "[unavailable in recovery schema v1]".to_owned(),
+                environment: EnvironmentDiff::default(),
+                output: CapturedOutput {
+                    stdout: legacy.output.stdout,
+                    stderr: legacy.output.stderr,
+                    truncated: legacy.output.truncated,
+                    stdout_discarded_bytes: 0,
+                    stderr_discarded_bytes: 0,
+                },
+                duration_ms: legacy.duration_ms,
+                status: legacy.status,
+                error_chain: legacy.error_chain,
+            }
         }
-        Ok(snapshot)
+        _ => return Err(unsupported_snapshot_error(expected_id, Some(version))),
+    };
+    if snapshot.document_type != DOCUMENT_TYPE
+        || snapshot.schema_version != RECOVERY_SCHEMA_VERSION
+        || snapshot.id != expected_id
+    {
+        return Err(unsupported_snapshot_error(expected_id, Some(version)));
     }
+    Ok(snapshot)
+}
+
+fn unsupported_snapshot_error(id: &str, version: Option<u64>) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        format!(
+            "recovery snapshot `{id}` uses unsupported schema {}",
+            version.map_or_else(|| "<missing>".to_owned(), |value| value.to_string())
+        ),
+    )
+    .with_help(format!(
+        "Expected {DOCUMENT_TYPE} schema {RECOVERY_OLDEST_READABLE_VERSION}..={RECOVERY_SCHEMA_VERSION}"
+    ))
 }
 
 fn snapshot_order_key(id: &str) -> (u128, u64, u64) {
@@ -324,10 +441,10 @@ pub fn execute(command: RecoveryCommand) -> Result<i32, ShellError> {
         RecoveryCommand::List { format } => {
             let ids = journal.ids()?;
             match format {
-                RecoveryFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&ids).map_err(json_error)?
-                ),
+                RecoveryFormat::Json => {
+                    let json = serde_json::to_string_pretty(&ids).map_err(json_error)?;
+                    println!("{}", escape_json_terminal_controls(&json));
+                }
                 RecoveryFormat::Text => {
                     if ids.is_empty() {
                         println!("no recovery snapshots");
@@ -351,10 +468,10 @@ pub fn execute(command: RecoveryCommand) -> Result<i32, ShellError> {
             )?;
             let snapshot = journal.read(&id)?;
             match format {
-                RecoveryFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&snapshot).map_err(json_error)?
-                ),
+                RecoveryFormat::Json => {
+                    let json = serde_json::to_string_pretty(&snapshot).map_err(json_error)?;
+                    println!("{}", escape_json_terminal_controls(&json));
+                }
                 RecoveryFormat::Text => print!("{}", render_snapshot_text(&snapshot)),
             }
         }
@@ -365,9 +482,9 @@ pub fn execute(command: RecoveryCommand) -> Result<i32, ShellError> {
 fn render_snapshot_text(snapshot: &RecoverySnapshot) -> String {
     let mut rendered = format!(
         "snapshot: {}\ncommand: {}\ncwd: {}\nstatus: {}\nduration: {} ms\n",
-        terminal_safe(&snapshot.id),
-        terminal_safe(&snapshot.command),
-        terminal_safe(&snapshot.cwd),
+        escape_terminal_controls(&snapshot.id),
+        escape_terminal_controls(&snapshot.command),
+        escape_terminal_controls(&snapshot.cwd),
         snapshot
             .status
             .map_or_else(|| "error".to_owned(), |status| status.to_string()),
@@ -375,14 +492,14 @@ fn render_snapshot_text(snapshot: &RecoverySnapshot) -> String {
     );
     if let Some(stdout) = snapshot.output.stdout.as_deref() {
         rendered.push_str("stdout:\n");
-        rendered.push_str(&terminal_safe(stdout));
+        rendered.push_str(&escape_terminal_controls(stdout));
         if !stdout.ends_with('\n') {
             rendered.push('\n');
         }
     }
     if let Some(stderr) = snapshot.output.stderr.as_deref() {
         rendered.push_str("stderr:\n");
-        rendered.push_str(&terminal_safe(stderr));
+        rendered.push_str(&escape_terminal_controls(stderr));
         if !stderr.ends_with('\n') {
             rendered.push('\n');
         }
@@ -395,21 +512,8 @@ fn render_snapshot_text(snapshot: &RecoverySnapshot) -> String {
     }
     for error in &snapshot.error_chain {
         rendered.push_str("error: ");
-        rendered.push_str(&terminal_safe(error));
+        rendered.push_str(&escape_terminal_controls(error));
         rendered.push('\n');
-    }
-    rendered
-}
-
-fn terminal_safe(value: &str) -> String {
-    let mut rendered = String::with_capacity(value.len());
-    for character in value.chars() {
-        if (character.is_control() && !matches!(character, '\n' | '\t')) || character == '\u{009b}'
-        {
-            rendered.extend(character.escape_default());
-        } else {
-            rendered.push(character);
-        }
     }
     rendered
 }
@@ -734,6 +838,17 @@ mod tests {
         assert_eq!(snapshot.environment.removed, ["REMOVED"]);
         assert!(snapshot.output.truncated);
         assert_eq!(snapshot.output.stdout_discarded_bytes, 28);
+        #[cfg(unix)]
+        {
+            let directory_mode = fs::metadata(&directory).unwrap().permissions().mode() & 0o777;
+            let snapshot_mode = fs::metadata(directory.join(format!("{id}.json")))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(directory_mode, 0o700);
+            assert_eq!(snapshot_mode, 0o600);
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -744,12 +859,32 @@ mod tests {
         assert_eq!(error.code, ErrorCode::InvalidArgument);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_symlink_cannot_escape_the_recovery_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_directory("symlink");
+        let directory = root.join("journal");
+        fs::create_dir_all(&directory).unwrap();
+        let outside = root.join("outside.json");
+        fs::write(&outside, b"{}").unwrap();
+        let id = "00000000000000000001-0000000001-00000000000000000001";
+        symlink(&outside, directory.join(format!("{id}.json"))).unwrap();
+        let journal = RecoveryJournal::new(directory, BTreeMap::new());
+
+        let error = journal.read(id).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("outside"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn text_rendering_escapes_ansi_osc_and_carriage_return_controls() {
         let hostile = "visible\u{1b}[31mred\u{1b}[0m\u{1b}]0;owned\u{7}\rreplace\u{009b}31m";
         let snapshot = RecoverySnapshot {
             document_type: DOCUMENT_TYPE.to_owned(),
-            schema_version: SCHEMA_VERSION,
+            schema_version: RECOVERY_SCHEMA_VERSION,
             id: "0001-0001-0001".to_owned(),
             created_unix_ms: 1,
             command: hostile.to_owned(),
@@ -776,6 +911,34 @@ mod tests {
         let json = serde_json::to_string(&snapshot).unwrap();
         let decoded: RecoverySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.output.stdout.as_deref(), Some(hostile));
+    }
+
+    #[test]
+    fn recovery_v1_migrates_without_unredacting_or_losing_captured_output() {
+        let id = "0001-0001-0001";
+        let legacy = LegacyRecoverySnapshotV1 {
+            document_type: DOCUMENT_TYPE.to_owned(),
+            schema_version: 1,
+            id: id.to_owned(),
+            created_unix_ms: 42,
+            output: LegacyCapturedOutputV1 {
+                stdout: Some("[redacted] output".to_owned()),
+                stderr: None,
+                truncated: true,
+            },
+            duration_ms: 7,
+            status: Some(1),
+            error_chain: vec!["[redacted] failure".to_owned()],
+        };
+        let migrated = decode_snapshot(&serde_json::to_vec(&legacy).unwrap(), id).unwrap();
+        assert_eq!(migrated.schema_version, RECOVERY_SCHEMA_VERSION);
+        assert_eq!(migrated.output.stdout.as_deref(), Some("[redacted] output"));
+        assert_eq!(migrated.command, "[unavailable in recovery schema v1]");
+        assert!(migrated.environment.changed.is_empty());
+
+        let mut future = serde_json::to_value(&migrated).unwrap();
+        future["schema_version"] = serde_json::json!(3);
+        assert!(decode_snapshot(&serde_json::to_vec(&future).unwrap(), id).is_err());
     }
 
     #[test]

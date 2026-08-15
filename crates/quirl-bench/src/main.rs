@@ -46,8 +46,10 @@ struct Measurement {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args().nth(1).as_deref() == Some("preview") {
-        return preview::run();
+    match std::env::args().nth(1).as_deref() {
+        Some("preview") => return preview::run(false),
+        Some("release") => return preview::run(true),
+        _ => {}
     }
     let fennel_path = argument_value("--fennel")
         .map(PathBuf::from)

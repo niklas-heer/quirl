@@ -24,11 +24,22 @@ pub const WASM_HOST_IMPORT: &str = "quirl:plugin/host@0.1.0";
 pub const WASM_GUEST_EXPORT: &str = "quirl:plugin/guest@0.1.0";
 pub const WASM_WIT: &str = include_str!("../wit/quirl-plugin.wit");
 
-const PLUGIN_SCHEMA: &str = "PluginManifest{deny_unknown;schema_version:u32;plugin:PluginMetadata;capabilities:PluginCapabilities;contributes:PluginContributions;public_commands:array<PackageCommand>;wasm:null|WasmComponentBoundary;adapter:null|OutOfProcessBoundary}";
-const LOCK_SCHEMA: &str = "PluginLockfile{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;resolved_api_version:string;plugins:array<LockedPlugin{deny_unknown;name:string;version:string;source:string;runtime:PluginRuntime;resolved_api_version:string;runtime_schema_hash:string;manifest_checksum:string;entry_checksum:string;source_checksum:string;requested_capabilities:array<string>;granted_capabilities:array<string>;enabled:bool}>}";
+pub const PLUGIN_SCHEMA_DESCRIPTOR: &str = "PluginManifest{deny_unknown;schema_version:u32;plugin:PluginMetadata{deny_unknown;name:string;version:string;entry:relative-path;quirl:version-range;api:string;runtime:trusted_lua|wasm_component|out_of_process;summary:string};capabilities:PluginCapabilities{deny_unknown;request:array<capability>};contributes:PluginContributions{deny_unknown;commands:array<string>;completions:array<string>;events:array<string>;panels:array<string>;indexers:array<string>};public_commands:array<PackageCommand@quirl.package@1>;wasm:null|WasmComponentBoundary{deny_unknown;world:string;max_memory_bytes:u64;fuel:u64;callback_timeout_ms:u64};adapter:null|OutOfProcessBoundary{deny_unknown;protocol:string;executable:string;arguments:array<string>;callback_timeout_ms:u64;max_message_bytes:u64}}";
+pub const LOCK_SCHEMA_DESCRIPTOR: &str = "PluginLockfile{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;resolved_api_version:string;plugins:array<LockedPlugin{deny_unknown;name:string;version:string;source:string;runtime:PluginRuntime;resolved_api_version:string;runtime_schema_hash:string;manifest_checksum:string;entry_checksum:string;source_checksum:string;requested_capabilities:array<string>;granted_capabilities:array<string>;enabled:bool}>}";
+pub const LOCK_SCHEMA_V1_DESCRIPTOR: &str = "PluginLockfile{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;resolved_api_version:string;plugins:array<LockedPlugin{deny_unknown;name:string;version:string;source:string;runtime:PluginRuntime;resolved_api_version:string;manifest_checksum:string;entry_checksum:string;source_checksum:string;requested_capabilities:array<string>;granted_capabilities:array<string>;enabled:bool}>}";
 
 pub fn plugin_manifest_schema_hash() -> String {
-    stable_hash(PLUGIN_SCHEMA.as_bytes())
+    stable_hash(
+        format!(
+            "{PLUGIN_SCHEMA_DESCRIPTOR};{}",
+            quirl_contract::PACKAGE_SCHEMA_DESCRIPTOR
+        )
+        .as_bytes(),
+    )
+}
+
+pub fn plugin_lock_schema_hash() -> String {
+    stable_hash(LOCK_SCHEMA_DESCRIPTOR.as_bytes())
 }
 
 pub fn wasm_world_hash() -> String {
@@ -151,6 +162,32 @@ pub struct LockedPlugin {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+struct LegacyPluginLockfileV1 {
+    document_type: String,
+    schema_version: u32,
+    schema_hash: String,
+    resolved_api_version: String,
+    plugins: Vec<LegacyLockedPluginV1>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LegacyLockedPluginV1 {
+    name: String,
+    version: String,
+    source: String,
+    runtime: PluginRuntime,
+    resolved_api_version: String,
+    manifest_checksum: String,
+    entry_checksum: String,
+    source_checksum: String,
+    requested_capabilities: Vec<String>,
+    granted_capabilities: Vec<String>,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PermissionDiff {
     pub added: Vec<String>,
     pub removed: Vec<String>,
@@ -188,7 +225,7 @@ impl PluginLockfile {
         Self {
             document_type: "quirl.plugin.lock".to_owned(),
             schema_version: LOCK_SCHEMA_VERSION,
-            schema_hash: stable_hash(LOCK_SCHEMA.as_bytes()),
+            schema_hash: plugin_lock_schema_hash(),
             resolved_api_version: PLUGIN_API_VERSION.to_owned(),
             plugins: Vec::new(),
         }
@@ -197,7 +234,7 @@ impl PluginLockfile {
     pub fn validate(&self) -> Result<(), ShellError> {
         if self.document_type != "quirl.plugin.lock"
             || self.schema_version != LOCK_SCHEMA_VERSION
-            || self.schema_hash != stable_hash(LOCK_SCHEMA.as_bytes())
+            || self.schema_hash != plugin_lock_schema_hash()
             || self.resolved_api_version != PLUGIN_API_VERSION
         {
             return Err(validation_error(
@@ -267,6 +304,89 @@ impl PluginLockfile {
             validate_sha256(&plugin.source_checksum)?;
         }
         Ok(())
+    }
+
+    pub fn from_json(bytes: &[u8]) -> Result<Self, ShellError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+            validation_error(
+                format!("plugin lockfile is not valid JSON: {error}"),
+                "Restore the lockfile backup or re-add plugins after review",
+            )
+        })?;
+        let version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                validation_error(
+                    "plugin lockfile has no integer schema_version",
+                    "Restore a versioned lockfile or re-add plugins after review",
+                )
+            })?;
+        match version {
+            2 => {
+                let lock: Self = serde_json::from_value(value).map_err(|error| {
+                    validation_error(
+                        format!("plugin lockfile schema is invalid: {error}"),
+                        "Restore the lockfile backup or re-add plugins after review",
+                    )
+                })?;
+                lock.validate()?;
+                Ok(lock)
+            }
+            1 => {
+                let legacy: LegacyPluginLockfileV1 =
+                    serde_json::from_value(value).map_err(|error| {
+                        validation_error(
+                            format!("legacy plugin lockfile schema is invalid: {error}"),
+                            "Use a Quirl release that can read lock schema v1",
+                        )
+                    })?;
+                if legacy.document_type != "quirl.plugin.lock"
+                    || legacy.schema_hash != stable_hash(LOCK_SCHEMA_V1_DESCRIPTOR.as_bytes())
+                    || legacy.resolved_api_version != PLUGIN_API_VERSION
+                {
+                    return Err(validation_error(
+                        "legacy plugin lockfile identity is invalid",
+                        "Restore the original v1 lockfile before migration",
+                    ));
+                }
+                let lock = Self {
+                    document_type: legacy.document_type,
+                    schema_version: LOCK_SCHEMA_VERSION,
+                    schema_hash: plugin_lock_schema_hash(),
+                    resolved_api_version: legacy.resolved_api_version,
+                    plugins: legacy
+                        .plugins
+                        .into_iter()
+                        .map(|plugin| LockedPlugin {
+                            runtime_schema_hash: match plugin.runtime {
+                                PluginRuntime::WasmComponent => wasm_world_hash(),
+                                PluginRuntime::TrustedLua | PluginRuntime::OutOfProcess => {
+                                    plugin_manifest_schema_hash()
+                                }
+                            },
+                            name: plugin.name,
+                            version: plugin.version,
+                            source: plugin.source,
+                            runtime: plugin.runtime,
+                            resolved_api_version: plugin.resolved_api_version,
+                            manifest_checksum: plugin.manifest_checksum,
+                            entry_checksum: plugin.entry_checksum,
+                            source_checksum: plugin.source_checksum,
+                            requested_capabilities: plugin.requested_capabilities,
+                            granted_capabilities: plugin.granted_capabilities,
+                            enabled: plugin.enabled,
+                        })
+                        .collect(),
+                };
+                lock.validate()?;
+                Ok(lock)
+            }
+            _ => Err(validation_error(
+                format!("plugin lockfile schema version {version} is unsupported"),
+                "Upgrade Quirl for newer locks or migrate older locks with an intermediate release",
+            )),
+        }
     }
 
     pub fn install(&self, plugin: LockedPlugin) -> Result<Self, ShellError> {
@@ -1155,6 +1275,14 @@ error_codes = { "0" = "success" }
     }
 
     #[test]
+    fn plugin_manifest_hash_transitively_covers_package_command_contract() {
+        let actual = plugin_manifest_schema_hash();
+        let shallow = stable_hash(PLUGIN_SCHEMA_DESCRIPTOR.as_bytes());
+        assert_ne!(actual, shallow);
+        assert_eq!(actual, plugin_manifest_schema_hash());
+    }
+
+    #[test]
     fn manifests_and_locks_reject_unknown_or_malformed_capabilities() {
         for capability in [
             "network.everything",
@@ -1198,6 +1326,43 @@ error_codes = { "0" = "success" }
         assert!(!installed.plugins[0].enabled);
         assert!(enabled.plugins[0].enabled);
         assert!(enabled.remove("demo").unwrap().plugins.is_empty());
+    }
+
+    #[test]
+    fn lock_v1_migrates_without_changing_identity_permissions_or_checksums() {
+        let plugin = resolved(&["commands.register".to_owned()]).unwrap();
+        let legacy = LegacyPluginLockfileV1 {
+            document_type: "quirl.plugin.lock".to_owned(),
+            schema_version: 1,
+            schema_hash: stable_hash(LOCK_SCHEMA_V1_DESCRIPTOR.as_bytes()),
+            resolved_api_version: PLUGIN_API_VERSION.to_owned(),
+            plugins: vec![LegacyLockedPluginV1 {
+                name: plugin.name.clone(),
+                version: plugin.version.clone(),
+                source: plugin.source.clone(),
+                runtime: plugin.runtime,
+                resolved_api_version: plugin.resolved_api_version.clone(),
+                manifest_checksum: plugin.manifest_checksum.clone(),
+                entry_checksum: plugin.entry_checksum.clone(),
+                source_checksum: plugin.source_checksum.clone(),
+                requested_capabilities: plugin.requested_capabilities.clone(),
+                granted_capabilities: plugin.granted_capabilities.clone(),
+                enabled: plugin.enabled,
+            }],
+        };
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let migrated = PluginLockfile::from_json(&bytes).unwrap();
+        assert_eq!(migrated.schema_version, LOCK_SCHEMA_VERSION);
+        assert_eq!(migrated.plugins[0].name, plugin.name);
+        assert_eq!(
+            migrated.plugins[0].granted_capabilities,
+            plugin.granted_capabilities
+        );
+        assert_eq!(migrated.plugins[0].entry_checksum, plugin.entry_checksum);
+
+        let mut future = serde_json::to_value(&migrated).unwrap();
+        future["schema_version"] = serde_json::json!(3);
+        assert!(PluginLockfile::from_json(&serde_json::to_vec(&future).unwrap()).is_err());
     }
 
     #[test]

@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const CATALOG_SCHEMA_VERSION: u32 = 4;
+pub const CATALOG_OLDEST_READABLE_VERSION: u32 = 2;
+pub const COMPLETION_PROTOCOL_VERSION: u32 = 1;
+pub const CATALOG_SCHEMA_DESCRIPTOR: &str = "quirl.catalog@4{Catalog{deny_unknown;schema_version:4;commands:array<CommandSpec>};CommandSpec{deny_unknown;id:string;version:null|string;path:string;aliases:array<string>;parent:null|string;signature:string;summary:string;details:string;arguments:array<ArgumentSpec>;examples:array<string>;io:IoContract;effects:array<Effect>;exit_codes:map<i32,string>;provenance:ProvenanceInfo};ArgumentSpec{deny_unknown;names:array<string>;kind:positional|option|flag;value_type:string;required:bool;repeatable:bool;values:null|CompletionSource;conflicts:array<string>;documentation:string;examples:array<string>;provenance:ProvenanceInfo};CompletionSource:tag(kind)[static{values:array<string>}|dynamic{provider:string}];IoContract{deny_unknown;input:string;output:string;streaming:bool};Effect:read_filesystem|write_filesystem|spawn_process|change_directory;ProvenanceInfo{deny_unknown;source:builtin|external|lua|plugin|fish|bash|zsh|help|man;confidence:low|medium|high|exact;trust:builtin|trusted|declared|imported|heuristic;origin:null|string;fingerprint:null|string;generated_at:null|string};migration:read-v2-v3-to-v4}";
+pub const COMPLETION_SCHEMA_DESCRIPTOR: &str = "quirl.completion@1{Completion{deny_unknown;value:string;display:string;summary:string;detail:string;replace_start:usize;replace_end:usize;match_indices:array<usize>};ordering:score-desc-then-display-value;catalog_source:quirl.catalog@4;static_values:CompletionSource.static;dynamic_values:provider-identity-only}";
 
 mod import;
 
@@ -211,12 +215,14 @@ impl ProvenanceInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogExplanation {
     pub command: String,
     pub facts: Vec<FactExplanation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FactExplanation {
     pub fact: String,
     pub value: String,
@@ -224,6 +230,7 @@ pub struct FactExplanation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Completion {
     pub value: String,
     pub display: String,
@@ -272,7 +279,7 @@ impl Catalog {
         let schema_version = serde_json::from_str::<serde_json::Value>(source)?
             .get("schema_version")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or_default();
+            .ok_or_else(|| unsupported_catalog_schema_error("<missing or non-integer>"))?;
         if schema_version == u64::from(CATALOG_SCHEMA_VERSION) {
             return serde_json::from_str(source);
         }
@@ -316,7 +323,9 @@ impl Catalog {
                     .collect(),
             });
         }
-        serde_json::from_str(source)
+        Err(unsupported_catalog_schema_error(
+            &schema_version.to_string(),
+        ))
     }
 
     pub fn builtin() -> Self {
@@ -398,7 +407,12 @@ impl Catalog {
                     "Create a checked embedded-language script",
                     "Writes a deterministic annotated Lua template with create-new semantics, so an existing script is never overwritten.",
                     vec![
-                        option(&["--lang"], Some("lua"), "Choose the generated embedded language"),
+                        option_with_static_values(
+                            &["--lang"],
+                            "lua",
+                            &["lua"],
+                            "Choose the generated embedded language",
+                        ),
                         option(&["--directory"], Some("path"), "Choose the destination directory"),
                     ],
                     &["quirl new automation --lang lua"],
@@ -552,7 +566,11 @@ impl Catalog {
                     "Install a local plugin with explicit permission approval",
                     "Validates the versioned manifest and runtime boundary, shows the permission diff, records SHA-256 source checksums, and atomically installs a disabled permission lock without implicit network access.",
                     vec![
-                        option(&["--allow"], Some("capability"), "Approve one requested capability after review; repeat as needed"),
+                        repeatable_option(
+                            &["--allow"],
+                            "capability",
+                            "Approve one requested capability after review; repeat as needed",
+                        ),
                         option(&["--format"], Some("text|json"), "Choose accessible text or stable machine JSON"),
                     ],
                     &["quirl plugin add ./kubernetes-workbench --allow commands.register --format json"],
@@ -638,10 +656,14 @@ impl Catalog {
                 ),
                 command(
                     "quirl catalog",
-                    "quirl catalog [--format json|markdown]",
+                    "quirl catalog [--format text|json|markdown]",
                     "Export installed command knowledge for humans or AI",
                     "Emits the versioned semantic catalog bundled with this binary.",
-                    vec![option(&["--format"], Some("json|markdown"), "Choose a stable output format")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json|markdown"),
+                        "Choose a stable output format",
+                    )],
                     &["quirl catalog --format json"],
                     &[],
                     Provenance::Builtin,
@@ -701,9 +723,9 @@ impl Catalog {
                     "Validate a versioned agent contract without execution",
                     "Rejects unknown fields, unsupported schema versions, tampered content hashes, nondeterministic ordering, and context payloads that exceed their declared token budget.",
                     vec![
-                        option(
+                        required_option(
                             &["--kind"],
-                            Some("catalog|context|manifest"),
+                            "catalog|context|manifest",
                             "Select the deny-unknown document schema",
                         ),
                         option(
@@ -872,7 +894,7 @@ impl Catalog {
                 ),
                 command(
                     "quirl pick",
-                    "quirl pick [--source stdin|history|files|actions] [--query text] [--multi]",
+                    "quirl pick [--source stdin|history|files|actions] [--query text] [--multi] [--limit count] [--root path] [--format text|json]",
                     "Select typed values with Quirl's shared fuzzy engine",
                     "The same deterministic exact/fuzzy/inverse query model ranks history, files, actions, jobs, completions, and data while returning the original value.",
                     vec![
@@ -1025,15 +1047,15 @@ impl Catalog {
                 ),
                 command(
                     "quirl index build",
-                    "quirl index build [--fish path] [--bash path] [--zsh path] [--help path] [--man path] [--output path]",
+                    "quirl index build [--fish path]... [--bash path]... [--zsh path]... [--help path]... [--man path]... [--output path] [--format text|json]",
                     "Build the attributed completion index",
                     "Imports declarative Fish, Bash, and Zsh completions plus bounded supplied help/man text without sourcing or executing providers, commands, or man, then atomically writes a versioned catalog.",
                     vec![
-                        option(&["--fish"], Some("path"), "Import a Fish completion file or directory"),
-                        option(&["--bash"], Some("path"), "Import a Bash completion file or directory"),
-                        option(&["--zsh"], Some("path"), "Import a Zsh completion file or directory"),
-                        option(&["--help"], Some("path"), "Parse supplied command-help text without executing its command"),
-                        option(&["--man"], Some("path"), "Parse supplied rendered/raw man text without invoking man"),
+                        repeatable_option(&["--fish"], "path", "Import a Fish completion file or directory"),
+                        repeatable_option(&["--bash"], "path", "Import a Bash completion file or directory"),
+                        repeatable_option(&["--zsh"], "path", "Import a Zsh completion file or directory"),
+                        repeatable_option(&["--help"], "path", "Parse supplied command-help text without executing its command"),
+                        repeatable_option(&["--man"], "path", "Parse supplied rendered/raw man text without invoking man"),
                         option(&["--output"], Some("path"), "Write a specific index instead of the default cache"),
                         option(&["--format"], Some("text|json"), "Choose the build report format"),
                     ],
@@ -1047,7 +1069,7 @@ impl Catalog {
                 ),
                 command(
                     "quirl index explain",
-                    "quirl index explain <command> [--index path] [--format text|json]",
+                    "quirl index explain <command...> [--index path] [--format text|json]",
                     "Explain where indexed command facts came from",
                     "Shows source kind, confidence, origin, and fingerprint for command metadata and each retained option.",
                     vec![
@@ -1599,6 +1621,15 @@ impl Catalog {
     }
 }
 
+fn unsupported_catalog_schema_error(found: &str) -> serde_json::Error {
+    serde_json::Error::io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "catalog schema version {found} is unsupported; expected {CATALOG_OLDEST_READABLE_VERSION}..={CATALOG_SCHEMA_VERSION}",
+        ),
+    ))
+}
+
 fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
     let query = query.to_lowercase();
     let candidate_lower = candidate.to_lowercase();
@@ -1649,6 +1680,31 @@ fn static_values(value: &str) -> Option<CompletionSource> {
         .map(str::to_owned)
         .collect::<Vec<_>>();
     (values.len() > 1).then_some(CompletionSource::Static { values })
+}
+
+fn option_with_static_values(
+    names: &[&str],
+    value_type: &str,
+    values: &[&str],
+    summary: &str,
+) -> OptionSpec {
+    let mut option = option(names, Some(value_type), summary);
+    option.values = Some(CompletionSource::Static {
+        values: values.iter().map(|value| (*value).to_owned()).collect(),
+    });
+    option
+}
+
+fn repeatable_option(names: &[&str], value_type: &str, summary: &str) -> OptionSpec {
+    let mut option = option(names, Some(value_type), summary);
+    option.repeatable = true;
+    option
+}
+
+fn required_option(names: &[&str], value_type: &str, summary: &str) -> OptionSpec {
+    let mut option = option(names, Some(value_type), summary);
+    option.required = true;
+    option
 }
 
 fn merge_option(options: &mut Vec<OptionSpec>, incoming: OptionSpec) {
@@ -1959,7 +2015,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v3_catalogs_migrate_without_fabricating_exact_facts() {
+    fn legacy_catalogs_migrate_without_fabricating_exact_facts() {
         let provenance = ProvenanceInfo::imported(
             Provenance::Fish,
             Confidence::High,
@@ -1967,7 +2023,6 @@ mod tests {
             "sha256:demo",
         );
         let source = serde_json::json!({
-            "schema_version": 3,
             "commands": [{
                 "path": "demo",
                 "signature": "demo [--output FILE]",
@@ -1984,16 +2039,32 @@ mod tests {
                 "provenance": provenance,
             }]
         });
-        let migrated = Catalog::from_json(&source.to_string()).unwrap();
-        let command = migrated.find("demo").unwrap();
-        assert_eq!(migrated.schema_version, CATALOG_SCHEMA_VERSION);
-        assert_eq!(command.id, "command:demo");
-        assert_eq!(command.version, None);
-        assert_eq!(command.io, IoContract::default());
-        assert_eq!(command.provenance.confidence, Confidence::High);
-        assert_eq!(command.options[0].value_type, "FILE");
-        assert_eq!(command.options[0].documentation, "Write output");
-        assert!(command.options[0].examples.is_empty());
+        for schema_version in [2, 3] {
+            let mut source = source.clone();
+            source["schema_version"] = serde_json::json!(schema_version);
+            let migrated = Catalog::from_json(&source.to_string()).unwrap();
+            let command = migrated.find("demo").unwrap();
+            assert_eq!(migrated.schema_version, CATALOG_SCHEMA_VERSION);
+            assert_eq!(command.id, "command:demo");
+            assert_eq!(command.version, None);
+            assert_eq!(command.io, IoContract::default());
+            assert_eq!(command.provenance.confidence, Confidence::High);
+            assert_eq!(command.options[0].value_type, "FILE");
+            assert_eq!(command.options[0].documentation, "Write output");
+            assert!(command.options[0].examples.is_empty());
+        }
+    }
+
+    #[test]
+    fn catalog_reader_fails_closed_for_expired_future_or_unversioned_documents() {
+        for source in [
+            serde_json::json!({"schema_version": 1, "commands": []}),
+            serde_json::json!({"schema_version": 5, "commands": []}),
+            serde_json::json!({"commands": []}),
+        ] {
+            let error = Catalog::from_json(&source.to_string()).unwrap_err();
+            assert!(error.to_string().contains("unsupported"));
+        }
     }
 
     #[test]

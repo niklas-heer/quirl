@@ -1,6 +1,6 @@
 use clap::{Args, ValueEnum};
 use quirl_catalog::{Catalog, CommandSpec};
-use quirl_core::{ErrorCode, ShellError};
+use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
 use std::{
     fs,
     io::Write,
@@ -71,7 +71,10 @@ pub(crate) fn create(command: NewCommand) -> Result<i32, ShellError> {
     fs::create_dir_all(&command.directory).map_err(|error| io_error("create", &path, error))?;
     let source = lua_script_template(&command.name);
     write_new_file(&path, source.as_bytes())?;
-    println!("created {}", path.display());
+    println!(
+        "created {}",
+        escape_terminal_controls(&path.display().to_string())
+    );
     Ok(0)
 }
 
@@ -83,7 +86,8 @@ pub(crate) fn describe(command: DescribeCommand, catalog: &Catalog) -> Result<i3
         )
         .with_help("Run `quirl catalog --format text` to list installed command paths")
     })?;
-    print!("{}", render_command(specification, command.format)?);
+    let rendered = render_command(specification, command.format)?;
+    print!("{}", terminal_safe_stdout(&rendered, command.format));
     Ok(0)
 }
 
@@ -92,7 +96,10 @@ pub(crate) fn doc(command: DocCommand, catalog: &Catalog) -> Result<i32, ShellEr
     match command.output {
         Some(path) => {
             atomic_write(&path, rendered.as_bytes())?;
-            println!("generated {}", path.display());
+            println!(
+                "generated {}",
+                escape_terminal_controls(&path.display().to_string())
+            );
             if command.open {
                 open_document(&path)?;
             }
@@ -104,7 +111,7 @@ pub(crate) fn doc(command: DocCommand, catalog: &Catalog) -> Result<i32, ShellEr
             )
             .with_help("Pass `--output target/quirl-docs/catalog.html --format html --open`"));
         }
-        None => print!("{rendered}"),
+        None => print!("{}", terminal_safe_stdout(&rendered, command.format)),
     }
     Ok(0)
 }
@@ -152,6 +159,16 @@ fn render_command(
             .map_err(json_error),
         DocumentationFormat::Markdown => Ok(render_command_markdown(command)),
         DocumentationFormat::Html => Ok(render_command_html(command)),
+    }
+}
+
+/// Sanitize only bytes written directly to a terminal. Explicit `--output`
+/// files retain their selected format exactly, including valid JSON/HTML bytes.
+fn terminal_safe_stdout(rendered: &str, format: DocumentationFormat) -> String {
+    if matches!(format, DocumentationFormat::Json) {
+        escape_json_terminal_controls(rendered)
+    } else {
+        escape_terminal_controls(rendered)
     }
 }
 
@@ -399,6 +416,42 @@ mod tests {
         assert!(render_catalog(&catalog, DocumentationFormat::Json)
             .unwrap()
             .contains("schema_version"));
+    }
+
+    #[test]
+    fn stdout_documentation_neutralizes_controls_without_changing_json_values() {
+        let mut catalog = Catalog::builtin();
+        let command = catalog.commands.first_mut().unwrap();
+        command.signature = "quirl hostile\u{1b}[31m\u{9b}2J\r".to_owned();
+        command.summary = "summary\u{1b}]8;;https://example.invalid\u{7}".to_owned();
+        command.details = "details\u{9b}2J\r".to_owned();
+        command.examples = vec!["echo \u{1b}[2J".to_owned()];
+
+        for format in [DocumentationFormat::Text, DocumentationFormat::Markdown] {
+            let rendered = render_command(command, format).unwrap();
+            let safe = terminal_safe_stdout(&rendered, format);
+            assert!(!safe.contains('\u{1b}'));
+            assert!(!safe.contains('\u{009b}'));
+            assert!(!safe.contains('\r'));
+            assert!(safe.contains("\\u{1b}[31m"));
+        }
+
+        let rendered = render_command(command, DocumentationFormat::Json).unwrap();
+        let safe = terminal_safe_stdout(&rendered, DocumentationFormat::Json);
+        assert!(!safe.contains('\u{1b}'));
+        assert!(!safe.contains('\u{009b}'));
+        let decoded: CommandSpec = serde_json::from_str(&safe).unwrap();
+        assert_eq!(decoded, *command);
+    }
+
+    #[test]
+    fn output_files_keep_the_requested_documentation_bytes_unmodified() {
+        let directory = temporary_directory("raw-output");
+        let path = directory.join("catalog.md");
+        let rendered = "heading\u{1b}[31m\u{9b}2J\r\n";
+        atomic_write(&path, rendered.as_bytes()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), rendered);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

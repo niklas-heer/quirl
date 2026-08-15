@@ -3,22 +3,29 @@
 use serde::{Deserialize, Serialize};
 use std::{fmt, str::FromStr};
 
-/// Versioned, machine-readable evidence for Quirl's current native compatibility subset.
+/// Versioned, machine-readable evidence for Quirl's current native compatibility subset and
+/// the frozen 1.0 C1/C2 disposition.
 pub const COMPATIBILITY_MATRIX_JSON: &str = include_str!("../compatibility-v0.1.json");
+pub const GRAMMAR_PROTOCOL_VERSION: u32 = 1;
+pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 2;
+pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@1{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;redirects:array<Redirect>};Redirect{deny_unknown;kind:input|output|append;path:string};tokens:word|pipe|and|or|input|output|append|background;quoting:single|double|backslash;expansion:none;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema2}";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandList {
     pub pipelines: Vec<Pipeline>,
     pub connectors: Vec<ListConnector>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Pipeline {
     pub commands: Vec<SimpleCommand>,
     pub background: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SimpleCommand {
     pub words: Vec<String>,
     pub redirects: Vec<Redirect>,
@@ -32,6 +39,7 @@ pub enum ListConnector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Redirect {
     pub kind: RedirectKind,
     pub path: String,
@@ -259,15 +267,20 @@ fn reject_unsupported_constructs(input: &str) -> Result<(), CommandSyntaxError> 
             return Err(dialect_mismatch(
                 leading_whitespace,
                 leading_whitespace + keyword.len(),
-                "compound command",
+                &format!("compound command `{keyword}`"),
             ));
         }
     }
     if trimmed.starts_with("[[") || trimmed.starts_with("((") {
+        let form = if trimmed.starts_with("[[") {
+            "conditional command `[[ ... ]]`"
+        } else {
+            "arithmetic command `(( ... ))`"
+        };
         return Err(dialect_mismatch(
             leading_whitespace,
             leading_whitespace + 2,
-            "dialect conditional or arithmetic command",
+            form,
         ));
     }
 
@@ -308,71 +321,90 @@ fn reject_unsupported_constructs(input: &str) -> Result<(), CommandSyntaxError> 
                         .nth(1)
                         .is_some_and(|next| matches!(next, '>' | '<'))))
         {
-            return Err(dialect_mismatch(
-                index,
-                index + 2,
-                "advanced file-descriptor or here-document redirection",
-            ));
+            let form = if rest.starts_with("<<<") {
+                "here-string redirection `<<<`".to_owned()
+            } else if rest.starts_with("<<") {
+                "here-document redirection `<<`".to_owned()
+            } else if rest.starts_with(">&") {
+                "file-descriptor duplication `>&`".to_owned()
+            } else if rest.starts_with("<&") {
+                "file-descriptor duplication `<&`".to_owned()
+            } else {
+                format!("file-descriptor redirection `{}`", &rest[..2])
+            };
+            return Err(dialect_mismatch(index, index + 2, &form));
         }
         if rest.starts_with("$(") {
             let form = if rest.starts_with("$((") {
-                "parameter or arithmetic expansion"
+                "arithmetic expansion `$((...))`"
             } else {
-                "command or process substitution"
+                "command substitution `$(...)`"
             };
             return Err(dialect_mismatch(index, index + 2, form));
         }
         if character == '$' {
-            return Err(dialect_mismatch(
-                index,
-                index + character.len_utf8(),
-                "parameter or arithmetic expansion",
-            ));
+            let form = parameter_expansion_form(rest);
+            return Err(dialect_mismatch(index, index + character.len_utf8(), form));
         }
         if character == '`' {
             return Err(dialect_mismatch(
                 index,
                 index + character.len_utf8(),
-                "command or process substitution",
+                "backtick command substitution `` `...` ``",
             ));
         }
         if quote.is_none() && (rest.starts_with("<(") || rest.starts_with(">(")) {
-            return Err(dialect_mismatch(
-                index,
-                index + 2,
-                "command or process substitution",
-            ));
+            let form = if rest.starts_with("<(") {
+                "process substitution `<(...)`"
+            } else {
+                "process substitution `>(...)`"
+            };
+            return Err(dialect_mismatch(index, index + 2, form));
         }
         if quote.is_none() && matches!(character, '*' | '?') {
             return Err(dialect_mismatch(
                 index,
                 index + character.len_utf8(),
-                "pathname expansion (globbing)",
+                &format!("pathname expansion `{character}`"),
             ));
         }
         if quote.is_none() && character == '[' && rest.contains(']') {
             return Err(dialect_mismatch(
                 index,
                 index + character.len_utf8(),
-                "pathname expansion (globbing)",
+                "pathname expansion `[...]`",
             ));
         }
         if quote.is_none() && character == ';' {
             return Err(dialect_mismatch(
                 index,
                 index + character.len_utf8(),
-                "compound command or semicolon-separated list",
+                "semicolon-separated command list `;`",
             ));
         }
         if quote.is_none() && matches!(character, '(' | ')' | '{' | '}') {
             return Err(dialect_mismatch(
                 index,
                 index + character.len_utf8(),
-                "compound command",
+                &format!("compound-command token `{character}`"),
             ));
         }
     }
     Ok(())
+}
+
+fn parameter_expansion_form(rest: &str) -> &'static str {
+    if rest.starts_with("${") {
+        "parameter expansion `${...}`"
+    } else if rest
+        .chars()
+        .nth(1)
+        .is_some_and(|character| character.is_ascii_digit() || "?@*#$!-".contains(character))
+    {
+        "special parameter expansion `$?`/`$1`"
+    } else {
+        "parameter expansion `$NAME`"
+    }
 }
 
 fn dialect_mismatch(start: usize, end: usize, form: &str) -> CommandSyntaxError {
@@ -380,7 +412,7 @@ fn dialect_mismatch(start: usize, end: usize, form: &str) -> CommandSyntaxError 
         message: format!("unsupported Bash/Zsh construct: {form}"),
         start,
         end,
-        help: "Run this form explicitly with `bash -c '...'` or `zsh -c '...'`; native dialect islands land after Preview"
+        help: "Run this form explicitly with `bash -c '...'` or `zsh -c '...'`; its native C1 disposition is recorded in the versioned compatibility matrix"
             .to_owned(),
     }
 }
@@ -615,26 +647,47 @@ mod tests {
     struct CompatibilityMatrix {
         schema_version: u64,
         matrix_version: String,
+        target_contract_version: String,
         compatibility_level: String,
         scope: String,
+        contract_status: String,
+        differential_fixtures: Vec<DifferentialFixture>,
         supported: Vec<SupportedFeature>,
-        unsupported: Vec<UnsupportedFeature>,
+        deferred: Vec<DeferredFeature>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DifferentialFixture {
+        id: String,
+        source: String,
+        stdout: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct SupportedFeature {
         id: String,
+        level: String,
+        implementation: String,
         forms: Vec<String>,
         limitations: String,
     }
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct UnsupportedFeature {
+    struct DeferredFeature {
         id: String,
+        level: String,
         dialects: Vec<String>,
-        forms: Vec<String>,
+        reason: String,
+        fixtures: Vec<MismatchFixture>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MismatchFixture {
+        source: String,
         diagnostic: String,
     }
 
@@ -714,10 +767,22 @@ mod tests {
     #[test]
     fn compatibility_matrix_is_versioned_complete_and_schema_checked() {
         let matrix: CompatibilityMatrix = serde_json::from_str(COMPATIBILITY_MATRIX_JSON).unwrap();
-        assert_eq!(matrix.schema_version, 1);
+        assert_eq!(matrix.schema_version, 2);
         assert_eq!(matrix.matrix_version, "0.1");
-        assert_eq!(matrix.compatibility_level, "C1-preview");
+        assert_eq!(matrix.target_contract_version, "1.0");
+        assert_eq!(matrix.compatibility_level, "C1-partial+C2-runner");
+        assert_eq!(matrix.contract_status, "frozen_disposition");
         assert!(!matrix.scope.is_empty());
+        assert!(!matrix.differential_fixtures.is_empty());
+        let fixture_ids = matrix
+            .differential_fixtures
+            .iter()
+            .map(|fixture| fixture.id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(fixture_ids.len(), matrix.differential_fixtures.len());
+        for fixture in &matrix.differential_fixtures {
+            assert!(!fixture.source.is_empty(), "{} needs a source", fixture.id);
+        }
 
         let supported = matrix
             .supported
@@ -734,9 +799,17 @@ mod tests {
                 "background_marker",
                 "boolean_lists",
                 "export_assignment",
+                "bash_script_runner",
+                "zsh_script_runner",
+                "script_shebang_dispatch",
             ])
         );
         for feature in &matrix.supported {
+            assert!(matches!(feature.level.as_str(), "C0" | "C1" | "C2"));
+            assert!(matches!(
+                feature.implementation.as_str(),
+                "native" | "reference_runner"
+            ));
             assert!(!feature.forms.is_empty(), "{} needs an example", feature.id);
             assert!(
                 !feature.limitations.is_empty(),
@@ -745,44 +818,38 @@ mod tests {
             );
         }
 
-        let unsupported = matrix
-            .unsupported
+        let deferred = matrix
+            .deferred
             .iter()
             .map(|feature| feature.id.as_str())
             .collect::<HashSet<_>>();
-        assert_eq!(unsupported.len(), matrix.unsupported.len());
-        assert!(unsupported.contains("pathname_expansion"));
-        assert!(unsupported.contains("command_and_process_substitution"));
-        assert!(unsupported.contains("compound_commands"));
-        assert!(unsupported.contains("parameter_and_arithmetic_expansion"));
-        for feature in &matrix.unsupported {
+        assert_eq!(deferred.len(), matrix.deferred.len());
+        assert!(deferred.contains("pathname_expansion"));
+        assert!(deferred.contains("command_and_process_substitution"));
+        assert!(deferred.contains("compound_commands"));
+        assert!(deferred.contains("parameter_and_arithmetic_expansion"));
+        assert!(deferred.contains("interactive_dialect_islands"));
+        for feature in &matrix.deferred {
+            assert!(matches!(feature.level.as_str(), "C1" | "C2"));
             assert_eq!(feature.dialects, ["bash", "zsh"]);
-            assert!(!feature.forms.is_empty(), "{} needs an example", feature.id);
-            assert!(feature
-                .diagnostic
-                .starts_with("unsupported Bash/Zsh construct:"));
+            assert!(!feature.reason.is_empty(), "{} needs a reason", feature.id);
+            assert!(
+                !feature.fixtures.is_empty(),
+                "{} needs a fixture",
+                feature.id
+            );
         }
     }
 
     #[test]
-    fn unsupported_bash_and_zsh_forms_produce_dialect_mismatch_diagnostics() {
-        let cases = [
-            ("echo $(pwd)", "command or process substitution"),
-            ("print -l **/*.rs(N)", "pathname expansion (globbing)"),
-            ("for file in *.rs; do echo file; done", "compound command"),
-            ("echo $HOME", "parameter or arithmetic expansion"),
-            ("name() { echo hi; }", "compound command"),
-            (
-                "[[ -n value ]]",
-                "dialect conditional or arithmetic command",
-            ),
-        ];
-        for (source, form) in cases {
-            let error = parse_command_list(source).unwrap_err();
+    fn every_deferred_form_produces_its_frozen_exact_mismatch_diagnostic() {
+        let matrix: CompatibilityMatrix = serde_json::from_str(COMPATIBILITY_MATRIX_JSON).unwrap();
+        for fixture in matrix.deferred.iter().flat_map(|feature| &feature.fixtures) {
+            let error = parse_command_list(&fixture.source).unwrap_err();
             assert_eq!(
-                error.message,
-                format!("unsupported Bash/Zsh construct: {form}"),
-                "source: {source}"
+                error.message, fixture.diagnostic,
+                "source: {}",
+                fixture.source
             );
             assert!(error.help.contains("bash -c"));
             assert!(error.help.contains("zsh -c"));
@@ -793,31 +860,37 @@ mod tests {
     }
 
     #[test]
-    fn bash_and_zsh_agree_with_supported_native_examples_when_available() {
-        let examples = [
-            ("printf '%s' 'hello world'", "hello world"),
-            ("printf A | tr A B", "B"),
-            ("false || printf recovered", "recovered"),
-            ("true && printf done", "done"),
-            ("printf redirected > /dev/null && printf done", "done"),
-            ("printf redirected < /dev/null", "redirected"),
-            ("printf background &", "background"),
-            ("export QUIRL_C1=value && printenv QUIRL_C1", "value\n"),
-        ];
+    fn bash_and_zsh_differential_fixtures_match_frozen_output_when_available() {
+        let matrix: CompatibilityMatrix = serde_json::from_str(COMPATIBILITY_MATRIX_JSON).unwrap();
 
         for shell in ["bash", "zsh"] {
             if !shell_is_available(shell) {
                 eprintln!("skipping {shell} differential checks: executable is unavailable");
                 continue;
             }
-            for (source, expected) in examples {
-                parse_command_list(source).unwrap();
-                let output = Command::new(shell).arg("-c").arg(source).output().unwrap();
-                assert!(output.status.success(), "{shell} rejected `{source}`");
+            for fixture in &matrix.differential_fixtures {
+                parse_command_list(&fixture.source).unwrap();
+                let mut command = Command::new(shell);
+                if shell == "bash" {
+                    command.args(["--noprofile", "--norc", "-c", &fixture.source]);
+                    command.env_remove("BASH_ENV").env_remove("ENV");
+                } else {
+                    command.args(["-f", "-c", &fixture.source]);
+                    command.env_remove("ZDOTDIR").env_remove("ENV");
+                }
+                let output = command.env("LC_ALL", "C").output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{shell} rejected differential fixture `{}` ({})",
+                    fixture.id,
+                    fixture.source
+                );
                 assert_eq!(
                     String::from_utf8(output.stdout).unwrap(),
-                    expected,
-                    "{shell} disagreed for `{source}`"
+                    fixture.stdout,
+                    "{shell} disagreed for differential fixture `{}` ({})",
+                    fixture.id,
+                    fixture.source
                 );
             }
         }

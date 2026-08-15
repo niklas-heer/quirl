@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const PICKER_PROTOCOL_VERSION: u32 = 1;
+pub const PICKER_SCHEMA_DESCRIPTOR: &str = "quirl.picker@1{PickItem{deny_unknown;id:string;kind:history|file|directory|action|completion|job|data;label:string;description:string;preview:null|string;value:json};PickMatch{deny_unknown;index:usize;score:i32;match_indices:array<usize>};query:space-separated-AND,apostrophe-exact,bang-exclude;ordering:score-desc,label-asc,id-asc;selection:stable-index-into-input}";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemKind {
@@ -16,6 +19,7 @@ pub enum ItemKind {
 
 /// A display model that retains the original typed value in `value`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PickItem {
     pub id: String,
     pub kind: ItemKind,
@@ -28,6 +32,7 @@ pub struct PickItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PickMatch {
     pub index: usize,
     pub score: i32,
@@ -188,5 +193,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["2"]
         );
+    }
+
+    #[test]
+    fn serialized_picker_contract_rejects_unknown_fields() {
+        let source = r#"{"id":"1","kind":"file","label":"a","description":"","preview":null,"value":null,"future":true}"#;
+        assert!(serde_json::from_str::<PickItem>(source).is_err());
+        assert_eq!(PICKER_PROTOCOL_VERSION, 1);
+        assert!(PICKER_SCHEMA_DESCRIPTOR.contains("selection:stable-index-into-input"));
     }
 }

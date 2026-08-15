@@ -16,10 +16,15 @@ use std::{
     collections::hash_map::DefaultHasher,
     env, fs,
     hash::{Hash, Hasher},
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
 };
+
+const MAX_PLUGIN_LOCK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PLUGIN_MANIFEST_BYTES: usize = 256 * 1024;
+const MAX_PLUGIN_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 
 pub type SharedLuaExtensions = Arc<Mutex<LuaExtensionHost>>;
 
@@ -686,14 +691,15 @@ fn snapshot_managed_plugins(
     if !lock_path.exists() {
         return (Vec::new(), PluginFingerprint::Files(fingerprints));
     }
-    let bytes = match fs::read(&lock_path) {
+    let bytes = match read_bounded_plugin_file(&lock_path, MAX_PLUGIN_LOCK_BYTES, "plugin lockfile")
+    {
         Ok(bytes) => bytes,
         Err(error) => {
             errors.push(io_error(&lock_path, error));
             return (Vec::new(), PluginFingerprint::Files(fingerprints));
         }
     };
-    let lock = match serde_json::from_slice::<PluginLockfile>(&bytes) {
+    let lock = match PluginLockfile::from_json(&bytes) {
         Ok(lock) => lock,
         Err(error) => {
             errors.push(
@@ -736,8 +742,17 @@ fn managed_plugin_candidate(
     }
     let manifest_path = managed_manifest_path(&locked.source)?;
     fingerprints.push((manifest_path.clone(), fingerprint_file(&manifest_path)?));
-    let manifest_source =
-        fs::read_to_string(&manifest_path).map_err(|error| io_error(&manifest_path, error))?;
+    let manifest_bytes =
+        read_bounded_plugin_file(&manifest_path, MAX_PLUGIN_MANIFEST_BYTES, "plugin manifest")
+            .map_err(|error| io_error(&manifest_path, error))?;
+    let manifest_source = String::from_utf8(manifest_bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "managed plugin manifest is not valid UTF-8",
+        )
+        .with_context(error.to_string())
+        .with_help("Encode plugin.toml as UTF-8")
+    })?;
     let manifest = parse_plugin_manifest(&manifest_source, &manifest_path.display().to_string())?;
     if manifest.plugin.name != locked.name
         || manifest.plugin.version != locked.version
@@ -765,12 +780,22 @@ fn managed_plugin_candidate(
         )
         .with_help("Use a relative entry path without parent components"));
     }
-    let entry_path = manifest_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(entry);
+    let package_root = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let entry_path = fs::canonicalize(package_root.join(entry))
+        .map_err(|error| io_error(&package_root.join(entry), error))?;
+    if !entry_path.starts_with(package_root) {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "managed plugin `{}` entry resolves outside its package",
+                locked.name
+            ),
+        )
+        .with_help("Keep the entry inside the package; external symlink targets are rejected"));
+    }
     fingerprints.push((entry_path.clone(), fingerprint_file(&entry_path)?));
-    let entry_bytes = fs::read(&entry_path).map_err(|error| io_error(&entry_path, error))?;
+    let entry_bytes = read_bounded_plugin_file(&entry_path, MAX_PLUGIN_ENTRY_BYTES, "plugin entry")
+        .map_err(|error| io_error(&entry_path, error))?;
     let report = doctor_plugin(locked, manifest_source.as_bytes(), &entry_bytes);
     if !report.healthy {
         return Err(ShellError::new(
@@ -809,12 +834,23 @@ fn managed_manifest_path(source: &str) -> Result<PathBuf, ShellError> {
         )
         .with_help("Platform v0.1 activates only locked local file sources"));
     }
-    let path = PathBuf::from(value);
-    Ok(if path.is_dir() {
-        path.join("plugin.toml")
+    let path = fs::canonicalize(value).map_err(|error| io_error(Path::new(value), error))?;
+    if path.is_dir() {
+        let manifest = fs::canonicalize(path.join("plugin.toml"))
+            .map_err(|error| io_error(&path.join("plugin.toml"), error))?;
+        if !manifest.starts_with(&path) {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "managed plugin manifest resolves outside its package",
+            )
+            .with_help(
+                "Keep plugin.toml inside the package; external symlink targets are rejected",
+            ));
+        }
+        Ok(manifest)
     } else {
-        path
-    })
+        Ok(path)
+    }
 }
 
 fn legacy_registration_grants() -> Vec<String> {
@@ -831,7 +867,7 @@ fn legacy_registration_grants() -> Vec<String> {
 }
 
 fn fingerprint_file(path: &Path) -> Result<FileFingerprint, ShellError> {
-    match fs::read(path) {
+    match read_bounded_plugin_file(path, MAX_PLUGIN_LOCK_BYTES, "plugin source") {
         Ok(contents) => {
             let mut hasher = DefaultHasher::new();
             contents.hash(&mut hasher);
@@ -843,6 +879,29 @@ fn fingerprint_file(path: &Path) -> Result<FileFingerprint, ShellError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileFingerprint::Missing),
         Err(error) => Err(io_error(path, error)),
     }
+}
+
+fn read_bounded_plugin_file(
+    path: &Path,
+    limit: usize,
+    context: &str,
+) -> Result<Vec<u8>, std::io::Error> {
+    let file = fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > limit as u64 {
+        return Err(std::io::Error::other(format!(
+            "{context} is {size} bytes; limit is {limit} bytes"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::other(format!(
+            "{context} exceeded its {limit}-byte limit while reading"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn io_error(path: &Path, error: std::io::Error) -> ShellError {
@@ -1189,6 +1248,50 @@ error_codes = { "0" = "success" }
             .iter()
             .any(|context| context.contains("capability denied: prompt.register"))));
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_activation_rejects_checksum_matching_entry_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_extension_directory();
+        let (manifest, lock) = write_managed_prompt_plugin(&directory);
+        let entry = manifest.parent().unwrap().join("plugin.lua");
+        let outside = directory.join("outside.lua");
+        fs::write(&outside, fs::read(&entry).unwrap()).unwrap();
+        fs::remove_file(&entry).unwrap();
+        symlink(&outside, &entry).unwrap();
+
+        let mut fingerprints = Vec::new();
+        let error = managed_plugin_candidate(&lock.plugins[0], &mut fingerprints).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("outside"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn managed_activation_rejects_oversized_entry_before_runtime_loading() {
+        let directory = temporary_extension_directory();
+        let (manifest, lock) = write_managed_prompt_plugin(&directory);
+        fs::write(
+            manifest.parent().unwrap().join("plugin.lua"),
+            vec![b'x'; MAX_PLUGIN_ENTRY_BYTES + 1],
+        )
+        .unwrap();
+
+        let mut fingerprints = Vec::new();
+        let error = managed_plugin_candidate(&lock.plugins[0], &mut fingerprints).unwrap_err();
+        assert!(matches!(
+            error.code,
+            ErrorCode::Io | ErrorCode::ResourceLimit
+        ));
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("limit")));
         fs::remove_dir_all(directory).unwrap();
     }
 

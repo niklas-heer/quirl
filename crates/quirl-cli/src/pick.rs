@@ -1,6 +1,6 @@
 use clap::{Args, ValueEnum};
 use quirl_catalog::Catalog;
-use quirl_core::{ErrorCode, ShellError};
+use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
 use quirl_picker::{ItemKind, PickItem, Picker};
 use std::{
     fs,
@@ -9,6 +9,8 @@ use std::{
 };
 
 const MAX_FILE_ITEMS: usize = 20_000;
+const MAX_STDIN_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STDIN_ITEMS: usize = 20_000;
 
 #[derive(Debug, Args)]
 pub struct PickCommand {
@@ -68,32 +70,57 @@ pub fn execute(command: PickCommand, catalog: &Catalog) -> Result<i32, ShellErro
     match command.format {
         PickFormat::Text => {
             for item in selected {
-                match &item.value {
-                    serde_json::Value::String(value) => println!("{value}"),
-                    value => println!("{}", serde_json::to_string(value).map_err(json_error)?),
-                }
+                println!("{}", render_text_value(&item.value)?);
             }
         }
-        PickFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&selected).map_err(json_error)?
-        ),
+        PickFormat::Json => println!("{}", render_json(&selected)?),
     }
     Ok(0)
 }
 
 fn stdin_items() -> Result<Vec<PickItem>, ShellError> {
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input).map_err(|error| {
-        ShellError::new(ErrorCode::Io, "could not read picker input")
-            .with_context(error.to_string())
-            .with_help("Pipe newline-delimited values into `quirl pick`")
+    stdin_items_from(io::stdin())
+}
+
+fn stdin_items_from(reader: impl Read) -> Result<Vec<PickItem>, ShellError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_STDIN_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ShellError::new(ErrorCode::Io, "could not read picker input")
+                .with_context(error.to_string())
+                .with_help("Pipe newline-delimited values into `quirl pick`")
+        })?;
+    if bytes.len() > MAX_STDIN_BYTES {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "picker standard input exceeds its read limit",
+        )
+        .with_context(format!("bytes: {}; limit: {MAX_STDIN_BYTES}", bytes.len()))
+        .with_help("Pipe at most 4 MiB of newline-delimited values into `quirl pick`"));
+    }
+    let input = String::from_utf8(bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "picker standard input is not valid UTF-8",
+        )
+        .with_context(error.to_string())
+        .with_help("Encode picker input as UTF-8 newline-delimited values")
     })?;
-    Ok(input
-        .lines()
-        .enumerate()
-        .map(|(index, line)| text_item(index, ItemKind::Data, line))
-        .collect())
+    let mut items = Vec::new();
+    for (index, line) in input.lines().enumerate() {
+        if index == MAX_STDIN_ITEMS {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "picker standard input contains too many values",
+            )
+            .with_context(format!("items: more than {MAX_STDIN_ITEMS}"))
+            .with_help("Limit newline-delimited picker input to 20000 values"));
+        }
+        items.push(text_item(index, ItemKind::Data, line));
+    }
+    Ok(items)
 }
 
 fn history_items() -> Result<Vec<PickItem>, ShellError> {
@@ -209,6 +236,21 @@ fn json_error(error: serde_json::Error) -> ShellError {
         .with_help("Retry with --format text")
 }
 
+fn render_text_value(value: &serde_json::Value) -> Result<String, ShellError> {
+    match value {
+        serde_json::Value::String(value) => Ok(escape_terminal_controls(value)),
+        value => Ok(escape_json_terminal_controls(
+            &serde_json::to_string(value).map_err(json_error)?,
+        )),
+    }
+}
+
+fn render_json(value: &impl serde::Serialize) -> Result<String, ShellError> {
+    Ok(escape_json_terminal_controls(
+        &serde_json::to_string_pretty(value).map_err(json_error)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,5 +260,34 @@ mod tests {
         let items = action_items(&Catalog::builtin());
         let selected = Picker.select(&items, "'index 'explain", 1);
         assert_eq!(selected[0].value, "quirl index explain");
+    }
+
+    #[test]
+    fn picker_output_neutralizes_c0_and_c1_controls_without_changing_json_semantics() {
+        let hostile = serde_json::json!("safe\u{1b}[31m\u{9b}2J\r");
+        let text = render_text_value(&hostile).unwrap();
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.contains('\u{009b}'));
+        assert!(!text.contains('\r'));
+        assert!(text.contains("\\u{1b}[31m"));
+
+        let selected = vec![text_item(0, ItemKind::Data, hostile.as_str().unwrap())];
+        let json = render_json(&selected).unwrap();
+        assert!(!json.contains('\u{009b}'));
+        let parsed: Vec<PickItem> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, selected);
+    }
+
+    #[test]
+    fn picker_stdin_rejects_oversized_input_and_item_counts_before_selection() {
+        let oversized = vec![b'x'; MAX_STDIN_BYTES + 1];
+        let error = stdin_items_from(std::io::Cursor::new(oversized)).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.help[0].contains("4 MiB"));
+
+        let many_items = "value\n".repeat(MAX_STDIN_ITEMS + 1);
+        let error = stdin_items_from(std::io::Cursor::new(many_items)).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.help[0].contains("20000"));
     }
 }

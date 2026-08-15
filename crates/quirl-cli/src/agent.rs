@@ -5,7 +5,7 @@ use quirl_contract::{
     validate_agent_document_with_anchors, AgentCatalog, AgentDocumentKind, AgentManifest,
     AgentValidationAnchors, HostCapability, HostParameter, ValidationReport, DEFAULT_TOKEN_BUDGET,
 };
-use quirl_core::{ErrorCode, ShellError};
+use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
 use quirl_lua::HOST_API;
 use serde::Serialize;
 use std::{
@@ -99,7 +99,12 @@ pub fn execute(command: AgentCommand, catalog: &Catalog) -> Result<i32, ShellErr
             let context = build_agent_context(&catalog, &query.join(" "), token_budget)?;
             match format {
                 ContextOutputFormat::Json => print_json(&context)?,
-                ContextOutputFormat::Markdown => print!("{}", render_context_markdown(&context)),
+                ContextOutputFormat::Markdown => {
+                    print!(
+                        "{}",
+                        escape_terminal_controls(&render_context_markdown(&context))
+                    )
+                }
             }
             Ok(0)
         }
@@ -158,63 +163,99 @@ fn installed_host_api() -> Vec<HostCapability> {
 }
 
 fn print_agent_catalog(catalog: &AgentCatalog) {
-    println!("Quirl {} agent catalog", catalog.quirl_version);
-    println!("catalog schema: {}", catalog.schema_hash);
-    println!("catalog content: {}", catalog.catalog_hash);
-    println!("host API: {}", catalog.host_api_hash);
+    println!(
+        "Quirl {} agent catalog",
+        escape_terminal_controls(&catalog.quirl_version)
+    );
+    println!(
+        "catalog schema: {}",
+        escape_terminal_controls(&catalog.schema_hash)
+    );
+    println!(
+        "catalog content: {}",
+        escape_terminal_controls(&catalog.catalog_hash)
+    );
+    println!(
+        "host API: {}",
+        escape_terminal_controls(&catalog.host_api_hash)
+    );
     println!("\nCommands:");
     for command in &catalog.commands {
-        println!("  {:<32} {}", command.signature, command.summary);
+        println!(
+            "  {:<32} {}",
+            escape_terminal_controls(&command.signature),
+            escape_terminal_controls(&command.summary)
+        );
     }
     println!("\nCapabilities:");
     for capability in &catalog.capabilities {
         println!(
             "  {:<24} v{} {}",
-            capability.name, capability.version, capability.schema_hash
+            escape_terminal_controls(&capability.name),
+            capability.version,
+            escape_terminal_controls(&capability.schema_hash)
         );
     }
 }
 
 fn print_agent_manifest(manifest: &AgentManifest) {
-    println!("Quirl {} installed agent interface", manifest.quirl_version);
-    println!("schema: {}", manifest.schema_hash);
+    println!(
+        "Quirl {} installed agent interface",
+        escape_terminal_controls(&manifest.quirl_version)
+    );
+    println!(
+        "schema: {}",
+        escape_terminal_controls(&manifest.schema_hash)
+    );
     println!("{} tools", manifest.tools.len());
     for tool in &manifest.tools {
-        println!("  {:<32} {}", tool.name, tool.summary);
+        println!(
+            "  {:<32} {}",
+            escape_terminal_controls(&tool.name),
+            escape_terminal_controls(&tool.summary)
+        );
     }
     println!("{} declared capabilities", manifest.capabilities.len());
     for capability in &manifest.capabilities {
-        println!("  {} ({})", capability.name, capability.schema_hash);
+        println!(
+            "  {} ({})",
+            escape_terminal_controls(&capability.name),
+            escape_terminal_controls(&capability.schema_hash)
+        );
     }
 }
 
 fn print_validation(file: &Path, report: &ValidationReport) {
     if report.valid {
-        println!("✓ {} is a valid versioned agent document", file.display());
+        println!(
+            "✓ {} is a valid versioned agent document",
+            escape_terminal_controls(&file.display().to_string())
+        );
         return;
     }
     println!(
         "✗ {} has {} diagnostics",
-        file.display(),
+        escape_terminal_controls(&file.display().to_string()),
         report.diagnostics.len()
     );
     for diagnostic in &report.diagnostics {
         println!(
             "  {} at {}: {}\n    help: {}",
-            diagnostic.code, diagnostic.path, diagnostic.message, diagnostic.help
+            escape_terminal_controls(&diagnostic.code),
+            escape_terminal_controls(&diagnostic.path),
+            escape_terminal_controls(&diagnostic.message),
+            escape_terminal_controls(&diagnostic.help)
         );
     }
 }
 
 fn print_json(value: &impl Serialize) -> Result<(), ShellError> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).map_err(|error| {
-            ShellError::new(ErrorCode::Io, "could not serialize agent output")
-                .with_context(error.to_string())
-                .with_help("Report this as a Quirl agent schema defect")
-        })?
-    );
+    let json = serde_json::to_string_pretty(value).map_err(|error| {
+        ShellError::new(ErrorCode::Io, "could not serialize agent output")
+            .with_context(error.to_string())
+            .with_help("Report this as a Quirl agent schema defect")
+    })?;
+    println!("{}", escape_json_terminal_controls(&json));
     Ok(())
 }
 

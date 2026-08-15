@@ -1,5 +1,5 @@
 use clap::{Subcommand, ValueEnum};
-use quirl_core::{ErrorCode, ShellError};
+use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
 use quirl_lua::{LuaPolicy, LuaRuntime, QuirlConfig};
 use std::{
     ffi::OsString,
@@ -60,20 +60,17 @@ fn check(file: &Path, format: ConfigOutputFormat) -> Result<i32, ShellError> {
         Ok(config) => {
             match format {
                 ConfigOutputFormat::Text => {
-                    println!("✓ {} is valid Lua configuration", file.display());
+                    println!(
+                        "✓ {} is valid Lua configuration",
+                        escape_terminal_controls(&file.display().to_string())
+                    );
                 }
-                ConfigOutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&config).map_err(json_error)?
-                ),
+                ConfigOutputFormat::Json => print_json(&config)?,
             }
             Ok(0)
         }
         Err(error) if matches!(format, ConfigOutputFormat::Json) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&error).map_err(json_error)?
-            );
+            print_json(&error)?;
             Ok(1)
         }
         Err(error) => Err(error),
@@ -83,18 +80,21 @@ fn check(file: &Path, format: ConfigOutputFormat) -> Result<i32, ShellError> {
 fn get(file: &Path, key: &str) -> Result<i32, ShellError> {
     let field = ConfigField::parse(key)?;
     let config = load(file)?;
-    println!("{}", field.value(&config));
+    println!("{}", escape_terminal_controls(&field.value(&config)));
     Ok(0)
 }
 
 fn tui(file: &Path) -> Result<i32, ShellError> {
     let config = load(file)?;
-    println!("Quirl configuration · {}", file.display());
+    println!(
+        "Quirl configuration · {}",
+        escape_terminal_controls(&file.display().to_string())
+    );
     println!("read-only line view; use `quirl config set` to change a literal value\n");
     println!("[editor]");
     println!(
         "editor.keymap = {}  (helix | emacs | vim)",
-        config.editor.keymap
+        escape_terminal_controls(&config.editor.keymap)
     );
     println!(
         "editor.semantic_hints = {}  (true | false)",
@@ -103,7 +103,7 @@ fn tui(file: &Path) -> Result<i32, ShellError> {
     println!("\n[picker]");
     println!(
         "picker.layout = {}  (adaptive | bottom | full)",
-        config.picker.layout
+        escape_terminal_controls(&config.picker.layout)
     );
     println!("picker.preview = {}  (true | false)", config.picker.preview);
     println!("\nThe synchronized local web configuration view remains future work.");
@@ -127,8 +127,8 @@ fn set(file: &Path, key: &str, value: &str) -> Result<i32, ShellError> {
     result?;
     println!(
         "updated {key} in {} (backup: {})",
-        file.display(),
-        backup_path(file).display()
+        escape_terminal_controls(&file.display().to_string()),
+        escape_terminal_controls(&backup_path(file).display().to_string())
     );
     Ok(0)
 }
@@ -498,6 +498,12 @@ fn file_error(action: &str, file: &Path, error: std::io::Error) -> ShellError {
 
 fn json_error(error: serde_json::Error) -> ShellError {
     ShellError::new(ErrorCode::Io, "could not produce JSON").with_context(error.to_string())
+}
+
+fn print_json(value: &impl serde::Serialize) -> Result<(), ShellError> {
+    let json = serde_json::to_string_pretty(value).map_err(json_error)?;
+    println!("{}", escape_json_terminal_controls(&json));
+    Ok(())
 }
 
 #[cfg(test)]

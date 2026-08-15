@@ -27,6 +27,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    io::IsTerminal,
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
@@ -120,6 +121,11 @@ fn configured_editor(
     history_items: Vec<PickItem>,
     history_path: Option<PathBuf>,
 ) -> Reedline {
+    let terminal_styles = terminal_styling_enabled(
+        std::io::stdout().is_terminal(),
+        env::var_os("NO_COLOR").is_some(),
+        dumb_terminal(),
+    );
     let completer = Box::new(CatalogCompleter::with_extensions_and_picker(
         catalog.clone(),
         extension_completer,
@@ -130,16 +136,20 @@ fn configured_editor(
     let mut line_editor = Reedline::create()
         .with_completer(completer)
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
-        .with_hinter(Box::new(
-            DefaultHinter::default().with_style(Style::new().italic().fg(Color::DarkGray)),
-        ))
+        .with_hinter(Box::new(DefaultHinter::default().with_style(
+            if terminal_styles {
+                Style::new().italic().fg(Color::DarkGray)
+            } else {
+                Style::new()
+            },
+        )))
         .with_validator(Box::new(DefaultValidator))
         .with_edit_mode(configured_edit_mode(&config.editor.keymap))
         .with_quick_completions(false);
     if let Some(history) = history {
         line_editor = line_editor.with_history(Box::new(history));
     }
-    if config.editor.semantic_hints {
+    if config.editor.semantic_hints && terminal_styles {
         line_editor = line_editor.with_highlighter(Box::new(SemanticHighlighter::new(catalog)));
     }
     line_editor
@@ -783,7 +793,7 @@ impl QuirlPrompt {
     }
 
     fn render_segments(&self, requested: &[String]) -> String {
-        requested
+        let parts = requested
             .iter()
             .filter_map(|name| match name.as_str() {
                 "directory" => Some(self.cwd.clone()),
@@ -801,9 +811,21 @@ impl QuirlPrompt {
                 "git_state" => self.git_state.as_ref().map(|state| format!("git:{state}")),
                 _ => self.named_extension_segments.get(name).cloned(),
             })
-            .collect::<Vec<_>>()
-            .join(" · ")
+            .collect::<Vec<_>>();
+        join_prompt_parts(&parts, dumb_terminal())
     }
+}
+
+fn join_prompt_parts(parts: &[String], dumb: bool) -> String {
+    parts.join(if dumb { " | " } else { " · " })
+}
+
+fn dumb_terminal() -> bool {
+    env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb"))
+}
+
+fn terminal_styling_enabled(terminal: bool, no_color_is_set: bool, dumb: bool) -> bool {
+    terminal && !no_color_is_set && !dumb
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -843,7 +865,7 @@ impl Prompt for QuirlPrompt {
         }
         let mut parts = vec![self.cwd.clone(), self.mode.to_string()];
         parts.extend(self.extension_segments.iter().cloned());
-        Cow::Owned(format!("{} ", parts.join(" · ")))
+        Cow::Owned(format!("{} ", join_prompt_parts(&parts, dumb_terminal())))
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -851,7 +873,7 @@ impl Prompt for QuirlPrompt {
     }
 
     fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
-        if env::var("TERM").is_ok_and(|term| term == "dumb") {
+        if dumb_terminal() {
             Cow::Owned(match self.mode {
                 Mode::Command => "> ".to_owned(),
                 Mode::Data => "data> ".to_owned(),
@@ -862,18 +884,22 @@ impl Prompt for QuirlPrompt {
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Borrowed("  · ")
+        Cow::Borrowed(if dumb_terminal() { "... " } else { "  · " })
     }
 
     fn render_prompt_history_search_indicator(
         &self,
         history_search: PromptHistorySearch,
     ) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "search `{}` {} ",
-            history_search.term,
+        let indicator = if dumb_terminal() {
+            match self.mode {
+                Mode::Command => ">",
+                Mode::Data => "data>",
+            }
+        } else {
             self.mode.prompt()
-        ))
+        };
+        Cow::Owned(format!("search `{}` {indicator} ", history_search.term))
     }
 }
 
@@ -1149,21 +1175,29 @@ pub fn render_error(error: &ShellError, color: bool) -> String {
     } else {
         heading
     };
-    let mut rendered = format!("{heading}: {}\n", error.message);
+    let mut rendered = format!(
+        "{heading}: {}\n",
+        quirl_core::escape_terminal_controls(&error.message)
+    );
     for label in &error.details.labels {
-        let source = label.source.as_deref().unwrap_or("input");
+        let source =
+            quirl_core::escape_terminal_controls(label.source.as_deref().unwrap_or("input"));
+        let message = quirl_core::escape_terminal_controls(&label.message);
         if color {
             rendered.push_str(&format!("  ╭─[{source}:{}..{}]\n", label.start, label.end));
-            rendered.push_str(&format!("  ╰─ {}\n", label.message));
+            rendered.push_str(&format!("  ╰─ {message}\n"));
         } else {
             rendered.push_str(&format!(
-                "  at {source}:{}..{}: {}\n",
-                label.start, label.end, label.message
+                "  at {source}:{}..{}: {message}\n",
+                label.start, label.end
             ));
         }
     }
     for context in &error.details.context {
-        rendered.push_str(&format!("  caused by: {context}\n"));
+        rendered.push_str(&format!(
+            "  caused by: {}\n",
+            quirl_core::escape_terminal_controls(context)
+        ));
     }
     for help in &error.details.help {
         let marker = if color {
@@ -1171,7 +1205,10 @@ pub fn render_error(error: &ShellError, color: bool) -> String {
         } else {
             "help".to_owned()
         };
-        rendered.push_str(&format!("  {marker}: {help}\n"));
+        rendered.push_str(&format!(
+            "  {marker}: {}\n",
+            quirl_core::escape_terminal_controls(help)
+        ));
     }
     rendered.trim_end().to_owned()
 }
@@ -1215,6 +1252,51 @@ mod tests {
     }
 
     #[test]
+    fn plain_diagnostics_neutralize_terminal_controls_from_every_error_field() {
+        let error = ShellError::new(ErrorCode::Lua, "bad\u{1b}[31mmessage")
+            .with_label(
+                Some("plugin\u{1b}]0;owned\u{7}".to_owned()),
+                0,
+                1,
+                "label\u{9b}2J",
+            )
+            .with_context("context\rrewritten")
+            .with_help("help\u{1b}[?25l");
+        let rendered = render_error(&error, false);
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{009b}'));
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.contains("\\u{1b}[31m"));
+        assert!(rendered.contains("\\u{9b}2J"));
+        assert!(rendered.contains("\\rrewritten"));
+    }
+
+    #[test]
+    fn dumb_terminal_prompt_join_uses_ascii_only() {
+        let parts = vec![
+            "project".to_owned(),
+            "command".to_owned(),
+            "git:main".to_owned(),
+        ];
+        assert_eq!(
+            join_prompt_parts(&parts, true),
+            "project | command | git:main"
+        );
+        assert_eq!(
+            join_prompt_parts(&parts, false),
+            "project · command · git:main"
+        );
+    }
+
+    #[test]
+    fn terminal_styles_require_an_interactive_color_capable_terminal() {
+        assert!(terminal_styling_enabled(true, false, false));
+        assert!(!terminal_styling_enabled(false, false, false));
+        assert!(!terminal_styling_enabled(true, true, false));
+        assert!(!terminal_styling_enabled(true, false, true));
+    }
+
+    #[test]
     fn lua_suggestions_merge_with_catalog_completion() {
         let mut completer =
             CatalogCompleter::with_extensions(Catalog::builtin(), Some(Box::new(ExampleExtension)));
@@ -1230,7 +1312,10 @@ mod tests {
         let prompt = QuirlPrompt::new(Mode::Command)
             .with_extension_segments(vec!["project".to_owned(), "git:main".to_owned()]);
         let rendered = prompt.render_prompt_left();
-        assert!(rendered.contains("project · git:main"));
+        assert!(rendered.contains(&join_prompt_parts(
+            &["project".to_owned(), "git:main".to_owned()],
+            dumb_terminal(),
+        )));
     }
 
     #[test]
@@ -1258,8 +1343,12 @@ mod tests {
             ]);
 
         let left = prompt.render_prompt_left();
-        assert!(left.starts_with("command · quirl · "));
-        assert_eq!(prompt.render_prompt_right(), "status:7 · eu-central");
+        let separator = if dumb_terminal() { " | " } else { " · " };
+        assert!(left.starts_with(&format!("command{separator}quirl{separator}")));
+        assert_eq!(
+            prompt.render_prompt_right(),
+            format!("status:7{separator}eu-central")
+        );
     }
 
     #[test]
@@ -1434,7 +1523,18 @@ mod tests {
 
         assert_eq!(
             prompt.render_prompt_left(),
-            "quirl · git:main · git:dirty · nsh "
+            format!(
+                "{} ",
+                join_prompt_parts(
+                    &[
+                        "quirl".to_owned(),
+                        "git:main".to_owned(),
+                        "git:dirty".to_owned(),
+                        "nsh".to_owned(),
+                    ],
+                    dumb_terminal(),
+                )
+            )
         );
     }
 

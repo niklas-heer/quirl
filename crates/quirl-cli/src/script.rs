@@ -1,7 +1,7 @@
 use clap::ValueEnum;
-use quirl_core::{ErrorCode, ShellError};
+use quirl_core::{escape_json_terminal_controls, ErrorCode, ShellError};
 use quirl_data::DataRuntime;
-use quirl_lua::{format_file, LuaPolicy, LuaRuntime};
+use quirl_lua::{format_file, LuaPolicy, LuaRuntime, MAX_LUA_SOURCE_BYTES};
 use quirl_process::{ChildProcessTree, NativeExecutor};
 use quirl_syntax::check_script;
 use quirl_ui::render_error;
@@ -109,14 +109,12 @@ fn render_analysis_report(
     lint: bool,
 ) -> Result<(), ShellError> {
     if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).map_err(|error| {
-                ShellError::new(ErrorCode::Io, "could not serialize script diagnostics")
-                    .with_context(error.to_string())
-                    .with_help("Report this as a Quirl script diagnostic schema defect")
-            })?
-        );
+        let json = serde_json::to_string_pretty(&report).map_err(|error| {
+            ShellError::new(ErrorCode::Io, "could not serialize script diagnostics")
+                .with_context(error.to_string())
+                .with_help("Report this as a Quirl script diagnostic schema defect")
+        })?;
+        println!("{}", escape_json_terminal_controls(&json));
     } else {
         for entry in &report.files {
             if let Some(error) = &entry.error {
@@ -299,7 +297,7 @@ fn check_script_file(path: &Path) -> Result<(), ShellError> {
     match script_language_for_path(path) {
         Some(ScriptLanguage::Lua) => LuaRuntime::check_file(path),
         Some(ScriptLanguage::Quirl) => {
-            let source = fs::read_to_string(path).map_err(|error| path_error(path, error))?;
+            let source = read_script_file(path)?;
             check_quirl_source(&source, &path.display().to_string())
         }
         Some(ScriptLanguage::Bash | ScriptLanguage::Zsh) => Err(unsupported_language_error(
@@ -349,25 +347,10 @@ pub fn run(
     arguments: &[String],
 ) -> Result<ScriptRunOutput, ShellError> {
     let (source, source_name) = if file == Path::new("-") {
-        let mut source = String::new();
-        io::stdin().read_to_string(&mut source).map_err(|error| {
-            ShellError::new(
-                ErrorCode::ScriptRead,
-                "cannot read script from standard input",
-            )
-            .with_context(error.to_string())
-            .with_help("Pipe UTF-8 source to `quirl run --lang lua|quirl|bash|zsh -`")
-        })?;
+        let source = read_script_stdin()?;
         (source, "<stdin>".to_owned())
     } else {
-        let source = fs::read_to_string(file).map_err(|error| {
-            ShellError::new(
-                ErrorCode::ScriptRead,
-                format!("cannot read script {}", file.display()),
-            )
-            .with_context(error.to_string())
-            .with_help("Check the script path and read permissions")
-        })?;
+        let source = read_script_file(file)?;
         (source, file.display().to_string())
     };
     let path = (file != Path::new("-")).then_some(file);
@@ -401,6 +384,57 @@ pub fn run(
         signal_hook::low_level::unregister(signal_id);
     }
     result
+}
+
+fn read_script_file(path: &Path) -> Result<String, ShellError> {
+    let file = fs::File::open(path).map_err(|error| path_error(path, error))?;
+    let size = file
+        .metadata()
+        .map_err(|error| path_error(path, error))?
+        .len();
+    if size > MAX_LUA_SOURCE_BYTES as u64 {
+        return Err(script_source_limit_error(&path.display().to_string(), size));
+    }
+    read_script_bytes(file, &path.display().to_string())
+}
+
+fn read_script_stdin() -> Result<String, ShellError> {
+    read_script_bytes(io::stdin(), "standard input")
+}
+
+fn read_script_bytes(reader: impl Read, source_name: &str) -> Result<String, ShellError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_LUA_SOURCE_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ShellError::new(
+                ErrorCode::ScriptRead,
+                format!("cannot read script from {source_name}"),
+            )
+            .with_context(error.to_string())
+            .with_help("Check the script source and read permissions")
+        })?;
+    if bytes.len() > MAX_LUA_SOURCE_BYTES {
+        return Err(script_source_limit_error(source_name, bytes.len() as u64));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::ScriptRead,
+            format!("script source from {source_name} is not valid UTF-8"),
+        )
+        .with_context(error.to_string())
+        .with_help("Encode script source as UTF-8")
+    })
+}
+
+fn script_source_limit_error(source_name: &str, size: u64) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("script source from {source_name} exceeds its read limit"),
+    )
+    .with_context(format!("bytes: {size}; limit: {MAX_LUA_SOURCE_BYTES}"))
+    .with_help("Keep executable source below 4 MiB and load data through bounded inputs")
 }
 
 #[cfg(test)]
@@ -1217,5 +1251,13 @@ mod tests {
         assert_eq!(format_paths(&quirl, false).unwrap(), 0);
         assert_eq!(fs::read_to_string(&quirl).unwrap(), quirl_source);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn script_reader_rejects_source_beyond_the_runtime_limit() {
+        let source = vec![b'x'; MAX_LUA_SOURCE_BYTES + 1];
+        let error = read_script_bytes(std::io::Cursor::new(source), "test input").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("limit"));
     }
 }

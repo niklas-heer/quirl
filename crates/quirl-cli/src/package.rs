@@ -5,7 +5,7 @@ use quirl_contract::{
     build_package, parse_package_manifest, DiagnosticSeverity, PackageBuild, PackageBuildOutcome,
     PackageManifest, PackagePublishPlan, PackageSourceAudit, ValidationDiagnostic,
 };
-use quirl_core::{ErrorCode, ShellError};
+use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
 use quirl_lua::{LuaRuntime, HOST_API};
 use serde::Serialize;
 use std::{
@@ -287,13 +287,19 @@ fn safe_entry_path(manifest: &Path, entry: &str) -> Option<PathBuf> {
 fn print_manifest(path: &Path, manifest: &PackageManifest) {
     println!(
         "{} {} ({})",
-        manifest.package.name,
-        manifest.package.version,
-        path.display()
+        escape_terminal_controls(&manifest.package.name),
+        escape_terminal_controls(&manifest.package.version),
+        escape_terminal_controls(&path.display().to_string())
     );
-    println!("  {}", manifest.package.summary);
-    println!("  entry: {}", manifest.package.entry);
-    println!("  Quirl: {}", manifest.package.quirl);
+    println!("  {}", escape_terminal_controls(&manifest.package.summary));
+    println!(
+        "  entry: {}",
+        escape_terminal_controls(&manifest.package.entry)
+    );
+    println!(
+        "  Quirl: {}",
+        escape_terminal_controls(&manifest.package.quirl)
+    );
     println!(
         "  contributions: {} commands, {} panels, {} indexers",
         manifest.contributes.commands.len(),
@@ -305,7 +311,7 @@ fn print_manifest(path: &Path, manifest: &PackageManifest) {
         if manifest.capabilities.request.is_empty() {
             "none".to_owned()
         } else {
-            manifest.capabilities.request.join(", ")
+            escape_terminal_controls(&manifest.capabilities.request.join(", "))
         }
     );
 }
@@ -323,13 +329,16 @@ fn print_build_outcome(
     } else {
         println!(
             "✗ {} failed package validation with {} diagnostics",
-            path.display(),
+            escape_terminal_controls(&path.display().to_string()),
             outcome.diagnostics.len()
         );
         for diagnostic in &outcome.diagnostics {
             println!(
                 "  {} at {}: {}\n    help: {}",
-                diagnostic.code, diagnostic.path, diagnostic.message, diagnostic.help
+                escape_terminal_controls(&diagnostic.code),
+                escape_terminal_controls(&diagnostic.path),
+                escape_terminal_controls(&diagnostic.message),
+                escape_terminal_controls(&diagnostic.help)
             );
         }
     }
@@ -339,13 +348,19 @@ fn print_build_outcome(
 fn print_build(path: &Path, build: &PackageBuild) {
     println!(
         "✓ built {} {} from {}",
-        build.package_name,
-        build.package_version,
-        path.display()
+        escape_terminal_controls(&build.package_name),
+        escape_terminal_controls(&build.package_version),
+        escape_terminal_controls(&path.display().to_string())
     );
-    println!("  manifest: {}", build.manifest_hash);
-    println!("  entry: {}", build.entry_hash);
-    println!("  host API: {}", build.host_api_hash);
+    println!(
+        "  manifest: {}",
+        escape_terminal_controls(&build.manifest_hash)
+    );
+    println!("  entry: {}", escape_terminal_controls(&build.entry_hash));
+    println!(
+        "  host API: {}",
+        escape_terminal_controls(&build.host_api_hash)
+    );
     println!(
         "  {} public commands passed metadata quality gates",
         build.public_commands.len()
@@ -355,16 +370,20 @@ fn print_build(path: &Path, build: &PackageBuild) {
 fn print_publish_plan(plan: &PackagePublishPlan) {
     println!(
         "✓ dry-run publish plan for {} {}",
-        plan.package_name, plan.package_version
+        escape_terminal_controls(&plan.package_name),
+        escape_terminal_controls(&plan.package_version)
     );
-    println!("  build: {}", plan.build_hash);
-    println!("  files: {}", plan.files.join(", "));
+    println!("  build: {}", escape_terminal_controls(&plan.build_hash));
+    println!(
+        "  files: {}",
+        escape_terminal_controls(&plan.files.join(", "))
+    );
     println!(
         "  capabilities: {}",
         if plan.requested_capabilities.is_empty() {
             "none".to_owned()
         } else {
-            plan.requested_capabilities.join(", ")
+            escape_terminal_controls(&plan.requested_capabilities.join(", "))
         }
     );
     println!("  network performed: no");
@@ -380,14 +399,12 @@ fn format_error(error: ShellError, format: PackageOutputFormat) -> Result<i32, S
 }
 
 fn print_json(value: &impl Serialize) -> Result<(), ShellError> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).map_err(|error| {
-            ShellError::new(ErrorCode::Io, "could not serialize package output")
-                .with_context(error.to_string())
-                .with_help("Report this as a Quirl package schema defect")
-        })?
-    );
+    let json = serde_json::to_string_pretty(value).map_err(|error| {
+        ShellError::new(ErrorCode::Io, "could not serialize package output")
+            .with_context(error.to_string())
+            .with_help("Report this as a Quirl package schema defect")
+    })?;
+    println!("{}", escape_json_terminal_controls(&json));
     Ok(())
 }
 

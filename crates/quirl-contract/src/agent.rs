@@ -20,14 +20,14 @@ const IO_SCHEMA: &str = "IoContract{deny_unknown;input:string;output:string;stre
 const COMMAND_SCHEMA: &str = "AgentCommand{deny_unknown;id:string;version:null|string;path:string;aliases:array<string>;parent:null|string;signature:string;summary:string;details:string;options:array<AgentOption>;examples:array<string>;io:IoContract;effects:array<enum[read_filesystem,write_filesystem,spawn_process,change_directory]>;exit_codes:map<i32,string>;provenance:AgentProvenance}";
 const HOST_SCHEMA: &str = "HostCapability{deny_unknown;path:string;summary:string;parameters:array<HostParameter{deny_unknown;name:string;value_type:string}>;returns:string;capability:null|string}";
 const CAPABILITY_SCHEMA: &str = "InstalledCapability{deny_unknown;name:string;version:u32;schema_hash:string;providers:array<string>}";
-const CATALOG_SCHEMA: &str = "AgentCatalog{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;quirl_version:string;catalog_schema_version:u32;catalog_hash:string;host_api_schema_version:u32;host_api_hash:string;commands:array<AgentCommand>;host_api:array<HostCapability>;capabilities:array<InstalledCapability>}";
-const CONTEXT_SCHEMA: &str = "AgentContext{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;query:string;token_budget:usize;estimated_tokens:usize;token_estimator:string;truncated:bool;catalog_hash:string;host_api_hash:string;commands:array<AgentCommand>;host_api:array<HostCapability>}";
+pub const AGENT_CATALOG_SCHEMA_DESCRIPTOR: &str = "AgentCatalog{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;quirl_version:string;catalog_schema_version:u32;catalog_hash:string;host_api_schema_version:u32;host_api_hash:string;commands:array<AgentCommand>;host_api:array<HostCapability>;capabilities:array<InstalledCapability>}";
+pub const AGENT_CONTEXT_SCHEMA_DESCRIPTOR: &str = "AgentContext{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;query:string;token_budget:usize;estimated_tokens:usize;token_estimator:string;truncated:bool;catalog_hash:string;host_api_hash:string;commands:array<AgentCommand>;host_api:array<HostCapability>}";
 const MANIFEST_COMPONENT_SCHEMA: &str = "AgentManifestComponents{SchemaDescriptor{deny_unknown;name:string;version:u32;schema_hash:string;content_hash:string};AgentTool{deny_unknown;name:string;version:string;summary:string;effects:array<Effect>};AgentValidator{deny_unknown;name:string;command:string;schema_version:u32;schema_hash:string}}";
-const MANIFEST_SCHEMA: &str = "AgentManifest{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;content_hash:string;quirl_version:string;schemas:array<SchemaDescriptor>;capabilities:array<InstalledCapability>;tools:array<AgentTool>;validators:array<AgentValidator>}";
+pub const AGENT_MANIFEST_SCHEMA_DESCRIPTOR: &str = "AgentManifest{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;content_hash:string;quirl_version:string;schemas:array<SchemaDescriptor>;capabilities:array<InstalledCapability>;tools:array<AgentTool>;validators:array<AgentValidator>}";
 
-fn catalog_schema_hash() -> String {
+pub fn agent_catalog_schema_hash() -> String {
     structural_schema_hash(&[
-        CATALOG_SCHEMA,
+        AGENT_CATALOG_SCHEMA_DESCRIPTOR,
         COMMAND_SCHEMA,
         OPTION_SCHEMA,
         COMPLETION_SCHEMA,
@@ -38,9 +38,9 @@ fn catalog_schema_hash() -> String {
     ])
 }
 
-fn context_schema_hash() -> String {
+pub fn agent_context_schema_hash() -> String {
     structural_schema_hash(&[
-        CONTEXT_SCHEMA,
+        AGENT_CONTEXT_SCHEMA_DESCRIPTOR,
         COMMAND_SCHEMA,
         OPTION_SCHEMA,
         COMPLETION_SCHEMA,
@@ -50,9 +50,9 @@ fn context_schema_hash() -> String {
     ])
 }
 
-fn manifest_schema_hash() -> String {
+pub fn agent_manifest_schema_hash() -> String {
     structural_schema_hash(&[
-        MANIFEST_SCHEMA,
+        AGENT_MANIFEST_SCHEMA_DESCRIPTOR,
         MANIFEST_COMPONENT_SCHEMA,
         CAPABILITY_SCHEMA,
     ])
@@ -287,7 +287,7 @@ pub fn build_agent_catalog(
     Ok(AgentCatalog {
         document_type: "quirl.agent.catalog".to_owned(),
         schema_version: AGENT_SCHEMA_VERSION,
-        schema_hash: catalog_schema_hash(),
+        schema_hash: agent_catalog_schema_hash(),
         quirl_version: quirl_version.to_owned(),
         catalog_schema_version: catalog.schema_version,
         catalog_hash,
@@ -316,19 +316,19 @@ pub fn build_agent_manifest(catalog: &AgentCatalog) -> Result<AgentManifest, She
         SchemaDescriptor {
             name: "quirl.agent.catalog".to_owned(),
             version: AGENT_SCHEMA_VERSION,
-            schema_hash: catalog_schema_hash(),
+            schema_hash: agent_catalog_schema_hash(),
             content_hash: catalog.catalog_hash.clone(),
         },
         SchemaDescriptor {
             name: "quirl.agent.context".to_owned(),
             version: AGENT_SCHEMA_VERSION,
-            schema_hash: context_schema_hash(),
+            schema_hash: agent_context_schema_hash(),
             content_hash: catalog.catalog_hash.clone(),
         },
         SchemaDescriptor {
             name: "quirl.agent.manifest".to_owned(),
             version: AGENT_SCHEMA_VERSION,
-            schema_hash: manifest_schema_hash(),
+            schema_hash: agent_manifest_schema_hash(),
             content_hash: catalog.host_api_hash.clone(),
         },
         SchemaDescriptor {
@@ -344,7 +344,7 @@ pub fn build_agent_manifest(catalog: &AgentCatalog) -> Result<AgentManifest, She
             command: "quirl agent validate <file> --kind <catalog|context|manifest> --format json"
                 .to_owned(),
             schema_version: AGENT_SCHEMA_VERSION,
-            schema_hash: manifest_schema_hash(),
+            schema_hash: agent_manifest_schema_hash(),
         },
         AgentValidator {
             name: "lua".to_owned(),
@@ -372,7 +372,7 @@ pub fn build_agent_manifest(catalog: &AgentCatalog) -> Result<AgentManifest, She
     Ok(AgentManifest {
         document_type: "quirl.agent.manifest".to_owned(),
         schema_version: AGENT_SCHEMA_VERSION,
-        schema_hash: manifest_schema_hash(),
+        schema_hash: agent_manifest_schema_hash(),
         content_hash,
         quirl_version: catalog.quirl_version.clone(),
         schemas,
@@ -436,7 +436,7 @@ pub fn build_agent_context(
     let mut context = AgentContext {
         document_type: "quirl.agent.context".to_owned(),
         schema_version: AGENT_SCHEMA_VERSION,
-        schema_hash: context_schema_hash(),
+        schema_hash: agent_context_schema_hash(),
         query: query.to_owned(),
         token_budget,
         estimated_tokens: 0,
@@ -790,7 +790,7 @@ fn validate_catalog(catalog: &AgentCatalog, diagnostics: &mut Vec<ValidationDiag
         "quirl.agent.catalog",
         catalog.schema_version,
         &catalog.schema_hash,
-        &catalog_schema_hash(),
+        &agent_catalog_schema_hash(),
         diagnostics,
     );
     validate_unique_sorted(
@@ -841,7 +841,7 @@ fn validate_context(
         "quirl.agent.context",
         context.schema_version,
         &context.schema_hash,
-        &context_schema_hash(),
+        &agent_context_schema_hash(),
         diagnostics,
     );
     if context.query.trim().is_empty() {
@@ -894,7 +894,7 @@ fn validate_manifest(
         "quirl.agent.manifest",
         manifest.schema_version,
         &manifest.schema_hash,
-        &manifest_schema_hash(),
+        &agent_manifest_schema_hash(),
         diagnostics,
     );
     if let Ok(expected) = hash_json(
@@ -925,9 +925,9 @@ fn validate_manifest(
         diagnostics,
     );
     let expected_schemas = BTreeMap::from([
-        ("quirl.agent.catalog", catalog_schema_hash()),
-        ("quirl.agent.context", context_schema_hash()),
-        ("quirl.agent.manifest", manifest_schema_hash()),
+        ("quirl.agent.catalog", agent_catalog_schema_hash()),
+        ("quirl.agent.context", agent_context_schema_hash()),
+        ("quirl.agent.manifest", agent_manifest_schema_hash()),
         ("quirl.package.manifest", package_manifest_schema_hash()),
     ]);
     if manifest.schemas.len() != expected_schemas.len() {

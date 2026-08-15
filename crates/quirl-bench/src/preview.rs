@@ -2,7 +2,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use quirl_catalog::Catalog;
 use quirl_lua::QuirlConfig;
 use quirl_syntax::Mode;
-use quirl_ui::{CatalogCompleter, QuirlPrompt};
+use quirl_ui::{CatalogCompleter, LiveBuffer, LiveSample, QuirlPrompt};
 use reedline::{Completer, Prompt, PromptEditMode};
 use serde::Serialize;
 use std::{
@@ -22,8 +22,11 @@ const DEFAULT_COLD_SAMPLES: usize = 31;
 const DEFAULT_EDIT_SAMPLES: usize = 2_000;
 const DEFAULT_PROMPT_SAMPLES: usize = 500;
 const DEFAULT_PTY_SAMPLES: usize = 31;
+const DEFAULT_RELEASE_PTY_SAMPLES: usize = 101;
 const DEFAULT_PTY_TIMEOUT_MS: usize = 2_000;
+const DEFAULT_STREAM_SAMPLES: usize = 100_000;
 const MINIMUM_ACCEPTED_PTY_SAMPLES: usize = 20;
+const DEFAULT_BINARY_BUDGET_BYTES: u64 = 5 * 1024 * 1024;
 const COLD_START_TARGET_MS: f64 = 25.0;
 const EDIT_FRAME_TARGET_MS: f64 = 8.0;
 const FIRST_PROMPT_TARGET_MS: f64 = 16.0;
@@ -36,6 +39,11 @@ struct PreviewReport {
     environment: Environment,
     methodology: Methodology,
     measurements: Vec<Measurement>,
+    stream_window: StreamWindowMeasurement,
+    binary_size: BinarySizeMeasurement,
+    evidence_gate_passed: bool,
+    performance_gate_passed: bool,
+    gate_failures: Vec<String>,
     release_gate_status: String,
 }
 
@@ -62,7 +70,38 @@ struct Methodology {
     cold_start: &'static str,
     headless_edit_frame: &'static str,
     first_prompt: &'static str,
+    stream_window: &'static str,
+    binary_size: &'static str,
     limitations: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamWindowMeasurement {
+    id: &'static str,
+    input_samples_per_capacity: usize,
+    capacities: Vec<StreamCapacityEvidence>,
+    invariant_valid: bool,
+    release_gate_accepted: bool,
+    explanation: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamCapacityEvidence {
+    capacity: usize,
+    retained_samples: usize,
+    dropped_samples: u64,
+    serialized_snapshot_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct BinarySizeMeasurement {
+    id: &'static str,
+    bytes: Option<u64>,
+    limit_bytes: u64,
+    target_result: &'static str,
+    measurement_valid: bool,
+    release_gate_accepted: bool,
+    explanation: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,13 +191,21 @@ enum HighlightClass {
     Value,
 }
 
-pub fn run() -> Result<(), Box<dyn Error>> {
+pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
+    if enforce && cfg!(debug_assertions) {
+        return Err(
+            "the release gate must be run from a release-built quirl-bench; use `cargo build --release -p quirl-cli -p quirl-bench` followed by `target/release/quirl-bench release --quirl target/release/quirl`"
+                .into(),
+        );
+    }
     let quirl = quirl_binary()?;
-    let pty_samples = sample_argument("--pty-samples", DEFAULT_PTY_SAMPLES)?;
+    let pty_samples = sample_argument("--pty-samples", default_pty_samples(enforce))?;
     let pty_timeout_ms = sample_argument("--pty-timeout-ms", DEFAULT_PTY_TIMEOUT_MS)?;
     let cold_samples = sample_argument("--cold-samples", DEFAULT_COLD_SAMPLES)?;
     let edit_samples = sample_argument("--edit-samples", DEFAULT_EDIT_SAMPLES)?;
     let prompt_samples = sample_argument("--prompt-samples", DEFAULT_PROMPT_SAMPLES)?;
+    let stream_samples = sample_argument("--stream-samples", DEFAULT_STREAM_SAMPLES)?;
+    let binary_budget = byte_argument("--max-binary-bytes", DEFAULT_BINARY_BUDGET_BYTES)?;
 
     let pty = measure_pty(
         &quirl,
@@ -168,6 +215,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let cold = measure_cli_startup(&quirl, cold_samples)?;
     let edit = measure_headless_edit_frame(edit_samples)?;
     let prompt = measure_first_prompt(prompt_samples)?;
+    let stream_window = measure_stream_window(stream_samples)?;
+    let binary_size = measure_binary_size(&quirl, binary_budget);
     let pty_valid = pty.requested_samples >= MINIMUM_ACCEPTED_PTY_SAMPLES
         && pty.successful_samples == pty.requested_samples
         && pty.prompt_paint.is_some()
@@ -178,11 +227,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pty_measurement(
             PtyMeasurementSpec {
                 id: "pty_cold_to_editable",
-                label: "process start to first prompt accepting and painting unique input",
+                label: "process start to first prompt accepting and painting one input character",
                 specification_target: "cold start to editable prompt P50 <=25 ms",
                 measured_percentile: "P50",
                 limit_ms: COLD_START_TARGET_MS,
-                explanation: "A PTY terminal model observed the prompt and a unique injected marker in the editable buffer.",
+                explanation: "A PTY terminal model observed the prompt and a single input character rendered in the editable buffer.",
             },
             &pty,
             pty.cold_to_editable.as_ref(),
@@ -276,17 +325,44 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         },
     ];
 
+    let timing_failures = timing_gate_failures(&measurements);
+    let evidence_gate_passed =
+        pty_valid && stream_window.release_gate_accepted && binary_size.release_gate_accepted;
+    let mut gate_failures = timing_failures;
+    if !stream_window.release_gate_accepted {
+        gate_failures
+            .push("stream retention did not remain bounded by the configured window".to_owned());
+    }
+    if binary_size.target_result == "measured_miss" {
+        gate_failures.push(format!(
+            "release binary exceeds the {}-byte budget",
+            binary_size.limit_bytes
+        ));
+    } else if !binary_size.measurement_valid {
+        gate_failures.push("release binary size could not be measured".to_owned());
+    }
+    let performance_gate_passed = evidence_gate_passed && gate_failures.is_empty();
+    let release_gate_status = if performance_gate_passed {
+        "passed_all_release_budgets"
+    } else if evidence_gate_passed {
+        "failed_one_or_more_release_budgets"
+    } else {
+        "not_accepted_measurements_incomplete"
+    };
+
     let report = PreviewReport {
-        schema_version: 1,
-        suite: "quirl_preview_v0.1_performance",
+        schema_version: 2,
+        suite: "quirl_1.0_release_performance",
         measured_at_utc: measured_at_utc(),
         environment: discover_environment(&quirl),
         methodology: Methodology {
             percentile_method: "nearest-rank over independently timed wall-clock samples",
-            pty_end_to_end: "Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with a unique marker, then records a final representative keystroke until the expected edited buffer is present in the terminal frame.",
+            pty_end_to_end: "Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with one input character, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
             cold_start: "Starts a new Quirl process for every sample and waits for `quirl --version` to exit. This measures process creation, dynamic loading, and CLI argument parsing, not cold-to-editable startup. OS filesystem caches are not flushed.",
             headless_edit_frame: "Calls Quirl's real CatalogCompleter and Prompt render methods, plus a benchmark-owned equivalent of the current semantic token classification, for `git commit --am`. No Reedline layout or terminal I/O occurs.",
             first_prompt: "Constructs a fresh configured QuirlPrompt and renders left, right, and indicator strings for every sample. Filesystem metadata may be served from OS cache. No terminal I/O occurs.",
+            stream_window: "Pushes a fixed-size typed sample sequence through Quirl's production LiveBuffer at capacities 1, 16, and 256, then verifies retained and dropped counts and records serialized snapshot bytes. This proves retention is bounded by window size for bounded records; it is not a producer-backpressure or allocator-RSS measurement.",
+            binary_size: "Reads the exact release executable passed with `--quirl` and compares its filesystem length with the explicit `--max-binary-bytes` budget (default 5 MiB).",
             limitations: vec![
                 "A completed frame means the expected screen state was reconstructed from the PTY byte stream; physical terminal-emulator scheduling, GPU composition, and monitor scanout are not measured.",
                 "The UI highlighter is private; the edit proxy reproduces its command/option/quote classification but not StyledText allocation or rendering.",
@@ -295,17 +371,25 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             ],
         },
         measurements,
-        release_gate_status: if pty_valid {
-            "accepted_end_to_end_measurements_valid_targets_recorded".to_owned()
-        } else {
-            "not_accepted_pty_measurements_incomplete".to_owned()
-        },
+        stream_window,
+        binary_size,
+        evidence_gate_passed,
+        performance_gate_passed,
+        gate_failures,
+        release_gate_status: release_gate_status.to_owned(),
     };
 
     if env::args().any(|argument| argument == "--json") {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_text(&report);
+    }
+    if enforce && !report.performance_gate_passed {
+        return Err(format!(
+            "release performance gate failed: {}",
+            report.gate_failures.join("; ")
+        )
+        .into());
     }
     Ok(())
 }
@@ -330,7 +414,7 @@ fn measure_pty(path: &Path, samples: usize, timeout: Duration) -> PtyStatistics 
     let mut failures = Vec::new();
 
     for sample in 0..samples {
-        match measure_pty_sample(path, &fixture, timeout, sample) {
+        match measure_pty_sample(path, &fixture, timeout) {
             Ok(measurement) => {
                 prompt_paint.push(measurement.prompt_paint);
                 cold_to_editable.push(measurement.cold_to_editable);
@@ -355,7 +439,6 @@ fn measure_pty_sample(
     path: &Path,
     fixture: &PtyFixture,
     timeout: Duration,
-    sample: usize,
 ) -> Result<PtySample, Box<dyn Error>> {
     let started = Instant::now();
     let mut session = PtySession::spawn(path, fixture)?;
@@ -363,9 +446,12 @@ fn measure_pty_sample(
         session.wait_for_screen("❯", timeout, "first command prompt")?;
         let prompt_paint = started.elapsed();
 
-        let marker = format!("qrlready{sample:04}");
+        // A single character establishes that the newly painted editor accepts
+        // input without turning the readiness probe into a multi-key paste
+        // benchmark (which Reedline intentionally batches).
+        let marker = "~";
         session.send(marker.as_bytes())?;
-        session.wait_for_screen(&marker, timeout, "editable prompt marker")?;
+        session.wait_for_screen(marker, timeout, "editable prompt marker")?;
         let cold_to_editable = started.elapsed();
 
         session.send(b"\x15")?;
@@ -685,6 +771,70 @@ fn construct_and_render_prompt(config: &QuirlConfig) {
     black_box((&prompt, left, right, indicator));
 }
 
+fn measure_stream_window(samples: usize) -> Result<StreamWindowMeasurement, Box<dyn Error>> {
+    let mut capacities = Vec::new();
+    let mut invariant_valid = true;
+    for capacity in [1, 16, 256] {
+        let mut buffer = LiveBuffer::new(capacity)?;
+        for sequence in 0..samples {
+            let sequence = u64::try_from(sequence)?;
+            let accepted = buffer.push(LiveSample {
+                sequence,
+                value: serde_json::json!({ "bounded_fixture": sequence % 10 }),
+            });
+            invariant_valid &= accepted;
+        }
+        let snapshot = buffer.snapshot();
+        let expected_retained = samples.min(capacity);
+        let expected_dropped = u64::try_from(samples.saturating_sub(capacity))?;
+        invariant_valid &= snapshot.capacity == capacity
+            && snapshot.samples.len() == expected_retained
+            && snapshot.dropped == expected_dropped;
+        capacities.push(StreamCapacityEvidence {
+            capacity,
+            retained_samples: snapshot.samples.len(),
+            dropped_samples: snapshot.dropped,
+            serialized_snapshot_bytes: serde_json::to_vec(&snapshot)?.len(),
+        });
+    }
+    Ok(StreamWindowMeasurement {
+        id: "live_stream_window_retention",
+        input_samples_per_capacity: samples,
+        capacities,
+        invariant_valid,
+        release_gate_accepted: invariant_valid,
+        explanation: "Production LiveBuffer retention equals min(input, capacity) and dropped counts equal input minus capacity at every supported boundary tested.",
+    })
+}
+
+fn measure_binary_size(path: &Path, limit_bytes: u64) -> BinarySizeMeasurement {
+    let bytes = fs::metadata(path).ok().map(|metadata| metadata.len());
+    let measurement_valid = bytes.is_some();
+    let target_result = match bytes {
+        Some(bytes) if bytes <= limit_bytes => "measured_within_target",
+        Some(_) => "measured_miss",
+        None => "invalid_or_incomplete_measurement",
+    };
+    BinarySizeMeasurement {
+        id: "release_binary_size",
+        bytes,
+        limit_bytes,
+        target_result,
+        measurement_valid,
+        release_gate_accepted: measurement_valid,
+        explanation: "The project Phase 4 default budget is 5 MiB; override it explicitly to compare another frozen release budget.",
+    }
+}
+
+fn timing_gate_failures(measurements: &[Measurement]) -> Vec<String> {
+    measurements
+        .iter()
+        .filter(|measurement| measurement.includes_terminal_io)
+        .filter(|measurement| measurement.target.target_result != "measured_within_target")
+        .map(|measurement| format!("{}: {}", measurement.id, measurement.target.target_result))
+        .collect()
+}
+
 fn semantic_highlight_proxy<'line>(
     catalog: &Catalog,
     line: &'line str,
@@ -861,6 +1011,27 @@ fn sample_argument(name: &str, default: usize) -> Result<usize, Box<dyn Error>> 
     Ok(samples)
 }
 
+fn default_pty_samples(enforce: bool) -> usize {
+    if enforce {
+        DEFAULT_RELEASE_PTY_SAMPLES
+    } else {
+        DEFAULT_PTY_SAMPLES
+    }
+}
+
+fn byte_argument(name: &str, default: u64) -> Result<u64, Box<dyn Error>> {
+    let Some(value) = argument_value(name) else {
+        return Ok(default);
+    };
+    let bytes = value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid {name} value `{value}`: {error}"))?;
+    if bytes == 0 {
+        return Err(format!("{name} must be greater than zero").into());
+    }
+    Ok(bytes)
+}
+
 fn quirl_binary() -> Result<PathBuf, Box<dyn Error>> {
     let path = argument_value("--quirl").map_or_else(
         || {
@@ -1001,7 +1172,7 @@ fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
 }
 
 fn print_text(report: &PreviewReport) {
-    println!("Quirl Preview v0.1 performance probes\n");
+    println!("Quirl 1.0 release performance gate\n");
     println!(
         "{} · {} · {} · {}",
         report.environment.operating_system,
@@ -1026,6 +1197,28 @@ fn print_text(report: &PreviewReport) {
             "  target: {} ({})",
             measurement.target.specification_target, measurement.target.target_result
         );
+    }
+    println!(
+        "{:<42} {:>10} {:>10}",
+        report.stream_window.id,
+        if report.stream_window.invariant_valid {
+            "bounded"
+        } else {
+            "invalid"
+        },
+        format!("{} input", report.stream_window.input_samples_per_capacity)
+    );
+    println!(
+        "{:<42} {:>10} {:>10}",
+        report.binary_size.id,
+        report
+            .binary_size
+            .bytes
+            .map_or_else(|| "n/a".to_owned(), |bytes| bytes.to_string()),
+        report.binary_size.target_result
+    );
+    for failure in &report.gate_failures {
+        println!("  failure: {failure}");
     }
     println!("\nRelease gate: {}.", report.release_gate_status);
 }
@@ -1084,5 +1277,59 @@ mod tests {
         assert_eq!(assessment.target_result, "measured_miss");
         assert!(assessment.release_gate_accepted);
         assert!(assessment.measurement_valid);
+    }
+
+    #[test]
+    fn production_live_buffer_retention_is_bounded_at_every_supported_scale() {
+        let evidence = measure_stream_window(257).unwrap();
+        assert!(evidence.invariant_valid);
+        assert!(evidence.release_gate_accepted);
+        assert_eq!(evidence.capacities[0].retained_samples, 1);
+        assert_eq!(evidence.capacities[1].retained_samples, 16);
+        assert_eq!(evidence.capacities[2].retained_samples, 256);
+        assert_eq!(evidence.capacities[2].dropped_samples, 1);
+        assert!(
+            evidence.capacities[0].serialized_snapshot_bytes
+                < evidence.capacities[1].serialized_snapshot_bytes
+        );
+        assert!(
+            evidence.capacities[1].serialized_snapshot_bytes
+                < evidence.capacities[2].serialized_snapshot_bytes
+        );
+    }
+
+    #[test]
+    fn missing_release_binary_never_accepts_size_evidence() {
+        let evidence = measure_binary_size(
+            Path::new("/definitely/missing/quirl-release-binary"),
+            DEFAULT_BINARY_BUDGET_BYTES,
+        );
+        assert_eq!(evidence.target_result, "invalid_or_incomplete_measurement");
+        assert!(!evidence.measurement_valid);
+        assert!(!evidence.release_gate_accepted);
+    }
+
+    #[test]
+    fn binary_size_budget_records_both_a_pass_and_a_miss() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let bytes = std::fs::metadata(&fixture).unwrap().len();
+
+        let accepted = measure_binary_size(&fixture, bytes);
+        assert_eq!(accepted.target_result, "measured_within_target");
+        assert!(accepted.release_gate_accepted);
+
+        let rejected = measure_binary_size(&fixture, bytes.saturating_sub(1));
+        assert_eq!(rejected.target_result, "measured_miss");
+        assert!(rejected.release_gate_accepted);
+    }
+
+    #[test]
+    fn enforcing_release_uses_more_independent_pty_samples_than_preview() {
+        let preview_samples = default_pty_samples(false);
+        let release_samples = default_pty_samples(true);
+
+        assert_eq!(preview_samples, DEFAULT_PTY_SAMPLES);
+        assert_eq!(release_samples, DEFAULT_RELEASE_PTY_SAMPLES);
+        assert!(release_samples > preview_samples);
     }
 }

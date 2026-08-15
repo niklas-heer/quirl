@@ -45,5 +45,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 strip = "symbols"
+panic = "abort"
+codegen-units = 1

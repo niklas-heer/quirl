@@ -1,8 +1,8 @@
 use crate::extensions::LuaExtensionHost;
 use clap::{Args, Subcommand, ValueEnum};
 use quirl_core::{
-    directory_entries, ContributionKind, ErrorCode, EventKind, ExtensionCapability, ExtensionEvent,
-    ShellError, EXTENSION_PROTOCOL_VERSION,
+    directory_entries, escape_json_terminal_controls, ContributionKind, ErrorCode, EventKind,
+    ExtensionCapability, ExtensionEvent, ShellError, EXTENSION_PROTOCOL_VERSION,
 };
 use quirl_data::DataRuntime;
 use quirl_ui::{directory_panel, process_panel, LiveBuffer, LiveSample, ProcessPanelRow};
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -22,6 +22,7 @@ use std::{
 
 const MAX_PROCESS_ROWS: usize = 512;
 const MAX_PROCESS_OUTPUT_BYTES: u64 = 256 * 1024;
+const MAX_EVENT_TRACE_BYTES: u64 = 4 * 1024 * 1024;
 const CANCELLATION_POLL_MS: u64 = 25;
 
 #[derive(Debug, Subcommand)]
@@ -215,10 +216,8 @@ pub fn execute_watch(command: WatchCommand) -> Result<i32, ShellError> {
                 break;
             }
             if matches!(command.format, PlatformOutputFormat::Text) {
-                println!(
-                    "[{sequence}] {}",
-                    serde_json::to_string(&value).map_err(json_error)?
-                );
+                let json = serde_json::to_string(&value).map_err(json_error)?;
+                println!("[{sequence}] {}", escape_json_terminal_controls(&json));
             }
             if !buffer.push(LiveSample { sequence, value }) {
                 break;
@@ -273,14 +272,50 @@ struct TraceValidation {
     events: usize,
 }
 
-fn read_trace(path: &PathBuf) -> Result<EventTrace, ShellError> {
-    let source = fs::read_to_string(path).map_err(|error| {
+fn read_trace(path: &Path) -> Result<EventTrace, ShellError> {
+    let file = fs::File::open(path).map_err(|error| {
         ShellError::new(
             ErrorCode::Io,
             format!("could not read extension trace {}", path.display()),
         )
         .with_context(error.to_string())
         .with_help("Pass a readable versioned JSON event trace")
+    })?;
+    let size = file
+        .metadata()
+        .map_err(|error| {
+            ShellError::new(
+                ErrorCode::Io,
+                format!("could not inspect extension trace {}", path.display()),
+            )
+            .with_context(error.to_string())
+            .with_help("Pass a readable versioned JSON event trace")
+        })?
+        .len();
+    if size > MAX_EVENT_TRACE_BYTES {
+        return Err(event_trace_limit_error(path, size));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(MAX_EVENT_TRACE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ShellError::new(
+                ErrorCode::Io,
+                format!("could not read extension trace {}", path.display()),
+            )
+            .with_context(error.to_string())
+            .with_help("Pass a readable versioned JSON event trace")
+        })?;
+    if bytes.len() as u64 > MAX_EVENT_TRACE_BYTES {
+        return Err(event_trace_limit_error(path, bytes.len() as u64));
+    }
+    let source = String::from_utf8(bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            format!("{} is not a UTF-8 extension trace", path.display()),
+        )
+        .with_context(error.to_string())
+        .with_help("Encode the versioned JSON event trace as UTF-8")
     })?;
     serde_json::from_str(&source).map_err(|error| {
         ShellError::new(
@@ -290,6 +325,15 @@ fn read_trace(path: &PathBuf) -> Result<EventTrace, ShellError> {
         .with_context(error.to_string())
         .with_help("Generate the schema with `quirl events schema --format json`")
     })
+}
+
+fn event_trace_limit_error(path: &Path, size: u64) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("extension trace {} exceeds its read limit", path.display()),
+    )
+    .with_context(format!("bytes: {size}; limit: {MAX_EVENT_TRACE_BYTES}"))
+    .with_help("Keep event traces below 4 MiB or split them into independently validated traces")
 }
 
 fn validate_trace(trace: &EventTrace) -> Result<(), ShellError> {
@@ -447,10 +491,8 @@ fn names<T: Serialize>(values: &[T]) -> Result<String, ShellError> {
 }
 
 fn print_json(value: &impl Serialize) -> Result<(), ShellError> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).map_err(json_error)?
-    );
+    let json = serde_json::to_string_pretty(value).map_err(json_error)?;
+    println!("{}", escape_json_terminal_controls(&json));
     Ok(())
 }
 
@@ -468,6 +510,7 @@ fn platform_error(message: impl Into<String>) -> ShellError {
 mod tests {
     use super::*;
     use quirl_core::ExtensionEventData;
+    use std::env;
 
     #[test]
     fn event_trace_rejects_reordered_records() {
@@ -506,5 +549,18 @@ mod tests {
 
         let cancelled = AtomicBool::new(true);
         assert!(wait_interruptibly(60_000, &cancelled));
+    }
+
+    #[test]
+    fn oversized_event_trace_is_rejected_before_json_allocation() {
+        let path = env::temp_dir().join(format!(
+            "quirl-event-trace-limit-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::write(&path, vec![b' '; MAX_EVENT_TRACE_BYTES as usize + 1]).unwrap();
+        let error = read_trace(&path).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        fs::remove_file(path).unwrap();
     }
 }

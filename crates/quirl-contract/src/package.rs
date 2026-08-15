@@ -12,12 +12,12 @@ const PACKAGE_CAPABILITY_SCHEMA: &str =
 const PACKAGE_CONTRIBUTION_SCHEMA: &str = "PackageContributions{deny_unknown;commands:array<string>(default-empty);panels:array<string>(default-empty);indexers:array<string>(default-empty)}";
 const PACKAGE_ARGUMENT_SCHEMA: &str = "PackageArgument{deny_unknown;names:array<string>;kind:enum[positional,option,flag];value_type:string;required:bool;repeatable:bool(default-false);documentation:string}";
 const PACKAGE_COMMAND_SCHEMA: &str = "PackageCommand{deny_unknown;path:string;signature:string;summary:string;details:string;input_type:string;output_type:string;arguments:array<PackageArgument>(default-empty);examples:array<string>;effects:array<enum[read_filesystem,write_filesystem,spawn_process,change_directory]>;error_codes:map<string,string>}";
-const PACKAGE_SCHEMA: &str = "PackageManifest{deny_unknown;schema_version:u32;package:PackageMetadata;capabilities:PackageCapabilitySection(default);contributes:PackageContributions(default);public_commands:array<PackageCommand>(default-empty)}";
-const PACKAGE_BUILD_SCHEMA: &str = "PackageBuild{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;manifest_schema_hash:string;package_name:string;package_version:string;resolved_quirl_version:string;manifest_hash:string;entry_hash:string;host_api_hash:string;capabilities:array<string>;public_commands:array<PackageCommand>;files:array<string>}";
+pub const PACKAGE_SCHEMA_DESCRIPTOR: &str = "PackageManifest{deny_unknown;schema_version:u32;package:PackageMetadata;capabilities:PackageCapabilitySection(default);contributes:PackageContributions(default);public_commands:array<PackageCommand>(default-empty)}";
+pub const PACKAGE_BUILD_SCHEMA_DESCRIPTOR: &str = "PackageBuild{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;manifest_schema_hash:string;package_name:string;package_version:string;resolved_quirl_version:string;manifest_hash:string;entry_hash:string;host_api_hash:string;capabilities:array<string>;public_commands:array<PackageCommand>;files:array<string>}";
 
-pub(crate) fn package_manifest_schema_hash() -> String {
+pub fn package_manifest_schema_hash() -> String {
     package_structural_hash(&[
-        PACKAGE_SCHEMA,
+        PACKAGE_SCHEMA_DESCRIPTOR,
         PACKAGE_METADATA_SCHEMA,
         PACKAGE_CAPABILITY_SCHEMA,
         PACKAGE_CONTRIBUTION_SCHEMA,
@@ -26,9 +26,9 @@ pub(crate) fn package_manifest_schema_hash() -> String {
     ])
 }
 
-fn package_build_schema_hash() -> String {
+pub fn package_build_schema_hash() -> String {
     package_structural_hash(&[
-        PACKAGE_BUILD_SCHEMA,
+        PACKAGE_BUILD_SCHEMA_DESCRIPTOR,
         PACKAGE_COMMAND_SCHEMA,
         PACKAGE_ARGUMENT_SCHEMA,
     ])

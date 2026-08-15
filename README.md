@@ -10,7 +10,7 @@
 
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
   [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](rust-toolchain.toml)
-  [![Status](https://img.shields.io/badge/status-0.1_preview-blue.svg)](#status)
+  [![Status](https://img.shields.io/badge/status-0.1_review_candidate-blue.svg)](#status)
 </div>
 
 ---
@@ -42,10 +42,11 @@ batter. The result is a single fast binary where your shell finally feels
 as smart as your editor.
 
 > [!IMPORTANT]
-> Quirl 0.1 is a **Platform Preview**. Its acceptance seams are runnable and
-> tested, but APIs may still break before 1.0. The Windows process backend is
-> cross-compiled and contract-tested; native terminal handoff and suspend remain
-> incomplete until they can be exercised on a Windows host.
+> Quirl 0.1 is a **review candidate**. Phase 4's protocol, migration,
+> compatibility, performance, security, and accessibility evidence is checked in
+> and executable, but the explicitly deferred contracts are not a 1.0 promise.
+> The Windows process backend is cross-compiled and contract-tested; native
+> terminal handoff and suspend remain incomplete until exercised on Windows.
 > See [Status](#status) for the exact implemented surface.
 
 ## Features
@@ -115,12 +116,14 @@ shell; Quirl is still an early Preview.
 
 ## Status
 
-Quirl 0.1 is a runnable Platform milestone: the Preview shell, scriptable
+Quirl 0.1 is a runnable Phase 4 review candidate: the Preview shell, scriptable
 authoring stack, permission-locked trusted-Lua extensions, typed extension
 protocols, reference-shell runners, panels, bounded watch history, recovery,
-and portable process backend work end to end. Isolated Wasm/out-of-process
-adapters are validated but deliberately cannot be enabled yet, and the platform
-is not the frozen, audited 1.0 daily-driver contract.
+and portable process backend work end to end. Public contract identities and
+migrations are reviewed in one golden manifest; compatibility, release
+performance, security, and accessibility evidence runs under the local gate.
+Isolated Wasm/out-of-process adapters are validated but deliberately cannot be
+enabled yet, so this checkpoint is not tagged as the 1.0 daily-driver contract.
 The architecture and decisions behind it are documented in depth:
 
 - [Language & product design](docs/language-design.md) — the intended
@@ -144,6 +147,13 @@ The architecture and decisions behind it are documented in depth:
 - [Extension events, typed views, and live pipelines](docs/extension-events-and-live-views.md) —
   immutable records, declared actions, contribution gates, terminal safety,
   plain fallbacks, and bounded streaming behavior.
+- [Protocol compatibility](docs/protocol-compatibility.md),
+  [ADR 0008](docs/decisions/0008-protocol-freeze-and-migrations.md), and the
+  [reviewed freeze manifest](docs/protocol-freeze-v1.json) — public identities,
+  reader policies, and deterministic migrations.
+- [Security and accessibility audit](docs/security-accessibility-audit-v0.1.md)
+  and [1.0 performance record](docs/benchmarks/release-v1.0.md) — adversarial
+  boundaries, text fallbacks, named hardware, reproducible budgets, and outcomes.
 - [Runtime selection spike](docs/benchmarks/embedded-language-selection.md) —
   the earlier latency benchmarks that fed the decision.
 
@@ -177,8 +187,10 @@ runtime dependencies have been removed.
   completion and panel contributions, and validated isolated-runtime boundaries.
 - [x] Bash/Zsh reference runners, bounded directory/process views and watch
   history, versioned recovery, and a contract-tested Windows process backend.
-- [ ] Executing isolated adapters, native Windows terminal validation, and 1.0
-  protocol freeze, security, accessibility, compatibility, and performance gates.
+- [x] Reviewed protocol identities and migrations, real Bash/Zsh differential
+  fixtures, terminal-safety and accessibility audits, and named 1.0 performance gates.
+- [ ] Executing isolated adapters, native Windows terminal validation, and the
+  explicitly deferred C1/C2 and asynchronous picker/completion contracts.
 
 ## Quick start
 

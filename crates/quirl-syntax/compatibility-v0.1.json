@@ -1,76 +1,158 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "matrix_version": "0.1",
-  "compatibility_level": "C1-preview",
-  "scope": "native command parser and execution graph",
+  "target_contract_version": "1.0",
+  "compatibility_level": "C1-partial+C2-runner",
+  "scope": "native command parser/execution graph and explicit reference-runner boundary",
+  "contract_status": "frozen_disposition",
+  "differential_fixtures": [
+    {
+      "id": "quoted_word",
+      "source": "printf '%s' 'hello world'",
+      "stdout": "hello world"
+    },
+    {
+      "id": "byte_pipeline",
+      "source": "printf A | tr A B",
+      "stdout": "B"
+    },
+    {
+      "id": "or_short_circuit",
+      "source": "false || printf recovered",
+      "stdout": "recovered"
+    },
+    {
+      "id": "and_short_circuit",
+      "source": "true && printf done",
+      "stdout": "done"
+    },
+    {
+      "id": "output_redirect",
+      "source": "printf redirected > /dev/null && printf done",
+      "stdout": "done"
+    },
+    {
+      "id": "input_redirect",
+      "source": "printf redirected < /dev/null",
+      "stdout": "redirected"
+    },
+    {
+      "id": "export_assignment",
+      "source": "export QUIRL_C1=value && printenv QUIRL_C1",
+      "stdout": "value\n"
+    }
+  ],
   "supported": [
     {
-      "id": "quoting",
+      "id": "quoting", "level": "C0", "implementation": "native",
       "forms": ["'literal text'", "\"grouped text\"", "escaped\\ space"],
       "limitations": "Quotes group words and are removed by the parser. Quote origin is not retained for later expansion."
     },
     {
-      "id": "byte_pipes",
+      "id": "byte_pipes", "level": "C0", "implementation": "native",
       "forms": ["producer | consumer"],
       "limitations": "Each stage is a simple command; typed data pipes use data mode."
     },
     {
-      "id": "redirects",
+      "id": "redirects", "level": "C0", "implementation": "native",
       "forms": ["command < input", "command > output", "command >> output"],
       "limitations": "File-descriptor prefixes, descriptor duplication, here-documents, and here-strings are unsupported."
     },
     {
-      "id": "background_marker",
+      "id": "background_marker", "level": "C0", "implementation": "native",
       "forms": ["command &"],
       "limitations": "The background marker must terminate the command list."
     },
     {
-      "id": "boolean_lists",
+      "id": "boolean_lists", "level": "C1", "implementation": "native",
       "forms": ["left && right", "left || right"],
-      "limitations": "Only AND/OR short-circuit connectors are supported; semicolon-separated lists are unsupported."
+      "limitations": "Only AND/OR short-circuit connectors are supported; semicolon-separated lists are deferred."
     },
     {
-      "id": "export_assignment",
+      "id": "export_assignment", "level": "C1", "implementation": "native",
       "forms": ["export NAME=value"],
       "limitations": "Only NAME=value assignments are accepted; shell export flags and bare-name export are unsupported."
+    },
+    {
+      "id": "bash_script_runner", "level": "C2", "implementation": "reference_runner",
+      "forms": ["quirl run --lang bash script.bash"],
+      "limitations": "Uses `bash --noprofile --norc`; interactive `bash { ... }` islands are deferred."
+    },
+    {
+      "id": "zsh_script_runner", "level": "C2", "implementation": "reference_runner",
+      "forms": ["quirl run --lang zsh script.zsh"],
+      "limitations": "Uses `zsh -f`; interactive `zsh { ... }` islands are deferred."
+    },
+    {
+      "id": "script_shebang_dispatch", "level": "C2", "implementation": "reference_runner",
+      "forms": ["#!/usr/bin/env bash", "#!/usr/bin/env zsh"],
+      "limitations": "Dispatch is available through `quirl run`; directly executable files remain selected by the operating system."
     }
   ],
-  "unsupported": [
+  "deferred": [
     {
-      "id": "advanced_redirections",
-      "dialects": ["bash", "zsh"],
-      "forms": ["2> errors", "2>&1", "<<EOF", "<<<word"],
-      "diagnostic": "unsupported Bash/Zsh construct: advanced file-descriptor or here-document redirection"
+      "id": "advanced_redirections", "level": "C1", "dialects": ["bash", "zsh"],
+      "reason": "The native redirect plan has no descriptor graph or here-document body node.",
+      "fixtures": [
+        {"source": "echo no 2> errors", "diagnostic": "unsupported Bash/Zsh construct: file-descriptor redirection `2>`"},
+        {"source": "echo no 2>&1", "diagnostic": "unsupported Bash/Zsh construct: file-descriptor redirection `2>`"},
+        {"source": "cat <<EOF", "diagnostic": "unsupported Bash/Zsh construct: here-document redirection `<<`"},
+        {"source": "cat <<<word", "diagnostic": "unsupported Bash/Zsh construct: here-string redirection `<<<`"}
+      ]
     },
     {
-      "id": "pathname_expansion",
-      "dialects": ["bash", "zsh"],
-      "forms": ["*.rs", "file?.txt", "[ab].txt", "**/*.rs(N)"],
-      "diagnostic": "unsupported Bash/Zsh construct: pathname expansion (globbing)"
+      "id": "pathname_expansion", "level": "C1", "dialects": ["bash", "zsh"],
+      "reason": "Correct expansion requires quote provenance, no-match policy, and dialect-specific option state that the native word plan does not retain.",
+      "fixtures": [
+        {"source": "printf '%s\\n' *.rs", "diagnostic": "unsupported Bash/Zsh construct: pathname expansion `*`"},
+        {"source": "printf '%s\\n' file?.txt", "diagnostic": "unsupported Bash/Zsh construct: pathname expansion `?`"},
+        {"source": "printf '%s\\n' [ab].txt", "diagnostic": "unsupported Bash/Zsh construct: pathname expansion `[...]`"}
+      ]
     },
     {
-      "id": "command_and_process_substitution",
-      "dialects": ["bash", "zsh"],
-      "forms": ["$(command)", "`command`", "<(command)", ">(command)"],
-      "diagnostic": "unsupported Bash/Zsh construct: command or process substitution"
+      "id": "command_and_process_substitution", "level": "C1", "dialects": ["bash", "zsh"],
+      "reason": "Substitution needs a nested execution graph, bounded capture, and quote-aware field handling.",
+      "fixtures": [
+        {"source": "echo $(pwd)", "diagnostic": "unsupported Bash/Zsh construct: command substitution `$(...)`"},
+        {"source": "echo `pwd`", "diagnostic": "unsupported Bash/Zsh construct: backtick command substitution `` `...` ``"},
+        {"source": "cat <(printf value)", "diagnostic": "unsupported Bash/Zsh construct: process substitution `<(...)`"}
+      ]
     },
     {
-      "id": "compound_commands",
-      "dialects": ["bash", "zsh"],
-      "forms": ["for name in values; do command; done", "while condition; do command; done", "if condition; then command; fi", "name() { command; }"],
-      "diagnostic": "unsupported Bash/Zsh construct: compound command"
+      "id": "compound_commands", "level": "C1", "dialects": ["bash", "zsh"],
+      "reason": "Loops and functions require scoped variables, list terminators, and compound-command plan nodes.",
+      "fixtures": [
+        {"source": "for name in values; do echo name; done", "diagnostic": "unsupported Bash/Zsh construct: compound command `for`"},
+        {"source": "while true; do echo value; done", "diagnostic": "unsupported Bash/Zsh construct: compound command `while`"},
+        {"source": "if true; then echo value; fi", "diagnostic": "unsupported Bash/Zsh construct: compound command `if`"},
+        {"source": "name() { echo hi; }", "diagnostic": "unsupported Bash/Zsh construct: compound-command token `(`"}
+      ]
     },
     {
-      "id": "parameter_and_arithmetic_expansion",
-      "dialects": ["bash", "zsh"],
-      "forms": ["$NAME", "${NAME}", "${NAME:-default}", "$1", "$?", "$((1 + 2))"],
-      "diagnostic": "unsupported Bash/Zsh construct: parameter or arithmetic expansion"
+      "id": "parameter_and_arithmetic_expansion", "level": "C1", "dialects": ["bash", "zsh"],
+      "reason": "Expansion requires quote provenance and a versioned parameter/field-splitting contract.",
+      "fixtures": [
+        {"source": "echo $HOME", "diagnostic": "unsupported Bash/Zsh construct: parameter expansion `$NAME`"},
+        {"source": "echo ${HOME}", "diagnostic": "unsupported Bash/Zsh construct: parameter expansion `${...}`"},
+        {"source": "echo $?", "diagnostic": "unsupported Bash/Zsh construct: special parameter expansion `$?`/`$1`"},
+        {"source": "echo $((1 + 2))", "diagnostic": "unsupported Bash/Zsh construct: arithmetic expansion `$((...))`"}
+      ]
     },
     {
-      "id": "dialect_conditionals",
-      "dialects": ["bash", "zsh"],
-      "forms": ["[[ expression ]]", "(( expression ))"],
-      "diagnostic": "unsupported Bash/Zsh construct: dialect conditional or arithmetic command"
+      "id": "dialect_conditionals", "level": "C1", "dialects": ["bash", "zsh"],
+      "reason": "Bash and Zsh conditional and arithmetic semantics diverge and require distinct typed nodes.",
+      "fixtures": [
+        {"source": "[[ -n value ]]", "diagnostic": "unsupported Bash/Zsh construct: conditional command `[[ ... ]]`"},
+        {"source": "(( 1 + 1 ))", "diagnostic": "unsupported Bash/Zsh construct: arithmetic command `(( ... ))`"}
+      ]
+    },
+    {
+      "id": "interactive_dialect_islands", "level": "C2", "dialects": ["bash", "zsh"],
+      "reason": "Reference-backed script and shebang execution exists, but `bash { ... }` and `zsh { ... }` do not yet have parser or plan nodes.",
+      "fixtures": [
+        {"source": "bash { echo value; }", "diagnostic": "unsupported Bash/Zsh construct: compound-command token `{`"},
+        {"source": "zsh { print value; }", "diagnostic": "unsupported Bash/Zsh construct: compound-command token `{`"}
+      ]
     }
   ]
 }

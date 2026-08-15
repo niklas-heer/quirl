@@ -1,0 +1,62 @@
+# ADR 0008: Freeze public protocols with owner-defined descriptors
+
+- Status: Accepted
+- Date: 2026-08-15
+- Extends: [ADR 0002](0002-crate-layering.md), [ADR 0007](0007-semantic-catalog-v4.md)
+
+## Context
+
+Quirl's public machine surfaces are spread across deliberately layered crates.
+Serde derives and numeric constants alone do not prove that a version still
+means the same shape: a field or enum can change while its version stays fixed.
+Conversely, a composition-root snapshot must not become a second source of
+truth for schemas owned by lower crates.
+
+Several persisted formats also predate the freeze. Catalog caches have an
+explicit v2/v3 to v4 migration, but plugin locks and recovery snapshots did not
+have equivalent readers, and Lua configuration was unversioned.
+
+## Decision
+
+Each owning crate publishes a canonical, complete structural descriptor beside
+its protocol version. The descriptor covers serialized fields, closed variants,
+important ordering and validation invariants, and known migration bounds. A
+named FNV-1a fingerprint identifies that descriptor. This fingerprint detects
+accidental compatibility drift; it is not an authenticity or supply-chain
+checksum.
+
+`quirl-core` owns the common version policy and fingerprint algorithm. Crates
+that cannot depend on core, such as catalog, syntax, and picker, expose plain
+descriptor strings; the CLI hashes them while assembling the reviewed
+`protocol-freeze-v1.json` golden inventory. This preserves every dependency
+arrow in ADR 0002. The inventory is evidence and a drift detector, not a schema
+definition.
+
+Compatibility is explicit per surface:
+
+- `frozen_major` accepts only the declared version. A structural or semantic
+  change requires a new version and either a migration or a fail-closed error.
+- `migrated_range` accepts only a documented inclusive range and deterministically
+  projects older documents to the current shape before validation.
+
+Catalog v2/v3 migrates to v4. Plugin lock v1 migrates to v2 without changing
+identity, checksums, requested permissions, grants, or enabled state; the new
+runtime-schema hash is derived from the locked runtime. Recovery v1 migrates to
+v2 with explicit unavailable markers for facts v1 never stored and never
+reconstructs secrets or executable commands. An absent Lua config version is
+the sole legacy v0 form and becomes config v1 through serde defaults before
+authoritative validation. Future versions always fail closed.
+
+## Consequences
+
+- A reviewed golden change is required when any public contract identity moves.
+- Persisted migrations are deterministic and tested for permission, checksum,
+  redaction, and source preservation.
+- Descriptor fingerprints do not replace SHA-256 content integrity in plugin
+  locks and do not establish trust.
+- The manifest is a **1.0 freeze candidate**, not proof that Phase 4 is accepted.
+  Command grammar remains a documented preview subset; completion and picker
+  currently freeze their Rust shapes rather than full asynchronous envelopes;
+  runner output remains text-shaped; Wasm remains non-executing and its full WIT
+  structural binding is pending. Performance, security, accessibility, and C1
+  compatibility evidence remain separate release gates.

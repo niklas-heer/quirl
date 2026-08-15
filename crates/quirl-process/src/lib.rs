@@ -1,5 +1,12 @@
 //! Native command graph execution and background-job lifecycle.
 
+pub const RUNNER_PROTOCOL_VERSION: u32 = 1;
+pub const RUNNER_SCHEMA_DESCRIPTOR: &str = "quirl.runner@1{input:quirl.command-grammar@1;ProcessBackend{execute_capture(source)->CommandOutcome;execute_interactive(source)->CommandOutcome;jobs()->array<JobState>;foreground_job(id)->JobState;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};byte-pipeline:ordered;redirection:input|output|append;background:terminal-ampersand;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows}";
+
+pub fn runner_schema_hash() -> String {
+    quirl_core::schema_fingerprint(RUNNER_SCHEMA_DESCRIPTOR)
+}
+
 #[cfg(unix)]
 mod platform {
 
@@ -35,6 +42,7 @@ mod platform {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
     pub struct JobState {
         pub id: u32,
         pub command: String,
@@ -204,6 +212,8 @@ mod platform {
             }
 
             let mut last = outcome(0, None, None);
+            let mut captured_stdout = String::new();
+            let mut captured_stderr = String::new();
             for (index, pipeline) in graph.pipelines.iter().enumerate() {
                 if index > 0 {
                     let connector = graph.connectors[index - 1];
@@ -214,6 +224,14 @@ mod platform {
                     }
                 }
                 last = self.execute_pipeline(pipeline, input, capture)?;
+                if capture {
+                    captured_stdout.push_str(last.stdout.as_deref().unwrap_or_default());
+                    captured_stderr.push_str(last.stderr.as_deref().unwrap_or_default());
+                }
+            }
+            if capture {
+                last.stdout = Some(captured_stdout);
+                last.stderr = Some(captured_stderr);
             }
             Ok(last)
         }
@@ -1199,6 +1217,19 @@ mod platform {
         }
 
         #[test]
+        fn captured_boolean_lists_preserve_output_from_every_executed_pipeline() {
+            let mut executor = NativeExecutor::default();
+            let result = executor
+                .execute_capture(
+                    "sh -c 'printf left; printf left-error >&2; exit 7' && printf no || sh -c 'printf recovered; printf recovered-error >&2'",
+                )
+                .unwrap();
+            assert_eq!(result.status, 0);
+            assert_eq!(result.stdout.as_deref(), Some("leftrecovered"));
+            assert_eq!(result.stderr.as_deref(), Some("left-errorrecovered-error"));
+        }
+
+        #[test]
         fn background_jobs_are_structured_and_can_be_foregrounded() {
             let mut executor = NativeExecutor::default();
             executor.execute_capture("sh -c 'sleep 0.02' &").unwrap();
@@ -1388,6 +1419,7 @@ mod platform {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
     pub struct JobState {
         pub id: u32,
         pub command: String,
@@ -1516,6 +1548,8 @@ mod platform {
                 stdout: None,
                 stderr: None,
             };
+            let mut captured_stdout = String::new();
+            let mut captured_stderr = String::new();
             for (index, pipeline) in graph.pipelines.iter().enumerate() {
                 if index > 0 {
                     let connector = graph.connectors[index - 1];
@@ -1526,6 +1560,14 @@ mod platform {
                     }
                 }
                 last = self.execute_pipeline(pipeline, input, capture)?;
+                if capture {
+                    captured_stdout.push_str(last.stdout.as_deref().unwrap_or_default());
+                    captured_stderr.push_str(last.stderr.as_deref().unwrap_or_default());
+                }
+            }
+            if capture {
+                last.stdout = Some(captured_stdout);
+                last.stderr = Some(captured_stderr);
             }
             Ok(last)
         }

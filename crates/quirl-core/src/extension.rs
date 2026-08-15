@@ -5,6 +5,11 @@ use std::collections::HashSet;
 
 pub const EXTENSION_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_EXTENSION_DEADLINE_MS: u64 = 250;
+pub const EXTENSION_SCHEMA_DESCRIPTOR: &str = "quirl.extension@1{ExtensionEvent{deny_unknown;protocol_version:u32;sequence:u64;data:ExtensionEventData};ExtensionEventData:tag(kind)[session_start{restored:bool}|session_restore{session_id:string}|directory_changed{previous:string,current:string}|command_plan{source:string,effects:array<string>}|execution_progress{completed:u64,total:null|u64,message:null|string}|output{stream:stdout|stderr,bytes:usize,text:null|string}|cancellation{reason:string}|result{status:i32,duration_ms:u64}|error{error:ShellError}];ExtensionAction:tag(action)[diagnose{message:string}|rewrite_plan{source:string}|set_environment{name:string,value:string}|block_execution{reason:string}|annotate_result{key:string,value:Value}];EventSubscription{deny_unknown;name:string;events:unique-array<EventKind>;capabilities:array<ExtensionCapability>;deadline_ms:1..250};ContributionRegistration{deny_unknown;kind:catalog|completion|panel;name:string;deadline_ms:1..250;plain_fallback:null|string};capabilities:events_observe|plan_rewrite|environment_mutate|output_read|execution_block|catalog_contribute|completion_contribute|ui_panel;event_sequence:strictly-increasing}";
+
+pub fn extension_schema_hash() -> String {
+    crate::schema_fingerprint(EXTENSION_SCHEMA_DESCRIPTOR)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -329,6 +334,38 @@ pub fn reject_terminal_controls(context: &str, value: &str) -> Result<(), ShellE
     Ok(())
 }
 
+/// Render untrusted text without allowing it to change terminal state.
+///
+/// Newlines and tabs remain readable. Other C0/C1 controls are written as
+/// visible Rust-style escapes so text output is safe while structured output
+/// can retain the original value.
+pub fn escape_terminal_controls(value: &str) -> String {
+    let mut rendered = String::with_capacity(value.len());
+    for character in value.chars() {
+        if (character.is_control() && !matches!(character, '\n' | '\t')) || character == '\u{009b}'
+        {
+            rendered.extend(character.escape_default());
+        } else {
+            rendered.push(character);
+        }
+    }
+    rendered
+}
+
+/// Escape terminal controls in an already serialized JSON document while
+/// preserving its parsed value. Pretty-printing whitespace remains intact.
+pub fn escape_json_terminal_controls(serialized: &str) -> String {
+    let mut rendered = String::with_capacity(serialized.len());
+    for character in serialized.chars() {
+        if character.is_control() && !matches!(character, '\n' | '\t') {
+            rendered.push_str(&format!("\\u{:04x}", character as u32));
+        } else {
+            rendered.push(character);
+        }
+    }
+    rendered
+}
+
 /// Recursively validate every object key and string leaf before an extension
 /// value reaches catalog, completion, or UI consumers.
 pub fn reject_json_terminal_controls(context: &str, value: &Value) -> Result<(), ShellError> {
@@ -439,5 +476,28 @@ mod tests {
     fn nested_contribution_strings_reject_terminal_controls() {
         let nested = serde_json::json!({"rows": [["safe", {"value": "\u{1b}[31mraw"}]]});
         assert!(reject_json_terminal_controls("contribution", &nested).is_err());
+    }
+
+    #[test]
+    fn terminal_escaping_preserves_layout_but_neutralizes_ansi_osc_and_c1() {
+        let hostile = "ok\n\t\u{1b}[31mred\u{1b}]8;;https://example.invalid\u{7}link\u{9b}2J\r";
+        let escaped = escape_terminal_controls(hostile);
+        assert_eq!(
+            escaped,
+            "ok\n\t\\u{1b}[31mred\\u{1b}]8;;https://example.invalid\\u{7}link\\u{9b}2J\\r"
+        );
+        assert!(!escaped.contains('\u{1b}'));
+        assert!(!escaped.contains('\u{009b}'));
+        assert!(!escaped.contains('\r'));
+    }
+
+    #[test]
+    fn json_terminal_escaping_preserves_the_parsed_value() {
+        let value = serde_json::json!({"hostile": "\u{009b}2J\u{007f}"});
+        let serialized = serde_json::to_string_pretty(&value).unwrap();
+        let escaped = escape_json_terminal_controls(&serialized);
+        assert!(!escaped.contains('\u{009b}'));
+        assert!(!escaped.contains('\u{007f}'));
+        assert_eq!(serde_json::from_str::<Value>(&escaped).unwrap(), value);
     }
 }

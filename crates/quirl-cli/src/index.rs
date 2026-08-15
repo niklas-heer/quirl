@@ -2,7 +2,7 @@ use clap::{ArgAction, Subcommand, ValueEnum};
 use quirl_catalog::{
     import_bash, import_fish, import_help, import_man, import_zsh, Catalog, ImportDiagnostic,
 };
-use quirl_core::{ErrorCode, ShellError};
+use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
 use serde::Serialize;
 use std::{
     env, fs,
@@ -194,19 +194,18 @@ fn build_index(
                 report.commands,
                 report.options,
                 report.source_files,
-                report.index.display()
+                escape_terminal_controls(&report.index.display().to_string())
             );
             for diagnostic in &report.diagnostics {
                 eprintln!(
                     "{}:{}: skipped completion declaration: {}",
-                    diagnostic.origin, diagnostic.line, diagnostic.message
+                    escape_terminal_controls(&diagnostic.origin),
+                    diagnostic.line,
+                    escape_terminal_controls(&diagnostic.message)
                 );
             }
         }
-        IndexOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&report).map_err(json_error)?
-        ),
+        IndexOutputFormat::Json => print_json(&report)?,
     }
     Ok(0)
 }
@@ -233,12 +232,9 @@ fn explain_index(
         .with_help("Run `quirl index build` to refresh installed completion metadata")
     })?;
     match format {
-        IndexOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&explanation).map_err(json_error)?
-        ),
+        IndexOutputFormat::Json => print_json(&explanation)?,
         IndexOutputFormat::Text => {
-            println!("{}", explanation.command);
+            println!("{}", escape_terminal_controls(&explanation.command));
             for fact in explanation.facts {
                 let origin = fact
                     .provenance
@@ -252,12 +248,12 @@ fn explain_index(
                     .map_or(String::new(), |value| format!(" · {value}"));
                 println!(
                     "  {} `{}` ← {:?} / {:?} · {}{}",
-                    fact.fact,
-                    fact.value,
+                    escape_terminal_controls(&fact.fact),
+                    escape_terminal_controls(&fact.value),
                     fact.provenance.source,
                     fact.provenance.confidence,
-                    origin,
-                    fingerprint
+                    escape_terminal_controls(origin),
+                    escape_terminal_controls(&fingerprint)
                 );
             }
         }
@@ -447,6 +443,12 @@ fn index_io_error(action: &str, path: &Path, error: std::io::Error) -> ShellErro
 fn json_error(error: serde_json::Error) -> ShellError {
     ShellError::new(ErrorCode::Io, "could not serialize completion index data")
         .with_context(error.to_string())
+}
+
+fn print_json(value: &impl Serialize) -> Result<(), ShellError> {
+    let json = serde_json::to_string_pretty(value).map_err(json_error)?;
+    println!("{}", escape_json_terminal_controls(&json));
+    Ok(())
 }
 
 #[cfg(test)]

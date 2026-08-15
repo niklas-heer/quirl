@@ -1,5 +1,8 @@
 use clap::{Subcommand, ValueEnum};
-use quirl_core::{ContributionKind, ErrorCode, ShellError};
+use quirl_core::{
+    escape_json_terminal_controls, escape_terminal_controls, ContributionKind, ErrorCode,
+    ShellError,
+};
 use quirl_lua::{LuaPolicy, LuaRuntime};
 use quirl_plugin::{
     doctor_plugin, parse_plugin_manifest, permission_diff, resolve_plugin,
@@ -9,11 +12,13 @@ use quirl_plugin::{
 use serde::Serialize;
 use std::{
     env, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
 
 const MANIFEST_FILE: &str = "plugin.toml";
+const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum PluginCommand {
@@ -253,6 +258,7 @@ pub fn execute(command: PluginCommand) -> Result<i32, ShellError> {
     }
 }
 
+#[derive(Debug)]
 struct SourcePackage {
     source_id: String,
     manifest_source: String,
@@ -277,29 +283,55 @@ fn read_source_package(source: &str) -> Result<SourcePackage, ShellError> {
             "Pass a local plugin directory or its plugin.toml path",
         )
     })?;
-    let manifest_path = if source_path.is_dir() {
+    let source_is_directory = source_path.is_dir();
+    let manifest_path = if source_is_directory {
         source_path.join(MANIFEST_FILE)
     } else {
         source_path.clone()
     };
-    let manifest_source = fs::read_to_string(&manifest_path).map_err(|error| {
+    let manifest_path = fs::canonicalize(&manifest_path).map_err(|error| {
         io_error(
-            format!("cannot read {}", manifest_path.display()),
+            format!("cannot resolve {}", manifest_path.display()),
             error,
-            "Provide a readable plugin.toml",
+            "Provide a readable plugin.toml inside the plugin package",
         )
+    })?;
+    if source_is_directory && !manifest_path.starts_with(&source_path) {
+        return Err(package_escape_error("plugin manifest"));
+    }
+    let manifest_bytes = read_bounded(
+        &manifest_path,
+        MAX_MANIFEST_BYTES,
+        "plugin manifest",
+        "Keep plugin.toml below 256 KiB",
+    )?;
+    let manifest_source = String::from_utf8(manifest_bytes).map_err(|error| {
+        ShellError::new(ErrorCode::Validation, "plugin.toml is not valid UTF-8")
+            .with_context(error.to_string())
+            .with_help("Encode the manifest as UTF-8")
     })?;
     let manifest = parse_plugin_manifest(&manifest_source, &manifest_path.display().to_string())?;
     let entry = safe_package_path(&manifest.plugin.entry)?;
     let directory = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-    let entry_path = directory.join(entry);
-    let entry_bytes = fs::read(&entry_path).map_err(|error| {
+    let entry_path = fs::canonicalize(directory.join(entry)).map_err(|error| {
         io_error(
-            format!("cannot read plugin entry {}", entry_path.display()),
+            format!(
+                "cannot resolve plugin entry declared by {}",
+                manifest_path.display()
+            ),
             error,
             "Correct the manifest entry path",
         )
     })?;
+    if !entry_path.starts_with(directory) {
+        return Err(package_escape_error("plugin entry"));
+    }
+    let entry_bytes = read_bounded(
+        &entry_path,
+        MAX_ENTRY_BYTES,
+        "plugin entry",
+        "Keep the plugin entry below 4 MiB and move data into bounded runtime inputs",
+    )?;
     let source_id = format!("file:{}", manifest_path.display());
     Ok(SourcePackage {
         source_id,
@@ -316,13 +348,12 @@ fn validate_runtime(
     grants: &[String],
     require_runnable: bool,
 ) -> Result<(), ShellError> {
-    let entry_bytes = fs::read(entry_path).map_err(|error| {
-        io_error(
-            format!("cannot read plugin entry {}", entry_path.display()),
-            error,
-            "Restore the locked entry before activation",
-        )
-    })?;
+    let entry_bytes = read_bounded(
+        entry_path,
+        MAX_ENTRY_BYTES,
+        "plugin entry",
+        "Restore a locked entry smaller than 4 MiB before activation",
+    )?;
     validate_plugin_manifest(manifest, &entry_bytes, env!("CARGO_PKG_VERSION"))?;
     if manifest.plugin.runtime != PluginRuntime::TrustedLua {
         if require_runnable {
@@ -436,7 +467,7 @@ fn check_legacy(path: &Path, format: PluginOutputFormat) -> Result<i32, ShellErr
         PluginOutputFormat::Json => print_json(&registrations)?,
         PluginOutputFormat::Text => println!(
             "✓ {} registered {} commands, {} completions, {} events, and {} prompt segments",
-            path.display(),
+            escape_terminal_controls(&path.display().to_string()),
             registrations.commands.len(),
             registrations.completion_providers.len(),
             registrations.events.len(),
@@ -458,16 +489,8 @@ fn load_lock(root: &Path) -> Result<PluginLockfile, ShellError> {
             "Repair permissions or restore the lockfile backup",
         )
     })?;
-    let lock = serde_json::from_slice::<PluginLockfile>(&bytes).map_err(|error| {
-        ShellError::new(ErrorCode::Validation, "plugin lockfile is corrupt")
-            .with_context(error.to_string())
-            .with_help(format!(
-                "Restore {}.bak or remove the corrupt file after review",
-                path.display()
-            ))
-    })?;
-    lock.validate()?;
-    Ok(lock)
+    PluginLockfile::from_json(&bytes)
+        .map_err(|error| error.with_context(format!("lockfile: {}", path.display())))
 }
 
 fn save_lock(root: &Path, lock: &PluginLockfile) -> Result<(), ShellError> {
@@ -617,6 +640,72 @@ fn safe_package_path(path: &str) -> Result<PathBuf, ShellError> {
     Ok(path.to_owned())
 }
 
+fn read_bounded(
+    path: &Path,
+    limit: usize,
+    context: &str,
+    help: &str,
+) -> Result<Vec<u8>, ShellError> {
+    let file = fs::File::open(path).map_err(|error| {
+        io_error(
+            format!("cannot read {context} {}", path.display()),
+            error,
+            help,
+        )
+    })?;
+    let size = file
+        .metadata()
+        .map_err(|error| {
+            io_error(
+                format!("cannot inspect {context} {}", path.display()),
+                error,
+                help,
+            )
+        })?
+        .len();
+    if size > limit as u64 {
+        return Err(resource_limit_error(context, size, limit, help));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            io_error(
+                format!("cannot read {context} {}", path.display()),
+                error,
+                help,
+            )
+        })?;
+    if bytes.len() > limit {
+        return Err(resource_limit_error(
+            context,
+            bytes.len() as u64,
+            limit,
+            help,
+        ));
+    }
+    Ok(bytes)
+}
+
+fn resource_limit_error(context: &str, size: u64, limit: usize, help: &str) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{context} exceeds its read limit"),
+    )
+    .with_context(format!("bytes: {size}; limit: {limit}"))
+    .with_help(help)
+}
+
+fn package_escape_error(context: &str) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        format!("{context} resolves outside its package directory"),
+    )
+    .with_help(
+        "Keep the manifest and entry inside the package; external symlink targets are rejected",
+    )
+}
+
 fn print_mutation(
     action: &'static str,
     plugin: &str,
@@ -635,7 +724,7 @@ fn print_mutation(
     match format {
         PluginOutputFormat::Json => print_json(&output),
         PluginOutputFormat::Text => {
-            println!("✓ {action} plugin {plugin}");
+            println!("✓ {action} plugin {}", escape_terminal_controls(plugin));
             if let Some(diff) = diff {
                 println!("  permissions added: {}", list_or_none(&diff.added));
                 println!("  permissions removed: {}", list_or_none(&diff.removed));
@@ -652,7 +741,10 @@ fn print_permissions(
     match format {
         PluginOutputFormat::Json => print_json(output),
         PluginOutputFormat::Text => {
-            println!("Permissions for {}", output.plugin);
+            println!(
+                "Permissions for {}",
+                escape_terminal_controls(output.plugin)
+            );
             println!("  requested: {}", list_or_none(output.requested));
             println!("  granted: {}", list_or_none(output.granted));
             println!(
@@ -675,12 +767,14 @@ fn print_doctor(report: &DoctorReport, format: PluginOutputFormat) -> Result<(),
                 } else {
                     "✗ unhealthy"
                 },
-                report.plugin
+                escape_terminal_controls(&report.plugin)
             );
             for diagnostic in &report.diagnostics {
                 println!(
                     "  {}: {}\n    help: {}",
-                    diagnostic.code, diagnostic.message, diagnostic.help
+                    escape_terminal_controls(&diagnostic.code),
+                    escape_terminal_controls(&diagnostic.message),
+                    escape_terminal_controls(&diagnostic.help)
                 );
             }
             Ok(())
@@ -689,14 +783,12 @@ fn print_doctor(report: &DoctorReport, format: PluginOutputFormat) -> Result<(),
 }
 
 fn print_json(value: &impl Serialize) -> Result<(), ShellError> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).map_err(|error| {
-            ShellError::new(ErrorCode::Io, "cannot serialize plugin platform output")
-                .with_context(error.to_string())
-                .with_help("Report this as a plugin platform schema defect")
-        })?
-    );
+    let json = serde_json::to_string_pretty(value).map_err(|error| {
+        ShellError::new(ErrorCode::Io, "cannot serialize plugin platform output")
+            .with_context(error.to_string())
+            .with_help("Report this as a plugin platform schema defect")
+    })?;
+    println!("{}", escape_json_terminal_controls(&json));
     Ok(())
 }
 
@@ -704,7 +796,7 @@ fn list_or_none(values: &[String]) -> String {
     if values.is_empty() {
         "none".to_owned()
     } else {
-        values.join(", ")
+        escape_terminal_controls(&values.join(", "))
     }
 }
 
@@ -737,6 +829,29 @@ fn io_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_package_directory(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "quirl-plugin-package-{name}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ))
+    }
+
+    fn trusted_manifest(entry: &str) -> String {
+        format!(
+            r#"schema_version = 1
+[plugin]
+name = "bounded"
+version = "0.1.0"
+entry = "{entry}"
+quirl = ">=0.1, <0.2"
+api = "0.1.0"
+runtime = "trusted_lua"
+summary = "Bounded plugin"
+"#
+        )
+    }
 
     #[test]
     fn invalid_candidate_never_replaces_last_known_good_lock() {
@@ -805,6 +920,54 @@ max_message_bytes = 65536
         assert!(validate_runtime(&manifest, &entry, &[], false).is_ok());
         let error = validate_runtime(&manifest, &entry, &[], true).unwrap_err();
         assert!(error.message.contains("non-executing"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_entry_symlink_cannot_escape_package_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_package_directory("symlink-escape");
+        let package = root.join("package");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join(MANIFEST_FILE), trusted_manifest("entry.lua")).unwrap();
+        let outside = root.join("outside.lua");
+        fs::write(&outside, "return {}\n").unwrap();
+        symlink(&outside, package.join("entry.lua")).unwrap();
+
+        let error = read_source_package(package.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("outside"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_plugin_manifest_is_rejected_before_allocation() {
+        let directory = test_package_directory("oversized-manifest");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(MANIFEST_FILE),
+            vec![b'x'; MAX_MANIFEST_BYTES + 1],
+        )
+        .unwrap();
+
+        let error = read_source_package(directory.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.message.contains("manifest"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn oversized_plugin_entry_is_rejected_before_runtime_loading() {
+        let directory = test_package_directory("oversized-entry");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(MANIFEST_FILE), trusted_manifest("entry.lua")).unwrap();
+        fs::write(directory.join("entry.lua"), vec![b'x'; MAX_ENTRY_BYTES + 1]).unwrap();
+
+        let error = read_source_package(directory.to_str().unwrap()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.message.contains("entry"));
         fs::remove_dir_all(directory).unwrap();
     }
 }

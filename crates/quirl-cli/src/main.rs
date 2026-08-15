@@ -8,6 +8,7 @@ mod package;
 mod pick;
 mod platform;
 mod plugin;
+mod protocol;
 mod recovery;
 mod script;
 
@@ -23,11 +24,13 @@ use platform::{EventsCommand, ViewCommand, WatchCommand};
 use plugin::PluginCommand;
 use quirl_catalog::{Catalog, CommandSpec, Completion};
 use quirl_core::{
-    reject_terminal_controls, CommandOutcome, ErrorCode, ExtensionAction, ExtensionEventData,
-    OutputStream, ShellError,
+    escape_json_terminal_controls, escape_terminal_controls, reject_terminal_controls,
+    CommandOutcome, ErrorCode, ExtensionAction, ExtensionEventData, OutputStream, ShellError,
 };
 use quirl_data::DataRuntime;
-use quirl_lua::{sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig};
+use quirl_lua::{
+    sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig, MAX_LUA_SOURCE_BYTES,
+};
 use quirl_process::{JobStatus, NativeExecutor};
 use quirl_syntax::{classify, InteractiveLine, Mode};
 use quirl_ui::{
@@ -221,7 +224,7 @@ fn main() -> ExitCode {
         Ok(status) => ExitCode::from(status.clamp(0, 255) as u8),
         Err(error) if wants_json => {
             match serde_json::to_string_pretty(&error) {
-                Ok(json) => println!("{json}"),
+                Ok(json) => println!("{}", escape_json_terminal_controls(&json)),
                 Err(_) => eprintln!("{}", render_stderr_error(&error)),
             }
             ExitCode::FAILURE
@@ -277,11 +280,13 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
         Some(Command::Catalog { format }) => {
             let catalog = load_composed_catalog();
             match format {
-                CatalogFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&catalog).map_err(json_error)?
-                ),
-                CatalogFormat::Markdown => print!("{}", catalog.to_markdown()),
+                CatalogFormat::Json => {
+                    let json = serde_json::to_string_pretty(&catalog).map_err(json_error)?;
+                    println!("{}", escape_json_terminal_controls(&json));
+                }
+                CatalogFormat::Markdown => {
+                    print!("{}", escape_terminal_controls(&catalog.to_markdown()));
+                }
                 CatalogFormat::Text => print_catalog(&catalog),
             }
             Ok(0)
@@ -304,13 +309,17 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
                     .map(extension_completion),
             );
             match format {
-                CompletionFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&completions).map_err(json_error)?
-                ),
+                CompletionFormat::Json => {
+                    let json = serde_json::to_string_pretty(&completions).map_err(json_error)?;
+                    println!("{}", escape_json_terminal_controls(&json));
+                }
                 _ => {
                     for completion in completions {
-                        println!("{:<28} {}", completion.display, completion.summary);
+                        println!(
+                            "{:<28} {}",
+                            escape_terminal_controls(&completion.display),
+                            escape_terminal_controls(&completion.summary)
+                        );
                     }
                 }
             }
@@ -323,13 +332,21 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
         Some(Command::Recover { command }) => recovery::execute(command),
         Some(Command::Exec { command }) => run_exec_with_recovery(&command.join(" ")),
         None if !io::stdin().is_terminal() => run_stdin(),
-        None => repl(load_composed_catalog()),
+        None => {
+            let mut host = LuaExtensionHost::discover();
+            let catalog = compose_catalog(&mut host);
+            repl(catalog, Arc::new(Mutex::new(host)))
+        }
     }
 }
 
 fn load_composed_catalog() -> Catalog {
+    compose_catalog(&mut LuaExtensionHost::discover())
+}
+
+fn compose_catalog(extensions: &mut LuaExtensionHost) -> Catalog {
     let mut catalog = index::load_default_catalog();
-    LuaExtensionHost::discover().merge_catalog_contributions(&mut catalog);
+    extensions.merge_catalog_contributions(&mut catalog);
     catalog
 }
 
@@ -517,8 +534,7 @@ fn execute_with_recovery(
     }
 }
 
-fn repl(catalog: Catalog) -> Result<i32, ShellError> {
-    let extensions = Arc::new(Mutex::new(LuaExtensionHost::discover()));
+fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     begin_extension_session(&extensions);
     emit_directory_snapshot(&extensions);
     let mut observed_directory = std::env::current_dir().unwrap_or_default();
@@ -986,7 +1002,11 @@ fn safe_extension_output_text(text: &str) -> Option<String> {
 fn print_extension_annotations(annotations: &BTreeMap<String, serde_json::Value>) {
     for (key, value) in annotations {
         let value = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
-        eprintln!("extension annotation {key}: {value}");
+        eprintln!(
+            "extension annotation {}: {}",
+            escape_terminal_controls(key),
+            escape_terminal_controls(&value)
+        );
     }
 }
 
@@ -1038,6 +1058,7 @@ fn print_banner() {
     if color_enabled(
         io::stdout().is_terminal(),
         std::env::var_os("NO_COLOR").is_some(),
+        terminal_is_dumb(),
     ) {
         println!("\x1b[1;32mQuirl\x1b[0m{}", &banner["Quirl".len()..]);
     } else {
@@ -1051,12 +1072,21 @@ fn render_stderr_error(error: &ShellError) -> String {
         color_enabled(
             io::stderr().is_terminal(),
             std::env::var_os("NO_COLOR").is_some(),
+            terminal_is_dumb(),
         ),
     )
 }
 
-fn color_enabled(terminal: bool, no_color_is_set: bool) -> bool {
-    terminal && !no_color_is_set
+fn color_enabled(terminal: bool, no_color_is_set: bool, dumb_terminal: bool) -> bool {
+    terminal && !no_color_is_set && !dumb_terminal
+}
+
+fn terminal_is_dumb() -> bool {
+    is_dumb_terminal(std::env::var("TERM").ok().as_deref())
+}
+
+fn is_dumb_terminal(term: Option<&str>) -> bool {
+    term.is_some_and(|term| term.eq_ignore_ascii_case("dumb"))
 }
 
 fn eval_lua(
@@ -1074,10 +1104,32 @@ fn eval_lua(
 }
 
 fn run_stdin() -> Result<i32, ShellError> {
-    let mut source = String::new();
-    io::stdin().read_to_string(&mut source).map_err(|error| {
-        ShellError::new(ErrorCode::Io, "could not read standard input")
-            .with_context(error.to_string())
+    let mut bytes = Vec::new();
+    io::stdin()
+        .take(MAX_LUA_SOURCE_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            ShellError::new(ErrorCode::Io, "could not read standard input")
+                .with_context(error.to_string())
+        })?;
+    if bytes.len() > MAX_LUA_SOURCE_BYTES {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "standard-input Lua source exceeds its read limit",
+        )
+        .with_context(format!(
+            "bytes: {}; limit: {MAX_LUA_SOURCE_BYTES}",
+            bytes.len()
+        ))
+        .with_help("Keep executable source below 4 MiB and load data through bounded inputs"));
+    }
+    let source = String::from_utf8(bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::ScriptRead,
+            "standard-input Lua source is not valid UTF-8",
+        )
+        .with_context(error.to_string())
+        .with_help("Encode Lua source as UTF-8")
     })?;
     let lua = LuaRuntime::new(LuaPolicy::script())?;
     print_json_value(lua.eval(&source)?);
@@ -1090,7 +1142,8 @@ fn print_help(catalog: &Catalog, topic: Option<&str>) {
             print_command_help(command);
         } else {
             println!(
-                "No exact catalog entry for `{topic}`. Press Tab to explore related commands."
+                "No exact catalog entry for `{}`. Press Tab to explore related commands.",
+                escape_terminal_controls(topic)
             );
         }
     } else {
@@ -1101,7 +1154,11 @@ fn print_help(catalog: &Catalog, topic: Option<&str>) {
 fn print_catalog(catalog: &Catalog) {
     println!("Quirl commands\n");
     for command in &catalog.commands {
-        println!("  {:<24} {}", command.signature, command.summary);
+        println!(
+            "  {:<24} {}",
+            escape_terminal_controls(&command.signature),
+            escape_terminal_controls(&command.summary)
+        );
     }
     println!(
         "\nTab opens the IDE completion menu; `quirl catalog --format json` is the AI interface."
@@ -1111,18 +1168,24 @@ fn print_catalog(catalog: &Catalog) {
 fn print_command_help(command: &CommandSpec) {
     println!(
         "{}\n  {}\n\n{}",
-        command.signature, command.summary, command.details
+        escape_terminal_controls(&command.signature),
+        escape_terminal_controls(&command.summary),
+        escape_terminal_controls(&command.details)
     );
     if !command.options.is_empty() {
         println!("\nOptions:");
         for option in &command.options {
-            println!("  {:<20} {}", option.names.join(", "), option.documentation);
+            println!(
+                "  {:<20} {}",
+                escape_terminal_controls(&option.names.join(", ")),
+                escape_terminal_controls(&option.documentation)
+            );
         }
     }
     if !command.examples.is_empty() {
         println!("\nExamples:");
         for example in &command.examples {
-            println!("  {example}");
+            println!("  {}", escape_terminal_controls(example));
         }
     }
 }
@@ -1130,13 +1193,11 @@ fn print_command_help(command: &CommandSpec) {
 fn print_json_value(value: serde_json::Value) {
     match value {
         serde_json::Value::Null => {}
-        serde_json::Value::String(value) => println!("{value}"),
+        serde_json::Value::String(value) => println!("{}", escape_terminal_controls(&value)),
         value if value.is_object() || value.is_array() => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&value)
-                    .unwrap_or_else(|_| "<unprintable Lua value>".to_owned())
-            );
+            let json = serde_json::to_string_pretty(&value)
+                .unwrap_or_else(|_| "<unprintable Lua value>".to_owned());
+            println!("{}", escape_json_terminal_controls(&json));
         }
         value => println!("{value}"),
     }
@@ -1163,12 +1224,139 @@ fn json_error(error: serde_json::Error) -> ShellError {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use quirl_catalog::{ArgumentKind, CompletionSource};
+    use quirl_core::CommandOutcome;
+    use std::collections::BTreeSet;
+    use std::{
+        fs,
+        path::Path,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_DIFFERENTIAL_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    struct DifferentialFixture {
+        root: PathBuf,
+    }
+
+    impl DifferentialFixture {
+        fn create(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "quirl-cli-differential-{label}-{}-{}",
+                std::process::id(),
+                NEXT_DIFFERENTIAL_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("input"), "from input\\n").unwrap();
+            Self { root }
+        }
+
+        fn path(&self, name: &str) -> String {
+            shell_word(&self.root.join(name))
+        }
+
+        fn redirected_output(&self) -> Option<Vec<u8>> {
+            fs::read(self.root.join("output")).ok()
+        }
+    }
+
+    impl Drop for DifferentialFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn shell_word(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "'\\\"'\\\"'"))
+    }
+
+    fn shell_is_available(shell: &str) -> bool {
+        std::process::Command::new(shell)
+            .arg("-c")
+            .arg(":")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn reference_outcome(shell: &str, source: &str) -> CommandOutcome {
+        let mut command = std::process::Command::new(shell);
+        if shell == "bash" {
+            command.args(["--noprofile", "--norc", "-c", source]);
+            command.env_remove("BASH_ENV").env_remove("ENV");
+        } else {
+            command.args(["-f", "-c", source]);
+            command.env_remove("ZDOTDIR").env_remove("ENV");
+        }
+        let output = command.env("LC_ALL", "C").output().unwrap();
+        CommandOutcome {
+            status: output.status.code().unwrap_or(1),
+            stdout: Some(String::from_utf8(output.stdout).unwrap()),
+            stderr: Some(String::from_utf8(output.stderr).unwrap()),
+        }
+    }
+
+    fn assert_same_outcome(label: &str, native: &CommandOutcome, reference: &CommandOutcome) {
+        assert_eq!(native.status, reference.status, "{label}: status");
+        assert_eq!(
+            native.stdout.as_deref().unwrap_or_default(),
+            reference.stdout.as_deref().unwrap_or_default(),
+            "{label}: stdout"
+        );
+        assert_eq!(
+            native.stderr.as_deref().unwrap_or_default(),
+            reference.stderr.as_deref().unwrap_or_default(),
+            "{label}: stderr"
+        );
+    }
+
+    fn assert_native_and_reference_case(
+        label: &str,
+        source: impl Fn(&DifferentialFixture) -> String,
+        expected_redirected_output: Option<&[u8]>,
+    ) {
+        let native_fixture = DifferentialFixture::create(label);
+        let native_source = source(&native_fixture);
+        let native = NativeExecutor::default()
+            .execute_capture(&native_source)
+            .unwrap();
+        assert_eq!(
+            native_fixture.redirected_output().as_deref(),
+            expected_redirected_output,
+            "{label}: native redirected filesystem effect"
+        );
+
+        for shell in ["bash", "zsh"] {
+            if !shell_is_available(shell) {
+                eprintln!("skipping {shell} composition differential: executable is unavailable");
+                continue;
+            }
+            let reference_fixture = DifferentialFixture::create(label);
+            let reference_source = source(&reference_fixture);
+            let reference = reference_outcome(shell, &reference_source);
+            assert_same_outcome(label, &native, &reference);
+            assert_eq!(
+                reference_fixture.redirected_output().as_deref(),
+                expected_redirected_output,
+                "{label}: {shell} redirected filesystem effect"
+            );
+        }
+    }
 
     #[test]
     fn color_requires_a_terminal_and_no_color_must_be_absent() {
-        assert!(color_enabled(true, false));
-        assert!(!color_enabled(false, false));
-        assert!(!color_enabled(true, true));
+        assert!(color_enabled(true, false, false));
+        assert!(!color_enabled(false, false, false));
+        assert!(!color_enabled(true, true, false));
+        assert!(!color_enabled(true, false, true));
+    }
+
+    #[test]
+    fn term_dumb_disables_color_case_insensitively() {
+        assert!(is_dumb_terminal(Some("dumb")));
+        assert!(is_dumb_terminal(Some("DUMB")));
+        assert!(!is_dumb_terminal(Some("xterm-256color")));
+        assert!(!is_dumb_terminal(None));
     }
 
     #[test]
@@ -1271,8 +1459,12 @@ mod tests {
     }
 
     #[test]
-    fn every_cli_leaf_has_one_exact_catalog_contract() {
-        fn leaves(command: &clap::Command, prefix: &str, output: &mut Vec<String>) {
+    fn catalog_contracts_match_visible_clap_arguments_and_value_domains() {
+        fn leaves<'command>(
+            command: &'command clap::Command,
+            prefix: &str,
+            output: &mut Vec<(String, &'command clap::Command)>,
+        ) {
             for child in command
                 .get_subcommands()
                 .filter(|child| child.get_name() != "help")
@@ -1284,24 +1476,212 @@ mod tests {
                 {
                     leaves(child, &path, output);
                 } else {
-                    output.push(path);
+                    output.push((path, child));
                 }
             }
         }
 
-        let mut cli_leaves = Vec::new();
-        leaves(&Cli::command(), "quirl", &mut cli_leaves);
+        fn visible_option_names(argument: &clap::Arg) -> BTreeSet<String> {
+            argument
+                .get_long_and_visible_aliases()
+                .into_iter()
+                .flatten()
+                .map(|name| format!("--{name}"))
+                .chain(
+                    argument
+                        .get_short_and_visible_aliases()
+                        .into_iter()
+                        .flatten()
+                        .map(|name| format!("-{name}")),
+                )
+                .collect()
+        }
+
         let catalog = Catalog::builtin();
-        for path in cli_leaves {
-            let count = catalog
+        let mut cli_leaves = Vec::new();
+        let cli = Cli::command();
+        leaves(&cli, "quirl", &mut cli_leaves);
+        for (path, cli) in cli_leaves {
+            let contract = catalog
                 .commands
                 .iter()
-                .filter(|command| command.path == path)
-                .count();
+                .find(|command| command.path == path)
+                .unwrap_or_else(|| panic!("CLI leaf `{path}` has no exact catalog contract"));
+            let visible_arguments = cli
+                .get_arguments()
+                .filter(|argument| {
+                    !argument.is_hide_set()
+                        && !matches!(argument.get_action(), clap::ArgAction::Help)
+                })
+                .collect::<Vec<_>>();
+
+            let documented_options = contract
+                .options
+                .iter()
+                .filter(|argument| argument.kind != ArgumentKind::Positional)
+                .flat_map(|argument| argument.names.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            let clap_options = visible_arguments
+                .iter()
+                .filter(|argument| !argument.is_positional())
+                .flat_map(|argument| visible_option_names(argument))
+                .collect::<BTreeSet<_>>();
             assert_eq!(
-                count, 1,
-                "CLI leaf `{path}` must have one exact catalog entry"
+                documented_options, clap_options,
+                "catalog option names diverge from Clap for `{path}`"
             );
+
+            for argument in visible_arguments {
+                if argument.is_positional() {
+                    let id = argument.get_id().as_str();
+                    let mut matching = contract
+                        .options
+                        .iter()
+                        .filter(|documented| {
+                            documented.kind == ArgumentKind::Positional
+                                && documented.names.iter().any(|name| {
+                                    name.split('|')
+                                        .any(|candidate| candidate.eq_ignore_ascii_case(id))
+                                })
+                        })
+                        .collect::<Vec<_>>();
+                    if matching.is_empty() {
+                        let positionals = contract
+                            .options
+                            .iter()
+                            .filter(|documented| documented.kind == ArgumentKind::Positional)
+                            .collect::<Vec<_>>();
+                        if positionals.len() == 1 {
+                            matching = positionals;
+                        }
+                    }
+                    assert_eq!(
+                        matching.len(),
+                        1,
+                        "catalog must describe positional `{id}` for `{path}` exactly once"
+                    );
+                    let documented = matching[0];
+                    assert_eq!(
+                        documented.required,
+                        argument.is_required_set(),
+                        "catalog requiredness diverges for positional `{id}` on `{path}`"
+                    );
+                    assert_eq!(
+                        documented.repeatable,
+                        matches!(argument.get_action(), clap::ArgAction::Append),
+                        "catalog repeatability diverges for positional `{id}` on `{path}`"
+                    );
+                    assert!(
+                                contract.signature.contains(&documented.names[0]),
+                                "catalog signature `{}` omits its positional contract for `{id}` on `{path}`",
+                                contract.signature
+                            );
+                    continue;
+                }
+
+                let names = visible_option_names(argument);
+                let matching = contract
+                    .options
+                    .iter()
+                    .filter(|documented| {
+                        documented.kind != ArgumentKind::Positional
+                            && documented.names.iter().cloned().collect::<BTreeSet<_>>() == names
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "catalog must describe visible option(s) {names:?} for `{path}` exactly once"
+                );
+                let documented = matching[0];
+                let possible_values = matches!(
+                    argument.get_action(),
+                    clap::ArgAction::Set | clap::ArgAction::Append
+                )
+                .then(|| {
+                    argument
+                        .get_possible_values()
+                        .into_iter()
+                        .map(|value| value.get_name().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+                let catalog_values = match &documented.values {
+                    Some(CompletionSource::Static { values }) => values.iter().cloned().collect(),
+                    Some(CompletionSource::Dynamic { provider }) => panic!(
+                        "catalog option(s) {names:?} for `{path}` uses dynamic values `{provider}` but Clap exposes a fixed domain"
+                    ),
+                    None => BTreeSet::new(),
+                };
+                assert_eq!(
+                    catalog_values, possible_values,
+                    "catalog value domain diverges for option(s) {names:?} on `{path}`"
+                );
+                assert_eq!(
+                    documented.required,
+                    argument.is_required_set(),
+                    "catalog requiredness diverges for option(s) {names:?} on `{path}`"
+                );
+                assert_eq!(
+                    documented.repeatable,
+                    matches!(argument.get_action(), clap::ArgAction::Append),
+                    "catalog repeatability diverges for option(s) {names:?} on `{path}`"
+                );
+                assert!(
+                    names.iter().all(|name| contract.signature.contains(name)),
+                    "catalog signature `{}` omits option(s) {names:?} for `{path}`",
+                    contract.signature
+                );
+            }
         }
+    }
+
+    #[test]
+    fn native_executor_matches_bash_and_zsh_for_frozen_c1_composition_fixtures() {
+        assert_native_and_reference_case(
+            "quoting-and-byte-pipe",
+            |_| "printf '%s' 'hello world' | tr a-z A-Z".to_owned(),
+            None,
+        );
+        assert_native_and_reference_case(
+            "boolean-short-circuit",
+            |_| {
+                "sh -c 'printf left; printf left-error >&2; exit 7' && printf no || sh -c 'printf recovered; printf recovered-error >&2'"
+                    .to_owned()
+            },
+            None,
+        );
+        assert_native_and_reference_case(
+            "stderr-and-status",
+            |_| "sh -c 'printf error >&2; exit 7'".to_owned(),
+            None,
+        );
+        assert_native_and_reference_case(
+            "output-and-append-redirect",
+            |fixture| {
+                format!(
+                    "printf first > {} && printf second >> {}",
+                    fixture.path("output"),
+                    fixture.path("output")
+                )
+            },
+            Some(b"firstsecond"),
+        );
+        assert_native_and_reference_case(
+            "input-redirect",
+            |fixture| format!("cat < {}", fixture.path("input")),
+            None,
+        );
+
+        let variable = format!(
+            "QUIRL_C1_DIFFERENTIAL_{}",
+            NEXT_DIFFERENTIAL_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        );
+        assert_native_and_reference_case(
+            "export-assignment",
+            |_| format!("export {variable}=value && printenv {variable}"),
+            None,
+        );
+        std::env::remove_var(variable);
     }
 }

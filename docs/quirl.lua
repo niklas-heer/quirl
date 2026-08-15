@@ -6,6 +6,7 @@
 ---@field error? string
 
 ---@class quirl.Config
+---@field schema_version integer
 ---@field editor table
 ---@field picker table
 ---@field prompt table
