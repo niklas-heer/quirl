@@ -645,10 +645,10 @@ These are targets, not current benchmark claims. Each release records cold/warm 
 | Phase | Status | Deliverable |
 | --- | --- | --- |
 | 0 | **Complete** | Lua runtime and generated SDK views; config validation; atomic live config/plugin reload; applied editor/prompt/picker settings; live prompt/completion callbacks; resource budgets; command graph; mode switch; focused native data grammar; C0 execution; byte pipes; built-in `ls`; error spans. |
-| 1 | Preview | Job control, redirects, indexed completions, Zsh/Bash/Fish and help/man ingestion, history/file/action picker, adaptive prompt, typed config forms with web/TUI views, C1 subset, structured core commands, plain fallbacks, Linux/macOS. |
-| 2 | Scriptable | Lua scripts and computed config, `quirl run`, formatter, annotation-aware checker, linter, tests, docs, language service, agent catalog/validation formats, package manifests, generated host API, deterministic tests. |
-| 3 | Platform | Trusted-language and Wasm SDKs, permissions/lockfile, catalog/completion/UI/event extension points, Bash/Zsh runners, directory/process panels, live pipelines, Windows job control, recovery. |
-| 4 | 1.0 | Freeze versioned grammar, command catalog, completion/picker protocols, agent schema, runner/plugin APIs, config schema/migration, performance gates, security/accessibility audits, compatibility matrix. |
+| 1 | **Accepted · Preview** | Job control, redirects, indexed completions, Zsh/Bash/Fish and help/man ingestion, history/file/action picker, adaptive prompt, typed config forms with web/TUI views, C1 subset, structured core commands, plain fallbacks, Linux/macOS. |
+| 2 | **Complete · Scriptable** | Lua scripts and computed config, `quirl run`, formatter, annotation-aware checker, linter, tests, docs, language service, agent catalog/validation formats, package manifests, generated host API, deterministic tests. |
+| 3 | **Accepted · Platform** | Trusted-language and isolated-plugin contracts, permissions/lockfile, catalog/completion/UI/event extension points, Bash/Zsh runners, directory/process panels, bounded live sampling, Windows process lifecycle, recovery. |
+| 4 | **Implemented · Review candidate** | Reviewed protocol identities and migrations, command/catalog parity, compatibility dispositions and differential evidence, performance gates, security/accessibility audits. Explicitly deferred contracts remain outside the 1.0 promise. |
 
 ### Phase 1 acceptance gates
 
@@ -679,6 +679,88 @@ list:
 
 Every gate lands with catalog metadata, diagnostics, keyboard navigation,
 and accessible text output, per the release criterion in §10.
+
+### Phase 2 acceptance evidence
+
+- **One script entry point.** `quirl run` selects Lua or the line-oriented
+  `.quirl` grammar by explicit `--lang`, shebang, or extension, accepts stdin,
+  preserves Lua resource policy, and reports labeled native command/data
+  failures. Unsupported Bash/Zsh runners remain an explicit Phase 3 surface.
+- **Deterministic authoring tools.** `fmt`, `check`, `lint`, and `test` accept
+  files or deterministic project discovery. They skip build/VCS directories
+  and symlink directories, aggregate every diagnostic, never execute checks,
+  and isolate test modules under the script policy.
+- **Generated knowledge.** `new`, `describe`, and `doc` use checked templates
+  and the semantic catalog. Lua annotations, editor completion, hover,
+  signatures, module docs, runtime bindings, and SDK output derive from the
+  same `HOST_API` definitions.
+- **Language service.** `quirl lsp` implements a bounded stdio LSP subset with
+  UTF-16 positions and deterministic document state. Lua diagnostics compile
+  and lint without invoking chunks; `.quirl` intelligence consumes the loaded
+  catalog without executing commands.
+- **Agent and package contracts.** Versioned deny-unknown documents carry
+  installed versions, named schema/content hashes, capabilities, validators,
+  and token-budgeted context. Package builds enforce public-command metadata,
+  entry/version/capability constraints, and reproducible output;
+  `publish --dry-run` proves that no registry or network action occurs.
+- **Evidence stays executable.** In-crate protocol, policy, schema,
+  determinism, traversal, quality-gate, and tamper tests run under the canonical
+  `mask check`, alongside the generated-SDK exactness and guest Lua suite.
+
+### Phase 3 acceptance evidence
+
+- **Permission lock is runtime authority.** Managed trusted-Lua plugins load
+  only when enabled, integrity-checked, and granted the exact locked
+  capabilities. Lifecycle writes are versioned, validated, flushed, recoverable,
+  and reject permission or source drift.
+- **Extension protocols are composed.** Versioned immutable events and typed
+  actions cover the execution lifecycle. Catalog, completion, and panel
+  contributions reach real consumers through deny-unknown, terminal-safe
+  boundaries with deadlines, collision checks, and failure isolation.
+- **Portable isolation is honest.** Wasm components and out-of-process adapters
+  have bounded, versioned validation contracts. The CLI refuses to enable them
+  until an executing isolated adapter exists; the checked-in WIT world and its
+  hash bind the future implementation without claiming one today.
+- **Platform processes and recovery are bounded.** Bash/Zsh runners preserve
+  arguments, environment, status, cancellation, and fixed-size output windows.
+  Recovery is versioned, atomic, quota-limited, terminal-safe in text mode, and
+  retains exact stored values in JSON.
+- **Windows has a native lifecycle backend.** Cross-target checks exercise byte
+  pipelines, redirects, boolean graphs, jobs, foregrounding, cancellation, and
+  Job Object tree containment. Windows suspend and native terminal handoff stay
+  explicit 1.0 work pending tests on a Windows host.
+- **Evidence stays executable.** The canonical `mask check` covers metadata
+  quality, capability smuggling, event ordering and action grants, contribution
+  composition, output and recovery bounds, terminal controls, plugin tampering,
+  runners, panels, watch cancellation, and generated-SDK exactness.
+
+### Phase 4 review evidence
+
+- **Contract changes are reviewable.** A checked-in golden manifest binds the
+  grammar matrix, catalog, picker/completion shapes, agent/package documents,
+  runner, plugin/WIT, events, config, and recovery contracts to named versions,
+  hashes, reader policies, and migration ranges. Future or expired documents
+  fail closed; every readable legacy version has deterministic migration tests.
+- **CLI and semantic metadata agree.** Composition tests recursively compare
+  every visible Clap leaf's options, positionals, requiredness, repeatability,
+  fixed value domains, and signature with the exact catalog contract.
+- **Compatibility evidence executes both sides.** The frozen matrix gives every
+  C0/C1/C2 form a native, reference-runner, or explicitly deferred disposition.
+  Composition tests compare Quirl's status, stdout, stderr, and redirected file
+  effects with Bash and Zsh for the supported native subset.
+- **Release budgets are enforced.** A named-hardware PTY harness measures 101
+  fresh processes for cold-to-editable P50, keystroke-to-frame P95, and first
+  prompt P95; production live-buffer retention proves O(window), and the exact
+  stripped release binary is checked against its size budget.
+- **Security and accessibility claims are adversarial.** Bounds, symlink and
+  path containment, capability smuggling, cancellation, hostile C0/C1 terminal
+  text, JSON semantic preservation, `NO_COLOR`, `TERM=dumb`, plain fallbacks,
+  and private recovery storage have executable tests and a checked-in audit.
+- **The remaining line is explicit.** Non-executing isolated adapters, native
+  Windows terminal/suspend validation, full native C1 and interactive C2 islands,
+  and versioned asynchronous picker/completion envelopes remain review blockers
+  before Quirl may claim the 1.0 contract; this Phase 4 checkpoint does not hide
+  them behind a successful test suite.
 
 ## 14. Review decisions
 

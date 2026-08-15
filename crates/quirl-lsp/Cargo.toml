@@ -1,0 +1,19 @@
+[package]
+name = "quirl-lsp"
+description = "Deterministic language services for Quirl and its Lua API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+quirl-catalog = { path = "../quirl-catalog" }
+quirl-core = { path = "../quirl-core" }
+quirl-lua = { path = "../quirl-lua" }
+quirl-syntax = { path = "../quirl-syntax" }
+serde.workspace = true
+serde_json.workspace = true

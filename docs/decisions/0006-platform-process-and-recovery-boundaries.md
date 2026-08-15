@@ -1,0 +1,86 @@
+# ADR 0006: Platform process and recovery boundaries
+
+- Status: Accepted
+- Date: 2026-08-15
+- Extends: [ADR 0003](0003-preview-runtime-layers.md), [ADR 0005](0005-plugin-platform-layer.md)
+
+## Context
+
+Phase 3 requires native process lifecycle behavior on Unix and Windows without
+making the CLI conditional on operating-system details. It also requires
+recoverable command failures. Process handles and terminal ownership belong in
+the process layer, while persistence paths and user-facing recovery commands
+belong at the CLI composition root. Recovery files can accidentally become a
+second secret store if command text, environment changes, or captured output
+are persisted verbatim.
+
+Reference Bash and Zsh execution is a separate compatibility bridge. It must
+select an explicit interpreter, avoid user startup files, and keep the stable
+`quirl run` result contract rather than silently routing native Quirl syntax
+through a login shell.
+
+## Decision
+
+`quirl-process` exports one `ProcessBackend` contract and one platform-selected
+`NativeExecutor`. The Unix backend retains process groups, terminal handoff,
+signals, stopped jobs, foreground/background transitions, pipes, and
+redirections. The Windows backend uses native child handles for foreground and
+background lifecycle, connects external commands with byte pipes, applies file
+redirections itself, and contains every spawned pipeline in a kill-on-close
+Windows Job Object. Explicit cancellation terminates the whole assigned job;
+normal foregrounding and job listing use the same portable states as Unix.
+Windows suspension remains explicitly unsupported because Windows has no Unix
+process-group or Ctrl-Z contract. Portable lifecycle and execution contracts
+are modeled and tested independently of the host backend.
+
+The Job Object wrapper is the only unsafe process boundary. It owns one
+non-null Win32 handle, passes live borrowed process handles to assignment, uses
+the exact extended-limit structure size, and closes its handle once. Children
+are assigned immediately after `std::process::Command::spawn`. That API cannot
+create the process suspended while also exposing the primary thread handle, so
+there is a narrow race in which a program could create a descendant before the
+parent is assigned. Once assignment succeeds, descendants inherit containment.
+Assignment failure kills and reaps the direct child rather than continuing
+without containment. Removing the race would require a larger native
+`CreateProcessW(CREATE_SUSPENDED)` spawning implementation and is deferred.
+
+`quirl run` invokes `bash --noprofile --norc` or `zsh -f` for explicitly
+selected reference scripts. It removes environment hooks that can source
+startup files, inherits the current directory, environment, and standard
+input, forwards arguments, captures both output streams concurrently, reports
+the exact status, and maps interpreter syntax failures and missing executables
+to labeled `ShellError` values. SIGINT becomes the runner's cancellation token
+for the duration of a reference script. Each output stream is continuously
+drained but retains at most 64 KiB and reports the exact discarded byte count.
+On Windows, the reference interpreter uses the same kill-on-close Job Object
+containment primitive as native background jobs; on Unix it uses a process
+group.
+
+The CLI owns a versioned recovery journal. Failed `quirl exec` invocations are
+captured and written with create-write-sync-rename semantics. Snapshots contain
+the redacted command, working directory, environment diff, bounded standard
+output and error, duration, status, and serialized error chain. Environment
+keys that look like credentials are never stored with their values, known
+credential values are removed from all text fields, captures are bounded, and
+snapshot IDs cannot escape the journal directory. Command text, cwd, and the
+session-relative environment are captured before execution; redaction retains
+original whitespace and quoting around replaced values. The journal keeps at
+most 32 snapshots and 4 MiB, refuses snapshots above 256 KiB before reading or
+writing them, and prunes oldest files after atomic installation. Text views
+visibly escape ANSI, OSC, carriage-return, and C1 controls, while JSON retains
+the exact stored strings under normal JSON escaping. `quirl recover list` and
+`quirl recover show` are read-only surfaces; replay remains an explicit future
+decision because it can repeat destructive effects.
+
+## Consequences
+
+- Unix job-control behavior remains unchanged behind a portable interface.
+- Windows cross-compiles against a native lifecycle backend with external byte
+  pipelines, redirects, foreground/background jobs, listing, foregrounding,
+  cancellation, and Job Object tree cleanup. Suspend/resume and terminal
+  ownership remain explicitly unsupported.
+- Bash and Zsh runners are exact-dialect bridges with no implicit user RC.
+- A failure to write recovery data emits a warning but never replaces the
+  command's original status or `ShellError`.
+- Recovery is intentionally CLI-owned and does not add filesystem dependencies
+  to foundation or process crates.

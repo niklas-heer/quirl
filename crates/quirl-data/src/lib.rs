@@ -2,7 +2,12 @@
 
 use quirl_core::{directory_entries, ErrorCode, ShellError};
 use serde_json::{Map, Value};
-use std::{cmp::Ordering, fs, path::PathBuf};
+use std::{
+    cmp::Ordering,
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
 
 #[derive(Debug, Default)]
 pub struct DataRuntime;
@@ -13,15 +18,38 @@ impl DataRuntime {
     }
 
     pub fn eval(&self, source: &str) -> Result<Value, ShellError> {
+        self.eval_with_cancellation(source, &AtomicBool::new(false))
+    }
+
+    pub fn eval_with_cancellation(
+        &self,
+        source: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<Value, ShellError> {
         let stages = split_pipeline(source)?;
         let Some((first, transforms)) = stages.split_first() else {
             return Ok(Value::Null);
         };
+        check_cancelled(cancelled)?;
         let mut value = evaluate_source(first)?;
         for transform in transforms {
+            check_cancelled(cancelled)?;
             value = apply_transform(value, transform)?;
         }
+        check_cancelled(cancelled)?;
         Ok(value)
+    }
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), ShellError> {
+    if cancelled.load(AtomicOrdering::Relaxed) {
+        Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "typed data evaluation was cancelled",
+        )
+        .with_help("Retry the pipeline when cancellation is no longer requested"))
+    } else {
+        Ok(())
     }
 }
 
@@ -718,5 +746,14 @@ mod tests {
             .eval(r#"[{"value":1},{"value":"one"}] | sort value"#)
             .is_err());
         assert!(runtime.eval("[1,2 | length").is_err());
+    }
+
+    #[test]
+    fn cancellation_stops_between_typed_pipeline_stages() {
+        let cancelled = AtomicBool::new(true);
+        let error = DataRuntime::new()
+            .eval_with_cancellation("[1,2,3] | length", &cancelled)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
     }
 }

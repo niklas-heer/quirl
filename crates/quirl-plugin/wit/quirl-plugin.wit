@@ -1,0 +1,56 @@
+package quirl:plugin@0.1.0;
+
+interface types {
+  variant value {
+    nothing,
+    boolean(bool),
+    integer(s64),
+    float(f64),
+    text(string),
+    string-list(list<string>),
+  }
+
+  record shell-error {
+    code: string,
+    message: string,
+    context: list<string>,
+    help: list<string>,
+  }
+
+  record event {
+    schema-version: u32,
+    sequence: u64,
+    kind: string,
+    payload: value,
+  }
+
+  record contribution {
+    kind: string,
+    name: string,
+    schema-version: u32,
+    value: value,
+  }
+
+  variant action-result {
+    ok(value),
+    error(shell-error),
+  }
+}
+
+interface host {
+  use types.{event, contribution, action-result};
+  emit-diagnostic: func(message: string);
+  publish-contribution: func(value: contribution) -> action-result;
+  observe-event: func(value: event) -> action-result;
+}
+
+interface guest {
+  use types.{event, action-result};
+  initialize: func() -> action-result;
+  handle-event: func(value: event) -> action-result;
+}
+
+world api {
+  import host;
+  export guest;
+}

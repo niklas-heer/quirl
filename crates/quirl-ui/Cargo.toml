@@ -16,5 +16,8 @@ nu-ansi-term.workspace = true
 quirl-catalog = { path = "../quirl-catalog" }
 quirl-core = { path = "../quirl-core" }
 quirl-lua = { path = "../quirl-lua" }
+quirl-picker = { path = "../quirl-picker" }
 quirl-syntax = { path = "../quirl-syntax" }
 reedline = { workspace = true, features = ["helix"] }
+serde.workspace = true
+serde_json.workspace = true

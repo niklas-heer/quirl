@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod preview;
+
 const COLD_SAMPLES: usize = 40;
 const EVAL_SAMPLES: usize = 400;
 const WARM_SAMPLES: usize = 10_000;
@@ -44,6 +46,11 @@ struct Measurement {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    match std::env::args().nth(1).as_deref() {
+        Some("preview") => return preview::run(false),
+        Some("release") => return preview::run(true),
+        _ => {}
+    }
     let fennel_path = argument_value("--fennel")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("QUIRL_FENNEL_LUA").map(PathBuf::from));

@@ -1,0 +1,93 @@
+# Plugin platform v0.1
+
+Quirl's first platform contract installs local plugin packages under an
+explicit permission lock. It is a Phase 3 vertical slice, not a claim that all
+Phase 3 deliverables are complete.
+
+## Lifecycle
+
+```sh
+quirl plugin add ./my-plugin --allow commands.register
+quirl plugin permissions my-plugin
+quirl plugin doctor my-plugin
+quirl plugin disable my-plugin
+quirl plugin enable my-plugin
+quirl plugin update --locked
+quirl plugin remove my-plugin
+```
+
+Set `QUIRL_PLUGIN_HOME` to override the state directory. Otherwise Quirl uses
+`$XDG_CONFIG_HOME/quirl/plugins` or `~/.config/quirl/plugins`. Every command
+supports `--format json` for stable machine output.
+
+`add` accepts a local directory, `plugin.toml`, or `file:` path. Platform v0.1
+does not fetch GitHub or registry sources: fetch them explicitly, inspect the
+content, and add the local result. Requested permissions must be sorted and
+each new permission must be repeated as `--allow`. The lock records requested
+and granted permissions separately, source identity, resolved API, runtime,
+enabled state, runtime/WIT schema hash, and SHA-256 manifest/entry/source
+checksums. Lock schema v2 binds portable components to the checked-in WIT
+world instead of trusting a manifest world string alone.
+New additions remain disabled until `plugin enable` repeats integrity and
+runtime-boundary checks.
+
+Mutations build and validate a complete candidate lock before writing and
+flushing a temporary file, syncing the state directory, and atomically
+replacing the current file. The previous lock is moved to
+`plugins.lock.json.bak`; failed replacement attempts restore it. A corrupt or
+incompatible lock is never silently overwritten. `remove` removes only the
+lock entry and never deletes source.
+`update --locked` verifies all local sources and rejects version, checksum,
+API, or permission changes.
+
+## Manifest
+
+Plugin manifests are deny-unknown TOML with `schema_version = 1`. The
+`[plugin]` table declares name, version, relative entry, Quirl range, exact
+plugin API (`0.1.0`), runtime, and summary. `[capabilities]` lists sorted
+requested grants. `[contributes]` lists sorted commands, completions, events,
+panels, and indexers. Every command has a matching complete
+`[[public_commands]]` contract.
+
+Contribution authority is explicit: commands need `commands.register`,
+completions need `completion.register`, events need `events.observe`, panels
+need `ui.panel`, and indexers need `catalog.register`; panels and indexers also
+need the registration handle `extension.contribute`. Scoped process
+permissions use forms such as `process.spawn:kubectl`.
+Unknown capability names are rejected in both manifests and locks. Only
+`process.spawn:<relative-executable>` and
+`filesystem.read/write:<package-relative-path>` accept scopes; control
+characters, traversal, absolute paths, and shell syntax are invalid. A scoped
+process handle accepts one physical command/argv line and rejects shell
+operators, tabs, and newlines before the shell-backed runner is reached.
+
+## Runtime boundaries
+
+Trusted Lua uses the pinned restricted Lua 5.4 runtime. Managed runtimes are
+constructed with exactly the granted capability strings. Host registration
+values are deny-unknown Rust schemas; command metadata is typed and complete;
+callbacks retain instruction, memory, cancellation, and deadline enforcement.
+Manifest command contributions must exactly match Lua registrations.
+The interactive extension host reads the same managed lock, integrity-checks
+every enabled trusted-Lua source, ignores disabled entries, and constructs each
+VM with exactly that entry's granted capabilities. It does not implicitly load
+unmanaged `plugins/*.lua` files. Explicit legacy check/test constructors remain
+registration-only and never receive process authority.
+
+Wasm platform v0.1 is deliberately non-executing. It verifies an actual
+component with the maintained `wasmparser` validator, parses a nonempty
+component type section, requires the exact host import and guest export named by
+[`quirl-plugin.wit`](../crates/quirl-plugin/wit/quirl-plugin.wit), binds that
+WIT world's hash into the lock, and enforces explicit memory, fuel, and callback
+budgets. The non-executing validator does not claim generated Rust bindings or
+full WIT structural type equivalence; selecting an execution adapter must add
+that proof. It does not claim to execute components, and the CLI refuses to mark
+one enabled until an isolated adapter exists. The
+out-of-process adapter contract likewise validates protocol
+`quirl.plugin.v1`, a package-relative executable, message bound, and callback
+deadline without spawning it. A future runtime implementation must preserve
+the same value/catalog/capability model and isolate crashes from the shell.
+
+`doctor` verifies locked checksums and the runtime/WIT schema hash, then
+validates the declared runtime boundary. Any mismatch prevents enablement and
+returns actionable text/JSON diagnostics.

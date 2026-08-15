@@ -113,9 +113,11 @@ The initial vertical slice landed with this decision:
 - Memory, instruction, wall-clock, and cancellation checks protect the VM.
 - Configuration is deserialized into Rust schemas, and a failed reload leaves the
   last-known-good configuration unchanged.
-- Interactive sessions fingerprint `config.lua` and sorted `plugins/*.lua`, build
-  a complete candidate generation in fresh restricted VMs, and atomically swap it
-  only after every file validates. Unchanged failures are reported once.
+- Interactive sessions fingerprint `config.lua`, the managed plugin lock, and
+  enabled integrity-checked plugin sources. They build a complete candidate
+  generation in fresh VMs with exactly the locked grants and atomically swap it
+  only after every source validates. Unchanged failures are reported once;
+  unmanaged directory loading is limited to explicit legacy/test constructors.
 - Registered prompt and completion callbacks remain in persistent VMs and feed
   the live Reedline prompt and IDE completion menu through typed Rust adapters.
 - Validated editor keymap, semantic highlighting, picker, and prompt composition
