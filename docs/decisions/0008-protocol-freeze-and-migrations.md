@@ -58,5 +58,6 @@ authoritative validation. Future versions always fail closed.
   Command grammar remains a documented preview subset; completion and picker
   currently freeze their Rust shapes rather than full asynchronous envelopes;
   runner output remains text-shaped; Wasm remains non-executing and its full WIT
-  structural binding is pending. Performance, security, accessibility, and C1
+  structural binding is pending, while the separate process-adapter v1
+  initialization handshake is executable. Performance, security, accessibility, and C1
   compatibility evidence remain separate release gates.

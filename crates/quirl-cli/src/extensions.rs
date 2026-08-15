@@ -8,6 +8,7 @@ use quirl_plugin::{
     doctor_plugin, normalize_plugin_commands, parse_plugin_manifest, validate_plugin_manifest,
     LockedPlugin, PluginLockfile, PluginRuntime, PLUGIN_LOCK_FILE,
 };
+use quirl_process::sandboxed_process_host;
 use quirl_syntax::Mode;
 use quirl_ui::{ExtensionCompleter, ExtensionSuggestion, PanelModel};
 use serde::Deserialize;
@@ -103,6 +104,7 @@ enum PluginSource {
 #[derive(Debug, Clone)]
 struct PluginCandidate {
     path: PathBuf,
+    runtime: PluginRuntime,
     grants: Vec<String>,
     catalog_commands: Vec<CommandSpec>,
 }
@@ -594,11 +596,26 @@ impl LuaExtensionHost {
         let mut contributions = Vec::new();
         let mut managed_commands = Vec::new();
         for plugin in &snapshot.plugins {
-            let runtime = LuaRuntime::new_with_capabilities(LuaPolicy::config(), &plugin.grants)?;
-            let registrations = runtime.load_plugin_file(&plugin.path)?;
-            contributions.extend(registrations.contributions);
             managed_commands.extend(plugin.catalog_commands.clone());
-            plugin_runtimes.push(runtime);
+            if plugin.runtime == PluginRuntime::TrustedLua {
+                let mut policy = LuaPolicy::config();
+                policy.allow_process = plugin
+                    .grants
+                    .iter()
+                    .any(|grant| grant == "process.spawn" || grant.starts_with("process.spawn:"));
+                let runtime = if policy.allow_process {
+                    LuaRuntime::new_with_capabilities_and_process_host(
+                        policy,
+                        &plugin.grants,
+                        Some(sandboxed_process_host()),
+                    )?
+                } else {
+                    LuaRuntime::new_with_capabilities(policy, &plugin.grants)?
+                };
+                let registrations = runtime.load_plugin_file(&plugin.path)?;
+                contributions.extend(registrations.contributions);
+                plugin_runtimes.push(runtime);
+            }
         }
         validate_contribution_set(&contributions)?;
         Ok((
@@ -697,6 +714,7 @@ fn snapshot_legacy_plugin_paths(
             .cloned()
             .map(|path| PluginCandidate {
                 path,
+                runtime: PluginRuntime::TrustedLua,
                 grants: grants.clone(),
                 catalog_commands: Vec::new(),
             })
@@ -759,15 +777,15 @@ fn managed_plugin_candidate(
     locked: &LockedPlugin,
     fingerprints: &mut Vec<(PathBuf, FileFingerprint)>,
 ) -> Result<PluginCandidate, ShellError> {
-    if locked.runtime != PluginRuntime::TrustedLua {
+    if locked.runtime == PluginRuntime::WasmComponent {
         return Err(ShellError::new(
             ErrorCode::Validation,
             format!(
-                "enabled plugin `{}` has no executable runtime adapter",
+                "enabled plugin `{}` has no executable Wasm component runtime",
                 locked.name
             ),
         )
-        .with_help("Disable it until its Wasm or out-of-process adapter is installed"));
+        .with_help("Disable it until a component runtime is installed"));
     }
     let manifest_path = managed_manifest_path(&locked.source)?;
     fingerprints.push((manifest_path.clone(), fingerprint_file(&manifest_path)?));
@@ -845,10 +863,19 @@ fn managed_plugin_candidate(
         .with_help("Run `quirl plugin doctor` and restore the locked source before activation"));
     }
     validate_plugin_manifest(&manifest, &entry_bytes, env!("CARGO_PKG_VERSION"))?;
+    if locked.runtime == PluginRuntime::OutOfProcess {
+        crate::plugin::execute_out_of_process_adapter(
+            &manifest,
+            &entry_path,
+            &locked.granted_capabilities,
+            None,
+        )?;
+    }
     let catalog_commands =
         normalize_plugin_commands(&manifest, &locked.source, &locked.source_checksum)?;
     Ok(PluginCandidate {
         path: entry_path,
+        runtime: locked.runtime,
         grants: locked.granted_capabilities.clone(),
         catalog_commands,
     })

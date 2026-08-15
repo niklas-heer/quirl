@@ -52,7 +52,7 @@ Compatibility, structured data, rich UI, and a real extension language pull in d
 
 > **Product anchor: Helix’s coherence, Bun’s completeness.** Quirl ships one deliberately integrated workflow: install one binary and immediately get editing, completion, fuzzy discovery, prompt context, structured tools, scripting, testing, formatting, documentation, and configuration. “Batteries included” means designed together and supported together—not a bundle of unrelated replacements for every Unix tool.
 
-> **Name decision: Quirl.** A *Quirl* is a German kitchen whisk—roughly pronounced “kvirl”—from a word family associated with turning and stirring. Product name: **Quirl**; binary: `quirl`; native data scripts: `.quirl`; extension scripts and configuration: `.lua`; environment prefix: `QUIRL_`.
+> **Name decision: Quirl.** A *Quirl* is a German kitchen whisk—roughly pronounced “kvirl”—from a word family associated with turning and stirring. Product name: **Quirl**; binary: `quirl`; native scripts: canonical `.qrl` (with readable `.quirl` and novelty `.🌀` input aliases); Lua scripts and configuration: `.lua`; environment prefix: `QUIRL_`.
 
 ## 3. Interaction model
 
@@ -118,7 +118,7 @@ Quirl imports existing definitions at index time and records source and confiden
 | Bash completions | Read `complete -p`; instrument common helpers and capture candidate metadata | Never implicitly source user RC files; sandbox dynamic functions |
 | Fish completions | Import declarative `complete` definitions and descriptions | High-confidence translation; worker for dynamic values |
 | Help and man pages | Parse usage, headings, options, subcommands, defaults, enums, examples | Heuristic, labeled with provenance and confidence |
-| Project manifests | Cargo, package scripts, task runners, containers, project-local `.quirl` commands | Scoped to the trusted project root |
+| Project manifests | Cargo, package scripts, task runners, containers, project-local `.qrl` commands | Scoped to the trusted project root |
 
 ```sh
 quirl index build                  # scan PATH and project sources
@@ -183,7 +183,8 @@ quirl serve mcp --capabilities catalog,complete,check,format
 ### The complete authoring toolchain ships with the shell
 
 ```sh
-quirl new automation --lang lua
+quirl new script
+quirl new script --lang quirl
 quirl check src/main.lua
 quirl run src/main.lua
 quirl fmt .
@@ -391,7 +392,7 @@ quirl run --lang zsh release.zsh
 | Script kind | Execution model | Status |
 | --- | --- | --- |
 | `.lua` | Pinned Lua 5.4 through `mlua`; generated annotations/bindings; restricted modules and explicit capabilities | Core commitment |
-| `.quirl` | Focused command/data automation lowered to the shared execution plan | Core commitment |
+| `.qrl` | Focused command/data automation lowered to the shared execution plan; `.quirl` and `.🌀` are input aliases | Core commitment |
 | `.luau` / `.rhai` / `.ts` | Measured alternatives; no second core SDK or config ecosystem | Research or future optional runners |
 | `.fnl` | Compile to cached Lua, then use the Lua engine and same host adapter | Companion to Lua |
 | `.py` | Optional PocketPy with explicit compatibility manifest; never presented as full CPython | Research candidate |
@@ -683,7 +684,8 @@ and accessible text output, per the release criterion in §10.
 ### Phase 2 acceptance evidence
 
 - **One script entry point.** `quirl run` selects Lua or the line-oriented
-  `.quirl` grammar by explicit `--lang`, shebang, or extension, accepts stdin,
+  native Quirl grammar by explicit `--lang`, shebang, or extension. `.qrl` is
+  canonical; `.quirl` and `.🌀` are accepted aliases. It accepts stdin,
   preserves Lua resource policy, and reports labeled native command/data
   failures. Unsupported Bash/Zsh runners remain an explicit Phase 3 surface.
 - **Deterministic authoring tools.** `fmt`, `check`, `lint`, and `test` accept
@@ -696,7 +698,7 @@ and accessible text output, per the release criterion in §10.
   same `HOST_API` definitions.
 - **Language service.** `quirl lsp` implements a bounded stdio LSP subset with
   UTF-16 positions and deterministic document state. Lua diagnostics compile
-  and lint without invoking chunks; `.quirl` intelligence consumes the loaded
+  and lint without invoking chunks; native Quirl intelligence consumes the loaded
   catalog without executing commands.
 - **Agent and package contracts.** Versioned deny-unknown documents carry
   installed versions, named schema/content hashes, capabilities, validators,
