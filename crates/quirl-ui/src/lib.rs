@@ -1208,7 +1208,7 @@ impl CompletionWorker {
             .store(request.request_id, Ordering::Release);
         self.requests
             .as_ref()
-            .ok_or_else(|| unavailable_completion_worker())?
+            .ok_or_else(unavailable_completion_worker)?
             .send(request)
             .map_err(|_| unavailable_completion_worker())
     }
