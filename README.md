@@ -193,6 +193,10 @@ Quirl is early and moving fast; the architecture decision records in
 and what's still open. Issues and discussion are welcome while the design
 solidifies.
 
+[`mask`](https://github.com/jacobdeichert/mask) is the local task runner.
+Run `mask check` before every commit; it is the canonical quality gate while
+the project deliberately operates without CI.
+
 ## License
 
 Quirl is licensed under the [MIT License](LICENSE).

@@ -88,6 +88,9 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
 
 ## Process
 
+- `mask check` is the canonical local quality gate and must pass before every
+  commit. Do not add CI workflows; local mask tasks deliberately replace CI
+  while project traffic is low.
 - Conventional commits (`feat`, `fix`, `docs`, `refactor`, `chore`, `bench`),
   present tense, optionally scoped, e.g. `feat(lua): add completion budgets`.
 - Significant design choices go through an ADR in `docs/decisions/`.
