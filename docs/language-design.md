@@ -717,10 +717,11 @@ and accessible text output, per the release criterion in §10.
   actions cover the execution lifecycle. Catalog, completion, and panel
   contributions reach real consumers through deny-unknown, terminal-safe
   boundaries with deadlines, collision checks, and failure isolation.
-- **Portable isolation is honest.** Wasm components and out-of-process adapters
-  have bounded, versioned validation contracts. The CLI refuses to enable them
-  until an executing isolated adapter exists; the checked-in WIT world and its
-  hash bind the future implementation without claiming one today.
+- **Portable isolation is honest.** Out-of-process adapters execute the bounded,
+  versioned `quirl.plugin.v1` initialization handshake with an exact scoped
+  launch grant, deny-unknown messages, output/deadline limits, and containment.
+  Wasm components remain validated but disabled until a component runtime is
+  selected; the checked-in WIT world and its hash bind that future work.
 - **Platform processes and recovery are bounded.** Bash/Zsh runners preserve
   arguments, environment, status, cancellation, and fixed-size output windows.
   Recovery is versioned, atomic, quota-limited, terminal-safe in text mode, and
@@ -757,10 +758,11 @@ and accessible text output, per the release criterion in §10.
   text, JSON semantic preservation, `NO_COLOR`, `TERM=dumb`, plain fallbacks,
   and private recovery storage have executable tests and a checked-in audit.
 - **The remaining line is explicit.** Non-executing isolated adapters, native
-  Windows terminal/suspend validation, full native C1 and interactive C2 islands,
-  and versioned asynchronous picker/completion envelopes remain review blockers
-  before Quirl may claim the 1.0 contract; this Phase 4 checkpoint does not hide
-  them behind a successful test suite.
+  Windows terminal/suspend validation, and full native C1 and interactive C2
+  islands remain review blockers before Quirl may claim the 1.0 contract. The
+  versioned asynchronous picker/completion envelopes are frozen separately with
+  bounded worker, cancellation, deadline, and stale-result evidence; this Phase
+  4 checkpoint does not hide the remaining work behind a successful test suite.
 
 ## 14. Review decisions
 

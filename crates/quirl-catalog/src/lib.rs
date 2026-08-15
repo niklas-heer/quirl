@@ -6,8 +6,11 @@ use std::collections::BTreeMap;
 pub const CATALOG_SCHEMA_VERSION: u32 = 4;
 pub const CATALOG_OLDEST_READABLE_VERSION: u32 = 2;
 pub const COMPLETION_PROTOCOL_VERSION: u32 = 1;
+pub const MAX_COMPLETION_QUERY_BYTES: usize = 4 * 1024;
+pub const MAX_COMPLETION_RESULTS: usize = 1_000;
+pub const MAX_COMPLETION_DEADLINE_MS: u64 = 250;
 pub const CATALOG_SCHEMA_DESCRIPTOR: &str = "quirl.catalog@4{Catalog{deny_unknown;schema_version:4;commands:array<CommandSpec>};CommandSpec{deny_unknown;id:string;version:null|string;path:string;aliases:array<string>;parent:null|string;signature:string;summary:string;details:string;arguments:array<ArgumentSpec>;examples:array<string>;io:IoContract;effects:array<Effect>;exit_codes:map<i32,string>;provenance:ProvenanceInfo};ArgumentSpec{deny_unknown;names:array<string>;kind:positional|option|flag;value_type:string;required:bool;repeatable:bool;values:null|CompletionSource;conflicts:array<string>;documentation:string;examples:array<string>;provenance:ProvenanceInfo};CompletionSource:tag(kind)[static{values:array<string>}|dynamic{provider:string}];IoContract{deny_unknown;input:string;output:string;streaming:bool};Effect:read_filesystem|write_filesystem|spawn_process|change_directory;ProvenanceInfo{deny_unknown;source:builtin|external|lua|plugin|fish|bash|zsh|help|man;confidence:low|medium|high|exact;trust:builtin|trusted|declared|imported|heuristic;origin:null|string;fingerprint:null|string;generated_at:null|string};migration:read-v2-v3-to-v4}";
-pub const COMPLETION_SCHEMA_DESCRIPTOR: &str = "quirl.completion@1{Completion{deny_unknown;value:string;display:string;summary:string;detail:string;replace_start:usize;replace_end:usize;match_indices:array<usize>};ordering:score-desc-then-display-value;catalog_source:quirl.catalog@4;static_values:CompletionSource.static;dynamic_values:provider-identity-only}";
+pub const COMPLETION_SCHEMA_DESCRIPTOR: &str = "quirl.completion@1{Completion{deny_unknown;value:string;display:string;summary:string;detail:string;replace_start:usize;replace_end:usize;match_indices:array<usize>};CompletionRequest{deny_unknown;protocol_version:u32;request_id:u64(strictly-increasing);line:utf8<=4096-bytes;cursor:usize(char-boundary);limit:usize<=1000;deadline_ms:1..250};CompletionCancellation{deny_unknown;protocol_version:u32;request_id:u64};CompletionResponse{deny_unknown;protocol_version:u32;request_id:u64;outcome:CompletionOutcome};CompletionOutcome:tag(status)[ready{items:array<Completion>}|cancelled{}|deadline_exceeded{}];policy:frozen-major-v1;ordering:score-desc-then-display-value;catalog_source:quirl.catalog@4;static_values:CompletionSource.static;dynamic_values:provider-identity-only;worker:newer-request-or-cancellation-never-overwrites-newer-result}";
 
 mod import;
 
@@ -239,6 +242,42 @@ pub struct Completion {
     pub replace_start: usize,
     pub replace_end: usize,
     pub match_indices: Vec<usize>,
+}
+
+/// Versioned completion work submitted by an interactive client. The owning UI
+/// validates bounds and drives cancellation before calling the catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionRequest {
+    pub protocol_version: u32,
+    pub request_id: u64,
+    pub line: String,
+    pub cursor: usize,
+    pub limit: usize,
+    pub deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionCancellation {
+    pub protocol_version: u32,
+    pub request_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "status", content = "data")]
+pub enum CompletionOutcome {
+    Ready { items: Vec<Completion> },
+    Cancelled,
+    DeadlineExceeded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionResponse {
+    pub protocol_version: u32,
+    pub request_id: u64,
+    pub outcome: CompletionOutcome,
 }
 
 #[derive(Deserialize)]
@@ -2131,5 +2170,13 @@ mod tests {
             assert!(!command.examples.is_empty(), "{path}");
             assert_eq!(command.provenance.confidence, Confidence::Exact);
         }
+    }
+
+    #[test]
+    fn async_completion_envelopes_reject_unknown_fields() {
+        let request = r#"{"protocol_version":1,"request_id":1,"line":"git c","cursor":5,"limit":10,"deadline_ms":25,"future":true}"#;
+        assert!(serde_json::from_str::<CompletionRequest>(request).is_err());
+        let response = r#"{"protocol_version":1,"request_id":1,"outcome":{"status":"cancelled"},"future":true}"#;
+        assert!(serde_json::from_str::<CompletionResponse>(response).is_err());
     }
 }

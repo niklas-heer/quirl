@@ -91,7 +91,7 @@ fn current_manifest() -> Result<ProtocolFreezeManifest, quirl_core::ShellError> 
             quirl_catalog::COMPLETION_PROTOCOL_VERSION,
             CompatibilityPolicy::FrozenMajor,
             schema_fingerprint(quirl_catalog::COMPLETION_SCHEMA_DESCRIPTOR),
-            "rust_shape_frozen",
+            "versioned_async_frozen",
         ),
         contract(
             "compatibility_matrix",
@@ -136,7 +136,7 @@ fn current_manifest() -> Result<ProtocolFreezeManifest, quirl_core::ShellError> 
             quirl_picker::PICKER_PROTOCOL_VERSION,
             CompatibilityPolicy::FrozenMajor,
             schema_fingerprint(quirl_picker::PICKER_SCHEMA_DESCRIPTOR),
-            "rust_shape_frozen",
+            "versioned_async_frozen",
         ),
         contract(
             "plugin_lock",

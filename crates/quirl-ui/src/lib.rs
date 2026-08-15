@@ -9,8 +9,12 @@ pub use panel::{
 
 use crossterm::event::{Event, KeyEvent};
 use nu_ansi_term::{Color, Style};
-use quirl_catalog::Catalog;
-use quirl_core::ShellError;
+use quirl_catalog::{
+    Catalog, CompletionCancellation, CompletionOutcome, CompletionRequest, CompletionResponse,
+    COMPLETION_PROTOCOL_VERSION, MAX_COMPLETION_DEADLINE_MS, MAX_COMPLETION_QUERY_BYTES,
+    MAX_COMPLETION_RESULTS,
+};
+use quirl_core::{ErrorCode, ShellError, VersionPolicy};
 use quirl_lua::QuirlConfig;
 use quirl_picker::{ItemKind, PickItem, Picker};
 use quirl_syntax::Mode;
@@ -30,7 +34,7 @@ use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU64, AtomicU8, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
@@ -1126,6 +1130,165 @@ pub trait ExtensionCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion>;
 }
 
+const COMPLETION_VERSION_POLICY: VersionPolicy = VersionPolicy::frozen(COMPLETION_PROTOCOL_VERSION);
+
+/// Worker-backed catalog completion. The editor can submit on every keystroke
+/// and consume only the newest response; old queries and explicit cancellation
+/// are never allowed to repaint a newer input buffer.
+pub struct CompletionWorker {
+    requests: Option<mpsc::Sender<CompletionRequest>>,
+    responses: mpsc::Receiver<CompletionResponse>,
+    latest_request_id: Arc<AtomicU64>,
+    submitted_request_id: u64,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl CompletionWorker {
+    pub fn new(catalog: Catalog) -> Self {
+        let (requests, request_receiver) = mpsc::channel::<CompletionRequest>();
+        let (response_sender, responses) = mpsc::channel::<CompletionResponse>();
+        let latest_request_id = Arc::new(AtomicU64::new(0));
+        let worker_latest = Arc::clone(&latest_request_id);
+        let worker = thread::spawn(move || {
+            while let Ok(request) = request_receiver.recv() {
+                let request_id = request.request_id;
+                if worker_latest.load(Ordering::Acquire) != request_id {
+                    continue;
+                }
+                let started = Instant::now();
+                let mut outcome = if worker_latest.load(Ordering::Acquire) != request_id {
+                    CompletionOutcome::Cancelled
+                } else {
+                    CompletionOutcome::Ready {
+                        items: catalog
+                            .complete(&request.line, request.cursor)
+                            .into_iter()
+                            .take(request.limit)
+                            .collect(),
+                    }
+                };
+                if worker_latest.load(Ordering::Acquire) != request_id {
+                    outcome = CompletionOutcome::Cancelled;
+                } else if started.elapsed() >= Duration::from_millis(request.deadline_ms) {
+                    outcome = CompletionOutcome::DeadlineExceeded;
+                }
+                if worker_latest.load(Ordering::Acquire) == request_id
+                    && response_sender
+                        .send(CompletionResponse {
+                            protocol_version: COMPLETION_PROTOCOL_VERSION,
+                            request_id,
+                            outcome,
+                        })
+                        .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        Self {
+            requests: Some(requests),
+            responses,
+            latest_request_id,
+            submitted_request_id: 0,
+            worker: Some(worker),
+        }
+    }
+
+    pub fn submit(&mut self, request: CompletionRequest) -> Result<(), ShellError> {
+        validate_completion_request(&request)?;
+        if request.request_id <= self.submitted_request_id {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "completion request IDs must be strictly increasing",
+            )
+            .with_help("Allocate a new request ID for every input change"));
+        }
+        self.submitted_request_id = request.request_id;
+        self.latest_request_id
+            .store(request.request_id, Ordering::Release);
+        self.requests
+            .as_ref()
+            .ok_or_else(|| unavailable_completion_worker())?
+            .send(request)
+            .map_err(|_| unavailable_completion_worker())
+    }
+
+    pub fn cancel(&self, cancellation: CompletionCancellation) -> Result<(), ShellError> {
+        COMPLETION_VERSION_POLICY
+            .validate("completion cancellation", cancellation.protocol_version)?;
+        let _ = self.latest_request_id.compare_exchange(
+            cancellation.request_id,
+            cancellation.request_id.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        Ok(())
+    }
+
+    pub fn try_recv_latest(&self) -> Option<CompletionResponse> {
+        let expected = self.submitted_request_id;
+        if self.latest_request_id.load(Ordering::Acquire) != expected {
+            while self.responses.try_recv().is_ok() {}
+            return None;
+        }
+        let mut newest = None;
+        loop {
+            match self.responses.try_recv() {
+                Ok(response) if response.request_id == expected => newest = Some(response),
+                Ok(_) => {}
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return newest,
+            }
+        }
+    }
+}
+
+impl Drop for CompletionWorker {
+    fn drop(&mut self) {
+        self.requests.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn validate_completion_request(request: &CompletionRequest) -> Result<(), ShellError> {
+    COMPLETION_VERSION_POLICY.validate("completion request", request.protocol_version)?;
+    if request.line.len() > MAX_COMPLETION_QUERY_BYTES {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!("completion query exceeds its limit of {MAX_COMPLETION_QUERY_BYTES} bytes"),
+        )
+        .with_help("Shorten the input before requesting completion"));
+    }
+    if request.cursor > request.line.len() || !request.line.is_char_boundary(request.cursor) {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "completion cursor must be a UTF-8 character boundary within the input",
+        )
+        .with_help("Use the editor cursor offset from the same input string"));
+    }
+    if request.limit > MAX_COMPLETION_RESULTS {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!("completion result limit exceeds {MAX_COMPLETION_RESULTS}"),
+        )
+        .with_help("Request at most the documented completion result limit"));
+    }
+    if !(1..=MAX_COMPLETION_DEADLINE_MS).contains(&request.deadline_ms) {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!("completion deadline must be between 1 and {MAX_COMPLETION_DEADLINE_MS} milliseconds"),
+        )
+        .with_help("Use a small positive deadline and issue a new request after expiry"));
+    }
+    Ok(())
+}
+
+fn unavailable_completion_worker() -> ShellError {
+    ShellError::new(ErrorCode::ResourceLimit, "completion worker is unavailable")
+        .with_help("Create a new editor completion worker for the next interactive session")
+}
+
 impl Completer for CatalogCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
         if let Some(kind) = PickerInvocation::from_state(&self.picker_invocation).item_kind() {
@@ -1513,6 +1676,78 @@ mod tests {
             suggestion.value == "production"
                 && suggestion.description.as_deref() == Some("Deployment environment")
         }));
+    }
+
+    fn completion_request(request_id: u64, line: &str) -> CompletionRequest {
+        CompletionRequest {
+            protocol_version: COMPLETION_PROTOCOL_VERSION,
+            request_id,
+            line: line.to_owned(),
+            cursor: line.len(),
+            limit: 10,
+            deadline_ms: 100,
+        }
+    }
+
+    #[test]
+    fn completion_worker_rejects_invalid_versions_bounds_and_cursor_offsets() {
+        let mut worker = CompletionWorker::new(Catalog::builtin());
+        let mut future = completion_request(1, "git");
+        future.protocol_version += 1;
+        assert_eq!(
+            worker.submit(future).unwrap_err().code,
+            ErrorCode::Validation
+        );
+
+        let mut offset = completion_request(1, "é");
+        offset.cursor = 1;
+        assert_eq!(
+            worker.submit(offset).unwrap_err().code,
+            ErrorCode::Validation
+        );
+
+        let mut excessive = completion_request(1, "git");
+        excessive.limit = MAX_COMPLETION_RESULTS + 1;
+        assert_eq!(
+            worker.submit(excessive).unwrap_err().code,
+            ErrorCode::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn completion_worker_never_returns_a_stale_query_result() {
+        let mut worker = CompletionWorker::new(Catalog::builtin());
+        worker.submit(completion_request(1, "git")).unwrap();
+        worker.submit(completion_request(2, "git c")).unwrap();
+        let until = Instant::now() + Duration::from_secs(1);
+        let mut response = None;
+        while Instant::now() < until {
+            response = worker.try_recv_latest();
+            if response.is_some() {
+                break;
+            }
+            thread::yield_now();
+        }
+        let response = response.expect("newest completion response should arrive");
+        assert_eq!(response.request_id, 2);
+        assert!(matches!(response.outcome, CompletionOutcome::Ready { .. }));
+    }
+
+    #[test]
+    fn completion_cancellation_prevents_a_result_for_that_request() {
+        let mut worker = CompletionWorker::new(Catalog::builtin());
+        worker.submit(completion_request(1, "git c")).unwrap();
+        worker
+            .cancel(CompletionCancellation {
+                protocol_version: COMPLETION_PROTOCOL_VERSION,
+                request_id: 1,
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < until {
+            assert!(worker.try_recv_latest().is_none());
+            thread::yield_now();
+        }
     }
 
     #[test]
