@@ -395,7 +395,7 @@ fn read_documentation(path: &Path) -> Result<String, ShellError> {
 }
 
 fn decode_catalog(source: &str, path: &Path) -> Result<Catalog, ShellError> {
-    let catalog: Catalog = serde_json::from_str(source).map_err(|error| {
+    let catalog = Catalog::from_json(source).map_err(|error| {
         ShellError::new(
             ErrorCode::Validation,
             format!("{} is not a valid Quirl completion index", path.display()),
@@ -606,5 +606,53 @@ mod tests {
             merged.find("quirl run").unwrap().summary,
             "stale cached summary"
         );
+    }
+
+    #[test]
+    fn legacy_v3_cache_is_migrated_then_merged_with_current_builtins() {
+        let directory = temporary_directory();
+        let path = directory.join("catalog-v3.json");
+        let source = serde_json::json!({
+            "schema_version": 3,
+            "commands": [{
+                "path": "demo",
+                "signature": "demo [--output FILE]",
+                "summary": "Imported demo",
+                "details": "Imported declarative completion metadata.",
+                "options": [{
+                    "names": ["--output"],
+                    "value": "FILE",
+                    "summary": "Write output",
+                    "provenance": {
+                        "source": "fish",
+                        "confidence": "high",
+                        "trust": "declared",
+                        "origin": "demo.fish",
+                        "fingerprint": "sha256:demo"
+                    }
+                }],
+                "examples": [],
+                "effects": ["spawn_process"],
+                "provenance": {
+                    "source": "fish",
+                    "confidence": "high",
+                    "trust": "declared",
+                    "origin": "demo.fish",
+                    "fingerprint": "sha256:demo"
+                }
+            }]
+        });
+        fs::write(&path, source.to_string()).unwrap();
+
+        let catalog = load_catalog_at(&path);
+        let imported = catalog.find("demo").unwrap();
+        assert_eq!(catalog.schema_version, Catalog::builtin().schema_version);
+        assert_eq!(imported.options[0].value_type, "FILE");
+        assert_eq!(
+            imported.provenance.confidence,
+            quirl_catalog::Confidence::High
+        );
+        assert!(catalog.find("quirl lsp").is_some());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

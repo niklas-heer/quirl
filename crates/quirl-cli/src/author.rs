@@ -174,7 +174,7 @@ fn render_command_text(command: &CommandSpec) -> String {
             output.push_str(&format!(
                 "  {:<24} {}\n",
                 option.names.join(", "),
-                option.summary
+                option.documentation
             ));
         }
     }
@@ -198,7 +198,7 @@ fn render_command_markdown(command: &CommandSpec) -> String {
             output.push_str(&format!(
                 "- `{}` — {}\n",
                 option.names.join("`, `"),
-                option.summary
+                option.documentation
             ));
         }
     }
@@ -235,7 +235,7 @@ fn render_command_html(command: &CommandSpec) -> String {
             output.push_str(&format!(
                 "<li><code>{}</code> — {}</li>",
                 escape_html(&option.names.join(", ")),
-                escape_html(&option.summary)
+                escape_html(&option.documentation)
             ));
         }
         output.push_str("</ul>");

@@ -6,6 +6,9 @@ mod index;
 mod lsp;
 mod package;
 mod pick;
+mod platform;
+mod plugin;
+mod recovery;
 mod script;
 
 use agent::AgentCommand;
@@ -16,8 +19,13 @@ use extensions::{LuaCompletionAdapter, LuaExtensionHost};
 use index::IndexCommand;
 use package::PackageCommand;
 use pick::PickCommand;
-use quirl_catalog::{Catalog, CommandSpec};
-use quirl_core::{ErrorCode, ShellError};
+use platform::{EventsCommand, ViewCommand, WatchCommand};
+use plugin::PluginCommand;
+use quirl_catalog::{Catalog, CommandSpec, Completion};
+use quirl_core::{
+    reject_terminal_controls, CommandOutcome, ErrorCode, ExtensionAction, ExtensionEventData,
+    OutputStream, ShellError,
+};
 use quirl_data::DataRuntime;
 use quirl_lua::{sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig};
 use quirl_process::{JobStatus, NativeExecutor};
@@ -26,9 +34,11 @@ use quirl_ui::{
     editor_with_extensions_config_and_history, history_path, render_error, PromptContextScheduler,
     QuirlPrompt, MODE_TOGGLE_HOST_COMMAND,
 };
+use recovery::RecoveryCommand;
 use reedline::Signal;
 use script::ScriptLanguage;
 use std::{
+    collections::BTreeMap,
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -50,7 +60,7 @@ enum Command {
         #[command(flatten)]
         command: NewCommand,
     },
-    /// Run a Lua or .quirl script under its explicit restricted policy.
+    /// Run a Lua, Quirl, Bash, or Zsh script through its explicit engine.
     Run {
         /// Script file, or - for standard input with --lang or a recognized shebang.
         file: PathBuf,
@@ -151,20 +161,30 @@ enum Command {
         #[command(flatten)]
         command: PickCommand,
     },
+    /// Inspect and validate the typed extension event protocol.
+    Events {
+        #[command(subcommand)]
+        command: EventsCommand,
+    },
+    /// Render escape-safe directory and process panel models.
+    View {
+        #[command(subcommand)]
+        command: ViewCommand,
+    },
+    /// Re-evaluate a typed data pipeline with bounded live samples.
+    Watch {
+        #[command(flatten)]
+        command: WatchCommand,
+    },
+    /// Inspect recoverable snapshots from failed commands.
+    Recover {
+        #[command(subcommand)]
+        command: RecoveryCommand,
+    },
     /// Execute one command through Quirl's native pipeline and job graph.
     Exec {
         #[arg(required = true, trailing_var_arg = true)]
         command: Vec<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum PluginCommand {
-    /// Load a plugin under restrictions and validate its registrations.
-    Check {
-        file: PathBuf,
-        #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
-        format: DiagnosticFormat,
     },
 }
 
@@ -245,29 +265,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             script::test_paths(file.as_deref().unwrap_or_else(|| Path::new(".")))
         }
         Some(Command::Config { command }) => config::execute(command),
-        Some(Command::Plugin {
-            command: PluginCommand::Check { file, format },
-        }) => {
-            let lua = LuaRuntime::new(LuaPolicy::config())?;
-            match lua.load_plugin_file(&file) {
-                Ok(registrations) => {
-                    match format {
-                        DiagnosticFormat::Json => println!(
-                            "{}",
-                            serde_json::to_string_pretty(&registrations).map_err(json_error)?
-                        ),
-                        _ => println!(
-                            "✓ {} registered {} prompt segments and {} completion providers",
-                            file.display(),
-                            registrations.prompt_segments.len(),
-                            registrations.completion_providers.len()
-                        ),
-                    }
-                    Ok(0)
-                }
-                Err(error) => validation_failure(error, format),
-            }
-        }
+        Some(Command::Plugin { command }) => plugin::execute(command),
         Some(Command::Sdk { format }) => {
             match format {
                 SdkFormat::Text => print!("{}", sdk_lua()),
@@ -277,7 +275,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             Ok(0)
         }
         Some(Command::Catalog { format }) => {
-            let catalog = index::load_default_catalog();
+            let catalog = load_composed_catalog();
             match format {
                 CatalogFormat::Json => println!(
                     "{}",
@@ -288,19 +286,23 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             }
             Ok(0)
         }
-        Some(Command::Agent { command }) => agent::execute(command, &index::load_default_catalog()),
-        Some(Command::Package { command }) => {
-            package::execute(command, &index::load_default_catalog())
-        }
-        Some(Command::Describe { command }) => {
-            author::describe(command, &index::load_default_catalog())
-        }
-        Some(Command::Doc { command }) => author::doc(command, &index::load_default_catalog()),
-        Some(Command::Lsp) => lsp::execute(index::load_default_catalog()),
+        Some(Command::Agent { command }) => agent::execute(command, &load_composed_catalog()),
+        Some(Command::Package { command }) => package::execute(command, &load_composed_catalog()),
+        Some(Command::Describe { command }) => author::describe(command, &load_composed_catalog()),
+        Some(Command::Doc { command }) => author::doc(command, &load_composed_catalog()),
+        Some(Command::Lsp) => lsp::execute(load_composed_catalog()),
         Some(Command::Index { command }) => index::execute(command),
         Some(Command::Complete { input, format }) => {
-            let catalog = index::load_default_catalog();
-            let completions = catalog.complete(&input, input.len());
+            let mut catalog = index::load_default_catalog();
+            let mut extensions = LuaExtensionHost::discover();
+            extensions.merge_catalog_contributions(&mut catalog);
+            let mut completions = catalog.complete(&input, input.len());
+            completions.extend(
+                extensions
+                    .complete(&input, input.len())
+                    .into_iter()
+                    .map(extension_completion),
+            );
             match format {
                 CompletionFormat::Json => println!(
                     "{}",
@@ -314,14 +316,32 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             }
             Ok(0)
         }
-        Some(Command::Pick { command }) => pick::execute(command, &index::load_default_catalog()),
-        Some(Command::Exec { command }) => {
-            let outcome = NativeExecutor::default().execute(&command.join(" "))?;
-            print_outcome(&outcome);
-            Ok(outcome.status)
-        }
+        Some(Command::Pick { command }) => pick::execute(command, &load_composed_catalog()),
+        Some(Command::Events { command }) => platform::execute_events(command),
+        Some(Command::View { command }) => platform::execute_view(command),
+        Some(Command::Watch { command }) => platform::execute_watch(command),
+        Some(Command::Recover { command }) => recovery::execute(command),
+        Some(Command::Exec { command }) => run_exec_with_recovery(&command.join(" ")),
         None if !io::stdin().is_terminal() => run_stdin(),
-        None => repl(index::load_default_catalog()),
+        None => repl(load_composed_catalog()),
+    }
+}
+
+fn load_composed_catalog() -> Catalog {
+    let mut catalog = index::load_default_catalog();
+    LuaExtensionHost::discover().merge_catalog_contributions(&mut catalog);
+    catalog
+}
+
+fn extension_completion(suggestion: quirl_ui::ExtensionSuggestion) -> Completion {
+    Completion {
+        value: suggestion.value,
+        display: suggestion.display,
+        summary: suggestion.summary,
+        detail: suggestion.detail,
+        replace_start: suggestion.replace_start,
+        replace_end: suggestion.replace_end,
+        match_indices: Vec::new(),
     }
 }
 
@@ -342,13 +362,6 @@ impl Command {
                 format: DiagnosticFormat::Json,
                 ..
             }
-            | Self::Plugin {
-                command:
-                    PluginCommand::Check {
-                        format: DiagnosticFormat::Json,
-                        ..
-                    },
-            }
             | Self::Sdk {
                 format: SdkFormat::Json,
             }
@@ -360,6 +373,7 @@ impl Command {
                 ..
             } => true,
             Self::Config { command } => config::wants_json(command),
+            Self::Plugin { command } => plugin::wants_json(command),
             Self::Agent { command } => agent::wants_json(command),
             Self::Package { command } => package::wants_json(command),
             Self::Describe { command } => {
@@ -370,13 +384,144 @@ impl Command {
             }
             Self::Index { command } => index::wants_json(command),
             Self::Pick { command } => command.wants_json(),
+            Self::Events { command } => platform::events_wants_json(command),
+            Self::View { command } => platform::view_wants_json(command),
+            Self::Watch { command } => {
+                matches!(command.format, platform::PlatformOutputFormat::Json)
+            }
+            Self::Recover { command } => recovery::wants_json(command),
             _ => false,
+        }
+    }
+}
+
+fn run_exec_with_recovery(command: &str) -> Result<i32, ShellError> {
+    let journal = recovery::RecoveryJournal::discover()?;
+    let extensions = Arc::new(Mutex::new(LuaExtensionHost::discover()));
+    begin_extension_session(&extensions);
+    emit_directory_snapshot(&extensions);
+    execute_with_recovery(
+        &mut NativeExecutor::default(),
+        &journal,
+        command,
+        Some(&extensions),
+    )
+}
+
+fn execute_with_recovery(
+    executor: &mut NativeExecutor,
+    journal: &recovery::RecoveryJournal,
+    command: &str,
+    extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
+) -> Result<i32, ShellError> {
+    let planned = match extensions {
+        Some(extensions) => {
+            match prepare_extension_plan(extensions, command, vec!["spawn_process".to_owned()]) {
+                Ok(planned) => planned,
+                Err(error) => {
+                    let mut annotations = BTreeMap::new();
+                    apply_observation_actions(
+                        notify_extensions(
+                            extensions,
+                            ExtensionEventData::Error {
+                                error: error.clone(),
+                            },
+                        ),
+                        &mut annotations,
+                    );
+                    print_extension_annotations(&annotations);
+                    return Err(error);
+                }
+            }
+        }
+        None => PlannedExecution::new(command),
+    };
+    let recovery_context = journal.capture_context(&planned.source)?;
+    let PlannedExecution {
+        source,
+        mut annotations,
+    } = planned;
+    if let Some(extensions) = extensions {
+        apply_observation_actions(
+            notify_extensions(
+                extensions,
+                ExtensionEventData::ExecutionProgress {
+                    completed: 0,
+                    total: Some(1),
+                    message: Some("execution started".to_owned()),
+                },
+            ),
+            &mut annotations,
+        );
+    }
+    let started = Instant::now();
+    match executor.execute_capture(&source) {
+        Ok(outcome) => {
+            let duration = started.elapsed();
+            if outcome.status != 0 {
+                if let Err(error) =
+                    journal.record_failure(&recovery_context, duration, Some(&outcome), None)
+                {
+                    eprintln!("warning: {}", render_stderr_error(&error));
+                }
+            }
+            if let Some(extensions) = extensions {
+                emit_outcome_events(extensions, &outcome, &mut annotations);
+                apply_observation_actions(
+                    notify_extensions(
+                        extensions,
+                        ExtensionEventData::ExecutionProgress {
+                            completed: 1,
+                            total: Some(1),
+                            message: Some("execution finished".to_owned()),
+                        },
+                    ),
+                    &mut annotations,
+                );
+                apply_observation_actions(
+                    notify_extensions(
+                        extensions,
+                        ExtensionEventData::Result {
+                            status: outcome.status,
+                            duration_ms: duration_millis(duration),
+                        },
+                    ),
+                    &mut annotations,
+                );
+            }
+            print_outcome(&outcome);
+            print_extension_annotations(&annotations);
+            Ok(outcome.status)
+        }
+        Err(error) => {
+            let duration = started.elapsed();
+            if let Err(journal_error) =
+                journal.record_failure(&recovery_context, duration, None, Some(&error))
+            {
+                eprintln!("warning: {}", render_stderr_error(&journal_error));
+            }
+            if let Some(extensions) = extensions {
+                apply_observation_actions(
+                    notify_extensions(
+                        extensions,
+                        ExtensionEventData::Error {
+                            error: error.clone(),
+                        },
+                    ),
+                    &mut annotations,
+                );
+                print_extension_annotations(&annotations);
+            }
+            Err(error)
         }
     }
 }
 
 fn repl(catalog: Catalog) -> Result<i32, ShellError> {
     let extensions = Arc::new(Mutex::new(LuaExtensionHost::discover()));
+    begin_extension_session(&extensions);
+    emit_directory_snapshot(&extensions);
+    let mut observed_directory = std::env::current_dir().unwrap_or_default();
     let (mut active_config, mut applied_revision) = {
         let mut host = extensions.lock().map_err(|_| {
             ShellError::new(ErrorCode::Io, "the extension host lock was poisoned")
@@ -391,6 +536,7 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
     print_banner();
     let mut mode = Mode::Command;
     let mut executor = NativeExecutor::default();
+    let recovery = recovery::RecoveryJournal::discover()?;
     let data = DataRuntime::new();
     // Script evaluation remains lazy; extension VMs load before the first editor view.
     let mut lua = None;
@@ -399,6 +545,22 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
     let prompt_context = PromptContextScheduler::default();
 
     loop {
+        let current_directory = std::env::current_dir().unwrap_or_default();
+        if current_directory != observed_directory {
+            let mut annotations = BTreeMap::new();
+            apply_observation_actions(
+                notify_extensions(
+                    &extensions,
+                    ExtensionEventData::DirectoryChanged {
+                        previous: observed_directory.display().to_string(),
+                        current: current_directory.display().to_string(),
+                    },
+                ),
+                &mut annotations,
+            );
+            print_extension_annotations(&annotations);
+            observed_directory = current_directory;
+        }
         let (extension_segments, next_config) = extensions
             .lock()
             .map(|mut extensions| {
@@ -455,10 +617,14 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
                     InteractiveLine::Help(topic) => print_help(&catalog, topic),
                     InteractiveLine::Command(command) => {
                         let started = Instant::now();
-                        match executor.execute(command) {
-                            Ok(outcome) => {
-                                last_status = outcome.status;
-                                print_outcome(&outcome);
+                        match execute_with_recovery(
+                            &mut executor,
+                            &recovery,
+                            command,
+                            Some(&extensions),
+                        ) {
+                            Ok(status) => {
+                                last_status = status;
                             }
                             Err(error) => {
                                 last_status = 1;
@@ -468,28 +634,136 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
                         last_duration = Some(started.elapsed());
                     }
                     InteractiveLine::Data(source) => {
+                        let planned = match prepare_extension_plan(&extensions, source, Vec::new())
+                        {
+                            Ok(planned) => planned,
+                            Err(error) => {
+                                last_status = 1;
+                                eprintln!("{}", render_stderr_error(&error));
+                                continue;
+                            }
+                        };
+                        let mut annotations = planned.annotations;
+                        apply_observation_actions(
+                            notify_extensions(
+                                &extensions,
+                                ExtensionEventData::ExecutionProgress {
+                                    completed: 0,
+                                    total: Some(1),
+                                    message: Some("data evaluation started".to_owned()),
+                                },
+                            ),
+                            &mut annotations,
+                        );
                         let started = Instant::now();
-                        match data.eval(source) {
+                        match data.eval(&planned.source) {
                             Ok(value) => {
                                 last_status = 0;
+                                emit_value_output(&extensions, &value, &mut annotations);
                                 print_json_value(value);
+                                apply_observation_actions(
+                                    notify_extensions(
+                                        &extensions,
+                                        ExtensionEventData::ExecutionProgress {
+                                            completed: 1,
+                                            total: Some(1),
+                                            message: Some("data evaluation finished".to_owned()),
+                                        },
+                                    ),
+                                    &mut annotations,
+                                );
+                                apply_observation_actions(
+                                    notify_extensions(
+                                        &extensions,
+                                        ExtensionEventData::Result {
+                                            status: 0,
+                                            duration_ms: duration_millis(started.elapsed()),
+                                        },
+                                    ),
+                                    &mut annotations,
+                                );
+                                print_extension_annotations(&annotations);
                             }
                             Err(error) => {
                                 last_status = 1;
+                                apply_observation_actions(
+                                    notify_extensions(
+                                        &extensions,
+                                        ExtensionEventData::Error {
+                                            error: error.clone(),
+                                        },
+                                    ),
+                                    &mut annotations,
+                                );
+                                print_extension_annotations(&annotations);
                                 eprintln!("{}", render_stderr_error(&error));
                             }
                         }
                         last_duration = Some(started.elapsed());
                     }
                     InteractiveLine::Lua(source) => {
+                        let planned = match prepare_extension_plan(&extensions, source, Vec::new())
+                        {
+                            Ok(planned) => planned,
+                            Err(error) => {
+                                last_status = 1;
+                                eprintln!("{}", render_stderr_error(&error));
+                                continue;
+                            }
+                        };
+                        let mut annotations = planned.annotations;
+                        apply_observation_actions(
+                            notify_extensions(
+                                &extensions,
+                                ExtensionEventData::ExecutionProgress {
+                                    completed: 0,
+                                    total: Some(1),
+                                    message: Some("Lua evaluation started".to_owned()),
+                                },
+                            ),
+                            &mut annotations,
+                        );
                         let started = Instant::now();
-                        match eval_lua(&mut lua, source) {
+                        match eval_lua(&mut lua, &planned.source) {
                             Ok(value) => {
                                 last_status = 0;
+                                emit_value_output(&extensions, &value, &mut annotations);
                                 print_json_value(value);
+                                apply_observation_actions(
+                                    notify_extensions(
+                                        &extensions,
+                                        ExtensionEventData::ExecutionProgress {
+                                            completed: 1,
+                                            total: Some(1),
+                                            message: Some("Lua evaluation finished".to_owned()),
+                                        },
+                                    ),
+                                    &mut annotations,
+                                );
+                                apply_observation_actions(
+                                    notify_extensions(
+                                        &extensions,
+                                        ExtensionEventData::Result {
+                                            status: 0,
+                                            duration_ms: duration_millis(started.elapsed()),
+                                        },
+                                    ),
+                                    &mut annotations,
+                                );
+                                print_extension_annotations(&annotations);
                             }
                             Err(error) => {
                                 last_status = 1;
+                                apply_observation_actions(
+                                    notify_extensions(
+                                        &extensions,
+                                        ExtensionEventData::Error {
+                                            error: error.clone(),
+                                        },
+                                    ),
+                                    &mut annotations,
+                                );
+                                print_extension_annotations(&annotations);
                                 eprintln!("{}", render_stderr_error(&error));
                             }
                         }
@@ -499,6 +773,16 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
             }
             Ok(Signal::CtrlC) => {
                 last_status = 130;
+                let mut annotations = BTreeMap::new();
+                apply_observation_actions(
+                    notify_extensions(
+                        &extensions,
+                        ExtensionEventData::Cancellation {
+                            reason: "interactive interrupt".to_owned(),
+                        },
+                    ),
+                    &mut annotations,
+                );
                 println!("^C");
             }
             Ok(Signal::CtrlD) => return Ok(last_status),
@@ -515,6 +799,199 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
             }
         }
     }
+}
+
+#[derive(Debug)]
+struct PlannedExecution {
+    source: String,
+    annotations: BTreeMap<String, serde_json::Value>,
+}
+
+impl PlannedExecution {
+    fn new(source: &str) -> Self {
+        Self {
+            source: source.to_owned(),
+            annotations: BTreeMap::new(),
+        }
+    }
+}
+
+fn notify_extensions(
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+    event: ExtensionEventData,
+) -> Vec<ExtensionAction> {
+    extensions
+        .lock()
+        .map(|mut extensions| extensions.dispatch_event(event))
+        .unwrap_or_default()
+}
+
+fn begin_extension_session(extensions: &Arc<Mutex<LuaExtensionHost>>) {
+    let restored_session = std::env::var("QUIRL_SESSION_ID")
+        .ok()
+        .filter(|session| !session.trim().is_empty());
+    let mut annotations = BTreeMap::new();
+    apply_observation_actions(
+        notify_extensions(
+            extensions,
+            ExtensionEventData::SessionStart {
+                restored: restored_session.is_some(),
+            },
+        ),
+        &mut annotations,
+    );
+    if let Some(session_id) = restored_session {
+        apply_observation_actions(
+            notify_extensions(
+                extensions,
+                ExtensionEventData::SessionRestore { session_id },
+            ),
+            &mut annotations,
+        );
+    }
+    print_extension_annotations(&annotations);
+}
+
+fn emit_directory_snapshot(extensions: &Arc<Mutex<LuaExtensionHost>>) {
+    let current = std::env::current_dir()
+        .unwrap_or_default()
+        .display()
+        .to_string();
+    let mut annotations = BTreeMap::new();
+    apply_observation_actions(
+        notify_extensions(
+            extensions,
+            ExtensionEventData::DirectoryChanged {
+                previous: current.clone(),
+                current,
+            },
+        ),
+        &mut annotations,
+    );
+    print_extension_annotations(&annotations);
+}
+
+fn prepare_extension_plan(
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+    source: &str,
+    effects: Vec<String>,
+) -> Result<PlannedExecution, ShellError> {
+    let mut planned = PlannedExecution::new(source);
+    apply_plan_actions(
+        notify_extensions(
+            extensions,
+            ExtensionEventData::CommandPlan {
+                source: source.to_owned(),
+                effects,
+            },
+        ),
+        &mut planned,
+    )?;
+    Ok(planned)
+}
+
+fn apply_plan_actions(
+    actions: Vec<ExtensionAction>,
+    planned: &mut PlannedExecution,
+) -> Result<(), ShellError> {
+    for action in actions {
+        match action {
+            ExtensionAction::Diagnose { message } => eprintln!("extension: {message}"),
+            ExtensionAction::RewritePlan { source } => planned.source = source,
+            ExtensionAction::SetEnvironment { name, value } => std::env::set_var(name, value),
+            ExtensionAction::BlockExecution { reason } => {
+                return Err(ShellError::new(
+                    ErrorCode::Validation,
+                    "an extension blocked execution",
+                )
+                .with_context(reason)
+                .with_help("Review the extension policy or disable the blocking plugin"))
+            }
+            ExtensionAction::AnnotateResult { key, value } => {
+                planned.annotations.insert(key, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_observation_actions(
+    actions: Vec<ExtensionAction>,
+    annotations: &mut BTreeMap<String, serde_json::Value>,
+) {
+    for action in actions {
+        match action {
+            ExtensionAction::Diagnose { message } => eprintln!("extension: {message}"),
+            ExtensionAction::SetEnvironment { name, value } => std::env::set_var(name, value),
+            ExtensionAction::AnnotateResult { key, value } => {
+                annotations.insert(key, value);
+            }
+            ExtensionAction::RewritePlan { .. } | ExtensionAction::BlockExecution { .. } => {
+                eprintln!("extension: plan mutation was ignored after execution began");
+            }
+        }
+    }
+}
+
+fn emit_outcome_events(
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+    outcome: &CommandOutcome,
+    annotations: &mut BTreeMap<String, serde_json::Value>,
+) {
+    for (stream, text) in [
+        (OutputStream::Stdout, outcome.stdout.as_deref()),
+        (OutputStream::Stderr, outcome.stderr.as_deref()),
+    ] {
+        if let Some(text) = text {
+            apply_observation_actions(
+                notify_extensions(
+                    extensions,
+                    ExtensionEventData::Output {
+                        stream,
+                        bytes: text.len(),
+                        text: safe_extension_output_text(text),
+                    },
+                ),
+                annotations,
+            );
+        }
+    }
+}
+
+fn emit_value_output(
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+    value: &serde_json::Value,
+    annotations: &mut BTreeMap<String, serde_json::Value>,
+) {
+    let text = serde_json::to_string(value).unwrap_or_default();
+    apply_observation_actions(
+        notify_extensions(
+            extensions,
+            ExtensionEventData::Output {
+                stream: OutputStream::Stdout,
+                bytes: text.len(),
+                text: safe_extension_output_text(&text),
+            },
+        ),
+        annotations,
+    );
+}
+
+fn safe_extension_output_text(text: &str) -> Option<String> {
+    reject_terminal_controls("extension output", text)
+        .is_ok()
+        .then(|| text.to_owned())
+}
+
+fn print_extension_annotations(annotations: &BTreeMap<String, serde_json::Value>) {
+    for (key, value) in annotations {
+        let value = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
+        eprintln!("extension annotation {key}: {value}");
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn configured_editor(
@@ -607,18 +1084,6 @@ fn run_stdin() -> Result<i32, ShellError> {
     Ok(0)
 }
 
-fn validation_failure(error: ShellError, format: DiagnosticFormat) -> Result<i32, ShellError> {
-    if matches!(format, DiagnosticFormat::Json) {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&error).map_err(json_error)?
-        );
-        Ok(1)
-    } else {
-        Err(error)
-    }
-}
-
 fn print_help(catalog: &Catalog, topic: Option<&str>) {
     if let Some(topic) = topic {
         if let Some(command) = catalog.find(topic) {
@@ -651,7 +1116,7 @@ fn print_command_help(command: &CommandSpec) {
     if !command.options.is_empty() {
         println!("\nOptions:");
         for option in &command.options {
-            println!("  {:<20} {}", option.names.join(", "), option.summary);
+            println!("  {:<20} {}", option.names.join(", "), option.documentation);
         }
     }
     if !command.examples.is_empty() {
@@ -747,6 +1212,17 @@ mod tests {
             vec![
                 "quirl", "pick", "--source", "files", "--root", "missing", "--format", "json",
             ],
+            vec!["quirl", "events", "validate", "missing", "--format", "json"],
+            vec!["quirl", "view", "directory", "missing", "--format", "json"],
+            vec![
+                "quirl",
+                "watch",
+                "pwd",
+                "--capacity",
+                "0",
+                "--format",
+                "json",
+            ],
         ] {
             let cli = Cli::try_parse_from(arguments).unwrap();
             assert!(cli.wants_json());
@@ -762,6 +1238,36 @@ mod tests {
             })
         ));
         assert!(Cli::try_parse_from(["quirl", "lsp", "--port", "9000"]).is_err());
+    }
+
+    #[test]
+    fn extension_plan_actions_rewrite_annotate_and_block_before_execution() {
+        let mut planned = PlannedExecution::new("echo original");
+        apply_plan_actions(
+            vec![
+                ExtensionAction::RewritePlan {
+                    source: "echo rewritten".to_owned(),
+                },
+                ExtensionAction::AnnotateResult {
+                    key: "policy".to_owned(),
+                    value: serde_json::json!("checked"),
+                },
+            ],
+            &mut planned,
+        )
+        .unwrap();
+        assert_eq!(planned.source, "echo rewritten");
+        assert_eq!(planned.annotations["policy"], "checked");
+
+        let error = apply_plan_actions(
+            vec![ExtensionAction::BlockExecution {
+                reason: "denied by policy".to_owned(),
+            }],
+            &mut planned,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("blocked"));
+        assert!(safe_extension_output_text("\u{1b}[31mraw").is_none());
     }
 
     #[test]

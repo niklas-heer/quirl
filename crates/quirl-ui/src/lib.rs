@@ -1,5 +1,12 @@
 //! Terminal interaction that treats completion and diagnostics as core behavior.
 
+mod panel;
+
+pub use panel::{
+    directory_panel, process_panel, LiveBuffer, LiveSample, LiveSnapshot, PanelModel,
+    ProcessPanelRow,
+};
+
 use crossterm::event::{Event, KeyEvent};
 use nu_ansi_term::{Color, Style};
 use quirl_catalog::Catalog;

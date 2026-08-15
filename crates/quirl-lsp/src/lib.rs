@@ -384,8 +384,8 @@ fn quirl_completions(catalog: &Catalog, text: &str, offset: usize, prefix: &str)
                         items.push(json!({
                             "label": name,
                             "kind": 5,
-                            "detail": option.value,
-                            "documentation": {"kind": "markdown", "value": option.summary},
+                            "detail": option.value_type,
+                            "documentation": {"kind": "markdown", "value": option.documentation},
                             "insertText": name,
                         }));
                     }

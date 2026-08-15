@@ -1,0 +1,1318 @@
+//! Stable, non-executing contracts for Quirl's Phase 3 plugin platform.
+//!
+//! This crate validates plugin identity, permissions, reproducible lock state,
+//! and isolated runtime boundaries. Filesystem mutation and runtime composition
+//! remain in `quirl-cli`; trusted Lua execution remains in `quirl-lua`.
+
+use quirl_catalog::{
+    ArgumentKind as CatalogArgumentKind, ArgumentSpec, Catalog, CommandSpec, Effect, IoContract,
+    Provenance, ProvenanceInfo,
+};
+use quirl_contract::{stable_hash, ArgumentKind as PackageArgumentKind, PackageCommand};
+use quirl_core::{ErrorCode, ShellError};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use wasmparser::{Encoding, Parser, Payload, Validator};
+
+pub const PLUGIN_SCHEMA_VERSION: u32 = 1;
+pub const LOCK_SCHEMA_VERSION: u32 = 2;
+pub const PLUGIN_API_VERSION: &str = "0.1.0";
+pub const PLUGIN_LOCK_FILE: &str = "plugins.lock.json";
+pub const WASM_WORLD: &str = "quirl:plugin/api@0.1.0";
+pub const WASM_HOST_IMPORT: &str = "quirl:plugin/host@0.1.0";
+pub const WASM_GUEST_EXPORT: &str = "quirl:plugin/guest@0.1.0";
+pub const WASM_WIT: &str = include_str!("../wit/quirl-plugin.wit");
+
+const PLUGIN_SCHEMA: &str = "PluginManifest{deny_unknown;schema_version:u32;plugin:PluginMetadata;capabilities:PluginCapabilities;contributes:PluginContributions;public_commands:array<PackageCommand>;wasm:null|WasmComponentBoundary;adapter:null|OutOfProcessBoundary}";
+const LOCK_SCHEMA: &str = "PluginLockfile{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;resolved_api_version:string;plugins:array<LockedPlugin{deny_unknown;name:string;version:string;source:string;runtime:PluginRuntime;resolved_api_version:string;runtime_schema_hash:string;manifest_checksum:string;entry_checksum:string;source_checksum:string;requested_capabilities:array<string>;granted_capabilities:array<string>;enabled:bool}>}";
+
+pub fn plugin_manifest_schema_hash() -> String {
+    stable_hash(PLUGIN_SCHEMA.as_bytes())
+}
+
+pub fn wasm_world_hash() -> String {
+    stable_hash(WASM_WIT.as_bytes())
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginRuntime {
+    TrustedLua,
+    WasmComponent,
+    OutOfProcess,
+}
+
+impl Default for PluginRuntime {
+    fn default() -> Self {
+        Self::TrustedLua
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginManifest {
+    pub schema_version: u32,
+    pub plugin: PluginMetadata,
+    #[serde(default)]
+    pub capabilities: PluginCapabilities,
+    #[serde(default)]
+    pub contributes: PluginContributions,
+    #[serde(default)]
+    pub public_commands: Vec<PackageCommand>,
+    #[serde(default)]
+    pub wasm: Option<WasmComponentBoundary>,
+    #[serde(default)]
+    pub adapter: Option<OutOfProcessBoundary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginMetadata {
+    pub name: String,
+    pub version: String,
+    pub entry: String,
+    pub quirl: String,
+    #[serde(default = "default_api_version")]
+    pub api: String,
+    #[serde(default)]
+    pub runtime: PluginRuntime,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginCapabilities {
+    #[serde(default)]
+    pub request: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginContributions {
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub completions: Vec<String>,
+    #[serde(default)]
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub panels: Vec<String>,
+    #[serde(default)]
+    pub indexers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WasmComponentBoundary {
+    pub world: String,
+    pub max_memory_bytes: u64,
+    pub fuel: u64,
+    pub callback_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutOfProcessBoundary {
+    pub protocol: String,
+    pub executable: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    pub callback_timeout_ms: u64,
+    pub max_message_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginLockfile {
+    pub document_type: String,
+    pub schema_version: u32,
+    pub schema_hash: String,
+    pub resolved_api_version: String,
+    pub plugins: Vec<LockedPlugin>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LockedPlugin {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub runtime: PluginRuntime,
+    pub resolved_api_version: String,
+    pub runtime_schema_hash: String,
+    pub manifest_checksum: String,
+    pub entry_checksum: String,
+    pub source_checksum: String,
+    pub requested_capabilities: Vec<String>,
+    pub granted_capabilities: Vec<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionDiff {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub unchanged: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DoctorDiagnostic {
+    pub severity: DoctorSeverity,
+    pub code: String,
+    pub message: String,
+    pub help: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DoctorReport {
+    pub document_type: String,
+    pub schema_version: u32,
+    pub plugin: String,
+    pub healthy: bool,
+    pub diagnostics: Vec<DoctorDiagnostic>,
+}
+
+impl PluginLockfile {
+    pub fn empty() -> Self {
+        Self {
+            document_type: "quirl.plugin.lock".to_owned(),
+            schema_version: LOCK_SCHEMA_VERSION,
+            schema_hash: stable_hash(LOCK_SCHEMA.as_bytes()),
+            resolved_api_version: PLUGIN_API_VERSION.to_owned(),
+            plugins: Vec::new(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ShellError> {
+        if self.document_type != "quirl.plugin.lock"
+            || self.schema_version != LOCK_SCHEMA_VERSION
+            || self.schema_hash != stable_hash(LOCK_SCHEMA.as_bytes())
+            || self.resolved_api_version != PLUGIN_API_VERSION
+        {
+            return Err(validation_error(
+                "plugin lockfile schema or resolved API version is incompatible",
+                "Regenerate the lockfile with the installed Quirl version",
+            ));
+        }
+        let mut names = self
+            .plugins
+            .iter()
+            .map(|plugin| plugin.name.as_str())
+            .collect::<Vec<_>>();
+        let original = names.clone();
+        names.sort_unstable();
+        names.dedup();
+        if names != original {
+            return Err(validation_error(
+                "plugin lock entries must be sorted and unique",
+                "Run `quirl plugin doctor` and rebuild the lockfile",
+            ));
+        }
+        for plugin in &self.plugins {
+            if plugin.enabled && plugin.runtime != PluginRuntime::TrustedLua {
+                return Err(validation_error(
+                    "non-executing plugin boundaries cannot be marked enabled",
+                    "Keep Wasm and out-of-process entries disabled until an isolated adapter is installed",
+                ));
+            }
+            if plugin.resolved_api_version != PLUGIN_API_VERSION || plugin.source.trim().is_empty()
+            {
+                return Err(validation_error(
+                    "locked plugin has an incompatible API or empty source identity",
+                    "Re-add the plugin with the installed Quirl version",
+                ));
+            }
+            let expected_runtime_hash = match plugin.runtime {
+                PluginRuntime::WasmComponent => wasm_world_hash(),
+                PluginRuntime::TrustedLua | PluginRuntime::OutOfProcess => {
+                    plugin_manifest_schema_hash()
+                }
+            };
+            if plugin.runtime_schema_hash != expected_runtime_hash {
+                return Err(validation_error(
+                    "locked plugin runtime schema hash is incompatible",
+                    "Re-add the plugin against the installed host schemas",
+                ));
+            }
+            validate_sorted_unique(
+                &plugin.requested_capabilities,
+                "locked requested capabilities",
+            )?;
+            validate_sorted_unique(&plugin.granted_capabilities, "locked granted capabilities")?;
+            validate_capabilities(&plugin.requested_capabilities)?;
+            validate_capabilities(&plugin.granted_capabilities)?;
+            if !plugin
+                .granted_capabilities
+                .iter()
+                .all(|grant| plugin.requested_capabilities.contains(grant))
+            {
+                return Err(validation_error(
+                    "plugin lock grants authority absent from the manifest request",
+                    "Remove the unexpected grant and re-add the plugin",
+                ));
+            }
+            validate_sha256(&plugin.manifest_checksum)?;
+            validate_sha256(&plugin.entry_checksum)?;
+            validate_sha256(&plugin.source_checksum)?;
+        }
+        Ok(())
+    }
+
+    pub fn install(&self, plugin: LockedPlugin) -> Result<Self, ShellError> {
+        self.validate()?;
+        if self.plugins.iter().any(|item| item.name == plugin.name) {
+            return Err(validation_error(
+                format!("plugin `{}` is already installed", plugin.name),
+                "Use `quirl plugin update --locked` or remove the installed plugin first",
+            ));
+        }
+        let mut candidate = self.clone();
+        candidate.plugins.push(plugin);
+        candidate
+            .plugins
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
+    pub fn replace_locked(&self, plugin: LockedPlugin) -> Result<Self, ShellError> {
+        self.validate()?;
+        let Some(existing) = self.plugins.iter().find(|item| item.name == plugin.name) else {
+            return Err(validation_error(
+                format!("plugin `{}` is not installed", plugin.name),
+                "Install it with `quirl plugin add <source>`",
+            ));
+        };
+        if existing.version != plugin.version
+            || existing.manifest_checksum != plugin.manifest_checksum
+            || existing.entry_checksum != plugin.entry_checksum
+            || existing.source_checksum != plugin.source_checksum
+            || existing.runtime_schema_hash != plugin.runtime_schema_hash
+            || existing.requested_capabilities != plugin.requested_capabilities
+            || existing.granted_capabilities != plugin.granted_capabilities
+        {
+            return Err(validation_error(
+                format!("locked plugin `{}` changed", plugin.name),
+                "Review the version, checksum, and permission diff; locked updates never rewrite them",
+            ));
+        }
+        let mut candidate = self.clone();
+        let item = candidate
+            .plugins
+            .iter_mut()
+            .find(|item| item.name == plugin.name)
+            .ok_or_else(|| validation_error("installed plugin disappeared", "Retry the update"))?;
+        item.source = plugin.source;
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
+    pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<Self, ShellError> {
+        self.validate()?;
+        let mut candidate = self.clone();
+        let plugin = candidate
+            .plugins
+            .iter_mut()
+            .find(|plugin| plugin.name == name)
+            .ok_or_else(|| unknown_plugin(name))?;
+        plugin.enabled = enabled;
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
+    pub fn remove(&self, name: &str) -> Result<Self, ShellError> {
+        self.validate()?;
+        let mut candidate = self.clone();
+        let before = candidate.plugins.len();
+        candidate.plugins.retain(|plugin| plugin.name != name);
+        if candidate.plugins.len() == before {
+            return Err(unknown_plugin(name));
+        }
+        Ok(candidate)
+    }
+
+    pub fn find(&self, name: &str) -> Result<&LockedPlugin, ShellError> {
+        self.plugins
+            .iter()
+            .find(|plugin| plugin.name == name)
+            .ok_or_else(|| unknown_plugin(name))
+    }
+}
+
+pub fn parse_plugin_manifest(source: &str, origin: &str) -> Result<PluginManifest, ShellError> {
+    toml::from_str::<PluginManifest>(source).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            format!("invalid plugin manifest {origin}"),
+        )
+        .with_context(error.to_string())
+        .with_help("Use schema_version = 1 and remove unknown plugin manifest fields")
+    })
+}
+
+pub fn validate_plugin_manifest(
+    manifest: &PluginManifest,
+    entry_bytes: &[u8],
+    quirl_version: &str,
+) -> Result<(), ShellError> {
+    if manifest.schema_version != PLUGIN_SCHEMA_VERSION {
+        return Err(validation_error(
+            format!(
+                "unsupported plugin schema version {}",
+                manifest.schema_version
+            ),
+            format!("Set schema_version = {PLUGIN_SCHEMA_VERSION}"),
+        ));
+    }
+    if !valid_name(&manifest.plugin.name)
+        || !valid_version(&manifest.plugin.version)
+        || manifest.plugin.summary.trim().is_empty()
+        || manifest.plugin.api != PLUGIN_API_VERSION
+        || !supports_version(&manifest.plugin.quirl, quirl_version)
+    {
+        return Err(validation_error(
+            "plugin identity, API, or Quirl version is invalid",
+            format!("Use a lowercase name, semantic version, summary, api = `{PLUGIN_API_VERSION}`, and a compatible Quirl range"),
+        ));
+    }
+    validate_relative_path(&manifest.plugin.entry)?;
+    validate_sorted_unique(&manifest.capabilities.request, "requested capabilities")?;
+    validate_capabilities(&manifest.capabilities.request)?;
+    validate_contributions(manifest)?;
+    match manifest.plugin.runtime {
+        PluginRuntime::TrustedLua => {
+            if !manifest.plugin.entry.ends_with(".lua")
+                || manifest.wasm.is_some()
+                || manifest.adapter.is_some()
+            {
+                return Err(validation_error(
+                    "trusted Lua plugins require a .lua entry and no isolated adapter block",
+                    "Set runtime = `trusted_lua` and remove wasm/adapter configuration",
+                ));
+            }
+        }
+        PluginRuntime::WasmComponent => validate_wasm_component(manifest, entry_bytes)?,
+        PluginRuntime::OutOfProcess => validate_out_of_process(manifest)?,
+    }
+    Ok(())
+}
+
+pub fn resolve_plugin(
+    manifest: &PluginManifest,
+    manifest_bytes: &[u8],
+    entry_bytes: &[u8],
+    source: &str,
+    approved_capabilities: &[String],
+    quirl_version: &str,
+) -> Result<(LockedPlugin, PermissionDiff), ShellError> {
+    validate_plugin_manifest(manifest, entry_bytes, quirl_version)?;
+    let diff = permission_diff(&[], &manifest.capabilities.request);
+    let approved = approved_capabilities.iter().collect::<BTreeSet<_>>();
+    let missing = diff
+        .added
+        .iter()
+        .filter(|permission| !approved.contains(permission))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "plugin requests unapproved permissions: {}",
+                missing.join(", ")
+            ),
+        )
+        .with_context(format!("permission diff: +{}", diff.added.join(", +")))
+        .with_help(
+            "Review the source, then repeat --allow <capability> for every approved addition",
+        ));
+    }
+    let manifest_checksum = sha256(manifest_bytes);
+    let entry_checksum = sha256(entry_bytes);
+    let source_checksum = sha256(
+        [
+            manifest_checksum.as_bytes(),
+            entry_checksum.as_bytes(),
+            source.as_bytes(),
+        ]
+        .concat(),
+    );
+    Ok((
+        LockedPlugin {
+            name: manifest.plugin.name.clone(),
+            version: manifest.plugin.version.clone(),
+            source: source.to_owned(),
+            runtime: manifest.plugin.runtime,
+            resolved_api_version: PLUGIN_API_VERSION.to_owned(),
+            runtime_schema_hash: match manifest.plugin.runtime {
+                PluginRuntime::WasmComponent => wasm_world_hash(),
+                PluginRuntime::TrustedLua | PluginRuntime::OutOfProcess => {
+                    plugin_manifest_schema_hash()
+                }
+            },
+            manifest_checksum,
+            entry_checksum,
+            source_checksum,
+            requested_capabilities: manifest.capabilities.request.clone(),
+            granted_capabilities: manifest.capabilities.request.clone(),
+            enabled: false,
+        },
+        diff,
+    ))
+}
+
+pub fn permission_diff(previous: &[String], requested: &[String]) -> PermissionDiff {
+    let previous = previous.iter().cloned().collect::<BTreeSet<_>>();
+    let requested = requested.iter().cloned().collect::<BTreeSet<_>>();
+    PermissionDiff {
+        added: requested.difference(&previous).cloned().collect(),
+        removed: previous.difference(&requested).cloned().collect(),
+        unchanged: previous.intersection(&requested).cloned().collect(),
+    }
+}
+
+/// Normalize manifest-declared plugin commands into the same semantic catalog
+/// contract used by builtins. Namespacing is mandatory in platform v0.1;
+/// shadowing a builtin is therefore impossible without a future explicit
+/// approval field and lockfile transition.
+pub fn normalize_plugin_commands(
+    manifest: &PluginManifest,
+    source: &str,
+    fingerprint: &str,
+) -> Result<Vec<CommandSpec>, ShellError> {
+    validate_contributions(manifest)?;
+    if Catalog::builtin().commands.iter().any(|command| {
+        command.path.split_whitespace().next() == Some(manifest.plugin.name.as_str())
+    }) {
+        return Err(validation_error(
+            format!(
+                "plugin namespace `{}` collides with an installed command namespace",
+                manifest.plugin.name
+            ),
+            "Rename the plugin; command shadow approval is not available in platform v0.1",
+        ));
+    }
+    let namespace = format!("{} ", manifest.plugin.name);
+    let provenance = ProvenanceInfo {
+        source: Provenance::Plugin,
+        confidence: quirl_catalog::Confidence::Exact,
+        trust: quirl_catalog::Trust::Trusted,
+        origin: Some(source.to_owned()),
+        fingerprint: Some(fingerprint.to_owned()),
+        generated_at: None,
+    };
+    let mut commands = Vec::new();
+    for command in &manifest.public_commands {
+        if command.path != manifest.plugin.name && !command.path.starts_with(&namespace) {
+            return Err(validation_error(
+                format!(
+                    "plugin command `{}` is outside namespace `{}`",
+                    command.path, manifest.plugin.name
+                ),
+                "Prefix contributed commands with the plugin name; shadowing is not available in platform v0.1",
+            ));
+        }
+        let arguments = command
+            .arguments
+            .iter()
+            .map(|argument| ArgumentSpec {
+                names: argument.names.clone(),
+                kind: match argument.kind {
+                    PackageArgumentKind::Positional => CatalogArgumentKind::Positional,
+                    PackageArgumentKind::Option => CatalogArgumentKind::Option,
+                    PackageArgumentKind::Flag => CatalogArgumentKind::Flag,
+                },
+                value_type: argument.value_type.clone(),
+                required: argument.required,
+                repeatable: argument.repeatable,
+                values: None,
+                conflicts: Vec::new(),
+                documentation: argument.documentation.clone(),
+                examples: command.examples.clone(),
+                provenance: provenance.clone(),
+            })
+            .collect();
+        let exit_codes = command
+            .error_codes
+            .iter()
+            .map(|(code, summary)| {
+                code.parse::<i32>()
+                    .map(|code| (code, summary.clone()))
+                    .map_err(|_| {
+                        validation_error(
+                            format!(
+                                "plugin command `{}` has non-numeric exit code `{code}`",
+                                command.path
+                            ),
+                            "Use signed integer exit-code keys",
+                        )
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        commands.push(CommandSpec {
+            id: format!(
+                "plugin:{}/{}",
+                manifest.plugin.name,
+                command
+                    .path
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join("/")
+            ),
+            version: Some(manifest.plugin.version.clone()),
+            path: command.path.clone(),
+            aliases: Vec::new(),
+            parent: command.path.rsplit_once(' ').map(|(parent, _)| {
+                format!(
+                    "plugin:{}/{}",
+                    manifest.plugin.name,
+                    parent.split_whitespace().collect::<Vec<_>>().join("/")
+                )
+            }),
+            signature: command.signature.clone(),
+            summary: command.summary.clone(),
+            details: command.details.clone(),
+            options: arguments,
+            examples: command.examples.clone(),
+            io: IoContract {
+                input: command.input_type.clone(),
+                output: command.output_type.clone(),
+                streaming: command.output_type.starts_with("Stream<"),
+            },
+            effects: command.effects.clone(),
+            exit_codes,
+            provenance: provenance.clone(),
+        });
+    }
+    commands.sort_by(|left, right| left.path.cmp(&right.path));
+    let ids = commands
+        .iter()
+        .map(|command| command.id.clone())
+        .collect::<BTreeSet<_>>();
+    for command in &mut commands {
+        if command
+            .parent
+            .as_ref()
+            .is_some_and(|parent| !ids.contains(parent))
+        {
+            command.parent = None;
+        }
+    }
+    Ok(commands)
+}
+
+pub fn doctor_plugin(
+    locked: &LockedPlugin,
+    manifest_bytes: &[u8],
+    entry_bytes: &[u8],
+) -> DoctorReport {
+    let mut diagnostics = Vec::new();
+    let manifest_checksum = sha256(manifest_bytes);
+    let entry_checksum = sha256(entry_bytes);
+    if manifest_checksum != locked.manifest_checksum {
+        diagnostics.push(doctor_error(
+            "plugin.manifest_tampered",
+            "manifest checksum differs from the permission lock",
+        ));
+    }
+    if entry_checksum != locked.entry_checksum {
+        diagnostics.push(doctor_error(
+            "plugin.entry_tampered",
+            "entry checksum differs from the permission lock",
+        ));
+    }
+    let source_checksum = sha256(
+        [
+            manifest_checksum.as_bytes(),
+            entry_checksum.as_bytes(),
+            locked.source.as_bytes(),
+        ]
+        .concat(),
+    );
+    if source_checksum != locked.source_checksum {
+        diagnostics.push(doctor_error(
+            "plugin.source_lock_tampered",
+            "source identity checksum differs from the permission lock",
+        ));
+    }
+    let expected_runtime_hash = match locked.runtime {
+        PluginRuntime::WasmComponent => wasm_world_hash(),
+        PluginRuntime::TrustedLua | PluginRuntime::OutOfProcess => plugin_manifest_schema_hash(),
+    };
+    if locked.runtime_schema_hash != expected_runtime_hash {
+        diagnostics.push(doctor_error(
+            "plugin.runtime_schema_mismatch",
+            "runtime schema or WIT world hash differs from the installed host",
+        ));
+    }
+    DoctorReport {
+        document_type: "quirl.plugin.doctor".to_owned(),
+        schema_version: PLUGIN_SCHEMA_VERSION,
+        plugin: locked.name.clone(),
+        healthy: diagnostics.is_empty(),
+        diagnostics,
+    }
+}
+
+fn validate_contributions(manifest: &PluginManifest) -> Result<(), ShellError> {
+    for (label, values) in [
+        ("commands", &manifest.contributes.commands),
+        ("completions", &manifest.contributes.completions),
+        ("events", &manifest.contributes.events),
+        ("panels", &manifest.contributes.panels),
+        ("indexers", &manifest.contributes.indexers),
+    ] {
+        validate_sorted_unique(values, label)?;
+    }
+    require_capability(
+        !manifest.contributes.commands.is_empty(),
+        "commands.register",
+        &manifest.capabilities.request,
+    )?;
+    require_capability(
+        !manifest.contributes.completions.is_empty(),
+        "completion.register",
+        &manifest.capabilities.request,
+    )?;
+    require_capability(
+        !manifest.contributes.events.is_empty(),
+        "events.observe",
+        &manifest.capabilities.request,
+    )?;
+    require_capability(
+        !manifest.contributes.panels.is_empty(),
+        "ui.panel",
+        &manifest.capabilities.request,
+    )?;
+    require_capability(
+        !manifest.contributes.indexers.is_empty(),
+        "catalog.register",
+        &manifest.capabilities.request,
+    )?;
+    require_capability(
+        !manifest.contributes.panels.is_empty() || !manifest.contributes.indexers.is_empty(),
+        "extension.contribute",
+        &manifest.capabilities.request,
+    )?;
+    let declared = manifest
+        .contributes
+        .commands
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let documented = manifest
+        .public_commands
+        .iter()
+        .map(|command| command.path.as_str())
+        .collect::<BTreeSet<_>>();
+    if declared != documented {
+        return Err(validation_error(
+            "every contributed command needs one exact public command contract",
+            "Keep contributes.commands and public_commands paths identical",
+        ));
+    }
+    for command in &manifest.public_commands {
+        validate_command(command)?;
+    }
+    Ok(())
+}
+
+fn validate_command(command: &PackageCommand) -> Result<(), ShellError> {
+    if command.path.trim().is_empty()
+        || command.signature.trim().is_empty()
+        || command.summary.trim().is_empty()
+        || command.details.trim().is_empty()
+        || command.input_type.trim().is_empty()
+        || command.output_type.trim().is_empty()
+        || command.examples.is_empty()
+        || command.effects.is_empty()
+        || command.error_codes.is_empty()
+    {
+        return Err(validation_error(
+            format!("public command `{}` has incomplete metadata", command.path),
+            "Document its signature, types, examples, effects, and error codes",
+        ));
+    }
+    let _effects = command.effects.iter().map(effect_name).collect::<Vec<_>>();
+    Ok(())
+}
+
+fn validate_wasm_component(
+    manifest: &PluginManifest,
+    entry_bytes: &[u8],
+) -> Result<(), ShellError> {
+    let boundary = manifest.wasm.as_ref().ok_or_else(|| {
+        validation_error(
+            "Wasm component plugins require a [wasm] boundary",
+            "Declare the imported world and non-zero memory, fuel, and callback budgets",
+        )
+    })?;
+    if manifest.adapter.is_some()
+        || !manifest.plugin.entry.ends_with(".wasm")
+        || boundary.world != WASM_WORLD
+        || boundary.max_memory_bytes == 0
+        || boundary.fuel == 0
+        || boundary.callback_timeout_ms == 0
+    {
+        return Err(validation_error(
+            "invalid or unbounded WebAssembly component boundary",
+            "Use a component-model binary for world `quirl:plugin/api@0.1.0` and declare non-zero budgets",
+        ));
+    }
+    validate_component_contract(entry_bytes)?;
+    Ok(())
+}
+
+fn validate_component_contract(bytes: &[u8]) -> Result<(), ShellError> {
+    Validator::new().validate_all(bytes).map_err(|error| {
+        validation_error(
+            format!("invalid WebAssembly component: {error}"),
+            "Build a validated component for the checked-in quirl-plugin.wit world",
+        )
+    })?;
+    let mut component = false;
+    let mut component_types = 0usize;
+    let mut imports = BTreeSet::new();
+    let mut exports = BTreeSet::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|error| {
+            validation_error(
+                format!("cannot inspect WebAssembly component metadata: {error}"),
+                "Rebuild the component from the checked-in WIT world",
+            )
+        })? {
+            Payload::Version { encoding, .. } => component = encoding == Encoding::Component,
+            Payload::ComponentTypeSection(reader) => {
+                for ty in reader {
+                    ty.map_err(|error| {
+                        validation_error(
+                            format!("invalid component type metadata: {error}"),
+                            "Rebuild the component from the checked-in WIT world",
+                        )
+                    })?;
+                    component_types = component_types.saturating_add(1);
+                }
+            }
+            Payload::ComponentImportSection(reader) => {
+                for import in reader {
+                    imports.insert(
+                        import
+                            .map_err(|error| {
+                                validation_error(
+                                    format!("invalid component import metadata: {error}"),
+                                    "Rebuild the component from the checked-in WIT world",
+                                )
+                            })?
+                            .name
+                            .name
+                            .to_owned(),
+                    );
+                }
+            }
+            Payload::ComponentExportSection(reader) => {
+                for export in reader {
+                    exports.insert(
+                        export
+                            .map_err(|error| {
+                                validation_error(
+                                    format!("invalid component export metadata: {error}"),
+                                    "Rebuild the component from the checked-in WIT world",
+                                )
+                            })?
+                            .name
+                            .name
+                            .to_owned(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    if !component
+        || component_types == 0
+        || imports != BTreeSet::from([WASM_HOST_IMPORT.to_owned()])
+        || exports != BTreeSet::from([WASM_GUEST_EXPORT.to_owned()])
+    {
+        return Err(validation_error(
+            "WebAssembly component imports or exports do not match the Quirl WIT world",
+            format!("Import exactly `{WASM_HOST_IMPORT}` and export exactly `{WASM_GUEST_EXPORT}`"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_out_of_process(manifest: &PluginManifest) -> Result<(), ShellError> {
+    let adapter = manifest.adapter.as_ref().ok_or_else(|| {
+        validation_error(
+            "out-of-process plugins require an [adapter] boundary",
+            "Declare protocol, relative executable, message limit, and callback timeout",
+        )
+    })?;
+    validate_relative_path(&adapter.executable)?;
+    if manifest.wasm.is_some()
+        || adapter.protocol != "quirl.plugin.v1"
+        || adapter.callback_timeout_ms == 0
+        || adapter.max_message_bytes == 0
+    {
+        return Err(validation_error(
+            "invalid or unbounded out-of-process adapter boundary",
+            "Use protocol `quirl.plugin.v1` with non-zero message and callback limits",
+        ));
+    }
+    Ok(())
+}
+
+fn require_capability(active: bool, needed: &str, requested: &[String]) -> Result<(), ShellError> {
+    if active && !requested.iter().any(|item| item == needed) {
+        return Err(validation_error(
+            format!("contribution requires capability `{needed}`"),
+            format!("Add `{needed}` to capabilities.request and approve the permission diff"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sorted_unique(values: &[String], label: &str) -> Result<(), ShellError> {
+    let mut normalized = values.to_vec();
+    normalized.sort();
+    normalized.dedup();
+    if normalized != values || values.iter().any(|item| item.trim().is_empty()) {
+        return Err(validation_error(
+            format!("{label} must be non-empty, sorted, and unique"),
+            "Sort values lexicographically and remove duplicates",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_capabilities(capabilities: &[String]) -> Result<(), ShellError> {
+    const EXACT: &[&str] = &[
+        "analysis.register",
+        "catalog.register",
+        "commands.register",
+        "completion.register",
+        "environment.mutate",
+        "events.observe",
+        "execution.block",
+        "extension.contribute",
+        "filesystem.read",
+        "filesystem.write",
+        "knowledge.register",
+        "output.read",
+        "plan.rewrite",
+        "process.spawn",
+        "prompt.register",
+        "ui.panel",
+        "view.register",
+    ];
+    for capability in capabilities {
+        if EXACT.contains(&capability.as_str()) {
+            continue;
+        }
+        let Some((name, scope)) = capability.split_once(':') else {
+            return Err(unsupported_capability(capability));
+        };
+        let valid = match name {
+            "process.spawn" => valid_executable_scope(scope),
+            "filesystem.read" | "filesystem.write" => valid_filesystem_scope(scope),
+            _ => false,
+        };
+        if !valid {
+            return Err(unsupported_capability(capability));
+        }
+    }
+    Ok(())
+}
+
+fn valid_executable_scope(scope: &str) -> bool {
+    let path = std::path::Path::new(scope);
+    !scope.is_empty()
+        && !scope.starts_with('-')
+        && !path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+        && scope.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'+')
+        })
+}
+
+fn valid_filesystem_scope(scope: &str) -> bool {
+    let path = std::path::Path::new(scope);
+    !scope.is_empty()
+        && !path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+}
+
+fn unsupported_capability(capability: &str) -> ShellError {
+    validation_error(
+        format!("unsupported or malformed plugin capability `{capability}`"),
+        "Use a documented capability; only process.spawn:<executable> and filesystem.read/write:<relative-path> accept scopes",
+    )
+}
+
+fn validate_relative_path(path: &str) -> Result<(), ShellError> {
+    let path = std::path::Path::new(path);
+    if path.is_absolute()
+        || path.as_os_str().is_empty()
+        || !path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(validation_error(
+            "plugin paths must stay relative to their package",
+            "Remove absolute and parent-directory components",
+        ));
+    }
+    Ok(())
+}
+
+fn sha256(bytes: impl AsRef<[u8]>) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes.as_ref()))
+}
+
+fn validate_sha256(checksum: &str) -> Result<(), ShellError> {
+    let value = checksum.strip_prefix("sha256:").unwrap_or_default();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(validation_error(
+            "plugin lockfile contains an invalid SHA-256 checksum",
+            "Re-add the plugin from a trusted source",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_version(version: &str) -> bool {
+    let core = version.split_once('-').map_or(version, |(core, _)| core);
+    let parts = core.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn supports_version(requirement: &str, installed: &str) -> bool {
+    let Some(installed) = parse_version(installed) else {
+        return false;
+    };
+    requirement.split(',').all(|constraint| {
+        let constraint = constraint.trim();
+        let (operator, version) = [">=", "<=", ">", "<", "="]
+            .into_iter()
+            .find_map(|operator| {
+                constraint
+                    .strip_prefix(operator)
+                    .map(|version| (operator, version.trim()))
+            })
+            .unwrap_or(("=", constraint));
+        let Some(required) = parse_version(version) else {
+            return false;
+        };
+        match operator {
+            ">=" => installed >= required,
+            "<=" => installed <= required,
+            ">" => installed > required,
+            "<" => installed < required,
+            _ => installed == required,
+        }
+    })
+}
+
+fn parse_version(version: &str) -> Option<[u64; 3]> {
+    let core = version.split_once('-').map_or(version, |(core, _)| core);
+    let mut parsed = [0_u64; 3];
+    let parts = core.split('.').collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    for (index, part) in parts.into_iter().enumerate() {
+        parsed[index] = part.parse().ok()?;
+    }
+    Some(parsed)
+}
+
+fn default_api_version() -> String {
+    PLUGIN_API_VERSION.to_owned()
+}
+
+fn doctor_error(code: &str, message: &str) -> DoctorDiagnostic {
+    DoctorDiagnostic {
+        severity: DoctorSeverity::Error,
+        code: code.to_owned(),
+        message: message.to_owned(),
+        help: "Restore the locked source or explicitly review and re-add the plugin".to_owned(),
+    }
+}
+
+fn unknown_plugin(name: &str) -> ShellError {
+    validation_error(
+        format!("plugin `{name}` is not installed"),
+        "List the lockfile or add the plugin before changing its state",
+    )
+}
+
+fn validation_error(message: impl Into<String>, help: impl Into<String>) -> ShellError {
+    ShellError::new(ErrorCode::Validation, message).with_help(help)
+}
+
+fn effect_name(effect: &Effect) -> &'static str {
+    match effect {
+        Effect::ReadFilesystem => "read_filesystem",
+        Effect::WriteFilesystem => "write_filesystem",
+        Effect::SpawnProcess => "spawn_process",
+        Effect::ChangeDirectory => "change_directory",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LUA_MANIFEST: &str = r#"
+schema_version = 1
+
+[plugin]
+name = "demo"
+version = "0.1.0"
+entry = "plugin.lua"
+quirl = ">=0.1, <0.2"
+api = "0.1.0"
+runtime = "trusted_lua"
+summary = "Demonstrate typed plugin state"
+
+[capabilities]
+request = ["commands.register"]
+
+[contributes]
+commands = ["demo run"]
+completions = []
+events = []
+panels = []
+indexers = []
+
+[[public_commands]]
+path = "demo run"
+signature = "demo run"
+summary = "Run the demo"
+details = "Returns one deterministic demo record."
+input_type = "Nothing"
+output_type = "Record"
+examples = ["demo run"]
+effects = ["read_filesystem"]
+error_codes = { "0" = "success" }
+"#;
+
+    fn resolved(approved: &[String]) -> Result<LockedPlugin, ShellError> {
+        let manifest = parse_plugin_manifest(LUA_MANIFEST, "plugin.toml")?;
+        resolve_plugin(
+            &manifest,
+            LUA_MANIFEST.as_bytes(),
+            b"quirl.plugin.command {}",
+            "file:/demo",
+            approved,
+            "0.1.0",
+        )
+        .map(|value| value.0)
+    }
+
+    #[test]
+    fn manifest_denies_unknown_fields_and_permission_escalation() {
+        let unknown = format!("{LUA_MANIFEST}\nunknown = true\n");
+        assert!(parse_plugin_manifest(&unknown, "plugin.toml").is_err());
+        let error = resolved(&[]).unwrap_err();
+        assert!(error.message.contains("unapproved permissions"));
+    }
+
+    #[test]
+    fn manifests_and_locks_reject_unknown_or_malformed_capabilities() {
+        for capability in [
+            "network.everything",
+            "process.spawn:printf\nsecond",
+            "process.spawn:../escape",
+            "filesystem.read:../../secret",
+            "commands.register:shadow",
+        ] {
+            let source = LUA_MANIFEST.replace(
+                "request = [\"commands.register\"]",
+                &format!("request = [\"{capability}\"]"),
+            );
+            if let Ok(manifest) = parse_plugin_manifest(&source, "plugin.toml") {
+                assert!(
+                    validate_plugin_manifest(&manifest, b"return true", "0.1.0").is_err(),
+                    "accepted {capability}"
+                );
+            }
+        }
+
+        let mut locked = resolved(&["commands.register".to_owned()]).unwrap();
+        locked
+            .requested_capabilities
+            .push("network.everything".to_owned());
+        locked.requested_capabilities.sort();
+        let lock = PluginLockfile {
+            plugins: vec![locked],
+            ..PluginLockfile::empty()
+        };
+        assert!(lock.validate().is_err());
+    }
+
+    #[test]
+    fn lock_transitions_are_copy_on_validate_and_sorted() {
+        let plugin = resolved(&["commands.register".to_owned()]).unwrap();
+        let empty = PluginLockfile::empty();
+        let installed = empty.install(plugin).unwrap();
+        assert!(empty.plugins.is_empty());
+        assert!(!installed.plugins[0].enabled);
+        let enabled = installed.set_enabled("demo", true).unwrap();
+        assert!(!installed.plugins[0].enabled);
+        assert!(enabled.plugins[0].enabled);
+        assert!(enabled.remove("demo").unwrap().plugins.is_empty());
+    }
+
+    #[test]
+    fn doctor_detects_manifest_and_entry_tampering() {
+        let plugin = resolved(&["commands.register".to_owned()]).unwrap();
+        let report = doctor_plugin(&plugin, b"tampered", b"tampered");
+        assert!(!report.healthy);
+        assert_eq!(report.diagnostics.len(), 3);
+    }
+
+    #[test]
+    fn locked_update_rejects_checksum_or_permission_changes() {
+        let plugin = resolved(&["commands.register".to_owned()]).unwrap();
+        let lock = PluginLockfile::empty().install(plugin.clone()).unwrap();
+        let mut escalated = plugin;
+        escalated
+            .requested_capabilities
+            .push("process.spawn:demo".to_owned());
+        escalated.requested_capabilities.sort();
+        assert!(lock.replace_locked(escalated).is_err());
+        assert_eq!(lock.plugins.len(), 1);
+    }
+
+    #[test]
+    fn wasm_boundary_accepts_components_and_rejects_core_modules() {
+        let mut wit = wit_parser::Resolve::default();
+        wit.push_str("quirl-plugin.wit", WASM_WIT).unwrap();
+        let source = LUA_MANIFEST
+            .replace("entry = \"plugin.lua\"", "entry = \"plugin.wasm\"")
+            .replace("runtime = \"trusted_lua\"", "runtime = \"wasm_component\"")
+            + r#"
+
+[wasm]
+world = "quirl:plugin/api@0.1.0"
+max_memory_bytes = 16777216
+fuel = 1000000
+callback_timeout_ms = 25
+"#;
+        let manifest = parse_plugin_manifest(&source, "plugin.toml").unwrap();
+        let component = wat::parse_str(format!(
+            r#"(component
+                (type (instance))
+                (import "{WASM_HOST_IMPORT}" (instance (type 0)))
+                (export "{WASM_GUEST_EXPORT}" (instance 0))
+            )"#
+        ))
+        .unwrap();
+        assert!(validate_plugin_manifest(&manifest, &component, "0.1.0").is_ok());
+        let (locked, _) = resolve_plugin(
+            &manifest,
+            source.as_bytes(),
+            &component,
+            "file:/demo/plugin.toml",
+            &["commands.register".to_owned()],
+            "0.1.0",
+        )
+        .unwrap();
+        let lock = PluginLockfile::empty().install(locked).unwrap();
+        assert!(lock.set_enabled("demo", true).is_err());
+        assert!(validate_plugin_manifest(&manifest, b"\0asm\x01\0\0\0", "0.1.0").is_err());
+        let wrong_world = wat::parse_str(
+            r#"(component
+                (type (instance))
+                (import "ambient:host/api" (instance (type 0)))
+                (export "quirl:plugin/guest@0.1.0" (instance 0))
+            )"#,
+        )
+        .unwrap();
+        assert!(validate_plugin_manifest(&manifest, &wrong_world, "0.1.0").is_err());
+        assert!(wasm_world_hash().starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn plugin_commands_normalize_into_exact_namespaced_catalog_facts() {
+        let manifest = parse_plugin_manifest(LUA_MANIFEST, "plugin.toml").unwrap();
+        let commands = normalize_plugin_commands(&manifest, "file:/demo", "sha256:demo").unwrap();
+        let command = &commands[0];
+        assert_eq!(command.id, "plugin:demo/demo/run");
+        assert_eq!(command.version.as_deref(), Some("0.1.0"));
+        assert_eq!(command.path, "demo run");
+        assert_eq!(command.io.input, "Nothing");
+        assert_eq!(command.io.output, "Record");
+        assert_eq!(
+            command.exit_codes.get(&0).map(String::as_str),
+            Some("success")
+        );
+        assert_eq!(command.provenance.source, Provenance::Plugin);
+        assert_eq!(
+            command.provenance.confidence,
+            quirl_catalog::Confidence::Exact
+        );
+        assert_eq!(command.provenance.trust, quirl_catalog::Trust::Trusted);
+        assert_eq!(
+            command.provenance.fingerprint.as_deref(),
+            Some("sha256:demo")
+        );
+    }
+
+    #[test]
+    fn plugin_commands_cannot_shadow_outside_their_namespace() {
+        let source = LUA_MANIFEST
+            .replace("commands = [\"demo run\"]", "commands = [\"git commit\"]")
+            .replace("path = \"demo run\"", "path = \"git commit\"")
+            .replace("signature = \"demo run\"", "signature = \"git commit\"");
+        let manifest = parse_plugin_manifest(&source, "plugin.toml").unwrap();
+        let error = normalize_plugin_commands(&manifest, "file:/demo", "sha256:demo").unwrap_err();
+        assert!(error.message.contains("outside namespace"));
+
+        let reserved = LUA_MANIFEST
+            .replace("name = \"demo\"", "name = \"git\"")
+            .replace("commands = [\"demo run\"]", "commands = [\"git extra\"]")
+            .replace("path = \"demo run\"", "path = \"git extra\"")
+            .replace("signature = \"demo run\"", "signature = \"git extra\"");
+        let manifest = parse_plugin_manifest(&reserved, "plugin.toml").unwrap();
+        let error = normalize_plugin_commands(&manifest, "file:/git", "sha256:git").unwrap_err();
+        assert!(error.message.contains("collides"));
+    }
+}

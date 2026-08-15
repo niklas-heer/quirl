@@ -1,6 +1,9 @@
 use crate::package::package_manifest_schema_hash;
 use crate::stable_hash;
-use quirl_catalog::{Catalog, CommandSpec, Confidence, Effect, Provenance};
+use quirl_catalog::{
+    ArgumentKind, Catalog, CommandSpec, CompletionSource, Confidence, Effect, IoContract,
+    Provenance, Trust,
+};
 use quirl_core::{ErrorCode, ShellError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,9 +12,12 @@ pub const AGENT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_TOKEN_BUDGET: usize = 6_000;
 pub const MINIMUM_TOKEN_BUDGET: usize = 64;
 
-const PROVENANCE_SCHEMA: &str = "AgentProvenance{deny_unknown;source:enum[builtin,external,lua,fish,bash,zsh,help,man];confidence:enum[low,medium,high,exact];origin:null|string;fingerprint:null|string}";
-const OPTION_SCHEMA: &str = "AgentOption{deny_unknown;names:array<string>;value:null|string;summary:string;provenance:AgentProvenance}";
-const COMMAND_SCHEMA: &str = "AgentCommand{deny_unknown;path:string;signature:string;summary:string;details:string;options:array<AgentOption>;examples:array<string>;effects:array<enum[read_filesystem,write_filesystem,spawn_process,change_directory]>;provenance:AgentProvenance}";
+const PROVENANCE_SCHEMA: &str = "AgentProvenance{deny_unknown;source:enum[builtin,external,lua,plugin,fish,bash,zsh,help,man];confidence:enum[low,medium,high,exact];trust:enum[builtin,trusted,declared,imported,heuristic];origin:null|string;fingerprint:null|string;generated_at:null|string}";
+const OPTION_SCHEMA: &str = "AgentOption{deny_unknown;names:array<string>;kind:enum[positional,option,flag];value_type:string;required:bool;repeatable:bool;values:null|CompletionSource;conflicts:array<string>;documentation:string;examples:array<string>;provenance:AgentProvenance}";
+const COMPLETION_SCHEMA: &str =
+    "CompletionSource{deny_unknown;tag=kind;static{values:array<string>};dynamic{provider:string}}";
+const IO_SCHEMA: &str = "IoContract{deny_unknown;input:string;output:string;streaming:bool}";
+const COMMAND_SCHEMA: &str = "AgentCommand{deny_unknown;id:string;version:null|string;path:string;aliases:array<string>;parent:null|string;signature:string;summary:string;details:string;options:array<AgentOption>;examples:array<string>;io:IoContract;effects:array<enum[read_filesystem,write_filesystem,spawn_process,change_directory]>;exit_codes:map<i32,string>;provenance:AgentProvenance}";
 const HOST_SCHEMA: &str = "HostCapability{deny_unknown;path:string;summary:string;parameters:array<HostParameter{deny_unknown;name:string;value_type:string}>;returns:string;capability:null|string}";
 const CAPABILITY_SCHEMA: &str = "InstalledCapability{deny_unknown;name:string;version:u32;schema_hash:string;providers:array<string>}";
 const CATALOG_SCHEMA: &str = "AgentCatalog{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;quirl_version:string;catalog_schema_version:u32;catalog_hash:string;host_api_schema_version:u32;host_api_hash:string;commands:array<AgentCommand>;host_api:array<HostCapability>;capabilities:array<InstalledCapability>}";
@@ -24,6 +30,8 @@ fn catalog_schema_hash() -> String {
         CATALOG_SCHEMA,
         COMMAND_SCHEMA,
         OPTION_SCHEMA,
+        COMPLETION_SCHEMA,
+        IO_SCHEMA,
         PROVENANCE_SCHEMA,
         HOST_SCHEMA,
         CAPABILITY_SCHEMA,
@@ -35,6 +43,8 @@ fn context_schema_hash() -> String {
         CONTEXT_SCHEMA,
         COMMAND_SCHEMA,
         OPTION_SCHEMA,
+        COMPLETION_SCHEMA,
+        IO_SCHEMA,
         PROVENANCE_SCHEMA,
         HOST_SCHEMA,
     ])
@@ -78,8 +88,14 @@ pub struct HostCapability {
 #[serde(deny_unknown_fields)]
 pub struct AgentOption {
     pub names: Vec<String>,
-    pub value: Option<String>,
-    pub summary: String,
+    pub kind: ArgumentKind,
+    pub value_type: String,
+    pub required: bool,
+    pub repeatable: bool,
+    pub values: Option<CompletionSource>,
+    pub conflicts: Vec<String>,
+    pub documentation: String,
+    pub examples: Vec<String>,
     pub provenance: AgentProvenance,
 }
 
@@ -88,20 +104,28 @@ pub struct AgentOption {
 pub struct AgentProvenance {
     pub source: Provenance,
     pub confidence: Confidence,
+    pub trust: Trust,
     pub origin: Option<String>,
     pub fingerprint: Option<String>,
+    pub generated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCommand {
+    pub id: String,
+    pub version: Option<String>,
     pub path: String,
+    pub aliases: Vec<String>,
+    pub parent: Option<String>,
     pub signature: String,
     pub summary: String,
     pub details: String,
     pub options: Vec<AgentOption>,
     pub examples: Vec<String>,
+    pub io: IoContract,
     pub effects: Vec<Effect>,
+    pub exit_codes: BTreeMap<i32, String>,
     pub provenance: AgentProvenance,
 }
 
@@ -388,7 +412,7 @@ pub fn build_agent_context(
             candidates.push(ContextCandidate::Command {
                 score,
                 key: format!("command:{}", command.path),
-                value: command.clone(),
+                value: Box::new(command.clone()),
             });
         }
     }
@@ -433,23 +457,58 @@ pub fn build_agent_context(
     }
     context.estimated_tokens = base_estimate;
     let candidate_count = candidates.len();
+    let mut content_truncated = false;
     for candidate in candidates {
-        let mut proposed = context.clone();
         match candidate {
-            ContextCandidate::Command { value, .. } => proposed.commands.push(value),
-            ContextCandidate::Host { value, .. } => proposed.host_api.push(value),
-        }
-        sort_context(&mut proposed);
-        let estimated = estimate_payload_tokens(&proposed)?;
-        if estimated <= token_budget {
-            context = proposed;
-            context.estimated_tokens = estimated;
+            ContextCandidate::Command { value, .. } => {
+                let mut proposed = context.clone();
+                proposed.commands.push((*value).clone());
+                sort_context(&mut proposed);
+                let estimated = estimate_payload_tokens(&proposed)?;
+                if estimated <= token_budget {
+                    context = proposed;
+                    context.estimated_tokens = estimated;
+                    continue;
+                }
+
+                // Preserve the highest-ranked command when its complete catalog
+                // record exceeds a small context budget. The context-wide
+                // `truncated` bit distinguishes this deterministic projection
+                // from the authoritative record referenced by `catalog_hash`.
+                let mut compact = context.clone();
+                compact.commands.push(compact_agent_command(*value));
+                sort_context(&mut compact);
+                let estimated = estimate_payload_tokens(&compact)?;
+                if estimated <= token_budget {
+                    context = compact;
+                    context.estimated_tokens = estimated;
+                    content_truncated = true;
+                }
+            }
+            ContextCandidate::Host { value, .. } => {
+                let mut proposed = context.clone();
+                proposed.host_api.push(value);
+                sort_context(&mut proposed);
+                let estimated = estimate_payload_tokens(&proposed)?;
+                if estimated <= token_budget {
+                    context = proposed;
+                    context.estimated_tokens = estimated;
+                }
+            }
         }
     }
     sort_context(&mut context);
     context.estimated_tokens = estimate_payload_tokens(&context)?;
-    context.truncated = context.commands.len() + context.host_api.len() < candidate_count;
+    context.truncated =
+        content_truncated || context.commands.len() + context.host_api.len() < candidate_count;
     Ok(context)
+}
+
+fn compact_agent_command(mut command: AgentCommand) -> AgentCommand {
+    command.options.clear();
+    command.examples.truncate(1);
+    command.aliases.clear();
+    command
 }
 
 pub fn render_context_markdown(context: &AgentContext) -> String {
@@ -525,7 +584,11 @@ pub fn validate_agent_document_with_anchors(
 impl From<&CommandSpec> for AgentCommand {
     fn from(command: &CommandSpec) -> Self {
         Self {
+            id: command.id.clone(),
+            version: command.version.clone(),
             path: command.path.clone(),
+            aliases: command.aliases.clone(),
+            parent: command.parent.clone(),
             signature: command.signature.clone(),
             summary: command.summary.clone(),
             details: command.details.clone(),
@@ -534,13 +597,21 @@ impl From<&CommandSpec> for AgentCommand {
                 .iter()
                 .map(|option| AgentOption {
                     names: option.names.clone(),
-                    value: option.value.clone(),
-                    summary: option.summary.clone(),
+                    kind: option.kind,
+                    value_type: option.value_type.clone(),
+                    required: option.required,
+                    repeatable: option.repeatable,
+                    values: option.values.clone(),
+                    conflicts: option.conflicts.clone(),
+                    documentation: option.documentation.clone(),
+                    examples: option.examples.clone(),
                     provenance: AgentProvenance::from(&option.provenance),
                 })
                 .collect(),
             examples: command.examples.clone(),
+            io: command.io.clone(),
             effects: command.effects.clone(),
+            exit_codes: command.exit_codes.clone(),
             provenance: AgentProvenance::from(&command.provenance),
         }
     }
@@ -551,8 +622,10 @@ impl From<&quirl_catalog::ProvenanceInfo> for AgentProvenance {
         Self {
             source: provenance.source,
             confidence: provenance.confidence,
+            trust: provenance.trust,
             origin: provenance.origin.clone(),
             fingerprint: provenance.fingerprint.clone(),
+            generated_at: provenance.generated_at.clone(),
         }
     }
 }
@@ -561,7 +634,7 @@ enum ContextCandidate {
     Command {
         score: i32,
         key: String,
-        value: AgentCommand,
+        value: Box<AgentCommand>,
     },
     Host {
         score: i32,
@@ -622,7 +695,7 @@ fn command_score(query: &str, command: &AgentCommand) -> i32 {
             command
                 .options
                 .iter()
-                .map(|option| format!("{} {}", option.names.join(" "), option.summary))
+                .map(|option| { format!("{} {}", option.names.join(" "), option.documentation) })
                 .collect::<Vec<_>>()
                 .join(" ")
         ),

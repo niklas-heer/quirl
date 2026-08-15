@@ -29,7 +29,11 @@ ties use stable names. The budget estimator is the Unicode-scalar length of the
 canonical compact JSON payload divided by four and rounded up. The envelope
 records the estimator, requested budget, estimated use, source hashes, and
 whether facts were truncated. A generated payload never exceeds its declared
-budget.
+budget. If the highest-ranked complete command record does not fit, context
+keeps a deterministic compact projection with stable identity, signature,
+summary, typed IO, effects, exits, and provenance, omits its argument list and
+all but one example, and sets `truncated = true`; the catalog hash still points
+to the authoritative complete record.
 
 Validation rejects unknown fields, incompatible schema versions, hash drift,
 nondeterministic ordering, and context budget drift. Catalog hashes are

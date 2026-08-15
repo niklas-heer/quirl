@@ -1,0 +1,31 @@
+schema_version = 1
+
+[plugin]
+name = "platform-demo"
+version = "0.1.0"
+entry = "plugin.lua"
+quirl = ">=0.1, <0.2"
+api = "0.1.0"
+runtime = "trusted_lua"
+summary = "Demonstrate permission-locked typed command registration"
+
+[capabilities]
+request = ["commands.register"]
+
+[contributes]
+commands = ["platform-demo run"]
+completions = []
+events = []
+panels = []
+indexers = []
+
+[[public_commands]]
+path = "platform-demo run"
+signature = "platform-demo run"
+summary = "Return a typed demonstration record"
+details = "Returns one deterministic record without ambient authority."
+input_type = "Nothing"
+output_type = "Record"
+examples = ["platform-demo run"]
+effects = ["read_filesystem"]
+error_codes = { "0" = "success" }

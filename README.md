@@ -42,8 +42,10 @@ batter. The result is a single fast binary where your shell finally feels
 as smart as your editor.
 
 > [!IMPORTANT]
-> Quirl 0.1 is a **Preview**. Its acceptance seams are runnable and tested, but
-> APIs may still break before 1.0 and Windows support remains later-phase work.
+> Quirl 0.1 is a **Platform Preview**. Its acceptance seams are runnable and
+> tested, but APIs may still break before 1.0. The Windows process backend is
+> cross-compiled and contract-tested; native terminal handoff and suspend remain
+> incomplete until they can be exercised on a Windows host.
 > See [Status](#status) for the exact implemented surface.
 
 ## Features
@@ -77,6 +79,15 @@ as smart as your editor.
 - **Explicit agent and package contracts** — versioned deny-unknown JSON,
   token-budgeted installed context, schema/content hashes, and package metadata
   quality gates are available without executing extensions or publishing.
+- **Permission-locked plugin platform** — local trusted Lua, Wasm-component,
+  and out-of-process packages use versioned manifests, requested/granted
+  capabilities, SHA-256 source locks, atomic lifecycle changes, and doctor
+  diagnostics; isolated boundaries are validated without pretending to
+  execute a Wasm runtime that is not yet selected.
+- **Typed extension events and live views** — immutable ordered event records,
+  explicit mutation grants, isolated deadline-bounded Lua handlers, composed
+  catalog/completion/panel providers, escape-safe directory/process panels,
+  and cancellable capacity-bounded `watch` sample history.
 
 ## How is Quirl different?
 
@@ -104,9 +115,12 @@ shell; Quirl is still an early Preview.
 
 ## Status
 
-Quirl 0.1 is a runnable Scriptable milestone: the Preview shell and Phase 2
-authoring, language-service, agent, and package contracts work end to end, but
-the platform is not yet the frozen, cross-platform 1.0 daily-driver contract.
+Quirl 0.1 is a runnable Platform milestone: the Preview shell, scriptable
+authoring stack, permission-locked trusted-Lua extensions, typed extension
+protocols, reference-shell runners, panels, bounded watch history, recovery,
+and portable process backend work end to end. Isolated Wasm/out-of-process
+adapters are validated but deliberately cannot be enabled yet, and the platform
+is not the frozen, audited 1.0 daily-driver contract.
 The architecture and decisions behind it are documented in depth:
 
 - [Language & product design](docs/language-design.md) — the intended
@@ -121,6 +135,15 @@ The architecture and decisions behind it are documented in depth:
   AI discovery, validation, `plugin.toml`, build, and dry-run publish formats.
 - [ADR 0004: Phase 2 product layers](docs/decisions/0004-phase-2-contract-and-language-service-layers.md) —
   one-way boundaries for contracts and the language service.
+- [Plugin platform v0.1](docs/plugin-platform.md) and
+  [ADR 0005](docs/decisions/0005-plugin-platform-layer.md) — permission locks,
+  trusted Lua grants, isolation manifests, and lifecycle recovery.
+- [Semantic command catalog schema v4](docs/catalog-schema.md) and
+  [ADR 0007](docs/decisions/0007-semantic-catalog-v4.md) — stable identities,
+  typed arguments and IO, exact metadata quality, provenance, and cache migration.
+- [Extension events, typed views, and live pipelines](docs/extension-events-and-live-views.md) —
+  immutable records, declared actions, contribution gates, terminal safety,
+  plain fallbacks, and bounded streaming behavior.
 - [Runtime selection spike](docs/benchmarks/embedded-language-selection.md) —
   the earlier latency benchmarks that fed the decision.
 
@@ -150,7 +173,12 @@ runtime dependencies have been removed.
 - [x] Named end-to-end PTY performance measurements with misses recorded.
 - [x] Deterministic Lua/`.quirl` run, format, check, lint, test, documentation,
   language-service, package, and agent-contract tooling.
-- [ ] Windows support plus 1.0 recovery, accessibility, and performance hardening.
+- [x] Permission-locked trusted-Lua plugins, typed events/actions, catalog,
+  completion and panel contributions, and validated isolated-runtime boundaries.
+- [x] Bash/Zsh reference runners, bounded directory/process views and watch
+  history, versioned recovery, and a contract-tested Windows process backend.
+- [ ] Executing isolated adapters, native Windows terminal validation, and 1.0
+  protocol freeze, security, accessibility, compatibility, and performance gates.
 
 ## Quick start
 
@@ -170,10 +198,13 @@ history, <kbd>Ctrl-T</kbd> for files, and <kbd>Ctrl-K</kbd> for catalog actions.
 The picker retains original typed values; `quirl pick` provides the same exact,
 fuzzy, and inverse query engine as a line-oriented/scriptable fallback.
 
-Quirl discovers `config.lua` and sorted `plugins/*.lua` under
-`$QUIRL_CONFIG_DIR`, `$XDG_CONFIG_HOME/quirl`, or `~/.config/quirl`. It watches
-their contents during an interactive session and installs a changed config and
-plugin set only after the whole generation validates.
+Quirl discovers `config.lua` under `$QUIRL_CONFIG_DIR`,
+`$XDG_CONFIG_HOME/quirl`, or `~/.config/quirl`. Interactive plugins come only
+from enabled entries in the permission lock under `QUIRL_PLUGIN_HOME` (or the
+configuration directory's `plugins` state folder); each source is
+integrity-checked and receives exactly its locked grants. Quirl watches the
+active sources and installs a changed config/plugin generation only after the
+whole candidate validates.
 
 Interactive history is stored at `$QUIRL_HISTORY` when set, otherwise at
 `$XDG_STATE_HOME/quirl/history` or `~/.local/state/quirl/history`. Quirl honors
@@ -207,6 +238,11 @@ cargo run -p quirl-cli -- package publish --dry-run --manifest examples/package/
 cargo run -p quirl-cli -- lsp
 cargo run -p quirl-cli -- index build
 cargo run -p quirl-cli -- index explain git commit
+cargo run -p quirl-cli -- events schema --format json
+cargo run -p quirl-cli -- view directory .
+cargo run -p quirl-cli -- view processes
+cargo run -p quirl-cli -- view panel cluster
+cargo run -p quirl-cli -- watch 'ls . | length' --samples 3 --interval-ms 250
 cargo run --release -p quirl-bench
 ```
 

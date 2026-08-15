@@ -1,4 +1,7 @@
-use crate::{Catalog, CommandSpec, Confidence, Effect, OptionSpec, Provenance, ProvenanceInfo};
+use crate::{
+    imported_argument, imported_command, Catalog, CommandSpec, Confidence, OptionSpec, Provenance,
+    ProvenanceInfo, CATALOG_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path};
 
@@ -177,15 +180,15 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
     }
     let mut imported = commands
         .iter()
-        .map(|path| CommandSpec {
-            path: path.clone(),
-            signature: format!("{path} [options]"),
-            summary: "Command discovered from Zsh completion metadata".to_owned(),
-            details: details.clone(),
-            options: options.clone(),
-            examples: Vec::new(),
-            effects: vec![Effect::SpawnProcess],
-            provenance: provenance.clone(),
+        .map(|path| {
+            imported_command(
+                path.clone(),
+                format!("{path} [options]"),
+                "Command discovered from Zsh completion metadata".to_owned(),
+                details.clone(),
+                options.clone(),
+                provenance.clone(),
+            )
         })
         .collect::<Vec<_>>();
     for command in &commands {
@@ -194,16 +197,15 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
             if name.starts_with('-') || name.is_empty() {
                 continue;
             }
-            imported.push(CommandSpec {
-                path: format!("{command} {name}"),
-                signature: format!("{command} {name} [options]"),
-                summary: summary.unwrap_or("Subcommand imported from Zsh").to_owned(),
-                details: "Imported from a static Zsh `_describe` candidate.".to_owned(),
-                options: Vec::new(),
-                examples: Vec::new(),
-                effects: vec![Effect::SpawnProcess],
-                provenance: provenance.clone(),
-            });
+            let path = format!("{command} {name}");
+            imported.push(imported_command(
+                path.clone(),
+                format!("{path} [options]"),
+                summary.unwrap_or("Subcommand imported from Zsh").to_owned(),
+                "Imported from a static Zsh `_describe` candidate.".to_owned(),
+                Vec::new(),
+                provenance.clone(),
+            ));
         }
     }
     let mut report = ImportReport {
@@ -286,18 +288,16 @@ fn import_documentation(source: &str, origin: &str, source_kind: Provenance) -> 
         _ => "documentation",
     };
     ImportReport {
-        commands: vec![CommandSpec {
-            path: command.clone(),
-            signature: format!("{command} [options]"),
-            summary: format!("Command discovered from supplied {label} text"),
-            details: format!(
+        commands: vec![imported_command(
+            command.clone(),
+            format!("{command} [options]"),
+            format!("Command discovered from supplied {label} text"),
+            format!(
                 "Options were heuristically parsed from bounded, supplied {label} text; no command was executed."
             ),
             options,
-            examples: Vec::new(),
-            effects: vec![Effect::SpawnProcess],
             provenance,
-        }],
+        )],
         diagnostics,
     }
 }
@@ -511,12 +511,7 @@ fn parse_zsh_argument(spec: &str, provenance: &ProvenanceInfo) -> Option<OptionS
                 .trim_matches(['[', ']'])
                 .to_owned()
         });
-    Some(OptionSpec {
-        names,
-        value,
-        summary,
-        provenance: provenance.clone(),
-    })
+    Some(imported_argument(names, value, summary, provenance.clone()))
 }
 
 fn strip_zsh_exclusion(spec: &str) -> &str {
@@ -614,15 +609,17 @@ fn parse_documentation_option(line: &str, provenance: &ProvenanceInfo) -> Option
     }
     names.sort();
     names.dedup();
-    (!names.is_empty()).then(|| OptionSpec {
-        names,
-        value,
-        summary: if description.is_empty() {
-            "Imported documentation option".to_owned()
-        } else {
-            description.to_owned()
-        },
-        provenance: provenance.clone(),
+    (!names.is_empty()).then(|| {
+        imported_argument(
+            names,
+            value,
+            if description.is_empty() {
+                "Imported documentation option".to_owned()
+            } else {
+                description.to_owned()
+            },
+            provenance.clone(),
+        )
     })
 }
 
@@ -725,12 +722,8 @@ fn parse_fish_declaration(
     let summary = description
         .clone()
         .unwrap_or_else(|| "Imported Fish completion".to_owned());
-    let option = (!names.is_empty()).then(|| OptionSpec {
-        names,
-        value,
-        summary: summary.clone(),
-        provenance: provenance.clone(),
-    });
+    let option = (!names.is_empty())
+        .then(|| imported_argument(names, value, summary.clone(), provenance.clone()));
     let mut details = String::from("Imported from a declarative Fish `complete` definition.");
     if !conditions.is_empty() {
         details.push_str(" Conditions: ");
@@ -744,15 +737,15 @@ fn parse_fish_declaration(
     }
     Ok(commands
         .into_iter()
-        .map(|path| CommandSpec {
-            signature: format!("{path} [options]"),
-            path,
-            summary: "Command discovered from Fish completion metadata".to_owned(),
-            details: details.clone(),
-            options: option.clone().into_iter().collect(),
-            examples: Vec::new(),
-            effects: vec![Effect::SpawnProcess],
-            provenance: provenance.clone(),
+        .map(|path| {
+            imported_command(
+                path.clone(),
+                format!("{path} [options]"),
+                "Command discovered from Fish completion metadata".to_owned(),
+                details.clone(),
+                option.clone().into_iter().collect(),
+                provenance.clone(),
+            )
         })
         .collect())
 }
@@ -827,14 +820,17 @@ fn parse_bash_declaration(
     option_names.dedup();
     let options = option_names
         .into_iter()
-        .map(|name| OptionSpec {
-            value: name
+        .map(|name| {
+            let value = name
                 .strip_suffix('=')
                 .filter(|_| name.ends_with('='))
-                .map(|_| "value".to_owned()),
-            names: vec![name.trim_end_matches('=').to_owned()],
-            summary: "Imported Bash completion candidate".to_owned(),
-            provenance: option_provenance.clone(),
+                .map(|_| "value".to_owned());
+            imported_argument(
+                vec![name.trim_end_matches('=').to_owned()],
+                value,
+                "Imported Bash completion candidate".to_owned(),
+                option_provenance.clone(),
+            )
         })
         .collect::<Vec<_>>();
     let mut details = String::from("Imported from a Bash `complete` declaration.");
@@ -845,22 +841,22 @@ fn parse_bash_declaration(
     }
     Ok(commands
         .into_iter()
-        .map(|path| CommandSpec {
-            signature: format!("{path} [options]"),
-            path,
-            summary: "Command discovered from Bash completion metadata".to_owned(),
-            details: details.clone(),
-            options: options.clone(),
-            examples: Vec::new(),
-            effects: vec![Effect::SpawnProcess],
-            provenance: command_provenance.clone(),
+        .map(|path| {
+            imported_command(
+                path.clone(),
+                format!("{path} [options]"),
+                "Command discovered from Bash completion metadata".to_owned(),
+                details.clone(),
+                options.clone(),
+                command_provenance.clone(),
+            )
         })
         .collect())
 }
 
 fn merge_report_commands(report: &mut ImportReport, commands: Vec<CommandSpec>) {
     let mut catalog = Catalog {
-        schema_version: 2,
+        schema_version: CATALOG_SCHEMA_VERSION,
         commands: std::mem::take(&mut report.commands),
     };
     catalog.merge(commands);
@@ -1011,8 +1007,8 @@ mod tests {
         let command = &report.commands[0];
         assert_eq!(command.path, "deploy");
         assert_eq!(command.options[0].names, vec!["--environment", "-e"]);
-        assert_eq!(command.options[0].value.as_deref(), Some("value"));
-        assert_eq!(command.options[0].summary, "Target environment");
+        assert_eq!(command.options[0].value_type, "value");
+        assert_eq!(command.options[0].documentation, "Target environment");
         assert!(command.details.contains("__fish_use_subcommand"));
         assert_eq!(command.options[0].provenance.source, Provenance::Fish);
     }
@@ -1044,7 +1040,7 @@ mod tests {
             .iter()
             .find(|option| option.names == ["--output"])
             .expect("output option imported");
-        assert_eq!(output.value.as_deref(), Some("value"));
+        assert_eq!(output.value_type, "value");
         assert_eq!(output.provenance.source, Provenance::Bash);
     }
 
@@ -1101,13 +1097,13 @@ _values 'environment' staging production
             .find(|option| option.names.contains(&"--verbose".to_owned()))
             .unwrap();
         assert_eq!(verbose.names, ["--verbose", "-v"]);
-        assert_eq!(verbose.summary, "Show details");
+        assert_eq!(verbose.documentation, "Show details");
         let output = command
             .options
             .iter()
             .find(|option| option.names == ["--output"])
             .unwrap();
-        assert_eq!(output.value.as_deref(), Some("file"));
+        assert_eq!(output.value_type, "file");
         assert!(report
             .commands
             .iter()
@@ -1128,14 +1124,14 @@ _values 'environment' staging production
             .find(|option| option.names.contains(&"--output".to_owned()))
             .unwrap();
         assert_eq!(output.names, ["--output", "-o"]);
-        assert_eq!(output.value.as_deref(), Some("FILE"));
-        assert_eq!(output.summary, "Write output");
+        assert_eq!(output.value_type, "FILE");
+        assert_eq!(output.documentation, "Write output");
         let color = command
             .options
             .iter()
             .find(|option| option.names == ["--color"])
             .unwrap();
-        assert_eq!(color.value.as_deref(), Some("WHEN"));
+        assert_eq!(color.value_type, "WHEN");
     }
 
     #[test]

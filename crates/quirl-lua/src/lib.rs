@@ -4,10 +4,14 @@ use mlua::{
     Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, RegistryKey, StdLib, Table, Value,
     VmState,
 };
-use quirl_core::{CommandRunner, ErrorCode, ShellError};
+use quirl_core::{
+    reject_json_terminal_controls, validate_contribution_set, CommandRunner, ContributionKind,
+    ContributionRegistration, ErrorCode, EventKind, EventSubscription, ExtensionAction,
+    ExtensionCapability, ExtensionEvent, ExtensionEventData, ShellError,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::Path,
     sync::{
@@ -152,10 +156,36 @@ pub struct CompletionRegistration {
     pub command: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CommandRegistration {
+    pub name: String,
+    pub signature: String,
+    pub summary: String,
+    pub details: String,
+    pub input_type: String,
+    pub output_type: String,
+    pub examples: Vec<String>,
+    pub effects: Vec<String>,
+    pub error_codes: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PluginRegistrations {
     pub prompt_segments: Vec<PromptRegistration>,
     pub completion_providers: Vec<CompletionRegistration>,
+    pub commands: Vec<CommandRegistration>,
+    pub events: Vec<EventSubscription>,
+    pub contributions: Vec<ContributionRegistration>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EventHandlerReport {
+    pub handler: String,
+    pub actions: Vec<ExtensionAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ShellError>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,6 +218,18 @@ const PROMPT_PARAMETER: &[HostParameter] = &[HostParameter {
 const COMPLETION_PARAMETER: &[HostParameter] = &[HostParameter {
     name: "spec",
     lua_type: "quirl.CompletionProvider",
+}];
+const PLUGIN_COMMAND_PARAMETER: &[HostParameter] = &[HostParameter {
+    name: "spec",
+    lua_type: "quirl.PluginCommand",
+}];
+const EVENT_PARAMETER: &[HostParameter] = &[HostParameter {
+    name: "spec",
+    lua_type: "quirl.EventSubscription",
+}];
+const CONTRIBUTION_PARAMETER: &[HostParameter] = &[HostParameter {
+    name: "spec",
+    lua_type: "quirl.Contribution",
 }];
 
 pub const HOST_API: &[HostApiSpec] = &[
@@ -226,6 +268,27 @@ pub const HOST_API: &[HostApiSpec] = &[
         returns: "nil",
         capability: Some("completion.register"),
     },
+    HostApiSpec {
+        path: "quirl.plugin.command",
+        summary: "Register a typed, documented plugin command.",
+        parameters: PLUGIN_COMMAND_PARAMETER,
+        returns: "nil",
+        capability: Some("commands.register"),
+    },
+    HostApiSpec {
+        path: "quirl.events.subscribe",
+        summary: "Observe immutable typed shell events and return declared actions.",
+        parameters: EVENT_PARAMETER,
+        returns: "nil",
+        capability: Some("events.observe"),
+    },
+    HostApiSpec {
+        path: "quirl.extension.contribute",
+        summary: "Register a typed catalog, completion, analysis, view, panel, or knowledge contribution.",
+        parameters: CONTRIBUTION_PARAMETER,
+        returns: "nil",
+        capability: Some("extension.contribute"),
+    },
 ];
 
 #[derive(Debug)]
@@ -238,10 +301,27 @@ struct Budget {
 struct PluginCallbacks {
     prompt_segments: HashMap<String, PromptCallback>,
     completion_providers: HashMap<String, RegistryKey>,
+    commands: HashMap<String, RegistryKey>,
+    events: HashMap<String, EventCallback>,
+    contributions: HashMap<String, ContributionCallback>,
 }
 
 #[derive(Debug)]
 struct PromptCallback {
+    function: RegistryKey,
+    deadline: Duration,
+}
+
+#[derive(Debug)]
+struct EventCallback {
+    function: RegistryKey,
+    events: Vec<EventKind>,
+    capabilities: Vec<ExtensionCapability>,
+    deadline: Duration,
+}
+
+#[derive(Debug)]
+struct ContributionCallback {
     function: RegistryKey,
     deadline: Duration,
 }
@@ -285,10 +365,31 @@ pub struct LuaRuntime {
     cancelled: Arc<AtomicBool>,
     registrations: Arc<Mutex<PluginRegistrations>>,
     callbacks: Arc<Mutex<PluginCallbacks>>,
+    last_event_sequence: Arc<Mutex<Option<u64>>>,
 }
 
 impl LuaRuntime {
     pub fn new(policy: LuaPolicy) -> Result<Self, ShellError> {
+        let mut capabilities = vec![
+            "commands.register".to_owned(),
+            "completion.register".to_owned(),
+            "events.observe".to_owned(),
+            "extension.contribute".to_owned(),
+            "catalog.register".to_owned(),
+            "ui.panel".to_owned(),
+            "prompt.register".to_owned(),
+        ];
+        if policy.allow_process {
+            capabilities.push("process.spawn".to_owned());
+        }
+        Self::new_with_capabilities(policy, &capabilities)
+    }
+
+    /// Construct a runtime whose host handles are limited to explicit grants.
+    pub fn new_with_capabilities(
+        policy: LuaPolicy,
+        granted_capabilities: &[String],
+    ) -> Result<Self, ShellError> {
         let libraries = StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8;
         let lua = Lua::new_with(libraries, LuaOptions::default())
             .map_err(|error| lua_error(error, None, 0))?;
@@ -299,6 +400,7 @@ impl LuaRuntime {
         let cancelled = Arc::new(AtomicBool::new(false));
         let registrations = Arc::new(Mutex::new(PluginRegistrations::default()));
         let callbacks = Arc::new(Mutex::new(PluginCallbacks::default()));
+        let last_event_sequence = Arc::new(Mutex::new(None));
 
         install_restrictions(&lua).map_err(|error| lua_error(error, None, 0))?;
         install_budget_hook(&lua, Arc::clone(&budget), Arc::clone(&cancelled))
@@ -306,6 +408,7 @@ impl LuaRuntime {
         install_host_api(
             &lua,
             policy,
+            granted_capabilities.iter().cloned().collect(),
             Arc::clone(&registrations),
             Arc::clone(&callbacks),
         )
@@ -320,6 +423,7 @@ impl LuaRuntime {
             cancelled,
             registrations,
             callbacks,
+            last_event_sequence,
         })
     }
 
@@ -402,7 +506,14 @@ impl LuaRuntime {
                 .expect("plugin callback mutex poisoned");
             callbacks.prompt_segments.clear();
             callbacks.completion_providers.clear();
+            callbacks.commands.clear();
+            callbacks.events.clear();
+            callbacks.contributions.clear();
         }
+        self.last_event_sequence
+            .lock()
+            .expect("plugin event sequence mutex poisoned")
+            .take();
         self.reset_budget();
         self.lua
             .load(&source)
@@ -414,13 +525,18 @@ impl LuaRuntime {
             .lock()
             .expect("plugin registration mutex poisoned")
             .clone();
-        if registrations.prompt_segments.is_empty() && registrations.completion_providers.is_empty()
+        if registrations.prompt_segments.is_empty()
+            && registrations.completion_providers.is_empty()
+            && registrations.commands.is_empty()
+            && registrations.events.is_empty()
+            && registrations.contributions.is_empty()
         {
             return Err(validation_error(
                 &path.display().to_string(),
-                "plugin did not register a prompt segment or completion provider",
+                "plugin did not register a command, prompt segment, completion provider, event handler, or contribution",
             ));
         }
+        validate_contribution_set(&registrations.contributions)?;
         Ok(registrations)
     }
 
@@ -500,6 +616,204 @@ impl LuaRuntime {
         let value = self.value_to_json(value, None, 0)?;
         validate_completion_result(&value, command)?;
         Ok(value)
+    }
+
+    #[allow(
+        clippy::expect_used,
+        reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
+    )]
+    pub fn invoke_contribution(
+        &self,
+        kind: ContributionKind,
+        name: &str,
+        context: &serde_json::Value,
+    ) -> Result<serde_json::Value, ShellError> {
+        let key = format!("{kind:?}:{name}");
+        let (function, deadline) = {
+            let callbacks = self
+                .callbacks
+                .lock()
+                .expect("plugin callback mutex poisoned");
+            let callback = callbacks.contributions.get(&key).ok_or_else(|| {
+                validation_error(name, format!("unknown {kind:?} contribution `{name}`"))
+            })?;
+            let function = self
+                .lua
+                .registry_value::<Function>(&callback.function)
+                .map_err(|error| lua_error(error, None, 0))?;
+            (function, callback.deadline)
+        };
+        let context = self
+            .lua
+            .to_value(context)
+            .map_err(|error| lua_error(error, None, 0))?;
+        self.reset_budget_with_deadline(deadline);
+        let value = function
+            .call::<Value>(context)
+            .map_err(|error| lua_error(error, None, 0))?;
+        let value = self.value_to_json(value, None, 0)?;
+        reject_json_terminal_controls("extension contribution output", &value)?;
+        Ok(value)
+    }
+
+    #[allow(
+        clippy::expect_used,
+        reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
+    )]
+    pub fn run_plugin_command(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value, ShellError> {
+        let function = {
+            let callbacks = self
+                .callbacks
+                .lock()
+                .expect("plugin callback mutex poisoned");
+            let key = callbacks.commands.get(name).ok_or_else(|| {
+                validation_error(name, format!("unknown plugin command `{name}`"))
+            })?;
+            self.lua
+                .registry_value::<Function>(key)
+                .map_err(|error| lua_error(error, None, 0))?
+        };
+        let arguments = self
+            .lua
+            .to_value(arguments)
+            .map_err(|error| lua_error(error, None, 0))?;
+        self.reset_budget_with_deadline(COMPLETION_CALLBACK_DEADLINE);
+        let value = function
+            .call::<Value>(arguments)
+            .map_err(|error| lua_error(error, None, 0))?;
+        self.value_to_json(value, None, 0)
+    }
+
+    #[allow(
+        clippy::expect_used,
+        reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
+    )]
+    pub fn dispatch_extension_event(
+        &self,
+        event: &ExtensionEvent,
+    ) -> Result<Vec<EventHandlerReport>, ShellError> {
+        {
+            let mut previous = self
+                .last_event_sequence
+                .lock()
+                .expect("plugin event sequence mutex poisoned");
+            event.validate_after(*previous)?;
+            *previous = Some(event.sequence);
+        }
+        let mut handlers = {
+            let callbacks = self
+                .callbacks
+                .lock()
+                .expect("plugin callback mutex poisoned");
+            callbacks
+                .events
+                .iter()
+                .filter(|(_, callback)| callback.events.contains(&event.data.kind()))
+                .map(|(name, callback)| {
+                    self.lua
+                        .registry_value::<Function>(&callback.function)
+                        .map(|function| {
+                            (
+                                name.clone(),
+                                function,
+                                callback.capabilities.clone(),
+                                callback.deadline,
+                            )
+                        })
+                })
+                .collect::<mlua::Result<Vec<_>>>()
+                .map_err(|error| lua_error(error, None, 0))?
+        };
+        handlers.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut reports = Vec::with_capacity(handlers.len());
+        for (name, function, capabilities, deadline) in handlers {
+            let mut visible_event = event.clone();
+            if !capabilities.contains(&ExtensionCapability::OutputRead) {
+                if let ExtensionEventData::Output { text, .. } = &mut visible_event.data {
+                    *text = None;
+                }
+            }
+            let result = self
+                .lua
+                .to_value(&visible_event)
+                .map_err(|error| lua_error(error, None, 0))
+                .and_then(|record| {
+                    self.reset_budget_with_deadline(deadline);
+                    function
+                        .call::<Value>(record)
+                        .map_err(|error| lua_error(error, None, 0))
+                })
+                .and_then(|value| {
+                    self.lua
+                        .from_value::<Vec<ExtensionAction>>(value)
+                        .map_err(|error| {
+                            validation_error(
+                                &name,
+                                format!("event handler must return an array of declared actions: {error}"),
+                            )
+                        })
+                })
+                .and_then(|actions| {
+                    for action in &actions {
+                        action.validate(&capabilities)?;
+                    }
+                    Ok(actions)
+                });
+            match result {
+                Ok(actions) => reports.push(EventHandlerReport {
+                    handler: name,
+                    actions,
+                    error: None,
+                }),
+                Err(error) => reports.push(EventHandlerReport {
+                    handler: name,
+                    actions: Vec::new(),
+                    error: Some(error),
+                }),
+            }
+        }
+        Ok(reports)
+    }
+
+    /// Compatibility adapter for the initial observation-only event API.
+    pub fn dispatch_plugin_event(
+        &self,
+        event: &str,
+        record: &serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>, ShellError> {
+        let kind = parse_event_kind(event).ok_or_else(|| {
+            validation_error(event, format!("unknown typed extension event `{event}`"))
+        })?;
+        let functions = {
+            let callbacks = self
+                .callbacks
+                .lock()
+                .map_err(|_| validation_error(event, "plugin callback state is unavailable"))?;
+            callbacks
+                .events
+                .values()
+                .filter(|callback| callback.events.contains(&kind))
+                .map(|callback| self.lua.registry_value::<Function>(&callback.function))
+                .collect::<mlua::Result<Vec<_>>>()
+                .map_err(|error| lua_error(error, None, 0))?
+        };
+        let mut values = Vec::new();
+        for function in functions {
+            let record = self
+                .lua
+                .to_value(record)
+                .map_err(|error| lua_error(error, None, 0))?;
+            self.reset_budget_with_deadline(COMPLETION_CALLBACK_DEADLINE);
+            let value = function
+                .call::<Value>(record)
+                .map_err(|error| lua_error(error, None, 0))?;
+            values.push(self.value_to_json(value, None, 0)?);
+        }
+        Ok(values)
     }
 
     pub fn test_file(&self, path: &Path) -> Result<usize, ShellError> {
@@ -925,7 +1239,7 @@ pub fn format_file(path: &Path, check: bool) -> Result<bool, ShellError> {
 
 pub fn sdk_lua() -> String {
     let mut output = String::from(
-        "---@meta quirl\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? string\n\n---@class quirl.Config\n---@field editor table\n---@field picker table\n---@field prompt table\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\nquirl = {}\n\n",
+        "---@meta quirl\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? string\n\n---@class quirl.Config\n---@field editor table\n---@field picker table\n---@field prompt table\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
     );
     for spec in HOST_API {
         output.push_str(&format!("---{}\n", spec.summary));
@@ -1044,6 +1358,7 @@ fn install_budget_hook(
 fn install_host_api(
     lua: &Lua,
     policy: LuaPolicy,
+    granted_capabilities: HashSet<String>,
     registrations: Arc<Mutex<PluginRegistrations>>,
     callbacks: Arc<Mutex<PluginCallbacks>>,
 ) -> mlua::Result<()> {
@@ -1060,10 +1375,11 @@ fn install_host_api(
     quirl.set("config", lua.create_function(|_, value: Table| Ok(value))?)?;
 
     let process = lua.create_table()?;
+    let process_grants = granted_capabilities.clone();
     process.set(
         "run",
         lua.create_function(move |lua, command: String| {
-            if !policy.allow_process {
+            if !policy.allow_process || !process_capability_granted(&process_grants, &command) {
                 return Err(mlua::Error::RuntimeError(
                     "capability denied: process.spawn".to_owned(),
                 ));
@@ -1082,11 +1398,13 @@ fn install_host_api(
     quirl.set("process", process)?;
 
     let prompt = lua.create_table()?;
+    let prompt_grants = granted_capabilities.clone();
     let prompt_registrations = Arc::clone(&registrations);
     let prompt_callbacks = Arc::clone(&callbacks);
     prompt.set(
         "add_segment",
         lua.create_function(move |lua, spec: Table| {
+            require_grant(&prompt_grants, "prompt.register")?;
             let render = spec.get::<Function>("render").map_err(|_| {
                 mlua::Error::RuntimeError("prompt segment `render` must be a function".to_owned())
             })?;
@@ -1127,11 +1445,13 @@ fn install_host_api(
     quirl.set("prompt", prompt)?;
 
     let completion = lua.create_table()?;
-    let completion_registrations = registrations;
-    let completion_callbacks = callbacks;
+    let completion_grants = granted_capabilities.clone();
+    let completion_registrations = Arc::clone(&registrations);
+    let completion_callbacks = Arc::clone(&callbacks);
     completion.set(
         "add_provider",
         lua.create_function(move |lua, spec: Table| {
+            require_grant(&completion_grants, "completion.register")?;
             let complete = spec.get::<Function>("complete").map_err(|_| {
                 mlua::Error::RuntimeError(
                     "completion provider `complete` must be a function".to_owned(),
@@ -1165,7 +1485,232 @@ fn install_host_api(
         })?,
     )?;
     quirl.set("completion", completion)?;
+
+    let plugin = lua.create_table()?;
+    let command_grants = granted_capabilities.clone();
+    let command_registrations = Arc::clone(&registrations);
+    let command_callbacks = Arc::clone(&callbacks);
+    plugin.set(
+        "command",
+        lua.create_function(move |lua, spec: Table| {
+            require_grant(&command_grants, "commands.register")?;
+            let run = spec.get::<Function>("run").map_err(|_| {
+                mlua::Error::RuntimeError("plugin command `run` must be a function".to_owned())
+            })?;
+            let registration: CommandRegistration =
+                deserialize_registration(lua, &spec, "run", "plugin command")?;
+            validate_command_registration(&registration)?;
+            let callback = lua.create_registry_value(run)?;
+            let mut callbacks = command_callbacks
+                .lock()
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
+            if callbacks.commands.contains_key(&registration.name) {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "duplicate plugin command `{}`",
+                    registration.name
+                )));
+            }
+            command_registrations
+                .lock()
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
+                .commands
+                .push(registration.clone());
+            callbacks.commands.insert(registration.name, callback);
+            Ok(())
+        })?,
+    )?;
+    quirl.set("plugin", plugin)?;
+
+    let events = lua.create_table()?;
+    let event_grants = granted_capabilities.clone();
+    let event_registrations = Arc::clone(&registrations);
+    let event_callbacks = Arc::clone(&callbacks);
+    events.set(
+        "subscribe",
+        lua.create_function(move |lua, spec: Table| {
+            require_grant(&event_grants, "events.observe")?;
+            let observe = spec.get::<Function>("observe").map_err(|_| {
+                mlua::Error::RuntimeError(
+                    "event subscription `observe` must be a function".to_owned(),
+                )
+            })?;
+            let registration: EventSubscription =
+                deserialize_registration(lua, &spec, "observe", "event subscription")?;
+            registration.validate().map_err(mlua::Error::external)?;
+            for capability in &registration.capabilities {
+                require_grant(&event_grants, extension_capability_grant(*capability))?;
+            }
+            let callback = lua.create_registry_value(observe)?;
+            let mut callbacks = event_callbacks
+                .lock()
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
+            if callbacks.events.contains_key(&registration.name) {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "duplicate event handler `{}`",
+                    registration.name
+                )));
+            }
+            event_registrations
+                .lock()
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
+                .events
+                .push(registration.clone());
+            callbacks.events.insert(
+                registration.name,
+                EventCallback {
+                    function: callback,
+                    events: registration.events,
+                    capabilities: registration.capabilities,
+                    deadline: Duration::from_millis(registration.deadline_ms),
+                },
+            );
+            Ok(())
+        })?,
+    )?;
+    quirl.set("events", events)?;
+
+    let extension = lua.create_table()?;
+    let contribution_grants = granted_capabilities;
+    let contribution_registrations = registrations;
+    let contribution_callbacks = callbacks;
+    extension.set(
+        "contribute",
+        lua.create_function(move |lua, spec: Table| {
+            require_grant(&contribution_grants, "extension.contribute")?;
+            let provide = spec.get::<Function>("provide").map_err(|_| {
+                mlua::Error::RuntimeError(
+                    "extension contribution `provide` must be a function".to_owned(),
+                )
+            })?;
+            let registration: ContributionRegistration =
+                deserialize_registration(lua, &spec, "provide", "extension contribution")?;
+            registration.validate().map_err(mlua::Error::external)?;
+            require_grant(
+                &contribution_grants,
+                contribution_capability_grant(registration.kind),
+            )?;
+            let callback = lua.create_registry_value(provide)?;
+            let key = format!("{:?}:{}", registration.kind, registration.name);
+            let mut callbacks = contribution_callbacks
+                .lock()
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
+            if callbacks.contributions.contains_key(&key) {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "duplicate {:?} contribution `{}`",
+                    registration.kind, registration.name
+                )));
+            }
+            contribution_registrations
+                .lock()
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
+                .contributions
+                .push(registration.clone());
+            callbacks.contributions.insert(
+                key,
+                ContributionCallback {
+                    function: callback,
+                    deadline: Duration::from_millis(registration.deadline_ms),
+                },
+            );
+            Ok(())
+        })?,
+    )?;
+    quirl.set("extension", extension)?;
     lua.globals().set("quirl", quirl)
+}
+
+fn require_grant(grants: &HashSet<String>, capability: &str) -> mlua::Result<()> {
+    if grants.contains(capability) {
+        Ok(())
+    } else {
+        Err(mlua::Error::RuntimeError(format!(
+            "capability denied: {capability}"
+        )))
+    }
+}
+
+fn extension_capability_grant(capability: ExtensionCapability) -> &'static str {
+    match capability {
+        ExtensionCapability::EventsObserve => "events.observe",
+        ExtensionCapability::PlanRewrite => "plan.rewrite",
+        ExtensionCapability::EnvironmentMutate => "environment.mutate",
+        ExtensionCapability::OutputRead => "output.read",
+        ExtensionCapability::ExecutionBlock => "execution.block",
+        ExtensionCapability::CatalogContribute => "catalog.register",
+        ExtensionCapability::CompletionContribute => "completion.register",
+        ExtensionCapability::UiPanel => "ui.panel",
+    }
+}
+
+fn contribution_capability_grant(kind: ContributionKind) -> &'static str {
+    match kind {
+        ContributionKind::Catalog => "catalog.register",
+        ContributionKind::Completion => "completion.register",
+        ContributionKind::Panel => "ui.panel",
+    }
+}
+
+fn parse_event_kind(value: &str) -> Option<EventKind> {
+    match value {
+        "session_start" | "session.start" => Some(EventKind::SessionStart),
+        "session_restore" | "session.restore" => Some(EventKind::SessionRestore),
+        "directory_changed" | "directory.changed" => Some(EventKind::DirectoryChanged),
+        "command_plan" | "command.plan" => Some(EventKind::CommandPlan),
+        "execution_progress" | "execution.progress" => Some(EventKind::ExecutionProgress),
+        "output" | "execution.output" => Some(EventKind::Output),
+        "cancellation" | "execution.cancellation" => Some(EventKind::Cancellation),
+        "result" | "execution.result" => Some(EventKind::Result),
+        "error" | "execution.error" => Some(EventKind::Error),
+        _ => None,
+    }
+}
+
+fn process_capability_granted(grants: &HashSet<String>, command: &str) -> bool {
+    if grants.contains("process.spawn") {
+        return true;
+    }
+    // Scoped grants describe exactly one executable invocation. CommandRunner
+    // uses a shell, so accept only one physical line and a deliberately small
+    // argv alphabet; tabs/newlines and shell operators must never reach it.
+    if command.is_empty()
+        || command.trim() != command
+        || command.chars().any(|character| character.is_control())
+    {
+        return false;
+    }
+    if !command.chars().all(|character| {
+        character.is_ascii_alphanumeric() || character == ' ' || "-_./:=,@%+".contains(character)
+    }) {
+        return false;
+    }
+    let executable = command.split_whitespace().next().unwrap_or_default();
+    grants.contains(&format!("process.spawn:{executable}"))
+}
+
+fn validate_command_registration(registration: &CommandRegistration) -> mlua::Result<()> {
+    for (field, value) in [
+        ("name", registration.name.as_str()),
+        ("signature", registration.signature.as_str()),
+        ("summary", registration.summary.as_str()),
+        ("details", registration.details.as_str()),
+        ("input_type", registration.input_type.as_str()),
+        ("output_type", registration.output_type.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(mlua::Error::RuntimeError(format!(
+                "plugin command `{field}` must not be empty"
+            )));
+        }
+    }
+    if registration.examples.is_empty()
+        || registration.effects.is_empty()
+        || registration.error_codes.is_empty()
+    {
+        return Err(mlua::Error::RuntimeError(
+            "plugin command requires examples, effects, and error codes".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn default_prompt_deadline_ms() -> u64 {
@@ -1657,6 +2202,34 @@ mod tests {
     }
 
     #[test]
+    fn scoped_process_grant_cannot_smuggle_shell_operators() {
+        let runtime = LuaRuntime::new_with_capabilities(
+            LuaPolicy {
+                allow_process: true,
+                ..LuaPolicy::config()
+            },
+            &["process.spawn:printf".to_owned()],
+        )
+        .unwrap();
+        let allowed = runtime
+            .eval("return quirl.process.run('printf scoped')")
+            .unwrap();
+        assert_eq!(allowed["status"], 0);
+        let error = runtime
+            .eval("return quirl.process.run('printf safe; printf smuggled')")
+            .unwrap_err();
+        assert!(error.details.context[0].contains("capability denied"));
+        let newline = runtime
+            .eval("return quirl.process.run('printf safe\\nprintf smuggled')")
+            .unwrap_err();
+        assert!(newline.details.context[0].contains("capability denied"));
+        let tab = runtime
+            .eval("return quirl.process.run('printf\\tsmuggled')")
+            .unwrap_err();
+        assert!(tab.details.context[0].contains("capability denied"));
+    }
+
+    #[test]
     fn instruction_budget_stops_runaway_code() {
         let runtime = LuaRuntime::new(LuaPolicy {
             instruction_limit: HOOK_GRANULARITY,
@@ -1995,5 +2568,141 @@ return { main = exported }
             .complete_with_provider("deploy --environment", &serde_json::json!({}))
             .unwrap();
         assert_eq!(completions, serde_json::json!(["staging", "production"]));
+    }
+
+    #[test]
+    fn typed_commands_require_an_explicit_grant_and_run_under_a_deadline() {
+        let source = r#"quirl.plugin.command {
+          name = "demo run", signature = "demo run", summary = "Run demo",
+          details = "Return one typed record.", input_type = "Nothing",
+          output_type = "Record", examples = { "demo run" },
+          effects = { "read_filesystem" }, error_codes = { ["0"] = "success" },
+          run = function(args) return { ok = true, value = args.value } end,
+        }"#;
+        let denied = LuaRuntime::new_with_capabilities(LuaPolicy::config(), &[]).unwrap();
+        let error = denied.eval(source).unwrap_err();
+        assert!(error.details.context[0].contains("capability denied: commands.register"));
+
+        let runtime = LuaRuntime::new_with_capabilities(
+            LuaPolicy::config(),
+            &["commands.register".to_owned()],
+        )
+        .unwrap();
+        runtime.eval(source).unwrap();
+        let output = runtime
+            .run_plugin_command("demo run", &serde_json::json!({"value": 42}))
+            .unwrap();
+        assert_eq!(output, serde_json::json!({"ok": true, "value": 42}));
+    }
+
+    #[test]
+    fn typed_event_handlers_are_ordered_and_fail_in_isolation() {
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        runtime
+            .eval(
+                r#"
+                quirl.events.subscribe {
+                  name = "z_bad", events = { "command_plan" },
+                  capabilities = { "events_observe" }, deadline_ms = 20,
+                  observe = function(_) return "not actions" end,
+                }
+                quirl.events.subscribe {
+                  name = "a_good", events = { "command_plan" },
+                  capabilities = { "events_observe" }, deadline_ms = 20,
+                  observe = function(event)
+                    return { { action = "diagnose", message = event.data.source } }
+                  end,
+                }
+                "#,
+            )
+            .unwrap();
+        let reports = runtime
+            .dispatch_extension_event(&ExtensionEvent::new(
+                1,
+                ExtensionEventData::CommandPlan {
+                    source: "echo safe".to_owned(),
+                    effects: Vec::new(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].handler, "a_good");
+        assert_eq!(reports[0].actions.len(), 1);
+        assert!(reports[0].error.is_none());
+        assert_eq!(reports[1].handler, "z_bad");
+        assert!(reports[1].error.is_some());
+    }
+
+    #[test]
+    fn event_deadlines_and_mutation_rights_are_enforced() {
+        let denied = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let error = denied
+            .eval(
+                r#"quirl.events.subscribe {
+                  name = "rewrite", events = { "command_plan" },
+                  capabilities = { "events_observe", "plan_rewrite" }, deadline_ms = 10,
+                  observe = function(_) return {} end,
+                }"#,
+            )
+            .unwrap_err();
+        assert!(error.details.context[0].contains("capability denied: plan.rewrite"));
+
+        let runtime = LuaRuntime::new_with_capabilities(
+            LuaPolicy {
+                instruction_limit: 100_000_000,
+                wall_time: Duration::from_secs(1),
+                ..LuaPolicy::config()
+            },
+            &["events.observe".to_owned()],
+        )
+        .unwrap();
+        runtime
+            .eval(
+                r#"quirl.events.subscribe {
+                  name = "slow", events = { "command_plan" },
+                  capabilities = { "events_observe" }, deadline_ms = 1,
+                  observe = function(_) while true do end end,
+                }"#,
+            )
+            .unwrap();
+        let reports = runtime
+            .dispatch_extension_event(&ExtensionEvent::new(
+                1,
+                ExtensionEventData::CommandPlan {
+                    source: "true".to_owned(),
+                    effects: Vec::new(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            reports[0].error.as_ref().unwrap().code,
+            ErrorCode::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn contributions_require_safe_fallbacks_and_deadline_boundaries() {
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        runtime
+            .eval(
+                r#"quirl.extension.contribute {
+                  kind = "panel", name = "cluster", deadline_ms = 10,
+                  plain_fallback = "cluster unavailable",
+                  provide = function(_) return "healthy" end,
+                }"#,
+            )
+            .unwrap();
+        let value = runtime
+            .invoke_contribution(ContributionKind::Panel, "cluster", &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(value, serde_json::json!("healthy"));
+
+        let unsafe_runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let error = unsafe_runtime
+            .eval(
+                "quirl.extension.contribute { kind = 'panel', name = 'raw', deadline_ms = 10, plain_fallback = '\\27[31mraw', provide = function() return 'x' end }",
+            )
+            .unwrap_err();
+        assert!(error.details.context[0].contains("terminal control"));
     }
 }

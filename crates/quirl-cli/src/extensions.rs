@@ -1,14 +1,24 @@
-use quirl_core::{ErrorCode, ShellError};
+use quirl_catalog::{Catalog, CommandSpec, Confidence, Provenance, ProvenanceInfo, Trust};
+use quirl_core::{
+    validate_contribution_set, ContributionKind, ErrorCode, ExtensionAction, ExtensionEvent,
+    ExtensionEventData, ShellError,
+};
 use quirl_lua::{ConfigStore, LuaPolicy, LuaRuntime, QuirlConfig};
+use quirl_plugin::{
+    doctor_plugin, normalize_plugin_commands, parse_plugin_manifest, validate_plugin_manifest,
+    LockedPlugin, PluginLockfile, PluginRuntime, PLUGIN_LOCK_FILE,
+};
 use quirl_syntax::Mode;
-use quirl_ui::{ExtensionCompleter, ExtensionSuggestion};
+use quirl_ui::{ExtensionCompleter, ExtensionSuggestion, PanelModel};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::hash_map::DefaultHasher,
     env, fs,
     hash::{Hash, Hasher},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
+    thread,
 };
 
 pub type SharedLuaExtensions = Arc<Mutex<LuaExtensionHost>>;
@@ -19,6 +29,24 @@ pub type SharedLuaExtensions = Arc<Mutex<LuaExtensionHost>>;
 pub struct NamedExtensionSegment {
     pub name: String,
     pub value: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogContributionOutput {
+    commands: Vec<CommandSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletionContributionItem {
+    value: String,
+    #[serde(default)]
+    display: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 /// The result of checking extension sources for a new valid generation.
@@ -39,6 +67,7 @@ enum FileFingerprint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PluginFingerprint {
     Files(Vec<(PathBuf, FileFingerprint)>),
+    #[cfg(test)]
     UnreadableDirectory(String),
 }
 
@@ -52,15 +81,26 @@ struct ExtensionFingerprint {
 struct SourceSnapshot {
     fingerprint: ExtensionFingerprint,
     config: Option<PathBuf>,
-    plugins: Vec<PathBuf>,
+    plugins: Vec<PluginCandidate>,
     errors: Vec<ShellError>,
 }
 
 #[derive(Debug)]
 enum PluginSource {
     Fixed(Vec<PathBuf>),
+    #[cfg(test)]
     Directory(PathBuf),
+    Managed(PathBuf),
 }
+
+#[derive(Debug, Clone)]
+struct PluginCandidate {
+    path: PathBuf,
+    grants: Vec<String>,
+    catalog_commands: Vec<CommandSpec>,
+}
+
+type BuiltExtensionGeneration = (ConfigStore, Vec<PathBuf>, Vec<LuaRuntime>, Vec<CommandSpec>);
 
 pub struct LuaExtensionHost {
     /// `Some` for a config file that is watched even when it does not exist yet.
@@ -69,18 +109,27 @@ pub struct LuaExtensionHost {
     plugin_paths: Vec<PathBuf>,
     config: ConfigStore,
     plugin_runtimes: Vec<LuaRuntime>,
+    managed_commands: Vec<CommandSpec>,
     errors: Vec<ShellError>,
     observed_fingerprint: Option<ExtensionFingerprint>,
     revision: u64,
+    event_sequence: u64,
 }
 
 impl LuaExtensionHost {
     pub fn discover() -> Self {
-        config_directory().map_or_else(|| Self::from_paths(None, Vec::new()), Self::from_directory)
+        let configuration = config_directory();
+        let config_path = configuration
+            .as_ref()
+            .map(|directory| directory.join("config.lua"));
+        match plugin_state_directory(configuration.as_deref()) {
+            Some(root) => Self::from_managed_root(config_path, root),
+            None => Self::from_paths(config_path, Vec::new()),
+        }
     }
 
-    /// Creates a host which watches `config.lua` and `plugins/*.lua` below a
-    /// configuration directory. Plugin discovery is repeated on every poll.
+    /// Test-only legacy constructor for exercising atomic directory reloads.
+    #[cfg(test)]
     pub fn from_directory(directory: PathBuf) -> Self {
         Self::with_source(
             Some(directory.join("config.lua")),
@@ -93,6 +142,10 @@ impl LuaExtensionHost {
         Self::with_source(config_path, PluginSource::Fixed(plugin_paths))
     }
 
+    pub fn from_managed_root(config_path: Option<PathBuf>, root: PathBuf) -> Self {
+        Self::with_source(config_path, PluginSource::Managed(root))
+    }
+
     fn with_source(config_path: Option<PathBuf>, plugin_source: PluginSource) -> Self {
         Self {
             config_path,
@@ -100,9 +153,11 @@ impl LuaExtensionHost {
             plugin_paths: Vec::new(),
             config: ConfigStore::default(),
             plugin_runtimes: Vec::new(),
+            managed_commands: Vec::new(),
             errors: Vec::new(),
             observed_fingerprint: None,
             revision: 0,
+            event_sequence: 0,
         }
     }
 
@@ -119,10 +174,11 @@ impl LuaExtensionHost {
         self.observed_fingerprint = Some(snapshot.fingerprint.clone());
 
         match self.build_candidate(snapshot) {
-            Ok((config, plugin_paths, plugin_runtimes)) => {
+            Ok((config, plugin_paths, plugin_runtimes, managed_commands)) => {
                 self.config = config;
                 self.plugin_paths = plugin_paths;
                 self.plugin_runtimes = plugin_runtimes;
+                self.managed_commands = managed_commands;
                 self.revision += 1;
                 ExtensionReloadState::Reloaded {
                     revision: self.revision,
@@ -225,12 +281,205 @@ impl LuaExtensionHost {
                     ),
                 }
             }
+            for registration in runtime
+                .registrations()
+                .contributions
+                .into_iter()
+                .filter(|item| item.kind == ContributionKind::Completion)
+            {
+                match runtime.invoke_contribution(
+                    ContributionKind::Completion,
+                    &registration.name,
+                    &context,
+                ) {
+                    Ok(value) => match serde_json::from_value::<Vec<CompletionContributionItem>>(
+                        value,
+                    ) {
+                        Ok(items) => {
+                            for item in items {
+                                if let Some(suggestion) = contribution_suggestion(
+                                    item,
+                                    query,
+                                    token_start,
+                                    position,
+                                    &registration.name,
+                                ) {
+                                    suggestions.push(suggestion);
+                                }
+                            }
+                        }
+                        Err(error) => self.errors.push(contribution_shape_error(
+                            &registration.name,
+                            "completion providers must return an array of typed completion items",
+                            error,
+                        )),
+                    },
+                    Err(error) => {
+                        self.errors.push(error.with_context(format!(
+                            "completion contribution: {}",
+                            registration.name
+                        )))
+                    }
+                }
+            }
         }
         suggestions
     }
 
+    /// Merge validated plugin command facts into the semantic catalog without
+    /// allowing a provider to shadow an installed command or forge provenance.
+    pub fn merge_catalog_contributions(&mut self, catalog: &mut Catalog) {
+        self.ensure_loaded();
+        if let Err(error) = validate_catalog_contribution(catalog, &self.managed_commands) {
+            self.errors
+                .push(error.with_context("managed plugin command manifests"));
+        } else {
+            catalog.merge(self.managed_commands.clone());
+        }
+        for runtime in &self.plugin_runtimes {
+            for registration in runtime
+                .registrations()
+                .contributions
+                .into_iter()
+                .filter(|item| item.kind == ContributionKind::Catalog)
+            {
+                let value =
+                    match runtime.invoke_contribution(
+                        ContributionKind::Catalog,
+                        &registration.name,
+                        &json!({"schema_version": catalog.schema_version}),
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.errors.push(error.with_context(format!(
+                                "catalog contribution: {}",
+                                registration.name
+                            )));
+                            continue;
+                        }
+                    };
+                let mut output = match serde_json::from_value::<CatalogContributionOutput>(value) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        self.errors.push(contribution_shape_error(
+                            &registration.name,
+                            "catalog providers must return { commands = CommandSpec[] }",
+                            error,
+                        ));
+                        continue;
+                    }
+                };
+                let provenance = ProvenanceInfo {
+                    source: Provenance::Plugin,
+                    confidence: Confidence::Exact,
+                    trust: Trust::Trusted,
+                    origin: Some(registration.name.clone()),
+                    fingerprint: None,
+                    generated_at: None,
+                };
+                for command in &mut output.commands {
+                    command.provenance = provenance.clone();
+                    for argument in &mut command.options {
+                        argument.provenance = provenance.clone();
+                    }
+                }
+                if let Err(error) = validate_catalog_contribution(catalog, &output.commands) {
+                    self.errors.push(
+                        error.with_context(format!("catalog contribution: {}", registration.name)),
+                    );
+                    continue;
+                }
+                catalog.merge(output.commands);
+            }
+        }
+    }
+
+    pub fn render_panel_contribution(
+        &mut self,
+        name: &str,
+        context: &Value,
+    ) -> Result<PanelModel, ShellError> {
+        self.ensure_loaded();
+        for runtime in &self.plugin_runtimes {
+            let Some(registration) = runtime
+                .registrations()
+                .contributions
+                .into_iter()
+                .find(|item| item.kind == ContributionKind::Panel && item.name == name)
+            else {
+                continue;
+            };
+            let value = runtime.invoke_contribution(ContributionKind::Panel, name, context)?;
+            let panel = serde_json::from_value::<PanelModel>(value).map_err(|error| {
+                contribution_shape_error(
+                    name,
+                    "panel providers must return the typed PanelModel object",
+                    error,
+                )
+            })?;
+            panel.validate()?;
+            if registration.plain_fallback.as_deref() != Some(panel.plain_fallback.as_str()) {
+                return Err(ShellError::new(
+                    ErrorCode::Validation,
+                    format!("panel contribution `{name}` changed its declared plain fallback"),
+                )
+                .with_help("Return the same plain_fallback declared at registration"));
+            }
+            return Ok(panel);
+        }
+        Err(ShellError::new(
+            ErrorCode::InvalidArgument,
+            format!("unknown panel contribution `{name}`"),
+        )
+        .with_help("Enable a plugin that declares this panel, then run plugin doctor"))
+    }
+
     pub fn take_errors(&mut self) -> Vec<ShellError> {
         std::mem::take(&mut self.errors)
+    }
+
+    /// Dispatch one immutable record to every active runtime. Individual
+    /// handler failures are retained as diagnostics and never stop later
+    /// runtimes or handlers.
+    pub fn dispatch_event(&mut self, data: ExtensionEventData) -> Vec<ExtensionAction> {
+        self.ensure_loaded();
+        self.event_sequence = self.event_sequence.saturating_add(1);
+        let event = ExtensionEvent::new(self.event_sequence, data);
+        let mut actions = Vec::new();
+        let outcomes = thread::scope(|scope| {
+            let handles = self
+                .plugin_runtimes
+                .iter_mut()
+                .map(|runtime| scope.spawn(|| runtime.dispatch_extension_event(&event)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join())
+                .collect::<Vec<_>>()
+        });
+        for outcome in outcomes {
+            match outcome {
+                Ok(Ok(reports)) => {
+                    for report in reports {
+                        if let Some(error) = report.error {
+                            self.errors.push(
+                                error.with_context(format!("event handler: {}", report.handler)),
+                            );
+                        } else {
+                            actions.extend(report.actions);
+                        }
+                    }
+                }
+                Ok(Err(error)) => self
+                    .errors
+                    .push(error.with_context("extension event dispatch")),
+                Err(_) => self.errors.push(
+                    ShellError::new(ErrorCode::Lua, "extension event worker panicked")
+                        .with_help("Disable the failing plugin and restart Quirl"),
+                ),
+            }
+        }
+        actions
     }
 
     fn ensure_loaded(&mut self) {
@@ -261,7 +510,8 @@ impl LuaExtensionHost {
         };
 
         let (plugins, plugins_fingerprint) = match &self.plugin_source {
-            PluginSource::Fixed(paths) => snapshot_plugin_paths(paths, &mut errors),
+            PluginSource::Fixed(paths) => snapshot_legacy_plugin_paths(paths, &mut errors),
+            #[cfg(test)]
             PluginSource::Directory(directory) => match fs::read_dir(directory) {
                 Ok(entries) => {
                     let mut paths = Vec::new();
@@ -290,7 +540,7 @@ impl LuaExtensionHost {
                         }
                     }
                     paths.sort();
-                    snapshot_plugin_paths(&paths, &mut errors)
+                    snapshot_legacy_plugin_paths(&paths, &mut errors)
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     (Vec::new(), PluginFingerprint::Files(Vec::new()))
@@ -305,6 +555,7 @@ impl LuaExtensionHost {
                     )
                 }
             },
+            PluginSource::Managed(root) => snapshot_managed_plugins(root, &mut errors),
         };
 
         SourceSnapshot {
@@ -321,7 +572,7 @@ impl LuaExtensionHost {
     fn build_candidate(
         &self,
         snapshot: SourceSnapshot,
-    ) -> Result<(ConfigStore, Vec<PathBuf>, Vec<LuaRuntime>), ShellError> {
+    ) -> Result<BuiltExtensionGeneration, ShellError> {
         if let Some(error) = snapshot.errors.into_iter().next() {
             return Err(error);
         }
@@ -333,12 +584,26 @@ impl LuaExtensionHost {
         }
 
         let mut plugin_runtimes = Vec::with_capacity(snapshot.plugins.len());
-        for path in &snapshot.plugins {
-            let runtime = LuaRuntime::new(LuaPolicy::config())?;
-            runtime.load_plugin_file(path)?;
+        let mut contributions = Vec::new();
+        let mut managed_commands = Vec::new();
+        for plugin in &snapshot.plugins {
+            let runtime = LuaRuntime::new_with_capabilities(LuaPolicy::config(), &plugin.grants)?;
+            let registrations = runtime.load_plugin_file(&plugin.path)?;
+            contributions.extend(registrations.contributions);
+            managed_commands.extend(plugin.catalog_commands.clone());
             plugin_runtimes.push(runtime);
         }
-        Ok((config, snapshot.plugins, plugin_runtimes))
+        validate_contribution_set(&contributions)?;
+        Ok((
+            config,
+            snapshot
+                .plugins
+                .into_iter()
+                .map(|plugin| plugin.path)
+                .collect(),
+            plugin_runtimes,
+            managed_commands,
+        ))
     }
 }
 
@@ -368,10 +633,16 @@ fn config_directory() -> Option<PathBuf> {
         .or_else(|| env::var_os("HOME").map(|path| PathBuf::from(path).join(".config/quirl")))
 }
 
-fn snapshot_plugin_paths(
+fn plugin_state_directory(configuration: Option<&Path>) -> Option<PathBuf> {
+    env::var_os("QUIRL_PLUGIN_HOME")
+        .map(PathBuf::from)
+        .or_else(|| configuration.map(|directory| directory.join("plugins")))
+}
+
+fn snapshot_legacy_plugin_paths(
     paths: &[PathBuf],
     errors: &mut Vec<ShellError>,
-) -> (Vec<PathBuf>, PluginFingerprint) {
+) -> (Vec<PluginCandidate>, PluginFingerprint) {
     let mut fingerprints = Vec::with_capacity(paths.len());
     for path in paths {
         match fingerprint_file(path) {
@@ -385,7 +656,178 @@ fn snapshot_plugin_paths(
             }
         }
     }
-    (paths.to_vec(), PluginFingerprint::Files(fingerprints))
+    let grants = legacy_registration_grants();
+    (
+        paths
+            .iter()
+            .cloned()
+            .map(|path| PluginCandidate {
+                path,
+                grants: grants.clone(),
+                catalog_commands: Vec::new(),
+            })
+            .collect(),
+        PluginFingerprint::Files(fingerprints),
+    )
+}
+
+fn snapshot_managed_plugins(
+    root: &Path,
+    errors: &mut Vec<ShellError>,
+) -> (Vec<PluginCandidate>, PluginFingerprint) {
+    let lock_path = root.join(PLUGIN_LOCK_FILE);
+    let mut fingerprints = vec![(
+        lock_path.clone(),
+        fingerprint_file(&lock_path).unwrap_or_else(|error| {
+            errors.push(error);
+            FileFingerprint::Unreadable("unable to read managed plugin lock".to_owned())
+        }),
+    )];
+    if !lock_path.exists() {
+        return (Vec::new(), PluginFingerprint::Files(fingerprints));
+    }
+    let bytes = match fs::read(&lock_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            errors.push(io_error(&lock_path, error));
+            return (Vec::new(), PluginFingerprint::Files(fingerprints));
+        }
+    };
+    let lock = match serde_json::from_slice::<PluginLockfile>(&bytes) {
+        Ok(lock) => lock,
+        Err(error) => {
+            errors.push(
+                ShellError::new(ErrorCode::Validation, "managed plugin lockfile is corrupt")
+                    .with_context(error.to_string())
+                    .with_help("Restore plugins.lock.json.bak or re-add plugins after review"),
+            );
+            return (Vec::new(), PluginFingerprint::Files(fingerprints));
+        }
+    };
+    if let Err(error) = lock.validate() {
+        errors.push(error);
+        return (Vec::new(), PluginFingerprint::Files(fingerprints));
+    }
+
+    let mut candidates = Vec::new();
+    for locked in lock.plugins.iter().filter(|plugin| plugin.enabled) {
+        match managed_plugin_candidate(locked, &mut fingerprints) {
+            Ok(candidate) => candidates.push(candidate),
+            Err(error) => errors.push(error),
+        }
+    }
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    (candidates, PluginFingerprint::Files(fingerprints))
+}
+
+fn managed_plugin_candidate(
+    locked: &LockedPlugin,
+    fingerprints: &mut Vec<(PathBuf, FileFingerprint)>,
+) -> Result<PluginCandidate, ShellError> {
+    if locked.runtime != PluginRuntime::TrustedLua {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "enabled plugin `{}` has no executable runtime adapter",
+                locked.name
+            ),
+        )
+        .with_help("Disable it until its Wasm or out-of-process adapter is installed"));
+    }
+    let manifest_path = managed_manifest_path(&locked.source)?;
+    fingerprints.push((manifest_path.clone(), fingerprint_file(&manifest_path)?));
+    let manifest_source =
+        fs::read_to_string(&manifest_path).map_err(|error| io_error(&manifest_path, error))?;
+    let manifest = parse_plugin_manifest(&manifest_source, &manifest_path.display().to_string())?;
+    if manifest.plugin.name != locked.name
+        || manifest.plugin.version != locked.version
+        || manifest.plugin.runtime != locked.runtime
+    {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "managed plugin `{}` identity differs from its lock",
+                locked.name
+            ),
+        )
+        .with_help("Restore the locked source or remove and re-add the plugin after review"));
+    }
+    let entry = Path::new(&manifest.plugin.entry);
+    if entry.is_absolute()
+        || entry.as_os_str().is_empty()
+        || !entry
+            .components()
+            .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!("managed plugin `{}` entry escapes its package", locked.name),
+        )
+        .with_help("Use a relative entry path without parent components"));
+    }
+    let entry_path = manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(entry);
+    fingerprints.push((entry_path.clone(), fingerprint_file(&entry_path)?));
+    let entry_bytes = fs::read(&entry_path).map_err(|error| io_error(&entry_path, error))?;
+    let report = doctor_plugin(locked, manifest_source.as_bytes(), &entry_bytes);
+    if !report.healthy {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "managed plugin `{}` failed its locked integrity check",
+                locked.name
+            ),
+        )
+        .with_context(
+            report
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+        .with_help("Run `quirl plugin doctor` and restore the locked source before activation"));
+    }
+    validate_plugin_manifest(&manifest, &entry_bytes, env!("CARGO_PKG_VERSION"))?;
+    let catalog_commands =
+        normalize_plugin_commands(&manifest, &locked.source, &locked.source_checksum)?;
+    Ok(PluginCandidate {
+        path: entry_path,
+        grants: locked.granted_capabilities.clone(),
+        catalog_commands,
+    })
+}
+
+fn managed_manifest_path(source: &str) -> Result<PathBuf, ShellError> {
+    let value = source.strip_prefix("file:").unwrap_or(source);
+    if value.contains(':') && !Path::new(value).exists() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!("managed plugin source `{source}` is not local"),
+        )
+        .with_help("Platform v0.1 activates only locked local file sources"));
+    }
+    let path = PathBuf::from(value);
+    Ok(if path.is_dir() {
+        path.join("plugin.toml")
+    } else {
+        path
+    })
+}
+
+fn legacy_registration_grants() -> Vec<String> {
+    let grants = [
+        "catalog.register",
+        "commands.register",
+        "completion.register",
+        "events.observe",
+        "extension.contribute",
+        "prompt.register",
+        "ui.panel",
+    ];
+    grants.into_iter().map(str::to_owned).collect()
 }
 
 fn fingerprint_file(path: &Path) -> Result<FileFingerprint, ShellError> {
@@ -467,6 +909,80 @@ fn extension_suggestion(
     })
 }
 
+fn contribution_suggestion(
+    item: CompletionContributionItem,
+    query: &str,
+    replace_start: usize,
+    replace_end: usize,
+    provider: &str,
+) -> Option<ExtensionSuggestion> {
+    if item.value.is_empty() || (!query.is_empty() && !is_subsequence(query, &item.value)) {
+        return None;
+    }
+    Some(ExtensionSuggestion {
+        display: item.display.unwrap_or_else(|| item.value.clone()),
+        summary: item
+            .summary
+            .unwrap_or_else(|| format!("Suggested by {provider}")),
+        detail: item.detail.unwrap_or_else(|| provider.to_owned()),
+        value: item.value,
+        replace_start,
+        replace_end,
+    })
+}
+
+fn validate_catalog_contribution(
+    installed: &Catalog,
+    commands: &[CommandSpec],
+) -> Result<(), ShellError> {
+    let mut paths = installed
+        .commands
+        .iter()
+        .map(|command| command.path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut ids = installed
+        .commands
+        .iter()
+        .map(|command| command.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for command in commands {
+        if !paths.insert(&command.path) || !ids.insert(&command.id) {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!(
+                    "plugin catalog command `{}` collides with installed semantic facts",
+                    command.path
+                ),
+            )
+            .with_help("Namespace plugin commands and use unique stable command IDs"));
+        }
+    }
+    let candidate = Catalog {
+        schema_version: installed.schema_version,
+        commands: commands.to_vec(),
+    };
+    let issues = candidate.quality_issues();
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(ShellError::new(
+            ErrorCode::Validation,
+            "plugin catalog contribution has incomplete exact metadata",
+        )
+        .with_context(issues.join("; "))
+        .with_help("Provide versioned command, argument, I/O, example, effect, and exit metadata"))
+    }
+}
+
+fn contribution_shape_error(name: &str, expected: &str, error: serde_json::Error) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        format!("extension contribution `{name}` returned the wrong shape"),
+    )
+    .with_context(error.to_string())
+    .with_help(expected)
+}
+
 fn is_subsequence(query: &str, candidate: &str) -> bool {
     let mut query = query.chars().flat_map(char::to_lowercase);
     let mut expected = query.next();
@@ -491,6 +1007,7 @@ fn floor_char_boundary(value: &str, mut index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quirl_plugin::resolve_plugin;
     use std::{
         process,
         sync::atomic::{AtomicUsize, Ordering},
@@ -541,6 +1058,80 @@ quirl.completion.add_provider {{
         .unwrap();
     }
 
+    fn write_managed_prompt_plugin(directory: &Path) -> (PathBuf, PluginLockfile) {
+        let package = directory.join("managed-package");
+        fs::create_dir_all(&package).unwrap();
+        let entry = package.join("plugin.lua");
+        let entry_source = r#"quirl.prompt.add_segment {
+          name = "managed", deadline_ms = 8,
+          render = function(_) return "managed-value" end,
+        }
+        quirl.plugin.command {
+          name = "managed run", signature = "managed run", summary = "Run managed",
+          details = "Return one managed test value.", input_type = "Nothing",
+          output_type = "String", examples = { "managed run" },
+          effects = { "read_filesystem" }, error_codes = { ["0"] = "success" },
+          run = function(_) return "managed" end,
+        }"#;
+        fs::write(&entry, entry_source).unwrap();
+        let manifest_path = package.join("plugin.toml");
+        let manifest_source = r#"schema_version = 1
+
+[plugin]
+name = "managed"
+version = "0.1.0"
+entry = "plugin.lua"
+quirl = ">=0.1, <0.2"
+api = "0.1.0"
+runtime = "trusted_lua"
+summary = "Managed prompt test"
+
+[capabilities]
+request = ["commands.register", "prompt.register"]
+
+[contributes]
+commands = ["managed run"]
+
+[[public_commands]]
+path = "managed run"
+signature = "managed run"
+summary = "Run managed"
+details = "Return one managed test value."
+input_type = "Nothing"
+output_type = "String"
+examples = ["managed run"]
+effects = ["read_filesystem"]
+error_codes = { "0" = "success" }
+"#;
+        fs::write(&manifest_path, manifest_source).unwrap();
+        let manifest = parse_plugin_manifest(manifest_source, "plugin.toml").unwrap();
+        let source = format!("file:{}", manifest_path.display());
+        let (locked, _) = resolve_plugin(
+            &manifest,
+            manifest_source.as_bytes(),
+            entry_source.as_bytes(),
+            &source,
+            &["commands.register".to_owned(), "prompt.register".to_owned()],
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap();
+        let lock = PluginLockfile::empty()
+            .install(locked)
+            .unwrap()
+            .set_enabled("managed", true)
+            .unwrap();
+        (manifest_path, lock)
+    }
+
+    fn write_managed_lock(root: &Path, lock: &PluginLockfile) {
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join(PLUGIN_LOCK_FILE),
+            serde_json::to_vec_pretty(lock).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn plugin_drives_prompt_and_completion_surfaces() {
         let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugin.lua");
@@ -553,6 +1144,52 @@ quirl.completion.add_provider {{
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].value, "production");
         assert!(host.take_errors().is_empty());
+    }
+
+    #[test]
+    fn managed_activation_obeys_enabled_state_integrity_and_exact_grants() {
+        let directory = temporary_extension_directory();
+        let root = directory.join("managed-state");
+        let (_manifest, enabled) = write_managed_prompt_plugin(&directory);
+        write_managed_lock(&root, &enabled);
+        let mut host = LuaExtensionHost::from_managed_root(None, root.clone());
+
+        assert!(matches!(
+            host.reload_if_changed(),
+            ExtensionReloadState::Reloaded { .. }
+        ));
+        assert_eq!(
+            host.named_prompt_segments(Mode::Command, 0)[0].name,
+            "managed"
+        );
+        let mut catalog = Catalog::builtin();
+        host.merge_catalog_contributions(&mut catalog);
+        assert_eq!(
+            catalog.find("managed run").unwrap().provenance.source,
+            Provenance::Plugin
+        );
+
+        let disabled = enabled.set_enabled("managed", false).unwrap();
+        write_managed_lock(&root, &disabled);
+        assert!(matches!(
+            host.reload_if_changed(),
+            ExtensionReloadState::Reloaded { .. }
+        ));
+        assert!(host.named_prompt_segments(Mode::Command, 0).is_empty());
+
+        let mut denied = enabled;
+        denied.plugins[0].granted_capabilities.clear();
+        denied.validate().unwrap();
+        write_managed_lock(&root, &denied);
+        assert_eq!(host.reload_if_changed(), ExtensionReloadState::Rejected);
+        assert!(host.named_prompt_segments(Mode::Command, 0).is_empty());
+        assert!(host.take_errors().iter().any(|error| error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("capability denied: prompt.register"))));
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -668,6 +1305,139 @@ quirl.completion.add_provider {{
                 .collect::<Vec<_>>(),
             vec!["apple", "zebra"]
         );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn typed_contributions_reach_catalog_completion_and_panel_consumers() {
+        let directory = temporary_extension_directory();
+        let plugin = directory.join("contributions.lua");
+        fs::write(
+            &plugin,
+            r#"
+quirl.extension.contribute {
+  kind = "catalog", name = "demo-catalog", deadline_ms = 10,
+  provide = function(_)
+    return { commands = {{
+      id = "command:demo", version = "0.1.0", path = "demo", aliases = {"d"},
+      signature = "demo", summary = "Demonstrate contributed metadata",
+      details = "A complete typed command contributed by a test plugin.",
+      arguments = {{
+        names = {"--ready"}, kind = "flag", value_type = "Bool",
+        required = false, repeatable = false, conflicts = {"--not-ready"},
+        documentation = "Report readiness", examples = {"demo --ready"},
+        provenance = { source = "plugin", confidence = "exact", trust = "trusted" },
+      }, {
+        names = {"--not-ready"}, kind = "flag", value_type = "Bool",
+        required = false, repeatable = false, conflicts = {"--ready"},
+        documentation = "Report non-readiness", examples = {"demo --not-ready"},
+        provenance = { source = "plugin", confidence = "exact", trust = "trusted" },
+      }},
+      examples = {"demo"},
+      io = { input = "Nothing", output = "Nothing", streaming = false },
+      effects = {"read_filesystem"}, exit_codes = { ["0"] = "success" },
+      provenance = { source = "plugin", confidence = "exact", trust = "trusted" },
+    }} }
+  end,
+}
+quirl.extension.contribute {
+  kind = "completion", name = "demo-completion", deadline_ms = 10,
+  provide = function(_) return {{ value = "demo-value", summary = "typed" }} end,
+}
+quirl.extension.contribute {
+  kind = "panel", name = "demo-panel", deadline_ms = 10,
+  plain_fallback = "demo unavailable",
+  provide = function(_)
+    return {
+      title = "demo", columns = {"value"}, rows = {{"ready"}},
+      plain_fallback = "demo unavailable",
+    }
+  end,
+}
+"#,
+        )
+        .unwrap();
+        let mut host = LuaExtensionHost::from_paths(None, vec![plugin]);
+        let mut catalog = Catalog::builtin();
+        host.merge_catalog_contributions(&mut catalog);
+        let errors = host.take_errors();
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert_eq!(
+            catalog.find("demo").unwrap().provenance.source,
+            Provenance::Plugin
+        );
+        assert!(host
+            .complete("demo-v", 6)
+            .iter()
+            .any(|item| item.value == "demo-value"));
+        let panel = host
+            .render_panel_contribution("demo-panel", &json!({}))
+            .unwrap();
+        assert_eq!(panel.rows, vec![vec!["ready"]]);
+        assert!(host.take_errors().is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn event_actions_keep_plugin_order_and_isolate_handler_failures() {
+        let directory = temporary_extension_directory();
+        let plugin = |name: &str, body: &str| {
+            format!(
+                r#"quirl.events.subscribe {{
+                  name = "{name}", events = {{ "session_start" }},
+                  capabilities = {{ "events_observe" }}, deadline_ms = 10,
+                  observe = function(_) {body} end,
+                }}"#
+            )
+        };
+        let first = directory.join("a.lua");
+        let broken = directory.join("m.lua");
+        let last = directory.join("z.lua");
+        fs::write(
+            &first,
+            plugin(
+                "first",
+                "return {{ action = 'diagnose', message = 'first' }}",
+            ),
+        )
+        .unwrap();
+        fs::write(&broken, plugin("broken", "error('broken handler')")).unwrap();
+        fs::write(
+            &last,
+            plugin("last", "return {{ action = 'diagnose', message = 'last' }}"),
+        )
+        .unwrap();
+        let mut host = LuaExtensionHost::from_paths(None, vec![last, broken, first]);
+        let actions = host.dispatch_event(ExtensionEventData::SessionStart { restored: false });
+        let messages = actions
+            .into_iter()
+            .filter_map(|action| match action {
+                ExtensionAction::Diagnose { message } => Some(message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(messages, vec!["first", "last"]);
+        assert_eq!(host.take_errors().len(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn contribution_collisions_reject_the_whole_extension_generation() {
+        let directory = temporary_extension_directory();
+        let contribution = r#"quirl.extension.contribute {
+          kind = "panel", name = "cluster", deadline_ms = 10,
+          plain_fallback = "cluster unavailable",
+          provide = function(_) return "ok" end,
+        }"#;
+        fs::write(directory.join("plugins/a.lua"), contribution).unwrap();
+        fs::write(directory.join("plugins/b.lua"), contribution).unwrap();
+        let mut host = LuaExtensionHost::from_directory(directory.clone());
+
+        assert_eq!(host.reload_if_changed(), ExtensionReloadState::Rejected);
+        let errors = host.take_errors();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("duplicate Panel contribution"));
 
         fs::remove_dir_all(directory).unwrap();
     }

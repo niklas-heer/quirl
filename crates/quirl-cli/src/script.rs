@@ -2,7 +2,7 @@ use clap::ValueEnum;
 use quirl_core::{ErrorCode, ShellError};
 use quirl_data::DataRuntime;
 use quirl_lua::{format_file, LuaPolicy, LuaRuntime};
-use quirl_process::NativeExecutor;
+use quirl_process::{ChildProcessTree, NativeExecutor};
 use quirl_syntax::check_script;
 use quirl_ui::render_error;
 use serde::Serialize;
@@ -11,18 +11,37 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+const MAX_REFERENCE_CAPTURE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ScriptLanguage {
     Lua,
     Quirl,
+    Bash,
+    Zsh,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScriptRunOutput {
     pub status: i32,
     pub value: Value,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ScriptCancellation {
+    cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -283,6 +302,9 @@ fn check_script_file(path: &Path) -> Result<(), ShellError> {
             let source = fs::read_to_string(path).map_err(|error| path_error(path, error))?;
             check_quirl_source(&source, &path.display().to_string())
         }
+        Some(ScriptLanguage::Bash | ScriptLanguage::Zsh) => Err(unsupported_language_error(
+            path.extension().and_then(|extension| extension.to_str()),
+        )),
         None => Err(unsupported_language_error(
             path.extension().and_then(|extension| extension.to_str()),
         )),
@@ -334,7 +356,7 @@ pub fn run(
                 "cannot read script from standard input",
             )
             .with_context(error.to_string())
-            .with_help("Pipe UTF-8 Lua or Quirl source to `quirl run --lang <language> -`")
+            .with_help("Pipe UTF-8 source to `quirl run --lang lua|quirl|bash|zsh -`")
         })?;
         (source, "<stdin>".to_owned())
     } else {
@@ -348,21 +370,64 @@ pub fn run(
         })?;
         (source, file.display().to_string())
     };
-    run_source(
+    let path = (file != Path::new("-")).then_some(file);
+    let language = detect_language(&source, path, requested_language)?;
+    let cancellation = ScriptCancellation::default();
+    let signal_id = matches!(language, ScriptLanguage::Bash | ScriptLanguage::Zsh)
+        .then(|| {
+            signal_hook::flag::register(
+                signal_hook::consts::SIGINT,
+                Arc::clone(&cancellation.cancelled),
+            )
+            .map_err(|error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not install script cancellation handler",
+                )
+                .with_context(error.to_string())
+                .with_help("Retry the script; report repeated signal-handler failures")
+            })
+        })
+        .transpose()?;
+    let result = run_source_with_cancellation(
         &source,
         &source_name,
-        (file != Path::new("-")).then_some(file),
-        requested_language,
+        path,
+        Some(language),
         arguments,
-    )
+        &cancellation,
+    );
+    if let Some(signal_id) = signal_id {
+        signal_hook::low_level::unregister(signal_id);
+    }
+    result
 }
 
+#[cfg(test)]
 pub fn run_source(
     source: &str,
     source_name: &str,
     path: Option<&Path>,
     requested_language: Option<ScriptLanguage>,
     arguments: &[String],
+) -> Result<ScriptRunOutput, ShellError> {
+    run_source_with_cancellation(
+        source,
+        source_name,
+        path,
+        requested_language,
+        arguments,
+        &ScriptCancellation::default(),
+    )
+}
+
+pub fn run_source_with_cancellation(
+    source: &str,
+    source_name: &str,
+    path: Option<&Path>,
+    requested_language: Option<ScriptLanguage>,
+    arguments: &[String],
+    cancellation: &ScriptCancellation,
 ) -> Result<ScriptRunOutput, ShellError> {
     let language = detect_language(source, path, requested_language)?;
     match language {
@@ -373,6 +438,25 @@ pub fn run_source(
             Ok(ScriptRunOutput { status, value })
         }
         ScriptLanguage::Quirl => run_quirl_source(source, source_name, arguments),
+        ScriptLanguage::Bash | ScriptLanguage::Zsh => run_reference_script(
+            source,
+            source_name,
+            language,
+            arguments,
+            cancellation,
+            language.executable(),
+        ),
+    }
+}
+
+impl ScriptLanguage {
+    fn executable(self) -> &'static str {
+        match self {
+            Self::Lua => "lua",
+            Self::Quirl => "quirl",
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+        }
     }
 }
 
@@ -400,6 +484,8 @@ pub fn detect_language(
         return match extension {
             "lua" => Ok(ScriptLanguage::Lua),
             "quirl" => Ok(ScriptLanguage::Quirl),
+            "sh" | "bash" => Ok(ScriptLanguage::Bash),
+            "zsh" => Ok(ScriptLanguage::Zsh),
             _ => Err(unsupported_language_error(Some(extension))),
         };
     }
@@ -424,7 +510,7 @@ fn language_from_shebang(line: &str) -> Result<Option<ScriptLanguage>, ShellErro
                     ErrorCode::InvalidArgument,
                     "script shebang has `--lang` without a language",
                 )
-                .with_help("Use `--lang lua` or `--lang quirl` in the shebang")
+                .with_help("Use `--lang lua|quirl|bash|zsh` in the shebang")
             })?;
             return language_name(language)
                 .map(Some)
@@ -439,7 +525,11 @@ fn language_from_shebang(line: &str) -> Result<Option<ScriptLanguage>, ShellErro
             return Ok(Some(ScriptLanguage::Lua));
         } else if executable == "quirl-script" {
             return Ok(Some(ScriptLanguage::Quirl));
-        } else if matches!(executable, "bash" | "zsh" | "sh") {
+        } else if executable == "bash" {
+            return Ok(Some(ScriptLanguage::Bash));
+        } else if executable == "zsh" {
+            return Ok(Some(ScriptLanguage::Zsh));
+        } else if executable == "sh" {
             return Err(unsupported_shebang_language(executable));
         }
     }
@@ -450,6 +540,8 @@ fn language_name(language: &str) -> Option<ScriptLanguage> {
     match language.to_ascii_lowercase().as_str() {
         "lua" | "lua5.4" => Some(ScriptLanguage::Lua),
         "quirl" => Some(ScriptLanguage::Quirl),
+        "bash" => Some(ScriptLanguage::Bash),
+        "zsh" => Some(ScriptLanguage::Zsh),
         _ => None,
     }
 }
@@ -457,14 +549,16 @@ fn language_name(language: &str) -> Option<ScriptLanguage> {
 fn unsupported_language_error(extension: Option<&str>) -> ShellError {
     let context = extension.map_or_else(
         || "the script has no recognized shebang or extension".to_owned(),
-        |extension| format!("the .{extension} extension has no Phase 2 runner"),
+        |extension| format!("the .{extension} extension has no registered runner"),
     );
     ShellError::new(
         ErrorCode::InvalidArgument,
         "cannot determine the script language",
     )
     .with_context(context)
-    .with_help("Use a .lua or .quirl file, a recognized shebang, or pass `--lang lua|quirl`")
+    .with_help(
+        "Use a .lua/.quirl/.sh/.bash/.zsh file, a recognized shebang, or pass `--lang lua|quirl|bash|zsh`",
+    )
 }
 
 fn unsupported_shebang_language(language: &str) -> ShellError {
@@ -472,7 +566,7 @@ fn unsupported_shebang_language(language: &str) -> ShellError {
         ErrorCode::InvalidArgument,
         format!("script shebang requests unsupported language `{language}`"),
     )
-    .with_help("Phase 2 supports `lua` and `quirl`; Bash and Zsh runners arrive in Phase 3")
+    .with_help("Use `--lang bash` or `--lang zsh`; generic `sh` remains intentionally ambiguous")
 }
 
 fn structured_status(value: &Value) -> Result<i32, ShellError> {
@@ -493,6 +587,245 @@ fn structured_status(value: &Value) -> Result<i32, ShellError> {
         )
         .with_help("Return a status between -2147483648 and 2147483647")
     })
+}
+
+fn run_reference_script(
+    source: &str,
+    source_name: &str,
+    language: ScriptLanguage,
+    arguments: &[String],
+    cancellation: &ScriptCancellation,
+    executable: &str,
+) -> Result<ScriptRunOutput, ShellError> {
+    let mut command = Command::new(executable);
+    match language {
+        ScriptLanguage::Bash => {
+            command.args(["--noprofile", "--norc", "-c", source, source_name]);
+            command.env_remove("BASH_ENV").env_remove("ENV");
+        }
+        ScriptLanguage::Zsh => {
+            command.args(["-f", "-c", source, source_name]);
+            command.env_remove("ZDOTDIR").env_remove("ENV");
+        }
+        _ => {
+            return Err(ShellError::new(
+                ErrorCode::InvalidArgument,
+                "reference runner requires Bash or Zsh",
+            ))
+        }
+    }
+    command
+        .args(arguments)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let containment = ChildProcessTree::new()?;
+    let mut child = command.spawn().map_err(|error| {
+        ShellError::new(
+            ErrorCode::ProcessSpawn,
+            format!("could not start reference interpreter `{executable}`"),
+        )
+        .with_context(error.to_string())
+        .with_label(
+            Some(source_name.to_owned()),
+            0,
+            source.lines().next().map_or(0, str::len),
+            "interpreter selected here",
+        )
+        .with_help(format!(
+            "Install {executable}, choose another `--lang`, or fix the script shebang"
+        ))
+    })?;
+    containment.assign(&mut child).map_err(|error| {
+        let _ = child.kill();
+        let _ = child.wait();
+        error.with_label(
+            Some(source_name.to_owned()),
+            0,
+            source.lines().next().map_or(0, str::len),
+            "reference interpreter containment failed",
+        )
+    })?;
+    let stdout = child.stdout.take().map(spawn_stream_reader);
+    let stderr = child.stderr.take().map(spawn_stream_reader);
+    let status = loop {
+        if cancellation.cancelled.load(Ordering::Relaxed) {
+            terminate_reference_process(&mut child, &containment);
+            let _ = join_stream_reader(stdout, "reference runner stdout");
+            let _ = join_stream_reader(stderr, "reference runner stderr");
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                format!("{executable} script execution was cancelled"),
+            )
+            .with_label(
+                Some(source_name.to_owned()),
+                0,
+                source.len(),
+                "cancelled reference script",
+            )
+            .with_help("Run the script again when cancellation is no longer requested"));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(2)),
+            Err(error) => {
+                terminate_reference_process(&mut child, &containment);
+                return Err(ShellError::new(
+                    ErrorCode::Io,
+                    format!("could not observe `{executable}` script status"),
+                )
+                .with_context(error.to_string())
+                .with_help(
+                    "Retry the script; report this if the interpreter remains unobservable",
+                ));
+            }
+        }
+    };
+    let stdout = join_stream_reader(stdout, "reference runner stdout")?;
+    let stderr = join_stream_reader(stderr, "reference runner stderr")?;
+    let status_code = status.code().unwrap_or(1);
+    if status_code != 0 && is_dialect_syntax_error(&stderr.value) {
+        let (start, end) = dialect_error_span(source, &stderr.value);
+        return Err(ShellError::new(
+            ErrorCode::InvalidCommand,
+            format!("{executable} rejected the script syntax"),
+        )
+        .with_context(truncate_capture(&stderr.value))
+        .with_label(
+            Some(source_name.to_owned()),
+            start,
+            end,
+            format!("{executable} dialect error"),
+        )
+        .with_help(format!(
+            "Run `{executable} -n {source_name}` for the interpreter's full syntax check"
+        )));
+    }
+    Ok(ScriptRunOutput {
+        status: status_code,
+        value: json!({
+            "language": language.executable(),
+            "status": status_code,
+            "stdout": stdout.value,
+            "stderr": stderr.value,
+            "stdout_discarded_bytes": stdout.discarded_bytes,
+            "stderr_discarded_bytes": stderr.discarded_bytes,
+        }),
+    })
+}
+
+fn terminate_reference_process(child: &mut std::process::Child, containment: &ChildProcessTree) {
+    #[cfg(unix)]
+    if let Ok(process_group) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(process_group),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    containment.terminate(child);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[derive(Debug)]
+struct StreamCapture {
+    value: String,
+    discarded_bytes: u64,
+}
+
+fn spawn_stream_reader(
+    mut stream: impl Read + Send + 'static,
+) -> thread::JoinHandle<io::Result<StreamCapture>> {
+    thread::spawn(move || {
+        let mut retained = Vec::with_capacity(MAX_REFERENCE_CAPTURE_BYTES);
+        let mut discarded_bytes = 0_u64;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let available = MAX_REFERENCE_CAPTURE_BYTES.saturating_sub(retained.len());
+            let keep = available.min(read);
+            retained.extend_from_slice(&buffer[..keep]);
+            discarded_bytes = discarded_bytes.saturating_add((read - keep) as u64);
+        }
+        Ok(StreamCapture {
+            value: String::from_utf8_lossy(&retained).into_owned(),
+            discarded_bytes,
+        })
+    })
+}
+
+fn join_stream_reader(
+    reader: Option<thread::JoinHandle<io::Result<StreamCapture>>>,
+    description: &str,
+) -> Result<StreamCapture, ShellError> {
+    let Some(reader) = reader else {
+        return Ok(StreamCapture {
+            value: String::new(),
+            discarded_bytes: 0,
+        });
+    };
+    match reader.join() {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(ShellError::new(
+            ErrorCode::Io,
+            format!("could not read {description}"),
+        )
+        .with_context(error.to_string())
+        .with_help("Retry the script; report repeated output capture failures")),
+        Err(_) => Err(
+            ShellError::new(ErrorCode::Io, format!("{description} task failed"))
+                .with_help("Retry the script; report repeated output capture failures"),
+        ),
+    }
+}
+
+fn is_dialect_syntax_error(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    [
+        "syntax error",
+        "parse error",
+        "unexpected eof",
+        "unexpected end",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
+}
+
+fn dialect_error_span(source: &str, stderr: &str) -> (usize, usize) {
+    let line = stderr
+        .split(|character: char| !character.is_ascii_digit())
+        .filter_map(|digits| digits.parse::<usize>().ok())
+        .find(|line| *line > 0 && *line <= source.lines().count())
+        .unwrap_or(1);
+    let start = source
+        .split_inclusive('\n')
+        .take(line.saturating_sub(1))
+        .map(str::len)
+        .sum();
+    let end = start
+        + source
+            .lines()
+            .nth(line.saturating_sub(1))
+            .map_or(0, str::len);
+    (start, end)
+}
+
+fn truncate_capture(value: &str) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+    if value.len() <= MAX_DIAGNOSTIC_BYTES {
+        value.to_owned()
+    } else {
+        let boundary = (0..=MAX_DIAGNOSTIC_BYTES)
+            .rev()
+            .find(|index| value.is_char_boundary(*index))
+            .unwrap_or(0);
+        format!("{}…", &value[..boundary])
+    }
 }
 
 fn run_quirl_source(
@@ -568,6 +901,15 @@ mod tests {
         path
     }
 
+    fn reference_interpreter_available(executable: &str) -> bool {
+        Command::new(executable)
+            .args(["-c", ":"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    }
+
     #[test]
     fn explicit_language_wins_over_shebang_and_extension() {
         assert_eq!(
@@ -604,13 +946,153 @@ mod tests {
     #[test]
     fn unsupported_shebang_language_is_not_silently_overridden_by_extension() {
         let error = detect_language(
-            "#!/usr/bin/env bash\necho nope",
+            "#!/usr/bin/env sh\necho nope",
             Some(Path::new("misleading.lua")),
             None,
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidArgument);
         assert!(error.message.contains("unsupported language"));
+    }
+
+    #[test]
+    fn reference_extensions_and_shebangs_select_the_exact_dialect() {
+        assert_eq!(
+            detect_language("echo bash", Some(Path::new("script.sh")), None).unwrap(),
+            ScriptLanguage::Bash
+        );
+        assert_eq!(
+            detect_language("echo bash", Some(Path::new("script.bash")), None).unwrap(),
+            ScriptLanguage::Bash
+        );
+        assert_eq!(
+            detect_language("#!/usr/bin/env zsh\necho zsh", None, None).unwrap(),
+            ScriptLanguage::Zsh
+        );
+    }
+
+    #[test]
+    fn reference_runners_preserve_arguments_cwd_environment_status_and_captures() {
+        for (language, executable) in [(ScriptLanguage::Bash, "bash"), (ScriptLanguage::Zsh, "zsh")]
+        {
+            if !reference_interpreter_available(executable) {
+                eprintln!("skipping {executable}: interpreter is unavailable");
+                continue;
+            }
+            let output = run_source(
+                "printf 'arg=%s\\n' \"$1\"; printf 'cwd=%s\\n' \"$PWD\"; printf 'env=%s\\n' \"${PATH:+set}\"; printf 'problem\\n' >&2; exit 7",
+                "contract-test",
+                None,
+                Some(language),
+                &["expected".to_owned()],
+            )
+            .unwrap();
+            assert_eq!(output.status, 7, "{executable}");
+            assert_eq!(
+                output.value["stdout"],
+                format!(
+                    "arg=expected\ncwd={}\nenv=set\n",
+                    std::env::current_dir().unwrap().display()
+                ),
+                "{executable}"
+            );
+            assert_eq!(output.value["stderr"], "problem\n", "{executable}");
+            assert_eq!(output.value["language"], executable, "{executable}");
+        }
+    }
+
+    #[test]
+    fn reference_runner_drains_but_does_not_retain_unbounded_output() {
+        if !reference_interpreter_available("bash") {
+            eprintln!("skipping bash: interpreter is unavailable");
+            return;
+        }
+        let output = run_source(
+            "i=0; while [ \"$i\" -lt 7000 ]; do printf 0123456789; printf abcdefghij >&2; i=$((i+1)); done",
+            "bounded.bash",
+            None,
+            Some(ScriptLanguage::Bash),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            output.value["stdout"].as_str().unwrap().len(),
+            MAX_REFERENCE_CAPTURE_BYTES
+        );
+        assert_eq!(
+            output.value["stderr"].as_str().unwrap().len(),
+            MAX_REFERENCE_CAPTURE_BYTES
+        );
+        assert_eq!(
+            output.value["stdout_discarded_bytes"],
+            70_000 - MAX_REFERENCE_CAPTURE_BYTES
+        );
+        assert_eq!(
+            output.value["stderr_discarded_bytes"],
+            70_000 - MAX_REFERENCE_CAPTURE_BYTES
+        );
+    }
+
+    #[test]
+    fn missing_reference_interpreter_has_a_labeled_actionable_error() {
+        let error = run_reference_script(
+            "echo unreachable",
+            "missing.bash",
+            ScriptLanguage::Bash,
+            &[],
+            &ScriptCancellation::default(),
+            "/definitely/missing/quirl-reference-interpreter",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProcessSpawn);
+        assert_eq!(
+            error.details.labels[0].source.as_deref(),
+            Some("missing.bash")
+        );
+        assert!(error.details.help[0].contains("Install"));
+    }
+
+    #[test]
+    fn reference_dialect_errors_retain_a_source_label() {
+        if !reference_interpreter_available("bash") {
+            eprintln!("skipping bash: interpreter is unavailable");
+            return;
+        }
+        let source = "echo before\nif then";
+        let error =
+            run_source(source, "broken.bash", None, Some(ScriptLanguage::Bash), &[]).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert_eq!(
+            error.details.labels[0].source.as_deref(),
+            Some("broken.bash")
+        );
+        assert!(error.details.labels[0].start < source.len());
+    }
+
+    #[test]
+    fn reference_runner_cancellation_terminates_the_interpreter() {
+        if !reference_interpreter_available("bash") {
+            eprintln!("skipping bash: interpreter is unavailable");
+            return;
+        }
+        let cancellation = ScriptCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            run_source_with_cancellation(
+                "sleep 10",
+                "cancel.bash",
+                None,
+                Some(ScriptLanguage::Bash),
+                &[],
+                &worker_cancellation,
+            )
+        });
+        thread::sleep(Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        cancellation.cancelled.store(true, Ordering::Relaxed);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

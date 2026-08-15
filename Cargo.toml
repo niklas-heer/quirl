@@ -9,6 +9,7 @@ members = [
     "crates/quirl-lua",
     "crates/quirl-lsp",
     "crates/quirl-picker",
+    "crates/quirl-plugin",
     "crates/quirl-process",
     "crates/quirl-syntax",
     "crates/quirl-ui",
@@ -33,9 +34,11 @@ reedline = "0.49"
 rhai = "1.25.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 shlex = "1.3"
 signal-hook = "0.3"
 toml = "0.9"
+wasmparser = { version = "0.256", default-features = false, features = ["std", "validate", "component-model"] }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
