@@ -63,18 +63,18 @@ license = "MIT"
 request = ["process.spawn"]
 
 [contributes]
-commands = ["deploy"]
+commands = ["deploy-tools deploy"]
 panels = []
 indexers = []
 
 [[public_commands]]
-path = "deploy"
-signature = "deploy <environment>"
+path = "deploy-tools deploy"
+signature = "deploy-tools deploy <environment>"
 summary = "Deploy a service"
 details = "Deploys one service after validation."
 input_type = "Nothing"
 output_type = "Result<Deployment>"
-examples = ["deploy staging"]
+examples = ["deploy-tools deploy staging"]
 effects = ["spawn_process"]
 error_codes = { "0" = "deployed", "1" = "deployment failed" }
 

@@ -608,19 +608,16 @@ fn sync_directory(_path: &Path) -> Result<(), ShellError> {
 }
 
 fn plugin_root() -> Result<PathBuf, ShellError> {
-    if let Some(root) = env::var_os("QUIRL_PLUGIN_HOME") {
-        return Ok(PathBuf::from(root));
-    }
-    if let Some(config) = env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(config).join("quirl/plugins"));
-    }
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".config/quirl/plugins"))
-        .ok_or_else(|| {
-            ShellError::new(ErrorCode::Io, "cannot determine plugin state directory")
-                .with_help("Set QUIRL_PLUGIN_HOME to a writable directory")
-        })
+    crate::extensions::resolve_plugin_state_directory(
+        env::var_os("QUIRL_PLUGIN_HOME"),
+        env::var_os("QUIRL_CONFIG_DIR"),
+        env::var_os("XDG_CONFIG_HOME"),
+        env::var_os("HOME"),
+    )
+    .ok_or_else(|| {
+        ShellError::new(ErrorCode::Io, "cannot determine plugin state directory")
+            .with_help("Set QUIRL_PLUGIN_HOME or QUIRL_CONFIG_DIR to a writable directory")
+    })
 }
 
 fn safe_package_path(path: &str) -> Result<PathBuf, ShellError> {

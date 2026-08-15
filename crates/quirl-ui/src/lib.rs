@@ -903,11 +903,18 @@ impl Prompt for QuirlPrompt {
     }
 }
 
+struct HistoryPickerCache {
+    len: u64,
+    modified: Option<SystemTime>,
+    items: Vec<PickItem>,
+}
+
 pub struct CatalogCompleter {
     catalog: Catalog,
     extensions: Option<Box<dyn ExtensionCompleter + Send>>,
     picker_items: Vec<PickItem>,
     history_path: Option<PathBuf>,
+    history_cache: Option<HistoryPickerCache>,
 }
 
 impl CatalogCompleter {
@@ -917,6 +924,7 @@ impl CatalogCompleter {
             extensions: None,
             picker_items: Vec::new(),
             history_path: None,
+            history_cache: None,
         }
     }
 
@@ -929,6 +937,7 @@ impl CatalogCompleter {
             extensions,
             picker_items: Vec::new(),
             history_path: None,
+            history_cache: None,
         }
     }
 
@@ -943,7 +952,28 @@ impl CatalogCompleter {
             extensions,
             picker_items,
             history_path,
+            history_cache: None,
         }
+    }
+
+    fn refreshed_history_items(&mut self) -> Option<&[PickItem]> {
+        let path = self.history_path.as_deref()?;
+        let metadata = fs::metadata(path).ok()?;
+        let len = metadata.len();
+        let modified = metadata.modified().ok();
+        let hit = self
+            .history_cache
+            .as_ref()
+            .is_some_and(|cache| cache.len == len && cache.modified == modified);
+        if !hit {
+            let items = read_history_picker_items(path)?;
+            self.history_cache = Some(HistoryPickerCache {
+                len,
+                modified,
+                items,
+            });
+        }
+        Some(&self.history_cache.as_ref()?.items)
     }
 }
 
@@ -967,31 +997,15 @@ impl Completer for CatalogCompleter {
             let query = line
                 .get(prefix.len()..pos.min(line.len()))
                 .unwrap_or_default();
-            let refreshed_history = (kind == ItemKind::History)
-                .then(|| {
-                    self.history_path
-                        .as_deref()
-                        .and_then(read_history_picker_items)
-                })
-                .flatten();
-            let picker_items = refreshed_history.as_ref().unwrap_or(&self.picker_items);
-            return Picker
-                .rank(picker_items, query)
-                .into_iter()
-                .filter_map(|matched| {
-                    let item = &picker_items[matched.index];
-                    (item.kind == kind).then(|| Suggestion {
-                        value: item.value.as_str().unwrap_or(&item.label).to_owned(),
-                        display_override: Some(item.label.clone()),
-                        description: Some(item.description.clone()),
-                        extra: item.preview.clone().map(|preview| vec![preview]),
-                        span: Span::new(0, pos),
-                        append_whitespace: false,
-                        match_indices: Some(matched.match_indices),
-                        ..Suggestion::default()
-                    })
-                })
-                .collect();
+            return if kind == ItemKind::History {
+                if let Some(items) = self.refreshed_history_items() {
+                    rank_picker_suggestions(items, query, pos)
+                } else {
+                    rank_picker_suggestions_of_kind(&self.picker_items, kind, query, pos)
+                }
+            } else {
+                rank_picker_suggestions_of_kind(&self.picker_items, kind, query, pos)
+            };
         }
         let mut suggestions = self
             .catalog
@@ -1028,6 +1042,40 @@ impl Completer for CatalogCompleter {
         suggestions.retain(|suggestion| seen.insert(suggestion.value.clone()));
         suggestions
     }
+}
+
+fn rank_picker_suggestions(items: &[PickItem], query: &str, pos: usize) -> Vec<Suggestion> {
+    Picker
+        .rank(items, query)
+        .into_iter()
+        .map(|matched| {
+            let item = &items[matched.index];
+            Suggestion {
+                value: item.value.as_str().unwrap_or(&item.label).to_owned(),
+                display_override: Some(item.label.clone()),
+                description: Some(item.description.clone()),
+                extra: item.preview.clone().map(|preview| vec![preview]),
+                span: Span::new(0, pos),
+                append_whitespace: false,
+                match_indices: Some(matched.match_indices),
+                ..Suggestion::default()
+            }
+        })
+        .collect()
+}
+
+fn rank_picker_suggestions_of_kind(
+    items: &[PickItem],
+    kind: ItemKind,
+    query: &str,
+    pos: usize,
+) -> Vec<Suggestion> {
+    let scoped = items
+        .iter()
+        .filter(|item| item.kind == kind)
+        .cloned()
+        .collect::<Vec<_>>();
+    rank_picker_suggestions(&scoped, query, pos)
 }
 
 fn read_history_picker_items(path: &Path) -> Option<Vec<PickItem>> {
@@ -1620,6 +1668,37 @@ mod tests {
         let suggestions = completer.complete(&line, line.len());
         assert_eq!(suggestions[0].value, "cargo test --workspace");
         assert_eq!(suggestions[0].span, Span::new(0, line.len()));
+    }
+
+    #[test]
+    fn history_picker_reloads_only_when_the_file_changes() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!(
+            "quirl-ui-history-cache-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let history_path = directory.join("history");
+        fs::write(&history_path, "cargo test\n").unwrap();
+        let mut completer = CatalogCompleter::with_extensions_and_picker(
+            Catalog::builtin(),
+            None,
+            Vec::new(),
+            Some(history_path.clone()),
+        );
+        let line = format!("{HISTORY_PICKER_PREFIX}cargo");
+        assert_eq!(completer.complete(&line, line.len())[0].value, "cargo test");
+        fs::write(&history_path, "cargo test\n").unwrap();
+        assert_eq!(completer.complete(&line, line.len())[0].value, "cargo test");
+        fs::write(&history_path, "cargo clippy\n").unwrap();
+        assert_eq!(
+            completer.complete(&line, line.len())[0].value,
+            "cargo clippy"
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

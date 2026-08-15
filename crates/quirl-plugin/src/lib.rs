@@ -22,6 +22,11 @@ pub const PLUGIN_LOCK_FILE: &str = "plugins.lock.json";
 pub const WASM_WORLD: &str = "quirl:plugin/api@0.1.0";
 pub const WASM_HOST_IMPORT: &str = "quirl:plugin/host@0.1.0";
 pub const WASM_GUEST_EXPORT: &str = "quirl:plugin/guest@0.1.0";
+/// Checked-in WIT world. WIT cannot express recursive `Value` or the full
+/// `ShellError` shape, so this is a narrower projection of
+/// `quirl_core::COMMON_ABI_SCHEMA_DESCRIPTOR`: wasm `value` drops nested
+/// `list<Value>` / `record<string,Value>` in favor of `string-list`, and
+/// `shell-error` omits `labels`, `command`, and `exit_status`.
 pub const WASM_WIT: &str = include_str!("../wit/quirl-plugin.wit");
 
 pub const PLUGIN_SCHEMA_DESCRIPTOR: &str = "PluginManifest{deny_unknown;schema_version:u32;plugin:PluginMetadata{deny_unknown;name:string;version:string;entry:relative-path;quirl:version-range;api:string;runtime:trusted_lua|wasm_component|out_of_process;summary:string};capabilities:PluginCapabilities{deny_unknown;request:array<capability>};contributes:PluginContributions{deny_unknown;commands:array<string>;completions:array<string>;events:array<string>;panels:array<string>;indexers:array<string>};public_commands:array<PackageCommand@quirl.package@1>;wasm:null|WasmComponentBoundary{deny_unknown;world:string;max_memory_bytes:u64;fuel:u64;callback_timeout_ms:u64};adapter:null|OutOfProcessBoundary{deny_unknown;protocol:string;executable:string;arguments:array<string>;callback_timeout_ms:u64;max_message_bytes:u64}}";
@@ -417,7 +422,6 @@ impl PluginLockfile {
         if existing.version != plugin.version
             || existing.manifest_checksum != plugin.manifest_checksum
             || existing.entry_checksum != plugin.entry_checksum
-            || existing.source_checksum != plugin.source_checksum
             || existing.runtime_schema_hash != plugin.runtime_schema_hash
             || existing.requested_capabilities != plugin.requested_capabilities
             || existing.granted_capabilities != plugin.granted_capabilities
@@ -427,6 +431,20 @@ impl PluginLockfile {
                 "Review the version, checksum, and permission diff; locked updates never rewrite them",
             ));
         }
+        let expected_source_checksum = derived_source_checksum(
+            &plugin.manifest_checksum,
+            &plugin.entry_checksum,
+            &plugin.source,
+        );
+        if plugin.source_checksum != expected_source_checksum {
+            return Err(validation_error(
+                format!(
+                    "locked plugin `{}` has an inconsistent source checksum",
+                    plugin.name
+                ),
+                "Re-resolve the plugin so the source identity checksum matches its source",
+            ));
+        }
         let mut candidate = self.clone();
         let item = candidate
             .plugins
@@ -434,6 +452,7 @@ impl PluginLockfile {
             .find(|item| item.name == plugin.name)
             .ok_or_else(|| validation_error("installed plugin disappeared", "Retry the update"))?;
         item.source = plugin.source;
+        item.source_checksum = plugin.source_checksum;
         candidate.validate()?;
         Ok(candidate)
     }
@@ -560,14 +579,7 @@ pub fn resolve_plugin(
     }
     let manifest_checksum = sha256(manifest_bytes);
     let entry_checksum = sha256(entry_bytes);
-    let source_checksum = sha256(
-        [
-            manifest_checksum.as_bytes(),
-            entry_checksum.as_bytes(),
-            source.as_bytes(),
-        ]
-        .concat(),
-    );
+    let source_checksum = derived_source_checksum(&manifest_checksum, &entry_checksum, source);
     Ok((
         LockedPlugin {
             name: manifest.plugin.name.clone(),
@@ -752,14 +764,8 @@ pub fn doctor_plugin(
             "entry checksum differs from the permission lock",
         ));
     }
-    let source_checksum = sha256(
-        [
-            manifest_checksum.as_bytes(),
-            entry_checksum.as_bytes(),
-            locked.source.as_bytes(),
-        ]
-        .concat(),
-    );
+    let source_checksum =
+        derived_source_checksum(&manifest_checksum, &entry_checksum, &locked.source);
     if source_checksum != locked.source_checksum {
         diagnostics.push(doctor_error(
             "plugin.source_lock_tampered",
@@ -902,6 +908,7 @@ fn validate_component_contract(bytes: &[u8]) -> Result<(), ShellError> {
         )
     })?;
     let mut component = false;
+    let mut saw_encoding = false;
     let mut component_types = 0usize;
     let mut imports = BTreeSet::new();
     let mut exports = BTreeSet::new();
@@ -912,7 +919,12 @@ fn validate_component_contract(bytes: &[u8]) -> Result<(), ShellError> {
                 "Rebuild the component from the checked-in WIT world",
             )
         })? {
-            Payload::Version { encoding, .. } => component = encoding == Encoding::Component,
+            Payload::Version { encoding, .. } => {
+                if !saw_encoding {
+                    component = encoding == Encoding::Component;
+                    saw_encoding = true;
+                }
+            }
             Payload::ComponentTypeSection(reader) => {
                 for ty in reader {
                     ty.map_err(|error| {
@@ -1081,6 +1093,20 @@ fn valid_filesystem_scope(scope: &str) -> bool {
                 std::path::Component::Normal(_) | std::path::Component::CurDir
             )
         })
+        && scope.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b'+')
+        })
+}
+
+fn derived_source_checksum(manifest_checksum: &str, entry_checksum: &str, source: &str) -> String {
+    sha256(
+        [
+            manifest_checksum.as_bytes(),
+            entry_checksum.as_bytes(),
+            source.as_bytes(),
+        ]
+        .concat(),
+    )
 }
 
 fn unsupported_capability(capability: &str) -> ShellError {
@@ -1289,6 +1315,8 @@ error_codes = { "0" = "success" }
             "process.spawn:printf\nsecond",
             "process.spawn:../escape",
             "filesystem.read:../../secret",
+            "filesystem.read:evil\nname",
+            "filesystem.write:dir/\u{1b}[31m",
             "commands.register:shadow",
         ] {
             let source = LUA_MANIFEST.replace(
@@ -1387,6 +1415,29 @@ error_codes = { "0" = "success" }
     }
 
     #[test]
+    fn locked_update_recomputes_source_checksum_from_the_new_source() {
+        let plugin = resolved(&["commands.register".to_owned()]).unwrap();
+        let lock = PluginLockfile::empty().install(plugin.clone()).unwrap();
+        let mut relocated = plugin.clone();
+        relocated.source = "file:/relocated/plugin.toml".to_owned();
+        relocated.source_checksum = derived_source_checksum(
+            &relocated.manifest_checksum,
+            &relocated.entry_checksum,
+            &relocated.source,
+        );
+        let updated = lock.replace_locked(relocated.clone()).unwrap();
+        assert_eq!(updated.plugins[0].source, relocated.source);
+        assert_eq!(
+            updated.plugins[0].source_checksum,
+            relocated.source_checksum
+        );
+
+        let mut stale = plugin;
+        stale.source = "file:/stale/plugin.toml".to_owned();
+        assert!(lock.replace_locked(stale).is_err());
+    }
+
+    #[test]
     fn wasm_boundary_accepts_components_and_rejects_core_modules() {
         let mut wit = wit_parser::Resolve::default();
         wit.push_str("quirl-plugin.wit", WASM_WIT).unwrap();
@@ -1423,6 +1474,20 @@ callback_timeout_ms = 25
         let lock = PluginLockfile::empty().install(locked).unwrap();
         assert!(lock.set_enabled("demo", true).is_err());
         assert!(validate_plugin_manifest(&manifest, b"\0asm\x01\0\0\0", "0.1.0").is_err());
+        let nested_core = wat::parse_str(format!(
+            r#"(component
+                (core module $nested
+                  (func (export "f") (result i32)
+                    i32.const 1
+                  )
+                )
+                (type (instance))
+                (import "{WASM_HOST_IMPORT}" (instance (type 0)))
+                (export "{WASM_GUEST_EXPORT}" (instance 0))
+            )"#
+        ))
+        .unwrap();
+        assert!(validate_plugin_manifest(&manifest, &nested_core, "0.1.0").is_ok());
         let wrong_world = wat::parse_str(
             r#"(component
                 (type (instance))

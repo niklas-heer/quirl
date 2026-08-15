@@ -14,7 +14,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::hash_map::DefaultHasher,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     hash::{Hash, Hasher},
     io::Read,
     path::{Component, Path, PathBuf},
@@ -127,7 +129,7 @@ impl LuaExtensionHost {
         let config_path = configuration
             .as_ref()
             .map(|directory| directory.join("config.lua"));
-        match plugin_state_directory(configuration.as_deref()) {
+        match plugin_state_directory() {
             Some(root) => Self::from_managed_root(config_path, root),
             None => Self::from_paths(config_path, Vec::new()),
         }
@@ -632,16 +634,43 @@ impl ExtensionCompleter for LuaCompletionAdapter {
 }
 
 fn config_directory() -> Option<PathBuf> {
-    env::var_os("QUIRL_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("XDG_CONFIG_HOME").map(|path| PathBuf::from(path).join("quirl")))
-        .or_else(|| env::var_os("HOME").map(|path| PathBuf::from(path).join(".config/quirl")))
+    resolve_config_directory(
+        env::var_os("QUIRL_CONFIG_DIR"),
+        env::var_os("XDG_CONFIG_HOME"),
+        env::var_os("HOME"),
+    )
 }
 
-fn plugin_state_directory(configuration: Option<&Path>) -> Option<PathBuf> {
-    env::var_os("QUIRL_PLUGIN_HOME")
+fn plugin_state_directory() -> Option<PathBuf> {
+    resolve_plugin_state_directory(
+        env::var_os("QUIRL_PLUGIN_HOME"),
+        env::var_os("QUIRL_CONFIG_DIR"),
+        env::var_os("XDG_CONFIG_HOME"),
+        env::var_os("HOME"),
+    )
+}
+
+pub(crate) fn resolve_config_directory(
+    config_dir: Option<OsString>,
+    xdg_config_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    config_dir
         .map(PathBuf::from)
-        .or_else(|| configuration.map(|directory| directory.join("plugins")))
+        .or_else(|| xdg_config_home.map(|path| PathBuf::from(path).join("quirl")))
+        .or_else(|| home.map(|path| PathBuf::from(path).join(".config/quirl")))
+}
+
+pub(crate) fn resolve_plugin_state_directory(
+    plugin_home: Option<OsString>,
+    config_dir: Option<OsString>,
+    xdg_config_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    plugin_home.map(PathBuf::from).or_else(|| {
+        resolve_config_directory(config_dir, xdg_config_home, home)
+            .map(|directory| directory.join("plugins"))
+    })
 }
 
 fn snapshot_legacy_plugin_paths(
@@ -1543,5 +1572,38 @@ quirl.extension.contribute {
         assert!(errors[0].message.contains("duplicate Panel contribution"));
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn plugin_state_root_follows_config_dir_when_plugin_home_is_unset() {
+        use std::ffi::OsString;
+
+        assert_eq!(
+            resolve_plugin_state_directory(
+                None,
+                Some(OsString::from("/tmp/custom")),
+                Some(OsString::from("/tmp/xdg")),
+                Some(OsString::from("/tmp/home")),
+            ),
+            Some(PathBuf::from("/tmp/custom/plugins"))
+        );
+        assert_eq!(
+            resolve_plugin_state_directory(
+                Some(OsString::from("/tmp/plugins")),
+                Some(OsString::from("/tmp/custom")),
+                Some(OsString::from("/tmp/xdg")),
+                Some(OsString::from("/tmp/home")),
+            ),
+            Some(PathBuf::from("/tmp/plugins"))
+        );
+        assert_eq!(
+            resolve_plugin_state_directory(
+                None,
+                None,
+                Some(OsString::from("/tmp/xdg")),
+                Some(OsString::from("/tmp/home")),
+            ),
+            Some(PathBuf::from("/tmp/xdg/quirl/plugins"))
+        );
     }
 }

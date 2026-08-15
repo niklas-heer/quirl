@@ -47,5 +47,7 @@ expect_used = "deny"
 [profile.release]
 lto = "fat"
 strip = "symbols"
-panic = "abort"
+# mlua converts host-callback panics into Lua errors via unwinding. abort
+# would terminate the shell instead of producing a ShellError.
+panic = "unwind"
 codegen-units = 1

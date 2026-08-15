@@ -449,7 +449,9 @@ fn measure_pty_sample(
         // A single character establishes that the newly painted editor accepts
         // input without turning the readiness probe into a multi-key paste
         // benchmark (which Reedline intentionally batches).
-        let marker = "~";
+        // `~` appears in home paths; `^` is not legal in typical path or prompt text.
+        let marker = "^";
+        session.assert_absent(marker, "editable prompt marker")?;
         session.send(marker.as_bytes())?;
         session.wait_for_screen(marker, timeout, "editable prompt marker")?;
         let cold_to_editable = started.elapsed();
@@ -459,6 +461,7 @@ fn measure_pty_sample(
         session.send(baseline.as_bytes())?;
         session.wait_for_screen(baseline, timeout, "representative edit baseline")?;
         let edit_started = Instant::now();
+        session.assert_absent("git commit --amend", "edited terminal frame")?;
         session.send(b"d")?;
         session.wait_for_screen("git commit --amend", timeout, "edited terminal frame")?;
 
@@ -562,6 +565,18 @@ impl PtySession {
     fn send(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         self.writer.write_all(bytes)?;
         self.writer.flush()?;
+        Ok(())
+    }
+
+    fn assert_absent(&self, marker: &str, phase: &str) -> Result<(), Box<dyn Error>> {
+        let screen = self.parser.screen().contents();
+        if screen.contains(marker) {
+            return Err(format!(
+                "{phase} marker `{marker}` was already on screen before injection; screen={:?}",
+                screen_tail(&screen)
+            )
+            .into());
+        }
         Ok(())
     }
 

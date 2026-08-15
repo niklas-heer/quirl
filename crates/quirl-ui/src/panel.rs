@@ -60,7 +60,17 @@ impl PanelModel {
         if self.rows.is_empty() {
             return format!("{}\n", self.plain_fallback.trim_end());
         }
-        let mut widths = self.columns.iter().map(String::len).collect::<Vec<_>>();
+        let cells = self
+            .rows
+            .iter()
+            .map(Vec::len)
+            .chain(std::iter::once(self.columns.len()))
+            .max()
+            .unwrap_or_default();
+        let mut widths = vec![0; cells];
+        for (index, column) in self.columns.iter().enumerate() {
+            widths[index] = column.len();
+        }
         for row in &self.rows {
             for (index, cell) in row.iter().enumerate() {
                 widths[index] = widths[index].max(cell.len());
@@ -251,6 +261,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(empty.render_plain(), "nothing to show\n");
+    }
+
+    #[test]
+    fn render_plain_tolerates_deserialized_rows_wider_than_columns() {
+        let panel: PanelModel = serde_json::from_str(
+            r#"{
+                "title": "wide",
+                "columns": ["name"],
+                "rows": [["alpha", "extra"]],
+                "plain_fallback": "plain"
+            }"#,
+        )
+        .unwrap();
+        assert!(panel.validate().is_err());
+        assert_eq!(panel.render_plain(), "name\nalpha  extra\n");
     }
 
     #[test]

@@ -163,6 +163,7 @@ fn install_candidate(file: &Path, temporary: &Path, candidate: &str) -> Result<(
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_parent(file: &Path) -> Result<(), ShellError> {
     let parent = file
         .parent()
@@ -171,6 +172,13 @@ fn sync_parent(file: &Path) -> Result<(), ShellError> {
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| file_error("sync the directory containing", file, error))
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_file: &Path) -> Result<(), ShellError> {
+    // Rust's portable File API cannot open directories on Windows. The
+    // replacement already succeeded and the file contents were flushed.
+    Ok(())
 }
 
 fn backup_path(file: &Path) -> PathBuf {

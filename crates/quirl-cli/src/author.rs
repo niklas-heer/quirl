@@ -311,15 +311,27 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), ShellError> {
             .and_then(|()| file.sync_all())
             .map_err(|error| io_error("write", &temporary, error))?;
         fs::rename(&temporary, path).map_err(|error| io_error("replace", path, error))?;
-        let directory = fs::File::open(parent).map_err(|error| io_error("open", parent, error))?;
-        directory
-            .sync_all()
-            .map_err(|error| io_error("synchronize", parent, error))
+        sync_parent_directory(parent)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<(), ShellError> {
+    let directory = fs::File::open(parent).map_err(|error| io_error("open", parent, error))?;
+    directory
+        .sync_all()
+        .map_err(|error| io_error("synchronize", parent, error))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<(), ShellError> {
+    // Rust's portable File API cannot open directories on Windows. The
+    // replacement already succeeded and the file contents were flushed.
+    Ok(())
 }
 
 fn open_document(path: &Path) -> Result<(), ShellError> {

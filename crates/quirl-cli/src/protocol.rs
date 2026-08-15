@@ -174,6 +174,8 @@ fn current_manifest() -> Result<ProtocolFreezeManifest, quirl_core::ShellError> 
             quirl_process::runner_schema_hash(),
             "text_outcome_only",
         ),
+        // WIT cannot express the recursive Value / full ShellError cases in
+        // COMMON_ABI_SCHEMA_DESCRIPTOR; see WASM_WIT for the projected shape.
         contract_text(
             "wasm_world",
             "quirl-plugin",

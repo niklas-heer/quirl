@@ -69,10 +69,12 @@ non-isolated, so these figures are named-hardware evidence rather than a
 cross-machine guarantee.
 
 The readiness probe writes a single character after the first prompt rather
-than a multi-key marker. This measures the required editable state without
-accidentally measuring Reedline's intentional multi-event paste coalescing.
-The earlier 100+ ms readiness reading was therefore a probe artifact, not
-evidence that a single newly painted prompt cannot accept input.
+than a multi-key marker, and it fails the sample if that character or the
+later `git commit --amend` text is already on screen. This measures the
+required editable state without accidentally measuring Reedline's intentional
+multi-event paste coalescing. The earlier 100+ ms readiness reading was
+therefore a probe artifact, not evidence that a single newly painted prompt
+cannot accept input.
 
 ## Stream retention evidence
 
