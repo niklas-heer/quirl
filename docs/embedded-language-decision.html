@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Quirl — Embedded Language Decision 1.0</title>
+  <title>Quirl — Embedded Language Decision 1.2</title>
   <style>
     :root {
       color-scheme: dark;
@@ -135,7 +135,7 @@
 <div class="shell">
   <aside>
     <div class="brand"><span class="mark">q&gt;</span> Quirl</div>
-    <div class="meta">Embedded language decision<br>Decision 1.0 · 15 Aug 2026</div>
+    <div class="meta">Embedded language decision<br>Decision 1.2 · 15 Aug 2026</div>
     <nav aria-label="Report sections">
       <a href="#outcome">01 · Outcome</a><a href="#scope">02 · Scope</a>
       <a href="#architecture">03 · Architecture</a><a href="#footprint">04 · Footprint</a>
@@ -280,10 +280,11 @@
         <h2>One familiar extension language, with Rust enforcing the contract.</h2>
         <p>Choose Lua 5.4 for configuration, scripts, and trusted plugins. Its familiarity, tiny footprint, longevity, and mature <code>mlua</code> bridge outweigh the stronger analysis offered by Luau. Quirl will deliver IDE-quality assistance through generated SDK annotations and metadata, while Rust schemas validate all values before state changes.</p>
         <ol class="clean">
-          <li>Add a <code>quirl-lua</code> crate with pinned Lua 5.4 through <code>mlua</code> and a deliberately restricted standard library and module loader.</li>
-          <li>Generate runtime bindings, LuaLS-compatible stubs, completion data, documentation, and AI schemas from one Rust host definition.</li>
-          <li>Run one configuration, one script, and one prompt/completion plugin through the same capability API and structured error boundary.</li>
-          <li>Ship the vertical slice with <code>check</code>, <code>fmt</code>, <code>lint</code>, <code>test</code>, cancellation, memory/instruction budgets, and last-known-good config reload.</li>
+          <li><strong>Implemented:</strong> <code>quirl-lua</code> embeds pinned Lua 5.4 through <code>mlua</code> with restricted libraries, capabilities, memory/instruction/time budgets, and cancellation.</li>
+          <li><strong>Implemented:</strong> one Rust host definition generates LuaLS stubs, completion data, Markdown, and AI-readable JSON.</li>
+          <li><strong>Implemented:</strong> configuration, scripts, prompt segments, and completion providers run through the same Rust-validated API; live prompt and IDE completion consume plugin callbacks.</li>
+          <li><strong>Implemented:</strong> the rejected prototype runtime, CLI bridge, workspace crate, dependencies, examples, and executable benchmark paths are removed.</li>
+          <li><strong>Next:</strong> watch and atomically reload configuration, apply keymap/picker settings live, and expand the native Rust data surface.</li>
         </ol>
       </div>
       <div class="grid" style="margin-top:16px">

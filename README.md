@@ -5,10 +5,9 @@ Everything you need, mixed in.
 Quirl is a proposed modern shell and terminal development environment: familiar
 Bash/Zsh command entry, typed data pipelines, a well-tooled Lua extension
 language, semantic completions, structured errors, rich built-in UI, and a
-capability-based plugin system in one fast Rust application. The runnable
-prototype currently uses Steel; the completed language evaluation selects Lua
-5.4 for configuration, automation, and trusted plugins. Rust remains the
-implementation language and validates every host boundary.
+capability-based plugin system in one fast Rust application. Lua 5.4 is the sole
+embedded language for configuration, automation, and trusted plugins; Rust
+remains the implementation language and validates every host boundary.
 
 The project now has a runnable vertical-slice prototype. Read the interactive
 [language and product design](docs/language-design.html) for the intended product,
@@ -23,8 +22,10 @@ latency details.
 The first Lua vertical slice is now runnable: a pinned Lua 5.4 runtime through
 `mlua`, generated runtime bindings and LuaLS-compatible stubs, and the same
 Rust-validated API powering configuration, scripts, and prompt/completion plugin
-registration. The next step is connecting these registrations to the live shell
-UI and replacing the remaining Steel-backed data-mode prototype deliberately.
+registration. Lua prompt segments and completion providers now feed the live
+editor through one persistent, resource-limited VM per plugin. Data mode uses
+Quirl's native Rust evaluator. The earlier Steel prototype and all of its runtime
+dependencies have been removed.
 
 ## Try the prototype
 
@@ -36,15 +37,17 @@ cargo run -p quirl-cli
 
 Inside the prompt, ordinary commands run through the configured compatibility
 shell, `ls` is Quirl-native, Tab opens a documented semantic completion menu,
-and the mode is always visible. The current baseline uses persistent Steel data
-mode; use `mode data` or bridge from command mode with `steel (+ 20 22)`.
+and the mode is always visible. Use `mode data` for native structured pipelines
+or bridge explicitly with `lua return 20 + 22`.
+Quirl discovers `config.lua` and sorted `plugins/*.lua` under
+`$QUIRL_CONFIG_DIR`, `$XDG_CONFIG_HOME/quirl`, or `~/.config/quirl`.
 
 Useful non-interactive surfaces:
 
 ```console
-cargo run -p quirl-cli -- run examples/hello.quirl
 cargo run -p quirl-cli -- run examples/hello.lua Codex
-cargo run -p quirl-cli -- check examples/hello.quirl --format json
+cargo run -p quirl-cli -- data '[{"name":"api","status":"up"}] | get name'
+cargo run -p quirl-cli -- check examples/hello.lua --format json
 cargo run -p quirl-cli -- config check examples/config.lua --format json
 cargo run -p quirl-cli -- plugin check examples/plugin.lua --format json
 cargo run -p quirl-cli -- test examples/lua_tests.lua
@@ -63,10 +66,10 @@ mutually exclusive runtime features into the shell.
 
 - `quirl-cli` — binary, REPL, script runner, and machine-facing commands
 - `quirl-core` — compatibility execution, native `ls`, values, and errors
+- `quirl-data` — native structured sources and `where`/`select`/`get`/`first`/`length` transforms
 - `quirl-lua` — restricted Lua 5.4 runtime, Rust schemas, resource budgets, and SDK generation
 - `quirl-syntax` — explicit command/data-mode interaction grammar
-- `quirl-steel` — temporary persistent Steel VM for the existing data-mode prototype
 - `quirl-catalog` — one schema for completion, help, docs, validation, and AI
 - `quirl-ui` — semantic highlighting, IDE completion menu, prompt, diagnostics
-- `quirl-bench` — reproducible Steel/Lua/Rhai/Fennel runtime spike
+- `quirl-bench` — reproducible Lua/Rhai/Fennel runtime spike
 - `spikes/` — isolated runtime, type-checking, binary-size, and peak-RSS measurements

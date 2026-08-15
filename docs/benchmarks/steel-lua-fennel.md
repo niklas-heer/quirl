@@ -1,4 +1,7 @@
-# Steel, Lua, and Fennel — spike 2
+# Steel, Lua, and Fennel — historical spike 2
+
+> Historical evidence only. Steel was rejected and its runtime, dependencies,
+> executable probes, and integration code have been removed from Quirl.
 
 > Historical baseline: the static-analysis requirement reopened the core
 > language decision. See the newer

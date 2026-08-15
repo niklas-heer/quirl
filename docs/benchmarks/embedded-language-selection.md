@@ -22,7 +22,7 @@ the strongest existing editor and AI ecosystem in the candidate set, a real
 ahead-of-execution checker, and a lightweight runtime without embedding V8.
 QuickJS-NG still clears the sub-millisecond startup gate comfortably.
 
-This reopens the earlier Steel-first decision; it does not silently create a
+This reopened the earlier Steel-first decision; it does not silently create a
 two-language core. If the TypeScript/QuickJS-NG vertical slice passes the remaining
 module, host-API, cancellation, and analyzer-service gates, scripts,
 configuration, commands, and trusted plugins should all move together to

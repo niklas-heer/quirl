@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Language and product specification for quirl: a fast, compatible, structured, IDE-like shell.">
-  <title>Quirl — Language &amp; Product Design, Draft 0.8</title>
+  <title>Quirl — Language &amp; Product Design, Draft 0.9</title>
   <style>
     :root {
       color-scheme:dark;
@@ -131,7 +131,7 @@
   <div class="shell">
     <aside class="sidebar" aria-label="Document navigation">
       <a class="brand" href="#top"><span class="brand-mark">q&gt;</span> Quirl</a>
-      <p class="doc-meta">Language &amp; product design<br>Draft 0.8 · 15 Aug 2026</p>
+      <p class="doc-meta">Language &amp; product design<br>Draft 0.9 · 15 Aug 2026</p>
       <p class="nav-label">Specification</p>
       <nav>
         <a href="#thesis">01 · Thesis</a><a href="#principles">02 · Principles</a>
@@ -152,7 +152,7 @@
         <p class="eyebrow">The development environment in your terminal</p>
         <h1 id="hero-title">Your shell should feel as smart as your editor.</h1>
         <p class="lede"><span class="highlight">Quirl</span> combines familiar Bash/Zsh command entry, typed data pipelines, Rust performance, and a well-tooled Lua extension language with an IDE-grade editing experience. Completion, diagnostics, documentation, prompt context, and interactive views are one product—not a pile of plugins.</p>
-        <div class="status-row"><span class="tag draft">Draft 0.8</span><span class="tag">Complete toolkit</span><span class="tag">Semantic completions</span><span class="tag">Native fuzzy picker</span><span class="tag">Lua 5.4 selected</span><span class="tag">Rust implementation</span></div>
+        <div class="status-row"><span class="tag draft">Draft 0.9</span><span class="tag">Complete toolkit</span><span class="tag">Semantic completions</span><span class="tag">Native fuzzy picker</span><span class="tag">Lua 5.4 selected</span><span class="tag">Rust implementation</span></div>
         <div class="hero-terminal" aria-label="Semantic quirl command editor with completions and diagnostics">
           <div class="terminal-bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="terminal-label">quirl · ~/src/payments</span></div>
           <div class="workspace-grid">
@@ -481,6 +481,7 @@ let body = result.unwrap_or_else(|e| cached(e))  # recover</code></pre></div>
         <p class="eyebrow">09 · Embedded language &amp; runners</p><h2>One familiar extension language, chosen on evidence.</h2>
         <p class="section-intro">Quirl needs one canonical general-purpose language for scripts, configuration, custom commands, prompt components, keymaps, and trusted UI extensions. The concise quirl command/data notation remains the interactive shell surface; it does not grow into a second general-purpose programming language.</p>
         <div class="callout"><strong>Accepted decision: Lua 5.4.</strong><p>Rust remains Quirl’s implementation language; Lua is the sole first-class language for configuration, automation, and trusted plugins. Familiarity, a 0.58 MiB measured runtime probe, decades of longevity, and the mature <code>mlua</code> bridge outweigh Luau’s stronger analyzer for this extension-only role. <a href="embedded-language-decision.html">Open the decision report</a> or read <a href="decisions/0001-lua-extension-language.md">ADR 0001</a>.</p></div>
+        <div class="callout"><strong>Implementation status: the first Lua slice is live.</strong><p>The Rust workspace now embeds restricted Lua 5.4, generates LuaLS/JSON/Markdown SDK views, validates configuration through Rust schemas, and routes registered prompt and completion callbacks into the interactive editor. Data mode now uses a native Rust structured evaluator. The rejected prototype runtime and all executable/dependency paths have been removed.</p></div>
         <div class="callout warn"><strong>Dynamic does not mean unchecked.</strong><p>Quirl generates LuaLS-compatible annotations, completion metadata, docs, and AI schemas from Rust host definitions. <code>quirl check</code> parses, lints, resolves modules and capabilities, and validates known schemas without execution. Rust validates every host value before mutation, but Quirl does not promise sound static typing for arbitrary Lua.</p></div>
         <table class="comparison">
           <thead><tr><th>Candidate</th><th>Strength</th><th>Core risk</th><th>Position</th></tr></thead>
@@ -492,7 +493,7 @@ let body = result.unwrap_or_else(|e| cached(e))  # recover</code></pre></div>
             <tr><td>AssemblyScript → Wasm</td><td>Strict TypeScript-shaped syntax, ahead-of-time compilation, portable isolation</td><td>Not full TypeScript; build step and rich host-data glue</td><td class="partial">Typed plugin spike</td></tr>
             <tr><td>MoonBit → Wasm</td><td>Static types, typed errors, integrated tooling, first-class WIT components</td><td>Young ecosystem; compiler/toolchain redistribution terms need review</td><td class="partial">Typed plugin spike</td></tr>
             <tr><td>TypeScript + V8</td><td>Node-compatible runtime expectations and package reach</td><td>Large runtime/build/cold-start tax; ambient APIs fight capability isolation</td><td>Rejected for base shell</td></tr>
-            <tr><td>Steel / Scheme</td><td>Rust integration, immutable values, contracts, macros, LSP</td><td>Runtime contracts, 64.7 ms VM startup, unfamiliar syntax, pre-1.0</td><td class="partial">Current baseline</td></tr>
+            <tr><td>Steel / Scheme</td><td>Rust integration, immutable values, contracts, macros, LSP</td><td>Runtime contracts, 64.7 ms VM startup, unfamiliar syntax, pre-1.0</td><td class="no">Rejected; implementation removed</td></tr>
             <tr><td>PocketPy</td><td>Familiar Python surface, portable C11 runtime, sub-ms startup</td><td>Annotations are not a static checker; not CPython/PyPI compatible</td><td>Optional runner candidate</td></tr>
             <tr><td>Fennel</td><td>Elegant Lisp syntax and macros on the selected Lua runtime</td><td>Creates another language identity and diagnostic mapping layer</td><td>Possible optional runner</td></tr>
             <tr><td>Native quirl only</td><td>One syntax and one toolchain</td><td>Forces the shell DSL to become a general language</td><td>Rejected for extensions</td></tr>
@@ -529,7 +530,6 @@ quirl run --lang zsh release.zsh</code></pre></div>
           <tbody>
             <tr><td><code>.lua</code></td><td>Pinned Lua 5.4 through <code>mlua</code>; generated annotations and bindings; restricted modules and explicit capabilities</td><td class="yes">Core commitment</td></tr>
             <tr><td><code>.quirl</code></td><td>Focused command/data automation lowered to the shared execution plan</td><td class="yes">Core commitment</td></tr>
-            <tr><td><code>.scm</code> / <code>.steel</code></td><td>Existing prototype engine retained only during the Lua vertical-slice migration</td><td class="partial">Temporary baseline</td></tr>
             <tr><td><code>.luau</code> / <code>.rhai</code> / <code>.ts</code></td><td>Measured alternatives; no second core SDK or configuration ecosystem</td><td>Research or future optional runners</td></tr>
             <tr><td><code>.fnl</code></td><td>Compile to cached Lua, then use the optional Lua engine and the same host adapter</td><td class="partial">Companion to Lua</td></tr>
             <tr><td><code>.py</code></td><td>Optional PocketPy runtime with an explicit compatibility manifest; never presented as full CPython</td><td class="partial">Research candidate</td></tr>
@@ -541,7 +541,7 @@ quirl run --lang zsh release.zsh</code></pre></div>
           <article class="decision"><span class="state">Generated</span><h3>Annotated host capabilities</h3><p>The Rust schema emits runtime bindings, LuaLS-compatible stubs, completion metadata, docs, and AI schemas for prompt, commands, filesystem, process, network, data, and TUI. Their schema hashes must match before code runs.</p></article>
           <article class="decision"><span class="state">Stable contract</span><h3>One value ABI</h3><p>The host’s <code>Value</code>, <code>Stream</code>, <code>Result</code>, and <code>ShellError</code> model crosses native commands, scripts, embedded code, and plugins.</p></article>
           <article class="decision"><span class="state">Safety</span><h3>Capability manifest</h3><p>Packages declare effects. First use prompts once; CI can enforce a lockfile policy. Untrusted packages run out-of-process or as WebAssembly.</p></article>
-          <article class="decision"><span class="state">Migration rule</span><h3>One Lua SDK</h3><p>The existing Steel prototype is replaced by the Lua vertical slice. Configuration, scripts, and trusted plugins share one generated <code>quirl</code> module; Quirl will not maintain two core extension ecosystems.</p></article>
+          <article class="decision"><span class="state">Migration complete</span><h3>One Lua SDK</h3><p>The earlier prototype runtime is fully removed. Configuration, scripts, and trusted plugins share one generated <code>quirl</code> module; Quirl does not maintain two core extension ecosystems.</p></article>
         </div>
         <div class="code-block"><button class="copy-button" type="button">Copy</button><pre><code>-- ~/.config/quirl/plugins/project.lua
 quirl.prompt.add_segment {
@@ -824,7 +824,7 @@ quirl plugin remove kubernetes-workbench</code></pre></div>
       <section id="roadmap">
         <p class="eyebrow">13 · Delivery sequence</p><h2>Prove the risky seams first.</h2>
         <div class="roadmap">
-          <article class="phase"><small>PHASE 0 · LAB</small><h3>Lua SDK + execution slice</h3><p>Pinned Lua 5.4 through <code>mlua</code>, generated runtime bindings and LuaLS-compatible stubs, one config, script, and prompt/completion plugin, semantic diagnostics, restricted modules, interruption and memory budgets, plus the command graph, mode switch, C0 execution, byte pipes, typed picker benchmark, built-in <code>ls</code>, and error spans.</p></article>
+          <article class="phase"><small>PHASE 0 · ACTIVE</small><h3>Lua SDK + execution slice</h3><p>The Lua runtime, generated SDK views, config validation, live prompt/completion callbacks, resource budgets, command graph, mode switch, native data evaluator, C0 execution, byte pipes, built-in <code>ls</code>, and error spans are implemented. Remaining work is live config reload, applying UI settings, and broadening the deliberately focused data grammar.</p></article>
           <article class="phase"><small>PHASE 1 · PREVIEW</small><h3>A complete shell worth using</h3><p>Job control, redirects, indexed completions, Zsh/Bash/Fish and help/man ingestion, native history/file/action picker, adaptive prompt, typed config forms with web/TUI views, C1 subset, structured core commands, plain fallbacks, Linux and macOS.</p></article>
           <article class="phase"><small>PHASE 2 · SCRIPTABLE</small><h3>Lua and a complete authoring toolchain</h3><p>Lua scripts and computed configuration, <code>quirl run</code>, formatter, annotation-aware checker, linter, tests, docs, language service, agent catalog/validation formats, package manifests, generated host API, and deterministic tests.</p></article>
           <article class="phase"><small>PHASE 3 · PLATFORM</small><h3>Plugins + rich composition</h3><p>Trusted-language and Wasm plugin SDKs, permissions and lockfile, catalog/completion/UI/event extension points, Bash/Zsh runners, directory and process panels, live pipelines, Windows job control, and recovery.</p></article>
@@ -848,7 +848,7 @@ quirl plugin remove kubernetes-workbench</code></pre></div>
         </div>
         <textarea class="review-notes" id="reviewNotes" aria-label="General review notes" placeholder="General notes, alternatives, syntax ideas, deal-breakers…"></textarea>
         <div class="review-footer"><button class="button primary" id="copyReview" type="button">Copy review as Markdown</button><button class="button" id="clearReview" type="button">Clear</button></div>
-        <h3 style="margin-top:48px">Open questions for Draft 0.8</h3>
+        <h3 style="margin-top:48px">Open questions for Draft 0.9</h3>
         <ol class="clean"><li>Which LuaLS-compatible annotation subset can Quirl generate and validate without bundling a fragile second source of truth?</li><li>Should Lua 5.4 be statically linked and vendored on every platform, and what exact compatibility policy governs a future Lua 5.5 upgrade?</li><li>Which standard-library modules and <code>require</code> behaviors are safe in config, trusted-plugin, and script contexts?</li><li>How should instruction hooks, memory accounting, async cancellation, and per-callback deadlines interact across <code>mlua</code> callbacks?</li><li>Should Wasm be limited to isolated plugins, or also be a first-class script runner?</li><li>Is a persistent mode switch better than one mode with a separate structured pipe operator?</li><li>How much dynamic Zsh/Bash completion code should run in workers instead of being translated and cached?</li><li>Should the agent interface begin as CLI/JSON only, or ship the optional MCP server in preview?</li><li>Which plugin hooks may mutate command plans, and what confirmation should that require?</li><li>How much Bash/Zsh syntax belongs in native C1 before complexity harms diagnostics?</li><li>Which fuzzy query language and scoring guarantees belong in the stable picker protocol?</li><li>Which IDE surfaces and bundled capabilities are essential for the first preview?</li></ol>
       </section>
       <section id="references">
@@ -886,7 +886,7 @@ quirl plugin remove kubernetes-workbench</code></pre></div>
         </ul>
       </section>
       <footer>
-        <p><strong>Quirl Language &amp; Product Design · Draft 0.8</strong></p>
+        <p><strong>Quirl Language &amp; Product Design · Draft 0.9</strong></p>
         <p>This specification separates product intent from implementation claims. Performance numbers are targets; compatibility levels are proposed contracts; syntax is illustrative until a grammar and conformance suite land.</p>
       </footer>
     </main>

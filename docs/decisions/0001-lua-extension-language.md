@@ -75,7 +75,7 @@ Accepted costs:
 
 ## Next implementation milestone
 
-Build one vertical slice before replacing the existing Steel prototype:
+Build one vertical slice and remove the existing prototype runtime:
 
 1. Add a `quirl-lua` crate using pinned Lua 5.4 through `mlua`.
 2. Define a small Rust host schema and generate both runtime bindings and
@@ -112,12 +112,18 @@ The initial vertical slice landed with this decision:
 - Memory, instruction, wall-clock, and cancellation checks protect the VM.
 - Configuration is deserialized into Rust schemas, and a failed reload leaves the
   last-known-good configuration unchanged.
-- Registered prompt and completion callbacks remain in the persistent VM and can
-  be invoked through typed Rust methods.
+- Registered prompt and completion callbacks remain in persistent VMs and feed
+  the live Reedline prompt and IDE completion menu through typed Rust adapters.
+- Interactive data mode now evaluates native Rust-owned structured sources and
+  transforms.
+- The prototype runtime, CLI bridge, workspace crate, dependencies, examples,
+  and benchmark executable paths have been removed. It remains mentioned only
+  in historical evaluation evidence documenting why Lua was selected.
 
-The next integration step is to connect those callback methods to the live prompt
-and semantic completion engine, then migrate the interactive prototype away from
-Steel without changing the focused Quirl data-mode grammar.
+The next integration step is live configuration watching and atomic session
+reload, applying the selected keymap/prompt/picker settings to the running UI,
+and expanding the native data grammar without turning it into a second general-
+purpose language.
 
 ## Revisit conditions
 
