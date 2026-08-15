@@ -1,0 +1,11 @@
+[package]
+name = "quirl-syntax"
+description = "The small, explicit interaction grammar for Quirl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true

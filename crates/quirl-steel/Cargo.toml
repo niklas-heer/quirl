@@ -1,0 +1,12 @@
+[package]
+name = "quirl-steel"
+description = "The first-class Steel runtime for Quirl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+quirl-core = { path = "../quirl-core" }
+steel-core.workspace = true

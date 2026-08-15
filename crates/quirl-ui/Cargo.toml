@@ -1,0 +1,15 @@
+[package]
+name = "quirl-ui"
+description = "Quirl's semantic prompt, completion menu, and diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nu-ansi-term.workspace = true
+quirl-catalog = { path = "../quirl-catalog" }
+quirl-core = { path = "../quirl-core" }
+quirl-syntax = { path = "../quirl-syntax" }
+reedline.workspace = true

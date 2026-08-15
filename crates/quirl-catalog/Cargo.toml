@@ -1,0 +1,12 @@
+[package]
+name = "quirl-catalog"
+description = "Quirl's semantic source of truth for completion, help, docs, and AI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

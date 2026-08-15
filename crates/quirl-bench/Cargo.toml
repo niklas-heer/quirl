@@ -1,0 +1,16 @@
+[package]
+name = "quirl-bench"
+description = "Reproducible embedded-language runtime spike for Quirl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+mlua.workspace = true
+rhai.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+steel-core.workspace = true

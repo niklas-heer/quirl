@@ -1,0 +1,14 @@
+[package]
+name = "quirl-lua"
+description = "Quirl's restricted Lua 5.4 extension runtime and generated SDK metadata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mlua.workspace = true
+quirl-core = { path = "../quirl-core" }
+serde.workspace = true
+serde_json.workspace = true
