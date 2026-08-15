@@ -25,6 +25,11 @@ critical path. Lua 5.4 is the only embedded language, and Rust validates
 every value that crosses the Lua boundary, so configuration and plugins fail
 safely instead of taking the shell down with them.
 
+> [!IMPORTANT]
+> Quirl is in an early **prototyping phase**. It's a runnable vertical slice,
+> not a daily-driver shell yet — expect rapid, breaking changes while the
+> design settles. See [Status](#status) for what's actually implemented today.
+
 ## Features
 
 - **Familiar command mode** — ordinary Bash/Zsh-style commands run through a
