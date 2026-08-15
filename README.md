@@ -188,7 +188,10 @@ runtime dependencies have been removed.
 - [x] Bash/Zsh reference runners, bounded directory/process views and watch
   history, versioned recovery, and a contract-tested Windows process backend.
 - [x] Reviewed protocol identities and migrations, real Bash/Zsh differential
-  fixtures, terminal-safety and accessibility audits, and named 1.0 performance gates.
+  fixtures, terminal-safety and accessibility audits, and a reproducible named
+  1.0 performance-gate harness.
+- [ ] Refresh the named 1.0 performance record for the current `panic=unwind`
+  release profile.
 - [ ] Executing isolated adapters, native Windows terminal validation, and the
   explicitly deferred C1/C2 and asynchronous picker/completion contracts.
 

@@ -209,6 +209,15 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
     })
 }
 
+/// Return the expression from a `data` statement.
+///
+/// The keyword must be followed by whitespace or the end of the line. Callers
+/// share this classifier so checking and execution cannot disagree.
+pub fn data_statement_expression(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("data")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim_start())
+}
+
 /// Validate a line-oriented `.quirl` script without executing it.
 ///
 /// Command statements use the same compatibility parser as interactive execution. `data`
@@ -228,13 +237,8 @@ pub fn check_script(source: &str) -> Vec<CommandSyntaxError> {
             offset += raw_line.len();
             continue;
         }
-        if trimmed == "data"
-            || trimmed
-                .strip_prefix("data")
-                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-        {
-            let expression = trimmed.strip_prefix("data").unwrap_or_default();
-            if expression.trim().is_empty() {
+        if let Some(expression) = data_statement_expression(trimmed) {
+            if expression.is_empty() {
                 diagnostics.push(CommandSyntaxError {
                     message: "data statement requires an expression".to_owned(),
                     start: offset + leading,
@@ -762,6 +766,17 @@ mod tests {
         assert_eq!(&source[diagnostics[0].start..diagnostics[0].end], "$");
         assert_eq!(&source[diagnostics[1].start..diagnostics[1].end], "|");
         assert_eq!(&source[diagnostics[2].start..diagnostics[2].end], "data");
+    }
+
+    #[test]
+    fn data_statement_classifier_accepts_whitespace_without_matching_command_names() {
+        assert_eq!(data_statement_expression("data\t[1, 2]"), Some("[1, 2]"));
+        assert_eq!(
+            data_statement_expression("data   { ok: true }"),
+            Some("{ ok: true }")
+        );
+        assert_eq!(data_statement_expression("data"), Some(""));
+        assert_eq!(data_statement_expression("database status"), None);
     }
 
     #[test]

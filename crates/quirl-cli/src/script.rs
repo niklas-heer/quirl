@@ -878,7 +878,7 @@ fn run_quirl_source(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some(expression) = line.strip_prefix("data ") {
+        if let Some(expression) = quirl_syntax::data_statement_expression(line) {
             value = data.eval(expression).map_err(|error| {
                 error.with_label(
                     Some(source_name.to_owned()),
@@ -1171,6 +1171,20 @@ mod tests {
         .unwrap();
         assert_ne!(output.status, 0);
         assert_eq!(output.value["stdout"], "");
+    }
+
+    #[test]
+    fn quirl_script_executes_data_statements_separated_by_tabs() {
+        let output = run_source(
+            "data\t[1, 2, 3] | length",
+            "tabbed-data.quirl",
+            Some(Path::new("tabbed-data.quirl")),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.value, json!(3));
     }
 
     #[test]

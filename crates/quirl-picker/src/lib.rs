@@ -1,6 +1,7 @@
 //! Terminal-independent typed fuzzy selection.
 
 use serde::{Deserialize, Serialize};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const PICKER_PROTOCOL_VERSION: u32 = 1;
 pub const PICKER_SCHEMA_DESCRIPTOR: &str = "quirl.picker@1{PickItem{deny_unknown;id:string;kind:history|file|directory|action|completion|job|data;label:string;description:string;preview:null|string;value:json};PickMatch{deny_unknown;index:usize;score:i32;match_indices:array<usize>};query:space-separated-AND,apostrophe-exact,bang-exclude;ordering:score-desc,label-asc,id-asc;selection:stable-index-into-input}";
@@ -85,12 +86,13 @@ impl Picker {
 }
 
 fn rank_item(item: &PickItem, terms: &[&str]) -> Option<(i32, Vec<usize>)> {
+    let label_graphemes = item.label.graphemes(true).count();
     let searchable = if item.description.is_empty() {
         item.label.clone()
     } else {
         format!("{} {}", item.label, item.description)
     };
-    let searchable_lower = searchable.to_lowercase();
+    let searchable = FoldedText::new(&searchable);
     let mut score = 0;
     let mut primary_indices = Vec::new();
     for raw_term in terms {
@@ -105,14 +107,14 @@ fn rank_item(item: &PickItem, terms: &[&str]) -> Option<(i32, Vec<usize>)> {
         }
         let term = term.to_lowercase();
         let matched = if exact {
-            searchable_lower.find(&term).map(|start| {
+            searchable.value.find(&term).map(|start| {
                 (
-                    20_000 - i32::try_from(start).unwrap_or(i32::MAX),
-                    (start..start + term.len()).collect::<Vec<_>>(),
+                    20_000 - i32::try_from(searchable.grapheme_at(start)).unwrap_or(i32::MAX),
+                    searchable.indices_for(start, start + term.len()),
                 )
             })
         } else {
-            fuzzy_match(&term, &searchable_lower)
+            fuzzy_match(&term, &searchable)
         };
         if inverse {
             if matched.is_some() {
@@ -122,31 +124,82 @@ fn rank_item(item: &PickItem, terms: &[&str]) -> Option<(i32, Vec<usize>)> {
         }
         let (term_score, indices) = matched?;
         score += term_score;
-        if primary_indices.is_empty() {
+        if primary_indices.is_empty() && indices.iter().all(|index| *index < label_graphemes) {
             primary_indices = indices;
         }
     }
     Some((score, primary_indices))
 }
 
-fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
+struct FoldedText {
+    value: String,
+    grapheme_by_byte: Vec<usize>,
+    grapheme_count: usize,
+}
+
+impl FoldedText {
+    fn new(value: &str) -> Self {
+        let mut folded = String::new();
+        let mut grapheme_by_byte = Vec::new();
+        let mut grapheme_count = 0;
+        for (index, grapheme) in value.graphemes(true).enumerate() {
+            let lowercase = grapheme.to_lowercase();
+            folded.push_str(&lowercase);
+            grapheme_by_byte.extend(std::iter::repeat_n(index, lowercase.len()));
+            grapheme_count = index + 1;
+        }
+        Self {
+            value: folded,
+            grapheme_by_byte,
+            grapheme_count,
+        }
+    }
+
+    fn grapheme_at(&self, byte_index: usize) -> usize {
+        self.grapheme_by_byte
+            .get(byte_index)
+            .copied()
+            .unwrap_or(self.grapheme_count)
+    }
+
+    fn indices_for(&self, start: usize, end: usize) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for index in self
+            .grapheme_by_byte
+            .get(start..end)
+            .unwrap_or_default()
+            .iter()
+            .copied()
+        {
+            if indices.last().copied() != Some(index) {
+                indices.push(index);
+            }
+        }
+        indices
+    }
+}
+
+fn fuzzy_match(query: &str, candidate: &FoldedText) -> Option<(i32, Vec<usize>)> {
     if query.is_empty() {
         return Some((0, Vec::new()));
     }
-    if candidate.starts_with(query) {
+    if candidate.value.starts_with(query) {
         return Some((
-            10_000 - i32::try_from(candidate.len()).unwrap_or(i32::MAX),
-            (0..query.chars().count()).collect(),
+            10_000 - i32::try_from(candidate.grapheme_count).unwrap_or(i32::MAX),
+            candidate.indices_for(0, query.len()),
         ));
     }
     let mut indices = Vec::new();
-    let mut characters = candidate.char_indices();
+    let mut characters = candidate.value.char_indices();
     for wanted in query.chars() {
         let (byte_index, _) = characters.find(|(_, actual)| *actual == wanted)?;
-        indices.push(candidate[..byte_index].chars().count());
+        let index = candidate.grapheme_at(byte_index);
+        if indices.last().copied() != Some(index) {
+            indices.push(index);
+        }
     }
     let spread = i32::try_from(indices.last().copied().unwrap_or_default()).unwrap_or(i32::MAX);
-    let length = i32::try_from(candidate.len()).unwrap_or(i32::MAX);
+    let length = i32::try_from(candidate.grapheme_count).unwrap_or(i32::MAX);
     Some((1_000 - spread - length, indices))
 }
 
@@ -193,6 +246,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["2"]
         );
+    }
+
+    #[test]
+    fn exact_and_fuzzy_matches_return_display_grapheme_indices() {
+        let items = vec![
+            item("1", ItemKind::File, "café🙂"),
+            item("2", ItemKind::File, "İstanbul"),
+        ];
+
+        let exact = Picker.rank(&items, "'fé");
+        assert_eq!(exact[0].match_indices, [2, 3]);
+
+        let fuzzy = Picker.rank(&items, "fé");
+        assert_eq!(fuzzy[0].match_indices, [2, 3]);
+
+        let expanded_lowercase = Picker.rank(&items, "is");
+        assert_eq!(expanded_lowercase[0].index, 1);
+        assert_eq!(expanded_lowercase[0].match_indices, [0, 1]);
+    }
+
+    #[test]
+    fn description_matches_do_not_claim_indices_in_the_display_label() {
+        let mut described = item("1", ItemKind::File, "alpha");
+        described.description = "unique description".to_owned();
+
+        let ranked = Picker.rank(&[described], "'unique");
+        assert_eq!(ranked.len(), 1);
+        assert!(ranked[0].match_indices.is_empty());
     }
 
     #[test]

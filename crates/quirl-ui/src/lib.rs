@@ -16,10 +16,10 @@ use quirl_picker::{ItemKind, PickItem, Picker};
 use quirl_syntax::Mode;
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
-    Completer, DefaultHinter, DefaultValidator, DescriptionMode, EditCommand, EditMode, Emacs,
-    FileBackedHistory, Helix, Highlighter, IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Prompt,
-    PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent,
-    Span, StyledText, Suggestion, Vi,
+    Completer, DefaultHinter, DefaultValidator, DescriptionMode, EditMode, Emacs,
+    FileBackedHistory, Helix, Highlighter, IdeMenu, InputMode, KeyCode, KeyModifiers, MenuBuilder,
+    OutputMode, Prompt, PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu,
+    ReedlineRawEvent, Span, StyledText, Suggestion, Vi,
 };
 use std::{
     borrow::Cow,
@@ -29,7 +29,10 @@ use std::{
     fs,
     io::IsTerminal,
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, Condvar, Mutex},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        mpsc, Arc, Condvar, Mutex,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -38,9 +41,43 @@ use std::{
 pub const MODE_TOGGLE_HOST_COMMAND: &str = "quirl:mode-toggle";
 
 const HISTORY_CAPACITY: usize = 50_000;
-const HISTORY_PICKER_PREFIX: &str = "\u{e000}history ";
-const FILE_PICKER_PREFIX: &str = "\u{e000}files ";
-const ACTION_PICKER_PREFIX: &str = "\u{e000}actions ";
+const COMPLETION_MENU: &str = "completion_menu";
+const HISTORY_PICKER_MENU: &str = "history_picker_menu";
+const FILE_PICKER_MENU: &str = "file_picker_menu";
+const ACTION_PICKER_MENU: &str = "action_picker_menu";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum PickerInvocation {
+    None,
+    History,
+    File,
+    Action,
+}
+
+impl PickerInvocation {
+    fn from_state(state: &AtomicU8) -> Self {
+        match state.load(Ordering::Relaxed) {
+            value if value == Self::History as u8 => Self::History,
+            value if value == Self::File as u8 => Self::File,
+            value if value == Self::Action as u8 => Self::Action,
+            _ => Self::None,
+        }
+    }
+
+    fn item_kind(self) -> Option<ItemKind> {
+        match self {
+            Self::None => None,
+            Self::History => Some(ItemKind::History),
+            Self::File => Some(ItemKind::File),
+            Self::Action => Some(ItemKind::Action),
+        }
+    }
+
+    fn activate(self, state: &AtomicU8) {
+        state.store(self as u8, Ordering::Relaxed);
+    }
+}
 
 /// Maximum time native context work is allowed to consume on the editor thread.
 ///
@@ -126,16 +163,39 @@ fn configured_editor(
         env::var_os("NO_COLOR").is_some(),
         dumb_terminal(),
     );
+    let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::None as u8));
     let completer = Box::new(CatalogCompleter::with_extensions_and_picker(
         catalog.clone(),
         extension_completer,
         picker_sources(&catalog, history_items),
         history_path,
+        Arc::clone(&picker_invocation),
     ));
     let completion_menu = Box::new(configured_completion_menu(&config));
+    let history_picker_menu = Box::new(configured_picker_menu(
+        &config,
+        HISTORY_PICKER_MENU,
+        OutputMode::FullBuffer,
+        false,
+    ));
+    let file_picker_menu = Box::new(configured_picker_menu(
+        &config,
+        FILE_PICKER_MENU,
+        OutputMode::SuggestedSpan,
+        true,
+    ));
+    let action_picker_menu = Box::new(configured_picker_menu(
+        &config,
+        ACTION_PICKER_MENU,
+        OutputMode::FullBuffer,
+        false,
+    ));
     let mut line_editor = Reedline::create()
         .with_completer(completer)
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_menu(ReedlineMenu::EngineCompleter(history_picker_menu))
+        .with_menu(ReedlineMenu::EngineCompleter(file_picker_menu))
+        .with_menu(ReedlineMenu::EngineCompleter(action_picker_menu))
         .with_hinter(Box::new(DefaultHinter::default().with_style(
             if terminal_styles {
                 Style::new().italic().fg(Color::DarkGray)
@@ -144,7 +204,10 @@ fn configured_editor(
             },
         )))
         .with_validator(Box::new(DefaultValidator))
-        .with_edit_mode(configured_edit_mode(&config.editor.keymap))
+        .with_edit_mode(configured_edit_mode_with_picker(
+            &config.editor.keymap,
+            picker_invocation,
+        ))
         .with_quick_completions(false);
     if let Some(history) = history {
         line_editor = line_editor.with_history(Box::new(history));
@@ -189,24 +252,39 @@ fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
 }
 
 fn completion_menu_event() -> ReedlineEvent {
+    menu_event(COMPLETION_MENU, false)
+}
+
+fn menu_event(menu: &str, replace_active: bool) -> ReedlineEvent {
+    if replace_active {
+        return ReedlineEvent::Multiple(vec![
+            ReedlineEvent::Esc,
+            ReedlineEvent::Menu(menu.to_owned()),
+            ReedlineEvent::MenuNext,
+        ]);
+    }
     ReedlineEvent::UntilFound(vec![
-        ReedlineEvent::Menu("completion_menu".to_owned()),
+        ReedlineEvent::Menu(menu.to_owned()),
         ReedlineEvent::MenuNext,
     ])
 }
 
-fn picker_menu_event(prefix: &str) -> ReedlineEvent {
-    ReedlineEvent::Multiple(vec![
-        ReedlineEvent::Edit(vec![
-            EditCommand::MoveToStart { select: false },
-            EditCommand::InsertString(prefix.to_owned()),
-        ]),
-        ReedlineEvent::Menu("completion_menu".to_owned()),
-        ReedlineEvent::MenuNext,
-    ])
+fn picker_menu_event(menu: &str, replace_active: bool) -> ReedlineEvent {
+    menu_event(menu, replace_active)
 }
 
+#[cfg(test)]
 fn configured_edit_mode(keymap: &str) -> Box<dyn EditMode> {
+    configured_edit_mode_with_picker(
+        keymap,
+        Arc::new(AtomicU8::new(PickerInvocation::None as u8)),
+    )
+}
+
+fn configured_edit_mode_with_picker(
+    keymap: &str,
+    picker_invocation: Arc<AtomicU8>,
+) -> Box<dyn EditMode> {
     let (inner, complete_tab): (Box<dyn EditMode>, bool) = match keymap {
         "vim" => {
             let mut insert = default_vi_insert_keybindings();
@@ -231,6 +309,7 @@ fn configured_edit_mode(keymap: &str) -> Box<dyn EditMode> {
     Box::new(QuirlEditMode {
         inner,
         complete_tab,
+        picker_invocation,
     })
 }
 
@@ -238,6 +317,7 @@ fn configured_edit_mode(keymap: &str) -> Box<dyn EditMode> {
 struct QuirlEditMode {
     inner: Box<dyn EditMode>,
     complete_tab: bool,
+    picker_invocation: Arc<AtomicU8>,
 }
 
 impl EditMode for QuirlEditMode {
@@ -247,25 +327,42 @@ impl EditMode for QuirlEditMode {
             return ReedlineEvent::ExecuteHostCommand(MODE_TOGGLE_HOST_COMMAND.to_owned());
         }
         if is_history_search(&event) {
-            return picker_menu_event(HISTORY_PICKER_PREFIX);
+            let replace_active =
+                PickerInvocation::from_state(&self.picker_invocation) != PickerInvocation::History;
+            PickerInvocation::History.activate(&self.picker_invocation);
+            return picker_menu_event(HISTORY_PICKER_MENU, replace_active);
         }
         if is_file_picker(&event) {
-            return picker_menu_event(FILE_PICKER_PREFIX);
+            let replace_active =
+                PickerInvocation::from_state(&self.picker_invocation) != PickerInvocation::File;
+            PickerInvocation::File.activate(&self.picker_invocation);
+            return picker_menu_event(FILE_PICKER_MENU, replace_active);
         }
         if is_action_picker(&event) {
-            return picker_menu_event(ACTION_PICKER_PREFIX);
+            let replace_active =
+                PickerInvocation::from_state(&self.picker_invocation) != PickerInvocation::Action;
+            PickerInvocation::Action.activate(&self.picker_invocation);
+            return picker_menu_event(ACTION_PICKER_MENU, replace_active);
         }
-        if self.complete_tab
-            && matches!(
-                event,
-                Event::Key(KeyEvent {
-                    code: KeyCode::Tab,
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                })
-            )
+        if PickerInvocation::from_state(&self.picker_invocation) != PickerInvocation::None
+            && ends_picker_session(&event)
         {
-            return completion_menu_event();
+            PickerInvocation::None.activate(&self.picker_invocation);
+        }
+        if matches!(
+            event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            })
+        ) {
+            let replace_active =
+                PickerInvocation::from_state(&self.picker_invocation) != PickerInvocation::None;
+            PickerInvocation::None.activate(&self.picker_invocation);
+            if self.complete_tab || replace_active {
+                return menu_event(COMPLETION_MENU, replace_active);
+            }
         }
         let Ok(event) = ReedlineRawEvent::try_from(event) else {
             // Reedline intentionally rejects key-release events; they have no editor action.
@@ -328,10 +425,43 @@ fn is_action_picker(event: &Event) -> bool {
     )
 }
 
+fn ends_picker_session(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Esc | KeyCode::Enter,
+            ..
+        })
+    ) || matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers,
+            ..
+        }) if modifiers.contains(KeyModifiers::CONTROL)
+    )
+}
+
 fn configured_completion_menu(config: &QuirlConfig) -> IdeMenu {
-    let menu = IdeMenu::default()
-        .with_name("completion_menu")
-        .with_default_border();
+    configured_menu(config, COMPLETION_MENU)
+}
+
+fn configured_picker_menu(
+    config: &QuirlConfig,
+    name: &str,
+    output_mode: OutputMode,
+    full_buffer: bool,
+) -> IdeMenu {
+    let menu = configured_menu(config, name).with_output_mode(output_mode);
+    if full_buffer {
+        menu.with_input_mode(InputMode::FullBuffer)
+    } else {
+        menu
+    }
+}
+
+fn configured_menu(config: &QuirlConfig, name: &str) -> IdeMenu {
+    let menu = IdeMenu::default().with_name(name).with_default_border();
     let menu = match config.picker.layout.as_str() {
         // Reedline's IDE menu is always anchored below the input. A bounded height is
         // the closest supported equivalent to a bottom picker; the default adapts to
@@ -915,6 +1045,7 @@ pub struct CatalogCompleter {
     picker_items: Vec<PickItem>,
     history_path: Option<PathBuf>,
     history_cache: Option<HistoryPickerCache>,
+    picker_invocation: Arc<AtomicU8>,
 }
 
 impl CatalogCompleter {
@@ -925,6 +1056,7 @@ impl CatalogCompleter {
             picker_items: Vec::new(),
             history_path: None,
             history_cache: None,
+            picker_invocation: Arc::new(AtomicU8::new(PickerInvocation::None as u8)),
         }
     }
 
@@ -938,6 +1070,7 @@ impl CatalogCompleter {
             picker_items: Vec::new(),
             history_path: None,
             history_cache: None,
+            picker_invocation: Arc::new(AtomicU8::new(PickerInvocation::None as u8)),
         }
     }
 
@@ -946,6 +1079,7 @@ impl CatalogCompleter {
         extensions: Option<Box<dyn ExtensionCompleter + Send>>,
         picker_items: Vec<PickItem>,
         history_path: Option<PathBuf>,
+        picker_invocation: Arc<AtomicU8>,
     ) -> Self {
         Self {
             catalog,
@@ -953,6 +1087,7 @@ impl CatalogCompleter {
             picker_items,
             history_path,
             history_cache: None,
+            picker_invocation,
         }
     }
 
@@ -993,18 +1128,28 @@ pub trait ExtensionCompleter {
 
 impl Completer for CatalogCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
-        if let Some((kind, prefix)) = picker_context(line) {
-            let query = line
-                .get(prefix.len()..pos.min(line.len()))
-                .unwrap_or_default();
+        if let Some(kind) = PickerInvocation::from_state(&self.picker_invocation).item_kind() {
+            let (query, replace_start, replace_end) = picker_query_and_span(kind, line, pos);
             return if kind == ItemKind::History {
                 if let Some(items) = self.refreshed_history_items() {
-                    rank_picker_suggestions(items, query, pos)
+                    rank_picker_suggestions(items, query, replace_start, replace_end)
                 } else {
-                    rank_picker_suggestions_of_kind(&self.picker_items, kind, query, pos)
+                    rank_picker_suggestions_of_kind(
+                        &self.picker_items,
+                        kind,
+                        query,
+                        replace_start,
+                        replace_end,
+                    )
                 }
             } else {
-                rank_picker_suggestions_of_kind(&self.picker_items, kind, query, pos)
+                rank_picker_suggestions_of_kind(
+                    &self.picker_items,
+                    kind,
+                    query,
+                    replace_start,
+                    replace_end,
+                )
             };
         }
         let mut suggestions = self
@@ -1044,7 +1189,31 @@ impl Completer for CatalogCompleter {
     }
 }
 
-fn rank_picker_suggestions(items: &[PickItem], query: &str, pos: usize) -> Vec<Suggestion> {
+fn picker_query_and_span(kind: ItemKind, line: &str, pos: usize) -> (&str, usize, usize) {
+    let end = pos.min(line.len());
+    let before_cursor = line.get(..end).unwrap_or(line);
+    if kind != ItemKind::File {
+        return (before_cursor, 0, end);
+    }
+    let start = before_cursor
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    let suffix = line.get(end..).unwrap_or_default();
+    let suffix_len = suffix
+        .char_indices()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(suffix.len(), |(index, _)| index);
+    (&before_cursor[start..], start, end + suffix_len)
+}
+
+fn rank_picker_suggestions(
+    items: &[PickItem],
+    query: &str,
+    replace_start: usize,
+    replace_end: usize,
+) -> Vec<Suggestion> {
     Picker
         .rank(items, query)
         .into_iter()
@@ -1055,7 +1224,7 @@ fn rank_picker_suggestions(items: &[PickItem], query: &str, pos: usize) -> Vec<S
                 display_override: Some(item.label.clone()),
                 description: Some(item.description.clone()),
                 extra: item.preview.clone().map(|preview| vec![preview]),
-                span: Span::new(0, pos),
+                span: Span::new(replace_start, replace_end),
                 append_whitespace: false,
                 match_indices: Some(matched.match_indices),
                 ..Suggestion::default()
@@ -1068,14 +1237,15 @@ fn rank_picker_suggestions_of_kind(
     items: &[PickItem],
     kind: ItemKind,
     query: &str,
-    pos: usize,
+    replace_start: usize,
+    replace_end: usize,
 ) -> Vec<Suggestion> {
     let scoped = items
         .iter()
         .filter(|item| item.kind == kind)
         .cloned()
         .collect::<Vec<_>>();
-    rank_picker_suggestions(&scoped, query, pos)
+    rank_picker_suggestions(&scoped, query, replace_start, replace_end)
 }
 
 fn read_history_picker_items(path: &Path) -> Option<Vec<PickItem>> {
@@ -1088,16 +1258,6 @@ fn read_history_picker_items(path: &Path) -> Option<Vec<PickItem>> {
             .map(|(index, line)| picker_item(index, ItemKind::History, line, "history"))
             .collect(),
     )
-}
-
-fn picker_context(line: &str) -> Option<(ItemKind, &str)> {
-    [
-        (ItemKind::History, HISTORY_PICKER_PREFIX),
-        (ItemKind::File, FILE_PICKER_PREFIX),
-        (ItemKind::Action, ACTION_PICKER_PREFIX),
-    ]
-    .into_iter()
-    .find(|(_, prefix)| line.starts_with(prefix))
 }
 
 fn picker_sources(catalog: &Catalog, mut items: Vec<PickItem>) -> Vec<PickItem> {
@@ -1621,7 +1781,9 @@ mod tests {
     #[test]
     fn every_keymap_exposes_mode_toggle_and_history_search() {
         for keymap in ["emacs", "vim", "helix"] {
-            let mut edit_mode = configured_edit_mode(keymap);
+            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::None as u8));
+            let mut edit_mode =
+                configured_edit_mode_with_picker(keymap, Arc::clone(&picker_invocation));
             let toggle = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
                 KeyCode::Char(' '),
                 KeyModifiers::CONTROL,
@@ -1640,34 +1802,108 @@ mod tests {
             .unwrap();
             assert_eq!(
                 edit_mode.parse_event(search),
-                picker_menu_event(HISTORY_PICKER_PREFIX),
+                picker_menu_event(HISTORY_PICKER_MENU, true),
                 "history search in {keymap} keymap"
             );
+            assert_eq!(
+                PickerInvocation::from_state(&picker_invocation),
+                PickerInvocation::History
+            );
+            let search_again = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+            assert_eq!(
+                edit_mode.parse_event(search_again),
+                picker_menu_event(HISTORY_PICKER_MENU, false)
+            );
 
-            for (key, prefix) in [('t', FILE_PICKER_PREFIX), ('k', ACTION_PICKER_PREFIX)] {
+            for (key, menu, invocation) in [
+                ('t', FILE_PICKER_MENU, PickerInvocation::File),
+                ('k', ACTION_PICKER_MENU, PickerInvocation::Action),
+            ] {
                 let picker = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
                     KeyCode::Char(key),
                     KeyModifiers::CONTROL,
                 )))
                 .unwrap();
-                assert_eq!(edit_mode.parse_event(picker), picker_menu_event(prefix));
+                assert_eq!(edit_mode.parse_event(picker), picker_menu_event(menu, true));
+                assert_eq!(PickerInvocation::from_state(&picker_invocation), invocation);
             }
         }
     }
 
     #[test]
-    fn typed_picker_completer_returns_original_values() {
+    fn semantic_completion_clears_the_prior_picker_kind() {
+        for keymap in ["emacs", "vim", "helix"] {
+            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
+            let mut edit_mode =
+                configured_edit_mode_with_picker(keymap, Arc::clone(&picker_invocation));
+            let tab = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+            assert_eq!(
+                edit_mode.parse_event(tab),
+                menu_event(COMPLETION_MENU, true)
+            );
+            assert_eq!(
+                PickerInvocation::from_state(&picker_invocation),
+                PickerInvocation::None,
+                "semantic completion in {keymap} keymap"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_or_accepting_clears_the_picker_kind() {
+        for code in [KeyCode::Esc, KeyCode::Enter] {
+            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
+            let mut edit_mode =
+                configured_edit_mode_with_picker("emacs", Arc::clone(&picker_invocation));
+            let event =
+                ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                    .unwrap();
+
+            let _ = edit_mode.parse_event(event);
+            assert_eq!(
+                PickerInvocation::from_state(&picker_invocation),
+                PickerInvocation::None
+            );
+        }
+    }
+
+    #[test]
+    fn typed_picker_completer_returns_original_values_with_kind_specific_spans() {
         let items = vec![
             picker_item(0, ItemKind::History, "cargo test --workspace", "history"),
             picker_item(1, ItemKind::File, "crates/quirl-ui/src/lib.rs", "file"),
             picker_item(2, ItemKind::Action, "mode data", "action"),
         ];
-        let mut completer =
-            CatalogCompleter::with_extensions_and_picker(Catalog::builtin(), None, items, None);
-        let line = format!("{HISTORY_PICKER_PREFIX}cts");
-        let suggestions = completer.complete(&line, line.len());
+        let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
+        let mut completer = CatalogCompleter::with_extensions_and_picker(
+            Catalog::builtin(),
+            None,
+            items,
+            None,
+            Arc::clone(&picker_invocation),
+        );
+        let suggestions = completer.complete("cts", 3);
         assert_eq!(suggestions[0].value, "cargo test --workspace");
-        assert_eq!(suggestions[0].span, Span::new(0, line.len()));
+        assert_eq!(suggestions[0].span, Span::new(0, 3));
+
+        PickerInvocation::File.activate(&picker_invocation);
+        let line = "cat crates/quirlXYZ trailing";
+        let cursor = "cat crates/quirl".len();
+        let suggestions = completer.complete(line, cursor);
+        assert_eq!(suggestions[0].value, "crates/quirl-ui/src/lib.rs");
+        assert_eq!(
+            suggestions[0].span,
+            Span::new(4, "cat crates/quirlXYZ".len())
+        );
     }
 
     #[test]
@@ -1683,19 +1919,21 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let history_path = directory.join("history");
         fs::write(&history_path, "cargo test\n").unwrap();
+        let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
         let mut completer = CatalogCompleter::with_extensions_and_picker(
             Catalog::builtin(),
             None,
             Vec::new(),
             Some(history_path.clone()),
+            picker_invocation,
         );
-        let line = format!("{HISTORY_PICKER_PREFIX}cargo");
-        assert_eq!(completer.complete(&line, line.len())[0].value, "cargo test");
+        let line = "cargo";
+        assert_eq!(completer.complete(line, line.len())[0].value, "cargo test");
         fs::write(&history_path, "cargo test\n").unwrap();
-        assert_eq!(completer.complete(&line, line.len())[0].value, "cargo test");
+        assert_eq!(completer.complete(line, line.len())[0].value, "cargo test");
         fs::write(&history_path, "cargo clippy\n").unwrap();
         assert_eq!(
-            completer.complete(&line, line.len())[0].value,
+            completer.complete(line, line.len())[0].value,
             "cargo clippy"
         );
         fs::remove_dir_all(directory).unwrap();

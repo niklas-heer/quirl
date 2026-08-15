@@ -1,9 +1,16 @@
 # 1.0 release performance record
 
+> **Historical evidence — not valid for current HEAD.** The measured artifact
+> used `panic=abort`; commit `0fb047d` changed the release profile to
+> `panic=unwind` so Lua callback panics remain recoverable. Rebuild and rerun the
+> enforcing gate before using this record for a release decision. Benchmark
+> report schema v3 now records the source commit, dirty state, panic strategy,
+> and exact binary SHA-256 so future evidence cannot silently drift.
+
 **Measured:** 15 August 2026 at 21:49:13 UTC
 **Source state:** uncommitted Phase 4 worktree based on
 `0607b7f0d2ce76380c9e5e455906aa8ebb029751`
-**Release gate:** **passed — three independent 101-sample enforcing gates within target**
+**Historical release gate:** **passed — three independent 101-sample enforcing gates within target**
 
 This is a release-build record from the named machine below. The harness runs
 the actual Quirl binary in a fresh pseudo-terminal for each end-to-end sample.
@@ -43,11 +50,11 @@ The gate uses P95 conservatively rather than treating the P50 as sufficient.
 The 5 MiB binary budget is a Phase 4 release-tool default; it may be overridden
 explicitly for another frozen release budget.
 
-The release profile now uses `panic = "abort"`, `codegen-units = 1`, fat LTO,
-and stripped symbols. Together those settings reduce the executable from the
-earlier 7.4 MB measurement to 4,718,960 bytes. They substantially increase
-clean release-build time; the runtime figures above are measured rather than
-inferred from the smaller artifact.
+The measured release profile used `panic = "abort"`, `codegen-units = 1`, fat
+LTO, and stripped symbols. Together those settings reduced the executable from
+the earlier 7.4 MB measurement to 4,718,960 bytes. Current Quirl intentionally
+uses `panic = "unwind"`, so the size and timing figures above are historical
+rather than inferred evidence for the current artifact.
 
 ## Repeat stability audit
 

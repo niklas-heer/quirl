@@ -5,6 +5,7 @@ use quirl_syntax::Mode;
 use quirl_ui::{CatalogCompleter, LiveBuffer, LiveSample, QuirlPrompt};
 use reedline::{Completer, Prompt, PromptEditMode};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     env,
     error::Error,
@@ -57,9 +58,13 @@ struct Environment {
     memory_bytes: Option<u64>,
     rustc: String,
     cargo: String,
+    source_commit: String,
+    source_dirty: Option<bool>,
     build_profile: &'static str,
+    panic_strategy: &'static str,
     quirl_binary: String,
     quirl_binary_bytes: Option<u64>,
+    quirl_binary_sha256: Option<String>,
     quirl_version: String,
 }
 
@@ -351,7 +356,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     };
 
     let report = PreviewReport {
-        schema_version: 2,
+        schema_version: 3,
         suite: "quirl_1.0_release_performance",
         measured_at_utc: measured_at_utc(),
         environment: discover_environment(&quirl),
@@ -1090,13 +1095,22 @@ fn discover_environment(quirl: &Path) -> Environment {
         rustc: command_output("rustc", &["--version", "--verbose"])
             .unwrap_or_else(|| "unknown".to_owned()),
         cargo: command_output("cargo", &["--version"]).unwrap_or_else(|| "unknown".to_owned()),
+        source_commit: command_output("git", &["rev-parse", "HEAD"])
+            .unwrap_or_else(|| "unknown".to_owned()),
+        source_dirty: source_dirty(),
         build_profile: if cfg!(debug_assertions) {
             "debug"
         } else {
             "release"
         },
+        panic_strategy: if cfg!(panic = "unwind") {
+            "unwind"
+        } else {
+            "abort"
+        },
         quirl_binary: quirl.display().to_string(),
         quirl_binary_bytes: fs::metadata(quirl).ok().map(|metadata| metadata.len()),
+        quirl_binary_sha256: binary_sha256(quirl),
         quirl_version: Command::new(quirl)
             .arg("--version")
             .output()
@@ -1105,6 +1119,19 @@ fn discover_environment(quirl: &Path) -> Environment {
             .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
             .unwrap_or_else(|| "unknown".to_owned()),
     }
+}
+
+fn source_dirty() -> Option<bool> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .ok()?;
+    output.status.success().then_some(!output.stdout.is_empty())
+}
+
+fn binary_sha256(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn measured_at_utc() -> String {
@@ -1194,6 +1221,21 @@ fn print_text(report: &PreviewReport) {
         report.environment.architecture,
         report.environment.cpu,
         report.environment.build_profile
+    );
+    println!(
+        "source {}{} · panic={} · binary sha256={}",
+        report.environment.source_commit,
+        if report.environment.source_dirty == Some(true) {
+            " (dirty)"
+        } else {
+            ""
+        },
+        report.environment.panic_strategy,
+        report
+            .environment
+            .quirl_binary_sha256
+            .as_deref()
+            .unwrap_or("unknown")
     );
     println!(
         "{:<42} {:>10} {:>10} {:>10}",
@@ -1336,6 +1378,16 @@ mod tests {
         let rejected = measure_binary_size(&fixture, bytes.saturating_sub(1));
         assert_eq!(rejected.target_result, "measured_miss");
         assert!(rejected.release_gate_accepted);
+    }
+
+    #[test]
+    fn artifact_identity_hashes_the_exact_measured_binary() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let hash = binary_sha256(&fixture).unwrap();
+
+        assert_eq!(hash.len(), 64);
+        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(binary_sha256(Path::new("/definitely/missing/quirl")).is_none());
     }
 
     #[test]
