@@ -60,8 +60,8 @@ pub enum InteractiveLine<'a> {
     ToggleMode,
     Help(Option<&'a str>),
     Command(&'a str),
+    Data(&'a str),
     Lua(&'a str),
-    Steel(&'a str),
 }
 
 pub fn classify(mode: Mode, input: &str) -> InteractiveLine<'_> {
@@ -86,16 +86,13 @@ pub fn classify(mode: Mode, input: &str) -> InteractiveLine<'_> {
     if let Some(topic) = input.strip_prefix("help ") {
         return InteractiveLine::Help(Some(topic.trim()));
     }
-    if let Some(expression) = input.strip_prefix("steel ") {
-        return InteractiveLine::Steel(expression.trim());
-    }
     if let Some(expression) = input.strip_prefix("lua ") {
         return InteractiveLine::Lua(expression.trim());
     }
 
     match mode {
         Mode::Command => InteractiveLine::Command(input),
-        Mode::Data => InteractiveLine::Steel(input),
+        Mode::Data => InteractiveLine::Data(input),
     }
 }
 
@@ -110,20 +107,12 @@ mod tests {
             InteractiveLine::ChangeMode(Mode::Data)
         );
         assert_eq!(
-            classify(Mode::Data, "(+ 1 2)"),
-            InteractiveLine::Steel("(+ 1 2)")
+            classify(Mode::Data, "[1,2,3] | length"),
+            InteractiveLine::Data("[1,2,3] | length")
         );
         assert_eq!(
             classify(Mode::Command, "echo hello"),
             InteractiveLine::Command("echo hello")
-        );
-    }
-
-    #[test]
-    fn steel_can_be_bridged_from_command_mode() {
-        assert_eq!(
-            classify(Mode::Command, "steel (+ 1 2)"),
-            InteractiveLine::Steel("(+ 1 2)")
         );
     }
 

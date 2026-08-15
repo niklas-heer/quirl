@@ -13,4 +13,3 @@ mlua.workspace = true
 rhai.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-steel-core.workspace = true

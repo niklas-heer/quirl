@@ -396,6 +396,13 @@ impl LuaRuntime {
         Ok(registrations)
     }
 
+    pub fn registrations(&self) -> PluginRegistrations {
+        self.registrations
+            .lock()
+            .expect("plugin registration mutex poisoned")
+            .clone()
+    }
+
     pub fn render_prompt_segment(
         &self,
         name: &str,

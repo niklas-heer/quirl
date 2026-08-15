@@ -1,15 +1,19 @@
+mod extensions;
+
 use clap::{Parser, Subcommand, ValueEnum};
+use extensions::{LuaCompletionAdapter, LuaExtensionHost};
 use quirl_catalog::{Catalog, CommandSpec};
 use quirl_core::{CommandRunner, ErrorCode, ShellError};
+use quirl_data::DataRuntime;
 use quirl_lua::{format_file, sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig};
-use quirl_steel::SteelRuntime;
 use quirl_syntax::{classify, InteractiveLine, Mode};
-use quirl_ui::{editor, render_error, QuirlPrompt};
+use quirl_ui::{editor_with_extensions, render_error, QuirlPrompt};
 use reedline::Signal;
 use std::{
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Debug, Parser)]
@@ -21,7 +25,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run a Lua script, or a legacy Steel/Scheme prototype, in-process.
+    /// Run a Lua script in-process.
     Run {
         file: PathBuf,
         #[arg(trailing_var_arg = true)]
@@ -29,6 +33,8 @@ enum Command {
     },
     /// Evaluate Lua and print the returned value.
     Eval { expression: String },
+    /// Evaluate a native structured-data expression or pipeline.
+    Data { expression: String },
     /// Parse a script without executing it.
     Check {
         file: PathBuf,
@@ -122,19 +128,19 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<i32, ShellError> {
     let catalog = Catalog::builtin();
     match cli.command {
-        Some(Command::Run { file, arguments }) if is_lua(&file) => {
+        Some(Command::Run { file, arguments }) => {
+            require_lua_file(&file)?;
             let lua = LuaRuntime::new(LuaPolicy::script())?;
             print_json_value(lua.run_file(&file, &arguments)?);
-            Ok(0)
-        }
-        Some(Command::Run { file, .. }) => {
-            let mut steel = SteelRuntime::new();
-            print_values(steel.run_file(&file)?);
             Ok(0)
         }
         Some(Command::Eval { expression }) => {
             let lua = LuaRuntime::new(LuaPolicy::script())?;
             print_json_value(lua.eval(&expression)?);
+            Ok(0)
+        }
+        Some(Command::Data { expression }) => {
+            print_json_value(DataRuntime::new().eval(&expression)?);
             Ok(0)
         }
         Some(Command::Check { file, format }) => validate_file(&file, format),
@@ -241,16 +247,24 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
     println!(
         "\x1b[1;32mQuirl\x1b[0m 0.1 · command mode · Tab explores · `mode data` switches grammar"
     );
-    let mut line_editor = editor(catalog.clone());
+    let extensions = Arc::new(Mutex::new(LuaExtensionHost::discover()));
+    let completion_adapter = LuaCompletionAdapter::new(Arc::clone(&extensions));
+    let mut line_editor =
+        editor_with_extensions(catalog.clone(), Some(Box::new(completion_adapter)));
     let mut mode = Mode::Command;
     let runner = CommandRunner::default();
+    let data = DataRuntime::new();
     // Extension VMs remain lazy so they do not delay the first prompt.
     let mut lua = None;
-    let mut steel = None;
     let mut last_status = 0;
 
     loop {
-        let prompt = QuirlPrompt::new(mode);
+        let extension_segments = extensions
+            .lock()
+            .map(|mut extensions| extensions.prompt_segments(mode, last_status))
+            .unwrap_or_default();
+        print_extension_errors(&extensions);
+        let prompt = QuirlPrompt::new(mode).with_extension_segments(extension_segments);
         match line_editor.read_line(&prompt) {
             Ok(Signal::Success(buffer)) => match classify(mode, &buffer) {
                 InteractiveLine::Empty => {}
@@ -274,7 +288,7 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
                         eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
                     }
                 },
-                InteractiveLine::Lua(source) => match eval_lua(&mut lua, source) {
+                InteractiveLine::Data(source) => match data.eval(source) {
                     Ok(value) => {
                         last_status = 0;
                         print_json_value(value);
@@ -284,10 +298,10 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
                         eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
                     }
                 },
-                InteractiveLine::Steel(source) => match eval_steel(&mut steel, source) {
-                    Ok(values) => {
+                InteractiveLine::Lua(source) => match eval_lua(&mut lua, source) {
+                    Ok(value) => {
                         last_status = 0;
-                        print_values(values);
+                        print_json_value(value);
                     }
                     Err(error) => {
                         last_status = 1;
@@ -311,6 +325,16 @@ fn repl(catalog: Catalog) -> Result<i32, ShellError> {
     }
 }
 
+fn print_extension_errors(extensions: &Arc<Mutex<LuaExtensionHost>>) {
+    let errors = extensions
+        .lock()
+        .map(|mut extensions| extensions.take_errors())
+        .unwrap_or_default();
+    for error in errors {
+        eprintln!("{}", render_error(&error, io::stderr().is_terminal()));
+    }
+}
+
 fn eval_lua(
     runtime: &mut Option<LuaRuntime>,
     source: &str,
@@ -322,10 +346,6 @@ fn eval_lua(
         .as_ref()
         .expect("Lua runtime initialized")
         .eval(source)
-}
-
-fn eval_steel(runtime: &mut Option<SteelRuntime>, source: &str) -> Result<Vec<String>, ShellError> {
-    runtime.get_or_insert_with(SteelRuntime::new).eval(source)
 }
 
 fn run_stdin() -> Result<i32, ShellError> {
@@ -340,14 +360,10 @@ fn run_stdin() -> Result<i32, ShellError> {
 }
 
 fn validate_file(file: &Path, format: OutputFormat) -> Result<i32, ShellError> {
-    if is_lua(file) {
-        validate_lua(file, format, "valid Lua")
-    } else {
-        match SteelRuntime::check_file(file) {
-            Ok(()) => validation_success(file, format, "valid Steel"),
-            Err(error) => validation_failure(error, format),
-        }
+    if let Err(error) = require_lua_file(file) {
+        return validation_failure(error, format);
     }
+    validate_lua(file, format, "valid Lua")
 }
 
 fn validate_lua(file: &Path, format: OutputFormat, message: &str) -> Result<i32, ShellError> {
@@ -399,6 +415,18 @@ fn is_lua(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "lua")
 }
 
+fn require_lua_file(path: &Path) -> Result<(), ShellError> {
+    if is_lua(path) {
+        Ok(())
+    } else {
+        Err(ShellError::new(
+            ErrorCode::InvalidArgument,
+            format!("{} is not a Lua script", path.display()),
+        )
+        .with_help("Quirl currently runs embedded scripts with the .lua extension"))
+    }
+}
+
 fn print_help(catalog: &Catalog, topic: Option<&str>) {
     match topic.and_then(|topic| catalog.find(topic)) {
         Some(command) => print_command_help(command),
@@ -436,12 +464,6 @@ fn print_command_help(command: &CommandSpec) {
         for example in &command.examples {
             println!("  {example}");
         }
-    }
-}
-
-fn print_values(values: Vec<String>) {
-    for value in values {
-        println!("{value}");
     }
 }
 

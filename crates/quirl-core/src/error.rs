@@ -6,13 +6,13 @@ use std::{error::Error, fmt};
 pub enum ErrorCode {
     InvalidCommand,
     InvalidArgument,
+    Data,
     Io,
     ProcessSpawn,
     ScriptRead,
     Lua,
     Validation,
     ResourceLimit,
-    Steel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -6,8 +6,6 @@ use mlua::Lua;
 use mlua::{Function, Table};
 #[cfg(feature = "quickjs")]
 use rquickjs::{Context, Runtime};
-#[cfg(feature = "steel")]
-use steel::steel_vm::engine::Engine;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     run()
@@ -58,14 +56,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "steel")]
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut engine = Engine::new();
-    let values = engine.run("(+ 20 22)".to_owned())?;
-    println!("steel:{}", values.len());
-    Ok(())
-}
-
 #[cfg(feature = "gluon")]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let vm = gluon::new_vm();
@@ -85,7 +75,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     feature = "fennel",
     feature = "rhai",
     feature = "quickjs",
-    feature = "steel",
     feature = "gluon"
 )))]
 compile_error!("enable exactly one runtime feature");

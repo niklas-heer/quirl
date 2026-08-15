@@ -202,7 +202,7 @@ impl CommandRunner {
             }
         }
         let path = path.unwrap_or_else(|| PathBuf::from("."));
-        let entries = read_entries(&path, show_all)?;
+        let entries = directory_entries(&path, show_all)?;
         let output = if json {
             serde_json::to_string_pretty(&entries).map_err(|error| {
                 ShellError::new(ErrorCode::Io, "could not serialize directory entries")
@@ -215,7 +215,7 @@ impl CommandRunner {
     }
 }
 
-fn read_entries(path: &Path, show_all: bool) -> Result<Vec<Entry>, ShellError> {
+pub fn directory_entries(path: &Path, show_all: bool) -> Result<Vec<Entry>, ShellError> {
     let iterator = fs::read_dir(path).map_err(|error| {
         ShellError::new(ErrorCode::Io, format!("cannot read {}", path.display()))
             .with_context(error.to_string())

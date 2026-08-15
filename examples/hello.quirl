@@ -1,6 +1,0 @@
-#!/usr/bin/env quirl
-
-(displayln "Hello from Quirl's embedded Steel runtime")
-(displayln (string-append "cwd: " (quirl-cwd)))
-(define output (quirl-command "printf 'host bridge works'"))
-(displayln output)

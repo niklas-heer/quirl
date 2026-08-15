@@ -43,7 +43,6 @@ pub enum Provenance {
     Builtin,
     External,
     Lua,
-    Steel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,10 +75,24 @@ impl Catalog {
                     "mode",
                     "mode <command|data|toggle>",
                     "Switch the visible interactive grammar",
-                    "Command mode carries bytes and process status. Data mode evaluates Steel values in this prototype.",
+                    "Command mode carries bytes and process status. Data mode evaluates Quirl's native structured values and pipelines.",
                     vec![],
                     &["mode data", "mode command", "mode toggle"],
                     &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl data",
+                    "quirl data <source> [| transform ...]",
+                    "Evaluate a native structured-data pipeline",
+                    "Sources are `pwd`, `ls [path]`, `open <path>`, or JSON. Initial transforms are `where`, `select`, `get`, `first`, and `length`.",
+                    vec![],
+                    &[
+                        "mode data",
+                        "ls . | select name kind size",
+                        "quirl data '[1,2,3] | length'",
+                    ],
+                    &[Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
                 command(
@@ -117,20 +130,10 @@ impl Catalog {
                     Provenance::Lua,
                 ),
                 command(
-                    "steel",
-                    "steel <expression>",
-                    "Evaluate Steel without leaving command mode",
-                    "Runs an expression in the persistent embedded Steel VM.",
-                    vec![],
-                    &["steel (+ 1 2)"],
-                    &[],
-                    Provenance::Steel,
-                ),
-                command(
                     "quirl run",
                     "quirl run <file>",
-                    "Run a Lua, Steel, Scheme, or prototype .quirl script",
-                    "Lua is the first-class extension language; legacy prototype files continue through Steel during migration.",
+                    "Run a Lua script in Quirl's restricted runtime",
+                    "Lua is Quirl's sole embedded language for scripts, configuration, and trusted plugins.",
                     vec![],
                     &["quirl run scripts/deploy.lua -- staging"],
                     &[Effect::ReadFilesystem],

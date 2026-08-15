@@ -15,8 +15,8 @@ path = "src/main.rs"
 clap.workspace = true
 quirl-catalog = { path = "../quirl-catalog" }
 quirl-core = { path = "../quirl-core" }
+quirl-data = { path = "../quirl-data" }
 quirl-lua = { path = "../quirl-lua" }
-quirl-steel = { path = "../quirl-steel" }
 quirl-syntax = { path = "../quirl-syntax" }
 quirl-ui = { path = "../quirl-ui" }
 reedline.workspace = true

@@ -7,10 +7,6 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
-use steel::{
-    rvals::SteelVal,
-    steel_vm::{engine::Engine, register_fn::RegisterFn},
-};
 
 const COLD_SAMPLES: usize = 40;
 const EVAL_SAMPLES: usize = 400;
@@ -54,10 +50,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fennel_source = fennel_path.as_deref().map(fs::read_to_string).transpose()?;
     let mut measurements = Vec::new();
 
-    measurements.push(measure("steel", "cold_start", COLD_SAMPLES, || {
-        black_box(Engine::new());
-        Ok(())
-    })?);
     measurements.push(measure("lua", "cold_start", COLD_SAMPLES, || {
         black_box(Lua::new());
         Ok(())
@@ -67,15 +59,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })?);
 
-    let mut steel_eval = Engine::new();
-    measurements.push(measure("steel", "expression_eval", EVAL_SAMPLES, || {
-        black_box(
-            steel_eval
-                .run("(+ 20 22)".to_owned())
-                .map_err(|error| error.to_string())?,
-        );
-        Ok(())
-    })?);
     let lua_eval = Lua::new();
     measurements.push(measure("lua", "expression_eval", EVAL_SAMPLES, || {
         black_box(
@@ -96,15 +79,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })?);
 
-    let mut steel_host = steel_host()?;
-    measurements.push(measure("steel", "warm_host_call", WARM_SAMPLES, || {
-        black_box(
-            steel_host
-                .call_function_by_name_with_args("bench", vec![SteelVal::IntV(41)])
-                .map_err(|error| error.to_string())?,
-        );
-        Ok(())
-    })?);
     let (lua_host, lua_bench) = lua_host()?;
     measurements.push(measure("lua", "warm_host_call", WARM_SAMPLES, || {
         black_box(
@@ -201,18 +175,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n{}", report.note);
     }
     Ok(())
-}
-
-fn steel_host() -> Result<Engine, String> {
-    fn host_add(value: isize) -> isize {
-        value + 1
-    }
-    let mut engine = Engine::new();
-    engine.register_fn("host-add", host_add);
-    engine
-        .run("(define (bench value) (host-add value))".to_owned())
-        .map_err(|error| error.to_string())?;
-    Ok(engine)
 }
 
 fn lua_host() -> Result<(Lua, Function), mlua::Error> {

@@ -9,10 +9,20 @@ use reedline::{
     IdeMenu, KeyCode, KeyModifiers, MenuBuilder, Prompt, PromptEditMode, PromptHistorySearch,
     Reedline, ReedlineEvent, ReedlineMenu, Span, StyledText, Suggestion,
 };
-use std::{borrow::Cow, env};
+use std::{borrow::Cow, collections::HashSet, env};
 
 pub fn editor(catalog: Catalog) -> Reedline {
-    let completer = Box::new(CatalogCompleter::new(catalog.clone()));
+    editor_with_extensions(catalog, None)
+}
+
+pub fn editor_with_extensions(
+    catalog: Catalog,
+    extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
+) -> Reedline {
+    let completer = Box::new(CatalogCompleter::with_extensions(
+        catalog.clone(),
+        extension_completer,
+    ));
     let highlighter = Box::new(SemanticHighlighter::new(catalog));
     let completion_menu = Box::new(
         IdeMenu::default()
@@ -45,6 +55,7 @@ pub fn editor(catalog: Catalog) -> Reedline {
 pub struct QuirlPrompt {
     mode: Mode,
     cwd: String,
+    extension_segments: Vec<String>,
 }
 
 impl QuirlPrompt {
@@ -57,13 +68,24 @@ impl QuirlPrompt {
             })
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "/".to_owned());
-        Self { mode, cwd }
+        Self {
+            mode,
+            cwd,
+            extension_segments: Vec::new(),
+        }
+    }
+
+    pub fn with_extension_segments(mut self, segments: Vec<String>) -> Self {
+        self.extension_segments = segments;
+        self
     }
 }
 
 impl Prompt for QuirlPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("{} · {} ", self.cwd, self.mode))
+        let mut parts = vec![self.cwd.clone(), self.mode.to_string()];
+        parts.extend(self.extension_segments.iter().cloned());
+        Cow::Owned(format!("{} ", parts.join(" · ")))
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
@@ -92,17 +114,46 @@ impl Prompt for QuirlPrompt {
 
 pub struct CatalogCompleter {
     catalog: Catalog,
+    extensions: Option<Box<dyn ExtensionCompleter + Send>>,
 }
 
 impl CatalogCompleter {
     pub fn new(catalog: Catalog) -> Self {
-        Self { catalog }
+        Self {
+            catalog,
+            extensions: None,
+        }
     }
+
+    pub fn with_extensions(
+        catalog: Catalog,
+        extensions: Option<Box<dyn ExtensionCompleter + Send>>,
+    ) -> Self {
+        Self {
+            catalog,
+            extensions,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionSuggestion {
+    pub value: String,
+    pub display: String,
+    pub summary: String,
+    pub detail: String,
+    pub replace_start: usize,
+    pub replace_end: usize,
+}
+
+pub trait ExtensionCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion>;
 }
 
 impl Completer for CatalogCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
-        self.catalog
+        let mut suggestions = self
+            .catalog
             .complete(line, pos)
             .into_iter()
             .map(|completion| Suggestion {
@@ -115,7 +166,26 @@ impl Completer for CatalogCompleter {
                 match_indices: Some(completion.match_indices),
                 ..Suggestion::default()
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if let Some(extensions) = &mut self.extensions {
+            suggestions.extend(
+                extensions
+                    .complete(line, pos)
+                    .into_iter()
+                    .map(|completion| Suggestion {
+                        value: completion.value,
+                        display_override: Some(completion.display),
+                        description: Some(completion.summary),
+                        extra: Some(vec![completion.detail]),
+                        span: Span::new(completion.replace_start, completion.replace_end),
+                        append_whitespace: true,
+                        ..Suggestion::default()
+                    }),
+            );
+        }
+        let mut seen = HashSet::new();
+        suggestions.retain(|suggestion| seen.insert(suggestion.value.clone()));
+        suggestions
     }
 }
 
@@ -213,6 +283,21 @@ mod tests {
     use super::*;
     use quirl_core::ErrorCode;
 
+    struct ExampleExtension;
+
+    impl ExtensionCompleter for ExampleExtension {
+        fn complete(&mut self, _line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
+            vec![ExtensionSuggestion {
+                value: "production".to_owned(),
+                display: "production".to_owned(),
+                summary: "Deployment environment".to_owned(),
+                detail: "Lua plugin".to_owned(),
+                replace_start: pos.saturating_sub(4),
+                replace_end: pos,
+            }]
+        }
+    }
+
     #[test]
     fn completion_contains_explanatory_metadata() {
         let mut completer = CatalogCompleter::new(Catalog::builtin());
@@ -223,9 +308,28 @@ mod tests {
 
     #[test]
     fn diagnostics_have_stable_codes_and_help() {
-        let error = ShellError::new(ErrorCode::Steel, "program failed").with_help("fix it");
+        let error = ShellError::new(ErrorCode::Lua, "program failed").with_help("fix it");
         let rendered = render_error(&error, false);
-        assert!(rendered.starts_with("error[steel]"));
+        assert!(rendered.starts_with("error[lua]"));
         assert!(rendered.contains("help: fix it"));
+    }
+
+    #[test]
+    fn lua_suggestions_merge_with_catalog_completion() {
+        let mut completer =
+            CatalogCompleter::with_extensions(Catalog::builtin(), Some(Box::new(ExampleExtension)));
+        let result = completer.complete("deploy --environment prod", 25);
+        assert!(result.iter().any(|suggestion| {
+            suggestion.value == "production"
+                && suggestion.description.as_deref() == Some("Deployment environment")
+        }));
+    }
+
+    #[test]
+    fn prompt_renders_extension_segments() {
+        let prompt = QuirlPrompt::new(Mode::Command)
+            .with_extension_segments(vec!["project".to_owned(), "git:main".to_owned()]);
+        let rendered = prompt.render_prompt_left();
+        assert!(rendered.contains("project · git:main"));
     }
 }

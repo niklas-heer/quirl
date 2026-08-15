@@ -4,4 +4,4 @@ mod error;
 mod process;
 
 pub use error::{ErrorCode, ErrorLabel, ShellError};
-pub use process::{CommandOutcome, CommandRunner, Entry, EntryKind};
+pub use process::{directory_entries, CommandOutcome, CommandRunner, Entry, EntryKind};
