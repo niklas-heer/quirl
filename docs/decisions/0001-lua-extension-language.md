@@ -112,18 +112,26 @@ The initial vertical slice landed with this decision:
 - Memory, instruction, wall-clock, and cancellation checks protect the VM.
 - Configuration is deserialized into Rust schemas, and a failed reload leaves the
   last-known-good configuration unchanged.
+- Interactive sessions fingerprint `config.lua` and sorted `plugins/*.lua`, build
+  a complete candidate generation in fresh restricted VMs, and atomically swap it
+  only after every file validates. Unchanged failures are reported once.
 - Registered prompt and completion callbacks remain in persistent VMs and feed
   the live Reedline prompt and IDE completion menu through typed Rust adapters.
-- Interactive data mode now evaluates native Rust-owned structured sources and
-  transforms.
+- Validated editor keymap, semantic highlighting, picker, and prompt composition
+  settings are applied at the next safe prompt boundary. Emacs, Vim, and native
+  Reedline Helix editing modes are supported.
+- Interactive data mode evaluates Rust-owned structured sources, typed comparison
+  predicates with `and`/`or`, dotted field paths, projection, sorting, limiting,
+  and scalar/collection transforms.
 - The prototype runtime, CLI bridge, workspace crate, dependencies, examples,
   and benchmark executable paths have been removed. It remains mentioned only
   in historical evaluation evidence documenting why Lua was selected.
 
-The next integration step is live configuration watching and atomic session
-reload, applying the selected keymap/prompt/picker settings to the running UI,
-and expanding the native data grammar without turning it into a second general-
-purpose language.
+The Phase 0 integration step is complete: live atomic reload, selected UI
+settings, and the focused data grammar are wired into the running session. The
+next product milestone is the Phase 1 shell preview: durable history and picker
+state, redirects and job control, broader completion ingestion, and portable
+plain fallbacks.
 
 ## Revisit conditions
 
