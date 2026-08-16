@@ -219,9 +219,11 @@ enum Command {
     },
     /// Execute one command through Quirl's native pipeline and job graph.
     Exec {
-        /// Command and arguments to execute without shell string parsing.
-        #[arg(required = true, trailing_var_arg = true)]
-        command: Vec<String>,
+        /// Complete Quirl source, passed as one outer-shell argument.
+        source: String,
+        /// Error renderer; JSON emits the stable ShellError object.
+        #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
+        format: DiagnosticFormat,
     },
 }
 
@@ -404,7 +406,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
         Some(Command::View { command }) => platform::execute_view(command),
         Some(Command::Watch { command }) => platform::execute_watch(command),
         Some(Command::Recover { command }) => recovery::execute(command),
-        Some(Command::Exec { command }) => run_exec_with_recovery(&command.join(" ")),
+        Some(Command::Exec { source, .. }) => run_exec_with_recovery(&source),
         None if !io::stdin().is_terminal() => run_stdin(),
         None => {
             let mut host = LuaExtensionHost::discover();
@@ -485,12 +487,31 @@ impl Command {
                 matches!(command.format, platform::PlatformOutputFormat::Json)
             }
             Self::Recover { command } => recovery::wants_json(command),
+            Self::Exec {
+                format: DiagnosticFormat::Json,
+                ..
+            } => true,
             _ => false,
         }
     }
 }
 
-fn run_exec_with_recovery(command: &str) -> Result<i32, ShellError> {
+// `quirl exec` source-boundary failure model:
+//
+// - The outer shell owns argv construction and removes only its own quoting. Exec accepts one
+//   UTF-8 argv element as complete Quirl source; it never joins, escapes, or reparses multiple
+//   argv elements.
+// - Quirl quoting, operators, redirects, and empty command arguments are syntax inside that one
+//   source element. A second argv element, including `;`, is a Clap error and cannot acquire Quirl
+//   syntax during dispatch.
+// - The accepted source is passed byte-for-byte to the plan event. Without a rewrite, the same
+//   source reaches parsing, diagnostics, and recovery capture; persisted recovery data remains
+//   subject to its existing bounds and secret redaction.
+// - An explicit extension `RewritePlan` action is the only later source transition. Its replacement
+//   becomes the source used by execution, error events, and recovery without another argv boundary.
+// - Parse, execution, extension, and recovery failures remain `ShellError` values. The selected
+//   renderer changes presentation only and cannot change the accepted or recorded source.
+fn run_exec_with_recovery(source: &str) -> Result<i32, ShellError> {
     let journal = recovery::RecoveryJournal::discover()?;
     let extensions = Arc::new(Mutex::new(LuaExtensionHost::discover()));
     begin_extension_session(&extensions);
@@ -498,7 +519,7 @@ fn run_exec_with_recovery(command: &str) -> Result<i32, ShellError> {
     execute_with_recovery(
         &mut NativeExecutor::default(),
         &journal,
-        command,
+        source,
         Some(&extensions),
         ExecutionOutputMode::Capture,
     )
@@ -513,13 +534,13 @@ enum ExecutionOutputMode {
 fn execute_with_recovery(
     executor: &mut NativeExecutor,
     journal: &recovery::RecoveryJournal,
-    command: &str,
+    source: &str,
     extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
     output_mode: ExecutionOutputMode,
 ) -> Result<i32, ShellError> {
     let planned = match extensions {
         Some(extensions) => {
-            match prepare_extension_plan(extensions, command, vec!["spawn_process".to_owned()]) {
+            match prepare_extension_plan(extensions, source, vec!["spawn_process".to_owned()]) {
                 Ok(planned) => planned,
                 Err(error) => {
                     let mut annotations = BTreeMap::new();
@@ -537,7 +558,7 @@ fn execute_with_recovery(
                 }
             }
         }
-        None => PlannedExecution::new(command),
+        None => PlannedExecution::new(source),
     };
     let recovery_context = journal.capture_context(&planned.source)?;
     let PlannedExecution {
@@ -636,10 +657,21 @@ fn execute_command_or_dialect_island(
             &script::ScriptCancellation::default(),
         );
     }
-    match output_mode {
+    let result = match output_mode {
         ExecutionOutputMode::Capture => executor.execute_capture(source),
         ExecutionOutputMode::Interactive => executor.execute_interactive(source),
-    }
+    };
+    result.map_err(|mut error| {
+        // Native syntax diagnostics currently identify their label source with the logical name
+        // `command`. At the CLI boundary, replace only that sentinel with the exact accepted source
+        // so text rendering and the already-exact ShellError command field agree.
+        for label in &mut error.details.labels {
+            if label.source.as_deref() == Some("command") {
+                label.source = Some(source.to_owned());
+            }
+        }
+        error
+    })
 }
 
 fn recovery_journal(
@@ -1955,6 +1987,93 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["quirl", "sdk", "--format", "markdown"]).is_ok());
         assert!(Cli::try_parse_from(["quirl", "catalog", "--format", "markdown"]).is_ok());
+    }
+
+    #[test]
+    fn exec_accepts_exactly_one_complete_source_operand() {
+        let source = r#"printf '<%s>|<%s>' 'hello world' ''"#;
+        let cli = Cli::try_parse_from(["quirl", "exec", source]).unwrap();
+        assert!(!cli.wants_json());
+        assert!(matches!(
+            cli.command,
+            Some(Command::Exec {
+                source: accepted,
+                format: DiagnosticFormat::Text,
+            }) if accepted == source
+        ));
+
+        let json = Cli::try_parse_from(["quirl", "exec", source, "--format", "json"]).unwrap();
+        assert!(json.wants_json());
+        assert!(matches!(
+            json.command,
+            Some(Command::Exec {
+                source: accepted,
+                format: DiagnosticFormat::Json,
+            }) if accepted == source
+        ));
+
+        assert!(Cli::try_parse_from(["quirl", "exec", source, ";"]).is_err());
+        assert!(Cli::try_parse_from(["quirl", "exec", "printf", "hello world"]).is_err());
+    }
+
+    #[test]
+    fn exec_source_preserves_spaces_empty_arguments_quotes_and_backslashes() {
+        let source = r#"printf '<%s>|<%s>|<%s>' 'hello world' '' 'quote\"\slash'"#;
+        let outcome = NativeExecutor::default().execute_capture(source).unwrap();
+        assert_eq!(outcome.status, 0);
+        assert_eq!(
+            outcome.stdout.as_deref(),
+            Some(r#"<hello world>|<>|<quote\"\slash>"#)
+        );
+    }
+
+    #[test]
+    fn exec_source_intentionally_parses_operators_and_redirects() {
+        let fixture = DifferentialFixture::create("exec-source-operators");
+        let source = format!(
+            "printf '%s\\n' first second | grep second > {}; cat {}",
+            fixture.path("output"),
+            fixture.path("output")
+        );
+        let cli = Cli::try_parse_from(["quirl", "exec", source.as_str()]).unwrap();
+        let accepted = match cli.command {
+            Some(Command::Exec { source, .. }) => source,
+            _ => panic!("exec arguments must parse as an exec command"),
+        };
+        assert_eq!(accepted, source);
+
+        let outcome = NativeExecutor::default()
+            .execute_capture(&accepted)
+            .unwrap();
+        assert_eq!(outcome.status, 0);
+        assert_eq!(outcome.stdout.as_deref(), Some("second\n"));
+        assert_eq!(
+            fixture.redirected_output().as_deref(),
+            Some(&b"second\n"[..])
+        );
+    }
+
+    #[test]
+    fn exec_text_and_json_errors_retain_the_exact_source() {
+        let source = "printf 'unterminated\\path";
+        let error = execute_command_or_dialect_island(
+            &mut NativeExecutor::default(),
+            source,
+            ExecutionOutputMode::Capture,
+        )
+        .unwrap_err();
+        assert_eq!(error.details.command.as_deref(), Some(source));
+        assert_eq!(error.details.labels[0].source.as_deref(), Some(source));
+        assert!(!error.details.help.is_empty());
+
+        let text = render_error(&error, false);
+        assert!(text.contains(source));
+        assert!(text.contains("help"));
+
+        let json = serde_json::to_string(&error).unwrap();
+        let decoded: ShellError = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.details.command.as_deref(), Some(source));
+        assert_eq!(decoded.details.help, error.details.help);
     }
 
     #[test]
