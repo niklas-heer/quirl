@@ -5,12 +5,12 @@ use mlua::{
     VmState,
 };
 use quirl_core::{
-    reject_json_terminal_controls, validate_contribution_set, ContributionKind,
-    ContributionRegistration, ErrorCode, EventKind, EventSubscription, ExtensionAction,
-    ExtensionCapability, ExtensionEvent, ExtensionEventData, ProcessHost, ProcessRequest,
-    ShellError,
+    reject_json_terminal_controls, reject_terminal_controls, validate_contribution_set,
+    ContributionKind, ContributionRegistration, ErrorCode, EventKind, EventSubscription,
+    ExtensionAction, ExtensionCapability, ExtensionEvent, ExtensionEventData, ProcessHost,
+    ProcessRequest, ShellError,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
@@ -24,13 +24,62 @@ use std::{
 };
 
 const HOOK_GRANULARITY: u64 = 10_000;
-const RESOURCE_LIMIT_SENTINEL: &str = "quirl resource limit exceeded";
 const DEFAULT_PROMPT_DEADLINE_MS: u64 = 8;
 const MAX_CALLBACK_DEADLINE_MS: u64 = 100;
 const COMPLETION_CALLBACK_DEADLINE: Duration = Duration::from_millis(50);
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_LUA_COMPLETION_RESULTS: usize = 1_000;
 const MAX_LUA_COMPLETION_ITEM_BYTES: usize = 16 * 1024;
+const MAX_LUA_COMPLETION_RETAINED_BYTES: usize = 256 * 1024;
+const MAX_LUA_RETURN_RETAINED_BYTES: usize = 256 * 1024;
+const MAX_LUA_RETURN_NODES: usize = 4_096;
+const MAX_LUA_RETURN_INDEX: i64 = 4_096;
+const MAX_LUA_RETURN_DEPTH: usize = 16;
+const MAX_PROMPT_RETURN_BYTES: usize = 16 * 1024;
+const MAX_EVENT_ACTIONS: usize = 64;
+const MAX_COMMAND_EXAMPLES: usize = 32;
+const MAX_COMMAND_EFFECTS: usize = 32;
+const MAX_COMMAND_ERROR_CODES: usize = 64;
+const MAX_COMMAND_EXAMPLE_BYTES: usize = 4 * 1024;
+const MAX_COMMAND_EFFECT_BYTES: usize = 256;
+const MAX_COMMAND_ERROR_CODE_BYTES: usize = 256;
+const MAX_COMMAND_ERROR_DESCRIPTION_BYTES: usize = 2 * 1024;
+const MAX_PANEL_FALLBACK_BYTES: usize = 16 * 1024;
+const MAX_REGISTRATION_INPUT_NODES: usize = 512;
+const MAX_REGISTRATION_INPUT_DEPTH: usize = 4;
+const MAX_REGISTRATION_INPUT_BYTES: usize = 64 * 1024;
+/// Maximum number of prompt callback declarations retained from one Lua plugin.
+pub const MAX_PLUGIN_PROMPT_SEGMENTS: usize = 64;
+/// Maximum retained UTF-8 metadata bytes across one plugin's prompt declarations.
+pub const MAX_PLUGIN_PROMPT_BYTES: usize = 8 * 1024;
+/// Maximum number of completion provider declarations retained from one Lua plugin.
+pub const MAX_PLUGIN_COMPLETION_PROVIDERS: usize = 64;
+/// Maximum retained UTF-8 metadata bytes across one plugin's completion declarations.
+pub const MAX_PLUGIN_COMPLETION_BYTES: usize = 16 * 1024;
+/// Maximum number of typed command declarations retained from one Lua plugin.
+pub const MAX_PLUGIN_COMMANDS: usize = 64;
+/// Maximum retained UTF-8 metadata bytes across one plugin's command declarations.
+pub const MAX_PLUGIN_COMMAND_BYTES: usize = 256 * 1024;
+/// Maximum number of event handler declarations retained from one Lua plugin.
+pub const MAX_PLUGIN_EVENT_HANDLERS: usize = 64;
+/// Maximum retained UTF-8 metadata bytes across one plugin's event declarations.
+pub const MAX_PLUGIN_EVENT_BYTES: usize = 64 * 1024;
+/// Maximum number of contribution declarations retained from one Lua plugin.
+pub const MAX_PLUGIN_CONTRIBUTIONS: usize = 64;
+/// Maximum retained UTF-8 metadata bytes across one plugin's contribution declarations.
+pub const MAX_PLUGIN_CONTRIBUTION_BYTES: usize = 64 * 1024;
+/// Maximum number of panel contributions retained from one Lua plugin.
+pub const MAX_PLUGIN_PANELS: usize = 16;
+/// Maximum retained UTF-8 metadata bytes across one plugin's panel declarations.
+pub const MAX_PLUGIN_PANEL_BYTES: usize = 32 * 1024;
+/// Maximum UTF-8 byte length of any registration or callback identifier.
+pub const MAX_REGISTRATION_NAME_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of a short registration description or signature.
+pub const MAX_REGISTRATION_DESCRIPTION_BYTES: usize = 2 * 1024;
+/// Maximum UTF-8 byte length of detailed command documentation.
+pub const MAX_COMMAND_DETAILS_BYTES: usize = 16 * 1024;
+/// Maximum UTF-8 byte length of one semantic pipeline type expression.
+pub const MAX_COMMAND_TYPE_BYTES: usize = 256;
 /// Maximum number of custom palettes retained from one configuration.
 pub const MAX_CUSTOM_THEMES: usize = 32;
 /// Maximum UTF-8 byte length accepted for a selected or custom theme name.
@@ -98,6 +147,22 @@ impl LuaPolicy {
             instruction_limit: 500_000,
             wall_time: Duration::from_millis(100),
         }
+    }
+
+    fn validate(self) -> Result<(), ShellError> {
+        for (name, valid) in [
+            ("memory_limit_bytes", self.memory_limit_bytes > 0),
+            ("instruction_limit", self.instruction_limit > 0),
+            ("wall_time", !self.wall_time.is_zero()),
+        ] {
+            if !valid {
+                return Err(validation_error(
+                    "Lua policy",
+                    format!("{name} must be greater than zero"),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -917,7 +982,7 @@ pub fn builtin_theme(name: &str) -> Option<ThemeColors> {
 #[serde(deny_unknown_fields)]
 /// Metadata for a named plugin prompt callback.
 pub struct PromptRegistration {
-    /// Unique callback name used by the UI to request this segment.
+    /// Unique callback name, capped at [`MAX_REGISTRATION_NAME_BYTES`] UTF-8 bytes.
     pub name: String,
     /// Per-render wall deadline in milliseconds, from 1 through 100.
     ///
@@ -931,7 +996,7 @@ pub struct PromptRegistration {
 #[serde(deny_unknown_fields)]
 /// Metadata for a plugin completion callback registered for one command.
 pub struct CompletionRegistration {
-    /// Unique command path whose completion context is handled by the provider.
+    /// Unique command path, capped at [`MAX_REGISTRATION_NAME_BYTES`] UTF-8 bytes.
     pub command: String,
 }
 
@@ -942,32 +1007,33 @@ pub struct CompletionRegistration {
 /// Registration rejects empty core fields and requires examples, effects, and
 /// error codes before the callback becomes visible to higher catalog consumers.
 pub struct CommandRegistration {
-    /// Unique command path used to dispatch the registered callback.
+    /// Unique command path capped at [`MAX_REGISTRATION_NAME_BYTES`] UTF-8 bytes.
     pub name: String,
-    /// Human-readable invocation syntax including arguments and options.
+    /// Human-readable invocation syntax capped at 2 KiB.
     pub signature: String,
-    /// Short description for completion lists and tool manifests.
+    /// Short description for completion lists and tool manifests, capped at 2 KiB.
     pub summary: String,
-    /// Longer behavioral documentation for help, hover, and agent context.
+    /// Behavioral documentation for help, hover, and agent context, capped at 16 KiB.
     pub details: String,
-    /// Semantic type accepted from the preceding typed pipeline stage.
+    /// Semantic input type expression capped at 256 UTF-8 bytes.
     pub input_type: String,
-    /// Semantic type returned to the following typed pipeline stage.
+    /// Semantic output type expression capped at 256 UTF-8 bytes.
     pub output_type: String,
-    /// Complete invocation examples required by the public-command quality gate.
+    /// At most 32 bounded invocation examples required by the quality gate.
     pub examples: Vec<String>,
-    /// Declared external effects, normalized by the catalog boundary.
+    /// At most 32 bounded external effects, normalized by the catalog boundary.
     pub effects: Vec<String>,
-    /// Stable error-code names mapped to human-readable meanings.
+    /// At most 64 bounded error-code names mapped to human-readable meanings.
     pub error_codes: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /// Snapshot of metadata registered while loading one Lua plugin source.
 ///
 /// Callback functions remain in the runtime registry; this serializable value
 /// exposes only validated declarations to catalog, UI, and extension consumers.
+/// Serialization and deserialization both repeat [`Self::validate`] so persisted
+/// or protocol metadata cannot bypass the Lua ingestion bounds.
 pub struct PluginRegistrations {
     /// Prompt callbacks registered under the `prompt.register` capability.
     pub prompt_segments: Vec<PromptRegistration>,
@@ -979,6 +1045,159 @@ pub struct PluginRegistrations {
     pub events: Vec<EventSubscription>,
     /// Catalog, completion, and panel contribution declarations.
     pub contributions: Vec<ContributionRegistration>,
+}
+
+#[derive(Serialize)]
+struct PluginRegistrationsRef<'a> {
+    prompt_segments: &'a [PromptRegistration],
+    completion_providers: &'a [CompletionRegistration],
+    commands: &'a [CommandRegistration],
+    events: &'a [EventSubscription],
+    contributions: &'a [ContributionRegistration],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginRegistrationsWire {
+    prompt_segments: Vec<PromptRegistration>,
+    completion_providers: Vec<CompletionRegistration>,
+    commands: Vec<CommandRegistration>,
+    events: Vec<EventSubscription>,
+    contributions: Vec<ContributionRegistration>,
+}
+
+impl Serialize for PluginRegistrations {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        PluginRegistrationsRef {
+            prompt_segments: &self.prompt_segments,
+            completion_providers: &self.completion_providers,
+            commands: &self.commands,
+            events: &self.events,
+            contributions: &self.contributions,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PluginRegistrations {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PluginRegistrationsWire::deserialize(deserializer)?;
+        let registrations = Self {
+            prompt_segments: wire.prompt_segments,
+            completion_providers: wire.completion_providers,
+            commands: wire.commands,
+            events: wire.events,
+            contributions: wire.contributions,
+        };
+        registrations.validate().map_err(serde::de::Error::custom)?;
+        Ok(registrations)
+    }
+}
+
+impl PluginRegistrations {
+    /// Validate all registration bounds and identities at a serialization or protocol boundary.
+    ///
+    /// Lua callbacks validate before mutating runtime state; this second pass protects readers
+    /// and persisted writers from invalid values constructed directly through the public fields.
+    pub fn validate(&self) -> Result<(), ShellError> {
+        validate_registration_collection(
+            "prompt segments",
+            self.prompt_segments.len(),
+            self.prompt_segments.iter().map(prompt_registration_bytes),
+            MAX_PLUGIN_PROMPT_SEGMENTS,
+            MAX_PLUGIN_PROMPT_BYTES,
+        )?;
+        validate_registration_collection(
+            "completion providers",
+            self.completion_providers.len(),
+            self.completion_providers
+                .iter()
+                .map(completion_registration_bytes),
+            MAX_PLUGIN_COMPLETION_PROVIDERS,
+            MAX_PLUGIN_COMPLETION_BYTES,
+        )?;
+        validate_registration_collection(
+            "plugin commands",
+            self.commands.len(),
+            self.commands.iter().map(command_registration_bytes),
+            MAX_PLUGIN_COMMANDS,
+            MAX_PLUGIN_COMMAND_BYTES,
+        )?;
+        validate_registration_collection(
+            "event handlers",
+            self.events.len(),
+            self.events.iter().map(event_registration_bytes),
+            MAX_PLUGIN_EVENT_HANDLERS,
+            MAX_PLUGIN_EVENT_BYTES,
+        )?;
+        validate_registration_collection(
+            "contributions",
+            self.contributions.len(),
+            self.contributions
+                .iter()
+                .map(contribution_registration_bytes),
+            MAX_PLUGIN_CONTRIBUTIONS,
+            MAX_PLUGIN_CONTRIBUTION_BYTES,
+        )?;
+        let panels = self
+            .contributions
+            .iter()
+            .filter(|registration| registration.kind == ContributionKind::Panel)
+            .collect::<Vec<_>>();
+        validate_registration_collection(
+            "panel contributions",
+            panels.len(),
+            panels
+                .iter()
+                .map(|registration| contribution_registration_bytes(registration)),
+            MAX_PLUGIN_PANELS,
+            MAX_PLUGIN_PANEL_BYTES,
+        )?;
+
+        validate_unique_names(
+            "prompt segment",
+            self.prompt_segments.iter().map(|item| item.name.as_str()),
+        )?;
+        validate_unique_names(
+            "completion provider",
+            self.completion_providers
+                .iter()
+                .map(|item| item.command.as_str()),
+        )?;
+        validate_unique_names(
+            "plugin command",
+            self.commands.iter().map(|item| item.name.as_str()),
+        )?;
+        validate_unique_names(
+            "event handler",
+            self.events.iter().map(|item| item.name.as_str()),
+        )?;
+        for registration in &self.prompt_segments {
+            validate_prompt_registration(registration)?;
+        }
+        for registration in &self.completion_providers {
+            validate_completion_registration(registration)?;
+        }
+        for registration in &self.commands {
+            validate_command_registration(registration)?;
+        }
+        for registration in &self.events {
+            validate_event_registration(registration)?;
+        }
+        for registration in &self.contributions {
+            validate_contribution_registration(registration)?;
+        }
+        validate_contribution_set(&self.contributions)
+            .map_err(|error| registration_validation_error(error.message))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1109,7 +1328,7 @@ pub const HOST_API: &[HostApiSpec] = &[
     },
     HostApiSpec {
         path: "quirl.extension.contribute",
-        summary: "Register a typed catalog, completion, analysis, view, panel, or knowledge contribution.",
+        summary: "Register a typed catalog, completion, or panel contribution.",
         parameters: CONTRIBUTION_PARAMETER,
         returns: "nil",
         capability: Some("extension.contribute"),
@@ -1118,8 +1337,11 @@ pub const HOST_API: &[HostApiSpec] = &[
 
 #[derive(Debug)]
 struct Budget {
+    instruction_limit: u64,
     remaining_instructions: u64,
+    started: Instant,
     deadline: Instant,
+    wall_time: Duration,
 }
 
 #[derive(Clone)]
@@ -1255,12 +1477,25 @@ impl LuaRuntime {
         granted_capabilities: &[String],
         process_host: Option<ProcessHost>,
     ) -> Result<Self, ShellError> {
+        policy.validate()?;
         let libraries = StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8;
         let lua = Lua::new_with(libraries, LuaOptions::default())
             .map_err(|error| lua_error(error, None, 0))?;
+        lua.set_memory_limit(policy.memory_limit_bytes)
+            .map_err(|error| lua_error(error, None, 0))?;
+        let started = Instant::now();
+        let deadline = started.checked_add(policy.wall_time).ok_or_else(|| {
+            validation_error(
+                "Lua policy",
+                "wall_time is too large for the host monotonic clock",
+            )
+        })?;
         let budget = Arc::new(Mutex::new(Budget {
+            instruction_limit: policy.instruction_limit,
             remaining_instructions: policy.instruction_limit,
-            deadline: Instant::now() + policy.wall_time,
+            started,
+            deadline,
+            wall_time: policy.wall_time,
         }));
         let cancelled = Arc::new(AtomicBool::new(false));
         let registrations = Arc::new(Mutex::new(PluginRegistrations::default()));
@@ -1283,9 +1518,6 @@ impl LuaRuntime {
             Arc::clone(&callbacks),
         )
         .map_err(|error| lua_error(error, None, 0))?;
-        lua.set_memory_limit(policy.memory_limit_bytes)
-            .map_err(|error| lua_error(error, None, 0))?;
-
         Ok(Self {
             lua,
             policy,
@@ -1299,17 +1531,17 @@ impl LuaRuntime {
 }
 
 fn default_capabilities(policy: LuaPolicy) -> Vec<String> {
-    let mut capabilities = vec![
-        "commands.register".to_owned(),
-        "completion.register".to_owned(),
-        "events.observe".to_owned(),
-        "extension.contribute".to_owned(),
-        "catalog.register".to_owned(),
-        "ui.panel".to_owned(),
-        "prompt.register".to_owned(),
-    ];
-    if policy.allow_process {
-        capabilities.push("process.spawn".to_owned());
+    let mut capabilities = Vec::new();
+    for capability in HOST_API.iter().filter_map(|spec| spec.capability) {
+        if capability != "process.spawn" || policy.allow_process {
+            let capability = capability.to_owned();
+            if !capabilities.contains(&capability) {
+                capabilities.push(capability);
+            }
+        }
+    }
+    for capability in ["catalog.register", "ui.panel"] {
+        capabilities.push(capability.to_owned());
     }
     capabilities
 }
@@ -1425,31 +1657,16 @@ impl LuaRuntime {
         let path = Path::new(source_name);
         validate_source_length(source, path)?;
         lint_source(source, path)?;
-        self.registrations
-            .lock()
-            .expect("plugin registration mutex poisoned")
-            .clone_from(&PluginRegistrations::default());
-        {
-            let mut callbacks = self
-                .callbacks
-                .lock()
-                .expect("plugin callback mutex poisoned");
-            callbacks.prompt_segments.clear();
-            callbacks.completion_providers.clear();
-            callbacks.commands.clear();
-            callbacks.events.clear();
-            callbacks.contributions.clear();
-        }
+        self.clear_plugin_state();
         self.last_event_sequence
             .lock()
             .expect("plugin event sequence mutex poisoned")
             .take();
         self.reset_budget();
-        self.lua
-            .load(source)
-            .set_name(source_name)
-            .exec()
-            .map_err(|error| lua_error(error, Some(path), source.len()))?;
+        if let Err(error) = self.lua.load(source).set_name(source_name).exec() {
+            self.clear_plugin_state();
+            return Err(lua_error(error, Some(path), source.len()));
+        }
         let registrations = self
             .registrations
             .lock()
@@ -1466,8 +1683,31 @@ impl LuaRuntime {
                 "plugin did not register a command, prompt segment, completion provider, event handler, or contribution",
             ));
         }
-        validate_contribution_set(&registrations.contributions)?;
+        if let Err(error) = registrations.validate() {
+            self.clear_plugin_state();
+            return Err(error.with_context("lua failure: registration validation"));
+        }
         Ok(registrations)
+    }
+
+    #[allow(
+        clippy::expect_used,
+        reason = "poisoned plugin state cannot be recovered or exposed safely"
+    )]
+    fn clear_plugin_state(&self) {
+        self.registrations
+            .lock()
+            .expect("plugin registration mutex poisoned")
+            .clone_from(&PluginRegistrations::default());
+        let mut callbacks = self
+            .callbacks
+            .lock()
+            .expect("plugin callback mutex poisoned");
+        callbacks.prompt_segments.clear();
+        callbacks.completion_providers.clear();
+        callbacks.commands.clear();
+        callbacks.events.clear();
+        callbacks.contributions.clear();
     }
 
     #[allow(
@@ -1516,9 +1756,36 @@ impl LuaRuntime {
             .to_value(context)
             .map_err(|error| lua_error(error, None, 0))?;
         self.reset_budget_with_deadline(deadline);
-        function
-            .call::<Option<String>>(context)
-            .map_err(|error| lua_error(error, None, 0))
+        let rendered = function
+            .call::<Value>(context)
+            .map_err(|error| lua_error(error, None, 0))?;
+        match rendered {
+            Value::Nil => Ok(None),
+            Value::String(rendered) => {
+                if rendered.as_bytes().len() > MAX_PROMPT_RETURN_BYTES {
+                    return Err(lua_return_limit_error(
+                        "prompt bytes",
+                        rendered.as_bytes().len(),
+                        MAX_PROMPT_RETURN_BYTES,
+                    ));
+                }
+                let rendered = rendered.to_str().map_err(|error| {
+                    validation_error(
+                        name,
+                        format!("prompt segment must return valid UTF-8 text: {error}"),
+                    )
+                })?;
+                reject_terminal_controls("prompt segment", &rendered)?;
+                Ok(Some(rendered.to_owned()))
+            }
+            other => Err(validation_error(
+                name,
+                format!(
+                    "prompt segment must return text or nil, not Lua {}",
+                    other.type_name()
+                ),
+            )),
+        }
     }
 
     #[allow(
@@ -1704,17 +1971,25 @@ impl LuaRuntime {
                         .call::<Value>(record)
                         .map_err(|error| lua_error(error, None, 0))
                 })
+                .and_then(|value| self.value_to_json(value, None, 0))
                 .and_then(|value| {
-                    self.lua
-                        .from_value::<Vec<ExtensionAction>>(value)
-                        .map_err(|error| {
-                            validation_error(
-                                &name,
-                                format!("event handler must return an array of declared actions: {error}"),
-                            )
-                        })
+                    serde_json::from_value::<Vec<ExtensionAction>>(value).map_err(|error| {
+                        validation_error(
+                            &name,
+                            format!(
+                                "event handler must return an array of declared actions: {error}"
+                            ),
+                        )
+                    })
                 })
                 .and_then(|actions| {
+                    if actions.len() > MAX_EVENT_ACTIONS {
+                        return Err(lua_return_limit_error(
+                            "event actions",
+                            actions.len(),
+                            MAX_EVENT_ACTIONS,
+                        ));
+                    }
                     for action in &actions {
                         action.validate(&capabilities)?;
                     }
@@ -1906,6 +2181,7 @@ impl LuaRuntime {
         if matches!(value, Value::Nil) {
             return Ok(serde_json::Value::Null);
         }
+        validate_lua_return_shape(&value)?;
         self.lua
             .from_value(value)
             .map_err(|error| lua_error(error, path, source_len))
@@ -1925,8 +2201,14 @@ impl LuaRuntime {
     )]
     fn reset_budget_with_deadline(&self, deadline: Duration) {
         let mut budget = self.budget.lock().expect("Lua budget mutex poisoned");
+        let wall_time = deadline.min(self.policy.wall_time);
+        let started = Instant::now();
+        let expires = started.checked_add(wall_time).unwrap_or(started);
+        budget.instruction_limit = self.policy.instruction_limit;
         budget.remaining_instructions = self.policy.instruction_limit;
-        budget.deadline = Instant::now() + deadline.min(self.policy.wall_time);
+        budget.started = started;
+        budget.deadline = expires;
+        budget.wall_time = wall_time;
     }
 }
 
@@ -2313,7 +2595,7 @@ pub fn sdk_markdown() -> String {
 fn install_restrictions(lua: &Lua) -> mlua::Result<()> {
     let globals = lua.globals();
     for name in [
-        "debug", "dofile", "io", "loadfile", "os", "package", "require",
+        "debug", "dofile", "io", "loadfile", "os", "package", "print", "require", "warn",
     ] {
         globals.set(name, Value::Nil)?;
     }
@@ -2331,13 +2613,36 @@ fn install_budget_hook(
             let mut budget = budget.lock().map_err(|_| {
                 mlua::Error::RuntimeError("quirl budget state is unavailable".to_owned())
             })?;
-            if cancelled.load(Ordering::Relaxed)
-                || budget.remaining_instructions < HOOK_GRANULARITY
-                || Instant::now() > budget.deadline
-            {
-                return Err(mlua::Error::RuntimeError(
-                    RESOURCE_LIMIT_SENTINEL.to_owned(),
-                ));
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(mlua::Error::external(lua_resource_error(
+                    "cancellation",
+                    "cancellation flag: set",
+                    "Clear cancellation only before deliberately reusing the runtime",
+                )));
+            }
+            if budget.remaining_instructions < HOOK_GRANULARITY {
+                let observed = budget
+                    .instruction_limit
+                    .saturating_sub(budget.remaining_instructions);
+                return Err(mlua::Error::external(lua_resource_error(
+                    "instruction",
+                    format!(
+                        "instructions observed: approximately {observed}; limit: {}",
+                        budget.instruction_limit
+                    ),
+                    "Reduce Lua work or raise instruction_limit after review",
+                )));
+            }
+            if Instant::now() > budget.deadline {
+                let observed = budget.started.elapsed().as_millis();
+                return Err(mlua::Error::external(lua_resource_error(
+                    "wall_time",
+                    format!(
+                        "elapsed: {observed} ms; limit: {} ms",
+                        budget.wall_time.as_millis()
+                    ),
+                    "Reduce callback work or raise wall_time after review",
+                )));
             }
             budget.remaining_instructions -= HOOK_GRANULARITY;
             Ok(VmState::Continue)
@@ -2373,9 +2678,12 @@ fn install_host_api(
     process.set(
         "run",
         lua.create_function(move |lua, command: String| {
-            if !policy.allow_process || !process_capability_granted(&process_grants, &command) {
+            let capability = host_api_capability("quirl.process.run")?;
+            if !policy.allow_process
+                || !process_capability_granted(&process_grants, capability, &command)
+            {
                 return Err(mlua::Error::RuntimeError(
-                    "capability denied: process.spawn".to_owned(),
+                    format!("capability denied: {capability}"),
                 ));
             }
             let Some(process_host) = process_host.as_ref() else {
@@ -2385,9 +2693,11 @@ fn install_host_api(
                 ));
             };
             if process_cancelled.load(Ordering::Relaxed) {
-                return Err(mlua::Error::RuntimeError(
-                    RESOURCE_LIMIT_SENTINEL.to_owned(),
-                ));
+                return Err(mlua::Error::external(lua_resource_error(
+                    "cancellation",
+                    "cancellation flag: set",
+                    "Clear cancellation only before deliberately reusing the runtime",
+                )));
             }
             let deadline = process_budget
                 .lock()
@@ -2397,9 +2707,11 @@ fn install_host_api(
                 .deadline
                 .saturating_duration_since(Instant::now());
             if deadline.is_zero() {
-                return Err(mlua::Error::RuntimeError(
-                    RESOURCE_LIMIT_SENTINEL.to_owned(),
-                ));
+                return Err(mlua::Error::external(lua_resource_error(
+                    "wall_time",
+                    "remaining wall time: 0 ms",
+                    "Reduce host-call work or raise wall_time after review",
+                )));
             }
             let outcome = process_host(ProcessRequest {
                 command,
@@ -2410,14 +2722,7 @@ fn install_host_api(
                 cancelled: Arc::clone(&process_cancelled),
                 max_output_bytes: MAX_PROCESS_OUTPUT_BYTES,
             })
-            .map_err(|error| {
-                let prefix = if error.code == ErrorCode::ResourceLimit {
-                    format!("{RESOURCE_LIMIT_SENTINEL}: ")
-                } else {
-                    String::new()
-                };
-                mlua::Error::RuntimeError(format!("{prefix}{error}"))
-            })?;
+            .map_err(mlua::Error::external)?;
             let result = lua.create_table()?;
             result.set("ok", outcome.status == 0)?;
             result.set("status", outcome.status)?;
@@ -2435,33 +2740,41 @@ fn install_host_api(
     prompt.set(
         "add_segment",
         lua.create_function(move |lua, spec: Table| {
-            require_grant(&prompt_grants, "prompt.register")?;
+            require_host_api_grant(&prompt_grants, "quirl.prompt.add_segment")?;
             let render = spec.get::<Function>("render").map_err(|_| {
-                mlua::Error::RuntimeError("prompt segment `render` must be a function".to_owned())
+                mlua::Error::external(registration_validation_error(
+                    "prompt segment `render` must be a function",
+                ))
             })?;
             let registration: PromptRegistration =
                 deserialize_registration(lua, &spec, "render", "prompt segment")?;
-            validate_registration_name("prompt segment name", &registration.name)?;
-            if !(1..=MAX_CALLBACK_DEADLINE_MS).contains(&registration.deadline_ms) {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "prompt segment `deadline_ms` must be between 1 and {MAX_CALLBACK_DEADLINE_MS}"
-                )));
-            }
-            let callback = lua.create_registry_value(render)?;
+            validate_prompt_registration(&registration).map_err(mlua::Error::external)?;
             let mut callbacks = prompt_callbacks
                 .lock()
                 .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
             if callbacks.prompt_segments.contains_key(&registration.name) {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "duplicate prompt segment `{}`",
-                    registration.name
+                return Err(mlua::Error::external(registration_validation_error(
+                    format!("duplicate prompt segment `{}`", registration.name),
                 )));
             }
-            prompt_registrations
+            let mut registrations = prompt_registrations
                 .lock()
-                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
-                .prompt_segments
-                .push(registration.clone());
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
+            validate_registration_addition(
+                "prompt segments",
+                registrations.prompt_segments.len(),
+                registrations
+                    .prompt_segments
+                    .iter()
+                    .map(prompt_registration_bytes)
+                    .sum(),
+                prompt_registration_bytes(&registration),
+                MAX_PLUGIN_PROMPT_SEGMENTS,
+                MAX_PLUGIN_PROMPT_BYTES,
+            )
+            .map_err(mlua::Error::external)?;
+            let callback = lua.create_registry_value(render)?;
+            registrations.prompt_segments.push(registration.clone());
             let deadline = Duration::from_millis(registration.deadline_ms);
             callbacks.prompt_segments.insert(
                 registration.name,
@@ -2482,16 +2795,15 @@ fn install_host_api(
     completion.set(
         "add_provider",
         lua.create_function(move |lua, spec: Table| {
-            require_grant(&completion_grants, "completion.register")?;
+            require_host_api_grant(&completion_grants, "quirl.completion.add_provider")?;
             let complete = spec.get::<Function>("complete").map_err(|_| {
-                mlua::Error::RuntimeError(
-                    "completion provider `complete` must be a function".to_owned(),
-                )
+                mlua::Error::external(registration_validation_error(
+                    "completion provider `complete` must be a function",
+                ))
             })?;
             let registration: CompletionRegistration =
                 deserialize_registration(lua, &spec, "complete", "completion provider")?;
-            validate_registration_name("completion provider command", &registration.command)?;
-            let callback = lua.create_registry_value(complete)?;
+            validate_completion_registration(&registration).map_err(mlua::Error::external)?;
             let mut callbacks = completion_callbacks
                 .lock()
                 .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
@@ -2499,14 +2811,28 @@ fn install_host_api(
                 .completion_providers
                 .contains_key(&registration.command)
             {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "duplicate completion provider `{}`",
-                    registration.command
+                return Err(mlua::Error::external(registration_validation_error(
+                    format!("duplicate completion provider `{}`", registration.command),
                 )));
             }
-            completion_registrations
+            let mut registrations = completion_registrations
                 .lock()
-                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
+            validate_registration_addition(
+                "completion providers",
+                registrations.completion_providers.len(),
+                registrations
+                    .completion_providers
+                    .iter()
+                    .map(completion_registration_bytes)
+                    .sum(),
+                completion_registration_bytes(&registration),
+                MAX_PLUGIN_COMPLETION_PROVIDERS,
+                MAX_PLUGIN_COMPLETION_BYTES,
+            )
+            .map_err(mlua::Error::external)?;
+            let callback = lua.create_registry_value(complete)?;
+            registrations
                 .completion_providers
                 .push(registration.clone());
             callbacks
@@ -2524,28 +2850,41 @@ fn install_host_api(
     plugin.set(
         "command",
         lua.create_function(move |lua, spec: Table| {
-            require_grant(&command_grants, "commands.register")?;
+            require_host_api_grant(&command_grants, "quirl.plugin.command")?;
             let run = spec.get::<Function>("run").map_err(|_| {
-                mlua::Error::RuntimeError("plugin command `run` must be a function".to_owned())
+                mlua::Error::external(registration_validation_error(
+                    "plugin command `run` must be a function",
+                ))
             })?;
             let registration: CommandRegistration =
                 deserialize_registration(lua, &spec, "run", "plugin command")?;
-            validate_command_registration(&registration)?;
-            let callback = lua.create_registry_value(run)?;
+            validate_command_registration(&registration).map_err(mlua::Error::external)?;
             let mut callbacks = command_callbacks
                 .lock()
                 .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
             if callbacks.commands.contains_key(&registration.name) {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "duplicate plugin command `{}`",
-                    registration.name
+                return Err(mlua::Error::external(registration_validation_error(
+                    format!("duplicate plugin command `{}`", registration.name),
                 )));
             }
-            command_registrations
+            let mut registrations = command_registrations
                 .lock()
-                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
-                .commands
-                .push(registration.clone());
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
+            validate_registration_addition(
+                "plugin commands",
+                registrations.commands.len(),
+                registrations
+                    .commands
+                    .iter()
+                    .map(command_registration_bytes)
+                    .sum(),
+                command_registration_bytes(&registration),
+                MAX_PLUGIN_COMMANDS,
+                MAX_PLUGIN_COMMAND_BYTES,
+            )
+            .map_err(mlua::Error::external)?;
+            let callback = lua.create_registry_value(run)?;
+            registrations.commands.push(registration.clone());
             callbacks.commands.insert(registration.name, callback);
             Ok(())
         })?,
@@ -2559,33 +2898,44 @@ fn install_host_api(
     events.set(
         "subscribe",
         lua.create_function(move |lua, spec: Table| {
-            require_grant(&event_grants, "events.observe")?;
+            require_host_api_grant(&event_grants, "quirl.events.subscribe")?;
             let observe = spec.get::<Function>("observe").map_err(|_| {
-                mlua::Error::RuntimeError(
-                    "event subscription `observe` must be a function".to_owned(),
-                )
+                mlua::Error::external(registration_validation_error(
+                    "event subscription `observe` must be a function",
+                ))
             })?;
             let registration: EventSubscription =
                 deserialize_registration(lua, &spec, "observe", "event subscription")?;
-            registration.validate().map_err(mlua::Error::external)?;
+            validate_event_registration(&registration).map_err(mlua::Error::external)?;
             for capability in &registration.capabilities {
                 require_grant(&event_grants, extension_capability_grant(*capability))?;
             }
-            let callback = lua.create_registry_value(observe)?;
             let mut callbacks = event_callbacks
                 .lock()
                 .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
             if callbacks.events.contains_key(&registration.name) {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "duplicate event handler `{}`",
-                    registration.name
+                return Err(mlua::Error::external(registration_validation_error(
+                    format!("duplicate event handler `{}`", registration.name),
                 )));
             }
-            event_registrations
+            let mut registrations = event_registrations
                 .lock()
-                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
-                .events
-                .push(registration.clone());
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
+            validate_registration_addition(
+                "event handlers",
+                registrations.events.len(),
+                registrations
+                    .events
+                    .iter()
+                    .map(event_registration_bytes)
+                    .sum(),
+                event_registration_bytes(&registration),
+                MAX_PLUGIN_EVENT_HANDLERS,
+                MAX_PLUGIN_EVENT_BYTES,
+            )
+            .map_err(mlua::Error::external)?;
+            let callback = lua.create_registry_value(observe)?;
+            registrations.events.push(registration.clone());
             callbacks.events.insert(
                 registration.name,
                 EventCallback {
@@ -2607,35 +2957,65 @@ fn install_host_api(
     extension.set(
         "contribute",
         lua.create_function(move |lua, spec: Table| {
-            require_grant(&contribution_grants, "extension.contribute")?;
+            require_host_api_grant(&contribution_grants, "quirl.extension.contribute")?;
             let provide = spec.get::<Function>("provide").map_err(|_| {
-                mlua::Error::RuntimeError(
-                    "extension contribution `provide` must be a function".to_owned(),
-                )
+                mlua::Error::external(registration_validation_error(
+                    "extension contribution `provide` must be a function",
+                ))
             })?;
             let registration: ContributionRegistration =
                 deserialize_registration(lua, &spec, "provide", "extension contribution")?;
-            registration.validate().map_err(mlua::Error::external)?;
+            validate_contribution_registration(&registration).map_err(mlua::Error::external)?;
             require_grant(
                 &contribution_grants,
                 contribution_capability_grant(registration.kind),
             )?;
-            let callback = lua.create_registry_value(provide)?;
             let key = format!("{:?}:{}", registration.kind, registration.name);
             let mut callbacks = contribution_callbacks
                 .lock()
                 .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
             if callbacks.contributions.contains_key(&key) {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "duplicate {:?} contribution `{}`",
-                    registration.kind, registration.name
+                return Err(mlua::Error::external(registration_validation_error(
+                    format!(
+                        "duplicate {:?} contribution `{}`",
+                        registration.kind, registration.name
+                    ),
                 )));
             }
-            contribution_registrations
+            let mut registrations = contribution_registrations
                 .lock()
-                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?
-                .contributions
-                .push(registration.clone());
+                .map_err(|_| mlua::Error::RuntimeError("plugin state unavailable".to_owned()))?;
+            let added_bytes = contribution_registration_bytes(&registration);
+            validate_registration_addition(
+                "contributions",
+                registrations.contributions.len(),
+                registrations
+                    .contributions
+                    .iter()
+                    .map(contribution_registration_bytes)
+                    .sum(),
+                added_bytes,
+                MAX_PLUGIN_CONTRIBUTIONS,
+                MAX_PLUGIN_CONTRIBUTION_BYTES,
+            )
+            .map_err(mlua::Error::external)?;
+            if registration.kind == ContributionKind::Panel {
+                let panels = registrations
+                    .contributions
+                    .iter()
+                    .filter(|item| item.kind == ContributionKind::Panel);
+                validate_registration_addition(
+                    "panel contributions",
+                    panels.clone().count(),
+                    panels.map(contribution_registration_bytes).sum(),
+                    added_bytes,
+                    MAX_PLUGIN_PANELS,
+                    MAX_PLUGIN_PANEL_BYTES,
+                )
+                .map_err(mlua::Error::external)?;
+            }
+            let callback = lua.create_registry_value(provide)?;
+            registrations.contributions.push(registration.clone());
             callbacks.contributions.insert(
                 key,
                 ContributionCallback {
@@ -2654,10 +3034,32 @@ fn require_grant(grants: &HashSet<String>, capability: &str) -> mlua::Result<()>
     if grants.contains(capability) {
         Ok(())
     } else {
-        Err(mlua::Error::RuntimeError(format!(
-            "capability denied: {capability}"
-        )))
+        Err(mlua::Error::external(
+            ShellError::new(
+                ErrorCode::Validation,
+                format!("capability denied: {capability}"),
+            )
+            .with_context(format!("capability denied: {capability}"))
+            .with_context("lua failure: registration")
+            .with_help("Grant only the capability approved by the plugin policy"),
+        ))
     }
+}
+
+fn host_api_capability(path: &str) -> mlua::Result<&'static str> {
+    HOST_API
+        .iter()
+        .find(|spec| spec.path == path)
+        .and_then(|spec| spec.capability)
+        .ok_or_else(|| {
+            mlua::Error::RuntimeError(format!(
+                "internal host API declaration for `{path}` has no capability"
+            ))
+        })
+}
+
+fn require_host_api_grant(grants: &HashSet<String>, path: &str) -> mlua::Result<()> {
+    require_grant(grants, host_api_capability(path)?)
 }
 
 fn extension_capability_grant(capability: ExtensionCapability) -> &'static str {
@@ -2696,8 +3098,8 @@ fn parse_event_kind(value: &str) -> Option<EventKind> {
     }
 }
 
-fn process_capability_granted(grants: &HashSet<String>, command: &str) -> bool {
-    if grants.contains("process.spawn") {
+fn process_capability_granted(grants: &HashSet<String>, capability: &str, command: &str) -> bool {
+    if grants.contains(capability) {
         return true;
     }
     // Scoped grants describe exactly one executable invocation. The injected
@@ -2716,33 +3118,340 @@ fn process_capability_granted(grants: &HashSet<String>, command: &str) -> bool {
         return false;
     }
     let executable = command.split_whitespace().next().unwrap_or_default();
-    grants.contains(&format!("process.spawn:{executable}"))
+    grants.contains(&format!("{capability}:{executable}"))
 }
 
-fn validate_command_registration(registration: &CommandRegistration) -> mlua::Result<()> {
-    for (field, value) in [
-        ("name", registration.name.as_str()),
-        ("signature", registration.signature.as_str()),
-        ("summary", registration.summary.as_str()),
-        ("details", registration.details.as_str()),
-        ("input_type", registration.input_type.as_str()),
-        ("output_type", registration.output_type.as_str()),
-    ] {
-        if value.trim().is_empty() {
-            return Err(mlua::Error::RuntimeError(format!(
-                "plugin command `{field}` must not be empty"
-            )));
-        }
+fn validate_prompt_registration(registration: &PromptRegistration) -> Result<(), ShellError> {
+    validate_registration_name("prompt segment name", &registration.name)?;
+    if !(1..=MAX_CALLBACK_DEADLINE_MS).contains(&registration.deadline_ms) {
+        return Err(registration_validation_error(format!(
+            "prompt segment `deadline_ms` must be between 1 and {MAX_CALLBACK_DEADLINE_MS}"
+        )));
     }
-    if registration.examples.is_empty()
-        || registration.effects.is_empty()
-        || registration.error_codes.is_empty()
-    {
-        return Err(mlua::Error::RuntimeError(
-            "plugin command requires examples, effects, and error codes".to_owned(),
+    Ok(())
+}
+
+fn validate_completion_registration(
+    registration: &CompletionRegistration,
+) -> Result<(), ShellError> {
+    validate_registration_name("completion provider command", &registration.command)
+}
+
+fn validate_command_registration(registration: &CommandRegistration) -> Result<(), ShellError> {
+    validate_bounded_text(
+        "plugin command name",
+        &registration.name,
+        MAX_REGISTRATION_NAME_BYTES,
+    )?;
+    for (field, value, limit) in [
+        (
+            "signature",
+            registration.signature.as_str(),
+            MAX_REGISTRATION_DESCRIPTION_BYTES,
+        ),
+        (
+            "summary",
+            registration.summary.as_str(),
+            MAX_REGISTRATION_DESCRIPTION_BYTES,
+        ),
+        (
+            "details",
+            registration.details.as_str(),
+            MAX_COMMAND_DETAILS_BYTES,
+        ),
+        (
+            "input_type",
+            registration.input_type.as_str(),
+            MAX_COMMAND_TYPE_BYTES,
+        ),
+        (
+            "output_type",
+            registration.output_type.as_str(),
+            MAX_COMMAND_TYPE_BYTES,
+        ),
+    ] {
+        validate_bounded_text(&format!("plugin command {field}"), value, limit)?;
+    }
+    validate_string_collection(
+        "plugin command examples",
+        &registration.examples,
+        MAX_COMMAND_EXAMPLES,
+        MAX_COMMAND_EXAMPLE_BYTES,
+    )?;
+    validate_string_collection(
+        "plugin command effects",
+        &registration.effects,
+        MAX_COMMAND_EFFECTS,
+        MAX_COMMAND_EFFECT_BYTES,
+    )?;
+    if registration.error_codes.is_empty() {
+        return Err(registration_validation_error(
+            "plugin command error_codes must not be empty",
+        ));
+    }
+    if registration.error_codes.len() > MAX_COMMAND_ERROR_CODES {
+        return Err(registration_limit_error(
+            "plugin command error codes",
+            "entries",
+            registration.error_codes.len(),
+            MAX_COMMAND_ERROR_CODES,
+        ));
+    }
+    for (code, description) in &registration.error_codes {
+        validate_bounded_text(
+            "plugin command error code",
+            code,
+            MAX_COMMAND_ERROR_CODE_BYTES,
+        )?;
+        validate_bounded_text(
+            "plugin command error description",
+            description,
+            MAX_COMMAND_ERROR_DESCRIPTION_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_event_registration(registration: &EventSubscription) -> Result<(), ShellError> {
+    validate_registration_name("event handler name", &registration.name)?;
+    registration
+        .validate()
+        .map_err(|error| registration_validation_error(error.message))?;
+    if registration.events.len() > EventKind::ALL.len() {
+        return Err(registration_limit_error(
+            "event names",
+            "entries",
+            registration.events.len(),
+            EventKind::ALL.len(),
+        ));
+    }
+    if registration.capabilities.len() > ExtensionCapability::ALL.len() {
+        return Err(registration_limit_error(
+            "event capabilities",
+            "entries",
+            registration.capabilities.len(),
+            ExtensionCapability::ALL.len(),
+        ));
+    }
+    let unique = registration
+        .capabilities
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if unique.len() != registration.capabilities.len() {
+        return Err(registration_validation_error(
+            "event handler contains duplicate capabilities",
         ));
     }
     Ok(())
+}
+
+fn validate_contribution_registration(
+    registration: &ContributionRegistration,
+) -> Result<(), ShellError> {
+    validate_registration_name("contribution name", &registration.name)?;
+    if let Some(fallback) = &registration.plain_fallback {
+        validate_bounded_text("panel plain_fallback", fallback, MAX_PANEL_FALLBACK_BYTES)?;
+    }
+    registration
+        .validate()
+        .map_err(|error| registration_validation_error(error.message))
+}
+
+fn validate_string_collection(
+    description: &str,
+    values: &[String],
+    count_max: usize,
+    item_bytes_max: usize,
+) -> Result<(), ShellError> {
+    if values.is_empty() {
+        return Err(registration_validation_error(format!(
+            "{description} must not be empty"
+        )));
+    }
+    if values.len() > count_max {
+        return Err(registration_limit_error(
+            description,
+            "entries",
+            values.len(),
+            count_max,
+        ));
+    }
+    for value in values {
+        validate_bounded_text(description, value, item_bytes_max)?;
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(
+    description: &str,
+    value: &str,
+    bytes_max: usize,
+) -> Result<(), ShellError> {
+    if value.trim().is_empty() {
+        return Err(registration_validation_error(format!(
+            "{description} must not be empty"
+        )));
+    }
+    if value.len() > bytes_max {
+        return Err(registration_limit_error(
+            description,
+            "bytes",
+            value.len(),
+            bytes_max,
+        ));
+    }
+    reject_terminal_controls(description, value)
+        .map_err(|error| registration_validation_error(error.message))
+}
+
+fn validate_registration_name(description: &str, value: &str) -> Result<(), ShellError> {
+    validate_bounded_text(description, value, MAX_REGISTRATION_NAME_BYTES)
+}
+
+fn validate_registration_collection(
+    description: &str,
+    count: usize,
+    mut retained_sizes: impl Iterator<Item = usize>,
+    count_max: usize,
+    retained_bytes_max: usize,
+) -> Result<(), ShellError> {
+    if count > count_max {
+        return Err(registration_limit_error(
+            description,
+            "registrations",
+            count,
+            count_max,
+        ));
+    }
+    let retained_bytes = retained_sizes.try_fold(0_usize, |total, size| {
+        total.checked_add(size).ok_or_else(|| {
+            registration_limit_error(description, "bytes", usize::MAX, retained_bytes_max)
+        })
+    })?;
+    if retained_bytes > retained_bytes_max {
+        return Err(registration_limit_error(
+            description,
+            "bytes",
+            retained_bytes,
+            retained_bytes_max,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_registration_addition(
+    description: &str,
+    current_count: usize,
+    current_retained_bytes: usize,
+    added_retained_bytes: usize,
+    count_max: usize,
+    retained_bytes_max: usize,
+) -> Result<(), ShellError> {
+    let observed_count = current_count.checked_add(1).ok_or_else(|| {
+        registration_limit_error(description, "registrations", usize::MAX, count_max)
+    })?;
+    if observed_count > count_max {
+        return Err(registration_limit_error(
+            description,
+            "registrations",
+            observed_count,
+            count_max,
+        ));
+    }
+    let observed_bytes = current_retained_bytes
+        .checked_add(added_retained_bytes)
+        .ok_or_else(|| {
+            registration_limit_error(description, "bytes", usize::MAX, retained_bytes_max)
+        })?;
+    if observed_bytes > retained_bytes_max {
+        return Err(registration_limit_error(
+            description,
+            "bytes",
+            observed_bytes,
+            retained_bytes_max,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unique_names<'a>(
+    description: &str,
+    names: impl Iterator<Item = &'a str>,
+) -> Result<(), ShellError> {
+    let mut unique = HashSet::new();
+    for name in names {
+        if !unique.insert(name) {
+            return Err(registration_validation_error(format!(
+                "duplicate {description} `{name}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn prompt_registration_bytes(registration: &PromptRegistration) -> usize {
+    registration.name.len()
+}
+
+fn completion_registration_bytes(registration: &CompletionRegistration) -> usize {
+    registration.command.len()
+}
+
+fn command_registration_bytes(registration: &CommandRegistration) -> usize {
+    let scalar_bytes = registration.name.len()
+        + registration.signature.len()
+        + registration.summary.len()
+        + registration.details.len()
+        + registration.input_type.len()
+        + registration.output_type.len();
+    let list_bytes = registration
+        .examples
+        .iter()
+        .chain(&registration.effects)
+        .map(String::len)
+        .sum::<usize>();
+    let map_bytes = registration
+        .error_codes
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum::<usize>();
+    scalar_bytes
+        .checked_add(list_bytes)
+        .and_then(|total| total.checked_add(map_bytes))
+        .unwrap_or(usize::MAX)
+}
+
+fn event_registration_bytes(registration: &EventSubscription) -> usize {
+    registration.name.len()
+        + registration.events.len() * std::mem::size_of::<EventKind>()
+        + registration.capabilities.len() * std::mem::size_of::<ExtensionCapability>()
+}
+
+fn contribution_registration_bytes(registration: &ContributionRegistration) -> usize {
+    registration.name.len() + registration.plain_fallback.as_ref().map_or(0, String::len)
+}
+
+fn registration_limit_error(
+    description: &str,
+    unit: &str,
+    observed: usize,
+    limit: usize,
+) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{description} exceed the configured registration limit"),
+    )
+    .with_context(format!("{unit}: {observed}; limit: {limit}"))
+    .with_context("lua failure: registration")
+    .with_help("Reduce plugin registration metadata or split the plugin after review")
+}
+
+fn registration_validation_error(message: impl Into<String>) -> ShellError {
+    ShellError::new(ErrorCode::Validation, "Lua registration failed validation")
+        .with_context(message)
+        .with_context("lua failure: registration")
+        .with_help("Fix the registration before loading the plugin")
 }
 
 fn default_prompt_deadline_ms() -> u64 {
@@ -2755,6 +3464,8 @@ fn deserialize_registration<T: DeserializeOwned>(
     callback_field: &str,
     description: &str,
 ) -> mlua::Result<T> {
+    validate_registration_input_shape(spec, callback_field, description)
+        .map_err(mlua::Error::external)?;
     let metadata = lua.create_table()?;
     for pair in spec.clone().pairs::<Value, Value>() {
         let (key, value) = pair?;
@@ -2767,16 +3478,136 @@ fn deserialize_registration<T: DeserializeOwned>(
         }
     }
     lua.from_value(Value::Table(metadata)).map_err(|error| {
-        mlua::Error::RuntimeError(format!("invalid {description} registration: {error}"))
+        mlua::Error::external(registration_validation_error(format!(
+            "invalid {description} registration: {error}"
+        )))
     })
 }
 
-fn validate_registration_name(description: &str, value: &str) -> mlua::Result<()> {
-    if value.trim().is_empty() {
-        return Err(mlua::Error::RuntimeError(format!(
-            "{description} must not be empty"
-        )));
+fn validate_registration_input_shape(
+    spec: &Table,
+    callback_field: &str,
+    description: &str,
+) -> Result<(), ShellError> {
+    let mut stack = Vec::new();
+    let mut seen_tables = HashSet::new();
+    seen_tables.insert(spec.to_pointer());
+    let mut scheduled_nodes = 0_usize;
+    for pair in spec.clone().pairs::<Value, Value>() {
+        let (key, value) = pair.map_err(|error| {
+            registration_validation_error(format!(
+                "cannot inspect {description} registration: {error}"
+            ))
+        })?;
+        let is_callback = matches!(
+            &key,
+            Value::String(name)
+                if name.to_str().is_ok_and(|name| name.as_bytes() == callback_field.as_bytes())
+        );
+        schedule_registration_value(&mut stack, &mut scheduled_nodes, key, 1, description)?;
+        if !is_callback {
+            schedule_registration_value(&mut stack, &mut scheduled_nodes, value, 1, description)?;
+        }
     }
+
+    let mut retained_bytes = 0_usize;
+    let mut observed_nodes = 0_usize;
+    while let Some((value, depth)) = stack.pop() {
+        observed_nodes += 1;
+        match value {
+            Value::String(value) => {
+                retained_bytes = retained_bytes
+                    .checked_add(value.as_bytes().len())
+                    .ok_or_else(|| {
+                        registration_limit_error(
+                            description,
+                            "bytes",
+                            usize::MAX,
+                            MAX_REGISTRATION_INPUT_BYTES,
+                        )
+                    })?;
+                if retained_bytes > MAX_REGISTRATION_INPUT_BYTES {
+                    return Err(registration_limit_error(
+                        description,
+                        "bytes",
+                        retained_bytes,
+                        MAX_REGISTRATION_INPUT_BYTES,
+                    ));
+                }
+            }
+            Value::Table(table) => {
+                if depth >= MAX_REGISTRATION_INPUT_DEPTH {
+                    return Err(registration_limit_error(
+                        description,
+                        "depth",
+                        depth + 1,
+                        MAX_REGISTRATION_INPUT_DEPTH,
+                    ));
+                }
+                if !seen_tables.insert(table.to_pointer()) {
+                    return Err(registration_validation_error(format!(
+                        "{description} registration contains a cyclic or repeated table"
+                    )));
+                }
+                for pair in table.pairs::<Value, Value>() {
+                    let (key, value) = pair.map_err(|error| {
+                        registration_validation_error(format!(
+                            "cannot inspect nested {description} metadata: {error}"
+                        ))
+                    })?;
+                    schedule_registration_value(
+                        &mut stack,
+                        &mut scheduled_nodes,
+                        key,
+                        depth + 1,
+                        description,
+                    )?;
+                    schedule_registration_value(
+                        &mut stack,
+                        &mut scheduled_nodes,
+                        value,
+                        depth + 1,
+                        description,
+                    )?;
+                }
+            }
+            Value::Nil | Value::Boolean(_) | Value::Integer(_) | Value::Number(_) => {}
+            unsupported => {
+                return Err(registration_validation_error(format!(
+                    "{description} metadata contains unsupported Lua {}",
+                    unsupported.type_name()
+                )));
+            }
+        }
+    }
+    debug_assert_eq!(observed_nodes, scheduled_nodes);
+    Ok(())
+}
+
+fn schedule_registration_value(
+    stack: &mut Vec<(Value, usize)>,
+    scheduled_nodes: &mut usize,
+    value: Value,
+    depth: usize,
+    description: &str,
+) -> Result<(), ShellError> {
+    *scheduled_nodes = scheduled_nodes.checked_add(1).ok_or_else(|| {
+        registration_limit_error(
+            description,
+            "nodes",
+            usize::MAX,
+            MAX_REGISTRATION_INPUT_NODES,
+        )
+    })?;
+    if *scheduled_nodes > MAX_REGISTRATION_INPUT_NODES {
+        return Err(registration_limit_error(
+            description,
+            "nodes",
+            *scheduled_nodes,
+            MAX_REGISTRATION_INPUT_NODES,
+        ));
+    }
+    stack.push((value, depth));
     Ok(())
 }
 
@@ -2798,6 +3629,7 @@ fn validate_completion_result(value: &serde_json::Value, command: &str) -> Resul
         ))
         .with_help("Return the most relevant completion items and keep the result bounded"));
     }
+    let mut total_retained_bytes = 0_usize;
     for (index, item) in items.iter().enumerate() {
         let retained_bytes = match item {
             serde_json::Value::String(value) => value.len(),
@@ -2835,8 +3667,130 @@ fn validate_completion_result(value: &serde_json::Value, command: &str) -> Resul
             ))
             .with_help("Shorten completion display, summary, and detail text"));
         }
+        total_retained_bytes = total_retained_bytes
+            .checked_add(retained_bytes)
+            .ok_or_else(|| {
+                lua_return_limit_error(
+                    "completion retained bytes",
+                    usize::MAX,
+                    MAX_LUA_COMPLETION_RETAINED_BYTES,
+                )
+            })?;
+        if total_retained_bytes > MAX_LUA_COMPLETION_RETAINED_BYTES {
+            return Err(lua_return_limit_error(
+                "completion retained bytes",
+                total_retained_bytes,
+                MAX_LUA_COMPLETION_RETAINED_BYTES,
+            ));
+        }
     }
     Ok(())
+}
+
+fn validate_lua_return_shape(value: &Value) -> Result<(), ShellError> {
+    let mut stack = vec![(value.clone(), 0_usize)];
+    let mut seen_tables = HashSet::new();
+    let mut scheduled_nodes = 1_usize;
+    let mut retained_bytes = 0_usize;
+    while let Some((value, depth)) = stack.pop() {
+        match value {
+            Value::Nil | Value::Boolean(_) | Value::Integer(_) | Value::Number(_) => {}
+            Value::LightUserData(data) if data.0.is_null() => {}
+            Value::String(value) => {
+                retained_bytes = retained_bytes
+                    .checked_add(value.as_bytes().len())
+                    .ok_or_else(|| {
+                        lua_return_limit_error(
+                            "retained bytes",
+                            usize::MAX,
+                            MAX_LUA_RETURN_RETAINED_BYTES,
+                        )
+                    })?;
+                if retained_bytes > MAX_LUA_RETURN_RETAINED_BYTES {
+                    return Err(lua_return_limit_error(
+                        "retained bytes",
+                        retained_bytes,
+                        MAX_LUA_RETURN_RETAINED_BYTES,
+                    ));
+                }
+            }
+            Value::Table(table) => {
+                if depth >= MAX_LUA_RETURN_DEPTH {
+                    return Err(lua_return_limit_error(
+                        "depth",
+                        depth + 1,
+                        MAX_LUA_RETURN_DEPTH,
+                    ));
+                }
+                if !seen_tables.insert(table.to_pointer()) {
+                    return Err(validation_error(
+                        "Lua callback return",
+                        "return value contains a cyclic or repeated table",
+                    ));
+                }
+                for pair in table.pairs::<Value, Value>() {
+                    let (key, value) = pair.map_err(|error| {
+                        validation_error(
+                            "Lua callback return",
+                            format!("cannot inspect returned table: {error}"),
+                        )
+                    })?;
+                    match &key {
+                        Value::String(_) => {}
+                        Value::Integer(index) if (1..=MAX_LUA_RETURN_INDEX).contains(index) => {}
+                        _ => {
+                            return Err(validation_error(
+                                "Lua callback return",
+                                "returned tables require bounded positive integer or string keys",
+                            ));
+                        }
+                    }
+                    schedule_lua_return_value(&mut stack, &mut scheduled_nodes, key, depth + 1)?;
+                    schedule_lua_return_value(&mut stack, &mut scheduled_nodes, value, depth + 1)?;
+                }
+            }
+            unsupported => {
+                return Err(validation_error(
+                    "Lua callback return",
+                    format!(
+                        "return value contains unsupported Lua {}",
+                        unsupported.type_name()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn schedule_lua_return_value(
+    stack: &mut Vec<(Value, usize)>,
+    scheduled_nodes: &mut usize,
+    value: Value,
+    depth: usize,
+) -> Result<(), ShellError> {
+    *scheduled_nodes = scheduled_nodes
+        .checked_add(1)
+        .ok_or_else(|| lua_return_limit_error("nodes", usize::MAX, MAX_LUA_RETURN_NODES))?;
+    if *scheduled_nodes > MAX_LUA_RETURN_NODES {
+        return Err(lua_return_limit_error(
+            "nodes",
+            *scheduled_nodes,
+            MAX_LUA_RETURN_NODES,
+        ));
+    }
+    stack.push((value, depth));
+    Ok(())
+}
+
+fn lua_return_limit_error(description: &str, observed: usize, limit: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        "Lua callback return exceeded its configured shape limit",
+    )
+    .with_context("lua failure: returned shape")
+    .with_context(format!("{description}: {observed}; limit: {limit}"))
+    .with_help("Return a smaller, shallower typed value")
 }
 
 fn lint_source(source: &str, path: &Path) -> Result<(), ShellError> {
@@ -3185,18 +4139,39 @@ fn script_read_error(path: &Path, error: std::io::Error) -> ShellError {
 }
 
 fn lua_error(error: mlua::Error, path: Option<&Path>, source_len: usize) -> ShellError {
+    if let Some(error) = error.downcast_ref::<ShellError>() {
+        let mut error = error.clone();
+        if error.details.context.is_empty() {
+            let message = error.message.clone();
+            error = error.with_context(message);
+        }
+        if let Some(path) = path {
+            error = error.with_label(
+                Some(path.display().to_string()),
+                0,
+                source_len,
+                "failed Lua operation",
+            );
+        }
+        return error;
+    }
     let message = error.to_string();
-    let code = if message.contains(RESOURCE_LIMIT_SENTINEL) || message.contains("memory error") {
-        ErrorCode::ResourceLimit
-    } else {
-        ErrorCode::Lua
-    };
-    let summary = if code == ErrorCode::ResourceLimit {
-        "Lua exceeded its configured resource budget"
-    } else {
-        "Lua could not load or evaluate the program"
-    };
-    ShellError::new(code, summary)
+    if lua_error_is_memory(&error) {
+        return ShellError::new(
+            ErrorCode::ResourceLimit,
+            "Lua exceeded its configured memory budget",
+        )
+        .with_context("lua failure: memory")
+        .with_context(message)
+        .with_help("Reduce retained Lua data or raise memory_limit_bytes after review")
+        .with_label(
+            path.map(|path| path.display().to_string()),
+            0,
+            source_len,
+            "Lua allocator refused memory",
+        );
+    }
+    ShellError::new(ErrorCode::Lua, "Lua could not load or evaluate the program")
         .with_context(message)
         .with_help("Run `quirl check <file> --format json` for a machine-readable diagnostic")
         .with_label(
@@ -3205,6 +4180,30 @@ fn lua_error(error: mlua::Error, path: Option<&Path>, source_len: usize) -> Shel
             source_len,
             "invalid or failed Lua program",
         )
+}
+
+fn lua_error_is_memory(error: &mlua::Error) -> bool {
+    match error {
+        mlua::Error::MemoryError(_) => true,
+        mlua::Error::BadArgument { cause, .. }
+        | mlua::Error::CallbackError { cause, .. }
+        | mlua::Error::WithContext { cause, .. } => lua_error_is_memory(cause),
+        _ => false,
+    }
+}
+
+fn lua_resource_error(
+    resource: &str,
+    observation: impl Into<String>,
+    help: impl Into<String>,
+) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("Lua exceeded its configured {resource} budget"),
+    )
+    .with_context(format!("lua failure: {resource}"))
+    .with_context(observation)
+    .with_help(help)
 }
 
 fn validation_error(source: &str, message: impl Into<String>) -> ShellError {
@@ -3717,6 +4716,11 @@ mod tests {
         .unwrap();
         let error = runtime.eval("while true do end").unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|item| item == "lua failure: instruction"));
     }
 
     #[test]
@@ -3725,6 +4729,70 @@ mod tests {
         runtime.cancellation_token().cancel();
         let error = runtime.eval("while true do end").unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|item| item == "lua failure: cancellation"));
+    }
+
+    #[test]
+    fn allocator_refusal_is_distinct_and_the_runtime_recovers() {
+        let baseline = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let memory_limit_bytes = baseline.lua.used_memory() + 64 * 1024;
+        drop(baseline);
+        let runtime = LuaRuntime::new(LuaPolicy {
+            memory_limit_bytes,
+            ..LuaPolicy::config()
+        })
+        .unwrap();
+        let error = runtime
+            .eval(
+                "local values = {}; for i = 1, 100000 do values[i] = string.rep('x', 128) end; return values",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|item| item == "lua failure: memory"));
+        assert_eq!(runtime.eval("collectgarbage(); return 42").unwrap(), 42);
+    }
+
+    #[test]
+    fn invalid_and_tiny_policies_fail_without_leaking_partial_initialization() {
+        for policy in [
+            LuaPolicy {
+                memory_limit_bytes: 0,
+                ..LuaPolicy::config()
+            },
+            LuaPolicy {
+                instruction_limit: 0,
+                ..LuaPolicy::config()
+            },
+            LuaPolicy {
+                wall_time: Duration::ZERO,
+                ..LuaPolicy::config()
+            },
+        ] {
+            let error = LuaRuntime::new(policy).err().unwrap();
+            assert_eq!(error.code, ErrorCode::Validation);
+        }
+
+        let error = LuaRuntime::new(LuaPolicy {
+            memory_limit_bytes: 1,
+            ..LuaPolicy::config()
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|item| item == "lua failure: memory"));
+        LuaRuntime::new(LuaPolicy::config()).unwrap();
     }
 
     #[test]
@@ -3750,12 +4818,139 @@ mod tests {
         let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
         let value = runtime
             .eval(
-                "return { io == nil, os == nil, debug == nil, package == nil, require == nil, dofile == nil, loadfile == nil }",
+                "return { io == nil, os == nil, debug == nil, package == nil, require == nil, dofile == nil, loadfile == nil, print == nil, warn == nil, coroutine == nil, table ~= nil, string ~= nil, math ~= nil, utf8 ~= nil }",
             )
             .unwrap();
         assert_eq!(
             value,
-            serde_json::json!([true, true, true, true, true, true, true])
+            serde_json::json!([
+                true, true, true, true, true, true, true, true, true, true, true, true, true, true
+            ])
+        );
+    }
+
+    #[test]
+    fn every_registration_surface_rejects_count_amplification_and_rolls_back() {
+        let cases = [
+            (
+                MAX_PLUGIN_PROMPT_SEGMENTS,
+                r#"quirl.prompt.add_segment { name = "prompt" .. i, render = function() return nil end }"#,
+            ),
+            (
+                MAX_PLUGIN_COMPLETION_PROVIDERS,
+                r#"quirl.completion.add_provider { command = "complete" .. i, complete = function() return {} end }"#,
+            ),
+            (
+                MAX_PLUGIN_COMMANDS,
+                r#"quirl.plugin.command { name = "command" .. i, signature = "command", summary = "summary", details = "details", input_type = "Nothing", output_type = "Record", examples = { "command" }, effects = { "none" }, error_codes = { E = "error" }, run = function() return {} end }"#,
+            ),
+            (
+                MAX_PLUGIN_EVENT_HANDLERS,
+                r#"quirl.events.subscribe { name = "handler" .. i, events = { "result" }, capabilities = { "events_observe" }, deadline_ms = 10, observe = function() return {} end }"#,
+            ),
+            (
+                MAX_PLUGIN_CONTRIBUTIONS,
+                r#"quirl.extension.contribute { kind = "catalog", name = "contribution" .. i, deadline_ms = 10, provide = function() return {} end }"#,
+            ),
+            (
+                MAX_PLUGIN_PANELS,
+                r#"quirl.extension.contribute { kind = "panel", name = "panel" .. i, deadline_ms = 10, plain_fallback = "unavailable", provide = function() return {} end }"#,
+            ),
+        ];
+        for (limit, registration) in cases {
+            let exact_source = format!("for i = 1, {limit} do {registration} end");
+            let exact_runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+            exact_runtime
+                .load_plugin_source(&exact_source, "exact-boundary.lua")
+                .unwrap();
+
+            let source = format!("for i = 1, {} do {registration} end", limit + 1);
+            let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+            let error = runtime
+                .load_plugin_source(&source, "amplification.lua")
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "lua failure: registration"));
+            assert_eq!(runtime.registrations(), PluginRegistrations::default());
+        }
+    }
+
+    #[test]
+    fn registration_fields_and_aggregate_bytes_are_bounded_before_commit() {
+        let oversized_name = "x".repeat(MAX_REGISTRATION_NAME_BYTES + 1);
+        let oversized_description = "x".repeat(MAX_REGISTRATION_DESCRIPTION_BYTES + 1);
+        let oversized_details = "x".repeat(MAX_COMMAND_DETAILS_BYTES + 1);
+        let oversized_type = "x".repeat(MAX_COMMAND_TYPE_BYTES + 1);
+        let oversized_fallback = "x".repeat(MAX_PANEL_FALLBACK_BYTES + 1);
+        let cases = [
+            format!(
+                "quirl.prompt.add_segment {{ name = '{oversized_name}', render = function() end }}"
+            ),
+            format!(
+                "quirl.completion.add_provider {{ command = '{oversized_name}', complete = function() return {{}} end }}"
+            ),
+            format!(
+                "quirl.plugin.command {{ name = 'command', signature = 'command', summary = '{oversized_description}', details = 'details', input_type = 'Nothing', output_type = 'Record', examples = {{ 'command' }}, effects = {{ 'none' }}, error_codes = {{ E = 'error' }}, run = function() end }}"
+            ),
+            format!(
+                "quirl.plugin.command {{ name = 'command', signature = 'command', summary = 'summary', details = '{oversized_details}', input_type = 'Nothing', output_type = 'Record', examples = {{ 'command' }}, effects = {{ 'none' }}, error_codes = {{ E = 'error' }}, run = function() end }}"
+            ),
+            format!(
+                "quirl.plugin.command {{ name = 'command', signature = 'command', summary = 'summary', details = 'details', input_type = '{oversized_type}', output_type = 'Record', examples = {{ 'command' }}, effects = {{ 'none' }}, error_codes = {{ E = 'error' }}, run = function() end }}"
+            ),
+            format!(
+                "quirl.events.subscribe {{ name = '{oversized_name}', events = {{ 'result' }}, capabilities = {{ 'events_observe' }}, deadline_ms = 10, observe = function() return {{}} end }}"
+            ),
+            format!(
+                "quirl.extension.contribute {{ kind = 'catalog', name = '{oversized_name}', deadline_ms = 10, provide = function() return {{}} end }}"
+            ),
+            format!(
+                "quirl.extension.contribute {{ kind = 'panel', name = 'panel', deadline_ms = 10, plain_fallback = '{oversized_fallback}', provide = function() return {{}} end }}"
+            ),
+        ];
+        for source in cases {
+            let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+            let error = runtime
+                .load_plugin_source(&source, "oversized-registration.lua")
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert_eq!(runtime.registrations(), PluginRegistrations::default());
+        }
+    }
+
+    #[test]
+    fn failed_plugin_load_discards_partial_callbacks_and_allows_recovery() {
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let error = runtime
+            .load_plugin_source(
+                r#"
+                quirl.prompt.add_segment { name = "partial", render = function() return "bad" end }
+                quirl.prompt.add_segment { name = "partial", render = function() return "duplicate" end }
+                "#,
+                "partial.lua",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert_eq!(runtime.registrations(), PluginRegistrations::default());
+        assert!(runtime
+            .render_prompt_segment("partial", &serde_json::json!({}))
+            .is_err());
+
+        runtime
+            .load_plugin_source(
+                r#"quirl.prompt.add_segment { name = "recovered", render = function() return "ok" end }"#,
+                "recovered.lua",
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .render_prompt_segment("recovered", &serde_json::json!({}))
+                .unwrap(),
+            Some("ok".to_owned())
         );
     }
 
@@ -3840,6 +5035,11 @@ mod tests {
             .render_prompt_segment("runaway", &serde_json::json!({}))
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|item| item == "lua failure: wall_time"));
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
@@ -3895,6 +5095,122 @@ mod tests {
         let error = validate_completion_result(&too_large, "bounded").unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert!(error.message.contains("too large"));
+
+        let aggregate = serde_json::Value::Array(
+            (0..=MAX_LUA_COMPLETION_RETAINED_BYTES / MAX_LUA_COMPLETION_ITEM_BYTES)
+                .map(|_| serde_json::Value::String("x".repeat(MAX_LUA_COMPLETION_ITEM_BYTES)))
+                .collect(),
+        );
+        let error = validate_completion_result(&aggregate, "bounded").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|item| item.contains("completion retained bytes")));
+    }
+
+    #[test]
+    fn callback_returns_enforce_bytes_nodes_depth_cycles_and_action_counts() {
+        let prompt = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        prompt
+            .eval(&format!(
+                "quirl.prompt.add_segment {{ name = 'large', render = function() return string.rep('x', {}) end }}",
+                MAX_PROMPT_RETURN_BYTES + 1
+            ))
+            .unwrap();
+        let error = prompt
+            .render_prompt_segment("large", &serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+
+        let shape = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let deeply_nested = format!(
+            "local value = 1; {} return value",
+            (0..=MAX_LUA_RETURN_DEPTH)
+                .map(|_| "value = { value };")
+                .collect::<String>()
+        );
+        let error = shape.eval(&deeply_nested).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        let error = shape
+            .eval("local value = {}; value.self = value; return value")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        let error = shape
+            .eval(&format!(
+                "local value = {{}}; for i = 1, {MAX_LUA_RETURN_NODES} do value[i] = i end; return value"
+            ))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+
+        let events = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        events
+            .eval(&format!(
+                r#"quirl.events.subscribe {{
+                    name = "many", events = {{ "result" }},
+                    capabilities = {{ "events_observe" }}, deadline_ms = 10,
+                    observe = function()
+                        local actions = {{}}
+                        for i = 1, {} do
+                            actions[i] = {{ action = "diagnose", message = "message" }}
+                        end
+                        return actions
+                    end,
+                }}"#,
+                MAX_EVENT_ACTIONS + 1
+            ))
+            .unwrap();
+        let reports = events
+            .dispatch_extension_event(&ExtensionEvent::new(
+                1,
+                ExtensionEventData::Result {
+                    status: 0,
+                    duration_ms: 1,
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            reports[0].error.as_ref().unwrap().code,
+            ErrorCode::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn serialized_registrations_validate_on_writer_and_reader_boundaries() {
+        let invalid = PluginRegistrations {
+            prompt_segments: vec![PromptRegistration {
+                name: "x".repeat(MAX_REGISTRATION_NAME_BYTES + 1),
+                deadline_ms: 8,
+            }],
+            ..PluginRegistrations::default()
+        };
+        assert!(serde_json::to_string(&invalid).is_err());
+
+        let wire = serde_json::json!({
+            "prompt_segments": [{
+                "name": "x".repeat(MAX_REGISTRATION_NAME_BYTES + 1),
+                "deadline_ms": 8
+            }],
+            "completion_providers": [],
+            "commands": [],
+            "events": [],
+            "contributions": []
+        });
+        assert!(serde_json::from_value::<PluginRegistrations>(wire).is_err());
+
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let valid = runtime
+            .load_plugin_source(
+                r#"quirl.prompt.add_segment { name = "valid", render = function() end }"#,
+                "valid.lua",
+            )
+            .unwrap();
+        let encoded = serde_json::to_vec(&valid).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<PluginRegistrations>(&encoded).unwrap(),
+            valid
+        );
     }
 
     #[test]
@@ -4031,6 +5347,70 @@ return { main = exported }
         assert!(markdown.contains("`quirl.process.run(command: string) -> quirl.Result`"));
         assert!(markdown.contains("| `command` | `string` |"));
         assert!(markdown.contains("Returns: `quirl.Result`"));
+    }
+
+    #[test]
+    fn installed_runtime_functions_and_primary_grants_exactly_match_host_api() {
+        fn collect_functions(table: &Table, prefix: &str, paths: &mut Vec<String>) {
+            for pair in table.clone().pairs::<String, Value>() {
+                let (name, value) = pair.unwrap();
+                let path = format!("{prefix}.{name}");
+                match value {
+                    Value::Function(_) => paths.push(path),
+                    Value::Table(table) => collect_functions(&table, &path, paths),
+                    _ => {}
+                }
+            }
+        }
+
+        let runtime = LuaRuntime::new_with_capabilities(LuaPolicy::config(), &[]).unwrap();
+        let quirl = runtime.lua.globals().get::<Table>("quirl").unwrap();
+        let mut installed = Vec::new();
+        collect_functions(&quirl, "quirl", &mut installed);
+        installed.sort();
+        let mut declared = HOST_API
+            .iter()
+            .map(|specification| specification.path.to_owned())
+            .collect::<Vec<_>>();
+        declared.sort();
+        declared.dedup();
+        assert_eq!(
+            declared.len(),
+            HOST_API.len(),
+            "HOST_API paths must be unique"
+        );
+        assert_eq!(installed, declared);
+
+        for specification in HOST_API {
+            let Some(capability) = specification.capability else {
+                continue;
+            };
+            let mut parts = specification.path.split('.');
+            assert_eq!(parts.next(), Some("quirl"));
+            let mut table = quirl.clone();
+            let mut function = None;
+            let components = parts.collect::<Vec<_>>();
+            for (index, component) in components.iter().enumerate() {
+                if index + 1 == components.len() {
+                    function = Some(table.get::<Function>(*component).unwrap());
+                } else {
+                    table = table.get::<Table>(*component).unwrap();
+                }
+            }
+            let argument = if specification.path == "quirl.process.run" {
+                Value::String(runtime.lua.create_string("true").unwrap())
+            } else {
+                Value::Table(runtime.lua.create_table().unwrap())
+            };
+            let error = function.unwrap().call::<Value>(argument).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("capability denied: {capability}")),
+                "{} did not enforce its declared primary grant",
+                specification.path
+            );
+        }
     }
 
     #[test]
