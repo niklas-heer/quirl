@@ -137,13 +137,8 @@ pub fn editor_with_extensions_config_and_history(
             .with_context(error.to_string())
             .with_help("Set QUIRL_HISTORY to a writable file path")
         })?;
-    let history_items = fs::read_to_string(&history_path)
-        .unwrap_or_default()
-        .lines()
-        .rev()
-        .enumerate()
-        .map(|(index, line)| picker_item(index, ItemKind::History, line, "history"))
-        .collect();
+    let history_items =
+        history_picker_items(&fs::read_to_string(&history_path).unwrap_or_default());
     Ok(configured_editor(
         catalog,
         extension_completer,
@@ -1414,9 +1409,13 @@ fn rank_picker_suggestions_of_kind(
     replace_start: usize,
     replace_end: usize,
 ) -> Vec<Suggestion> {
+    let mut seen_history_values = HashSet::new();
     let scoped = items
         .iter()
-        .filter(|item| item.kind == kind)
+        .filter(|item| {
+            item.kind == kind
+                && (kind != ItemKind::History || seen_history_values.insert(item.value.as_str()))
+        })
         .cloned()
         .collect::<Vec<_>>();
     rank_picker_suggestions(&scoped, query, replace_start, replace_end)
@@ -1424,14 +1423,18 @@ fn rank_picker_suggestions_of_kind(
 
 fn read_history_picker_items(path: &Path) -> Option<Vec<PickItem>> {
     let source = fs::read_to_string(path).ok()?;
-    Some(
-        source
-            .lines()
-            .rev()
-            .enumerate()
-            .map(|(index, line)| picker_item(index, ItemKind::History, line, "history"))
-            .collect(),
-    )
+    Some(history_picker_items(&source))
+}
+
+fn history_picker_items(source: &str) -> Vec<PickItem> {
+    let mut seen = HashSet::new();
+    source
+        .lines()
+        .rev()
+        .filter(|line| seen.insert((*line).to_owned()))
+        .enumerate()
+        .map(|(index, line)| picker_item(index, ItemKind::History, line, "history"))
+        .collect()
 }
 
 fn picker_sources(catalog: &Catalog, mut items: Vec<PickItem>) -> Vec<PickItem> {
@@ -2175,6 +2178,30 @@ mod tests {
             suggestions[0].span,
             Span::new(4, "cat crates/quirlXYZ".len())
         );
+    }
+
+    #[test]
+    fn history_picker_keeps_only_the_most_recent_copy_of_each_command() {
+        let items = history_picker_items("cargo test\ncargo clippy\ncargo test\n");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].value, "cargo test");
+        assert_eq!(items[1].value, "cargo clippy");
+
+        let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
+        let fallback_items = vec![
+            picker_item(0, ItemKind::History, "cargo test", "history"),
+            picker_item(1, ItemKind::History, "cargo test", "history"),
+        ];
+        let mut completer = CatalogCompleter::with_extensions_and_picker(
+            Catalog::builtin(),
+            None,
+            fallback_items,
+            None,
+            picker_invocation,
+        );
+        let suggestions = completer.complete("cargo", 5);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].value, "cargo test");
     }
 
     #[test]
