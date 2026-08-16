@@ -7,7 +7,6 @@ use quirl_core::ShellError;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver},
         Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
@@ -78,7 +77,7 @@ struct ExtensionQueue {
 
 struct ExtensionWorker {
     queue: Arc<(Mutex<ExtensionQueue>, Condvar)>,
-    responses: Receiver<ExtensionResponse>,
+    response: Arc<Mutex<Option<ExtensionResponse>>>,
     latest_request_id: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
 }
@@ -87,9 +86,10 @@ impl ExtensionWorker {
     fn new(mut completer: Box<dyn ExtensionCompleter + Send>) -> Self {
         let queue = Arc::new((Mutex::new(ExtensionQueue::default()), Condvar::new()));
         let worker_queue = Arc::clone(&queue);
+        let response = Arc::new(Mutex::new(None));
+        let worker_response = Arc::clone(&response);
         let latest_request_id = Arc::new(AtomicU64::new(0));
         let worker_latest = Arc::clone(&latest_request_id);
-        let (response_sender, responses) = mpsc::channel();
         let worker = thread::spawn(move || loop {
             let request = {
                 let (lock, ready) = &*worker_queue;
@@ -108,20 +108,21 @@ impl ExtensionWorker {
                 continue;
             };
             let items = completer.complete(&request.line, request.cursor);
-            if worker_latest.load(Ordering::Acquire) == request.request_id
-                && response_sender
-                    .send(ExtensionResponse {
+            if worker_latest.load(Ordering::Acquire) == request.request_id {
+                let mut slot = worker_response
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if worker_latest.load(Ordering::Acquire) == request.request_id {
+                    *slot = Some(ExtensionResponse {
                         request_id: request.request_id,
                         items,
-                    })
-                    .is_err()
-            {
-                return;
+                    });
+                }
             }
         });
         Self {
             queue,
-            responses,
+            response,
             latest_request_id,
             worker: Some(worker),
         }
@@ -153,18 +154,29 @@ impl ExtensionWorker {
         {
             state.pending = None;
         }
+        drop(state);
+        let mut response = self
+            .response
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if response
+            .as_ref()
+            .is_some_and(|response| response.request_id == request_id)
+        {
+            response.take();
+        }
     }
 
     fn try_recv_latest(&self, request_id: u64) -> Option<Vec<ExtensionSuggestion>> {
-        let mut newest = None;
-        while let Ok(response) = self.responses.try_recv() {
-            if response.request_id == request_id
-                && self.latest_request_id.load(Ordering::Acquire) == request_id
-            {
-                newest = Some(response.items);
-            }
-        }
-        newest
+        let mut response = self
+            .response
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        response.take().and_then(|response| {
+            (response.request_id == request_id
+                && self.latest_request_id.load(Ordering::Acquire) == request_id)
+                .then_some(response.items)
+        })
     }
 }
 
@@ -176,9 +188,11 @@ impl Drop for ExtensionWorker {
         state.pending = None;
         ready.notify_one();
         drop(state);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // Completion callbacks are host/plugin code. Once one is executing,
+        // synchronous cancellation cannot make joining safe for terminal
+        // teardown. All worker-owned state is Arc-backed, so detach after
+        // recording shutdown and let a bounded callback finish independently.
+        self.worker.take();
     }
 }
 
@@ -514,7 +528,10 @@ fn infer_kind(value: &str) -> CompletionKind {
 mod tests {
     use super::*;
     use quirl_catalog::Catalog;
-    use std::time::{Duration, Instant};
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
 
     struct SlowCompleter {
         delay: Duration,
@@ -531,6 +548,27 @@ mod tests {
                 replace_start: 0,
                 replace_end: cursor,
             }]
+        }
+    }
+
+    struct GatedCompleter {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        started: mpsc::Sender<()>,
+        finished: mpsc::Sender<()>,
+    }
+
+    impl ExtensionCompleter for GatedCompleter {
+        fn complete(&mut self, _line: &str, _cursor: usize) -> Vec<ExtensionSuggestion> {
+            let _ = self.started.send(());
+            let (lock, ready) = &*self.gate;
+            let mut released = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*released {
+                released = ready
+                    .wait(released)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            let _ = self.finished.send(());
+            Vec::new()
         }
     }
 
@@ -663,5 +701,58 @@ mod tests {
         }
         assert!(state.items.iter().any(|item| item.value == "plugin-new"));
         assert!(!state.items.iter().any(|item| item.value == "plugin-old"));
+    }
+
+    #[test]
+    fn blocked_extension_shutdown_is_nonblocking_and_flood_keeps_one_pending_query() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = ExtensionWorker::new(Box::new(GatedCompleter {
+            gate: Arc::clone(&gate),
+            started: started_tx,
+            finished: finished_tx,
+        }));
+        worker.submit(ExtensionRequest {
+            request_id: 1,
+            line: "first".to_owned(),
+            cursor: 5,
+        });
+        assert!(started_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+
+        const REQUESTS: u64 = 10_000;
+        for request_id in 2..=REQUESTS {
+            worker.submit(ExtensionRequest {
+                request_id,
+                line: "latest".to_owned(),
+                cursor: 6,
+            });
+        }
+        let pending = {
+            let (lock, _) = &*worker.queue;
+            lock.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pending
+                .as_ref()
+                .map(|request| request.request_id)
+        };
+        assert_eq!(pending, Some(REQUESTS));
+
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(worker);
+            let _ = dropped_tx.send(());
+        });
+        let drop_result = dropped_rx.recv_timeout(Duration::from_millis(250));
+
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        ready.notify_all();
+        assert!(finished_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        dropper.join().unwrap();
+        assert!(
+            drop_result.is_ok(),
+            "worker shutdown waited for a blocked extension callback"
+        );
     }
 }

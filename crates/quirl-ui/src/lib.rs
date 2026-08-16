@@ -32,9 +32,11 @@ use reedline::{
     PromptViMode, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Span, StyledText,
     Suggestion, Vi,
 };
+#[cfg(test)]
+use std::sync::mpsc;
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     ffi::OsString,
     fs,
@@ -42,7 +44,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
-        mpsc, Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -791,12 +793,16 @@ struct PromptCacheEntry {
 #[derive(Default)]
 struct PromptSchedulerState {
     entries: HashMap<PathBuf, PromptCacheEntry>,
-    in_flight: HashSet<PathBuf>,
+    entry_recency: VecDeque<PathBuf>,
+    active: Option<PathBuf>,
+    pending: Option<RefreshRequest>,
+    shutdown: bool,
     refresh_generation: u64,
 }
 
 struct PromptSchedulerShared {
     state: Mutex<PromptSchedulerState>,
+    request_ready: Condvar,
     refreshed: Condvar,
 }
 
@@ -815,7 +821,6 @@ type PromptContextLoader =
 /// while one persistent worker validates the cwd and `.git` dependencies.
 pub struct PromptContextScheduler {
     shared: Arc<PromptSchedulerShared>,
-    requests: Option<mpsc::Sender<RefreshRequest>>,
     worker: Option<JoinHandle<()>>,
     first_paint_budget: Duration,
 }
@@ -832,28 +837,49 @@ impl PromptContextScheduler {
     }
 
     fn with_context_loader(first_paint_budget: Duration, loader: Arc<PromptContextLoader>) -> Self {
+        // Failure model: cwd changes can outpace filesystem scans, and a read
+        // error can drop the scheduler while the loader is still running. One
+        // replaceable request bounds queued paths, the cache has a fixed LRU
+        // cardinality, and shutdown never waits for loader completion.
         let shared = Arc::new(PromptSchedulerShared {
             state: Mutex::new(PromptSchedulerState::default()),
+            request_ready: Condvar::new(),
             refreshed: Condvar::new(),
         });
-        let (requests, receiver) = mpsc::channel::<RefreshRequest>();
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("quirl-prompt-context".to_owned())
-            .spawn(move || {
-                while let Ok(request) = receiver.recv() {
-                    let entry = loader(request.cwd.clone(), request.previous);
+            .spawn(move || loop {
+                let request = {
                     let mut state = lock_recover(&worker_shared.state);
-                    state.entries.insert(request.cwd.clone(), entry);
-                    state.in_flight.remove(&request.cwd);
-                    state.refresh_generation = state.refresh_generation.wrapping_add(1);
-                    worker_shared.refreshed.notify_all();
+                    while state.pending.is_none() && !state.shutdown {
+                        state = match worker_shared.request_ready.wait(state) {
+                            Ok(state) => state,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                    }
+                    if state.shutdown {
+                        return;
+                    }
+                    let request = state.pending.take();
+                    state.active = request.as_ref().map(|request| request.cwd.clone());
+                    request
+                };
+                let Some(request) = request else {
+                    continue;
+                };
+                let entry = loader(request.cwd.clone(), request.previous);
+                let mut state = lock_recover(&worker_shared.state);
+                if !state.shutdown {
+                    insert_prompt_cache_entry(&mut state, request.cwd, entry);
                 }
+                state.active = None;
+                state.refresh_generation = state.refresh_generation.wrapping_add(1);
+                worker_shared.refreshed.notify_all();
             })
             .ok();
         Self {
             shared,
-            requests: Some(requests),
             worker,
             first_paint_budget,
         }
@@ -868,10 +894,13 @@ impl PromptContextScheduler {
         let started = Instant::now();
         let cwd = cwd.to_path_buf();
         let directory = display_directory(&cwd);
-        let (context, cache_hit, refresh_started, request) = {
+        let (context, cache_hit, refresh_started) = {
             let mut state = lock_recover(&self.shared.state);
             let cached = state.entries.get(&cwd).cloned();
             let cache_hit = cached.is_some();
+            if cache_hit {
+                touch_prompt_cache_entry(&mut state, &cwd);
+            }
             let context = cached
                 .as_ref()
                 .map(|entry| entry.context.clone())
@@ -879,23 +908,18 @@ impl PromptContextScheduler {
                     directory,
                     ..NativePromptContext::default()
                 });
-            let refresh_started = state.in_flight.insert(cwd.clone());
-            let request = refresh_started.then_some(RefreshRequest {
-                cwd: cwd.clone(),
-                previous: cached,
-            });
-            (context, cache_hit, refresh_started, request)
-        };
-
-        if let Some(request) = request {
-            let sent = self
-                .requests
-                .as_ref()
-                .is_some_and(|requests| requests.send(request).is_ok());
-            if !sent {
-                lock_recover(&self.shared.state).in_flight.remove(&cwd);
+            let already_scheduled = state.active.as_ref() == Some(&cwd)
+                || state.pending.as_ref().map(|request| &request.cwd) == Some(&cwd);
+            let refresh_started = self.worker.is_some() && !already_scheduled && !state.shutdown;
+            if refresh_started {
+                state.pending = Some(RefreshRequest {
+                    cwd: cwd.clone(),
+                    previous: cached,
+                });
+                self.shared.request_ready.notify_one();
             }
-        }
+            (context, cache_hit, refresh_started)
+        };
 
         PromptContextSample {
             context,
@@ -912,27 +936,63 @@ impl PromptContextScheduler {
     #[cfg(test)]
     fn wait_until_idle(&self, timeout: Duration) -> bool {
         let state = lock_recover(&self.shared.state);
-        if state.in_flight.is_empty() {
+        if state.active.is_none() && state.pending.is_none() {
             return true;
         }
         let waited = self
             .shared
             .refreshed
-            .wait_timeout_while(state, timeout, |state| !state.in_flight.is_empty());
+            .wait_timeout_while(state, timeout, |state| {
+                state.active.is_some() || state.pending.is_some()
+            });
         match waited {
-            Ok((state, _)) => state.in_flight.is_empty(),
-            Err(poisoned) => poisoned.into_inner().0.in_flight.is_empty(),
+            Ok((state, _)) => state.active.is_none() && state.pending.is_none(),
+            Err(poisoned) => {
+                let state = poisoned.into_inner().0;
+                state.active.is_none() && state.pending.is_none()
+            }
         }
     }
 }
 
 impl Drop for PromptContextScheduler {
     fn drop(&mut self) {
-        self.requests.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        let mut state = lock_recover(&self.shared.state);
+        state.shutdown = true;
+        state.pending = None;
+        self.shared.request_ready.notify_one();
+        self.shared.refreshed.notify_all();
+        drop(state);
+        // Native loading is bounded by the ancestor walk and the worktree
+        // entry limit below. Arc-owned state makes detaching safe, while not
+        // joining guarantees terminal restoration cannot wait on filesystem I/O.
+        self.worker.take();
     }
+}
+
+const MAX_PROMPT_CACHE_ENTRIES: usize = 64;
+
+fn touch_prompt_cache_entry(state: &mut PromptSchedulerState, cwd: &Path) {
+    state.entry_recency.retain(|entry| entry != cwd);
+    state.entry_recency.push_back(cwd.to_path_buf());
+}
+
+fn insert_prompt_cache_entry(
+    state: &mut PromptSchedulerState,
+    cwd: PathBuf,
+    entry: PromptCacheEntry,
+) {
+    touch_prompt_cache_entry(state, &cwd);
+    state.entries.insert(cwd, entry);
+    while state.entries.len() > MAX_PROMPT_CACHE_ENTRIES {
+        let Some(expired) = state.entry_recency.pop_front() else {
+            debug_assert!(false, "prompt cache recency must track every entry");
+            state.entries.clear();
+            return;
+        };
+        state.entries.remove(&expired);
+    }
+    debug_assert_eq!(state.entries.len(), state.entry_recency.len());
 }
 
 fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1687,9 +1747,15 @@ const COMPLETION_VERSION_POLICY: VersionPolicy = VersionPolicy::frozen(COMPLETIO
 /// Worker-backed catalog completion. The editor can submit on every keystroke
 /// and consume only the newest response; old queries and explicit cancellation
 /// are never allowed to repaint a newer input buffer.
+#[derive(Default)]
+struct CompletionQueue {
+    pending: Option<CompletionRequest>,
+    shutdown: bool,
+}
+
 pub struct CompletionWorker {
-    requests: Option<mpsc::Sender<CompletionRequest>>,
-    responses: mpsc::Receiver<CompletionResponse>,
+    queue: Arc<(Mutex<CompletionQueue>, Condvar)>,
+    response: Arc<Mutex<Option<CompletionResponse>>>,
     latest_request_id: Arc<AtomicU64>,
     submitted_request_id: u64,
     worker: Option<JoinHandle<()>>,
@@ -1697,49 +1763,71 @@ pub struct CompletionWorker {
 
 impl CompletionWorker {
     pub fn new(catalog: Catalog) -> Self {
-        let (requests, request_receiver) = mpsc::channel::<CompletionRequest>();
-        let (response_sender, responses) = mpsc::channel::<CompletionResponse>();
+        // Failure model: input can arrive faster than catalog work completes,
+        // and a terminal error can drop the editor while work is in flight.
+        // One replaceable request and one replaceable response bound retained
+        // query memory. Shutdown only records state; it never waits for a
+        // worker that might still be inside a dependency call.
+        let queue = Arc::new((Mutex::new(CompletionQueue::default()), Condvar::new()));
+        let worker_queue = Arc::clone(&queue);
+        let response = Arc::new(Mutex::new(None));
+        let worker_response = Arc::clone(&response);
         let latest_request_id = Arc::new(AtomicU64::new(0));
         let worker_latest = Arc::clone(&latest_request_id);
-        let worker = thread::spawn(move || {
-            while let Ok(request) = request_receiver.recv() {
-                let request_id = request.request_id;
+        let worker = thread::spawn(move || loop {
+            let request = {
+                let (lock, ready) = &*worker_queue;
+                let mut state = lock_recover(lock);
+                while state.pending.is_none() && !state.shutdown {
+                    state = match ready.wait(state) {
+                        Ok(state) => state,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                }
+                if state.shutdown {
+                    return;
+                }
+                state.pending.take()
+            };
+            let Some(request) = request else {
+                continue;
+            };
+            let request_id = request.request_id;
+            if worker_latest.load(Ordering::Acquire) != request_id {
+                continue;
+            }
+            let started = Instant::now();
+            let mut outcome = if worker_latest.load(Ordering::Acquire) != request_id {
+                CompletionOutcome::Cancelled
+            } else {
+                CompletionOutcome::Ready {
+                    items: catalog
+                        .complete(&request.line, request.cursor)
+                        .into_iter()
+                        .take(request.limit)
+                        .collect(),
+                }
+            };
+            if worker_latest.load(Ordering::Acquire) != request_id {
+                outcome = CompletionOutcome::Cancelled;
+            } else if started.elapsed() >= Duration::from_millis(request.deadline_ms) {
+                outcome = CompletionOutcome::DeadlineExceeded;
+            }
+            if worker_latest.load(Ordering::Acquire) == request_id {
+                let mut slot = lock_recover(&worker_response);
                 if worker_latest.load(Ordering::Acquire) != request_id {
                     continue;
                 }
-                let started = Instant::now();
-                let mut outcome = if worker_latest.load(Ordering::Acquire) != request_id {
-                    CompletionOutcome::Cancelled
-                } else {
-                    CompletionOutcome::Ready {
-                        items: catalog
-                            .complete(&request.line, request.cursor)
-                            .into_iter()
-                            .take(request.limit)
-                            .collect(),
-                    }
-                };
-                if worker_latest.load(Ordering::Acquire) != request_id {
-                    outcome = CompletionOutcome::Cancelled;
-                } else if started.elapsed() >= Duration::from_millis(request.deadline_ms) {
-                    outcome = CompletionOutcome::DeadlineExceeded;
-                }
-                if worker_latest.load(Ordering::Acquire) == request_id
-                    && response_sender
-                        .send(CompletionResponse {
-                            protocol_version: COMPLETION_PROTOCOL_VERSION,
-                            request_id,
-                            outcome,
-                        })
-                        .is_err()
-                {
-                    return;
-                }
+                *slot = Some(CompletionResponse {
+                    protocol_version: COMPLETION_PROTOCOL_VERSION,
+                    request_id,
+                    outcome,
+                });
             }
         });
         Self {
-            requests: Some(requests),
-            responses,
+            queue,
+            response,
             latest_request_id,
             submitted_request_id: 0,
             worker: Some(worker),
@@ -1758,11 +1846,14 @@ impl CompletionWorker {
         self.submitted_request_id = request.request_id;
         self.latest_request_id
             .store(request.request_id, Ordering::Release);
-        self.requests
-            .as_ref()
-            .ok_or_else(unavailable_completion_worker)?
-            .send(request)
-            .map_err(|_| unavailable_completion_worker())
+        let (lock, ready) = &*self.queue;
+        let mut state = lock_recover(lock);
+        if state.shutdown {
+            return Err(unavailable_completion_worker());
+        }
+        state.pending = Some(request);
+        ready.notify_one();
+        Ok(())
     }
 
     pub fn cancel(&self, cancellation: CompletionCancellation) -> Result<(), ShellError> {
@@ -1774,32 +1865,50 @@ impl CompletionWorker {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+        let (lock, _) = &*self.queue;
+        let mut state = lock_recover(lock);
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|request| request.request_id == cancellation.request_id)
+        {
+            state.pending = None;
+        }
+        let mut response = lock_recover(&self.response);
+        if response
+            .as_ref()
+            .is_some_and(|response| response.request_id == cancellation.request_id)
+        {
+            response.take();
+        }
         Ok(())
     }
 
     pub fn try_recv_latest(&self) -> Option<CompletionResponse> {
         let expected = self.submitted_request_id;
+        let mut response = lock_recover(&self.response);
         if self.latest_request_id.load(Ordering::Acquire) != expected {
-            while self.responses.try_recv().is_ok() {}
+            response.take();
             return None;
         }
-        let mut newest = None;
-        loop {
-            match self.responses.try_recv() {
-                Ok(response) if response.request_id == expected => newest = Some(response),
-                Ok(_) => {}
-                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return newest,
-            }
-        }
+        response
+            .take()
+            .filter(|response| response.request_id == expected)
     }
 }
 
 impl Drop for CompletionWorker {
     fn drop(&mut self) {
-        self.requests.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        let (lock, ready) = &*self.queue;
+        let mut state = lock_recover(lock);
+        state.shutdown = true;
+        state.pending = None;
+        ready.notify_one();
+        drop(state);
+        // A worker already inside catalog code cannot be synchronously
+        // cancelled. Its state is Arc-owned, so detaching is memory-safe and
+        // keeps terminal teardown bounded.
+        self.worker.take();
     }
 }
 
@@ -2794,6 +2903,34 @@ mod tests {
     }
 
     #[test]
+    fn completion_worker_flood_retains_only_latest_request_and_response() {
+        let mut worker = CompletionWorker::new(Catalog::builtin());
+        const REQUESTS: u64 = 10_000;
+        for request_id in 1..=REQUESTS {
+            worker
+                .submit(completion_request(request_id, "git c"))
+                .unwrap();
+            let (lock, _) = &*worker.queue;
+            let pending_count = usize::from(lock_recover(lock).pending.is_some());
+            assert!(pending_count <= 1);
+        }
+
+        let until = Instant::now() + Duration::from_secs(1);
+        let response = loop {
+            if let Some(response) = worker.try_recv_latest() {
+                break response;
+            }
+            assert!(
+                Instant::now() < until,
+                "newest flooded request did not finish"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(response.request_id, REQUESTS);
+        assert!(lock_recover(&worker.response).is_none());
+    }
+
+    #[test]
     fn completion_cancellation_prevents_a_result_for_that_request() {
         let mut worker = CompletionWorker::new(Catalog::builtin());
         worker.submit(completion_request(1, "git c")).unwrap();
@@ -3005,6 +3142,125 @@ mod tests {
         assert!(scheduler.wait_until_idle(Duration::from_secs(1)));
         let refreshed = scheduler.sample(cwd);
         assert_eq!(refreshed.context.git_branch.as_deref(), Some("topic"));
+    }
+
+    #[test]
+    fn prompt_refresh_flood_retains_only_active_and_latest_paths() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let (started_tx, started_rx) = mpsc::channel();
+        let loader = Arc::new(move |cwd: PathBuf, _previous: Option<PromptCacheEntry>| {
+            let _ = started_tx.send(cwd.clone());
+            let (lock, ready) = &*worker_gate;
+            let mut released = lock_recover(lock);
+            while !*released {
+                released = ready
+                    .wait(released)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            test_prompt_entry(&cwd, "main", None)
+        });
+        let scheduler =
+            PromptContextScheduler::with_context_loader(Duration::from_millis(250), loader);
+        let active = PathBuf::from("/tmp/quirl-prompt-active");
+        let _ = scheduler.sample(&active);
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            active
+        );
+
+        const REQUESTS: usize = 10_000;
+        let mut latest = PathBuf::new();
+        for index in 0..REQUESTS {
+            latest = PathBuf::from(format!("/tmp/quirl-prompt-flood-{index}"));
+            let _ = scheduler.sample(&latest);
+        }
+        {
+            let state = lock_recover(&scheduler.shared.state);
+            assert_eq!(state.active.as_ref(), Some(&active));
+            assert_eq!(
+                state.pending.as_ref().map(|request| &request.cwd),
+                Some(&latest)
+            );
+        }
+
+        let (lock, ready) = &*gate;
+        *lock_recover(lock) = true;
+        ready.notify_all();
+        assert!(scheduler.wait_until_idle(Duration::from_secs(1)));
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            latest
+        );
+        assert!(started_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn prompt_cache_evicts_old_paths_at_its_cardinality_limit() {
+        let loader = Arc::new(|cwd: PathBuf, _previous: Option<PromptCacheEntry>| {
+            test_prompt_entry(&cwd, "main", None)
+        });
+        let scheduler =
+            PromptContextScheduler::with_context_loader(Duration::from_millis(250), loader);
+
+        for index in 0..MAX_PROMPT_CACHE_ENTRIES.saturating_mul(2) {
+            let cwd = PathBuf::from(format!("/tmp/quirl-prompt-cache-{index}"));
+            let _ = scheduler.sample(&cwd);
+            assert!(scheduler.wait_until_idle(Duration::from_secs(1)));
+            let state = lock_recover(&scheduler.shared.state);
+            assert!(state.entries.len() <= MAX_PROMPT_CACHE_ENTRIES);
+            assert_eq!(state.entries.len(), state.entry_recency.len());
+        }
+
+        let state = lock_recover(&scheduler.shared.state);
+        assert!(!state
+            .entries
+            .contains_key(Path::new("/tmp/quirl-prompt-cache-0")));
+        let newest = PathBuf::from(format!(
+            "/tmp/quirl-prompt-cache-{}",
+            MAX_PROMPT_CACHE_ENTRIES.saturating_mul(2).saturating_sub(1)
+        ));
+        assert!(state.entries.contains_key(&newest));
+    }
+
+    #[test]
+    fn blocked_prompt_loader_does_not_block_scheduler_drop() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let worker_gate = Arc::clone(&gate);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let loader = Arc::new(move |cwd: PathBuf, _previous: Option<PromptCacheEntry>| {
+            let _ = started_tx.send(());
+            let (lock, ready) = &*worker_gate;
+            let mut released = lock_recover(lock);
+            while !*released {
+                released = ready
+                    .wait(released)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            let _ = finished_tx.send(());
+            test_prompt_entry(&cwd, "main", None)
+        });
+        let scheduler =
+            PromptContextScheduler::with_context_loader(Duration::from_millis(250), loader);
+        let _ = scheduler.sample(Path::new("/tmp/quirl-prompt-drop"));
+        assert!(started_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(scheduler);
+            let _ = dropped_tx.send(());
+        });
+        let drop_result = dropped_rx.recv_timeout(Duration::from_millis(250));
+        let (lock, ready) = &*gate;
+        *lock_recover(lock) = true;
+        ready.notify_all();
+        assert!(finished_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        dropper.join().unwrap();
+        assert!(
+            drop_result.is_ok(),
+            "scheduler shutdown waited for a blocked prompt loader"
+        );
     }
 
     #[test]

@@ -123,7 +123,8 @@ target/release/quirl-bench release \
 when the human-readable report is sufficient; use the direct command above to
 capture canonical JSON evidence.
 
-- [ ] The harness accepts the clean revision, artifact identity, release
+- [ ] The harness accepts the clean revision embedded independently in both
+  `quirl` and `quirl-bench`, their matching source identity, the artifact
   profile, panic strategy, operating system, architecture, and independent
   digest.
 - [ ] All enforced PTY latency, first-prompt, binary-size, and bounded-history

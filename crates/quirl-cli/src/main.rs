@@ -1164,12 +1164,9 @@ impl SessionEditor {
 fn configured_editor(
     catalog: &Catalog,
     extensions: &Arc<Mutex<LuaExtensionHost>>,
-    mut config: QuirlConfig,
+    config: QuirlConfig,
     history_path: &Path,
 ) -> Result<SessionEditor, ShellError> {
-    if std::env::var_os("NO_COLOR").is_some() {
-        config.editor.semantic_hints = false;
-    }
     let completion_adapter = LuaCompletionAdapter::new(Arc::clone(extensions));
     let picker_ranker: Arc<dyn PickerRanker> = Arc::new(SharedPickerRanker);
     if select_surface(&config.ui.surface) == SurfaceKind::Rich {

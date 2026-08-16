@@ -573,6 +573,18 @@ impl RichSurface {
     }
 }
 
+impl Drop for RichSurface {
+    fn drop(&mut self) {
+        // Failure model: a read/history/completion error can unwind while raw
+        // mode is active, and completion workers may still be inside plugin
+        // code. Restore terminal ownership explicitly before Rust begins
+        // dropping fields in declaration order.
+        if self.terminal.active {
+            self.terminal.reset_best_effort();
+        }
+    }
+}
+
 #[derive(Default)]
 struct SurfaceTerminal {
     terminal: Option<Terminal<CrosstermBackend<io::Stderr>>>,
@@ -711,8 +723,15 @@ impl SurfaceTerminal {
                 );
             }
         }
+        self.finish_release(failure)
+    }
+
+    fn finish_release(&mut self, failure: Option<ShellError>) -> Result<(), ShellError> {
         self.height = 0;
-        self.active = false;
+        // Keep the guard armed after any cleanup failure. The caller may
+        // unwind immediately, and Drop must make one more best-effort attempt
+        // to restore cooked mode, cursor visibility, and input features.
+        self.active = failure.is_some();
         failure.map_or(Ok(()), Err)
     }
 
@@ -921,5 +940,23 @@ mod tests {
         trim_history(&mut history);
         assert!(history.len() <= 50_000);
         assert!(history.iter().map(String::len).sum::<usize>() <= MAX_HISTORY_RETAINED_BYTES);
+    }
+
+    #[test]
+    fn failed_explicit_release_keeps_drop_cleanup_armed() {
+        let mut terminal = SurfaceTerminal {
+            terminal: None,
+            height: 4,
+            active: true,
+        };
+        let failure = ShellError::new(ErrorCode::Io, "injected terminal cleanup failure")
+            .with_help("Retry terminal cleanup from Drop");
+
+        assert!(terminal.finish_release(Some(failure)).is_err());
+        assert!(terminal.active);
+        assert_eq!(terminal.height, 0);
+
+        assert!(terminal.finish_release(None).is_ok());
+        assert!(!terminal.active);
     }
 }

@@ -1400,14 +1400,26 @@ fn set(file: &Path, key: &str, value: &str) -> Result<i32, ShellError> {
     Ok(0)
 }
 
-/// Validate and atomically install `candidate` only if `file` still has the
-/// source the editor originally loaded. This is optimistic concurrency: a
-/// configuration app must never turn an external edit into an invisible loss.
+/// Validate and install `candidate` with no-replace semantics only if `file`
+/// still has the source the editor originally loaded. This is optimistic
+/// concurrency: a configuration app must never turn an external edit into an
+/// invisible loss. The prior entry is made durable before the candidate link,
+/// so a crash or concurrent save always leaves an explicit recovery copy.
 fn install_candidate(
     file: &Path,
     temporary: &Path,
     candidate: &str,
     expected_source: &str,
+) -> Result<(), CandidateInstallFailure> {
+    install_candidate_with_hook(file, temporary, candidate, expected_source, || {})
+}
+
+fn install_candidate_with_hook(
+    file: &Path,
+    temporary: &Path,
+    candidate: &str,
+    expected_source: &str,
+    before_candidate_link: impl FnOnce(),
 ) -> Result<(), CandidateInstallFailure> {
     let mut output = OpenOptions::new()
         .create_new(true)
@@ -1428,32 +1440,215 @@ fn install_candidate(
         .map_err(CandidateInstallFailure::from)?
         .load_config_file(temporary)
         .map_err(CandidateInstallFailure::from)?;
+    drop(output);
 
     let current = read_config_source(file).map_err(CandidateInstallFailure::from)?;
     if current != expected_source {
         return Err(CandidateInstallFailure::Conflict(conflict_error()));
     }
 
-    if let Ok(metadata) = fs::metadata(file) {
-        fs::set_permissions(temporary, metadata.permissions()).map_err(|error| {
-            CandidateInstallFailure::from(file_error("preserve permissions for", file, error))
+    // A hard link gives this transaction the portable no-replace primitive
+    // that `rename` does not: creating the destination fails if an external
+    // editor has recreated it. Prove the filesystem supports that primitive
+    // before moving the user's source entry.
+    let link_probe = transaction_path(temporary, "link-probe");
+    fs::hard_link(temporary, &link_probe).map_err(|error| {
+        CandidateInstallFailure::from(
+            file_error(
+                "prepare a no-replace configuration install for",
+                file,
+                error,
+            )
+            .with_help(
+                "Move config.lua to a filesystem that supports hard links, or edit it directly",
+            ),
+        )
+    })?;
+    fs::remove_file(&link_probe).map_err(|error| {
+        CandidateInstallFailure::from(file_error(
+            "clean up the no-replace configuration probe for",
+            file,
+            error,
+        ))
+    })?;
+
+    // Capture the directory entry before comparing it. From this point on an
+    // atomic external save can only recreate `file`; the no-replace link below
+    // observes that race instead of overwriting it. In-place writers retain the
+    // captured inode, which becomes the backup on success.
+    let retained = transaction_path(temporary, "original");
+    match fs::symlink_metadata(&retained) {
+        Ok(_) => {
+            return Err(CandidateInstallFailure::from(
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not reserve a configuration recovery path",
+                )
+                .with_context(format!("path already exists: {}", retained.display()))
+                .with_help("Retry the configuration update"),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(CandidateInstallFailure::from(file_error(
+                "inspect the configuration recovery path for",
+                file,
+                error,
+            )));
+        }
+    }
+    fs::rename(file, &retained).map_err(|error| {
+        CandidateInstallFailure::from(file_error("capture the current source for", file, error))
+    })?;
+    if let Err(error) = sync_parent(&retained) {
+        return Err(CandidateInstallFailure::Other(recover_missing_source(
+            file, &retained, error,
+        )));
+    }
+
+    let captured = match read_config_source(&retained) {
+        Ok(captured) => captured,
+        Err(error) => {
+            return Err(recover_missing_source(file, &retained, error).into());
+        }
+    };
+    if captured != expected_source {
+        return Err(CandidateInstallFailure::Conflict(recover_missing_source(
+            file,
+            &retained,
+            conflict_error(),
+        )));
+    }
+    let source_permissions = match fs::metadata(&retained) {
+        Ok(metadata) => metadata.permissions(),
+        Err(error) => {
+            let error = file_error("inspect permissions for", file, error);
+            return Err(CandidateInstallFailure::Other(recover_missing_source(
+                file, &retained, error,
+            )));
+        }
+    };
+    if let Err(error) = fs::set_permissions(temporary, source_permissions) {
+        let error = file_error("preserve permissions for", file, error);
+        return Err(CandidateInstallFailure::Other(recover_missing_source(
+            file, &retained, error,
+        )));
+    }
+
+    let backup = backup_path(file);
+    let retained_is_symlink = match fs::symlink_metadata(&retained) {
+        Ok(metadata) => metadata.file_type().is_symlink(),
+        Err(error) => {
+            let error = file_error("inspect captured source for", file, error);
+            return Err(CandidateInstallFailure::Other(recover_missing_source(
+                file, &retained, error,
+            )));
+        }
+    };
+    let recovery = if retained_is_symlink {
+        // Backups are always regular validated text, never a link to an
+        // unrelated target. Keep the captured link until candidate install
+        // succeeds so a failure can still be recovered explicitly.
+        if let Err(error) = install_backup(&retained, &backup, expected_source) {
+            return Err(CandidateInstallFailure::Other(recover_missing_source(
+                file,
+                &retained,
+                error.into_shell_error(),
+            )));
+        }
+        retained.clone()
+    } else {
+        if let Err(error) = replace_backup_candidate(&retained, &backup) {
+            return Err(CandidateInstallFailure::Other(recover_missing_source(
+                file, &retained, error,
+            )));
+        }
+        if let Err(error) = sync_parent(&backup) {
+            return Err(CandidateInstallFailure::Other(recover_missing_source(
+                file, &backup, error,
+            )));
+        }
+        backup.clone()
+    };
+
+    before_candidate_link();
+
+    if let Err(error) = fs::hard_link(temporary, file) {
+        let source_was_recreated = error.kind() == io::ErrorKind::AlreadyExists;
+        let shell_error = if source_was_recreated {
+            conflict_error()
+        } else {
+            file_error("install the validated candidate for", file, error)
+        };
+        return Err(if source_was_recreated {
+            CandidateInstallFailure::Conflict(recover_missing_source(file, &recovery, shell_error))
+        } else {
+            CandidateInstallFailure::Other(recover_missing_source(file, &recovery, shell_error))
+        });
+    }
+
+    if retained_is_symlink {
+        fs::remove_file(&retained).map_err(|error| {
+            CandidateInstallFailure::from(
+                file_error("clean up the captured configuration link for", file, error).with_help(
+                    format!("The captured link remains at {}", retained.display()),
+                ),
+            )
         })?;
     }
-    let backup = backup_path(file);
-    install_backup(file, &backup, expected_source)?;
-    // Copying the backup can be slow on networked filesystems. Re-check after
-    // it so an edit that raced the transaction is reported instead of replaced.
-    let current = read_config_source(file).map_err(CandidateInstallFailure::from)?;
-    if current != expected_source {
-        return Err(CandidateInstallFailure::Conflict(conflict_error()));
-    }
-    fs::rename(temporary, file).map_err(|error| {
-        CandidateInstallFailure::from(file_error("atomically replace", file, error).with_help(
-            format!("The original remains available at {}", backup.display()),
-        ))
+    sync_parent(file).map_err(|error| {
+        CandidateInstallFailure::from(error.with_help(format!(
+            "The candidate may be installed; the original remains available at {}",
+            backup.display()
+        )))
+    })?;
+    fs::remove_file(temporary).map_err(|error| {
+        CandidateInstallFailure::from(
+            file_error("clean up the installed candidate for", file, error).with_help(format!(
+                "The candidate is installed; remove the extra link at {}",
+                temporary.display()
+            )),
+        )
     })?;
     sync_parent(file).map_err(CandidateInstallFailure::from)?;
     Ok(())
+}
+
+fn recover_missing_source(file: &Path, recovery: &Path, error: ShellError) -> ShellError {
+    if fs::symlink_metadata(file).is_ok() {
+        return error.with_context(format!(
+            "the concurrently created source was preserved; the prior source remains at {}",
+            recovery.display()
+        ));
+    }
+    match fs::hard_link(recovery, file) {
+        Ok(()) => {
+            if recovery != backup_path(file) {
+                if let Err(cleanup_error) = fs::remove_file(recovery) {
+                    return error
+                        .with_context(format!("recovery source: {}", recovery.display()))
+                        .with_context(format!("recovery cleanup failed: {cleanup_error}"))
+                        .with_help("Review and remove the retained recovery link after reloading");
+                }
+            }
+            if let Err(sync_error) = sync_parent(file) {
+                return error
+                    .with_context(format!("automatic restore sync failed: {sync_error}"))
+                    .with_help("Verify the restored configuration after the next filesystem sync");
+            }
+            error
+        }
+        Err(restore_error) => error
+            .with_context(format!("recovery source: {}", recovery.display()))
+            .with_context(format!("automatic restore failed: {restore_error}"))
+            .with_help("Do not retry until the retained source has been restored or reviewed"),
+    }
+}
+
+fn transaction_path(temporary: &Path, suffix: &str) -> PathBuf {
+    let mut value = OsString::from(temporary.as_os_str());
+    value.push(format!(".{suffix}"));
+    PathBuf::from(value)
 }
 
 /// Install the backup through a fresh sibling and an atomic rename. Replacing
@@ -2143,6 +2338,30 @@ return config
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn external_edit_at_final_install_boundary_is_preserved_as_a_conflict() {
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("config.lua");
+        let source = example_source();
+        let external = source.replace("keymap = \"helix\"", "keymap = \"vim\"");
+        let candidate = source.replace("preview = true", "preview = false");
+        fs::write(&file, source).unwrap();
+        let temporary = temporary_path(&file).unwrap();
+
+        let error = install_candidate_with_hook(&file, &temporary, &candidate, source, || {
+            fs::write(&file, &external).unwrap()
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, CandidateInstallFailure::Conflict(_)));
+        assert_eq!(fs::read_to_string(&file).unwrap(), external);
+        assert_eq!(fs::read_to_string(backup_path(&file)).unwrap(), source);
+        assert!(!transaction_path(&temporary, "original").exists());
+        fs::remove_file(temporary).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn backup_install_replaces_symlink_without_overwriting_its_target() {
@@ -2159,6 +2378,36 @@ return config
         set(&file, "picker.preview", "false").unwrap();
 
         assert_eq!(fs::read_to_string(&target).unwrap(), "do not overwrite");
+        assert_eq!(
+            fs::read_to_string(backup_path(&file)).unwrap(),
+            example_source()
+        );
+        assert!(!fs::symlink_metadata(backup_path(&file))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_symlink_update_preserves_target_and_writes_a_regular_backup() {
+        use std::os::unix::fs::symlink;
+
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("shared-config.lua");
+        let file = directory.join("config.lua");
+        fs::write(&target, example_source()).unwrap();
+        symlink(&target, &file).unwrap();
+
+        set(&file, "picker.preview", "false").unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), example_source());
+        assert!(!fs::symlink_metadata(&file)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(
             fs::read_to_string(backup_path(&file)).unwrap(),
             example_source()

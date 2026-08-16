@@ -34,6 +34,7 @@ class Session:
         shell: Path | None = None,
         symbols: str = "plain",
         semantic_hints: bool = True,
+        no_color: bool = False,
     ) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="quirl-pty-")
         private = Path(self.temp.name)
@@ -79,6 +80,8 @@ return quirl.config {{
             "XDG_DATA_HOME": str(private / "data"),
             "XDG_STATE_HOME": str(private / "state"),
         }
+        if no_color:
+            environment["NO_COLOR"] = "1"
 
         pid, master = pty.fork()
         if pid == 0:
@@ -411,6 +414,20 @@ def check_fallbacks(binary: Path, root: Path) -> None:
             redirected.close()
 
 
+def check_no_color_preserves_semantic_hints(binary: Path, root: Path) -> None:
+    session = Session(binary, root, no_color=True)
+    try:
+        session.wait_for(STARTUP_MARKER)
+        session.type("quirl describe --unknown")
+        session.wait_for(b"unknown flag")
+        session.send(b"\x03")
+        session.wait_for(b"^C")
+        session.send(b"\x04")
+        session.wait_exit()
+    finally:
+        session.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", nargs="?", default="target/debug/quirl")
@@ -426,6 +443,7 @@ def main() -> None:
         check_rich_review_regressions,
         check_suspend_resume,
         check_fallbacks,
+        check_no_color_preserves_semantic_hints,
     ]
     for check in checks:
         check(binary, root)

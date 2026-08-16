@@ -119,6 +119,7 @@ mod platform {
     };
 
     use nix::{
+        errno::Errno,
         sys::{
             signal::{kill, killpg, pthread_sigmask, SigSet, SigmaskHow, Signal},
             termios::{tcgetattr, tcsetattr, SetArg, Termios},
@@ -140,10 +141,10 @@ mod platform {
         process::{Child, Command, Stdio},
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex, MutexGuard, OnceLock, TryLockError,
         },
         thread::{self, JoinHandle},
-        time::Instant,
+        time::{Duration, Instant},
     };
 
     #[cfg(unix)]
@@ -221,10 +222,47 @@ mod platform {
     type WriterTask = JoinHandle<std::io::Result<()>>;
     type PendingWriter = (PipeWriter, Vec<u8>);
     type OutputStdio = (Stdio, Option<PipeReader>, Option<PipeWriter>, Option<File>);
+    const FOREGROUND_TERMINAL_LEASE_WAIT_MAX: Duration = Duration::from_secs(30);
 
     struct PreparedInput {
         stdio: Stdio,
         writer: Option<PendingWriter>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RequestContext<'a> {
+        request: &'a ProcessRequest,
+        deadline: Instant,
+    }
+
+    impl<'a> RequestContext<'a> {
+        fn new(request: &'a ProcessRequest) -> Result<Self, ShellError> {
+            let deadline = Instant::now()
+                .checked_add(request.deadline)
+                .ok_or_else(|| {
+                    ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "process execution deadline is outside the platform range",
+                    )
+                    .with_context(format!("requested duration: {:?}", request.deadline))
+                    .with_help("Use a finite process deadline supported by this platform")
+                })?;
+            Ok(Self { request, deadline })
+        }
+
+        fn ensure_active(self) -> Result<(), ShellError> {
+            let cancelled = self.request.cancelled.load(Ordering::Relaxed);
+            if !cancelled && Instant::now() < self.deadline {
+                return Ok(());
+            }
+            let message = if cancelled {
+                "process execution was cancelled"
+            } else {
+                "process execution exceeded its deadline"
+            };
+            Err(ShellError::new(ErrorCode::ResourceLimit, message)
+                .with_help("Use a shorter-running command or increase the Lua policy deadline"))
+        }
     }
 
     pub struct NativeExecutor {
@@ -302,7 +340,8 @@ mod platform {
             &mut self,
             request: ProcessRequest,
         ) -> Result<CommandOutcome, ShellError> {
-            self.execute_inner_with_request(&request.command, true, Some(&request))
+            let context = RequestContext::new(&request)?;
+            self.execute_inner_with_request(&request.command, true, Some(context))
         }
 
         pub fn jobs(&mut self) -> Vec<JobState> {
@@ -388,8 +427,11 @@ mod platform {
             &mut self,
             input: &str,
             capture: bool,
-            request: Option<&ProcessRequest>,
+            request: Option<RequestContext<'_>>,
         ) -> Result<CommandOutcome, ShellError> {
+            if let Some(request) = request {
+                request.ensure_active()?;
+            }
             validate_native_source(input)?;
             let graph = parse_command_list(input).map_err(|error| {
                 ShellError::new(ErrorCode::InvalidCommand, error.message)
@@ -403,6 +445,9 @@ mod platform {
                     .with_command(input)
             })?;
             validate_native_plan(&graph)?;
+            if let Some(request) = request {
+                request.ensure_active()?;
+            }
             if graph.pipelines.is_empty() {
                 return Ok(outcome(0, None, None));
             }
@@ -424,12 +469,12 @@ mod platform {
                     append_captured_output(
                         &mut captured_stdout,
                         last.stdout.as_deref().unwrap_or_default(),
-                        retained_output_limit(request),
+                        retained_output_limit(request.map(|request| request.request)),
                     )?;
                     append_captured_output(
                         &mut captured_stderr,
                         last.stderr.as_deref().unwrap_or_default(),
-                        retained_output_limit(request),
+                        retained_output_limit(request.map(|request| request.request)),
                     )?;
                 }
             }
@@ -445,9 +490,12 @@ mod platform {
             pipeline: &Pipeline,
             source: &str,
             capture: bool,
-            request: Option<&ProcessRequest>,
+            request: Option<RequestContext<'_>>,
             previous_status: i32,
         ) -> Result<CommandOutcome, ShellError> {
+            if let Some(request) = request {
+                request.ensure_active()?;
+            }
             let pipeline = self.expand_pipeline(pipeline, request, previous_status)?;
             let pipeline = &pipeline;
             if pipeline.commands.len() == 1 {
@@ -475,16 +523,12 @@ mod platform {
         fn expand_pipeline(
             &mut self,
             pipeline: &Pipeline,
-            request: Option<&ProcessRequest>,
+            request: Option<RequestContext<'_>>,
             previous_status: i32,
         ) -> Result<Pipeline, ShellError> {
             const MAX_SUBSTITUTION_BYTES: usize = 16 * 1024;
-            if request.is_some_and(|request| request.cancelled.load(Ordering::Relaxed)) {
-                return Err(ShellError::new(
-                    ErrorCode::ResourceLimit,
-                    "command expansion was cancelled before execution",
-                )
-                .with_help("Run the command again when cancellation is no longer requested"));
+            if let Some(request) = request {
+                request.ensure_active()?;
             }
             let mut expanded = pipeline.clone();
             for command in &mut expanded.commands {
@@ -525,7 +569,7 @@ mod platform {
             &mut self,
             word: &Word,
             limit: usize,
-            request: Option<&ProcessRequest>,
+            request: Option<RequestContext<'_>>,
             previous_status: i32,
         ) -> Result<(String, bool), ShellError> {
             let mut value = String::new();
@@ -554,7 +598,7 @@ mod platform {
             &mut self,
             text: &str,
             limit: usize,
-            request: Option<&ProcessRequest>,
+            request: Option<RequestContext<'_>>,
             previous_status: i32,
         ) -> Result<String, ShellError> {
             let mut output = String::new();
@@ -737,8 +781,18 @@ mod platform {
             pipeline: &Pipeline,
             source: &str,
             capture: bool,
-            request: Option<&ProcessRequest>,
+            request: Option<RequestContext<'_>>,
         ) -> Result<CommandOutcome, ShellError> {
+            // Foreground ownership is process-global. Acquire the lease before
+            // the first child can inherit the controlling terminal, and keep it
+            // until both the foreground process group and saved terminal modes
+            // have been restored. Per-syscall locking would still allow another
+            // executor to steal the terminal between handoff and restoration.
+            let terminal_lease = if pipeline.background {
+                ForegroundTerminalLease::none()
+            } else {
+                ForegroundTerminalLease::acquire(request)?
+            };
             // Pipeline construction is a transaction. Local descriptors and
             // the guard own every partial resource until the complete process
             // group is either registered as a job or handed to the waiter.
@@ -750,7 +804,7 @@ mod platform {
             let mut stderr_readers = Vec::new();
             let mut pending_writers: Vec<PendingWriter> = Vec::new();
             let capture_streams = capture && !pipeline.background;
-            let output_limit = retained_output_limit(request);
+            let output_limit = retained_output_limit(request.map(|request| request.request));
             let stderr_budget = Arc::new(CaptureBudget::new(output_limit));
 
             for (index, command) in pipeline.commands.iter().enumerate() {
@@ -888,25 +942,12 @@ mod platform {
             }
 
             let process_group = spawned.process_group;
-            let mut terminal = ForegroundTerminal::give_to(process_group)?;
+            let mut terminal = ForegroundTerminal::give_to(process_group, terminal_lease)?;
             let mut children = spawned.release();
             let stdout_reader = capture_reader.map(|reader| spawn_reader(reader, output_limit));
             let child_count = children.len();
-            let mut wait_error = None;
-            if let Some(request) = request {
-                wait_error =
-                    wait_for_children_with_request(&mut children, process_group, request).err();
-            } else {
-                for child in &mut children {
-                    match wait_for_child(&mut child.child) {
-                        Ok(exit) => child.record(exit),
-                        Err(error) => {
-                            wait_error = Some(error);
-                            break;
-                        }
-                    }
-                }
-            }
+            let wait_error =
+                wait_for_foreground_children(&mut children, process_group, request).err();
             if let Some(error) = wait_error {
                 terminate_children(&mut children, process_group);
                 let _ = terminal.restore();
@@ -986,24 +1027,21 @@ mod platform {
         fn foreground(&mut self, id: Option<u32>) -> Result<CommandOutcome, ShellError> {
             self.refresh_jobs();
             let index = select_job(&self.jobs, id)?;
-            let mut terminal = ForegroundTerminal::give_to(self.jobs[index].state.process_group)?;
+            let terminal_lease = ForegroundTerminalLease::acquire(None)?;
+            let mut terminal =
+                ForegroundTerminal::give_to(self.jobs[index].state.process_group, terminal_lease)?;
             resume_job(&self.jobs[index])?;
             let mut job = self.jobs.remove(index);
-            let mut wait_error = None;
             for child in &mut job.children {
                 if child.status == JobStatus::Done {
                     continue;
                 }
                 child.status = JobStatus::Running;
-                match wait_for_child(&mut child.child) {
-                    Ok(exit) => child.record(exit),
-                    Err(error) => {
-                        wait_error = Some(error);
-                        break;
-                    }
-                }
+                child.exit_status = None;
             }
-            if let Some(error) = wait_error {
+            if let Err(error) =
+                wait_for_foreground_children(&mut job.children, job.state.process_group, None)
+            {
                 terminate_children(&mut job.children, job.state.process_group);
                 return Err(error);
             }
@@ -1789,17 +1827,6 @@ mod platform {
         }
     }
 
-    impl JobChild {
-        fn record(&mut self, result: ChildWait) {
-            self.status = if result.stopped {
-                JobStatus::Stopped
-            } else {
-                JobStatus::Done
-            };
-            self.exit_status = Some(result.status);
-        }
-    }
-
     fn terminate_children(children: &mut [JobChild], process_group: Option<i32>) {
         if children.is_empty() {
             return;
@@ -1945,15 +1972,27 @@ mod platform {
     }
 
     fn poll_child(child: &mut JobChild) {
-        let Ok(process_id) = i32::try_from(child.child.id()) else {
-            return;
-        };
-        let Ok(status) = waitpid(
+        let _ = poll_child_checked(child);
+    }
+
+    fn poll_child_checked(child: &mut JobChild) -> Result<bool, ShellError> {
+        let process_id = i32::try_from(child.child.id()).map_err(|error| {
+            ShellError::new(
+                ErrorCode::Io,
+                "child process id is outside the platform range",
+            )
+            .with_context(error.to_string())
+            .with_help("Report this platform-specific process error")
+        })?;
+        let status = waitpid(
             Pid::from_raw(process_id),
             Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
-        ) else {
-            return;
-        };
+        )
+        .map_err(|error| {
+            ShellError::new(ErrorCode::Io, "could not observe command state")
+                .with_context(error.to_string())
+                .with_help("Inspect the job with `jobs` and retry")
+        })?;
         match status {
             WaitStatus::Exited(_, code) => {
                 child.status = JobStatus::Done;
@@ -1973,11 +2012,81 @@ mod platform {
             }
             WaitStatus::StillAlive => {}
         }
+        Ok(!matches!(status, WaitStatus::StillAlive))
+    }
+
+    static FOREGROUND_TERMINAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct ForegroundTerminalLease {
+        guard: Option<MutexGuard<'static, ()>>,
+    }
+
+    impl ForegroundTerminalLease {
+        fn none() -> Self {
+            Self { guard: None }
+        }
+
+        fn acquire(request: Option<RequestContext<'_>>) -> Result<Self, ShellError> {
+            if !std::io::stdin().is_terminal() {
+                return Ok(Self::none());
+            }
+            Self::acquire_from(
+                FOREGROUND_TERMINAL_LOCK.get_or_init(|| Mutex::new(())),
+                request,
+                FOREGROUND_TERMINAL_LEASE_WAIT_MAX,
+            )
+        }
+
+        fn acquire_from(
+            lock: &'static Mutex<()>,
+            request: Option<RequestContext<'_>>,
+            wait_max: Duration,
+        ) -> Result<Self, ShellError> {
+            let started = Instant::now();
+            loop {
+                match lock.try_lock() {
+                    Ok(guard) => return Ok(Self { guard: Some(guard) }),
+                    Err(TryLockError::Poisoned(_)) => {
+                        return Err(ShellError::new(
+                            ErrorCode::Io,
+                            "foreground terminal ownership state is unavailable",
+                        )
+                        .with_help(
+                            "Restart Quirl so terminal ownership can be initialized safely",
+                        ));
+                    }
+                    Err(TryLockError::WouldBlock) => {
+                        if let Some(request) = request {
+                            request.ensure_active()?;
+                        } else if started.elapsed() >= wait_max {
+                            return Err(ShellError::new(
+                                ErrorCode::ResourceLimit,
+                                "foreground terminal lease wait exceeded its limit",
+                            )
+                            .with_context(format!(
+                                "limit {} ms; observed at least {} ms",
+                                wait_max.as_millis(),
+                                started.elapsed().as_millis()
+                            ))
+                            .with_help(
+                                "Wait for the active foreground command to finish, then retry",
+                            ));
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+        }
+
+        fn release(&mut self) {
+            self.guard.take();
+        }
     }
 
     struct ForegroundTerminal {
         restore_group: Option<Pid>,
         restore_modes: Option<Termios>,
+        lease: ForegroundTerminalLease,
     }
 
     struct BlockedTerminalSignals {
@@ -2008,7 +2117,10 @@ mod platform {
     }
 
     impl ForegroundTerminal {
-        fn give_to(process_group: Option<i32>) -> Result<Self, ShellError> {
+        fn give_to(
+            process_group: Option<i32>,
+            lease: ForegroundTerminalLease,
+        ) -> Result<Self, ShellError> {
             let mut restore_modes = None;
             let restore_group = if std::io::stdin().is_terminal() {
                 if let Some(group) = process_group {
@@ -2044,11 +2156,13 @@ mod platform {
             Ok(Self {
                 restore_group,
                 restore_modes,
+                lease,
             })
         }
 
         fn restore(&mut self) -> Result<(), ShellError> {
             let Some(group) = self.restore_group else {
+                self.lease.release();
                 return Ok(());
             };
             let _blocked = BlockedTerminalSignals::new()?;
@@ -2072,6 +2186,7 @@ mod platform {
             }
             self.restore_group = None;
             self.restore_modes = None;
+            self.lease.release();
             Ok(())
         }
     }
@@ -2082,61 +2197,76 @@ mod platform {
         }
     }
 
-    struct ChildWait {
-        status: i32,
-        stopped: bool,
-    }
-
-    fn wait_for_children_with_request(
+    fn wait_for_foreground_children(
         children: &mut [JobChild],
         process_group: Option<i32>,
-        request: &ProcessRequest,
+        request: Option<RequestContext<'_>>,
     ) -> Result<(), ShellError> {
-        let deadline = Instant::now() + request.deadline;
+        // A pipeline is one job: if any member stops, stop every remaining
+        // live member before returning it to the job table. Waiting children in
+        // source order can deadlock when an upstream process stops while a
+        // downstream reader waits forever for its still-open pipe. Polling all
+        // children every bounded turn observes exits and stops independently,
+        // and every observed exit is reaped exactly once into `JobChild`.
+        let mut stop_propagated = false;
         loop {
             for child in children
                 .iter_mut()
                 .filter(|child| child.status != JobStatus::Done)
             {
-                match child.child.try_wait() {
-                    Ok(Some(status)) => child.record(ChildWait {
-                        status: status.code().unwrap_or(1),
-                        stopped: false,
-                    }),
-                    Ok(None) => {}
-                    Err(error) => {
-                        terminate_children(children, process_group);
-                        return Err(ShellError::new(ErrorCode::Io, "could not poll command")
-                            .with_context(error.to_string())
-                            .with_help("Retry the command; report this if the failure repeats"));
-                    }
+                if let Err(error) = poll_child_checked(child) {
+                    terminate_children(children, process_group);
+                    return Err(error);
                 }
             }
-            if children.iter().all(|child| child.status == JobStatus::Done) {
+
+            let any_stopped = children
+                .iter()
+                .any(|child| child.status == JobStatus::Stopped);
+            if any_stopped && !stop_propagated {
+                stop_live_children(children, process_group)?;
+                stop_propagated = true;
+            }
+
+            let all_done = children.iter().all(|child| child.status == JobStatus::Done);
+            let all_live_stopped = children
+                .iter()
+                .filter(|child| child.status != JobStatus::Done)
+                .all(|child| child.status == JobStatus::Stopped);
+            if all_done || (any_stopped && all_live_stopped) {
                 return Ok(());
             }
-            let cancelled = request.cancelled.load(Ordering::Relaxed);
-            if cancelled || Instant::now() >= deadline {
-                terminate_children(children, process_group);
-                let message = if cancelled {
-                    "process execution was cancelled"
-                } else {
-                    "process execution exceeded its deadline"
-                };
-                return Err(
-                    ShellError::new(ErrorCode::ResourceLimit, message).with_help(
-                        "Use a shorter-running command or increase the Lua policy deadline",
-                    ),
-                );
+
+            if let Some(request) = request {
+                if let Err(error) = request.ensure_active() {
+                    terminate_children(children, process_group);
+                    return Err(error);
+                }
             }
-            thread::sleep(std::time::Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
-    fn wait_for_child(child: &mut Child) -> Result<ChildWait, ShellError> {
-        let pid = i32::try_from(child.id())
-            .map(Pid::from_raw)
-            .map_err(|error| {
+    fn stop_live_children(
+        children: &[JobChild],
+        process_group: Option<i32>,
+    ) -> Result<(), ShellError> {
+        if let Some(group) = process_group {
+            return match killpg(Pid::from_raw(group), Signal::SIGSTOP) {
+                Ok(()) | Err(Errno::ESRCH) => Ok(()),
+                Err(error) => Err(ShellError::new(
+                    ErrorCode::Io,
+                    "could not stop the complete foreground pipeline",
+                )
+                .with_context(error.to_string())
+                .with_help("Inspect the job with `jobs`, then cancel or resume it")),
+            };
+        }
+        for child in children
+            .iter()
+            .filter(|child| child.status == JobStatus::Running)
+        {
+            let process_id = i32::try_from(child.child.id()).map_err(|error| {
                 ShellError::new(
                     ErrorCode::Io,
                     "child process id is outside the platform range",
@@ -2144,33 +2274,19 @@ mod platform {
                 .with_context(error.to_string())
                 .with_help("Report this platform-specific process error")
             })?;
-        loop {
-            match waitpid(pid, Some(WaitPidFlag::WUNTRACED)).map_err(|error| {
-                ShellError::new(ErrorCode::Io, "could not wait for command")
+            match kill(Pid::from_raw(process_id), Signal::SIGSTOP) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(error) => {
+                    return Err(ShellError::new(
+                        ErrorCode::Io,
+                        "could not stop the complete foreground pipeline",
+                    )
                     .with_context(error.to_string())
-                    .with_help("Inspect the job with `jobs` and retry")
-            })? {
-                WaitStatus::Exited(_, code) => {
-                    return Ok(ChildWait {
-                        status: code,
-                        stopped: false,
-                    });
+                    .with_help("Inspect the job with `jobs`, then cancel or resume it"));
                 }
-                WaitStatus::Signaled(_, signal, _) => {
-                    return Ok(ChildWait {
-                        status: 128 + signal as i32,
-                        stopped: false,
-                    });
-                }
-                WaitStatus::Stopped(_, signal) => {
-                    return Ok(ChildWait {
-                        status: 128 + signal as i32,
-                        stopped: true,
-                    });
-                }
-                WaitStatus::Continued(_) | WaitStatus::StillAlive => {}
             }
         }
+        Ok(())
     }
 
     fn outcome(status: i32, stdout: Option<String>, stderr: Option<String>) -> CommandOutcome {
@@ -2230,6 +2346,7 @@ mod platform {
         };
 
         static NEXT_TEMP_PATH: AtomicUsize = AtomicUsize::new(0);
+        static TERMINAL_LEASE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
         fn temporary_path(label: &str) -> std::path::PathBuf {
             env::temp_dir().join(format!(
@@ -2473,6 +2590,89 @@ mod platform {
         }
 
         #[test]
+        fn one_absolute_deadline_bounds_the_complete_command_list() {
+            let request = ProcessRequest {
+                command: "sh -c 'sleep 0.07'; sh -c 'sleep 0.07'".to_owned(),
+                deadline: Duration::from_millis(110),
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: 1024,
+            };
+            let started = Instant::now();
+            let error = NativeExecutor::default()
+                .execute_capture_request(request)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("deadline"));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn nested_substitution_consumes_the_parent_absolute_deadline() {
+            let request = ProcessRequest {
+                command: "printf '%s' $(sh -c 'sleep 0.07; printf nested'); sh -c 'sleep 0.07'"
+                    .to_owned(),
+                deadline: Duration::from_millis(110),
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: 1024,
+            };
+            let started = Instant::now();
+            let error = NativeExecutor::default()
+                .execute_capture_request(request)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("deadline"));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn terminal_lease_waits_are_bounded_with_and_without_a_request() {
+            let held = ForegroundTerminalLease::acquire_from(
+                &TERMINAL_LEASE_TEST_LOCK,
+                None,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            let request = ProcessRequest {
+                command: "true".to_owned(),
+                deadline: Duration::from_millis(20),
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: 1024,
+            };
+            let context = RequestContext::new(&request).unwrap();
+            let started = Instant::now();
+            let error = ForegroundTerminalLease::acquire_from(
+                &TERMINAL_LEASE_TEST_LOCK,
+                Some(context),
+                Duration::from_secs(1),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(started.elapsed() < Duration::from_secs(1));
+
+            let started = Instant::now();
+            let error = ForegroundTerminalLease::acquire_from(
+                &TERMINAL_LEASE_TEST_LOCK,
+                None,
+                Duration::from_millis(20),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.details.context.iter().any(|context| {
+                context.contains("limit 20 ms") && context.contains("observed at least")
+            }));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            drop(held);
+            assert!(ForegroundTerminalLease::acquire_from(
+                &TERMINAL_LEASE_TEST_LOCK,
+                None,
+                Duration::from_secs(1)
+            )
+            .is_ok());
+        }
+
+        #[test]
         fn bounded_capture_drains_but_does_not_retain_unbounded_output() {
             let request = ProcessRequest {
                 command: "sh -c 'yes x | head -c 65536'".to_owned(),
@@ -2534,6 +2734,7 @@ mod platform {
                     "--nocapture",
                 ])
                 .env("QUIRL_INTERACTIVE_LIMIT_HELPER", "1")
+                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -2660,6 +2861,38 @@ mod platform {
             let finished = executor.execute_capture("fg %1").unwrap();
             assert_eq!(finished.status, 7);
             assert!(executor.jobs().is_empty());
+        }
+
+        #[test]
+        fn downstream_stop_is_observed_without_waiting_for_the_upstream_stage() {
+            let mut executor = NativeExecutor::default();
+            let started = Instant::now();
+            let stopped = executor
+                .execute_capture("sh -c 'sleep 5' | sh -c 'kill -STOP $$'")
+                .unwrap();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_ne!(stopped.status, 0);
+
+            let jobs = executor.jobs();
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].status, JobStatus::Stopped);
+            executor.cancel_job(jobs[0].id).unwrap();
+            assert_eq!(executor.jobs()[0].status, JobStatus::Done);
+        }
+
+        #[test]
+        fn stopped_upstream_cannot_hang_a_downstream_pipe_reader() {
+            let mut executor = NativeExecutor::default();
+            let started = Instant::now();
+            executor
+                .execute_capture("sh -c 'kill -STOP $$' | cat")
+                .unwrap();
+            assert!(started.elapsed() < Duration::from_secs(1));
+
+            let jobs = executor.jobs();
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].status, JobStatus::Stopped);
+            executor.cancel_job(jobs[0].id).unwrap();
         }
 
         #[test]
@@ -2826,6 +3059,42 @@ mod platform {
 
     type ReaderTask = JoinHandle<io::Result<ReaderCapture>>;
 
+    #[derive(Clone, Copy)]
+    struct RequestContext<'a> {
+        request: &'a ProcessRequest,
+        deadline: Instant,
+    }
+
+    impl<'a> RequestContext<'a> {
+        fn new(request: &'a ProcessRequest) -> Result<Self, ShellError> {
+            let deadline = Instant::now()
+                .checked_add(request.deadline)
+                .ok_or_else(|| {
+                    ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "process execution deadline is outside the platform range",
+                    )
+                    .with_context(format!("requested duration: {:?}", request.deadline))
+                    .with_help("Use a finite process deadline supported by this platform")
+                })?;
+            Ok(Self { request, deadline })
+        }
+
+        fn ensure_active(self) -> Result<(), ShellError> {
+            let cancelled = self.request.cancelled.load(Ordering::Relaxed);
+            if !cancelled && Instant::now() < self.deadline {
+                return Ok(());
+            }
+            let message = if cancelled {
+                "process execution was cancelled"
+            } else {
+                "process execution exceeded its deadline"
+            };
+            Err(ShellError::new(ErrorCode::ResourceLimit, message)
+                .with_help("Use a shorter-running command or increase the Lua policy deadline"))
+        }
+    }
+
     pub struct NativeExecutor {
         jobs: Vec<Job>,
         next_job_id: u32,
@@ -2888,7 +3157,8 @@ mod platform {
             &mut self,
             request: ProcessRequest,
         ) -> Result<CommandOutcome, ShellError> {
-            self.execute_inner_with_request(&request.command, true, Some(&request))
+            let context = RequestContext::new(&request)?;
+            self.execute_inner_with_request(&request.command, true, Some(context))
         }
 
         pub fn jobs(&mut self) -> Vec<JobState> {
@@ -2942,8 +3212,11 @@ mod platform {
             &mut self,
             input: &str,
             capture: bool,
-            request: Option<&ProcessRequest>,
+            request: Option<RequestContext<'_>>,
         ) -> Result<CommandOutcome, ShellError> {
+            if let Some(request) = request {
+                request.ensure_active()?;
+            }
             validate_native_source(input)?;
             let graph = parse_command_list(input).map_err(|error| {
                 ShellError::new(ErrorCode::InvalidCommand, error.message)
@@ -2957,6 +3230,9 @@ mod platform {
                     .with_command(input)
             })?;
             validate_native_plan(&graph)?;
+            if let Some(request) = request {
+                request.ensure_active()?;
+            }
             let mut last = CommandOutcome {
                 status: 0,
                 stdout: None,
@@ -2978,12 +3254,12 @@ mod platform {
                     append_captured_output(
                         &mut captured_stdout,
                         last.stdout.as_deref().unwrap_or_default(),
-                        retained_output_limit(request),
+                        retained_output_limit(request.map(|request| request.request)),
                     )?;
                     append_captured_output(
                         &mut captured_stderr,
                         last.stderr.as_deref().unwrap_or_default(),
-                        retained_output_limit(request),
+                        retained_output_limit(request.map(|request| request.request)),
                     )?;
                 }
             }
@@ -2999,8 +3275,11 @@ mod platform {
             pipeline: &Pipeline,
             source: &str,
             capture: bool,
-            request: Option<&ProcessRequest>,
+            request: Option<RequestContext<'_>>,
         ) -> Result<CommandOutcome, ShellError> {
+            if let Some(request) = request {
+                request.ensure_active()?;
+            }
             if pipeline.commands.len() == 1 {
                 if pipeline.background
                     && pipeline.commands[0].words.first().is_some_and(|name| {
@@ -3113,7 +3392,7 @@ mod platform {
             pipeline: &Pipeline,
             source: &str,
             capture: bool,
-            request: Option<&ProcessRequest>,
+            request: Option<RequestContext<'_>>,
         ) -> Result<CommandOutcome, ShellError> {
             let object = JobObject::new()?;
             let mut children = Vec::with_capacity(pipeline.commands.len());
@@ -3121,7 +3400,7 @@ mod platform {
             let mut previous_stdout: Option<ChildStdout> = None;
             let mut stdout_reader = None;
             let mut stderr_readers = Vec::new();
-            let output_limit = retained_output_limit(request);
+            let output_limit = retained_output_limit(request.map(|request| request.request));
             let stderr_budget = Arc::new(CaptureBudget::new(output_limit));
 
             for (index, command) in pipeline.commands.iter().enumerate() {
@@ -3483,27 +3762,17 @@ mod platform {
         object: &JobObject,
         children: &mut [Child],
         exit_statuses: &mut [Option<i32>],
-        request: &ProcessRequest,
+        request: RequestContext<'_>,
     ) -> Result<(), ShellError> {
-        let deadline = Instant::now() + request.deadline;
         loop {
             refresh_children(children, exit_statuses);
             if exit_statuses.iter().all(Option::is_some) {
                 return Ok(());
             }
-            if request.cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            if let Err(error) = request.ensure_active() {
                 object.terminate(130)?;
                 wait_children(children, exit_statuses);
-                let message = if request.cancelled.load(Ordering::Relaxed) {
-                    "process execution was cancelled"
-                } else {
-                    "process execution exceeded its deadline"
-                };
-                return Err(
-                    ShellError::new(ErrorCode::ResourceLimit, message).with_help(
-                        "Use a shorter-running command or increase the Lua policy deadline",
-                    ),
-                );
+                return Err(error);
             }
             thread::sleep(std::time::Duration::from_millis(1));
         }

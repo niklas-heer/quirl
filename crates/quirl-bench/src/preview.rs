@@ -63,6 +63,7 @@ struct Environment {
     artifact_digest_verified: bool,
     artifact_profile_verified: bool,
     artifact_source_verified: bool,
+    harness_source_verified: bool,
     build_profile: String,
     optimization_level: String,
     panic_strategy: String,
@@ -239,6 +240,15 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
+    let harness_source_verified = build_info
+        .as_ref()
+        .is_some_and(build_info_matches_harness_source);
+    if enforce && !harness_source_verified {
+        return Err(
+            "the release gate requires quirl and quirl-bench to be built cleanly from the same source commit; build both together from a clean candidate with `cargo build --release -p quirl-cli -p quirl-bench`"
+                .into(),
+        );
+    }
     let pty_samples = sample_argument("--pty-samples", default_pty_samples(enforce))?;
     let pty_timeout_ms = sample_argument("--pty-timeout-ms", DEFAULT_PTY_TIMEOUT_MS)?;
     let cold_samples = sample_argument("--cold-samples", DEFAULT_COLD_SAMPLES)?;
@@ -262,6 +272,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
         build_info.as_ref(),
         artifact_digest_verified,
         artifact_profile_verified,
+        harness_source_verified,
     );
     environment.artifact_source_verified = build_info.as_ref().is_some_and(|info| {
         info.source_dirty == Some(false)
@@ -382,6 +393,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
         && environment.source_dirty == Some(false)
         && environment.artifact_digest_verified
         && environment.artifact_source_verified
+        && environment.harness_source_verified
         && environment.quirl_binary_sha256.is_some();
     let evidence_gate_passed = pty_valid
         && stream_window.release_gate_accepted
@@ -415,6 +427,11 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
                 .to_owned(),
         );
     }
+    if !environment.harness_source_verified {
+        gate_failures.push(
+            "quirl and quirl-bench were not built cleanly from the same source commit".to_owned(),
+        );
+    }
     match environment.source_dirty {
         Some(false) => {}
         Some(true) => gate_failures.push(
@@ -436,7 +453,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     };
 
     let report = PreviewReport {
-        schema_version: 5,
+        schema_version: 6,
         suite: "quirl_1.0_release_performance",
         measured_at_utc: measured_at_utc(),
         environment,
@@ -1345,6 +1362,7 @@ fn discover_environment(
     build_info: Option<&QuirlBuildInfo>,
     artifact_digest_verified: bool,
     artifact_profile_verified: bool,
+    harness_source_verified: bool,
 ) -> Environment {
     Environment {
         hostname: command_output("hostname", &[]).unwrap_or_else(|| "unknown".to_owned()),
@@ -1362,6 +1380,7 @@ fn discover_environment(
         artifact_digest_verified,
         artifact_profile_verified,
         artifact_source_verified: false,
+        harness_source_verified,
         build_profile: build_info
             .map(|info| info.build_profile.clone())
             .unwrap_or_else(|| "unknown".to_owned()),
@@ -1414,6 +1433,14 @@ fn build_info_matches_benchmark(info: &QuirlBuildInfo) -> bool {
         && info.panic_strategy == expected_panic
         && info.operating_system == env::consts::OS
         && info.architecture == env::consts::ARCH
+}
+
+fn build_info_matches_harness_source(info: &QuirlBuildInfo) -> bool {
+    let harness_commit = env!("QUIRL_BUILD_COMMIT");
+    harness_commit != "unknown"
+        && env!("QUIRL_BUILD_DIRTY") == "false"
+        && info.source_commit == harness_commit
+        && info.source_dirty == Some(false)
 }
 
 fn binary_sha256(path: &Path) -> Option<String> {
@@ -1753,6 +1780,32 @@ mod tests {
             ..matching
         };
         assert!(!build_info_matches_benchmark(&mismatched));
+    }
+
+    #[test]
+    fn release_harness_requires_the_same_clean_source_as_the_binary() {
+        let matching = QuirlBuildInfo {
+            schema_version: 2,
+            version: "0.1.0".to_owned(),
+            build_profile: "release".to_owned(),
+            optimization_level: "z".to_owned(),
+            panic_strategy: "unwind".to_owned(),
+            operating_system: env::consts::OS.to_owned(),
+            architecture: env::consts::ARCH.to_owned(),
+            source_commit: env!("QUIRL_BUILD_COMMIT").to_owned(),
+            source_dirty: Some(false),
+        };
+
+        assert_eq!(
+            build_info_matches_harness_source(&matching),
+            env!("QUIRL_BUILD_COMMIT") != "unknown" && env!("QUIRL_BUILD_DIRTY") == "false"
+        );
+
+        let stale = QuirlBuildInfo {
+            source_commit: "different-commit".to_owned(),
+            ..matching
+        };
+        assert!(!build_info_matches_harness_source(&stale));
     }
 
     #[test]
