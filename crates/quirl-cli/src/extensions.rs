@@ -1,3 +1,7 @@
+use crate::extension_scheduler::{
+    ExtensionScheduler, ExtensionSchedulerHandle, ExtensionWork, ExtensionWorkBatch,
+    ExtensionWorkContext, WorkPriority,
+};
 use quirl_catalog::{
     Catalog, CommandSpec, Confidence, Provenance, ProvenanceInfo, Trust,
     MAX_COMPLETION_QUERY_BYTES, MAX_COMPLETION_RESULTS,
@@ -6,7 +10,10 @@ use quirl_core::{
     validate_contribution_set, ContributionKind, ErrorCode, ExtensionAction, ExtensionEvent,
     ExtensionEventData, ShellError,
 };
-use quirl_lua::{ConfigStore, LuaPolicy, LuaRuntime, QuirlConfig};
+use quirl_lua::{
+    ConfigStore, EventHandlerReport, LuaCancellation, LuaPolicy, LuaRuntime, PluginRegistrations,
+    QuirlConfig,
+};
 use quirl_plugin::{
     doctor_plugin, normalize_plugin_commands, parse_plugin_manifest, validate_plugin_manifest,
     LockedPlugin, PluginLockfile, PluginRuntime, PLUGIN_LOCK_FILE,
@@ -24,18 +31,34 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+        Arc, Mutex, MutexGuard,
     },
-    thread,
     time::{Duration, Instant},
 };
 
 const MAX_PLUGIN_LOCK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_PLUGIN_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PLUGIN_CANDIDATES: usize = 32;
+const MAX_LOADED_PLUGIN_RUNTIMES: usize = 16;
+const MAX_PLUGIN_GENERATION_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HOST_EVENT_HANDLERS: usize = 64;
+const MAX_HOST_PROMPT_SEGMENTS: usize = 64;
+const MAX_HOST_CONTRIBUTIONS: usize = 64;
+const MAX_HOST_MANAGED_COMMANDS: usize = 128;
+const MAX_RETAINED_EXTENSION_ERRORS: usize = 64;
+const MAX_CACHED_PROMPT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_EXTENSION_EVENT_BYTES: usize = 256 * 1024;
+const MAX_EXTENSION_EVENT_ACTIONS: usize = 256;
 const MAX_EXTENSION_COMPLETION_CALLBACKS: usize = 64;
 const EXTENSION_COMPLETION_WALL_TIME: Duration = Duration::from_millis(250);
+const EXTENSION_EVENT_WALL_TIME: Duration = Duration::from_millis(250);
+const EXTENSION_PROMPT_REFRESH_WALL_TIME: Duration = Duration::from_millis(100);
+const EXTENSION_SAFE_POINT_WAIT: Duration = Duration::from_millis(125);
+
+static NEXT_RUNTIME_KEY: AtomicU64 = AtomicU64::new(1);
 
 pub type SharedLuaExtensions = Arc<Mutex<LuaExtensionHost>>;
 
@@ -45,6 +68,162 @@ pub type SharedLuaExtensions = Arc<Mutex<LuaExtensionHost>>;
 pub struct NamedExtensionSegment {
     pub name: String,
     pub value: String,
+}
+
+struct ExtensionRuntimeSlot {
+    key: u64,
+    runtime: Mutex<LuaRuntime>,
+    registrations: PluginRegistrations,
+    cancellation: LuaCancellation,
+}
+
+impl ExtensionRuntimeSlot {
+    fn new(runtime: LuaRuntime, registrations: PluginRegistrations) -> Result<Self, ShellError> {
+        let key = NEXT_RUNTIME_KEY
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|observed| {
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "extension runtime identity counter was exhausted",
+                )
+                .with_context(format!("observed identity: {observed}"))
+                .with_help("Restart Quirl before loading another extension runtime")
+            })?;
+        let cancellation = runtime.cancellation_token();
+        Ok(Self {
+            key,
+            runtime: Mutex::new(runtime),
+            registrations,
+            cancellation,
+        })
+    }
+
+    fn with_runtime<T>(
+        &self,
+        operation: impl FnOnce(&LuaRuntime) -> Result<T, ShellError>,
+    ) -> Result<T, ShellError> {
+        let runtime = self.lock_runtime()?;
+        runtime.clear_cancellation();
+        let result = operation(&runtime);
+        runtime.clear_cancellation();
+        result
+    }
+
+    fn run_scheduled<T>(
+        &self,
+        control: &mut ExtensionWorkContext,
+        operation: impl FnOnce(&LuaRuntime) -> Result<T, ShellError>,
+    ) -> ScheduledInvocation<T> {
+        if control.is_cancelled() || Instant::now() >= control.deadline() {
+            return ScheduledInvocation::Cancelled;
+        }
+        let runtime = match self.lock_runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => return ScheduledInvocation::Finished(Err(error)),
+        };
+        if control.is_cancelled() || Instant::now() >= control.deadline() {
+            return ScheduledInvocation::Cancelled;
+        }
+
+        // The gate prevents a deadline monitor that already cloned the
+        // cancellation closure from setting the sticky Lua flag after this
+        // invocation has completed and cleared it.
+        let cancellation_enabled = Arc::new(Mutex::new(false));
+        let cancellation_gate = Arc::clone(&cancellation_enabled);
+        let cancellation = self.cancellation.clone();
+        if !control.begin(Arc::new(move || {
+            if *lock_recover(&cancellation_gate) {
+                cancellation.cancel();
+            }
+        })) {
+            return ScheduledInvocation::Cancelled;
+        }
+
+        let mut enabled = lock_recover(&cancellation_enabled);
+        runtime.clear_cancellation();
+        *enabled = true;
+        drop(enabled);
+
+        let result = operation(&runtime);
+        let cancelled = control.is_cancelled();
+        let mut enabled = lock_recover(&cancellation_enabled);
+        *enabled = false;
+        runtime.clear_cancellation();
+        drop(enabled);
+        if cancelled {
+            ScheduledInvocation::Cancelled
+        } else {
+            ScheduledInvocation::Finished(result)
+        }
+    }
+
+    fn lock_runtime(&self) -> Result<MutexGuard<'_, LuaRuntime>, ShellError> {
+        self.runtime.lock().map_err(|_| {
+            ShellError::new(
+                ErrorCode::Lua,
+                "an extension runtime was quarantined after a panic",
+            )
+            .with_context(format!("runtime key: {}", self.key))
+            .with_help("Disable the failing plugin and restart Quirl")
+        })
+    }
+}
+
+enum ScheduledInvocation<T> {
+    Finished(Result<T, ShellError>),
+    Cancelled,
+}
+
+struct PromptPluginResult {
+    plugin_index: usize,
+    invocation: ScheduledInvocation<Vec<NamedExtensionSegment>>,
+    errors: Vec<ShellError>,
+}
+
+struct PromptRefresh {
+    request_id: u64,
+    generation: u64,
+    deadline: Instant,
+    batch: ExtensionWorkBatch,
+    receiver: Receiver<PromptPluginResult>,
+    results: Vec<Option<PromptPluginResult>>,
+}
+
+struct EventPluginResult {
+    plugin_index: usize,
+    invocation: ScheduledInvocation<Vec<EventHandlerReport>>,
+}
+
+/// A cancellation boundary detached from the extension-host mutex.
+pub(crate) struct ExtensionCallbackQuiescence {
+    scheduler: Option<ExtensionSchedulerHandle>,
+    generation: u64,
+}
+
+impl ExtensionCallbackQuiescence {
+    /// Wait for all callbacks from the captured generation to release their Lua
+    /// runtimes before the caller begins a process, terminal, job, or persistence
+    /// transition.
+    pub(crate) fn wait(self) -> Result<(), ShellError> {
+        let Some(scheduler) = self.scheduler else {
+            return Ok(());
+        };
+        if scheduler.wait_generation_idle(self.generation, EXTENSION_SAFE_POINT_WAIT) {
+            return Ok(());
+        }
+        Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "extension callbacks did not quiesce before execution",
+        )
+        .with_context(format!(
+            "generation: {}; wait limit: {} ms",
+            self.generation,
+            EXTENSION_SAFE_POINT_WAIT.as_millis()
+        ))
+        .with_help("Disable the blocked plugin before retrying the command"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,12 +295,18 @@ struct PluginCandidate {
     /// snapshot. Loading these bytes instead of reopening `path` closes the
     /// integrity-check-to-execution race.
     verified_source: Option<String>,
+    source_bytes: usize,
     runtime: PluginRuntime,
     grants: Vec<String>,
     catalog_commands: Vec<CommandSpec>,
 }
 
-type BuiltExtensionGeneration = (ConfigStore, Vec<PathBuf>, Vec<LuaRuntime>, Vec<CommandSpec>);
+type BuiltExtensionGeneration = (
+    ConfigStore,
+    Vec<PathBuf>,
+    Vec<Arc<ExtensionRuntimeSlot>>,
+    Vec<CommandSpec>,
+);
 
 pub struct LuaExtensionHost {
     /// `Some` for a config file that is watched even when it does not exist yet.
@@ -129,12 +314,17 @@ pub struct LuaExtensionHost {
     plugin_source: PluginSource,
     plugin_paths: Vec<PathBuf>,
     config: ConfigStore,
-    plugin_runtimes: Vec<LuaRuntime>,
+    plugin_runtimes: Vec<Arc<ExtensionRuntimeSlot>>,
     managed_commands: Vec<CommandSpec>,
     errors: Vec<ShellError>,
+    error_overflow_count: usize,
     observed_fingerprint: Option<ExtensionFingerprint>,
     revision: u64,
     event_sequence: u64,
+    scheduler: Option<ExtensionScheduler>,
+    prompt_request_id: u64,
+    prompt_refresh: Option<PromptRefresh>,
+    prompt_cache: Vec<Vec<NamedExtensionSegment>>,
 }
 
 impl LuaExtensionHost {
@@ -176,9 +366,14 @@ impl LuaExtensionHost {
             plugin_runtimes: Vec::new(),
             managed_commands: Vec::new(),
             errors: Vec::new(),
+            error_overflow_count: 0,
             observed_fingerprint: None,
             revision: 0,
             event_sequence: 0,
+            scheduler: None,
+            prompt_request_id: 0,
+            prompt_refresh: None,
+            prompt_cache: Vec::new(),
         }
     }
 
@@ -203,19 +398,55 @@ impl LuaExtensionHost {
         }
         self.observed_fingerprint = Some(snapshot.fingerprint.clone());
 
+        let next_revision = match self.revision.checked_add(1) {
+            Some(revision) => revision,
+            None => {
+                self.record_error(
+                    ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "extension generation counter was exhausted",
+                    )
+                    .with_help("Restart Quirl before reloading extensions again"),
+                );
+                return ExtensionReloadState::Rejected;
+            }
+        };
         match self.build_candidate(snapshot) {
             Ok((config, plugin_paths, plugin_runtimes, managed_commands)) => {
+                if !plugin_runtimes.is_empty() && self.scheduler.is_none() {
+                    self.scheduler = Some(ExtensionScheduler::new());
+                }
+                if let Some(error) = self
+                    .scheduler
+                    .as_mut()
+                    .and_then(ExtensionScheduler::take_startup_error)
+                {
+                    self.record_error(error.with_context(
+                        "extension reload rejected; retaining the last known-good generation",
+                    ));
+                    return ExtensionReloadState::Rejected;
+                }
+                if let Some(scheduler) = &self.scheduler {
+                    if let Err(error) = scheduler.activate_generation(next_revision) {
+                        self.record_error(error.with_context(
+                            "extension reload rejected; retaining the last known-good generation",
+                        ));
+                        return ExtensionReloadState::Rejected;
+                    }
+                }
                 self.config = config;
                 self.plugin_paths = plugin_paths;
                 self.plugin_runtimes = plugin_runtimes;
                 self.managed_commands = managed_commands;
-                self.revision += 1;
+                self.prompt_refresh.take();
+                self.prompt_cache = vec![Vec::new(); self.plugin_runtimes.len()];
+                self.revision = next_revision;
                 ExtensionReloadState::Reloaded {
                     revision: self.revision,
                 }
             }
             Err(error) => {
-                self.errors.push(
+                self.record_error(
                     error.with_context("extension reload rejected; retaining the last known-good configuration and plugins"),
                 );
                 ExtensionReloadState::Rejected
@@ -246,36 +477,224 @@ impl LuaExtensionHost {
         last_status: i32,
     ) -> Vec<NamedExtensionSegment> {
         self.ensure_loaded();
+        self.poll_prompt_refresh();
+        let snapshot = self
+            .prompt_cache
+            .iter()
+            .flat_map(|segments| segments.iter().cloned())
+            .take(MAX_HOST_PROMPT_SEGMENTS)
+            .collect::<Vec<_>>();
+        if self.plugin_runtimes.is_empty() {
+            return snapshot;
+        }
+
         let cwd = env::current_dir().unwrap_or_default();
-        let context = json!({
+        let context = Arc::new(json!({
             "cwd": cwd,
             "project_name": cwd.file_name().map(|name| name.to_string_lossy()),
             "mode": mode.to_string(),
             "last_status": last_status,
+        }));
+        self.start_prompt_refresh(context);
+        snapshot
+    }
+
+    fn start_prompt_refresh(&mut self, context: Arc<Value>) {
+        if let Some(previous) = self.prompt_refresh.take() {
+            if let Some(scheduler) = &self.scheduler {
+                scheduler.cancel_batch(&previous.batch);
+            }
+        }
+        let request_id = match self.prompt_request_id.checked_add(1) {
+            Some(request_id) => request_id,
+            None => {
+                self.record_error(
+                    ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "extension prompt generation counter was exhausted",
+                    )
+                    .with_help("Restart Quirl before refreshing extension prompts again"),
+                );
+                return;
+            }
+        };
+        self.prompt_request_id = request_id;
+        let started = Instant::now();
+        let Some(deadline) = started.checked_add(EXTENSION_PROMPT_REFRESH_WALL_TIME) else {
+            self.record_error(
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "extension prompt deadline exceeded the host monotonic clock",
+                )
+                .with_help("Restart Quirl before refreshing extension prompts again"),
+            );
+            return;
+        };
+        let (sender, receiver) = mpsc::sync_channel(self.plugin_runtimes.len());
+        let mut work = Vec::with_capacity(self.plugin_runtimes.len());
+        for (plugin_index, slot) in self.plugin_runtimes.iter().enumerate() {
+            let slot = Arc::clone(slot);
+            let registrations = slot.registrations.prompt_segments.clone();
+            let context = Arc::clone(&context);
+            let sender = sender.clone();
+            work.push(ExtensionWork::new(slot.key, move |mut control| {
+                let mut errors = Vec::new();
+                let invocation = slot.run_scheduled(&mut control, |runtime| {
+                    let mut rendered = Vec::new();
+                    for segment in registrations {
+                        match runtime.render_prompt_segment(&segment.name, &context) {
+                            Ok(Some(value)) if !value.is_empty() => {
+                                rendered.push(NamedExtensionSegment {
+                                    name: segment.name,
+                                    value,
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(error) => errors.push(
+                                error.with_context(format!("prompt segment: {}", segment.name)),
+                            ),
+                        }
+                    }
+                    Ok(rendered)
+                });
+                let _ = sender.try_send(PromptPluginResult {
+                    plugin_index,
+                    invocation,
+                    errors,
+                });
+            }));
+        }
+        drop(sender);
+        let Some(scheduler) = &self.scheduler else {
+            return;
+        };
+        let batch =
+            match scheduler.submit_batch(self.revision, deadline, WorkPriority::Prompt, work) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.record_error(error.with_context("extension prompt refresh"));
+                    return;
+                }
+            };
+        self.prompt_refresh = Some(PromptRefresh {
+            request_id,
+            generation: self.revision,
+            deadline,
+            batch,
+            receiver,
+            results: std::iter::repeat_with(|| None)
+                .take(self.plugin_runtimes.len())
+                .collect(),
         });
-        let mut rendered = Vec::new();
-        for runtime in &self.plugin_runtimes {
-            for segment in runtime.registrations().prompt_segments {
-                match runtime.render_prompt_segment(&segment.name, &context) {
-                    Ok(Some(value)) if !value.is_empty() => rendered.push(NamedExtensionSegment {
-                        name: segment.name.clone(),
-                        value,
-                    }),
-                    Ok(_) => {}
-                    Err(error) => self
-                        .errors
-                        .push(error.with_context(format!("prompt segment: {}", segment.name))),
+    }
+
+    fn poll_prompt_refresh(&mut self) {
+        let Some(mut refresh) = self.prompt_refresh.take() else {
+            return;
+        };
+        loop {
+            match refresh.receiver.try_recv() {
+                Ok(result)
+                    if result.plugin_index < refresh.results.len()
+                        && refresh.generation == self.revision
+                        && refresh.request_id == self.prompt_request_id =>
+                {
+                    let index = result.plugin_index;
+                    refresh.results[index] = Some(result);
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        let complete = refresh.results.iter().all(Option::is_some);
+        let expired = Instant::now() >= refresh.deadline;
+        if !complete && !expired {
+            self.prompt_refresh = Some(refresh);
+            return;
+        }
+        if !complete {
+            if let Some(scheduler) = &self.scheduler {
+                scheduler.cancel_batch(&refresh.batch);
+            }
+        }
+        if refresh.generation != self.revision || refresh.request_id != self.prompt_request_id {
+            return;
+        }
+
+        let mut completed_plugins = 0_usize;
+        for result in refresh.results.into_iter().flatten() {
+            completed_plugins = completed_plugins.saturating_add(1);
+            let callback_failed = !result.errors.is_empty();
+            for error in result.errors {
+                self.record_error(error);
+            }
+            match result.invocation {
+                ScheduledInvocation::Finished(Ok(segments)) if !callback_failed => {
+                    if self.prompt_cache_accepts(result.plugin_index, &segments) {
+                        self.prompt_cache[result.plugin_index] = segments;
+                    } else {
+                        self.record_error(
+                            ShellError::new(
+                                ErrorCode::ResourceLimit,
+                                "extension prompt cache byte limit was exceeded",
+                            )
+                            .with_context(format!(
+                                "limit: {MAX_CACHED_PROMPT_BYTES}; plugin index: {}",
+                                result.plugin_index
+                            ))
+                            .with_help("Shorten enabled extension prompt segment output"),
+                        );
+                    }
+                }
+                ScheduledInvocation::Finished(Ok(_)) => {}
+                ScheduledInvocation::Finished(Err(error)) => self.record_error(error),
+                ScheduledInvocation::Cancelled => {}
+            }
+        }
+        if expired && completed_plugins < self.plugin_runtimes.len() {
+            self.record_error(
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "extension prompt refresh reached its aggregate deadline",
+                )
+                .with_context(format!(
+                    "completed plugins: {completed_plugins}; total plugins: {}; deadline: {} ms",
+                    self.plugin_runtimes.len(),
+                    EXTENSION_PROMPT_REFRESH_WALL_TIME.as_millis()
+                ))
+                .with_help("Reduce slow prompt providers; the last cached snapshot remains active"),
+            );
+        }
+    }
+
+    fn prompt_cache_accepts(
+        &self,
+        plugin_index: usize,
+        replacement: &[NamedExtensionSegment],
+    ) -> bool {
+        let mut bytes = 0_usize;
+        for (index, segments) in self.prompt_cache.iter().enumerate() {
+            let segments = if index == plugin_index {
+                replacement
+            } else {
+                segments
+            };
+            for segment in segments {
+                bytes = bytes.saturating_add(segment.name.len());
+                bytes = bytes.saturating_add(segment.value.len());
+                if bytes > MAX_CACHED_PROMPT_BYTES {
+                    return false;
                 }
             }
         }
-        rendered
+        true
     }
 
     pub fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
         self.ensure_loaded();
         let position = floor_char_boundary(line, pos.min(line.len()));
         if line.len() > MAX_COMPLETION_QUERY_BYTES {
-            self.errors.push(
+            self.record_error(
                 ShellError::new(
                     ErrorCode::ResourceLimit,
                     "extension completion query exceeds its byte limit",
@@ -300,9 +719,10 @@ impl LuaExtensionHost {
         let started = Instant::now();
         let mut callback_count = 0_usize;
         let mut limit_reason = None;
+        let runtimes = self.plugin_runtimes.clone();
 
-        'plugins: for runtime in &self.plugin_runtimes {
-            for provider in runtime.registrations().completion_providers {
+        'plugins: for runtime in &runtimes {
+            for provider in runtime.registrations.completion_providers.clone() {
                 if !provider_applies(before, &provider.command) {
                     continue;
                 }
@@ -320,7 +740,9 @@ impl LuaExtensionHost {
                     break 'plugins;
                 }
                 callback_count = callback_count.saturating_add(1);
-                match runtime.complete_with_provider(&provider.command, &context) {
+                match runtime.with_runtime(|runtime| {
+                    runtime.complete_with_provider(&provider.command, &context)
+                }) {
                     Ok(Value::Array(values)) => {
                         for value in values {
                             if suggestions.len() == MAX_COMPLETION_RESULTS {
@@ -340,20 +762,21 @@ impl LuaExtensionHost {
                             }
                         }
                     }
-                    Ok(_) => self.errors.push(ShellError::new(
+                    Ok(_) => self.record_error(ShellError::new(
                         ErrorCode::Validation,
                         format!(
                             "completion provider `{}` must return an array",
                             provider.command
                         ),
                     )),
-                    Err(error) => self.errors.push(
+                    Err(error) => self.record_error(
                         error.with_context(format!("completion provider: {}", provider.command)),
                     ),
                 }
             }
             for registration in runtime
-                .registrations()
+                .registrations
+                .clone()
                 .contributions
                 .into_iter()
                 .filter(|item| item.kind == ContributionKind::Completion)
@@ -372,11 +795,13 @@ impl LuaExtensionHost {
                     break 'plugins;
                 }
                 callback_count = callback_count.saturating_add(1);
-                match runtime.invoke_contribution(
-                    ContributionKind::Completion,
-                    &registration.name,
-                    &context,
-                ) {
+                match runtime.with_runtime(|runtime| {
+                    runtime.invoke_contribution(
+                        ContributionKind::Completion,
+                        &registration.name,
+                        &context,
+                    )
+                }) {
                     Ok(value) => match serde_json::from_value::<Vec<CompletionContributionItem>>(
                         value,
                     ) {
@@ -399,14 +824,14 @@ impl LuaExtensionHost {
                                 }
                             }
                         }
-                        Err(error) => self.errors.push(contribution_shape_error(
+                        Err(error) => self.record_error(contribution_shape_error(
                             &registration.name,
                             "completion providers must return an array of typed completion items",
                             error,
                         )),
                     },
                     Err(error) => {
-                        self.errors.push(error.with_context(format!(
+                        self.record_error(error.with_context(format!(
                             "completion contribution: {}",
                             registration.name
                         )))
@@ -415,7 +840,7 @@ impl LuaExtensionHost {
             }
         }
         if let Some(reason) = limit_reason {
-            self.errors.push(
+            self.record_error(
                 ShellError::new(ErrorCode::ResourceLimit, reason).with_help(
                     "Reduce enabled completion providers or narrow their returned items",
                 ),
@@ -429,27 +854,30 @@ impl LuaExtensionHost {
     pub fn merge_catalog_contributions(&mut self, catalog: &mut Catalog) {
         self.ensure_loaded();
         if let Err(error) = validate_catalog_contribution(catalog, &self.managed_commands) {
-            self.errors
-                .push(error.with_context("managed plugin command manifests"));
+            self.record_error(error.with_context("managed plugin command manifests"));
         } else {
             catalog.merge(self.managed_commands.clone());
         }
-        for runtime in &self.plugin_runtimes {
+        let runtimes = self.plugin_runtimes.clone();
+        for runtime in &runtimes {
             for registration in runtime
-                .registrations()
+                .registrations
+                .clone()
                 .contributions
                 .into_iter()
                 .filter(|item| item.kind == ContributionKind::Catalog)
             {
                 let value =
-                    match runtime.invoke_contribution(
-                        ContributionKind::Catalog,
-                        &registration.name,
-                        &json!({"schema_version": catalog.schema_version}),
-                    ) {
+                    match runtime.with_runtime(|runtime| {
+                        runtime.invoke_contribution(
+                            ContributionKind::Catalog,
+                            &registration.name,
+                            &json!({"schema_version": catalog.schema_version}),
+                        )
+                    }) {
                         Ok(value) => value,
                         Err(error) => {
-                            self.errors.push(error.with_context(format!(
+                            self.record_error(error.with_context(format!(
                                 "catalog contribution: {}",
                                 registration.name
                             )));
@@ -459,7 +887,7 @@ impl LuaExtensionHost {
                 let mut output = match serde_json::from_value::<CatalogContributionOutput>(value) {
                     Ok(output) => output,
                     Err(error) => {
-                        self.errors.push(contribution_shape_error(
+                        self.record_error(contribution_shape_error(
                             &registration.name,
                             "catalog providers must return { commands = CommandSpec[] }",
                             error,
@@ -467,6 +895,14 @@ impl LuaExtensionHost {
                         continue;
                     }
                 };
+                if output.commands.len() > MAX_HOST_MANAGED_COMMANDS {
+                    self.record_error(host_count_limit_error(
+                        "catalog contribution commands",
+                        output.commands.len(),
+                        MAX_HOST_MANAGED_COMMANDS,
+                    ));
+                    continue;
+                }
                 let provenance = ProvenanceInfo {
                     source: Provenance::Plugin,
                     confidence: Confidence::Exact,
@@ -482,7 +918,7 @@ impl LuaExtensionHost {
                     }
                 }
                 if let Err(error) = validate_catalog_contribution(catalog, &output.commands) {
-                    self.errors.push(
+                    self.record_error(
                         error.with_context(format!("catalog contribution: {}", registration.name)),
                     );
                     continue;
@@ -498,16 +934,20 @@ impl LuaExtensionHost {
         context: &Value,
     ) -> Result<PanelModel, ShellError> {
         self.ensure_loaded();
-        for runtime in &self.plugin_runtimes {
+        let runtimes = self.plugin_runtimes.clone();
+        for runtime in &runtimes {
             let Some(registration) = runtime
-                .registrations()
+                .registrations
+                .clone()
                 .contributions
                 .into_iter()
                 .find(|item| item.kind == ContributionKind::Panel && item.name == name)
             else {
                 continue;
             };
-            let value = runtime.invoke_contribution(ContributionKind::Panel, name, context)?;
+            let value = runtime.with_runtime(|runtime| {
+                runtime.invoke_contribution(ContributionKind::Panel, name, context)
+            })?;
             let panel = serde_json::from_value::<PanelModel>(value).map_err(|error| {
                 contribution_shape_error(
                     name,
@@ -533,51 +973,223 @@ impl LuaExtensionHost {
     }
 
     pub fn take_errors(&mut self) -> Vec<ShellError> {
+        if self.error_overflow_count > 0 {
+            let overflow = ShellError::new(
+                ErrorCode::ResourceLimit,
+                "extension diagnostic retention limit was reached",
+            )
+            .with_context(format!(
+                "additional diagnostics dropped: {}; retained limit: {MAX_RETAINED_EXTENSION_ERRORS}",
+                self.error_overflow_count
+            ))
+            .with_help("Disable repeatedly failing extension callbacks before retrying");
+            if self.errors.len() == MAX_RETAINED_EXTENSION_ERRORS {
+                self.errors.pop();
+            }
+            self.errors.push(overflow);
+            self.error_overflow_count = 0;
+        }
         std::mem::take(&mut self.errors)
     }
 
     /// Dispatch one immutable record to every active runtime. Individual
     /// handler failures are retained as diagnostics and never stop later
     /// runtimes or handlers.
-    pub fn dispatch_event(&mut self, data: ExtensionEventData) -> Vec<ExtensionAction> {
+    pub fn dispatch_event(
+        &mut self,
+        data: ExtensionEventData,
+    ) -> Result<Vec<ExtensionAction>, ShellError> {
         self.ensure_loaded();
-        self.event_sequence = self.event_sequence.saturating_add(1);
-        let event = ExtensionEvent::new(self.event_sequence, data);
+        if self.plugin_runtimes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sequence = self.event_sequence.checked_add(1).ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::ResourceLimit,
+                "extension event sequence counter was exhausted",
+            )
+            .with_help("Restart Quirl before dispatching another extension event")
+        })?;
+        let event = Arc::new(ExtensionEvent::new(sequence, data));
+        event.validate_after(None)?;
+        let event_bytes = serde_json::to_vec(event.as_ref()).map_err(|error| {
+            ShellError::new(
+                ErrorCode::Validation,
+                "extension event could not be encoded",
+            )
+            .with_context(error.to_string())
+            .with_help("Reduce or repair the event payload before dispatch")
+        })?;
+        if event_bytes.len() > MAX_EXTENSION_EVENT_BYTES {
+            let error = ShellError::new(
+                ErrorCode::ResourceLimit,
+                "extension event exceeds its host-side byte limit",
+            )
+            .with_context(format!(
+                "bytes: {}; limit: {MAX_EXTENSION_EVENT_BYTES}",
+                event_bytes.len()
+            ))
+            .with_help("Reduce the event payload before dispatching it to extensions");
+            self.record_error(error.clone());
+            return Err(error);
+        }
+        self.event_sequence = sequence;
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(EXTENSION_EVENT_WALL_TIME)
+            .ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "extension event deadline exceeded the host monotonic clock",
+                )
+                .with_help("Restart Quirl before dispatching another extension event")
+            })?;
+        let (sender, receiver) = mpsc::sync_channel(self.plugin_runtimes.len());
+        let mut work = Vec::with_capacity(self.plugin_runtimes.len());
+        for (plugin_index, runtime) in self.plugin_runtimes.iter().enumerate() {
+            let runtime = Arc::clone(runtime);
+            let event = Arc::clone(&event);
+            let sender = sender.clone();
+            work.push(ExtensionWork::new(runtime.key, move |mut control| {
+                let invocation = runtime.run_scheduled(&mut control, |runtime| {
+                    runtime.dispatch_extension_event(&event)
+                });
+                let _ = sender.try_send(EventPluginResult {
+                    plugin_index,
+                    invocation,
+                });
+            }));
+        }
+        drop(sender);
+        let Some(scheduler) = &self.scheduler else {
+            let error = unavailable_event_scheduler_error();
+            self.record_error(error.clone());
+            return Err(error);
+        };
+        let batch = match scheduler.submit_batch(self.revision, deadline, WorkPriority::Event, work)
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.record_error(error.clone().with_context("extension event dispatch"));
+                return Err(error);
+            }
+        };
+
+        let mut outcomes = std::iter::repeat_with(|| None)
+            .take(self.plugin_runtimes.len())
+            .collect::<Vec<Option<EventPluginResult>>>();
+        let mut completed_plugins = 0_usize;
+        while completed_plugins < outcomes.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match receiver.recv_timeout(remaining) {
+                Ok(outcome) if outcome.plugin_index < outcomes.len() => {
+                    let index = outcome.plugin_index;
+                    if outcomes[index].is_none() {
+                        completed_plugins = completed_plugins.saturating_add(1);
+                        outcomes[index] = Some(outcome);
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        if completed_plugins < outcomes.len() {
+            scheduler.cancel_batch(&batch);
+        }
+
         let mut actions = Vec::new();
-        let outcomes = thread::scope(|scope| {
-            let handles = self
-                .plugin_runtimes
-                .iter_mut()
-                .map(|runtime| scope.spawn(|| runtime.dispatch_extension_event(&event)))
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| handle.join())
-                .collect::<Vec<_>>()
-        });
-        for outcome in outcomes {
-            match outcome {
-                Ok(Ok(reports)) => {
+        let mut action_bytes = 0_usize;
+        for outcome in outcomes.into_iter().flatten() {
+            match outcome.invocation {
+                ScheduledInvocation::Finished(Ok(reports)) => {
                     for report in reports {
                         if let Some(error) = report.error {
-                            self.errors.push(
+                            self.record_error(
                                 error.with_context(format!("event handler: {}", report.handler)),
                             );
                         } else {
-                            actions.extend(report.actions);
+                            for action in report.actions {
+                                if actions.len() == MAX_EXTENSION_EVENT_ACTIONS {
+                                    self.record_error(host_count_limit_error(
+                                        "extension event actions",
+                                        actions.len().saturating_add(1),
+                                        MAX_EXTENSION_EVENT_ACTIONS,
+                                    ));
+                                    break;
+                                }
+                                let bytes = serde_json::to_vec(&action)
+                                    .map(|encoded| encoded.len())
+                                    .unwrap_or(MAX_EXTENSION_EVENT_BYTES.saturating_add(1));
+                                action_bytes = action_bytes.saturating_add(bytes);
+                                if action_bytes > MAX_EXTENSION_EVENT_BYTES {
+                                    self.record_error(
+                                        ShellError::new(
+                                            ErrorCode::ResourceLimit,
+                                            "extension event actions exceed their retained byte limit",
+                                        )
+                                        .with_context(format!(
+                                            "bytes: {action_bytes}; limit: {MAX_EXTENSION_EVENT_BYTES}"
+                                        ))
+                                        .with_help("Return fewer or smaller extension event actions"),
+                                    );
+                                    break;
+                                }
+                                actions.push(action);
+                            }
                         }
                     }
                 }
-                Ok(Err(error)) => self
-                    .errors
-                    .push(error.with_context("extension event dispatch")),
-                Err(_) => self.errors.push(
-                    ShellError::new(ErrorCode::Lua, "extension event worker panicked")
-                        .with_help("Disable the failing plugin and restart Quirl"),
-                ),
+                ScheduledInvocation::Finished(Err(error)) => {
+                    self.record_error(error.with_context("extension event dispatch"));
+                }
+                ScheduledInvocation::Cancelled => {}
             }
         }
-        actions
+        if completed_plugins < self.plugin_runtimes.len() {
+            let error = ShellError::new(
+                ErrorCode::ResourceLimit,
+                "extension event dispatch reached its aggregate deadline",
+            )
+            .with_context(format!(
+                "completed plugins: {completed_plugins}; total plugins: {}; deadline: {} ms",
+                self.plugin_runtimes.len(),
+                EXTENSION_EVENT_WALL_TIME.as_millis()
+            ))
+            .with_help("Disable blocked event providers before retrying this host transition");
+            self.record_error(error.clone());
+            return Err(error);
+        }
+        Ok(actions)
+    }
+
+    /// Cancel queued and active callbacks for the installed generation and
+    /// return a detached wait handle for a pre-execution safe point.
+    pub(crate) fn begin_callback_quiescence(&mut self) -> ExtensionCallbackQuiescence {
+        self.poll_prompt_refresh();
+        if let Some(refresh) = self.prompt_refresh.take() {
+            if let Some(scheduler) = &self.scheduler {
+                scheduler.cancel_batch(&refresh.batch);
+            }
+        }
+        let scheduler = self.scheduler.as_ref().map(ExtensionScheduler::handle);
+        if let Some(scheduler) = &scheduler {
+            scheduler.cancel_generation(self.revision);
+        }
+        ExtensionCallbackQuiescence {
+            scheduler,
+            generation: self.revision,
+        }
+    }
+
+    fn record_error(&mut self, error: ShellError) {
+        if self.errors.len() < MAX_RETAINED_EXTENSION_ERRORS {
+            self.errors.push(error);
+        } else {
+            self.error_overflow_count = self.error_overflow_count.saturating_add(1);
+        }
     }
 
     fn ensure_loaded(&mut self) {
@@ -619,6 +1231,14 @@ impl LuaExtensionHost {
                                 let path = entry.path();
                                 if path.extension().is_some_and(|extension| extension == "lua") {
                                     paths.push(path);
+                                    if paths.len() > MAX_PLUGIN_CANDIDATES {
+                                        errors.push(host_count_limit_error(
+                                            "extension directory plugin candidates",
+                                            paths.len(),
+                                            MAX_PLUGIN_CANDIDATES,
+                                        ));
+                                        break;
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -676,6 +1296,41 @@ impl LuaExtensionHost {
         if let Some(error) = snapshot.errors.into_iter().next() {
             return Err(error);
         }
+        if snapshot.plugins.len() > MAX_PLUGIN_CANDIDATES {
+            return Err(host_count_limit_error(
+                "extension plugin candidates",
+                snapshot.plugins.len(),
+                MAX_PLUGIN_CANDIDATES,
+            ));
+        }
+        let runtime_count = snapshot
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.runtime == PluginRuntime::TrustedLua)
+            .count();
+        if runtime_count > MAX_LOADED_PLUGIN_RUNTIMES {
+            return Err(host_count_limit_error(
+                "loaded trusted-Lua plugin runtimes",
+                runtime_count,
+                MAX_LOADED_PLUGIN_RUNTIMES,
+            ));
+        }
+        let source_bytes = snapshot.plugins.iter().try_fold(0_usize, |total, plugin| {
+            total.checked_add(plugin.source_bytes).ok_or_else(|| {
+                host_byte_limit_error(
+                    "extension generation source",
+                    usize::MAX,
+                    MAX_PLUGIN_GENERATION_SOURCE_BYTES,
+                )
+            })
+        })?;
+        if source_bytes > MAX_PLUGIN_GENERATION_SOURCE_BYTES {
+            return Err(host_byte_limit_error(
+                "extension generation source",
+                source_bytes,
+                MAX_PLUGIN_GENERATION_SOURCE_BYTES,
+            ));
+        }
 
         let mut config = ConfigStore::default();
         if let Some(path) = &snapshot.config {
@@ -686,8 +1341,17 @@ impl LuaExtensionHost {
         let mut plugin_runtimes = Vec::with_capacity(snapshot.plugins.len());
         let mut contributions = Vec::new();
         let mut managed_commands = Vec::new();
+        let mut prompt_segments = 0_usize;
+        let mut event_handlers = 0_usize;
         for plugin in &snapshot.plugins {
             managed_commands.extend(plugin.catalog_commands.clone());
+            if managed_commands.len() > MAX_HOST_MANAGED_COMMANDS {
+                return Err(host_count_limit_error(
+                    "managed plugin commands",
+                    managed_commands.len(),
+                    MAX_HOST_MANAGED_COMMANDS,
+                ));
+            }
             if plugin.runtime == PluginRuntime::TrustedLua {
                 let runtime = crate::plugin::trusted_lua_runtime(&plugin.grants)?;
                 let registrations = if let Some(source) = &plugin.verified_source {
@@ -695,8 +1359,32 @@ impl LuaExtensionHost {
                 } else {
                     runtime.load_plugin_file(&plugin.path)?
                 };
-                contributions.extend(registrations.contributions);
-                plugin_runtimes.push(runtime);
+                prompt_segments =
+                    prompt_segments.saturating_add(registrations.prompt_segments.len());
+                event_handlers = event_handlers.saturating_add(registrations.events.len());
+                contributions.extend(registrations.contributions.clone());
+                if prompt_segments > MAX_HOST_PROMPT_SEGMENTS {
+                    return Err(host_count_limit_error(
+                        "extension prompt segments",
+                        prompt_segments,
+                        MAX_HOST_PROMPT_SEGMENTS,
+                    ));
+                }
+                if event_handlers > MAX_HOST_EVENT_HANDLERS {
+                    return Err(host_count_limit_error(
+                        "extension event handlers",
+                        event_handlers,
+                        MAX_HOST_EVENT_HANDLERS,
+                    ));
+                }
+                if contributions.len() > MAX_HOST_CONTRIBUTIONS {
+                    return Err(host_count_limit_error(
+                        "extension contributions",
+                        contributions.len(),
+                        MAX_HOST_CONTRIBUTIONS,
+                    ));
+                }
+                plugin_runtimes.push(Arc::new(ExtensionRuntimeSlot::new(runtime, registrations)?));
             }
         }
         validate_contribution_set(&contributions)?;
@@ -776,6 +1464,14 @@ fn snapshot_legacy_plugin_paths(
     paths: &[PathBuf],
     errors: &mut Vec<ShellError>,
 ) -> (Vec<PluginCandidate>, PluginFingerprint) {
+    if paths.len() > MAX_PLUGIN_CANDIDATES {
+        errors.push(host_count_limit_error(
+            "extension plugin candidates",
+            paths.len(),
+            MAX_PLUGIN_CANDIDATES,
+        ));
+        return (Vec::new(), PluginFingerprint::Files(Vec::new()));
+    }
     let mut fingerprints = Vec::with_capacity(paths.len());
     for path in paths {
         match fingerprint_file(path) {
@@ -791,12 +1487,15 @@ fn snapshot_legacy_plugin_paths(
     }
     let grants = legacy_registration_grants();
     (
-        paths
+        fingerprints
             .iter()
-            .cloned()
-            .map(|path| PluginCandidate {
-                path,
+            .map(|(path, fingerprint)| PluginCandidate {
+                path: path.clone(),
                 verified_source: None,
+                source_bytes: match fingerprint {
+                    FileFingerprint::Contents { bytes, .. } => *bytes,
+                    FileFingerprint::Missing | FileFingerprint::Unreadable(_) => 0,
+                },
                 runtime: PluginRuntime::TrustedLua,
                 grants: grants.clone(),
                 catalog_commands: Vec::new(),
@@ -843,6 +1542,16 @@ fn snapshot_managed_plugins(
     };
     if let Err(error) = lock.validate() {
         errors.push(error);
+        return (Vec::new(), PluginFingerprint::Files(fingerprints));
+    }
+
+    let enabled_count = lock.plugins.iter().filter(|plugin| plugin.enabled).count();
+    if enabled_count > MAX_PLUGIN_CANDIDATES {
+        errors.push(host_count_limit_error(
+            "enabled managed plugin candidates",
+            enabled_count,
+            MAX_PLUGIN_CANDIDATES,
+        ));
         return (Vec::new(), PluginFingerprint::Files(fingerprints));
     }
 
@@ -996,6 +1705,7 @@ fn managed_plugin_candidate_with_cancellation(
     Ok(PluginCandidate {
         path: entry_path,
         verified_source,
+        source_bytes: entry_bytes.len(),
         runtime: locked.runtime,
         grants: locked.granted_capabilities.clone(),
         catalog_commands,
@@ -1219,6 +1929,39 @@ fn contribution_shape_error(name: &str, expected: &str, error: serde_json::Error
     .with_help(expected)
 }
 
+fn host_count_limit_error(resource: &str, observed: usize, limit: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{resource} exceed the host-side count limit"),
+    )
+    .with_context(format!("observed: {observed}; limit: {limit}"))
+    .with_help("Reduce enabled plugin registrations before reloading extensions")
+}
+
+fn host_byte_limit_error(resource: &str, observed: usize, limit: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{resource} exceeds the host-side byte limit"),
+    )
+    .with_context(format!("bytes: {observed}; limit: {limit}"))
+    .with_help("Reduce enabled plugin source or retained callback output")
+}
+
+fn unavailable_event_scheduler_error() -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        "the extension event scheduler is unavailable",
+    )
+    .with_help("Restart Quirl after reducing process or extension resource pressure")
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 fn is_subsequence(query: &str, candidate: &str) -> bool {
     let mut query = query.chars().flat_map(char::to_lowercase);
     let mut expected = query.next();
@@ -1292,6 +2035,24 @@ quirl.completion.add_provider {{
             format!("return {{ editor = {{ keymap = \"{keymap}\" }} }}"),
         )
         .unwrap();
+    }
+
+    fn refreshed_prompt_segments(
+        host: &mut LuaExtensionHost,
+        mode: Mode,
+        last_status: i32,
+    ) -> Vec<NamedExtensionSegment> {
+        let initial = host.named_prompt_segments(mode, last_status);
+        if host.plugin_runtimes.is_empty() {
+            return initial;
+        }
+        let scheduler = host.scheduler.as_ref().unwrap().handle();
+        assert!(scheduler.wait_generation_idle(host.revision, Duration::from_secs(1)));
+        host.poll_prompt_refresh();
+        host.prompt_cache
+            .iter()
+            .flat_map(|segments| segments.iter().cloned())
+            .collect()
     }
 
     fn write_managed_prompt_plugin(directory: &Path) -> (PathBuf, PluginLockfile) {
@@ -1372,7 +2133,7 @@ error_codes = { "0" = "success" }
     fn plugin_drives_prompt_and_completion_surfaces() {
         let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugin.lua");
         let mut host = LuaExtensionHost::from_paths(None, vec![plugin]);
-        let prompt = host.named_prompt_segments(Mode::Command, 0);
+        let prompt = refreshed_prompt_segments(&mut host, Mode::Command, 0);
         assert_eq!(prompt.len(), 1);
         assert!(!prompt[0].value.is_empty());
 
@@ -1395,7 +2156,7 @@ error_codes = { "0" = "success" }
             ExtensionReloadState::Reloaded { .. }
         ));
         assert_eq!(
-            host.named_prompt_segments(Mode::Command, 0)[0].name,
+            refreshed_prompt_segments(&mut host, Mode::Command, 0)[0].name,
             "managed"
         );
         let mut catalog = Catalog::builtin();
@@ -1539,7 +2300,7 @@ error_codes = { "0" = "success" }
         assert_eq!(host.active_config().editor.keymap, "emacs");
         assert_eq!(host.complete("fruit ", 6)[0].value, "apple");
         assert_eq!(
-            host.named_prompt_segments(Mode::Command, 0)[0].name,
+            refreshed_prompt_segments(&mut host, Mode::Command, 0)[0].name,
             "fruit"
         );
 
@@ -1733,7 +2494,9 @@ quirl.extension.contribute {
         )
         .unwrap();
         let mut host = LuaExtensionHost::from_paths(None, vec![last, broken, first]);
-        let actions = host.dispatch_event(ExtensionEventData::SessionStart { restored: false });
+        let actions = host
+            .dispatch_event(ExtensionEventData::SessionStart { restored: false })
+            .unwrap();
         let messages = actions
             .into_iter()
             .filter_map(|action| match action {
@@ -1743,6 +2506,149 @@ quirl.extension.contribute {
             .collect::<Vec<_>>();
         assert_eq!(messages, vec!["first", "last"]);
         assert_eq!(host.take_errors().len(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn first_prompt_uses_only_cache_and_newest_generation_refreshes_later() {
+        let directory = temporary_extension_directory();
+        let plugin = directory.join("status.lua");
+        fs::write(
+            &plugin,
+            r#"quirl.prompt.add_segment {
+              name = "status", deadline_ms = 20,
+              render = function(ctx)
+                if ctx.last_status == 1 then return "one" end
+                if ctx.last_status == 2 then return "two" end
+                if ctx.last_status == 3 then return "three" end
+                return "four"
+              end,
+            }"#,
+        )
+        .unwrap();
+        let mut host = LuaExtensionHost::from_paths(None, vec![plugin]);
+
+        assert!(host.named_prompt_segments(Mode::Command, 1).is_empty());
+        let scheduler = host.scheduler.as_ref().unwrap().handle();
+        assert!(scheduler.wait_generation_idle(host.revision, Duration::from_secs(1)));
+        host.poll_prompt_refresh();
+        assert_eq!(host.prompt_cache[0][0].value, "one");
+
+        let stale = host.named_prompt_segments(Mode::Command, 2);
+        assert_eq!(stale[0].value, "one");
+        assert!(scheduler.wait_generation_idle(host.revision, Duration::from_secs(1)));
+        host.poll_prompt_refresh();
+        assert_eq!(host.prompt_cache[0][0].value, "two");
+
+        let _ = host.named_prompt_segments(Mode::Command, 3);
+        let _ = host.named_prompt_segments(Mode::Command, 4);
+        assert!(scheduler.wait_generation_idle(host.revision, Duration::from_secs(1)));
+        host.poll_prompt_refresh();
+        assert_eq!(host.prompt_cache[0][0].value, "four");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failing_prompt_refresh_preserves_the_last_completed_snapshot() {
+        let directory = temporary_extension_directory();
+        let plugin = directory.join("stale.lua");
+        fs::write(
+            &plugin,
+            r#"quirl.prompt.add_segment {
+              name = "stale", deadline_ms = 20,
+              render = function(ctx)
+                if ctx.last_status == 0 then return "cached" end
+                error("refresh failed")
+              end,
+            }"#,
+        )
+        .unwrap();
+        let mut host = LuaExtensionHost::from_paths(None, vec![plugin]);
+        assert_eq!(
+            refreshed_prompt_segments(&mut host, Mode::Command, 0)[0].value,
+            "cached"
+        );
+        let scheduler = host.scheduler.as_ref().unwrap().handle();
+        let stale = host.named_prompt_segments(Mode::Command, 1);
+        assert_eq!(stale[0].value, "cached");
+        assert!(scheduler.wait_generation_idle(host.revision, Duration::from_secs(1)));
+        host.poll_prompt_refresh();
+        assert_eq!(host.prompt_cache[0][0].value, "cached");
+        assert_eq!(host.take_errors().len(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn plugin_cardinality_is_rejected_before_runtime_creation() {
+        let directory = temporary_extension_directory();
+        let mut plugins = Vec::new();
+        for index in 0..=MAX_LOADED_PLUGIN_RUNTIMES {
+            let path = directory.join(format!("runtime-{index:02}.lua"));
+            write_plugin(&path, &format!("segment-{index}"), "value");
+            plugins.push(path);
+        }
+        let mut host = LuaExtensionHost::from_paths(None, plugins);
+        assert_eq!(host.reload_if_changed(), ExtensionReloadState::Rejected);
+        assert!(host.scheduler.is_none());
+        let errors = host.take_errors();
+        assert!(errors.iter().any(|error| error
+            .details
+            .context
+            .iter()
+            .any(|context| { context.contains(&format!("limit: {MAX_LOADED_PLUGIN_RUNTIMES}")) })));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn aggregate_registration_caps_reject_amplification_across_plugins() {
+        for kind in ["prompt", "event", "contribution"] {
+            let directory = temporary_extension_directory();
+            let first = directory.join(format!("{kind}-a.lua"));
+            let second = directory.join(format!("{kind}-b.lua"));
+            fs::write(&first, registration_source(kind, "a", 64)).unwrap();
+            fs::write(&second, registration_source(kind, "b", 1)).unwrap();
+            let mut host = LuaExtensionHost::from_paths(None, vec![first, second]);
+            assert_eq!(host.reload_if_changed(), ExtensionReloadState::Rejected);
+            let errors = host.take_errors();
+            assert!(errors.iter().any(|error| error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("observed: 65; limit: 64"))));
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn event_action_retention_is_bounded_across_plugins() {
+        let directory = temporary_extension_directory();
+        let mut plugins = Vec::new();
+        for plugin_index in 0..5 {
+            let path = directory.join(format!("actions-{plugin_index}.lua"));
+            let mut actions = String::new();
+            for action_index in 0..64 {
+                actions.push_str(&format!(
+                    "{{ action = 'diagnose', message = 'p{plugin_index}-{action_index}' }},"
+                ));
+            }
+            fs::write(
+                &path,
+                format!(
+                    "quirl.events.subscribe {{ name = 'handler-{plugin_index}', events = {{ 'session_start' }}, capabilities = {{ 'events_observe' }}, deadline_ms = 20, observe = function(_) return {{ {actions} }} end }}"
+                ),
+            )
+            .unwrap();
+            plugins.push(path);
+        }
+        let mut host = LuaExtensionHost::from_paths(None, plugins);
+        let actions = host
+            .dispatch_event(ExtensionEventData::SessionStart { restored: false })
+            .unwrap();
+        assert_eq!(actions.len(), MAX_EXTENSION_EVENT_ACTIONS);
+        assert!(host
+            .take_errors()
+            .iter()
+            .any(|error| error.message.contains("event actions")));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1797,5 +2703,24 @@ quirl.extension.contribute {
             ),
             Some(PathBuf::from("/tmp/xdg/quirl/plugins"))
         );
+    }
+
+    fn registration_source(kind: &str, prefix: &str, count: usize) -> String {
+        let mut source = String::new();
+        for index in 0..count {
+            match kind {
+                "prompt" => source.push_str(&format!(
+                    "quirl.prompt.add_segment {{ name = '{prefix}-{index}', deadline_ms = 8, render = function(_) return '{prefix}' end }}\n"
+                )),
+                "event" => source.push_str(&format!(
+                    "quirl.events.subscribe {{ name = '{prefix}-{index}', events = {{ 'session_start' }}, capabilities = {{ 'events_observe' }}, deadline_ms = 8, observe = function(_) return {{}} end }}\n"
+                )),
+                "contribution" => source.push_str(&format!(
+                    "quirl.extension.contribute {{ kind = 'completion', name = '{prefix}-{index}', deadline_ms = 8, provide = function(_) return {{}} end }}\n"
+                )),
+                _ => unreachable!("test supplies a fixed registration kind"),
+            }
+        }
+        source
     }
 }

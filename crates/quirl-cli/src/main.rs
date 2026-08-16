@@ -3,6 +3,7 @@
 mod agent;
 mod author;
 mod config;
+mod extension_scheduler;
 mod extensions;
 mod index;
 mod lsp;
@@ -970,7 +971,9 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
     // Environment capture can be deferred past the first interactive paint.
     let mut recovery = None;
     let data = DataRuntime::with_process_host(sandboxed_process_host());
-    // Script evaluation remains lazy; extension VMs load before the first editor view.
+    // Script evaluation remains lazy. Extension VMs load before the first editor
+    // view, but first paint reads only their bounded prompt cache; Lua refreshes
+    // on the fixed worker pool after the snapshot is returned.
     let mut lua = None;
     let mut last_status = 0;
     let mut last_duration: Option<Duration> = None;
@@ -1060,6 +1063,7 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
         match signal {
             Ok(InteractiveSignal::Success(buffer)) => {
                 sync_history(&mut line_editor, &history_path)?;
+                quiesce_extension_callbacks(&extensions)?;
                 match classify(mode, &buffer) {
                     InteractiveLine::Empty => {}
                     InteractiveLine::Exit => return Ok(last_status),
@@ -1282,8 +1286,32 @@ fn notify_extensions(
 ) -> Vec<ExtensionAction> {
     extensions
         .lock()
-        .map(|mut extensions| extensions.dispatch_event(event))
+        .map(|mut extensions| extensions.dispatch_event(event).unwrap_or_default())
         .unwrap_or_default()
+}
+
+fn notify_extensions_required(
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+    event: ExtensionEventData,
+) -> Result<Vec<ExtensionAction>, ShellError> {
+    let mut extensions = extensions.lock().map_err(|_| {
+        ShellError::new(ErrorCode::Lua, "the extension host lock was poisoned")
+            .with_help("Restart Quirl before executing another command")
+    })?;
+    extensions.dispatch_event(event)
+}
+
+fn quiesce_extension_callbacks(
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+) -> Result<(), ShellError> {
+    let quiescence = {
+        let mut extensions = extensions.lock().map_err(|_| {
+            ShellError::new(ErrorCode::Lua, "the extension host lock was poisoned")
+                .with_help("Restart Quirl before executing another command")
+        })?;
+        extensions.begin_callback_quiescence()
+    };
+    quiescence.wait()
 }
 
 fn begin_extension_session(extensions: &Arc<Mutex<LuaExtensionHost>>) {
@@ -1338,13 +1366,13 @@ fn prepare_extension_plan(
 ) -> Result<PlannedExecution, ShellError> {
     let mut planned = PlannedExecution::new(source);
     apply_plan_actions(
-        notify_extensions(
+        notify_extensions_required(
             extensions,
             ExtensionEventData::CommandPlan {
                 source: source.to_owned(),
                 effects,
             },
-        ),
+        )?,
         &mut planned,
     )?;
     Ok(planned)
@@ -1438,9 +1466,9 @@ fn emit_value_output(
 }
 
 fn safe_extension_output_text(text: &str) -> Option<String> {
-    reject_terminal_controls("extension output", text)
-        .is_ok()
-        .then(|| text.to_owned())
+    (text.len() <= extensions::MAX_EXTENSION_EVENT_BYTES
+        && reject_terminal_controls("extension output", text).is_ok())
+    .then(|| text.to_owned())
 }
 
 fn print_extension_annotations(annotations: &BTreeMap<String, serde_json::Value>) {
