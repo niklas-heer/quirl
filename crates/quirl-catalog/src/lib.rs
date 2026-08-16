@@ -10,7 +10,7 @@ pub const MAX_COMPLETION_QUERY_BYTES: usize = 4 * 1024;
 pub const MAX_COMPLETION_RESULTS: usize = 1_000;
 pub const MAX_COMPLETION_DEADLINE_MS: u64 = 250;
 pub const CATALOG_SCHEMA_DESCRIPTOR: &str = "quirl.catalog@4{Catalog{deny_unknown;schema_version:4;commands:array<CommandSpec>};CommandSpec{deny_unknown;id:string;version:null|string;path:string;aliases:array<string>;parent:null|string;signature:string;summary:string;details:string;arguments:array<ArgumentSpec>;examples:array<string>;io:IoContract;effects:array<Effect>;exit_codes:map<i32,string>;provenance:ProvenanceInfo};ArgumentSpec{deny_unknown;names:array<string>;kind:positional|option|flag;value_type:string;required:bool;repeatable:bool;values:null|CompletionSource;conflicts:array<string>;documentation:string;examples:array<string>;provenance:ProvenanceInfo};CompletionSource:tag(kind)[static{values:array<string>}|dynamic{provider:string}];IoContract{deny_unknown;input:string;output:string;streaming:bool};Effect:read_filesystem|write_filesystem|spawn_process|change_directory;ProvenanceInfo{deny_unknown;source:builtin|external|lua|plugin|fish|bash|zsh|help|man;confidence:low|medium|high|exact;trust:builtin|trusted|declared|imported|heuristic;origin:null|string;fingerprint:null|string;generated_at:null|string};migration:read-v2-v3-to-v4}";
-pub const COMPLETION_SCHEMA_DESCRIPTOR: &str = "quirl.completion@1{Completion{deny_unknown;value:string;display:string;summary:string;detail:string;replace_start:usize;replace_end:usize;match_indices:array<usize>};CompletionRequest{deny_unknown;protocol_version:u32;request_id:u64(strictly-increasing);line:utf8<=4096-bytes;cursor:usize(char-boundary);limit:usize<=1000;deadline_ms:1..250};CompletionCancellation{deny_unknown;protocol_version:u32;request_id:u64};CompletionResponse{deny_unknown;protocol_version:u32;request_id:u64;outcome:CompletionOutcome};CompletionOutcome:tag(status)[ready{items:array<Completion>}|cancelled{}|deadline_exceeded{}];policy:frozen-major-v1;ordering:score-desc-then-display-value;catalog_source:quirl.catalog@4;static_values:CompletionSource.static;dynamic_values:provider-identity-only;worker:newer-request-or-cancellation-never-overwrites-newer-result}";
+pub const COMPLETION_SCHEMA_DESCRIPTOR: &str = "quirl.completion@1{Completion{deny_unknown;value:string;display:string;summary:string;detail:string;replace_start:usize;replace_end:usize;match_indices:array<usize>};CompletionRequest{deny_unknown;protocol_version:u32;request_id:u64(strictly-increasing);line:utf8<=4096-bytes;cursor:usize(char-boundary);limit:usize<=1000;deadline_ms:1..250};CompletionCancellation{deny_unknown;protocol_version:u32;request_id:u64};CompletionResponse{deny_unknown;protocol_version:u32;request_id:u64;outcome:CompletionOutcome};CompletionOutcome:tag(status);content(data)[ready{items:array<Completion>}|cancelled{}|deadline_exceeded{}];policy:frozen-major-v1;ordering:score-desc-then-display-value;catalog_source:quirl.catalog@4;static_values:CompletionSource.static;dynamic_values:provider-identity-only;worker:newer-request-or-cancellation-never-overwrites-newer-result}";
 
 mod import;
 
@@ -417,13 +417,18 @@ impl Catalog {
                     "ls",
                     "ls [path] [options]",
                     "List a directory as structured entries",
-                    "Quirl's bounded native ls renders terminal-safe plain rows for humans and preserves exact entry values in stable JSON. Sorting is deterministic; symlink targets are lazy and opt-in.",
+                    "Quirl's bounded native ls renders terminal-safe plain rows for humans and preserves exact entry values in stable JSON. Sorting is deterministic; symlink targets are lazy and opt-in. `--max-entries` is a positive, explicit resource bound.",
                     vec![
                         option(&["-a", "--all"], None, "Include hidden entries"),
                         option(&["-l", "--long"], None, "Show size, kind, and modified time"),
                         option(&["-r", "--reverse"], None, "Reverse the selected sort within directory/file groups"),
                         option(&["--directories-first", "--dirs-first"], None, "Keep directories before other entry kinds"),
                         option(&["--resolve-links"], None, "Read symlink targets as an explicit metadata enrichment"),
+                        option(
+                            &["--max-entries"],
+                            Some("positive-integer"),
+                            "Limit the listing to a positive number of entries",
+                        ),
                         option(&["--json"], None, "Emit stable structured JSON"),
                         option_with_static_values(
                             &["--format"],
@@ -438,7 +443,7 @@ impl Catalog {
                             "Choose the deterministic entry ordering",
                         ),
                     ],
-                    &["ls", "ls -la src", "ls --sort size --reverse", "ls --format json | jq"],
+                    &["ls", "ls -la src", "ls --max-entries=1000 --sort size --reverse", "ls --format json | jq"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
@@ -2290,5 +2295,18 @@ mod tests {
         assert!(serde_json::from_str::<CompletionRequest>(request).is_err());
         let response = r#"{"protocol_version":1,"request_id":1,"outcome":{"status":"cancelled"},"future":true}"#;
         assert!(serde_json::from_str::<CompletionResponse>(response).is_err());
+    }
+
+    #[test]
+    fn completion_descriptor_matches_the_tagged_serialized_outcome() {
+        let response = CompletionResponse {
+            protocol_version: 1,
+            request_id: 9,
+            outcome: CompletionOutcome::Ready { items: Vec::new() },
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["outcome"]["status"], "ready");
+        assert_eq!(value["outcome"]["data"]["items"], serde_json::json!([]));
+        assert!(COMPLETION_SCHEMA_DESCRIPTOR.contains("tag(status);content(data)"));
     }
 }

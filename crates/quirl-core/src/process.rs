@@ -280,6 +280,21 @@ impl CommandRunner {
                 value if value.starts_with("--sort=") => {
                     options.sort = parse_directory_sort(&value[7..], words)?;
                 }
+                "--max-entries" => {
+                    index += 1;
+                    let value = words.get(index).ok_or_else(|| {
+                        ShellError::new(
+                            ErrorCode::InvalidArgument,
+                            "ls --max-entries needs a positive value",
+                        )
+                        .with_command(words.join(" "))
+                        .with_help("Use a positive bound, for example `ls --max-entries 1000`")
+                    })?;
+                    options.max_entries = parse_max_entries(value, words)?;
+                }
+                value if value.starts_with("--max-entries=") => {
+                    options.max_entries = parse_max_entries(&value[14..], words)?;
+                }
                 "--format" => {
                     index += 1;
                     let value = words.get(index).ok_or_else(|| {
@@ -394,20 +409,23 @@ pub fn directory_entries_with_options(
             )
             .with_help("Choose a narrower directory or increase the explicit listing limit"));
         }
-        let metadata = fs::symlink_metadata(item.path()).map_err(|error| {
-            ShellError::new(
-                ErrorCode::Io,
-                format!("cannot inspect {}", item.path().display()),
-            )
-            .with_context(error.to_string())
-        })?;
-        let file_type = item.file_type().map_err(|error| {
-            ShellError::new(
-                ErrorCode::Io,
-                format!("cannot identify {}", item.path().display()),
-            )
-            .with_context(error.to_string())
-        })?;
+        let entry_path = item.path();
+        let metadata = match fs::symlink_metadata(&entry_path) {
+            Ok(metadata) => metadata,
+            // A directory may change while it is listed. A vanished entry is
+            // not an error in the listing itself; retain failures for all
+            // other metadata errors so permissions problems remain visible.
+            Err(error) if is_not_found(&error) => continue,
+            Err(error) => {
+                return Err(ShellError::new(
+                    ErrorCode::Io,
+                    format!("cannot inspect {}", entry_path.display()),
+                )
+                .with_context(error.to_string())
+                .with_help("Check that the directory remains readable while it is listed"));
+            }
+        };
+        let file_type = metadata.file_type();
         let kind = if file_type.is_dir() {
             EntryKind::Directory
         } else if file_type.is_file() {
@@ -418,22 +436,26 @@ pub fn directory_entries_with_options(
             EntryKind::Other
         };
         let symlink_target = if options.resolve_symlink_targets && file_type.is_symlink() {
-            Some(fs::read_link(item.path()).map_err(|error| {
-                ShellError::new(
-                    ErrorCode::Io,
-                    format!("cannot resolve symlink {}", item.path().display()),
-                )
-                .with_context(error.to_string())
-                .with_help(
-                    "Check that the symlink remains readable, or list without --resolve-links",
-                )
-            })?)
+            match fs::read_link(&entry_path) {
+                Ok(target) => Some(target),
+                Err(error) if is_not_found(&error) => continue,
+                Err(error) => {
+                    return Err(ShellError::new(
+                        ErrorCode::Io,
+                        format!("cannot resolve symlink {}", entry_path.display()),
+                    )
+                    .with_context(error.to_string())
+                    .with_help(
+                        "Check that the symlink remains readable, or list without --resolve-links",
+                    ));
+                }
+            }
         } else {
             None
         };
         entries.push(Entry {
             name,
-            path: item.path(),
+            path: entry_path,
             kind,
             size: metadata.len(),
             modified_unix_seconds: metadata
@@ -463,6 +485,22 @@ fn parse_directory_sort(value: &str, words: &[String]) -> Result<DirectorySort, 
         .with_command(words.join(" "))
         .with_help("Use one of: name, size, modified, kind")),
     }
+}
+
+fn parse_max_entries(value: &str, words: &[String]) -> Result<usize, ShellError> {
+    let parsed = value.parse::<usize>().ok().filter(|value| *value > 0);
+    parsed.ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::InvalidArgument,
+            format!("ls --max-entries needs a positive integer, got `{value}`"),
+        )
+        .with_command(words.join(" "))
+        .with_help("Use a positive bound, for example `ls --max-entries=1000`")
+    })
+}
+
+fn is_not_found(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
 }
 
 fn parse_ls_format(value: &str, words: &[String]) -> Result<bool, ShellError> {
@@ -519,7 +557,7 @@ fn render_entries(entries: &[Entry], long: bool) -> String {
     for entry in entries {
         if long {
             let kind = match entry.kind {
-                EntryKind::Directory => "dir ",
+                EntryKind::Directory => "dir",
                 EntryKind::File => "file",
                 EntryKind::Symlink => "link",
                 EntryKind::Other => "other",
@@ -528,7 +566,7 @@ fn render_entries(entries: &[Entry], long: bool) -> String {
                 .modified_unix_seconds
                 .map_or_else(|| "-".to_owned(), |seconds| seconds.to_string());
             output.push_str(&format!(
-                "{kind}  {:>10}  {:>10}  {}\n",
+                "{kind:<5}  {:>10}  {:>10}  {}\n",
                 entry.size,
                 modified,
                 entry.display_name()
@@ -604,6 +642,34 @@ mod tests {
         // kind, byte count, modification time, and terminal-safe name.
         assert_eq!(result.stdout.unwrap().split_whitespace().count(), 8);
 
+        let limited = runner
+            .execute_capture(&format!(
+                "ls --max-entries 1 {path}",
+                path = directory.display()
+            ))
+            .unwrap_err();
+        assert_eq!(limited.code, ErrorCode::ResourceLimit);
+
+        let one = runner
+            .execute_capture(&format!(
+                "ls --max-entries=2 --format json {path}",
+                path = directory.display()
+            ))
+            .unwrap();
+        let entries: Vec<Entry> = serde_json::from_str(one.stdout.as_deref().unwrap()).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        for value in ["0", "not-a-number"] {
+            let error = runner
+                .execute_capture(&format!(
+                    "ls --max-entries={value} {path}",
+                    path = directory.display()
+                ))
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+            assert!(!error.details.help.is_empty());
+        }
+
         let error = runner
             .execute_capture(&format!(
                 "ls --sort nonsense {path}",
@@ -674,6 +740,7 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn plain_rendering_neutralizes_hostile_and_unicode_filenames() {
         let directory = test_directory("terminal-names");
@@ -686,6 +753,48 @@ mod tests {
         assert!(!output.contains('\u{1b}'));
         assert!(output.contains("name"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn long_listing_uses_a_fixed_width_kind_column() {
+        let entries = [
+            Entry {
+                name: "directory".to_owned(),
+                path: PathBuf::from("directory"),
+                kind: EntryKind::Directory,
+                size: 1,
+                modified_unix_seconds: Some(2),
+                hidden: false,
+                symlink_target: None,
+                readonly: false,
+            },
+            Entry {
+                name: "other".to_owned(),
+                path: PathBuf::from("other"),
+                kind: EntryKind::Other,
+                size: 1,
+                modified_unix_seconds: Some(2),
+                hidden: false,
+                symlink_target: None,
+                readonly: false,
+            },
+        ];
+        let output = render_entries(&entries, true);
+        let columns = output
+            .lines()
+            .map(|line| line.find("         1").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(columns, vec![7, 7]);
+    }
+
+    #[test]
+    fn only_not_found_errors_are_treated_as_listing_races() {
+        assert!(is_not_found(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!is_not_found(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
     }
 
     #[cfg(unix)]

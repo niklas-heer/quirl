@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
+    fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -113,7 +113,10 @@ impl DataValue {
             | Self::Pattern(value) => value.clone(),
             Self::Duration { nanoseconds } => format!("{nanoseconds}ns"),
             Self::Size { bytes } => format!("{bytes}B"),
-            Self::List(_) | Self::Record(_) => serde_json::to_string(self)
+            // Plain output is for people. Keep the typed/tagged representation
+            // at the JSON ABI boundary, but do not expose those implementation
+            // tags when showing a nested native value at a terminal.
+            Self::List(_) | Self::Record(_) => serde_json::to_string(&self.json_value())
                 .unwrap_or_else(|_| "<unrenderable structured value>".to_owned()),
         }
     }
@@ -641,19 +644,12 @@ impl DataRuntime {
     }
 
     fn open_value(&self, path: &Path) -> Result<Value, ShellError> {
-        let metadata = fs::metadata(path).map_err(|error| io_error("inspect", path, error))?;
-        if metadata.len() > self.limits.max_file_bytes {
-            return Err(limit_error(
-                format!("{} exceeds the file-size limit", path.display()),
-                "Increase the data file limit or select a smaller input file",
-            ));
-        }
         match extension(path).as_deref() {
             Some("csv") => return Ok(Value::Array(read_csv(path, self.limits)?)),
             Some("tar") => return Ok(Value::Array(read_tar(path, self.limits)?)),
             _ => {}
         }
-        let contents = fs::read_to_string(path).map_err(|error| io_error("open", path, error))?;
+        let contents = read_bounded_utf8(path, self.limits.max_file_bytes)?;
         let value = match extension(path).as_deref() {
             Some("json") => serde_json::from_str(&contents).map_err(|error| {
                 ShellError::new(
@@ -991,6 +987,123 @@ fn io_error(action: &str, path: &Path, error: std::io::Error) -> ShellError {
         .with_help("Check that the path exists and that Quirl has permission to read it")
 }
 
+const FILE_SIZE_LIMIT_ERROR: &str = "Quirl bounded reader reached its input limit";
+
+/// A reader that proves the bytes consumed after opening a file stay within a
+/// limit. Filesystem metadata is advisory: a path can be replaced or enlarged
+/// between `metadata` and `open`, so every adapter enforces its bound on the
+/// opened handle itself.
+struct BoundedReader<R> {
+    inner: R,
+    limit: u64,
+    consumed: u64,
+}
+
+impl<R> BoundedReader<R> {
+    const fn new(inner: R, limit: u64) -> Self {
+        Self {
+            inner,
+            limit,
+            consumed: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for BoundedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.consumed < self.limit {
+            let remaining = self.limit - self.consumed;
+            let allowed = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(buffer.len());
+            let read = self.inner.read(&mut buffer[..allowed])?;
+            self.consumed += u64::try_from(read).unwrap_or(u64::MAX);
+            return Ok(read);
+        }
+
+        // Probe once at the boundary. Returning EOF here accepts an input of
+        // exactly `limit` bytes; seeing one more byte fails before it reaches a
+        // parser or accumulates in memory.
+        let mut probe = [0_u8; 1];
+        if self.inner.read(&mut probe)? == 0 {
+            Ok(0)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                FILE_SIZE_LIMIT_ERROR,
+            ))
+        }
+    }
+}
+
+fn is_file_size_limit(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::InvalidData && error.to_string() == FILE_SIZE_LIMIT_ERROR
+}
+
+fn bounded_io_error(action: &str, path: &Path, error: std::io::Error) -> ShellError {
+    if is_file_size_limit(&error) {
+        limit_error(
+            format!("{} exceeds the file-size limit", path.display()),
+            "Increase the data file limit or select a smaller input file",
+        )
+    } else {
+        io_error(action, path, error)
+    }
+}
+
+fn read_bounded_utf8(path: &Path, limit: u64) -> Result<String, ShellError> {
+    let mut reader = open_bounded_file(path, limit)?;
+    let mut contents = String::new();
+    reader
+        .read_to_string(&mut contents)
+        .map_err(|error| bounded_io_error("read", path, error))?;
+    Ok(contents)
+}
+
+/// Open first, then inspect that exact handle before exposing it to a lazy
+/// adapter. The follow-up [`BoundedReader`] still enforces the same limit for
+/// regular files that grow after this metadata snapshot.
+fn open_bounded_file(path: &Path, limit: u64) -> Result<BoundedReader<File>, ShellError> {
+    let file = open_data_file(path).map_err(|error| io_error("open", path, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| io_error("inspect", path, error))?;
+    if !metadata.is_file() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!("data source {} is not a regular file", path.display()),
+        )
+        .with_context("directories, FIFOs, sockets, and device nodes are rejected")
+        .with_help("Copy the input into a bounded regular file before opening it as data"));
+    }
+    if metadata.len() > limit {
+        return Err(limit_error(
+            format!("{} exceeds the file-size limit", path.display()),
+            "Increase the data file limit or select a smaller input file",
+        ));
+    }
+    Ok(BoundedReader::new(file, limit))
+}
+
+fn open_data_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // Opening a read-only FIFO normally waits forever for a writer. Apply
+        // O_NONBLOCK to the open operation itself, then reject every
+        // non-regular handle from its exact metadata above. Regular files keep
+        // their usual blocking read semantics on supported Unix kernels.
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
 fn limit_error(message: impl Into<String>, help: impl Into<String>) -> ShellError {
     ShellError::new(ErrorCode::ResourceLimit, message).with_help(help)
 }
@@ -1039,19 +1152,11 @@ fn read_csv(path: &Path, limits: DataLimits) -> Result<Vec<Value>, ShellError> {
 }
 
 fn open_csv_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellError> {
-    let metadata = fs::metadata(path).map_err(|error| io_error("inspect", path, error))?;
-    if metadata.len() > limits.max_file_bytes {
-        return Err(limit_error(
-            format!("{} exceeds the file-size limit", path.display()),
-            "Increase the data file limit or select a smaller input file",
-        ));
-    }
-    let file = File::open(path).map_err(|error| io_error("open", path, error))?;
-    let mut lines = BufReader::new(file).lines();
+    let mut lines = BufReader::new(open_bounded_file(path, limits.max_file_bytes)?).lines();
     let header = lines
         .next()
         .transpose()
-        .map_err(|error| io_error("read", path, error))?
+        .map_err(|error| bounded_io_error("read", path, error))?
         .ok_or_else(|| {
             ShellError::new(
                 ErrorCode::Data,
@@ -1062,13 +1167,10 @@ fn open_csv_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
     let headers = parse_csv_record(&header).map_err(|message| csv_error(path, 1, message))?;
     validate_csv_headers(&headers, limits, path)?;
     let display = path.display().to_string();
+    let source_path = path.to_path_buf();
     let iterator = lines.enumerate().map(move |(index, line)| {
         let line_number = index + 2;
-        let line = line.map_err(|error| {
-            ShellError::new(ErrorCode::Io, format!("cannot read {display}"))
-                .with_context(error.to_string())
-                .with_help("Check the CSV file for a readable UTF-8 text encoding")
-        })?;
+        let line = line.map_err(|error| bounded_io_error("read", &source_path, error))?;
         let fields = parse_csv_record(&line)
             .map_err(|message| csv_error_display(&display, line_number, message))?;
         if fields.len() != headers.len() {
@@ -1178,16 +1280,9 @@ fn read_tar(path: &Path, limits: DataLimits) -> Result<Vec<Value>, ShellError> {
 /// stream owns a single file reader and advances one header per pull, so a
 /// caller that takes a few entries does not walk the rest of the archive.
 fn open_tar_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellError> {
-    let metadata = fs::metadata(path).map_err(|error| io_error("inspect", path, error))?;
-    if metadata.len() > limits.max_file_bytes {
-        return Err(limit_error(
-            format!("{} exceeds the archive-size limit", path.display()),
-            "Increase the data file limit or select a smaller archive",
-        ));
-    }
-    let file = File::open(path).map_err(|error| io_error("open", path, error))?;
     let display = path.display().to_string();
-    let mut reader = BufReader::new(file);
+    let source_path = path.to_path_buf();
+    let mut reader = BufReader::new(open_bounded_file(path, limits.max_file_bytes)?);
     let mut finished = false;
     Ok(DataStream::from_pull(
         move |cancelled| {
@@ -1198,11 +1293,9 @@ fn open_tar_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
             let mut header = [0_u8; 512];
             let mut read = 0;
             while read < header.len() {
-                let count = reader.read(&mut header[read..]).map_err(|error| {
-                    ShellError::new(ErrorCode::Io, format!("cannot read {display}"))
-                        .with_context(error.to_string())
-                        .with_help("Check that the archive is readable")
-                })?;
+                let count = reader
+                    .read(&mut header[read..])
+                    .map_err(|error| bounded_io_error("read", &source_path, error))?;
                 if count == 0 {
                     if read == 0 {
                         finished = true;
@@ -1265,11 +1358,9 @@ fn open_tar_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
                     usize::try_from(remaining.min(discard.len() as u64)).map_err(|_| {
                         tar_error_display(&display, "entry size cannot be represented on this host")
                     })?;
-                let count = reader.read(&mut discard[..wanted]).map_err(|error| {
-                    ShellError::new(ErrorCode::Io, format!("cannot read {display}"))
-                        .with_context(error.to_string())
-                        .with_help("Check that the archive is readable")
-                })?;
+                let count = reader
+                    .read(&mut discard[..wanted])
+                    .map_err(|error| bounded_io_error("read", &source_path, error))?;
                 if count == 0 {
                     return Err(tar_error_display(&display, "entry payload is truncated"));
                 }
@@ -2086,29 +2177,79 @@ fn data_error(source: &str, message: impl Into<String>) -> ShellError {
 mod tests {
     use super::*;
     use std::{
-        fs,
+        fs::OpenOptions,
         io::{self, Write},
-        time::{SystemTime, UNIX_EPOCH},
+        sync::atomic::AtomicU64,
     };
 
-    fn temporary_file(extension: &str, contents: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("quirl-data-{nonce}.{extension}"));
-        fs::write(&path, contents).unwrap();
-        path
+    static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TemporaryFile {
+        path: PathBuf,
     }
 
-    fn temporary_bytes(extension: &str, contents: &[u8]) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("quirl-data-{nonce}.{extension}"));
-        fs::write(&path, contents).unwrap();
-        path
+    impl TemporaryFile {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for TemporaryFile {
+        fn as_ref(&self) -> &Path {
+            self.path()
+        }
+    }
+
+    impl Drop for TemporaryFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn temporary_bytes(extension: &str, contents: &[u8]) -> TemporaryFile {
+        for _ in 0..128 {
+            let nonce = TEMPORARY_FILE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "quirl-data-{}-{nonce}.{extension}",
+                std::process::id()
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    if let Err(error) = file.write_all(contents) {
+                        drop(file);
+                        let _ = std::fs::remove_file(&path);
+                        panic!("could not write temporary test file: {error}");
+                    }
+                    return TemporaryFile { path };
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create temporary test file: {error}"),
+            }
+        }
+        panic!("could not allocate a unique temporary test file after 128 attempts");
+    }
+
+    fn temporary_file(extension: &str, contents: &str) -> TemporaryFile {
+        temporary_bytes(extension, contents.as_bytes())
+    }
+
+    #[cfg(unix)]
+    fn temporary_fifo(extension: &str) -> TemporaryFile {
+        use nix::{errno::Errno, sys::stat::Mode, unistd::mkfifo};
+
+        for _ in 0..128 {
+            let nonce = TEMPORARY_FILE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "quirl-data-{}-{nonce}.{extension}",
+                std::process::id()
+            ));
+            match mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR) {
+                Ok(()) => return TemporaryFile { path },
+                Err(Errno::EEXIST) => continue,
+                Err(error) => panic!("could not create temporary test FIFO: {error}"),
+            }
+        }
+        panic!("could not allocate a unique temporary test FIFO after 128 attempts");
     }
 
     fn tar_entry(name: &str, contents: &[u8]) -> Vec<u8> {
@@ -2296,7 +2437,10 @@ mod tests {
 
         assert_eq!(
             runtime
-                .eval(&format!("open {} | get service.name", toml.display()))
+                .eval(&format!(
+                    "open {} | get service.name",
+                    toml.path().display()
+                ))
                 .unwrap(),
             "api"
         );
@@ -2310,8 +2454,6 @@ mod tests {
             Some(serde_json::json!({"name": "worker", "enabled": "false"}))
         );
         assert_eq!(stream.next(&AtomicBool::new(false)).unwrap(), None);
-        fs::remove_file(toml).unwrap();
-        fs::remove_file(csv).unwrap();
     }
 
     #[test]
@@ -2325,7 +2467,10 @@ mod tests {
 
         assert_eq!(
             runtime
-                .eval(&format!("open {} | get service.name", yaml.display()))
+                .eval(&format!(
+                    "open {} | get service.name",
+                    yaml.path().display()
+                ))
                 .unwrap(),
             "api"
         );
@@ -2339,20 +2484,20 @@ mod tests {
             Some(serde_json::json!({"path":"nested/bravo.txt", "kind":"file", "size":5}))
         );
         assert_eq!(stream.next(&AtomicBool::new(false)).unwrap(), None);
-        fs::remove_file(yaml).unwrap();
-        fs::remove_file(tar).unwrap();
     }
 
     #[test]
     fn pull_pipeline_stops_before_later_invalid_csv_rows() {
         let csv = temporary_file("csv", "name,kind\napi,service\nbroken\n");
         let output = DataRuntime::new()
-            .eval_output(&format!("open {} | take 1 | select name", csv.display()))
+            .eval_output(&format!(
+                "open {} | take 1 | select name",
+                csv.path().display()
+            ))
             .unwrap()
             .render(DataRenderFormat::Plain, &AtomicBool::new(false))
             .unwrap();
         assert_eq!(output, "{\"name\":\"api\"}\n");
-        fs::remove_file(csv).unwrap();
     }
 
     #[test]
@@ -2378,7 +2523,6 @@ mod tests {
             .collect(&AtomicBool::new(false))
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        fs::remove_file(tar).unwrap();
     }
 
     #[test]
@@ -2394,7 +2538,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Data);
         assert!(error.details.context[0].contains("checksum"));
-        fs::remove_file(tar).unwrap();
     }
 
     #[test]
@@ -2443,7 +2586,6 @@ mod tests {
         let active = AtomicBool::new(false);
         assert!(stream.next(&active).unwrap().is_some());
         assert_eq!(stream.next(&active).unwrap_err().code, ErrorCode::Data);
-        fs::remove_file(csv).unwrap();
     }
 
     #[test]
@@ -2475,6 +2617,68 @@ mod tests {
         assert!(json.contains("\"type\": \"string\""));
         let table = envelope.render(DataRenderFormat::Table).unwrap();
         assert_eq!(table, "name\tport\n\"api\"\t8080\n");
+    }
+
+    #[test]
+    fn plain_rendering_of_nested_values_does_not_leak_abi_tags() {
+        let output = DataEnvelope::value(serde_json::json!({
+            "service": {"name": "api"},
+            "ports": [8080, 8443],
+        }))
+        .render(DataRenderFormat::Plain)
+        .unwrap();
+        assert_eq!(
+            output,
+            "{\"ports\":[8080,8443],\"service\":{\"name\":\"api\"}}\n"
+        );
+        assert!(!output.contains("\"type\""));
+    }
+
+    #[test]
+    fn bounded_reader_rejects_data_past_the_open_handle_limit() {
+        let mut reader = BoundedReader::new(std::io::Cursor::new(b"abc"), 2);
+        let mut bytes = Vec::new();
+        let error = reader.read_to_end(&mut bytes).unwrap_err();
+        assert!(is_file_size_limit(&error));
+        assert_eq!(bytes, b"ab");
+    }
+
+    #[test]
+    fn file_adapters_enforce_the_bound_while_reading_not_from_metadata() {
+        let json = temporary_file("json", "\"abc\"");
+        let runtime = DataRuntime::with_limits(DataLimits {
+            max_file_bytes: 4,
+            ..DataLimits::DEFAULT
+        });
+        let error = runtime
+            .eval(&format!("open {}", json.path().display()))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(!error.details.help.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_without_a_writer_is_rejected_without_blocking_open() {
+        let fifo = temporary_fifo("json");
+        let path = fifo.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = open_bounded_file(&path, DataLimits::DEFAULT.max_file_bytes).map(|_| ());
+            let _ = sender.send(result);
+        });
+
+        let result = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("opening a FIFO without a writer must not block");
+        let error = match result {
+            Ok(()) => panic!("non-regular data source must fail closed"),
+            Err(error) => error,
+        };
+        worker.join().unwrap();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("not a regular file"));
+        assert!(!error.details.help.is_empty());
     }
 
     #[test]
