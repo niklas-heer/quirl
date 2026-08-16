@@ -812,7 +812,25 @@ and accessible text output, per the release criterion in §10.
 - **Deterministic authoring tools.** `fmt`, `check`, `lint`, and `test` accept
   files or deterministic project discovery. They skip build/VCS directories
   and symlink directories, aggregate every diagnostic, never execute checks,
-  and isolate test modules under the script policy.
+  and isolate test modules under the script policy. Discovery uses an explicit
+  stack and filesystem identities rather than recursion: depth is capped at 32,
+  directories at 4,096, entries per directory at 4,096, total entries at
+  65,536, supported files at 8,192, live retained path state at 4 MiB, and
+  scanned filename bytes at 4 MiB. A bind-mount or other directory alias is
+  rejected; permission and disappearing-entry failures are reported rather
+  than silently producing a partial project view.
+- **Crash-safe formatting.** Changed Lua and native Quirl sources are written to
+  a create-new sibling, flushed and synchronized, assigned the original
+  permissions, and atomically installed only after the complete bounded output
+  is durable. Formatting rejects symlinks, special files, and observed
+  concurrent changes; Unix also rejects pre-existing hard-link aliases, while
+  platforms without a stable link-count API replace only the named entry. A
+  synchronized same-directory recovery link retains the original across
+  replacement and parent-directory sync; returned failures roll back and clean
+  transaction files. On Unix each namespace transition is
+  directory-synchronized. Other platforms retain the synchronized-file
+  guarantee but depend on the operating system's rename durability because
+  portable Rust cannot sync a directory.
 - **Generated knowledge.** `new`, `describe`, and `doc` use checked templates
   and the semantic catalog. Lua annotations, editor completion, hover,
   signatures, module docs, runtime bindings, and SDK output derive from the

@@ -6,11 +6,12 @@ use mlua::{
 };
 use quirl_core::{
     escape_terminal_controls, reject_json_terminal_controls, reject_terminal_controls,
-    validate_contribution_set, ContributionKind, ContributionRegistration, ErrorCode, ErrorLabel,
-    EventKind, EventSubscription, ExecutionCancellation, ExecutionCleanupState, ExecutionEffect,
-    ExecutionEffects, ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget,
-    ExecutionStatus, ExtensionAction, ExtensionCapability, ExtensionEvent, ExtensionEventData,
-    ProcessHost, ProcessRequest, ShellError, StructuredValue, EXECUTION_ARGUMENTS_MAX,
+    replace_file_atomically, validate_contribution_set, AtomicReplaceOptions, ContributionKind,
+    ContributionRegistration, ErrorCode, ErrorLabel, EventKind, EventSubscription,
+    ExecutionCancellation, ExecutionCleanupState, ExecutionEffect, ExecutionEffects,
+    ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget, ExecutionStatus,
+    ExtensionAction, ExtensionCapability, ExtensionEvent, ExtensionEventData, ProcessHost,
+    ProcessRequest, ShellError, StructuredValue, EXECUTION_ARGUMENTS_MAX,
     EXECUTION_ARGUMENT_BYTES_MAX, EXECUTION_BYTES_MAX,
 };
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
@@ -3336,20 +3337,25 @@ fn blocks_opened(shape: &str) -> usize {
 
 /// Format one bounded Lua file and report whether its contents differed.
 ///
-/// With `check` set, no write occurs. Otherwise changed content replaces the file.
-/// Inputs larger than [`MAX_LUA_SOURCE_BYTES`] fail with a resource-limit error.
+/// With `check` set, no write occurs. Otherwise changed content uses the shared
+/// crash-safe replacement transaction: links and special files fail closed,
+/// permissions are preserved, concurrent changes observed before commit are
+/// rejected, and the original remains recoverable across every durability
+/// stage. Inputs and formatted output larger than [`MAX_LUA_SOURCE_BYTES`] fail
+/// with a resource-limit error.
 pub fn format_file(path: &Path, check: bool) -> Result<bool, ShellError> {
     let source = read_source_bounded(path)?;
     let formatted = format_source(&source);
     let changed = source != formatted;
     if changed && !check {
-        fs::write(path, formatted).map_err(|error| {
-            ShellError::new(
-                ErrorCode::Io,
-                format!("cannot write formatted Lua file {}", path.display()),
-            )
-            .with_context(error.to_string())
-        })?;
+        replace_file_atomically(
+            path,
+            source.as_bytes(),
+            formatted.as_bytes(),
+            AtomicReplaceOptions {
+                bytes_max: MAX_LUA_SOURCE_BYTES,
+            },
+        )?;
     }
     Ok(changed)
 }

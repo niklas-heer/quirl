@@ -1,11 +1,13 @@
 //! Shared execution and error contracts for every Quirl surface.
 
+mod atomic_file;
 mod error;
 mod execution;
 mod extension;
 mod process;
 mod protocol;
 
+pub use atomic_file::{replace_file_atomically, AtomicReplaceOptions};
 pub use error::{ErrorCode, ErrorLabel, ShellError};
 pub use execution::{
     ExecutionCancellation, ExecutionCleanupOwner, ExecutionCleanupState, ExecutionEffect,

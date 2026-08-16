@@ -115,9 +115,9 @@ enum Command {
         #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
         format: DiagnosticFormat,
     },
-    /// Deterministically format Lua files under a file or directory path.
+    /// Deterministically format Lua or native Quirl files under a bounded path traversal.
     Fmt {
-        /// Lua or native Quirl script/directory; native source is unchanged.
+        /// Lua or native Quirl script or directory.
         #[arg(value_name = "PATH")]
         file: PathBuf,
         /// Report formatting drift without modifying any file.

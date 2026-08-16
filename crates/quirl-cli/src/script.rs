@@ -1,7 +1,8 @@
 use clap::ValueEnum;
 use quirl_core::{
-    escape_json_terminal_controls, ErrorCode, ExecutionEffect, ExecutionEffects, ExecutionInput,
-    ExecutionOutput, ExecutionOutputTarget, ShellError,
+    escape_json_terminal_controls, replace_file_atomically, AtomicReplaceOptions, ErrorCode,
+    ExecutionEffect, ExecutionEffects, ExecutionInput, ExecutionOutput, ExecutionOutputTarget,
+    ShellError,
 };
 use quirl_data::{
     syntax::{
@@ -16,6 +17,7 @@ use quirl_ui::render_error;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     fs,
     io::{self, Read},
     ops::Range,
@@ -35,6 +37,26 @@ use std::os::unix::process::CommandExt;
 const MAX_REFERENCE_CAPTURE_BYTES: usize = 64 * 1024;
 const QUIRL_CANONICAL_EXTENSION: &str = "qrl";
 const QUIRL_EXTENSION_ALIASES: [&str; 2] = ["quirl", "🌀"];
+const AUTHORING_DISCOVERY_LIMITS: ScriptDiscoveryLimits = ScriptDiscoveryLimits {
+    depth_max: 32,
+    directories_max: 4_096,
+    entries_per_directory_max: 4_096,
+    entries_total_max: 65_536,
+    supported_files_max: 8_192,
+    retained_path_bytes_max: 4 * 1024 * 1024,
+    scanned_name_bytes_max: 4 * 1024 * 1024,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScriptDiscoveryLimits {
+    depth_max: usize,
+    directories_max: usize,
+    entries_per_directory_max: usize,
+    entries_total_max: usize,
+    supported_files_max: usize,
+    retained_path_bytes_max: usize,
+    scanned_name_bytes_max: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ScriptLanguage {
@@ -91,7 +113,7 @@ struct QuirlSyntaxDiagnostic {
 
 pub fn analyze(path: &Path, json_output: bool, lint: bool) -> Result<i32, ShellError> {
     let operation = if lint { "lint" } else { "check" };
-    let report = match analysis_report(path, operation) {
+    let report = match analysis_report(path, operation, AUTHORING_DISCOVERY_LIMITS) {
         Ok(report) => report,
         Err(error) if json_output => AnalysisReport {
             document_type: "quirl.script.analysis",
@@ -110,8 +132,12 @@ pub fn analyze(path: &Path, json_output: bool, lint: bool) -> Result<i32, ShellE
     Ok(i32::from(!report.valid))
 }
 
-fn analysis_report(path: &Path, operation: &'static str) -> Result<AnalysisReport, ShellError> {
-    let files = discover_supported_files(path)?;
+fn analysis_report(
+    path: &Path,
+    operation: &'static str,
+    discovery_limits: ScriptDiscoveryLimits,
+) -> Result<AnalysisReport, ShellError> {
+    let files = discover_supported_files(path, discovery_limits)?;
     let mut entries = Vec::with_capacity(files.len());
     for file in files {
         let result = check_script_file(&file);
@@ -160,7 +186,7 @@ fn render_analysis_report(
 }
 
 pub fn format_paths(path: &Path, check: bool) -> Result<i32, ShellError> {
-    let files = discover_supported_files(path)?;
+    let files = discover_supported_files(path, AUTHORING_DISCOVERY_LIMITS)?;
     let mut drift = Vec::new();
     let mut failures = Vec::new();
     for file in files {
@@ -206,14 +232,14 @@ fn format_quirl_file(path: &Path, check: bool) -> Result<bool, ShellError> {
     let formatted = format_quirl_source(&source, &path.display().to_string())?;
     let changed = source != formatted;
     if changed && !check {
-        fs::write(path, formatted).map_err(|error| {
-            ShellError::new(
-                ErrorCode::Io,
-                format!("cannot write formatted Quirl file {}", path.display()),
-            )
-            .with_context(error.to_string())
-            .with_help("Check file permissions and retry `quirl fmt`")
-        })?;
+        replace_file_atomically(
+            path,
+            source.as_bytes(),
+            formatted.as_bytes(),
+            AtomicReplaceOptions {
+                bytes_max: MAX_LUA_SOURCE_BYTES,
+            },
+        )?;
     }
     Ok(changed)
 }
@@ -266,7 +292,7 @@ fn format_quirl_source(source: &str, source_name: &str) -> Result<String, ShellE
 
 pub fn test_paths(path: &Path) -> Result<i32, ShellError> {
     let explicit_file = path.is_file();
-    let mut files = discover_supported_files(path)?;
+    let mut files = discover_supported_files(path, AUTHORING_DISCOVERY_LIMITS)?;
     files.retain(|file| {
         script_language_for_path(file) == Some(ScriptLanguage::Lua)
             && (explicit_file || is_test_module(file))
@@ -303,9 +329,98 @@ pub fn test_paths(path: &Path) -> Result<i32, ShellError> {
     Ok(i32::from(failed > 0))
 }
 
-fn discover_supported_files(path: &Path) -> Result<Vec<PathBuf>, ShellError> {
+/// Discover supported scripts without recursion or unbounded directory collection.
+///
+/// Failure model: a deep, wide, or path-heavy tree is rejected before another
+/// path is retained; per-directory and aggregate entries, scanned filename
+/// bytes, directories, depth, supported files, and live path bytes each have an
+/// explicit caller-provided limit. Directory symlinks are skipped. Stable
+/// filesystem identities reject bind-mount or other directory aliases instead
+/// of traversing a cycle twice. Permission errors and entries that disappear
+/// after enumeration are reported as I/O errors. Entries are sorted within each
+/// bounded directory and the bounded result is sorted globally, so traversal
+/// and output remain deterministic. No cancellation input exists on these
+/// synchronous authoring commands; every turn is instead bounded by these
+/// admission limits.
+fn discover_supported_files(
+    path: &Path,
+    limits: ScriptDiscoveryLimits,
+) -> Result<Vec<PathBuf>, ShellError> {
+    discover_supported_files_with_hook(path, limits, |_, _| Ok(()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryStage {
+    ReadDirectory,
+    InspectEntry,
+}
+
+#[derive(Debug)]
+struct PendingDirectory {
+    path: PathBuf,
+    depth: usize,
+    retained_path_bytes: usize,
+}
+
+#[derive(Debug)]
+struct DiscoveredPath {
+    path: PathBuf,
+    file_type: fs::FileType,
+    retained_path_bytes: usize,
+}
+
+#[derive(Debug)]
+struct RetainedPathBytes {
+    current: usize,
+    maximum: usize,
+}
+
+impl RetainedPathBytes {
+    fn new(maximum: usize) -> Self {
+        Self {
+            current: 0,
+            maximum,
+        }
+    }
+
+    fn retain(&mut self, path: &Path) -> Result<usize, ShellError> {
+        let bytes = path.as_os_str().as_encoded_bytes().len();
+        let observed = self.current.checked_add(bytes).unwrap_or(usize::MAX);
+        if observed > self.maximum {
+            return Err(discovery_limit_error(
+                path,
+                "retained path bytes",
+                self.maximum,
+                observed,
+            ));
+        }
+        self.current = observed;
+        Ok(bytes)
+    }
+
+    fn release(&mut self, bytes: usize) {
+        debug_assert!(bytes <= self.current);
+        self.current = self.current.saturating_sub(bytes);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    canonical_path: PathBuf,
+}
+
+fn discover_supported_files_with_hook(
+    path: &Path,
+    limits: ScriptDiscoveryLimits,
+    mut before_stage: impl FnMut(DiscoveryStage, &Path) -> io::Result<()>,
+) -> Result<Vec<PathBuf>, ShellError> {
+    validate_discovery_limits(limits)?;
     let metadata = fs::symlink_metadata(path).map_err(|error| path_error(path, error))?;
-    let mut files = Vec::new();
     if metadata.file_type().is_symlink() {
         return Err(ShellError::new(
             ErrorCode::InvalidArgument,
@@ -317,21 +432,174 @@ fn discover_supported_files(path: &Path) -> Result<Vec<PathBuf>, ShellError> {
     }
     if metadata.is_file() {
         if script_language_for_path(path).is_some() {
-            files.push(path.to_path_buf());
-        } else {
-            return Err(unsupported_language_error(
-                path.extension().and_then(|extension| extension.to_str()),
-            ));
+            let mut retained = RetainedPathBytes::new(limits.retained_path_bytes_max);
+            retained.retain(path)?;
+            return Ok(vec![path.to_path_buf()]);
         }
-    } else if metadata.is_dir() {
-        discover_directory(path, &mut files)?;
-    } else {
+        return Err(unsupported_language_error(
+            path.extension().and_then(|extension| extension.to_str()),
+        ));
+    }
+    if !metadata.is_dir() {
         return Err(ShellError::new(
             ErrorCode::InvalidArgument,
             format!("{} is not a regular file or directory", path.display()),
         )
         .with_help("Pass a .lua, .qrl, .quirl, or .🌀 file, or a directory containing scripts"));
     }
+
+    let mut retained = RetainedPathBytes::new(limits.retained_path_bytes_max);
+    let root_bytes = retained.retain(path)?;
+    let mut directories = vec![PendingDirectory {
+        path: path.to_path_buf(),
+        depth: 0,
+        retained_path_bytes: root_bytes,
+    }];
+    let root_identity = directory_identity(path, &metadata)?;
+    retain_directory_identity(&mut retained, &root_identity)?;
+    let mut visited = BTreeSet::from([root_identity]);
+    let mut directory_count = 1_usize;
+    if directory_count > limits.directories_max {
+        return Err(discovery_limit_error(
+            path,
+            "directories",
+            limits.directories_max,
+            directory_count,
+        ));
+    }
+    let mut entry_count = 0_usize;
+    let mut scanned_name_bytes = 0_usize;
+    let mut files = Vec::new();
+
+    while let Some(directory) = directories.pop() {
+        before_stage(DiscoveryStage::ReadDirectory, &directory.path)
+            .map_err(|error| path_error(&directory.path, error))?;
+        let iterator =
+            fs::read_dir(&directory.path).map_err(|error| path_error(&directory.path, error))?;
+        let mut entries = Vec::new();
+        let mut directory_entry_count = 0_usize;
+        for item in iterator {
+            directory_entry_count = directory_entry_count.saturating_add(1);
+            if directory_entry_count > limits.entries_per_directory_max {
+                return Err(discovery_limit_error(
+                    &directory.path,
+                    "entries per directory",
+                    limits.entries_per_directory_max,
+                    directory_entry_count,
+                ));
+            }
+            entry_count = entry_count.saturating_add(1);
+            if entry_count > limits.entries_total_max {
+                return Err(discovery_limit_error(
+                    &directory.path,
+                    "total entries",
+                    limits.entries_total_max,
+                    entry_count,
+                ));
+            }
+            let entry = item.map_err(|error| path_error(&directory.path, error))?;
+            let name = entry.file_name();
+            let name_bytes = name.as_encoded_bytes().len();
+            scanned_name_bytes = scanned_name_bytes
+                .checked_add(name_bytes)
+                .unwrap_or(usize::MAX);
+            if scanned_name_bytes > limits.scanned_name_bytes_max {
+                return Err(discovery_limit_error(
+                    &directory.path,
+                    "scanned filename bytes",
+                    limits.scanned_name_bytes_max,
+                    scanned_name_bytes,
+                ));
+            }
+            let entry_path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| path_error(&entry_path, error))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() && matches!(name.to_str(), Some(".git" | "target")) {
+                continue;
+            }
+            let supported_file =
+                file_type.is_file() && script_language_for_path(&entry_path).is_some();
+            if !file_type.is_dir() && !supported_file {
+                continue;
+            }
+            let retained_path_bytes = retained.retain(&entry_path)?;
+            entries.push(DiscoveredPath {
+                path: entry_path,
+                file_type,
+                retained_path_bytes,
+            });
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let mut nested_directories = Vec::new();
+        for entry in entries {
+            before_stage(DiscoveryStage::InspectEntry, &entry.path)
+                .map_err(|error| path_error(&entry.path, error))?;
+            let current_metadata = fs::symlink_metadata(&entry.path)
+                .map_err(|error| path_error(&entry.path, error))?;
+            if entry.file_type.is_dir() {
+                if !current_metadata.is_dir() || current_metadata.file_type().is_symlink() {
+                    retained.release(entry.retained_path_bytes);
+                    continue;
+                }
+                let depth = directory.depth.saturating_add(1);
+                if depth > limits.depth_max {
+                    return Err(discovery_limit_error(
+                        &entry.path,
+                        "directory depth",
+                        limits.depth_max,
+                        depth,
+                    ));
+                }
+                let observed_directories = directory_count.saturating_add(1);
+                if observed_directories > limits.directories_max {
+                    return Err(discovery_limit_error(
+                        &entry.path,
+                        "directories",
+                        limits.directories_max,
+                        observed_directories,
+                    ));
+                }
+                let identity = directory_identity(&entry.path, &current_metadata)?;
+                retain_directory_identity(&mut retained, &identity)?;
+                if !visited.insert(identity) {
+                    return Err(ShellError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("directory alias detected at {}", entry.path.display()),
+                    )
+                    .with_help("Remove bind-mount or filesystem aliases from the script tree"));
+                }
+                directory_count = observed_directories;
+                nested_directories.push(PendingDirectory {
+                    path: entry.path,
+                    depth,
+                    retained_path_bytes: entry.retained_path_bytes,
+                });
+            } else if current_metadata.is_file() && !current_metadata.file_type().is_symlink() {
+                let observed_files = files.len().saturating_add(1);
+                if observed_files > limits.supported_files_max {
+                    return Err(discovery_limit_error(
+                        &entry.path,
+                        "supported files",
+                        limits.supported_files_max,
+                        observed_files,
+                    ));
+                }
+                files.push(entry.path);
+            } else {
+                retained.release(entry.retained_path_bytes);
+            }
+        }
+        retained.release(directory.retained_path_bytes);
+        for nested in nested_directories.into_iter().rev() {
+            directories.push(nested);
+        }
+    }
+
     files.sort();
     if files.is_empty() {
         return Err(ShellError::new(
@@ -343,30 +611,76 @@ fn discover_supported_files(path: &Path) -> Result<Vec<PathBuf>, ShellError> {
     Ok(files)
 }
 
-fn discover_directory(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), ShellError> {
-    let mut entries = fs::read_dir(directory)
-        .map_err(|error| path_error(directory, error))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| path_error(directory, error))?;
-    entries.sort_by_key(fs::DirEntry::path);
-    for entry in entries {
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| path_error(&path, error))?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            if matches!(entry.file_name().to_str(), Some(".git" | "target")) {
-                continue;
-            }
-            discover_directory(&path, files)?;
-        } else if file_type.is_file() && script_language_for_path(&path).is_some() {
-            files.push(path);
+fn validate_discovery_limits(limits: ScriptDiscoveryLimits) -> Result<(), ShellError> {
+    for (name, value) in [
+        ("directories_max", limits.directories_max),
+        (
+            "entries_per_directory_max",
+            limits.entries_per_directory_max,
+        ),
+        ("entries_total_max", limits.entries_total_max),
+        ("supported_files_max", limits.supported_files_max),
+        ("retained_path_bytes_max", limits.retained_path_bytes_max),
+        ("scanned_name_bytes_max", limits.scanned_name_bytes_max),
+    ] {
+        if value == 0 {
+            return Err(ShellError::new(
+                ErrorCode::InvalidArgument,
+                format!("script discovery limit {name} must be greater than zero"),
+            )
+            .with_help("Pass explicit positive script discovery limits"));
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn directory_identity(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<DirectoryIdentity, ShellError> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(DirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn directory_identity(
+    path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<DirectoryIdentity, ShellError> {
+    let canonical_path = fs::canonicalize(path).map_err(|error| path_error(path, error))?;
+    Ok(DirectoryIdentity { canonical_path })
+}
+
+#[cfg(unix)]
+fn retain_directory_identity(
+    _retained: &mut RetainedPathBytes,
+    _identity: &DirectoryIdentity,
+) -> Result<(), ShellError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn retain_directory_identity(
+    retained: &mut RetainedPathBytes,
+    identity: &DirectoryIdentity,
+) -> Result<(), ShellError> {
+    retained.retain(&identity.canonical_path).map(|_| ())
+}
+
+fn discovery_limit_error(path: &Path, resource: &str, limit: usize, observed: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!(
+            "script discovery {resource} limit exceeded under {}",
+            path.display()
+        ),
+    )
+    .with_context(format!("limit: {limit}; observed: {observed}"))
+    .with_help("Narrow the script path or split the tree into smaller bounded directories")
 }
 
 fn path_error(path: &Path, error: io::Error) -> ShellError {
@@ -1970,7 +2284,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("nested"), root.join("linked")).unwrap();
 
-        let files = discover_supported_files(&root).unwrap();
+        let files = discover_supported_files(&root, AUTHORING_DISCOVERY_LIMITS).unwrap();
         let relative = files
             .iter()
             .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
@@ -1988,6 +2302,168 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn discovery_limits_for_test() -> ScriptDiscoveryLimits {
+        ScriptDiscoveryLimits {
+            depth_max: 8,
+            directories_max: 16,
+            entries_per_directory_max: 16,
+            entries_total_max: 64,
+            supported_files_max: 16,
+            retained_path_bytes_max: 16 * 1024,
+            scanned_name_bytes_max: 16 * 1024,
+        }
+    }
+
+    fn assert_discovery_limit(error: &ShellError, limit: usize, observed: usize) {
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context == &format!("limit: {limit}; observed: {observed}")));
+    }
+
+    #[test]
+    fn discovery_depth_and_directory_limits_fail_at_the_exact_boundary() {
+        let root = test_directory("discovery-depth");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/script.lua"), "return 1\n").unwrap();
+        let mut limits = discovery_limits_for_test();
+        limits.depth_max = 1;
+        let error = discover_supported_files(&root, limits).unwrap_err();
+        assert_discovery_limit(&error, 1, 2);
+        fs::remove_dir_all(root).unwrap();
+
+        let root = test_directory("discovery-directories");
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a/script.lua"), "return 1\n").unwrap();
+        let mut limits = discovery_limits_for_test();
+        limits.directories_max = 2;
+        let error = discover_supported_files(&root, limits).unwrap_err();
+        assert_discovery_limit(&error, 2, 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_entry_and_supported_file_limits_fail_at_the_exact_boundary() {
+        let root = test_directory("discovery-entry-per-directory");
+        fs::write(root.join("a.lua"), "return 1\n").unwrap();
+        fs::write(root.join("b.lua"), "return 2\n").unwrap();
+        let mut limits = discovery_limits_for_test();
+        limits.entries_per_directory_max = 1;
+        let error = discover_supported_files(&root, limits).unwrap_err();
+        assert_discovery_limit(&error, 1, 2);
+        fs::remove_dir_all(root).unwrap();
+
+        let root = test_directory("discovery-total-entries");
+        fs::write(root.join("a.txt"), "ignored\n").unwrap();
+        fs::write(root.join("b.lua"), "return 2\n").unwrap();
+        let mut limits = discovery_limits_for_test();
+        limits.entries_total_max = 1;
+        let error = discover_supported_files(&root, limits).unwrap_err();
+        assert_discovery_limit(&error, 1, 2);
+        fs::remove_dir_all(root).unwrap();
+
+        let root = test_directory("discovery-supported-files");
+        fs::write(root.join("a.lua"), "return 1\n").unwrap();
+        fs::write(root.join("b.qrl"), "pwd\n").unwrap();
+        let mut limits = discovery_limits_for_test();
+        limits.supported_files_max = 1;
+        let error = discover_supported_files(&root, limits).unwrap_err();
+        assert_discovery_limit(&error, 1, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_path_and_scanned_name_byte_limits_bound_retention_before_growth() {
+        let root = test_directory("discovery-path-bytes");
+        let script = root.join("retained.lua");
+        fs::write(&script, "return 1\n").unwrap();
+        let root_bytes = root.as_os_str().as_encoded_bytes().len();
+        let script_bytes = script.as_os_str().as_encoded_bytes().len();
+        let mut limits = discovery_limits_for_test();
+        limits.retained_path_bytes_max = root_bytes;
+        let error = discover_supported_files(&root, limits).unwrap_err();
+        assert_discovery_limit(&error, root_bytes, root_bytes + script_bytes);
+        fs::remove_dir_all(root).unwrap();
+
+        let root = test_directory("discovery-name-bytes");
+        fs::write(root.join("long-name.lua"), "return 1\n").unwrap();
+        let mut limits = discovery_limits_for_test();
+        limits.scanned_name_bytes_max = 4;
+        let error = discover_supported_files(&root, limits).unwrap_err();
+        assert_discovery_limit(&error, 4, "long-name.lua".len());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovery_reports_permission_and_disappearing_entry_failures() {
+        let root = test_directory("discovery-permission");
+        let denied = root.join("denied");
+        fs::create_dir(&denied).unwrap();
+        fs::write(denied.join("script.lua"), "return 1\n").unwrap();
+        let error = discover_supported_files_with_hook(
+            &root,
+            discovery_limits_for_test(),
+            |stage, path| {
+                if stage == DiscoveryStage::ReadDirectory && path == denied {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "injected permission failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Io);
+        assert!(error.details.context[0].contains("injected permission failure"));
+        fs::remove_dir_all(root).unwrap();
+
+        let root = test_directory("discovery-disappearing");
+        let disappearing = root.join("disappearing");
+        fs::create_dir(&disappearing).unwrap();
+        fs::write(disappearing.join("script.lua"), "return 1\n").unwrap();
+        let error = discover_supported_files_with_hook(
+            &root,
+            discovery_limits_for_test(),
+            |stage, path| {
+                if stage == DiscoveryStage::InspectEntry && path == disappearing {
+                    fs::remove_dir_all(path)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Io);
+        assert!(error.message.contains("disappearing"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lua_and_quirl_formatting_share_atomic_replacement() {
+        let root = test_directory("atomic-format-integration");
+        let lua = root.join("script.lua");
+        let quirl = root.join("script.qrl");
+        fs::write(&lua, "local function main()\nreturn 1\nend\n").unwrap();
+        fs::write(&quirl, "data [1,2,3] | length\n").unwrap();
+
+        assert_eq!(format_paths(&root, false).unwrap(), 0);
+        assert_eq!(
+            fs::read_to_string(&lua).unwrap(),
+            "local function main()\n  return 1\nend\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&quirl).unwrap(),
+            "data [1, 2, 3] | length\n"
+        );
+        let entries = fs::read_dir(&root).unwrap().count();
+        assert_eq!(entries, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn directory_analysis_aggregates_lua_and_quirl_failures() {
         let root = test_directory("analysis");
@@ -1999,7 +2475,7 @@ mod tests {
         .unwrap();
         fs::write(root.join("bad.qrl"), "printf ok |\n").unwrap();
 
-        let report = analysis_report(&root, "check").unwrap();
+        let report = analysis_report(&root, "check", AUTHORING_DISCOVERY_LIMITS).unwrap();
         assert!(!report.valid);
         assert_eq!(report.files.len(), 3);
         assert_eq!(report.files.iter().filter(|entry| !entry.valid).count(), 2);
@@ -2025,7 +2501,7 @@ mod tests {
         let quirl_source = "printf preserved  \n";
         fs::write(&quirl, quirl_source).unwrap();
 
-        let files = discover_supported_files(&root).unwrap();
+        let files = discover_supported_files(&root, AUTHORING_DISCOVERY_LIMITS).unwrap();
         let tests = files
             .iter()
             .filter(|path| is_test_module(path))
