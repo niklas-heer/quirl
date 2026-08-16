@@ -1,46 +1,42 @@
 # 0.1.0 exact-candidate performance record
 
 <!-- quirl-release-evidence:v1
-status: historical
-measured-candidate-commit: 631d7849a22d04a028cbe90315dd63b8a526b03a
-evidence-documentation-commit: 31e9b9b9c6ee8b0b7fdcc8f4ebc7aabbdb006bf8
-artifact-sha256: 6ab5d8c5069956b5b5fe2d0b37b50e7d3c2a287df33a36ae75b88c87f900d8a0
-measured-at: 2026-08-16T21:54:29Z
+status: current
+measured-candidate-commit: 23fd5d36907fc816bdafd9aa3c2dcb3afb69feb5
+evidence-documentation-commit: none
+artifact-sha256: 9a893a5f1a0b49d62712f331c88966113d910d94efa9651dc4feffe9fd55b637
+measured-at: 2026-08-16T23:27:15Z
 measurement-platform-scope: macos-15.7.9-24g830-apple-m2-pro-aarch64-apple-darwin-automated-pty
 -->
 
-> **Historical artifact evidence.** This automated measurement record applies
-> only to corrected candidate
-> `631d7849a22d04a028cbe90315dd63b8a526b03a` and its named artifact. The
-> evidence documentation commit is
-> `31e9b9b9c6ee8b0b7fdcc8f4ebc7aabbdb006bf8`. Runtime code now postdates that
-> candidate, so none of these measurements is evidence for the current tree.
-> The performance gate also did not pass, so this remains observation rather
-> than a release-readiness claim.
+> **Current exact-candidate evidence.** This automated measurement record
+> applies only to candidate
+> `23fd5d36907fc816bdafd9aa3c2dcb3afb69feb5` and its named artifact. Evidence
+> commit B records candidate A's results; it is not the measured binary source.
+> Every automated merge-relevant gate passed. This is not a claim that human
+> terminal, Linux, remote-PTY, or candidate-demo review occurred.
 
-**Measured:** 16 August 2026 at 21:54:29 UTC
+**Measured:** 16 August 2026 at 23:27:15 UTC
 
-**Candidate A:** `631d7849a22d04a028cbe90315dd63b8a526b03a`
-(tree `25508427d228209ff026fdcd89f62e30ee73703c`, clean)
+**Candidate A:** `23fd5d36907fc816bdafd9aa3c2dcb3afb69feb5`
+(tree `613b948814d2fecd91fbe170c5b13b699e89ff59`, clean)
 
 **Artifact SHA-256:**
-`6ab5d8c5069956b5b5fe2d0b37b50e7d3c2a287df33a36ae75b88c87f900d8a0`
+`9a893a5f1a0b49d62712f331c88966113d910d94efa9651dc4feffe9fd55b637`
 
 **Measurement platform scope:**
 `macos-15.7.9-24g830-apple-m2-pro-aarch64-apple-darwin-automated-pty`
 
-**Automated performance gate:** **failed one release budget**
+**Automated performance gate:** **passed all release budgets**
 
-**Overall release readiness:** **blocked**. The enforcing harness observed a
-first-prompt P95 of 21.140250 ms against the 21 ms budget. Named human terminal
-review on Linux and macOS, remote-PTY review, and human review of a
-candidate-derived real-terminal demo are also unavailable. No tag, release,
-upload, deployment, publication, or remote operation was performed.
+**Overall release readiness:** **blocked pending human and platform review**.
+Named human terminal review on Linux and macOS, remote-PTY review, and human
+review of a candidate-derived real-terminal demo remain unavailable. No tag,
+release, upload, deployment, publication, or remote operation was performed.
 
-This record measures the exact `quirl 0.1.0` artifact named above. Evidence
-commit B only records candidate A's results; it is not the measured binary
-source. Report schema v7 rejected tracked or untracked source changes, required
-an independently supplied SHA-256, copied the artifact into a private read-only
+This record measures the exact `quirl 0.1.0` artifact named above. Report
+schema v7 rejected tracked or untracked source changes, required an
+independently supplied SHA-256, copied the artifact into a private read-only
 staging directory, and verified the staged copy before execution. It also
 verified the artifact's embedded source revision, profile, optimization level,
 panic strategy, operating system, architecture, and the independently embedded
@@ -55,26 +51,28 @@ scanout, or human usability.
 
 | Field | Value |
 | --- | --- |
-| Candidate parent | `3393bd5cf9fa027402dee49d7030fd8d79b274a2` |
-| Candidate commit | `631d7849a22d04a028cbe90315dd63b8a526b03a` |
-| Candidate tree | `25508427d228209ff026fdcd89f62e30ee73703c` |
-| Candidate state | Detached `HEAD` in an isolated Codex worktree; clean before every build and measurement command |
-| `Cargo.lock` SHA-256 | `6d9f28ee132e2ae5005789e2edc0bd785b1b75160a85e4580130d1a52442569e` |
+| Candidate parent | `082154e43048d792ce1f94c44f471475ad29a910` |
+| Candidate commit | `23fd5d36907fc816bdafd9aa3c2dcb3afb69feb5` |
+| Candidate tree | `613b948814d2fecd91fbe170c5b13b699e89ff59` |
+| Candidate state | Detached `HEAD` in an isolated Codex worktree; clean before the joint release build and both enforcing measurements |
+| `Cargo.lock` SHA-256 | `58e92276a6b4b55e53e61a70b753095048ac3f5cfaee832a1960545015a5e0bb` |
 | `Cargo.toml` SHA-256 | `e74a48ef5c39ac7537fbf095ee249a4f08d4c3f210c78b6ded22bc564a594af2` |
 | `rust-toolchain.toml` SHA-256 | `1492287aa0b458ad3277d11eae2175fb662a33e7d7958ec99a057973f2bac1a2` |
 | Generated Lua SDK SHA-256 | `26241d77ba6d9eae18d1762fd90d9fe199a6fdcc77fc0c1bd5ff19b5b56cbfd6` |
+| Benchmark harness SHA-256 | `4f1f41148cd0ae5bab234eceb4540eeb1cfdd9a7e34d22b939aab7dad2a27e3a` |
 | Rust | `rustc 1.88.0 (6b00bc388 2025-06-23)`, LLVM 20.1.5 |
 | Cargo | `cargo 1.88.0 (873a06493 2025-05-10)` |
 | Target triple | `aarch64-apple-darwin` |
 | Build profile | Cargo `release`; `opt-level=z`; fat LTO; one codegen unit; symbols stripped; `panic=unwind` |
 | Embedded build identity | schema 2; source candidate A; `source_dirty=false`; `macos`; `aarch64`; `quirl 0.1.0` |
-| Artifact | 4,659,728 bytes; SHA-256 shown above |
+| Artifact | 4,676,272 bytes; SHA-256 shown above |
 
-The digest was computed independently with `shasum -a 256` and then supplied to
-both enforcing harness entry points. The digest printed by the harness, the
-embedded source identity, the harness source identity, and the independently
-recorded candidate commit all matched. Rebuilding the release binary for the
-text product tour produced the same digest.
+The digest was computed independently with `shasum -a 256` and supplied to
+both enforcing harness entry points. The canonical JSON run reported
+`artifact_digest_verified`, `artifact_profile_verified`,
+`artifact_source_verified`, and `harness_source_verified` as true. The digest
+printed by the reproduction, the artifact's hidden build report, the harness
+source identity, and the independently recorded candidate commit all matched.
 
 ## Measurement environment
 
@@ -96,24 +94,26 @@ hardware, named Linux terminal reviewer, SSH session, or remote PTY was used.
 
 Times are wall-clock milliseconds. Percentiles use nearest rank over 101
 independent fresh processes. All samples completed successfully before the
-phase timeout. The enforcing run returned nonzero because one valid measurement
-missed its budget.
+phase timeout, and every enforcing release budget passed on the single
+canonical run.
 
 | Measurement | Valid | Minimum | P50 | P95 | Maximum | Target | Outcome |
 | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| Process start to editable prompt | 101/101 | 15.140 | 23.557333 | 25.666750 | 26.588500 | P50 ≤25 ms | **Within** |
-| Final keystroke to corresponding frame | 101/101 | 0.621042 | 1.123042 | 2.229959 | 2.951583 | P95 ≤8 ms | **Within** |
-| Process start to first prompt frame | 101/101 | 11.417791 | 19.068209 | 21.140250 | 21.855625 | P95 ≤21 ms | **Miss by 0.140250 ms** |
-| Release executable size | - | - | 4,659,728 bytes | - | - | ≤10,485,760 bytes hard ceiling | **Within ideal 5 MiB tier** |
+| Process start to editable prompt | 101/101 | 10.509083 | 21.522917 | 23.468333 | 24.169458 | P50 ≤25 ms | **Within by 3.477083 ms** |
+| Final keystroke to corresponding frame | 101/101 | 0.422417 | 1.354875 | 2.436000 | 3.688834 | P95 ≤8 ms | **Within by 5.564000 ms** |
+| Process start to first prompt frame | 101/101 | 7.754500 | 17.355041 | 19.154208 | 19.463500 | P95 ≤21 ms | **Within by 1.845792 ms** |
+| Release executable size | - | - | 4,676,272 bytes | - | - | ≤10,485,760 bytes hard ceiling | **Within ideal 5 MiB tier** |
 
 The first-prompt gate uses P95. Binary units are MiB, where one MiB is exactly
-1,048,576 bytes. This artifact is 583,152 bytes below the 5 MiB ideal limit,
-3,728,880 bytes below the 8 MiB soft cap, and 5,826,032 bytes below the 10 MiB
+1,048,576 bytes. This artifact is 566,608 bytes below the 5 MiB ideal limit,
+3,712,336 bytes below the 8 MiB soft cap, and 5,809,488 bytes below the 10 MiB
 hard ceiling.
 
-The separate `cargo xtask release-gate` run also failed only the first-prompt
-budget: 101/101 samples were valid and its P95 was 21.463 ms. That reproduction
-did not replace or average away the canonical JSON measurement above.
+The one independent `cargo xtask release-gate` reproduction also passed all
+budgets: editable-prompt P50 21.704 ms, keystroke P95 2.364 ms, and
+first-prompt P95 19.311 ms, each with 101/101 valid samples. That reproduction
+confirms the gate result; it does not replace or average the canonical JSON
+measurement.
 
 ## Stream retention evidence
 
@@ -138,55 +138,74 @@ They are diagnostic only and cannot satisfy an end-to-end release gate.
 
 | Probe | Valid | Minimum | P50 | P95 | Maximum | Scope |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `quirl --version` subprocess | 31/31 | 2.974875 ms | 3.739333 ms | 5.844666 ms | 6.247458 ms | Process/loading/argument lower bound |
-| Completion, semantic-highlight proxy, prompt render | 2,000/2,000 | 2.334542 ms | 2.540875 ms | 2.796916 ms | 3.408375 ms | Headless CPU only |
-| Fresh prompt construction and render | 500/500 | 2.333958 ms | 2.541625 ms | 2.772250 ms | 2.940208 ms | Headless CPU only |
+| `quirl --version` subprocess | 31/31 | 2.995875 ms | 3.704833 ms | 5.543541 ms | 5.753667 ms | Process/loading/argument lower bound |
+| Completion, semantic-highlight proxy, prompt render | 2,000/2,000 | 0.024333 ms | 0.025792 ms | 0.033208 ms | 0.094292 ms | Headless CPU only |
+| Fresh prompt construction and render | 500/500 | 0.018625 ms | 0.019333 ms | 0.026625 ms | 0.050167 ms | Headless CPU only |
 
 ## Commands and outcomes
 
-Every duration below is the observed `/usr/bin/time -p` real duration. A
-nonzero release-performance command is an accurately recorded budget failure,
-not an infrastructure failure.
+Every duration below is the observed `/usr/bin/time -p` real duration. The
+single canonical JSON benchmark and the single independent reproduction both
+returned zero; neither was retried.
 
 | Command | Outcome | Real duration |
 | --- | --- | ---: |
-| `cargo xtask check` | Passed formatting, example formatting, Clippy, Rustdoc, workspace tests, nine real-PTY scenarios, and two guest Lua tests | 61.84 s |
-| `cargo xtask test` | Passed workspace tests, all nine real-PTY scenarios, and two guest Lua tests | 22.22 s |
-| `cargo xtask docs` | Passed workspace Rustdoc with warnings denied | 1.60 s |
+| `cargo xtask check` | Passed formatting, example formatting, Clippy, Rustdoc, workspace tests, all 11 real-PTY scenarios, and two guest Lua tests | 62.43 s |
+| `cargo xtask test` | Passed workspace tests, all 11 real-PTY scenarios, and two guest Lua tests | 23.22 s |
+| `cargo xtask docs` | Passed workspace Rustdoc with warnings denied | 1.50 s |
+| `cargo xtask sdk` plus `git diff --exit-code -- docs/quirl.lua` | Passed; generated Lua SDK was byte-identical | 1.85 s |
+| `cargo xtask demo` | Passed the deterministic text-only product tour | 61.18 s |
 | `npm ci --prefix website` | Installed 561 locked packages; audit reported zero vulnerabilities | 4.65 s |
-| `cargo xtask sdk` plus `git diff --exit-code -- docs/quirl.lua` | Passed; generated Lua SDK was byte-identical | 1.83 s |
 | `npm --prefix website run test:evidence` | Passed all 10 focused P19 evidence tests | 0.21 s |
-| `npm --prefix website run check:evidence` | Passed historical pre-update attribution | 0.18 s |
+| `npm --prefix website run check:evidence` | Passed historical pre-update semantic attribution | 0.16 s |
 | `npm --prefix website run sync:docs:check` | Passed freshness for 46 documentation sources before update | 0.16 s |
-| `npm --prefix website run sync:reference:check` | Passed freshness for two compiled reference pages | 3.27 s |
-| `cargo xtask release-preview` | Command completed; 31-sample preview was not accepted because first-prompt P95 was 21.044 ms and no independent digest is supplied in preview mode | 80.34 s |
-| `cargo xtask demo` | Passed the deterministic text-only product tour | 45.19 s |
-| `python3 scripts/check-rich-pty.py target/release/quirl` | Passed all nine scenarios against the exact release artifact | 12.16 s |
-| `target/release/quirl-bench release --quirl target/release/quirl --expected-sha256 6ab5d8c5069956b5b5fe2d0b37b50e7d3c2a287df33a36ae75b88c87f900d8a0 --json` | Valid exact-candidate evidence; exited 1 because first-prompt P95 missed the budget | 51.66 s |
-| `cargo xtask release-gate 6ab5d8c5069956b5b5fe2d0b37b50e7d3c2a287df33a36ae75b88c87f900d8a0` | Reproduced the first-prompt budget miss and exited 1 before its website substep | 48.17 s |
+| `npm --prefix website run sync:reference:check` | Passed freshness for two compiled reference pages | 3.42 s |
+| `npm --prefix website run lint` | Passed ESLint | 1.92 s |
+| `npm --prefix website run types:check` | Generated route types and passed TypeScript without emitting | 2.56 s |
+| `npm --prefix website run build` | Synchronized 46 sources and built 203 production pages | 9.96 s |
+| `cargo build --release -p quirl-cli -p quirl-bench` | Built the clean candidate binary and benchmark harness together | 47.23 s |
+| `target/release/quirl-bench release --quirl target/release/quirl --expected-sha256 9a893a5f1a0b49d62712f331c88966113d910d94efa9651dc4feffe9fd55b637 --json` | Passed all exact-candidate evidence and performance gates; 101/101 samples valid in every enforcing PTY phase | 45.71 s |
+| `cargo xtask release-gate 9a893a5f1a0b49d62712f331c88966113d910d94efa9651dc4feffe9fd55b637` | Independently reproduced all release-budget passes, then passed the complete website gate | 58.58 s |
 
-The post-generation website commands, idempotence checks, and post-commit
-semantic attribution result are reported with the final evidence commit.
+The post-generation idempotence checks and post-commit semantic attribution
+and website results are reported with evidence commit B.
 
 ## Missing evidence and blockers
 
-Release readiness remains blocked on:
+All automated merge-relevant gates passed. Overall release readiness remains
+blocked on:
 
-- the valid first-prompt P95 measurement exceeding the 21 ms release budget;
 - a named human reviewer completing the real-terminal checklist in an actual
   macOS terminal application, including resize, narrow, custom-theme,
   `config web`, foreground-terminal, and remote-PTY observations;
 - the same named real-terminal and process/job-control review on actual Linux
   hardware;
-- remote-PTY observations on the corrected candidate; and
+- remote-PTY observations on candidate A; and
 - human review of a candidate-derived real-terminal demo before any README or
   release asset is published.
 
-The automated real-PTY harness passed all nine scenarios against the release
-artifact: rich editing, completion, integrated runtime, rich regressions,
-native job control, noninteractive dialect islands, suspend/resume, fallback
-selection, and `NO_COLOR` semantic hints. That is supporting automated
-evidence, not human or cross-platform signoff.
+The automated real-PTY harness passed all 11 scenarios against the candidate
+source: rich editing, deferred catalog admission, catalog-failure terminal
+restoration, completion, integrated runtime, rich regressions, native job
+control, noninteractive dialect islands, suspend/resume, fallback selection,
+and `NO_COLOR` semantic hints. That is supporting automated evidence, not human
+or cross-platform signoff.
+
+## Immutable historical P20 evidence
+
+P20 remains historical evidence only for corrected candidate
+`631d7849a22d04a028cbe90315dd63b8a526b03a`, tree
+`25508427d228209ff026fdcd89f62e30ee73703c`, and artifact
+`6ab5d8c5069956b5b5fe2d0b37b50e7d3c2a287df33a36ae75b88c87f900d8a0`.
+Evidence commit `31e9b9b9c6ee8b0b7fdcc8f4ebc7aabbdb006bf8` preserves its full
+measurement record, environment, commands, and aggregate results. It measured
+on 16 August 2026 at 21:54:29 UTC with the same automated-macOS-PTY platform
+scope. Its enforcing run had 101/101 valid samples but failed the first-prompt
+budget at P95 21.140250 ms, a 0.140250 ms miss; editable-prompt P50 was
+23.557333 ms and keystroke P95 was 2.229959 ms. Its independent reproduction
+also failed only first-prompt P95 at 21.463 ms. None of those timings, that
+failure state, its environment, or its artifact identity is attributed to
+candidate A in the current record.
 
 ## Immutable historical P14 evidence
 
@@ -194,12 +213,12 @@ P14 remains immutable historical evidence for candidate
 `7bf188344ca61798a3cd8657787eacb8ec26ef84`, tree
 `60df4fe8309f624642273ca8981a43d95217191e`, and artifact
 `81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6`.
-Evidence commit `05df4b09349394cfd34f24d514e0e005365d0ed8` preserves its full measurement
-record, environment, commands, and aggregate results. It measured on 16 August
-2026 at 18:51:07 UTC with platform scope
+Evidence commit `05df4b09349394cfd34f24d514e0e005365d0ed8` preserves its full
+measurement record, environment, commands, and aggregate results. It measured
+on 16 August 2026 at 18:51:07 UTC with platform scope
 `macos-15.7.9-24g830-apple-m2-pro-aarch64-apple-darwin-automated-pty` and passed
 the budgets then observed. None of its timings, pass state, environment, or
-artifact identity is attributed to corrected candidate A.
+artifact identity is attributed to candidate A in the current record.
 
 An earlier record for commit
 `c5a8d757a35a92a9a269686a1cd166c5a486e2b3` and artifact
