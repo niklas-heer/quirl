@@ -1,10 +1,10 @@
 # 0.1.0 release performance record
 
-**Measured:** 16 August 2026 at 00:07:33 UTC
+**Measured:** 16 August 2026 at 00:23:37 UTC
 
-**Source:** `598c085ddd1821b4f8c9b725a9974a035f3d6ddc` (clean)
+**Source:** `0dfc3a481f5a9eb8865d0a6106ffb8d5aada524e` (clean)
 
-**Artifact SHA-256:** `7b51a637862c4d7387317f4a1ac0e985781d888e202ac5f745f384922562c608`
+**Artifact SHA-256:** `d2199715c8fc4b2acfac9df0f41a6cdc0febddcb63395a22e4f78ef79234f0cf`
 
 **Release gate:** **passed all release budgets**
 
@@ -29,7 +29,7 @@ monitor-scanout latency.
 | Rust | `rustc 1.88.0 (6b00bc388 2025-06-23)`, LLVM 20.1.5 |
 | Cargo | `cargo 1.88.0 (873a06493 2025-05-10)` |
 | Build | Cargo `release`; `opt-level=z`; fat LTO; one codegen unit; symbols stripped; `panic=unwind` |
-| Quirl | `quirl 0.1.0`, 3,861,712-byte executable |
+| Quirl | `quirl 0.1.0`, 3,861,728-byte executable |
 | PTY | 120 columns × 40 rows, `TERM=xterm-256color`, truecolor advertised |
 
 The machine was not isolated. CPU frequency, thermal state, scheduler load,
@@ -43,10 +43,10 @@ phase timeout.
 
 | Measurement | Valid samples | P50 | P95 | Target | Outcome |
 | --- | ---: | ---: | ---: | --- | --- |
-| Process start to editable prompt | 101/101 | 11.963 | 13.235 | P50 ≤25 ms | **Within** |
-| Final keystroke to corresponding frame | 101/101 | 0.188 | 0.228 | P95 ≤8 ms | **Within** |
-| Process start to first prompt frame | 101/101 | 11.768 | 13.051 | ≤16 ms | **Within (conservative P95)** |
-| Release executable size | — | 3,861,712 bytes | — | ≤5,242,880 bytes | **Within: 1,381,168 bytes headroom** |
+| Process start to editable prompt | 101/101 | 12.164 | 13.321 | P50 ≤25 ms | **Within** |
+| Final keystroke to corresponding frame | 101/101 | 0.190 | 0.243 | P95 ≤8 ms | **Within** |
+| Process start to first prompt frame | 101/101 | 11.953 | 13.057 | ≤16 ms | **Within (conservative P95)** |
+| Release executable size | — | 3,861,728 bytes | — | ≤5,242,880 bytes | **Within: 1,381,152 bytes headroom** |
 
 The language specification leaves the first-prompt percentile unspecified, so
 the gate conservatively enforces P95. The 5 MiB binary limit is the frozen
@@ -73,9 +73,9 @@ gate.
 
 | Probe | Samples | P50 | P95 | Scope |
 | --- | ---: | ---: | ---: | --- |
-| `quirl --version` subprocess | 31 | 3.238 ms | 5.263 ms | Process/loading/argument lower bound |
-| Completion, semantic-highlight proxy, prompt render | 2,000 | 0.0173 ms | 0.0205 ms | Headless CPU only |
-| Fresh prompt construction and render | 500 | 0.0069 ms | 0.0092 ms | Headless CPU only |
+| `quirl --version` subprocess | 31 | 3.582 ms | 5.258 ms | Process/loading/argument lower bound |
+| Completion, semantic-highlight proxy, prompt render | 2,000 | 0.0172 ms | 0.0217 ms | Headless CPU only |
+| Fresh prompt construction and render | 500 | 0.0071 ms | 0.0077 ms | Headless CPU only |
 
 ## Reproduce
 
