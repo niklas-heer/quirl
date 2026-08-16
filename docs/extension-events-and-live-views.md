@@ -88,6 +88,16 @@ quirl view panel cluster
 Text output is a stable line-oriented table. JSON returns the same validated
 panel model. Empty models render their required plain fallback.
 
+On the rich interactive path, panel callbacks are refreshed asynchronously on
+the existing fixed worker pool. First paint uses only the last complete cache;
+rendering never invokes Lua. The host publishes a complete monotonic snapshot,
+preserves the prior per-plugin model on failure or timeout, and publishes an
+empty replacement when a provider is removed. The UI accepts at most eight
+panels, 16 columns and 128 rows per panel, 4 KiB fields, and 128 KiB of text per
+generation. It applies no more than eight updates per event-loop turn, rejects
+stale generations, retains four `LiveBuffer` generations, and shows at most six
+rows for the focused panel.
+
 ## Bounded live pipelines
 
 `quirl watch` repeatedly evaluates a native typed data expression. Sampling is

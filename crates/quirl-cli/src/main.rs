@@ -33,12 +33,12 @@ use plugin::PluginCommand;
 use quirl_catalog::{Catalog, CommandSpec, Completion};
 use quirl_core::{
     escape_json_terminal_controls, escape_terminal_controls, reject_terminal_controls,
-    CommandOutcome, ErrorCode, ExecutionCleanupState, ExecutionEffect, ExecutionEffects,
-    ExecutionInput, ExecutionMode, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget,
-    ExecutionRequest, ExecutionSource, ExecutionStatus, ExtensionAction, ExtensionEventData,
-    OutputStream, ProcessRequest, ShellError, StructuredValue,
+    CommandOutcome, ErrorCode, ExecutionCancellation, ExecutionCleanupState, ExecutionEffect,
+    ExecutionEffects, ExecutionInput, ExecutionMode, ExecutionOutcome, ExecutionOutput,
+    ExecutionOutputTarget, ExecutionRequest, ExecutionSource, ExecutionStatus, ExtensionAction,
+    ExtensionEventData, OutputStream, ProcessRequest, ShellError, StructuredValue,
 };
-use quirl_data::{DataEnvelope, DataRenderFormat, DataRuntime};
+use quirl_data::{DataEnvelope, DataOutput, DataRenderFormat, DataRuntime};
 use quirl_lua::{
     sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig, MAX_LUA_SOURCE_BYTES,
 };
@@ -47,18 +47,20 @@ use quirl_process::{sandboxed_process_host, JobStatus, NativeExecutor, DEFAULT_C
 use quirl_syntax::{classify, InteractiveLine, Mode};
 use quirl_ui::{
     editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
-    terminal_supports_unicode, terminal_width, InteractiveSignal, PickerItem, PickerItemKind,
-    PickerMatch, PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind,
-    MODE_TOGGLE_HOST_COMMAND,
+    terminal_supports_unicode, terminal_width, InteractiveDataSnapshot, InteractiveJobAction,
+    InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
+    InteractiveRuntimeSnapshot, InteractiveSignal, PickerItem, PickerItemKind, PickerMatch,
+    PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind, DATA_ITEMS_MAX,
+    DATA_RETAINED_BYTES_MAX, MODE_TOGGLE_HOST_COMMAND,
 };
 use recovery::RecoveryCommand;
 use script::ScriptLanguage;
 use std::{
-    collections::BTreeMap,
-    io::{self, IsTerminal, Read},
+    collections::{BTreeMap, VecDeque},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc, Mutex},
     time::{Duration, Instant},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1005,6 +1007,345 @@ fn interactive_dialect_island(source: &str) -> Option<(ScriptLanguage, &str)> {
     None
 }
 
+const INTERACTIVE_DATA_PULLS_PER_TURN_MAX: usize = 16;
+const INTERACTIVE_DATA_OPTION_DEPTH_MAX: usize = 64;
+
+struct InteractiveSignalCancellation {
+    cancellation: ExecutionCancellation,
+    #[cfg(unix)]
+    signal_ids: Vec<signal_hook::SigId>,
+}
+
+impl InteractiveSignalCancellation {
+    fn install() -> Result<Self, ShellError> {
+        let flag = Arc::new(AtomicBool::new(false));
+        let cancellation = ExecutionCancellation::from_atomic(Arc::clone(&flag));
+        #[cfg(unix)]
+        {
+            let mut signal_ids = Vec::with_capacity(2);
+            for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+                match signal_hook::flag::register(signal, Arc::clone(&flag)) {
+                    Ok(signal_id) => signal_ids.push(signal_id),
+                    Err(error) => {
+                        for signal_id in signal_ids {
+                            signal_hook::low_level::unregister(signal_id);
+                        }
+                        return Err(ShellError::new(
+                            ErrorCode::Io,
+                            "could not install interactive data cancellation handlers",
+                        )
+                        .with_context(error.to_string())
+                        .with_help("Retry after restoring the process signal state"));
+                    }
+                }
+            }
+            Ok(Self {
+                cancellation,
+                signal_ids,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self { cancellation })
+        }
+    }
+}
+
+impl Drop for InteractiveSignalCancellation {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        for signal_id in self.signal_ids.drain(..) {
+            signal_hook::low_level::unregister(signal_id);
+        }
+    }
+}
+
+#[derive(Default)]
+struct InteractiveDataCache {
+    items: VecDeque<InteractiveDataSnapshot>,
+    retained_bytes: usize,
+    next_id: u64,
+}
+
+struct InteractiveDataStage {
+    items: VecDeque<(InteractiveDataSnapshot, usize)>,
+    retained_bytes: usize,
+    next_id: u64,
+}
+
+impl InteractiveDataCache {
+    fn stage(&self) -> InteractiveDataStage {
+        InteractiveDataStage {
+            items: VecDeque::with_capacity(DATA_ITEMS_MAX),
+            retained_bytes: 0,
+            next_id: self.next_id,
+        }
+    }
+
+    fn commit(&mut self, stage: InteractiveDataStage) {
+        self.next_id = stage.next_id;
+        for (item, bytes) in stage.items {
+            while self.items.len() == DATA_ITEMS_MAX
+                || self.retained_bytes.saturating_add(bytes) > DATA_RETAINED_BYTES_MAX
+            {
+                let Some(removed) = self.items.pop_front() else {
+                    break;
+                };
+                self.retained_bytes = self
+                    .retained_bytes
+                    .saturating_sub(interactive_data_snapshot_bytes(&removed));
+            }
+            if bytes <= DATA_RETAINED_BYTES_MAX {
+                self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+                self.items.push_back(item);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<InteractiveDataSnapshot> {
+        self.items.iter().cloned().collect()
+    }
+}
+
+impl InteractiveDataStage {
+    fn observe(&mut self, value: &StructuredValue) -> Result<(), ShellError> {
+        let id = self.next_id.checked_add(1).ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::ResourceLimit,
+                "interactive data result identity counter was exhausted",
+            )
+            .with_help("Restart Quirl before retaining another typed picker result")
+        })?;
+        self.next_id = id;
+        let plain = DataEnvelope::value(value.clone()).render(DataRenderFormat::Plain)?;
+        let label = plain.trim_end().chars().take(256).collect::<String>();
+        let preview = serde_json::to_string_pretty(value).map_err(|error| {
+            ShellError::new(
+                ErrorCode::Data,
+                "could not retain a typed data picker preview",
+            )
+            .with_context(error.to_string())
+            .with_help("Use the scrollback output without retaining this picker item")
+        })?;
+        let insertion = serde_json::to_string(&value.json_value()).map_err(|error| {
+            ShellError::new(ErrorCode::Data, "could not create a data picker insertion")
+                .with_context(error.to_string())
+                .with_help("Use the original data expression instead of this cached value")
+        })?;
+        let item = InteractiveDataSnapshot {
+            id,
+            label,
+            preview: Some(truncate_utf8_owned(preview, 4 * 1024)),
+            value: value.clone(),
+            insertion: truncate_utf8_owned(insertion, 4 * 1024),
+        };
+        let bytes = interactive_data_snapshot_bytes(&item);
+        while self.items.len() == DATA_ITEMS_MAX
+            || self.retained_bytes.saturating_add(bytes) > DATA_RETAINED_BYTES_MAX
+        {
+            let Some((_, removed_bytes)) = self.items.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(removed_bytes);
+        }
+        if bytes <= DATA_RETAINED_BYTES_MAX {
+            self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+            self.items.push_back((item, bytes));
+        }
+        Ok(())
+    }
+}
+
+fn interactive_data_snapshot_bytes(item: &InteractiveDataSnapshot) -> usize {
+    serde_json::to_vec(&item.value)
+        .map(|value| value.len())
+        .unwrap_or(DATA_RETAINED_BYTES_MAX.saturating_add(1))
+        .saturating_add(item.label.len())
+        .saturating_add(item.preview.as_ref().map_or(0, String::len))
+        .saturating_add(item.insertion.len())
+}
+
+fn truncate_utf8_owned(mut value: String, bytes_max: usize) -> String {
+    if value.len() <= bytes_max {
+        return value;
+    }
+    let mut end = bytes_max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
+fn execute_interactive_data(
+    source: &str,
+    cache: &mut InteractiveDataCache,
+) -> Result<(ExecutionOutcome, u64), ShellError> {
+    let signals = InteractiveSignalCancellation::install()?;
+    let request = execution_request(
+        "<interactive-data>",
+        source,
+        ExecutionMode::Data,
+        ExecutionOutputTarget::Inherit,
+        ExecutionEffects::all(),
+    )?
+    .with_cancellation(signals.cancellation.clone());
+    let plan = request.plan()?;
+    plan.cancellation()
+        .ensure_active("before interactive data initialization")?;
+    let cancelled = plan.cancellation().atomic();
+    let output = DataRuntime::with_process_host(sandboxed_process_host())
+        .eval_output_with_cancellation_handle(plan.source().text(), Arc::clone(&cancelled))?;
+    let mut stage = cache.stage();
+    let mut stdout = io::stdout().lock();
+    let bytes = render_interactive_data_output(output, &cancelled, &mut stdout, &mut stage)?;
+    plan.cancellation()
+        .ensure_active("after interactive data rendering")?;
+    cache.commit(stage);
+    let outcome = ExecutionOutcome::new(
+        ExecutionStatus::Exited(0),
+        ExecutionOutput::Inherited,
+        Vec::new(),
+        ExecutionCleanupState::Complete,
+    )?;
+    Ok((outcome, bytes))
+}
+
+fn render_interactive_data_output(
+    mut output: DataOutput,
+    cancelled: &AtomicBool,
+    writer: &mut impl Write,
+    stage: &mut InteractiveDataStage,
+) -> Result<u64, ShellError> {
+    let mut option_depth = 0_usize;
+    while let DataOutput::Option(Some(inner)) = output {
+        option_depth = option_depth
+            .checked_add(1)
+            .ok_or_else(|| interactive_data_option_depth_error(usize::MAX))?;
+        if option_depth > INTERACTIVE_DATA_OPTION_DEPTH_MAX {
+            return Err(interactive_data_option_depth_error(option_depth));
+        }
+        output = *inner;
+    }
+
+    let mut bytes = 0_u64;
+    for _ in 0..option_depth {
+        bytes = bytes.saturating_add(write_interactive_data_bytes(b"some(\n", cancelled, writer)?);
+    }
+    bytes = bytes.saturating_add(match output {
+        DataOutput::Value(value) => write_interactive_data_value(&value, cancelled, writer, stage),
+        DataOutput::Stream(mut stream) => {
+            let mut stream_bytes = 0_u64;
+            let mut pulls = 0_usize;
+            while let Some(value) = stream.next(cancelled)? {
+                stream_bytes = stream_bytes.saturating_add(write_interactive_data_value(
+                    &value, cancelled, writer, stage,
+                )?);
+                pulls = pulls.saturating_add(1);
+                if pulls == INTERACTIVE_DATA_PULLS_PER_TURN_MAX {
+                    pulls = 0;
+                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(ShellError::new(
+                            ErrorCode::ResourceLimit,
+                            "interactive data rendering was cancelled",
+                        )
+                        .with_help("Retry the expression after the cancellation is clear"));
+                    }
+                    std::thread::yield_now();
+                }
+            }
+            Ok(stream_bytes)
+        }
+        DataOutput::Option(None) => write_interactive_data_bytes(b"none\n", cancelled, writer),
+        DataOutput::Option(Some(_)) => unreachable!("nested options were flattened above"),
+    }?);
+    for _ in 0..option_depth {
+        bytes = bytes.saturating_add(write_interactive_data_bytes(b")\n", cancelled, writer)?);
+    }
+    Ok(bytes)
+}
+
+fn interactive_data_option_depth_error(observed: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        "interactive data option nesting exceeded its configured limit",
+    )
+    .with_context(format!(
+        "limit: {INTERACTIVE_DATA_OPTION_DEPTH_MAX}; observed: {observed}"
+    ))
+    .with_help("Reduce nested optional transforms before rendering this expression")
+}
+
+fn write_interactive_data_value(
+    value: &StructuredValue,
+    cancelled: &AtomicBool,
+    writer: &mut impl Write,
+    stage: &mut InteractiveDataStage,
+) -> Result<u64, ShellError> {
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "interactive data rendering was cancelled",
+        )
+        .with_help("Retry the expression after the cancellation is clear"));
+    }
+    let rendered = DataEnvelope::value(value.clone()).render(DataRenderFormat::Plain)?;
+    writer
+        .write_all(rendered.as_bytes())
+        .map_err(data_output_write_error)?;
+    writer.flush().map_err(data_output_write_error)?;
+    stage.observe(value)?;
+    Ok(u64::try_from(rendered.len()).unwrap_or(u64::MAX))
+}
+
+fn write_interactive_data_bytes(
+    bytes: &[u8],
+    cancelled: &AtomicBool,
+    writer: &mut impl Write,
+) -> Result<u64, ShellError> {
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "interactive data rendering was cancelled",
+        )
+        .with_help("Retry the expression after the cancellation is clear"));
+    }
+    writer.write_all(bytes).map_err(data_output_write_error)?;
+    writer.flush().map_err(data_output_write_error)?;
+    Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+}
+
+fn data_output_write_error(error: io::Error) -> ShellError {
+    ShellError::new(ErrorCode::Io, "cannot write interactive data output")
+        .with_context(error.to_string())
+        .with_help("Check that standard output is writable before retrying the expression")
+}
+
+fn interactive_job_snapshots(jobs: &[quirl_process::JobState]) -> Vec<InteractiveJobSnapshot> {
+    jobs.iter()
+        .filter_map(|job| {
+            let status = match job.status {
+                JobStatus::Running => InteractiveJobStatus::Running,
+                JobStatus::Stopped => InteractiveJobStatus::Stopped,
+                JobStatus::Done => return None,
+            };
+            let actions = match status {
+                InteractiveJobStatus::Running => vec![InteractiveJobAction::Foreground],
+                InteractiveJobStatus::Stopped => vec![
+                    InteractiveJobAction::Foreground,
+                    InteractiveJobAction::Background,
+                ],
+            };
+            Some(InteractiveJobSnapshot {
+                id: job.id,
+                status,
+                command: job.command.clone(),
+                actions,
+            })
+        })
+        .collect()
+}
+
 fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     let catalog = Arc::new(catalog);
     let runtime_extensions_present = extensions
@@ -1033,7 +1374,8 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
     // Recovery snapshots are only needed once a native command is accepted.
     // Environment capture can be deferred past the first interactive paint.
     let mut recovery = None;
-    let data = DataRuntime::with_process_host(sandboxed_process_host());
+    let mut data_cache = InteractiveDataCache::default();
+    let mut runtime_snapshot_generation = 0_u64;
     // Script evaluation remains lazy. Extension VMs load before the first editor
     // view, but first paint reads only their bounded prompt cache; Lua refreshes
     // on the fixed worker pool after the snapshot is returned.
@@ -1099,8 +1441,8 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
             }
         }
         print_extension_errors(&extensions);
-        let active_jobs = executor
-            .jobs()
+        let job_states = executor.jobs();
+        let active_jobs = job_states
             .iter()
             .filter(|job| job.status != JobStatus::Done)
             .count();
@@ -1114,6 +1456,19 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
         if let Some(duration) = last_duration {
             prompt = prompt.with_duration(duration);
         }
+        runtime_snapshot_generation =
+            runtime_snapshot_generation.checked_add(1).ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "interactive runtime snapshot generation counter was exhausted",
+                )
+                .with_help("Restart Quirl before preparing another interactive prompt")
+            })?;
+        line_editor.install_runtime_snapshot(InteractiveRuntimeSnapshot {
+            generation: runtime_snapshot_generation,
+            jobs: interactive_job_snapshots(&job_states),
+            data: data_cache.snapshot(),
+        });
         let signal = line_editor.read_line(&prompt);
         first_prompt = false;
         if prompt_context.is_none() {
@@ -1182,11 +1537,22 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
                             &mut annotations,
                         );
                         let started = Instant::now();
-                        match data.eval(&planned.source) {
-                            Ok(value) => {
+                        match execute_interactive_data(&planned.source, &mut data_cache) {
+                            Ok((outcome, output_bytes)) => {
                                 last_status = 0;
-                                emit_value_output(&extensions, &value, &mut annotations);
-                                print_json_value(value);
+                                apply_observation_actions(
+                                    notify_extensions(
+                                        &extensions,
+                                        ExtensionEventData::Output {
+                                            stream: OutputStream::Stdout,
+                                            bytes: usize::try_from(output_bytes)
+                                                .unwrap_or(usize::MAX),
+                                            text: None,
+                                        },
+                                    ),
+                                    &mut annotations,
+                                );
+                                debug_assert_eq!(outcome.status_code(), 0);
                                 apply_observation_actions(
                                     notify_extensions(
                                         &extensions,
@@ -1605,6 +1971,38 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+struct CachedPanelAdapter {
+    extensions: Arc<Mutex<LuaExtensionHost>>,
+    observed_generation: Option<u64>,
+}
+
+impl CachedPanelAdapter {
+    fn new(extensions: Arc<Mutex<LuaExtensionHost>>) -> Self {
+        Self {
+            extensions,
+            observed_generation: None,
+        }
+    }
+}
+
+impl InteractivePanelProvider for CachedPanelAdapter {
+    fn poll_cached(&mut self) -> Result<Option<InteractivePanelBatch>, ShellError> {
+        let mut extensions = self.extensions.lock().map_err(|_| {
+            ShellError::new(
+                ErrorCode::Lua,
+                "the extension panel cache lock was poisoned",
+            )
+            .with_help("Restart Quirl before displaying extension panels again")
+        })?;
+        let snapshot = extensions.cached_panel_snapshot();
+        if self.observed_generation == Some(snapshot.generation) {
+            return Ok(None);
+        }
+        self.observed_generation = Some(snapshot.generation);
+        Ok(Some(snapshot))
+    }
+}
+
 enum SessionEditor {
     Rich(Box<RichSurface>),
     Simple(Box<reedline::Reedline>),
@@ -1639,6 +2037,12 @@ impl SessionEditor {
             Self::Simple(editor) => sync_reedline_history(editor, history_path),
         }
     }
+
+    fn install_runtime_snapshot(&mut self, snapshot: InteractiveRuntimeSnapshot) {
+        if let Self::Rich(editor) = self {
+            editor.install_runtime_snapshot(snapshot);
+        }
+    }
 }
 
 fn configured_editor(
@@ -1657,7 +2061,10 @@ fn configured_editor(
             &config,
             history_path.to_path_buf(),
         )
-        .map(|editor| SessionEditor::Rich(Box::new(editor)));
+        .map(|mut editor| {
+            editor.set_panel_provider(Box::new(CachedPanelAdapter::new(Arc::clone(extensions))));
+            SessionEditor::Rich(Box::new(editor))
+        });
     }
     editor_with_extensions_config_history_and_picker(
         catalog.as_ref().clone(),
@@ -3098,5 +3505,117 @@ mod tests {
         .unwrap();
         let reference = reference_outcome("bash", "printf value; printf warning >&2; exit 7;");
         assert_same_outcome("bash interactive island", &native, &reference);
+    }
+
+    #[test]
+    fn interactive_data_rows_write_before_a_later_pull_failure() {
+        let path = std::env::temp_dir().join(format!(
+            "quirl-interactive-data-{}-{}.csv",
+            std::process::id(),
+            NEXT_DIFFERENTIAL_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, "name,kind\napi,service\nbroken\n").unwrap();
+        let output = DataRuntime::new()
+            .eval_output(&format!("open {}", path.display()))
+            .unwrap();
+        let mut rendered = Vec::new();
+        let mut stage = InteractiveDataCache::default().stage();
+        let error = render_interactive_data_output(
+            output,
+            &AtomicBool::new(false),
+            &mut rendered,
+            &mut stage,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Data);
+        assert!(String::from_utf8(rendered).unwrap().contains("api"));
+        assert_eq!(stage.items.len(), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn interactive_data_cancellation_stops_before_the_next_write() {
+        let output = DataRuntime::new()
+            .eval_output(r#""one\ntwo" | lines"#)
+            .unwrap();
+        let mut rendered = Vec::new();
+        let mut stage = InteractiveDataCache::default().stage();
+        let error = render_interactive_data_output(
+            output,
+            &AtomicBool::new(true),
+            &mut rendered,
+            &mut stage,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(rendered.is_empty());
+        assert!(stage.items.is_empty());
+    }
+
+    #[test]
+    fn interactive_data_option_depth_fails_before_rendering() {
+        let mut output = DataOutput::Value(StructuredValue::Int(1));
+        for _ in 0..=INTERACTIVE_DATA_OPTION_DEPTH_MAX {
+            output = DataOutput::Option(Some(Box::new(output)));
+        }
+        let mut rendered = Vec::new();
+        let mut stage = InteractiveDataCache::default().stage();
+        let error = render_interactive_data_output(
+            output,
+            &AtomicBool::new(false),
+            &mut rendered,
+            &mut stage,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("observed: 65"));
+        assert!(rendered.is_empty());
+        assert!(stage.items.is_empty());
+    }
+
+    struct FailingWriter {
+        remaining: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected failure",
+                ));
+            }
+            let written = buffer.len().min(self.remaining);
+            self.bytes.extend_from_slice(&buffer[..written]);
+            self.remaining = self.remaining.saturating_sub(written);
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn interactive_data_write_failure_is_not_a_successful_partial_result() {
+        let output = DataRuntime::new()
+            .eval_output(r#""one\ntwo" | lines"#)
+            .unwrap();
+        let mut writer = FailingWriter {
+            remaining: 2,
+            bytes: Vec::new(),
+        };
+        let mut stage = InteractiveDataCache::default().stage();
+        let error = render_interactive_data_output(
+            output,
+            &AtomicBool::new(false),
+            &mut writer,
+            &mut stage,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Io);
+        assert!(stage.items.is_empty());
     }
 }

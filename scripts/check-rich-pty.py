@@ -163,6 +163,13 @@ return quirl.config {{
     def type(self, text: str) -> None:
         self.send(text.encode("utf-8"))
 
+    def resize(self, rows: int, columns: int) -> None:
+        fcntl.ioctl(
+            self.master,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", rows, columns, 0, 0),
+        )
+
     def read(self, duration: float = 0.15) -> bytes:
         deadline = time.monotonic() + duration
         chunk = bytearray()
@@ -322,6 +329,74 @@ def check_completion(binary: Path, root: Path) -> None:
         session.read(0.1)
         session.send(b"\x03")
         session.wait_for(b"^C")
+        session.send(b"\x04")
+        session.wait_exit()
+    finally:
+        session.close()
+
+
+def check_interactive_runtime(binary: Path, root: Path) -> None:
+    session = Session(binary, root)
+    try:
+        session.wait_for(STARTUP_MARKER)
+
+        session.resize(4, 40)
+        session.read(0.2)
+        # Paste is one editor event, so the diff renderer emits the complete
+        # value in one write instead of styling one cell per keypress.
+        session.send(b"\x1b[200~resize-safe\x1b[201~")
+        session.wait_for(b"resize-safe")
+        session.send(b"\x03")
+        session.wait_for(b"^C")
+        session.resize(30, 120)
+        session.wait_for(STARTUP_MARKER)
+
+        # Populate and select a real process-owned job snapshot. Acceptance
+        # inserts an explicit command, so a changed/pruned job is revalidated by
+        # quirl-process instead of retaining a process handle in the picker.
+        enter_and_wait(session, "/bin/sleep 30 &", STARTUP_MARKER)
+        session.send(b"\x07")  # Ctrl-G: jobs picker
+        session.wait_for(b"fg job 1")
+        session.send(b"\r")
+        session.read(0.1)
+        session.send(b"\x03")
+        session.wait_for(b"^C")
+
+        # A successful typed stream becomes a bounded cached data source without
+        # rerunning the expression when Alt-D opens the data picker.
+        session.send(b"\x1bm")
+        session.wait_for(b"typed values and data pipelines")
+        enter_and_wait(session, "[1,2]", STARTUP_MARKER)
+        session.send(b"\x1bd")
+        session.wait_for(b"cached typed result")
+        session.send(b"\x1b")
+        session.read(0.1)
+        session.send(b"\x03")
+        session.wait_for(b"^C")
+
+        # Fill the PTY faster than the reader drains it. The first row must be
+        # visible before the complete source is consumed, and SIGINT must stop
+        # the bounded pull loop while preserving prompt terminal ownership.
+        csv_path = session.private / "stream.csv"
+        with csv_path.open("w", encoding="utf-8") as stream:
+            stream.write("name\n")
+            for index in range(100_000):
+                stream.write(f"row-{index:05d}\n")
+        session.type(f"open {csv_path}")
+        session.send(b"\r")
+        session.wait_for(b"row-00000")
+        session.send(b"\x03")
+        session.wait_for(b"cancelled")
+        wait_for_prompt(session)
+
+        session.send(b"\x1bm")
+        session.wait_for(b"processes and byte pipelines")
+        enter_and_wait(
+            session,
+            "/usr/bin/printf AFTER_%s DATA_CANCEL_RESTORED",
+            b"AFTER_DATA_CANCEL_RESTORED",
+        )
+        wait_for_prompt(session)
         session.send(b"\x04")
         session.wait_exit()
     finally:
@@ -605,6 +680,7 @@ def main() -> None:
     checks = [
         check_rich_editing,
         check_completion,
+        check_interactive_runtime,
         check_rich_review_regressions,
         check_native_job_control,
         check_noninteractive_dialect_islands,

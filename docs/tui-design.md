@@ -32,9 +32,9 @@ What is **kept** from today's implementation:
 - `Catalog::complete`, `quirl-picker` ranking, and the frozen completion
   protocol v1 (`CompletionWorker`, request/cancel envelopes, ≤250 ms deadline,
   ≤1000 results).
-- Lua extension prompt segments and completion providers. `PanelModel` and its
-  mandatory plain fallback remain available in `quirl-ui`; pinning panels into
-  the interactive frame is future work rather than current shell behavior.
+- Lua extension prompt segments, completion providers, and asynchronously
+  cached `PanelModel` regions. Panel callbacks run only on the fixed extension
+  workers; rendering consumes completed immutable snapshots.
 - Durable history (`QUIRL_HISTORY` / `$XDG_STATE_HOME/quirl/history`), bounded
   to 50 000 retained entries, 8 MiB decoded data, and a 32 MiB recent-file
   read/compaction window.
@@ -247,6 +247,7 @@ enum EditAction {
 | `Alt-M` | Command/data mode toggle | existing `quirl:mode-toggle` host action |
 | `Ctrl-Space` | Command/data mode toggle compatibility alias | some terminals cannot distinguish this from NUL |
 | `Ctrl-R` / `Ctrl-T` / `Alt-C` / `Ctrl-K` | History / files / directories / palette picker | existing bindings + Alt-C |
+| `Ctrl-G` / `Alt-D` | Active jobs / cached typed-data picker | snapshots only; selection inserts a revalidated command or data expression |
 | `Ctrl-C` | Clear line, dismiss popup; never exits | |
 | `Ctrl-D` | EOF on empty line → exit | |
 | `Ctrl-Z` | Release terminal, `SIGTSTP` self | resume redraws frame |
@@ -361,7 +362,7 @@ only if they can be proven not to reflow scrollback. Controlled by
 
 ### 5.6 Picker overlays
 
-`Ctrl-R`/`Ctrl-T`/`Alt-C`/`Ctrl-K` reuse the frame: the popup region becomes a
+`Ctrl-R`/`Ctrl-T`/`Alt-C`/`Ctrl-K`/`Ctrl-G`/`Alt-D` reuse the frame: the popup region becomes a
 picker (query row + virtualized result list + optional preview pane),
 honoring `picker.layout`:
 
@@ -374,6 +375,10 @@ The picker engine, ranking, and typed-value return stay in `quirl-picker`;
 the surface uses it through the `PickerRanker` composition adapter. Source
 items are capped at 4 096 and 2 MiB retained data, queries at 1 024 bytes, and
 ranked visible results at 256; rendering virtualizes the current window.
+Job entries come from `NativeExecutor::jobs()` after its refresh/prune step and
+retain only stable IDs, status, command text, and state-valid `fg`/`bg`
+commands. Data entries come only from the bounded cache of successful typed
+rows already rendered in the session; opening the picker never reruns a source.
 
 ---
 
@@ -650,10 +655,11 @@ distinguishes landed behavior from remaining parity and release-evidence work.
 | **M4 — Overlays + keymaps** | Landed: history/files/directories/palette overlays use the shared `quirl-picker` ranker through a composition-root adapter; queries are bounded and editable; Shift-Tab expands completion; adaptive/bottom and terminal-height inline full layouts honor preview config; Emacs/Helix/Vim editor modes remain available | Decide kitty/synchronized-output negotiation and gather named real-terminal layout evidence |
 | **M5 — Fallback retirement** | **Not accepted or implemented.** ADR 0012 flips `auto` to rich but deliberately retains Reedline for `simple` | Separate decision, full conformance and accessibility evidence, minimal fallback replacement, and removal of Reedline from `Cargo.lock` |
 
-Panels/watch regions pinned inside the frame (`Stream<T>` consumers, §10
-"Watch") are deliberately post-baseline. `PanelModel` and `LiveBuffer` exist
-as bounded standalone UI primitives, but no rich-surface panel event/layout
-path is wired; that work requires its own design addendum.
+Bounded extension panels are now pinned into the inline frame below the editor
+when no completion/picker overlay is active. `F6` cycles focus, at most six
+rows are visible, and `LiveBuffer` retains four completed generations per
+panel. Typed command output remains ordinary scrollback rather than becoming a
+full-screen watch application.
 
 ---
 
@@ -677,3 +683,74 @@ path is wired; that work requires its own design addendum.
 7. **Keymap data**: replace explicit binding branches with validated tables,
    then generate status hints from the live mapping before advertising user
    remapping.
+
+---
+
+## 15. Interactive runtime integration failure model
+
+The rich surface may present typed output, native jobs, cached data values, and
+extension panels, but it does not become an execution owner. Native jobs remain
+owned by `quirl-process`, live data readers remain owned by `quirl-data`, and
+Lua callbacks remain owned by the CLI extension scheduler. The UI receives
+only immutable snapshots and terminal-safe typed models.
+
+The integration maintains these invariants:
+
+- **Cancellation during pull or render.** Interactive data output uses the
+  shared execution request and cancellation identity. Plain rows are pulled and
+  written one at a time, with cancellation checked before every pull and write.
+  A cancellation or write failure after partial output remains a `ShellError`;
+  already-written scrollback is not reclassified as a successful value.
+- **Resize or suspension during a frame.** Resize invalidates the prepared
+  layout before the next draw. Terminals below five rows hide panels, previews,
+  and diagnostics in that order and keep the editor/status fallback usable.
+  Suspension releases the inline viewport, bracketed paste, cursor shape, and
+  raw mode before the process receives `SIGTSTP`; resume reacquires a newly
+  measured viewport. A frame prepared for an older size is never deliberately
+  written after a resize event has been observed.
+- **Provider failure or removal.** Panel providers execute only on the existing
+  extension workers. First paint consumes the last complete cache, a failure
+  preserves that last complete per-provider value, and a newer installed
+  extension generation removes providers absent from its complete snapshot.
+  The render path never locks a Lua VM or calls a plugin.
+- **Stale generations.** Runtime and panel generations increase monotonically.
+  The UI ignores an update older than the active generation; installing a newer
+  complete generation atomically replaces the visible provider set. Exhausting
+  a generation counter is `ErrorCode::ResourceLimit`, never wraparound.
+- **Terminal write failure or partial frame.** Ratatui/crossterm write errors
+  keep the terminal restoration guard armed. Cleanup restores cooked mode,
+  cursor visibility, bracketed-paste state, and the inline viewport on explicit
+  return and again best-effort from `Drop`. The original write error wins over
+  cleanup errors.
+- **Queue or output flood.** One UI turn polls at most one provider snapshot,
+  applies at most eight panel updates, and performs at most sixteen data pulls
+  before checking cancellation and scheduler state again. The panel queue holds
+  at most 32 updates; overflow drops the oldest pending update and records one
+  bounded notice. Repaints are coalesced to at most one per 16 ms poll turn.
+- **Non-TTY and tiny-terminal fallback.** Non-TTY, `TERM=dumb`, explicitly
+  simple, and initially sub-five-row terminals use the bounded Reedline/simple
+  path. A rich terminal resized below five rows uses the minimal editor/status
+  layout and suppresses optional regions until space returns. Provider failure
+  never changes command execution or native history.
+- **Shutdown with blocked workers.** The surface owns no extension worker.
+  Shutdown cancels the current generation through the existing scheduler and
+  waits only for its bounded safe point; an uncooperative callback is detached
+  by scheduler-owned `Arc` state and cannot delay terminal restoration.
+- **Stale job selection.** Picker entries contain a stable numeric job ID and
+  insert an explicit `fg` or `bg` command. Selection never retains a
+  process handle. The process owner revalidates the ID and state at execution,
+  so a pruned or changed job produces the normal bounded stale-job diagnostic.
+- **Oversized typed values.** Data values are validated by the data runtime
+  before rendering. Picker retention then caps labels, previews, value depth,
+  field count, and encoded bytes independently. A value that is too deep, wide,
+  or large may appear in scrollback through bounded incremental rendering but
+  is omitted from the picker cache with a resource notice.
+
+Concrete UI limits are eight panels, sixteen columns and 128 rows per panel,
+4 KiB per title/heading/cell, 512 KiB retained panel text, 32 queued updates,
+eight applied updates per turn, six visible panel rows, four retained live
+generations per panel, 128 cached typed data items, 512 KiB cached data text,
+256 display columns per data label, and 16 pulls per interactive data turn.
+Job snapshots retain at most 256 action items and 512 KiB of terminal-safe
+text. All optional regions are virtualized; offscreen rows stay within the
+declared snapshot bounds and are never rebuilt from Lua during a frame.

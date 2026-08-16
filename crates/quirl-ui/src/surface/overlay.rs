@@ -245,6 +245,7 @@ pub fn items(
                 .map_or(0, |index| index.saturating_add(1));
             directory_items(kind, Path::new("."), start, cursor)
         }
+        PickerKind::Jobs | PickerKind::Data => Vec::new(),
     }
 }
 
@@ -290,6 +291,8 @@ const fn picker_item_kind(kind: CompletionKind) -> PickerItemKind {
     match kind {
         CompletionKind::History => PickerItemKind::History,
         CompletionKind::Path => PickerItemKind::File,
+        CompletionKind::Job => PickerItemKind::Job,
+        CompletionKind::Data => PickerItemKind::Data,
         CompletionKind::Command | CompletionKind::Flag | CompletionKind::Value => {
             PickerItemKind::Action
         }

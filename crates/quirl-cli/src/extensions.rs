@@ -8,10 +8,10 @@ use quirl_catalog::{
 #[cfg(test)]
 use quirl_catalog::{Confidence, Provenance, ProvenanceInfo, Trust};
 use quirl_core::{
-    validate_contribution_set, ContributionKind, ErrorCode, ExecutionEffect, ExecutionEffects,
-    ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget, ExecutionPlan,
-    ExecutionRequest, ExecutionSource, ExtensionAction, ExtensionEvent, ExtensionEventData,
-    ShellError,
+    validate_contribution_set, ContributionKind, ContributionRegistration, ErrorCode,
+    ExecutionEffect, ExecutionEffects, ExecutionInput, ExecutionOutcome, ExecutionOutput,
+    ExecutionOutputTarget, ExecutionPlan, ExecutionRequest, ExecutionSource, ExtensionAction,
+    ExtensionEvent, ExtensionEventData, ShellError,
 };
 use quirl_lua::{
     CommandRegistration, ConfigStore, EventHandlerReport, LuaCancellation, LuaPolicy,
@@ -22,7 +22,11 @@ use quirl_plugin::{
     LockedPlugin, PluginLockfile, PluginRuntime, PLUGIN_LOCK_FILE,
 };
 use quirl_syntax::{parse_command_list, Mode};
-use quirl_ui::{ExtensionCompleter, ExtensionSuggestion, PanelModel};
+use quirl_ui::{
+    ExtensionCompleter, ExtensionSuggestion, InteractivePanelBatch, InteractivePanelSnapshot,
+    PanelModel, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
+    PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -59,6 +63,8 @@ const MAX_EXTENSION_COMPLETION_CALLBACKS: usize = 64;
 const EXTENSION_COMPLETION_WALL_TIME: Duration = Duration::from_millis(250);
 const EXTENSION_EVENT_WALL_TIME: Duration = Duration::from_millis(250);
 const EXTENSION_PROMPT_REFRESH_WALL_TIME: Duration = Duration::from_millis(100);
+const EXTENSION_PANEL_REFRESH_WALL_TIME: Duration = Duration::from_millis(250);
+const EXTENSION_PANEL_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const EXTENSION_SAFE_POINT_WAIT: Duration = Duration::from_millis(125);
 const PLUGIN_COMMAND_WALL_TIME: Duration = Duration::from_millis(50);
 
@@ -204,6 +210,21 @@ struct PromptRefresh {
     batch: ExtensionWorkBatch,
     receiver: Receiver<PromptPluginResult>,
     results: Vec<Option<PromptPluginResult>>,
+}
+
+struct PanelPluginResult {
+    plugin_index: usize,
+    invocation: ScheduledInvocation<Vec<InteractivePanelSnapshot>>,
+    errors: Vec<ShellError>,
+}
+
+struct PanelRefresh {
+    request_id: u64,
+    generation: u64,
+    deadline: Instant,
+    batch: ExtensionWorkBatch,
+    receiver: Receiver<PanelPluginResult>,
+    results: Vec<Option<PanelPluginResult>>,
 }
 
 struct EventPluginResult {
@@ -375,6 +396,11 @@ pub struct LuaExtensionHost {
     prompt_request_id: u64,
     prompt_refresh: Option<PromptRefresh>,
     prompt_cache: Vec<Vec<NamedExtensionSegment>>,
+    panel_request_id: u64,
+    panel_cache_generation: u64,
+    panel_refresh: Option<PanelRefresh>,
+    panel_cache: Vec<Vec<InteractivePanelSnapshot>>,
+    panel_last_refresh: Option<Instant>,
 }
 
 impl LuaExtensionHost {
@@ -425,6 +451,11 @@ impl LuaExtensionHost {
             prompt_request_id: 0,
             prompt_refresh: None,
             prompt_cache: Vec::new(),
+            panel_request_id: 0,
+            panel_cache_generation: 0,
+            panel_refresh: None,
+            panel_cache: Vec::new(),
+            panel_last_refresh: None,
         }
     }
 
@@ -464,6 +495,19 @@ impl LuaExtensionHost {
         };
         match self.build_candidate(snapshot) {
             Ok((config, plugin_paths, plugin_runtimes, managed_commands, command_bindings)) => {
+                let next_panel_generation = match self.panel_cache_generation.checked_add(1) {
+                    Some(generation) => generation,
+                    None => {
+                        self.record_error(
+                            ShellError::new(
+                                ErrorCode::ResourceLimit,
+                                "extension panel generation counter was exhausted",
+                            )
+                            .with_help("Restart Quirl before reloading extension panels again"),
+                        );
+                        return ExtensionReloadState::Rejected;
+                    }
+                };
                 if !plugin_runtimes.is_empty() && self.scheduler.is_none() {
                     self.scheduler = Some(ExtensionScheduler::new());
                 }
@@ -492,6 +536,10 @@ impl LuaExtensionHost {
                 self.command_bindings = command_bindings;
                 self.prompt_refresh.take();
                 self.prompt_cache = vec![Vec::new(); self.plugin_runtimes.len()];
+                self.panel_refresh.take();
+                self.panel_cache = vec![Vec::new(); self.plugin_runtimes.len()];
+                self.panel_cache_generation = next_panel_generation;
+                self.panel_last_refresh = None;
                 self.revision = next_revision;
                 ExtensionReloadState::Reloaded {
                     revision: self.revision,
@@ -907,6 +955,262 @@ impl LuaExtensionHost {
                 bytes = bytes.saturating_add(segment.name.len());
                 bytes = bytes.saturating_add(segment.value.len());
                 if bytes > MAX_CACHED_PROMPT_BYTES {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Return only completed panel cache state and schedule a bounded refresh.
+    ///
+    /// This method never invokes Lua on the caller. Provider callbacks are
+    /// submitted to the existing extension scheduler and a failing refresh
+    /// preserves the last complete per-plugin snapshot.
+    pub(crate) fn cached_panel_snapshot(&mut self) -> InteractivePanelBatch {
+        self.poll_panel_refresh();
+        let snapshot = InteractivePanelBatch {
+            generation: self.panel_cache_generation,
+            panels: self
+                .panel_cache
+                .iter()
+                .flatten()
+                .take(PANEL_COUNT_MAX)
+                .cloned()
+                .collect(),
+        };
+        let refresh_due = self
+            .panel_last_refresh
+            .is_none_or(|last| last.elapsed() >= EXTENSION_PANEL_REFRESH_INTERVAL);
+        if refresh_due && self.panel_refresh.is_none() && !self.plugin_runtimes.is_empty() {
+            self.start_panel_refresh();
+        }
+        snapshot
+    }
+
+    fn start_panel_refresh(&mut self) {
+        // Keep request identity, deadline construction, worker ownership, and
+        // publication setup in one transaction. Splitting this state-machine
+        // transition would make a partially submitted generation observable.
+        let request_id = match self.panel_request_id.checked_add(1) {
+            Some(request_id) => request_id,
+            None => {
+                self.record_error(
+                    ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "extension panel request counter was exhausted",
+                    )
+                    .with_help("Restart Quirl before refreshing extension panels again"),
+                );
+                return;
+            }
+        };
+        let started = Instant::now();
+        let Some(deadline) = started.checked_add(EXTENSION_PANEL_REFRESH_WALL_TIME) else {
+            self.record_error(
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "extension panel deadline exceeded the host monotonic clock",
+                )
+                .with_help("Restart Quirl before refreshing extension panels again"),
+            );
+            return;
+        };
+        self.panel_request_id = request_id;
+        self.panel_last_refresh = Some(started);
+        let cwd = env::current_dir().unwrap_or_default();
+        let context = Arc::new(json!({ "cwd": cwd }));
+        let (sender, receiver) = mpsc::sync_channel(self.plugin_runtimes.len());
+        let mut work = Vec::with_capacity(self.plugin_runtimes.len());
+        for (plugin_index, slot) in self.plugin_runtimes.iter().enumerate() {
+            let slot = Arc::clone(slot);
+            let registrations = slot
+                .registrations
+                .contributions
+                .iter()
+                .filter(|registration| registration.kind == ContributionKind::Panel)
+                .take(PANEL_COUNT_MAX)
+                .cloned()
+                .collect::<Vec<_>>();
+            let context = Arc::clone(&context);
+            let sender = sender.clone();
+            work.push(ExtensionWork::new(slot.key, move |mut control| {
+                let mut errors = Vec::new();
+                let invocation = slot.run_scheduled(&mut control, false, |runtime| {
+                    let mut panels = Vec::new();
+                    for registration in registrations {
+                        if panels.len() == PANEL_COUNT_MAX {
+                            break;
+                        }
+                        let value = match runtime.invoke_contribution(
+                            ContributionKind::Panel,
+                            &registration.name,
+                            context.as_ref(),
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                errors.push(error.with_context(format!(
+                                    "panel contribution: {}",
+                                    registration.name
+                                )));
+                                continue;
+                            }
+                        };
+                        let panel = match serde_json::from_value::<PanelModel>(value) {
+                            Ok(panel) => panel,
+                            Err(error) => {
+                                errors.push(contribution_shape_error(
+                                    &registration.name,
+                                    "panel providers must return the typed PanelModel object",
+                                    error,
+                                ));
+                                continue;
+                            }
+                        };
+                        if let Err(error) = validate_cached_panel(&registration, &panel) {
+                            errors.push(error);
+                            continue;
+                        }
+                        panels.push(InteractivePanelSnapshot {
+                            id: registration.name,
+                            model: panel,
+                        });
+                    }
+                    Ok(panels)
+                });
+                let _ = sender.try_send(PanelPluginResult {
+                    plugin_index,
+                    invocation,
+                    errors,
+                });
+            }));
+        }
+        drop(sender);
+        let Some(scheduler) = &self.scheduler else {
+            return;
+        };
+        let batch =
+            match scheduler.submit_batch(self.revision, deadline, WorkPriority::Prompt, work) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.record_error(error.with_context("extension panel refresh"));
+                    return;
+                }
+            };
+        self.panel_refresh = Some(PanelRefresh {
+            request_id,
+            generation: self.revision,
+            deadline,
+            batch,
+            receiver,
+            results: std::iter::repeat_with(|| None)
+                .take(self.plugin_runtimes.len())
+                .collect(),
+        });
+    }
+
+    fn poll_panel_refresh(&mut self) {
+        // Completion, expiry, cancellation, and cache publication are one
+        // transition: the old complete cache stays authoritative until every
+        // accepted result for this generation has been classified.
+        let Some(mut refresh) = self.panel_refresh.take() else {
+            return;
+        };
+        loop {
+            match refresh.receiver.try_recv() {
+                Ok(result)
+                    if result.plugin_index < refresh.results.len()
+                        && refresh.generation == self.revision
+                        && refresh.request_id == self.panel_request_id =>
+                {
+                    let index = result.plugin_index;
+                    refresh.results[index] = Some(result);
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+        let complete = refresh.results.iter().all(Option::is_some);
+        let expired = Instant::now() >= refresh.deadline;
+        if !complete && !expired {
+            self.panel_refresh = Some(refresh);
+            return;
+        }
+        if !complete {
+            if let Some(scheduler) = &self.scheduler {
+                scheduler.cancel_batch(&refresh.batch);
+            }
+        }
+        if refresh.generation != self.revision || refresh.request_id != self.panel_request_id {
+            return;
+        }
+
+        let mut changed = false;
+        let mut completed_plugins = 0_usize;
+        for result in refresh.results.into_iter().flatten() {
+            completed_plugins = completed_plugins.saturating_add(1);
+            let callback_failed = !result.errors.is_empty();
+            for error in result.errors {
+                self.record_error(error);
+            }
+            match result.invocation {
+                ScheduledInvocation::Finished(Ok(panels)) if !callback_failed => {
+                    if self.panel_cache_accepts(result.plugin_index, &panels) {
+                        changed |= self.panel_cache[result.plugin_index] != panels;
+                        self.panel_cache[result.plugin_index] = panels;
+                    } else {
+                        self.record_error(panel_cache_limit_error());
+                    }
+                }
+                ScheduledInvocation::Finished(Ok(_)) | ScheduledInvocation::Cancelled => {}
+                ScheduledInvocation::Finished(Err(error)) => self.record_error(error),
+            }
+        }
+        if changed {
+            match self.panel_cache_generation.checked_add(1) {
+                Some(generation) => self.panel_cache_generation = generation,
+                None => self.record_error(
+                    ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "extension panel cache generation counter was exhausted",
+                    )
+                    .with_help("Restart Quirl before refreshing extension panels again"),
+                ),
+            }
+        }
+        if expired && completed_plugins < self.plugin_runtimes.len() {
+            self.record_error(
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "extension panel refresh reached its aggregate deadline",
+                )
+                .with_context(format!(
+                    "completed plugins: {completed_plugins}; total plugins: {}; deadline: {} ms",
+                    self.plugin_runtimes.len(),
+                    EXTENSION_PANEL_REFRESH_WALL_TIME.as_millis()
+                ))
+                .with_help("Reduce slow panel providers; the last cached snapshot remains active"),
+            );
+        }
+    }
+
+    fn panel_cache_accepts(
+        &self,
+        plugin_index: usize,
+        replacement: &[InteractivePanelSnapshot],
+    ) -> bool {
+        let mut count = 0_usize;
+        let mut bytes = 0_usize;
+        for (index, panels) in self.panel_cache.iter().enumerate() {
+            let panels = if index == plugin_index {
+                replacement
+            } else {
+                panels
+            };
+            for panel in panels {
+                count = count.saturating_add(1);
+                bytes = bytes.saturating_add(panel_bytes(&panel.id, &panel.model));
+                if count > PANEL_COUNT_MAX || bytes > PANEL_GENERATION_BYTES_MAX {
                     return false;
                 }
             }
@@ -2676,6 +2980,72 @@ fn contribution_shape_error(name: &str, expected: &str, error: serde_json::Error
     .with_help(expected)
 }
 
+fn validate_cached_panel(
+    registration: &ContributionRegistration,
+    panel: &PanelModel,
+) -> Result<(), ShellError> {
+    panel.validate()?;
+    if registration.plain_fallback.as_deref() != Some(panel.plain_fallback.as_str()) {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "panel contribution `{}` changed its declared plain fallback",
+                registration.name
+            ),
+        )
+        .with_help("Return the same plain_fallback declared at registration"));
+    }
+    if panel.columns.len() > PANEL_COLUMNS_MAX {
+        return Err(host_count_limit_error(
+            "panel columns",
+            panel.columns.len(),
+            PANEL_COLUMNS_MAX,
+        ));
+    }
+    if panel.rows.len() > PANEL_ROWS_MAX {
+        return Err(host_count_limit_error(
+            "panel rows",
+            panel.rows.len(),
+            PANEL_ROWS_MAX,
+        ));
+    }
+    for field in std::iter::once(&registration.name)
+        .chain(std::iter::once(&panel.title))
+        .chain(panel.columns.iter())
+        .chain(panel.rows.iter().flatten())
+        .chain(std::iter::once(&panel.plain_fallback))
+    {
+        if field.len() > PANEL_FIELD_BYTES_MAX {
+            return Err(host_byte_limit_error(
+                "panel field",
+                field.len(),
+                PANEL_FIELD_BYTES_MAX,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn panel_bytes(id: &str, panel: &PanelModel) -> usize {
+    std::iter::once(id)
+        .chain(std::iter::once(panel.title.as_str()))
+        .chain(panel.columns.iter().map(String::as_str))
+        .chain(panel.rows.iter().flatten().map(String::as_str))
+        .chain(std::iter::once(panel.plain_fallback.as_str()))
+        .fold(0_usize, |bytes, field| bytes.saturating_add(field.len()))
+}
+
+fn panel_cache_limit_error() -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        "extension panel cache exceeded its count or byte limit",
+    )
+    .with_context(format!(
+        "panels: {PANEL_COUNT_MAX}; retained bytes: {PANEL_GENERATION_BYTES_MAX}"
+    ))
+    .with_help("Reduce enabled panel providers or shorten their typed output")
+}
+
 fn host_count_limit_error(resource: &str, observed: usize, limit: usize) -> ShellError {
     ShellError::new(
         ErrorCode::ResourceLimit,
@@ -3320,7 +3690,67 @@ quirl.extension.contribute {
             .render_panel_contribution("demo-panel", &json!({}))
             .unwrap();
         assert_eq!(panel.rows, vec![vec!["ready"]]);
+        let first = host.cached_panel_snapshot();
+        assert!(first.panels.is_empty());
+        let scheduler = host.scheduler.as_ref().unwrap().handle();
+        assert!(scheduler.wait_generation_idle(host.revision, Duration::from_secs(1)));
+        let cached = host.cached_panel_snapshot();
+        assert_eq!(cached.panels.len(), 1);
+        assert_eq!(cached.panels[0].model.rows, vec![vec!["ready"]]);
+        assert!(cached.generation > first.generation);
         assert!(host.take_errors().is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failing_panel_refresh_preserves_cache_and_provider_removal_publishes_empty_set() {
+        let directory = temporary_extension_directory();
+        let plugin = directory.join("plugins/panel.lua");
+        fs::write(
+            &plugin,
+            r#"
+local calls = 0
+quirl.extension.contribute {
+  kind = "panel", name = "demo-panel", deadline_ms = 10,
+  plain_fallback = "demo unavailable",
+  provide = function(_)
+    calls = calls + 1
+    if calls > 1 then error("injected panel failure") end
+    return {
+      title = "demo", columns = {"value"}, rows = {{"ready"}},
+      plain_fallback = "demo unavailable",
+    }
+  end,
+}
+"#,
+        )
+        .unwrap();
+        let mut host = LuaExtensionHost::from_directory(directory.clone());
+        assert!(matches!(
+            host.reload_if_changed(),
+            ExtensionReloadState::Reloaded { .. }
+        ));
+        assert!(host.cached_panel_snapshot().panels.is_empty());
+        let scheduler = host.scheduler.as_ref().unwrap().handle();
+        assert!(scheduler.wait_generation_idle(host.revision, Duration::from_secs(1)));
+        let ready = host.cached_panel_snapshot();
+        assert_eq!(ready.panels[0].model.rows, vec![vec!["ready"]]);
+
+        host.panel_last_refresh = None;
+        let _ = host.cached_panel_snapshot();
+        assert!(scheduler.wait_generation_idle(host.revision, Duration::from_secs(1)));
+        let failed = host.cached_panel_snapshot();
+        assert_eq!(failed.panels, ready.panels);
+        assert!(!host.take_errors().is_empty());
+
+        fs::remove_file(plugin).unwrap();
+        assert!(matches!(
+            host.reload_if_changed(),
+            ExtensionReloadState::Reloaded { .. }
+        ));
+        let removed = host.cached_panel_snapshot();
+        assert!(removed.panels.is_empty());
+        assert!(removed.generation > failed.generation);
         fs::remove_dir_all(directory).unwrap();
     }
 

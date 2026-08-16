@@ -23,6 +23,8 @@ pub enum CompletionKind {
     Path,
     Value,
     History,
+    Job,
+    Data,
 }
 
 impl CompletionKind {
@@ -33,11 +35,15 @@ impl CompletionKind {
             (Self::Path, true) => "/",
             (Self::Value, true) => "≡",
             (Self::History, true) => "↺",
+            (Self::Job, true) => "◉",
+            (Self::Data, true) => "◆",
             (Self::Command, false) => "c",
             (Self::Flag, false) => "f",
             (Self::Path, false) => "p",
             (Self::Value, false) => "v",
             (Self::History, false) => "h",
+            (Self::Job, false) => "j",
+            (Self::Data, false) => "d",
         }
     }
 }

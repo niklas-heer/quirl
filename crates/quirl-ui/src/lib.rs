@@ -8,7 +8,14 @@ pub use panel::{
     directory_panel, process_panel, LiveBuffer, LiveSample, LiveSnapshot, PanelModel,
     ProcessPanelRow,
 };
-pub use surface::{select_surface, InteractiveSignal, RichSurface, SurfaceKind};
+pub use surface::{
+    select_surface, InteractiveDataSnapshot, InteractiveJobAction, InteractiveJobSnapshot,
+    InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
+    InteractivePanelSnapshot, InteractiveRuntimeSnapshot, InteractiveSignal, RichSurface,
+    SurfaceKind, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, JOB_ACTION_ITEMS_MAX,
+    JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
+    PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+};
 
 use crossterm::{
     cursor::SetCursorStyle,

@@ -3,6 +3,7 @@ use super::{
     editor::EditorState,
     highlight::{DiagnosticSeverity, SurfaceDiagnostic},
     overlay::PickerLayout,
+    runtime::{RuntimeSurfaceState, PANEL_VISIBLE_ROWS_MAX},
     statusbar::StatusBarModel,
 };
 use crate::theme::Theme;
@@ -39,6 +40,7 @@ pub struct FrameModel<'a> {
     pub picker_layout: PickerLayout,
     pub picker_preview: bool,
     pub detail_scroll: u16,
+    pub runtime: &'a RuntimeSurfaceState,
 }
 
 impl FrameModel<'_> {
@@ -61,10 +63,20 @@ impl FrameModel<'_> {
         } else {
             0
         };
+        let panel = if !self.completion.open && terminal_height >= 5 {
+            self.runtime.focused_panel().map_or(0, |(_, panel)| {
+                u16::try_from(panel.rows.len().min(PANEL_VISIBLE_ROWS_MAX))
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(3)
+            })
+        } else {
+            0
+        };
         let height = 2_u16
             .saturating_add(input_rows)
             .saturating_add(diagnostics)
             .saturating_add(popup)
+            .saturating_add(panel)
             .min(terminal_height.max(1));
         if self.completion.open
             && self.picker_query.is_some()
@@ -147,6 +159,19 @@ impl FrameModel<'_> {
                         || (self.picker_layout == PickerLayout::Full && area.width >= 72))
             });
             self.render_completion(frame, popup_area, docs_allowed);
+        } else if next_y < area.bottom().saturating_sub(1) {
+            let available = area.bottom().saturating_sub(next_y).saturating_sub(1);
+            if let Some((id, panel)) = self.runtime.focused_panel().filter(|_| available >= 3) {
+                let desired = u16::try_from(panel.rows.len().min(PANEL_VISIBLE_ROWS_MAX))
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(3);
+                self.render_panel(
+                    frame,
+                    Rect::new(area.x, next_y, area.width, available.min(desired)),
+                    id,
+                    panel,
+                );
+            }
         }
         let status_area = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
         let status = StatusBarModel {
@@ -158,7 +183,8 @@ impl FrameModel<'_> {
             notice: self
                 .diagnostic
                 .filter(|_| self.compact)
-                .map(|diagnostic| diagnostic.message.as_str()),
+                .map(|diagnostic| diagnostic.message.as_str())
+                .or_else(|| self.runtime.notice()),
             timings: self.timings,
             unicode: self.unicode,
         };
@@ -202,6 +228,50 @@ impl FrameModel<'_> {
         spans.push(Span::raw(" ".repeat(gap)));
         spans.push(Span::styled(right, self.theme.context_secondary()));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    fn render_panel(&self, frame: &mut Frame<'_>, area: Rect, id: &str, panel: &crate::PanelModel) {
+        let title = format!(
+            " {} · {} · {}/{} · F6 next ",
+            escape_terminal_line(id),
+            escape_terminal_line(&panel.title),
+            self.runtime.panel_focus_position(),
+            self.runtime.panel_count()
+        );
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(self.theme.border());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height == 0 {
+            return;
+        }
+        let mut lines = Vec::new();
+        lines.push(Line::styled(
+            panel
+                .columns
+                .iter()
+                .map(|value| escape_terminal_line(value))
+                .collect::<Vec<_>>()
+                .join(" │ "),
+            self.theme.context_secondary(),
+        ));
+        lines.extend(
+            panel
+                .rows
+                .iter()
+                .take(usize::from(inner.height.saturating_sub(1)))
+                .map(|row| {
+                    Line::raw(
+                        row.iter()
+                            .map(|value| escape_terminal_line(value))
+                            .collect::<Vec<_>>()
+                            .join(" │ "),
+                    )
+                }),
+        );
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn input_render(&self, width: usize) -> InputRender {
@@ -559,6 +629,7 @@ mod tests {
         let catalog = Catalog::builtin();
         let mut completion = CompletionState::new(catalog, None);
         configure(&mut completion);
+        let runtime = RuntimeSurfaceState::new();
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
@@ -581,6 +652,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    runtime: &runtime,
                 }
                 .render(frame);
             })
@@ -638,6 +710,7 @@ mod tests {
             range: end_start..input.len(),
             kind: HighlightKind::StringDouble,
         }];
+        let runtime = RuntimeSurfaceState::new();
         let mut terminal = Terminal::new(TestBackend::new(24, 3)).unwrap();
         terminal
             .draw(|frame| {
@@ -660,6 +733,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    runtime: &runtime,
                 }
                 .render(frame);
             })
@@ -692,6 +766,7 @@ mod tests {
             range: 0..3,
             kind: HighlightKind::Command,
         }];
+        let runtime = RuntimeSurfaceState::new();
         let mut terminal = Terminal::new(TestBackend::new(40, 3)).unwrap();
         terminal
             .draw(|frame| {
@@ -714,6 +789,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    runtime: &runtime,
                 }
                 .render(frame);
             })
@@ -741,6 +817,103 @@ mod tests {
         assert!(row(&terminal, 1).contains("◆ files"));
         assert!(row(&terminal, 2).contains("data"));
         assert!(!row(&terminal, 2).contains("command"));
+    }
+
+    #[test]
+    fn cached_panel_region_renders_without_displacing_the_status_row() {
+        let editor = EditorState::new("emacs", Vec::new());
+        let completion = CompletionState::new(Catalog::builtin(), None);
+        let mut runtime = RuntimeSurfaceState::new();
+        assert!(
+            runtime.install_panel_batch(crate::surface::runtime::InteractivePanelBatch {
+                generation: 1,
+                panels: vec![crate::surface::runtime::InteractivePanelSnapshot {
+                    id: "demo".to_owned(),
+                    model: crate::PanelModel::new(
+                        "status",
+                        vec!["name".to_owned(), "state".to_owned()],
+                        vec![vec!["worker".to_owned(), "ready".to_owned()]],
+                        "no workers",
+                    )
+                    .unwrap(),
+                }],
+            })
+        );
+        let mut terminal = Terminal::new(TestBackend::new(78, 7)).unwrap();
+        terminal
+            .draw(|frame| {
+                FrameModel {
+                    context_left: "~/project",
+                    context_right: "",
+                    editor: &editor,
+                    completion: &completion,
+                    mode: Mode::Command,
+                    diagnostic: None,
+                    highlight_spans: &[],
+                    theme: Theme::new(true),
+                    unicode: true,
+                    symbols: SurfaceSymbols::Unicode,
+                    semantic_hints: true,
+                    hints: true,
+                    timings: None,
+                    compact: false,
+                    picker_query: None,
+                    picker_layout: PickerLayout::Adaptive,
+                    picker_preview: true,
+                    detail_scroll: 0,
+                    runtime: &runtime,
+                }
+                .render(frame);
+            })
+            .unwrap();
+        let rendered = (0..7).map(|y| row(&terminal, y)).collect::<String>();
+        assert!(rendered.contains("demo · status"));
+        assert!(rendered.contains("worker │ ready"));
+        assert!(row(&terminal, 6).contains("command"));
+    }
+
+    #[test]
+    fn tiny_terminal_suppresses_the_optional_panel_region() {
+        let editor = EditorState::new("emacs", Vec::new());
+        let completion = CompletionState::new(Catalog::builtin(), None);
+        let mut runtime = RuntimeSurfaceState::new();
+        assert!(
+            runtime.install_panel_batch(crate::surface::runtime::InteractivePanelBatch {
+                generation: 1,
+                panels: vec![crate::surface::runtime::InteractivePanelSnapshot {
+                    id: "demo".to_owned(),
+                    model: crate::PanelModel::new(
+                        "status",
+                        vec!["value".to_owned()],
+                        vec![vec!["ready".to_owned()]],
+                        "empty",
+                    )
+                    .unwrap(),
+                }],
+            })
+        );
+        let model = FrameModel {
+            context_left: "~/project",
+            context_right: "",
+            editor: &editor,
+            completion: &completion,
+            mode: Mode::Command,
+            diagnostic: None,
+            highlight_spans: &[],
+            theme: Theme::new(true),
+            unicode: true,
+            symbols: SurfaceSymbols::Unicode,
+            semantic_hints: true,
+            hints: true,
+            timings: None,
+            compact: true,
+            picker_query: None,
+            picker_layout: PickerLayout::Adaptive,
+            picker_preview: true,
+            detail_scroll: 0,
+            runtime: &runtime,
+        };
+        assert_eq!(model.height(4), 3);
     }
 
     #[test]
@@ -797,6 +970,7 @@ mod tests {
             }],
             "history",
         );
+        let runtime = RuntimeSurfaceState::new();
         let mut terminal = Terminal::new(TestBackend::new(90, 12)).unwrap();
         terminal
             .draw(|frame| {
@@ -819,6 +993,7 @@ mod tests {
                     picker_layout: PickerLayout::Full,
                     picker_preview: false,
                     detail_scroll: 0,
+                    runtime: &runtime,
                 };
                 assert_eq!(model.height(12), 12);
                 model.render(frame);
@@ -915,6 +1090,7 @@ mod tests {
             range: Some(range.clone()),
         };
         let spans = quirl_syntax::highlight(input, Mode::Command);
+        let runtime = RuntimeSurfaceState::new();
         let mut terminal = Terminal::new(TestBackend::new(78, 4)).unwrap();
         terminal
             .draw(|frame| {
@@ -937,6 +1113,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    runtime: &runtime,
                 }
                 .render(frame);
             })

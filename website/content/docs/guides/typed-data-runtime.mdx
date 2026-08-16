@@ -139,3 +139,13 @@ fully streaming JSON/YAML/TOML parser. HTTP is not implied by `open`: a future
 HTTP adapter must expose explicit request, timeout, redirect, byte, and
 capability limits. Those remain design targets rather than silently available
 0.1.0 behavior.
+
+The rich interactive data branch also uses a shared `ExecutionRequest` with an
+inherited output target. It writes terminal-safe plain values one row at a time,
+flushes each row, checks the shared SIGINT/SIGTERM cancellation identity before
+every pull and write, and yields after at most 16 pulls. A failed or cancelled
+stream may already have produced scrollback but never commits its partial rows
+to the picker cache. Only successful typed rows enter the 128-item, 512 KiB
+session cache used by Alt-D; opening that picker performs no evaluation.
+Nested `Option` wrappers are flattened iteratively and rejected before output
+at a depth above 64, so renderer stack use is independent of source nesting.

@@ -47,6 +47,8 @@ pub enum PickerKind {
     Files,
     Directories,
     Palette,
+    Jobs,
+    Data,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +167,7 @@ impl EditorState {
                 KeyCode::Char('r') => EditAction::OpenPicker(PickerKind::History),
                 KeyCode::Char('t') => EditAction::OpenPicker(PickerKind::Files),
                 KeyCode::Char('k') => EditAction::OpenPicker(PickerKind::Palette),
+                KeyCode::Char('g') => EditAction::OpenPicker(PickerKind::Jobs),
                 KeyCode::Char('l') => EditAction::ClearScreen,
                 KeyCode::Char('z') => EditAction::Suspend,
                 KeyCode::Char('a') => EditAction::MoveHome,
@@ -181,6 +184,7 @@ impl EditorState {
                 KeyCode::Char('m') => EditAction::ToggleGrammarMode,
                 KeyCode::Enter => EditAction::ForceNewline,
                 KeyCode::Char('c') => EditAction::OpenPicker(PickerKind::Directories),
+                KeyCode::Char('d') => EditAction::OpenPicker(PickerKind::Data),
                 KeyCode::Char('b') => EditAction::MoveWordLeft,
                 KeyCode::Char('f') => EditAction::MoveWordRight,
                 KeyCode::Char('u') => EditAction::Undo,

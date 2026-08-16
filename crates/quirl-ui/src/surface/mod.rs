@@ -4,9 +4,17 @@ mod editor;
 mod frame;
 pub(crate) mod highlight;
 mod overlay;
+mod runtime;
 mod statusbar;
 
 pub use degrade::{select_surface, SurfaceKind};
+pub use runtime::{
+    InteractiveDataSnapshot, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
+    InteractivePanelBatch, InteractivePanelProvider, InteractivePanelSnapshot,
+    InteractiveRuntimeSnapshot, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, JOB_ACTION_ITEMS_MAX,
+    JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
+    PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+};
 
 use self::{
     completion::CompletionState,
@@ -14,6 +22,7 @@ use self::{
     frame::FrameModel,
     highlight::InputAnalyzer,
     overlay::{contextual_help_query, PickerLayout, PickerOverlay},
+    runtime::RuntimeSurfaceState,
 };
 use super::{
     read_history, ExtensionCompleter, PickerRanker, QuirlPrompt, SurfaceSymbols,
@@ -101,6 +110,7 @@ pub struct RichSurface {
     help_active: bool,
     help_detail_scroll: u16,
     theme: Theme,
+    runtime: RuntimeSurfaceState,
 }
 
 impl RichSurface {
@@ -143,7 +153,18 @@ impl RichSurface {
             help_active: false,
             help_detail_scroll: 0,
             theme,
+            runtime: RuntimeSurfaceState::new(),
         })
+    }
+
+    /// Replace the bounded immutable job and typed-result sources for the next frame.
+    pub fn install_runtime_snapshot(&mut self, snapshot: InteractiveRuntimeSnapshot) {
+        self.runtime.install_snapshot(snapshot);
+    }
+
+    /// Attach a nonblocking provider of completed asynchronous panel snapshots.
+    pub fn set_panel_provider(&mut self, provider: Box<dyn InteractivePanelProvider>) {
+        self.runtime.set_provider(provider);
     }
 
     /// Run one blocking interactive edit session and return after terminal release.
@@ -210,6 +231,7 @@ impl RichSurface {
                     },
                     picker_preview: self.picker_preview,
                     detail_scroll: self.help_detail_scroll,
+                    runtime: &self.runtime,
                 };
                 let height = model.height(terminal_height);
                 self.terminal.ensure_height(height)?;
@@ -229,6 +251,10 @@ impl RichSurface {
                     let items = self.completion.items.clone();
                     self.open_picker_items(items, "completions", true);
                 }
+                dirty = true;
+                continue;
+            }
+            if self.runtime.poll_panels() {
                 dirty = true;
                 continue;
             }
@@ -256,6 +282,10 @@ impl RichSurface {
                 }
                 Event::Resize(_, _) => continue,
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if key.code == KeyCode::F(6) {
+                        let _ = self.runtime.cycle_panel_focus();
+                        continue;
+                    }
                     if key.code == KeyCode::F(1) {
                         if self.help_active {
                             self.completion.next();
@@ -461,7 +491,11 @@ impl RichSurface {
     ) {
         self.help_active = false;
         self.help_detail_scroll = 0;
-        let items = overlay::items(kind, &self.catalog, &self.history, line, cursor);
+        let items = match kind {
+            editor::PickerKind::Jobs => self.runtime.job_items(line.len()),
+            editor::PickerKind::Data => self.runtime.data_items(line.len()),
+            _ => overlay::items(kind, &self.catalog, &self.history, line, cursor),
+        };
         self.open_picker_items(items, label, expanded);
     }
 
