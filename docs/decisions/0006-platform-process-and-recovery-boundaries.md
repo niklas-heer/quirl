@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-08-15
 - Extends: [ADR 0003](0003-preview-runtime-layers.md), [ADR 0005](0005-plugin-platform-layer.md)
+- Ownership reconciliation: [ADR 0016](0016-runtime-layering-contract.md)
 
 ## Context
 

@@ -4,6 +4,7 @@
 - Date: 2026-08-15
 - Decision owners: Quirl maintainers
 - Applies to: all workspace crates and dependency additions
+- Superseded by: [ADR 0016](0016-runtime-layering-contract.md)
 
 ## Context
 

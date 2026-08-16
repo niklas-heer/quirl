@@ -52,7 +52,9 @@ Distinguish programmer errors from expected operating errors:
 
 - Invalid source, configuration, protocol data, I/O, resource exhaustion, and
   extension behavior are operating errors. Validate them and return
-  `ShellError`; never panic on user-controlled input.
+  `ShellError` at shell-effect boundaries; a core-independent foundation parser
+  may instead return an inert domain diagnostic for its consumer to map. Never
+  panic on user-controlled input.
 - Impossible internal states are programmer errors. Encode them with types
   first, then use `assert!` or `debug_assert!` where an executable invariant
   materially improves review and testing. Do not use assertions as a substitute
@@ -156,24 +158,34 @@ crate layering. Do not add a dependency for trivial convenience.
 ## Architecture: respect the layering
 
 Dependency direction is strict and one-way, codified in
-[ADR 0002](docs/decisions/0002-crate-layering.md):
+[ADR 0016](docs/decisions/0016-runtime-layering-contract.md). The ADR contains
+the complete allowed edge table; in summary:
 
-- Foundation crates — `quirl-core`, `quirl-catalog`, `quirl-syntax` — depend
-  only on serde-level libraries. They must never depend on `quirl-ui`,
-  `quirl-cli`, `quirl-data`, or `quirl-lua`.
-- `quirl-data` and `quirl-lua` sit on `quirl-core` only.
-- `quirl-ui` may use catalog, core, lua, and syntax.
-- `quirl-cli` is the only composition root; it is the only crate that sees
-  everything.
+- `quirl-catalog`, `quirl-core`, and `quirl-syntax` are foundation peers with
+  no dependencies on other Quirl crates.
+- Contract, data, Lua, picker, plugin, process, LSP, and UI crates use only the
+  inward Quirl edges listed in ADR 0016. In particular, `quirl-picker` may
+  depend on core, and `quirl-process` may depend on core and syntax.
+- `quirl-cli` is the sole product composition root and the only product crate
+  permitted to assemble every layer.
+- Native Quirl process execution and reusable child-lifecycle containment
+  belong to `quirl-process`; core retains passive capability and outcome values.
 
 When adding functionality, put it in the lowest crate that can own it, and
 never invert an arrow to make something compile.
 
-## One error type, everywhere
+## One operating error type at effectful boundaries
 
-All fallible cross-crate paths return `Result<T, quirl_core::ShellError>`.
+Fallible cross-crate service and shell-effect paths return
+`Result<T, quirl_core::ShellError>`.
 `ShellError` carries an `ErrorCode`, message, labels, context, and help, and
 derives `Serialize` so `--format json` works for free.
+
+Core-independent foundation parsers may return owned, inert diagnostics to
+avoid inverting the crate graph. Execution, I/O, and persistence consumers map
+those diagnostics to `ShellError` while preserving message, span, help, and
+source identity. Read-only presentation adapters may map them directly to their
+protocol's diagnostic value. Do not use this exception for operating failures.
 
 - Do not introduce `anyhow`, new error enums, or `thiserror` derives. Errors are
   hand-built for serialization control.
@@ -222,8 +234,10 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
   shell's Lua 5.4 build. Never add spikes as workspace members or import
   their dependencies into `crates/`.
 - `quirl-bench` is research tooling (`publish = false`), not product code.
-- No `unsafe` exists in `crates/` today. Adding any requires a comment
-  explaining why it is sound and should be a last resort.
+- Unsafe Rust is prohibited in `crates/` except for the private `cfg(windows)`
+  Job Object FFI wrapper in `quirl-process` sanctioned by ADR 0016. Every unsafe
+  block there requires a local safety explanation; expanding that audited
+  boundary requires a new ADR and security review.
 - No feature flags on the main crates; keep it that way unless an ADR says
   otherwise.
 
@@ -253,10 +267,10 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
   present tense, optionally scoped, e.g. `feat(lua): add completion budgets`.
 - Significant design choices go through an ADR in `docs/decisions/`.
   ADR 0001 is the standing contract: Lua is the only extension language,
-  Rust validates everything at the boundary. ADR 0002 fixes the crate
-  dependency graph. `docs/language-design.md` is the product specification;
-  its §13 delivery sequence and acceptance gates define what each phase
-  must prove.
+  Rust validates everything at the boundary. ADR 0016 fixes the crate
+  dependency and runtime-ownership graph. `docs/language-design.md` is the
+  product specification; its §13 delivery sequence and acceptance gates define
+  what each phase must prove.
 
 ### `xtask` command conventions
 

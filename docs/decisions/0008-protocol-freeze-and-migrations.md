@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-08-15
 - Extends: [ADR 0002](0002-crate-layering.md), [ADR 0007](0007-semantic-catalog-v4.md)
+- Superseded in part by: [ADR 0016](0016-runtime-layering-contract.md)
 
 ## Context
 

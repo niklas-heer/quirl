@@ -2,7 +2,7 @@
 
 - Status: Proposed
 - Date: 2026-08-16
-- Extends: [ADR 0002](0002-crate-layering.md), [ADR 0011](0011-deterministic-testing-and-bounded-engineering.md)
+- Extends: [ADR 0011](0011-deterministic-testing-and-bounded-engineering.md), [ADR 0016](0016-runtime-layering-contract.md)
 
 ## Context
 

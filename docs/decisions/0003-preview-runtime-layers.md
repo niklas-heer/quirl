@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-08-15
+- Superseded by: [ADR 0016](0016-runtime-layering-contract.md)
 
 ## Context
 
