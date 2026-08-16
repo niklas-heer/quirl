@@ -536,7 +536,6 @@ mod tests {
         editor::EditAction,
         CompletionState,
     };
-    use crate::CompletionWorker;
     use quirl_catalog::Catalog;
     use ratatui::{backend::TestBackend, style::Color, Terminal};
 
@@ -558,8 +557,7 @@ mod tests {
         let diagnostic = diagnostic.map(SurfaceDiagnostic::error);
         let highlight_spans = quirl_syntax::highlight(buffer, mode);
         let catalog = Catalog::builtin();
-        let mut completion =
-            CompletionState::new(CompletionWorker::new(catalog.clone()), catalog, None);
+        let mut completion = CompletionState::new(catalog, None);
         configure(&mut completion);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
@@ -634,8 +632,7 @@ mod tests {
         let mut editor = EditorState::new("emacs", Vec::new());
         editor.insert_paste(&input);
         let catalog = Catalog::builtin();
-        let completion =
-            CompletionState::new(CompletionWorker::new(catalog.clone()), catalog, None);
+        let completion = CompletionState::new(catalog, None);
         let end_start = input.len().saturating_sub(3);
         let spans = vec![HighlightSpan {
             range: end_start..input.len(),
@@ -690,8 +687,7 @@ mod tests {
         let mut editor = EditorState::new("emacs", vec!["git status".to_owned()]);
         editor.insert_paste("git");
         let catalog = Catalog::builtin();
-        let completion =
-            CompletionState::new(CompletionWorker::new(catalog.clone()), catalog, None);
+        let completion = CompletionState::new(catalog, None);
         let spans = vec![HighlightSpan {
             range: 0..3,
             kind: HighlightKind::Command,
@@ -785,8 +781,7 @@ mod tests {
         let mut editor = EditorState::new("emacs", Vec::new());
         editor.apply(EditAction::Insert('g'));
         let catalog = Catalog::builtin();
-        let mut completion =
-            CompletionState::new(CompletionWorker::new(catalog.clone()), catalog, None);
+        let mut completion = CompletionState::new(catalog, None);
         completion.show_picker_results(
             vec![CompletionItem {
                 value: "git status".to_owned(),
@@ -912,8 +907,7 @@ mod tests {
         let mut editor = EditorState::new("emacs", Vec::new());
         editor.insert_paste(input);
         let catalog = Catalog::builtin();
-        let completion =
-            CompletionState::new(CompletionWorker::new(catalog.clone()), catalog, None);
+        let completion = CompletionState::new(catalog, None);
         let range = input.find("--unknown").unwrap()..input.len();
         let diagnostic = SurfaceDiagnostic {
             message: "unknown flag `--unknown`".to_owned(),

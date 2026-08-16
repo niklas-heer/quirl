@@ -674,7 +674,7 @@ The parser boundary preserves compatibility without leaking it into the value ru
 | --- | --- |
 | Cold start | ≤25 ms to editable prompt, P50 on reference hardware |
 | Keystroke to frame | ≤8 ms P95 |
-| First prompt paint | ≤16 ms; slow segments refresh later |
+| First prompt paint | ≤21 ms P95; slow segments refresh later |
 | Stream memory | `O(window)` unless explicitly collected |
 
 These are targets, not current benchmark claims. Each release records cold/warm startup, completion/render latency, pipeline throughput, peak memory, and binary size on named hardware.

@@ -197,8 +197,9 @@ impl Drop for ExtensionWorker {
 }
 
 pub struct CompletionState {
-    worker: CompletionWorker,
-    catalog: Catalog,
+    worker: Option<CompletionWorker>,
+    catalog: Arc<Catalog>,
+    extension_source: Option<Box<dyn ExtensionCompleter + Send>>,
     extension_worker: Option<ExtensionWorker>,
     extension_pending: Option<Vec<ExtensionSuggestion>>,
     catalog_ready: bool,
@@ -214,19 +215,17 @@ pub struct CompletionState {
 
 impl CompletionState {
     pub fn new(
-        worker: CompletionWorker,
-        catalog: Catalog,
+        catalog: impl Into<Arc<Catalog>>,
         extensions: Option<Box<dyn ExtensionCompleter + Send>>,
     ) -> Self {
-        let extension_worker = extensions.map(ExtensionWorker::new);
-        let extension_ready = extension_worker.is_none();
         Self {
-            worker,
-            catalog,
-            extension_worker,
+            worker: None,
+            catalog: catalog.into(),
+            extension_source: extensions,
+            extension_worker: None,
             extension_pending: None,
             catalog_ready: false,
-            extension_ready,
+            extension_ready: false,
             request_id: 0,
             items: Vec::new(),
             selected: 0,
@@ -246,12 +245,15 @@ impl CompletionState {
             ));
             return Ok(());
         }
+        self.start_workers();
         self.resource_notice = None;
         if self.request_id > 0 {
-            self.worker.cancel(CompletionCancellation {
-                protocol_version: COMPLETION_PROTOCOL_VERSION,
-                request_id: self.request_id,
-            })?;
+            if let Some(worker) = &mut self.worker {
+                worker.cancel(CompletionCancellation {
+                    protocol_version: COMPLETION_PROTOCOL_VERSION,
+                    request_id: self.request_id,
+                })?;
+            }
         }
         self.request_id = self.request_id.saturating_add(1);
         self.items.clear();
@@ -262,14 +264,16 @@ impl CompletionState {
         self.open = true;
         self.streaming = true;
         self.source_label = "catalog";
-        self.worker.submit(CompletionRequest {
-            protocol_version: COMPLETION_PROTOCOL_VERSION,
-            request_id: self.request_id,
-            line: line.to_owned(),
-            cursor,
-            limit: MAX_COMPLETION_RESULTS,
-            deadline_ms: MAX_COMPLETION_DEADLINE_MS,
-        })?;
+        if let Some(worker) = &mut self.worker {
+            worker.submit(CompletionRequest {
+                protocol_version: COMPLETION_PROTOCOL_VERSION,
+                request_id: self.request_id,
+                line: line.to_owned(),
+                cursor,
+                limit: MAX_COMPLETION_RESULTS,
+                deadline_ms: MAX_COMPLETION_DEADLINE_MS,
+            })?;
+        }
         if let Some(worker) = &self.extension_worker {
             worker.submit(ExtensionRequest {
                 request_id: self.request_id,
@@ -282,10 +286,12 @@ impl CompletionState {
 
     pub fn cancel_for_edit(&mut self) {
         if self.request_id > 0 {
-            let _ = self.worker.cancel(CompletionCancellation {
-                protocol_version: COMPLETION_PROTOCOL_VERSION,
-                request_id: self.request_id,
-            });
+            if let Some(worker) = &mut self.worker {
+                let _ = worker.cancel(CompletionCancellation {
+                    protocol_version: COMPLETION_PROTOCOL_VERSION,
+                    request_id: self.request_id,
+                });
+            }
             if let Some(worker) = &self.extension_worker {
                 worker.cancel(self.request_id);
             }
@@ -304,7 +310,11 @@ impl CompletionState {
     pub fn poll(&mut self, _line: &str, _cursor: usize) -> bool {
         let selected_value = self.selected_item().map(|item| item.value.clone());
         let mut changed = false;
-        if let Some(response) = self.worker.try_recv_latest() {
+        if let Some(response) = self
+            .worker
+            .as_ref()
+            .and_then(CompletionWorker::try_recv_latest)
+        {
             self.items = bounded_items(match response.outcome {
                 CompletionOutcome::Ready { items } => items
                     .into_iter()
@@ -347,6 +357,19 @@ impl CompletionState {
         self.streaming = !self.catalog_ready || !self.extension_ready;
         self.open = !self.items.is_empty() || self.streaming;
         true
+    }
+
+    fn start_workers(&mut self) {
+        // The empty first frame cannot consume completion results. Defer both
+        // worker threads until the first actual request so process startup and
+        // first paint do not pay for idle control-plane resources.
+        if self.worker.is_none() {
+            self.worker = Some(CompletionWorker::new(self.catalog.as_ref().clone()));
+        }
+        if self.extension_worker.is_none() {
+            self.extension_worker = self.extension_source.take().map(ExtensionWorker::new);
+        }
+        self.extension_ready = self.extension_worker.is_none();
     }
 
     pub fn next(&mut self) {
@@ -590,8 +613,10 @@ mod tests {
     #[test]
     fn catalog_completion_uses_the_frozen_worker_envelope() {
         let catalog = Catalog::builtin();
-        let mut state = CompletionState::new(CompletionWorker::new(catalog.clone()), catalog, None);
+        let mut state = CompletionState::new(catalog, None);
+        assert!(state.worker.is_none());
         state.request("git st", 6).unwrap();
+        assert!(state.worker.is_some());
         for _ in 0..100 {
             if state.poll("git st", 6) {
                 break;
@@ -604,7 +629,7 @@ mod tests {
     #[test]
     fn oversized_query_stays_in_the_editor_and_reports_the_protocol_bound() {
         let catalog = Catalog::builtin();
-        let mut state = CompletionState::new(CompletionWorker::new(catalog.clone()), catalog, None);
+        let mut state = CompletionState::new(catalog, None);
         let line = "x".repeat(quirl_catalog::MAX_COMPLETION_QUERY_BYTES + 1);
         state.request(&line, line.len()).unwrap();
         assert!(!state.open);
@@ -630,7 +655,7 @@ mod tests {
     #[test]
     fn manual_and_extension_results_enforce_aggregate_bounds() {
         let catalog = Catalog::builtin();
-        let mut state = CompletionState::new(CompletionWorker::new(catalog.clone()), catalog, None);
+        let mut state = CompletionState::new(catalog, None);
         state.open_manual(
             (0..(COMPLETION_ITEMS_MAX + 10))
                 .map(|index| manual_item(format!("item-{index}")))
@@ -656,7 +681,6 @@ mod tests {
     fn slow_extensions_merge_after_catalog_without_blocking_first_paint() {
         let catalog = Catalog::builtin();
         let mut state = CompletionState::new(
-            CompletionWorker::new(catalog.clone()),
             catalog,
             Some(Box::new(SlowCompleter {
                 delay: Duration::from_millis(80),
@@ -683,7 +707,6 @@ mod tests {
     fn cancelled_slow_extension_results_never_repaint_a_newer_query() {
         let catalog = Catalog::builtin();
         let mut state = CompletionState::new(
-            CompletionWorker::new(catalog.clone()),
             catalog,
             Some(Box::new(SlowCompleter {
                 delay: Duration::from_millis(30),

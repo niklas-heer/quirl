@@ -626,6 +626,18 @@ fn execute_command_or_dialect_island(
     }
 }
 
+fn recovery_journal(
+    slot: &mut Option<recovery::RecoveryJournal>,
+) -> Result<&recovery::RecoveryJournal, ShellError> {
+    if slot.is_none() {
+        *slot = Some(recovery::RecoveryJournal::discover()?);
+    }
+    match slot {
+        Some(journal) => Ok(journal),
+        None => unreachable!("recovery journal was inserted above"),
+    }
+}
+
 /// Recognize a deliberately tiny, explicit bridge form. The body is passed verbatim to the
 /// selected interpreter; Quirl does not try to parse or reinterpret its dialect grammar.
 fn interactive_dialect_island(source: &str) -> Option<(ScriptLanguage, &str)> {
@@ -644,8 +656,15 @@ fn interactive_dialect_island(source: &str) -> Option<(ScriptLanguage, &str)> {
 }
 
 fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
-    begin_extension_session(&extensions);
-    emit_directory_snapshot(&extensions);
+    let catalog = Arc::new(catalog);
+    let runtime_extensions_present = extensions
+        .lock()
+        .map(|extensions| extensions.has_runtime_extensions())
+        .unwrap_or(false);
+    if runtime_extensions_present {
+        begin_extension_session(&extensions);
+        emit_directory_snapshot(&extensions);
+    }
     let mut observed_directory = std::env::current_dir().unwrap_or_default();
     let (mut active_config, mut applied_revision) = {
         let mut host = extensions.lock().map_err(|_| {
@@ -661,43 +680,60 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
     print_banner(&active_config);
     let mut mode = Mode::Command;
     let mut executor = NativeExecutor::default();
-    let recovery = recovery::RecoveryJournal::discover()?;
+    // Recovery snapshots are only needed once a native command is accepted.
+    // Environment capture can be deferred past the first interactive paint.
+    let mut recovery = None;
     let data = DataRuntime::with_process_host(sandboxed_process_host());
     // Script evaluation remains lazy; extension VMs load before the first editor view.
     let mut lua = None;
     let mut last_status = 0;
     let mut last_duration: Option<Duration> = None;
-    let prompt_context = PromptContextScheduler::default();
+    // The first prompt already renders the current directory from
+    // `QuirlPrompt::new`. Start Git/filesystem refresh after that prompt has
+    // returned so an idle worker thread is not on the cold-paint boundary.
+    let mut prompt_context: Option<PromptContextScheduler> = None;
+    let mut first_prompt = true;
 
     loop {
-        let current_directory = std::env::current_dir().unwrap_or_default();
-        if current_directory != observed_directory {
-            let mut annotations = BTreeMap::new();
-            apply_observation_actions(
-                notify_extensions(
-                    &extensions,
-                    ExtensionEventData::DirectoryChanged {
-                        previous: observed_directory.display().to_string(),
-                        current: current_directory.display().to_string(),
-                    },
-                ),
-                &mut annotations,
-            );
-            print_extension_annotations(&annotations);
-            observed_directory = current_directory;
+        if !first_prompt {
+            let current_directory = std::env::current_dir().unwrap_or_default();
+            if current_directory != observed_directory {
+                let mut annotations = BTreeMap::new();
+                apply_observation_actions(
+                    notify_extensions(
+                        &extensions,
+                        ExtensionEventData::DirectoryChanged {
+                            previous: observed_directory.display().to_string(),
+                            current: current_directory.display().to_string(),
+                        },
+                    ),
+                    &mut annotations,
+                );
+                print_extension_annotations(&annotations);
+                observed_directory = current_directory;
+            }
         }
         let (extension_segments, next_config) = extensions
             .lock()
             .map(|mut extensions| {
-                extensions.reload_if_changed();
+                // `active_config` and catalog composition already loaded and
+                // fingerprinted the first generation. Avoid repeating its
+                // bounded filesystem snapshot before the first paint.
+                if !first_prompt {
+                    extensions.reload_if_changed();
+                }
                 let revision = extensions.config_revision();
                 let next_config = (revision != applied_revision)
                     .then(|| (extensions.active_config().clone(), revision));
-                let segments: Vec<_> = extensions
-                    .named_prompt_segments(mode, last_status)
-                    .into_iter()
-                    .map(|segment| (segment.name, segment.value))
-                    .collect();
+                let segments: Vec<_> = if extensions.has_runtime_extensions() {
+                    extensions
+                        .named_prompt_segments(mode, last_status)
+                        .into_iter()
+                        .map(|segment| (segment.name, segment.value))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 (segments, next_config)
             })
             .unwrap_or_default();
@@ -716,16 +752,22 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
             .iter()
             .filter(|job| job.status != JobStatus::Done)
             .count();
-        let native_context = prompt_context.sample_current_dir();
         let mut prompt = QuirlPrompt::with_config(mode, &active_config)
-            .with_native_context(native_context.context)
             .with_status(last_status)
             .with_jobs(active_jobs)
             .with_named_extension_segments(extension_segments);
+        if let Some(scheduler) = &prompt_context {
+            prompt = prompt.with_native_context(scheduler.sample_current_dir().context);
+        }
         if let Some(duration) = last_duration {
             prompt = prompt.with_duration(duration);
         }
-        match line_editor.read_line(&prompt) {
+        let signal = line_editor.read_line(&prompt);
+        first_prompt = false;
+        if prompt_context.is_none() {
+            prompt_context = Some(PromptContextScheduler::default());
+        }
+        match signal {
             Ok(InteractiveSignal::Success(buffer)) => {
                 sync_history(&mut line_editor, &history_path)?;
                 match classify(mode, &buffer) {
@@ -739,12 +781,13 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
                         mode = mode.toggled();
                         print_mode_feedback(mode, &active_config);
                     }
-                    InteractiveLine::Help(topic) => print_help(&catalog, topic),
+                    InteractiveLine::Help(topic) => print_help(catalog.as_ref(), topic),
                     InteractiveLine::Command(command) => {
                         let started = Instant::now();
+                        let journal = recovery_journal(&mut recovery)?;
                         match execute_with_recovery(
                             &mut executor,
-                            &recovery,
+                            journal,
                             command,
                             Some(&extensions),
                             ExecutionOutputMode::Interactive,
@@ -1162,7 +1205,7 @@ impl SessionEditor {
 }
 
 fn configured_editor(
-    catalog: &Catalog,
+    catalog: &Arc<Catalog>,
     extensions: &Arc<Mutex<LuaExtensionHost>>,
     config: QuirlConfig,
     history_path: &Path,
@@ -1171,7 +1214,7 @@ fn configured_editor(
     let picker_ranker: Arc<dyn PickerRanker> = Arc::new(SharedPickerRanker);
     if select_surface(&config.ui.surface) == SurfaceKind::Rich {
         return RichSurface::new(
-            catalog.clone(),
+            Arc::clone(catalog),
             Some(Box::new(completion_adapter)),
             Arc::clone(&picker_ranker),
             &config,
@@ -1180,7 +1223,7 @@ fn configured_editor(
         .map(|editor| SessionEditor::Rich(Box::new(editor)));
     }
     editor_with_extensions_config_history_and_picker(
-        catalog.clone(),
+        catalog.as_ref().clone(),
         Some(Box::new(completion_adapter)),
         config,
         history_path.to_path_buf(),

@@ -63,7 +63,7 @@ pub struct InputAnalysis {
 /// The editor revision is the cache key. Filesystem discovery runs on a bounded
 /// worker and only publishes complete snapshots, so a keystroke never scans PATH.
 pub struct InputAnalyzer {
-    catalog: Catalog,
+    catalog: Arc<Catalog>,
     path_commands: PathCommandCache,
     cached_revision: Option<u64>,
     cached_mode: Mode,
@@ -72,10 +72,10 @@ pub struct InputAnalyzer {
 }
 
 impl InputAnalyzer {
-    pub fn new(catalog: Catalog) -> Self {
+    pub fn new(catalog: impl Into<Arc<Catalog>>) -> Self {
         Self {
-            catalog,
-            path_commands: PathCommandCache::new(env::var_os("PATH")),
+            catalog: catalog.into(),
+            path_commands: PathCommandCache::dormant(),
             cached_revision: None,
             cached_mode: Mode::Command,
             current: InputAnalysis::default(),
@@ -143,6 +143,8 @@ struct PathSnapshot {
 
 struct PathCommandCache {
     requests: Option<SyncSender<PathScanRequest>>,
+    request_receiver: Option<Receiver<PathScanRequest>>,
+    response_sender: Option<SyncSender<PathScanResponse>>,
     responses: Receiver<PathScanResponse>,
     worker: Option<JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
@@ -153,12 +155,43 @@ struct PathCommandCache {
 }
 
 impl PathCommandCache {
-    fn new(path: Option<OsString>) -> Self {
+    fn dormant() -> Self {
         let (request_sender, request_receiver) = mpsc::sync_channel::<PathScanRequest>(1);
         let (response_sender, responses) = mpsc::sync_channel::<PathScanResponse>(2);
         let cancel = Arc::new(AtomicBool::new(false));
-        let worker_cancel = Arc::clone(&cancel);
-        let worker = thread::spawn(move || {
+        Self {
+            requests: Some(request_sender),
+            request_receiver: Some(request_receiver),
+            response_sender: Some(response_sender),
+            responses,
+            worker: None,
+            cancel,
+            generation: 0,
+            requested_path: None,
+            commands: HashSet::new(),
+            ready: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn new(path: Option<OsString>) -> Self {
+        let mut cache = Self::dormant();
+        cache.request(path);
+        cache
+    }
+
+    fn start_worker(&mut self) {
+        if self.worker.is_some() {
+            return;
+        }
+        let Some(request_receiver) = self.request_receiver.take() else {
+            return;
+        };
+        let Some(response_sender) = self.response_sender.take() else {
+            return;
+        };
+        let worker_cancel = Arc::clone(&self.cancel);
+        self.worker = Some(thread::spawn(move || {
             while let Ok(mut request) = request_receiver.recv() {
                 if worker_cancel.load(Ordering::Acquire) {
                     return;
@@ -178,19 +211,7 @@ impl PathCommandCache {
                     return;
                 }
             }
-        });
-        let mut cache = Self {
-            requests: Some(request_sender),
-            responses,
-            worker: Some(worker),
-            cancel,
-            generation: 0,
-            requested_path: None,
-            commands: HashSet::new(),
-            ready: false,
-        };
-        cache.request(path);
-        cache
+        }));
     }
 
     fn request_if_changed(&mut self, path: Option<OsString>) {
@@ -200,6 +221,7 @@ impl PathCommandCache {
     }
 
     fn request(&mut self, path: Option<OsString>) {
+        self.start_worker();
         let generation = self.generation.saturating_add(1);
         if let Some(requests) = &self.requests {
             match requests.try_send(PathScanRequest {
@@ -528,6 +550,14 @@ mod tests {
             diagnostic_for(&catalog, &path_commands, input, Mode::Command, &spans).unwrap();
         assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
         assert!(diagnostic.message.contains("did you mean `git`"));
+    }
+
+    #[test]
+    fn path_worker_stays_dormant_until_prompt_preparation() {
+        let mut analyzer = InputAnalyzer::new(Catalog::builtin());
+        assert!(analyzer.path_commands.worker.is_none());
+        analyzer.prepare_prompt();
+        assert!(analyzer.path_commands.worker.is_some());
     }
 
     #[test]

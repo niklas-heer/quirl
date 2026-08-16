@@ -234,6 +234,10 @@ impl LuaExtensionHost {
         self.revision
     }
 
+    pub fn has_runtime_extensions(&self) -> bool {
+        !self.plugin_runtimes.is_empty()
+    }
+
     /// Render segments while retaining their registration names for config-driven
     /// ordering by the REPL/UI layer.
     pub fn named_prompt_segments(

@@ -21,8 +21,7 @@ use self::{
     theme::Theme,
 };
 use super::{
-    CompletionWorker, ExtensionCompleter, PickerRanker, QuirlPrompt, SurfaceSymbols,
-    MODE_TOGGLE_HOST_COMMAND,
+    ExtensionCompleter, PickerRanker, QuirlPrompt, SurfaceSymbols, MODE_TOGGLE_HOST_COMMAND,
 };
 use crossterm::{
     cursor::{SetCursorStyle, Show},
@@ -70,7 +69,7 @@ pub enum InteractiveSignal {
 }
 
 pub struct RichSurface {
-    catalog: Catalog,
+    catalog: Arc<Catalog>,
     completion: CompletionState,
     picker: PickerOverlay,
     picker_layout: PickerLayout,
@@ -94,20 +93,16 @@ pub struct RichSurface {
 
 impl RichSurface {
     pub fn new(
-        catalog: Catalog,
+        catalog: Arc<Catalog>,
         extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
         picker_ranker: Arc<dyn PickerRanker>,
         config: &QuirlConfig,
         history_path: PathBuf,
     ) -> Result<Self, ShellError> {
         let history = read_history(&history_path);
-        let input_analysis = InputAnalyzer::new(catalog.clone());
+        let input_analysis = InputAnalyzer::new(Arc::clone(&catalog));
         Ok(Self {
-            completion: CompletionState::new(
-                CompletionWorker::new(catalog.clone()),
-                catalog.clone(),
-                extension_completer,
-            ),
+            completion: CompletionState::new(Arc::clone(&catalog), extension_completer),
             picker: PickerOverlay::new(picker_ranker),
             picker_layout: PickerLayout::from_config(&config.picker.layout),
             picker_preview: config.picker.preview,
@@ -134,9 +129,6 @@ impl RichSurface {
         self.dismiss_picker();
         self.expand_completion_pending = false;
         let mut editor = EditorState::new(&self.keymap, self.history.clone());
-        if self.semantic_hints {
-            self.input_analysis.prepare_prompt();
-        }
         self.terminal.enter()?;
         let symbols = prompt.surface_symbols();
         let unicode = symbols.uses_unicode();
@@ -145,6 +137,7 @@ impl RichSurface {
             && !env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb"));
         let theme = Theme::new(color);
         let mut dirty = true;
+        let mut prompt_prepared = false;
 
         loop {
             if dirty {
@@ -213,6 +206,13 @@ impl RichSurface {
                 continue;
             }
             let input_event = event::read().map_err(terminal_error("read terminal input"))?;
+            if self.semantic_hints && !prompt_prepared {
+                // The empty first frame cannot use PATH discovery. Start the
+                // bounded worker when input first arrives, then publish only a
+                // complete snapshot on a later loop turn.
+                self.input_analysis.prepare_prompt();
+                prompt_prepared = true;
+            }
             dirty = true;
             match input_event {
                 Event::Paste(text) => {
