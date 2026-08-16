@@ -20,7 +20,10 @@ use std::{
     hash::{Hash, Hasher},
     io::Read,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
 };
 
@@ -103,6 +106,7 @@ enum PluginSource {
 #[derive(Debug, Clone)]
 struct PluginCandidate {
     path: PathBuf,
+    runtime: PluginRuntime,
     grants: Vec<String>,
     catalog_commands: Vec<CommandSpec>,
 }
@@ -174,7 +178,16 @@ impl LuaExtensionHost {
     /// reports one error and leaves the complete last-known-good generation live
     /// until its content changes again.
     pub fn reload_if_changed(&mut self) -> ExtensionReloadState {
-        let snapshot = self.snapshot_sources();
+        self.reload_if_changed_with_cancellation(&AtomicBool::new(false))
+    }
+
+    /// Poll source files and atomically install a generation unless the caller
+    /// cancels a potentially process-backed adapter handshake.
+    pub fn reload_if_changed_with_cancellation(
+        &mut self,
+        cancellation: &AtomicBool,
+    ) -> ExtensionReloadState {
+        let snapshot = self.snapshot_sources(cancellation);
         if self.observed_fingerprint.as_ref() == Some(&snapshot.fingerprint) {
             return ExtensionReloadState::Unchanged;
         }
@@ -495,7 +508,7 @@ impl LuaExtensionHost {
         }
     }
 
-    fn snapshot_sources(&self) -> SourceSnapshot {
+    fn snapshot_sources(&self, cancellation: &AtomicBool) -> SourceSnapshot {
         let mut errors = Vec::new();
         let (config, config_fingerprint) = match &self.config_path {
             Some(path) => match fingerprint_file(path) {
@@ -562,7 +575,9 @@ impl LuaExtensionHost {
                     )
                 }
             },
-            PluginSource::Managed(root) => snapshot_managed_plugins(root, &mut errors),
+            PluginSource::Managed(root) => {
+                snapshot_managed_plugins(root, &mut errors, cancellation)
+            }
         };
 
         SourceSnapshot {
@@ -594,11 +609,13 @@ impl LuaExtensionHost {
         let mut contributions = Vec::new();
         let mut managed_commands = Vec::new();
         for plugin in &snapshot.plugins {
-            let runtime = LuaRuntime::new_with_capabilities(LuaPolicy::config(), &plugin.grants)?;
-            let registrations = runtime.load_plugin_file(&plugin.path)?;
-            contributions.extend(registrations.contributions);
             managed_commands.extend(plugin.catalog_commands.clone());
-            plugin_runtimes.push(runtime);
+            if plugin.runtime == PluginRuntime::TrustedLua {
+                let runtime = crate::plugin::trusted_lua_runtime(&plugin.grants)?;
+                let registrations = runtime.load_plugin_file(&plugin.path)?;
+                contributions.extend(registrations.contributions);
+                plugin_runtimes.push(runtime);
+            }
         }
         validate_contribution_set(&contributions)?;
         Ok((
@@ -697,6 +714,7 @@ fn snapshot_legacy_plugin_paths(
             .cloned()
             .map(|path| PluginCandidate {
                 path,
+                runtime: PluginRuntime::TrustedLua,
                 grants: grants.clone(),
                 catalog_commands: Vec::new(),
             })
@@ -708,6 +726,7 @@ fn snapshot_legacy_plugin_paths(
 fn snapshot_managed_plugins(
     root: &Path,
     errors: &mut Vec<ShellError>,
+    cancellation: &AtomicBool,
 ) -> (Vec<PluginCandidate>, PluginFingerprint) {
     let lock_path = root.join(PLUGIN_LOCK_FILE);
     let mut fingerprints = vec![(
@@ -746,7 +765,17 @@ fn snapshot_managed_plugins(
 
     let mut candidates = Vec::new();
     for locked in lock.plugins.iter().filter(|plugin| plugin.enabled) {
-        match managed_plugin_candidate(locked, &mut fingerprints) {
+        if cancellation.load(Ordering::Relaxed) {
+            errors.push(
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "managed plugin reload was cancelled",
+                )
+                .with_help("Retry extension reload when cancellation is no longer requested"),
+            );
+            break;
+        }
+        match managed_plugin_candidate_with_cancellation(locked, &mut fingerprints, cancellation) {
             Ok(candidate) => candidates.push(candidate),
             Err(error) => errors.push(error),
         }
@@ -755,19 +784,28 @@ fn snapshot_managed_plugins(
     (candidates, PluginFingerprint::Files(fingerprints))
 }
 
+#[cfg(test)]
 fn managed_plugin_candidate(
     locked: &LockedPlugin,
     fingerprints: &mut Vec<(PathBuf, FileFingerprint)>,
 ) -> Result<PluginCandidate, ShellError> {
-    if locked.runtime != PluginRuntime::TrustedLua {
+    managed_plugin_candidate_with_cancellation(locked, fingerprints, &AtomicBool::new(false))
+}
+
+fn managed_plugin_candidate_with_cancellation(
+    locked: &LockedPlugin,
+    fingerprints: &mut Vec<(PathBuf, FileFingerprint)>,
+    cancellation: &AtomicBool,
+) -> Result<PluginCandidate, ShellError> {
+    if locked.runtime == PluginRuntime::WasmComponent {
         return Err(ShellError::new(
             ErrorCode::Validation,
             format!(
-                "enabled plugin `{}` has no executable runtime adapter",
+                "enabled plugin `{}` has no executable Wasm component runtime",
                 locked.name
             ),
         )
-        .with_help("Disable it until its Wasm or out-of-process adapter is installed"));
+        .with_help("Disable it until a component runtime is installed"));
     }
     let manifest_path = managed_manifest_path(&locked.source)?;
     fingerprints.push((manifest_path.clone(), fingerprint_file(&manifest_path)?));
@@ -845,10 +883,19 @@ fn managed_plugin_candidate(
         .with_help("Run `quirl plugin doctor` and restore the locked source before activation"));
     }
     validate_plugin_manifest(&manifest, &entry_bytes, env!("CARGO_PKG_VERSION"))?;
+    if locked.runtime == PluginRuntime::OutOfProcess {
+        crate::plugin::execute_out_of_process_adapter(
+            &manifest,
+            &entry_path,
+            &locked.granted_capabilities,
+            Some(cancellation),
+        )?;
+    }
     let catalog_commands =
         normalize_plugin_commands(&manifest, &locked.source, &locked.source_checksum)?;
     Ok(PluginCandidate {
         path: entry_path,
+        runtime: locked.runtime,
         grants: locked.granted_capabilities.clone(),
         catalog_commands,
     })
@@ -1277,6 +1324,25 @@ error_codes = { "0" = "success" }
             .iter()
             .any(|context| context.contains("capability denied: prompt.register"))));
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn managed_reload_observes_cancellation_before_starting_plugin_activation() {
+        let directory = temporary_extension_directory();
+        let root = directory.join("managed-state");
+        let (_manifest, enabled) = write_managed_prompt_plugin(&directory);
+        write_managed_lock(&root, &enabled);
+        let mut host = LuaExtensionHost::from_managed_root(None, root);
+        let cancelled = AtomicBool::new(true);
+
+        assert_eq!(
+            host.reload_if_changed_with_cancellation(&cancelled),
+            ExtensionReloadState::Rejected
+        );
+        assert!(host.take_errors().iter().any(|error| error
+            .message
+            .contains("managed plugin reload was cancelled")));
         fs::remove_dir_all(directory).unwrap();
     }
 

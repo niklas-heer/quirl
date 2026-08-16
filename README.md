@@ -74,7 +74,8 @@ as smart as your editor.
 - **Generated everything** — LuaLS-compatible stubs, Markdown docs, and
   versioned JSON metadata are generated from the same Rust host definitions that power the
   runtime, so the SDK, editor completions, and AI context never drift apart.
-- **Built-in language service** — `quirl lsp` gives Lua and `.quirl` files
+- **Built-in language service** — `quirl lsp` gives Lua and native Quirl (`.qrl`,
+  with `.quirl` and `.🌀` input aliases) files
   deterministic diagnostics, completion, hover, signatures, and generated
   module docs over stdio without evaluating the document.
 - **Explicit agent and package contracts** — versioned deny-unknown JSON,
@@ -122,8 +123,11 @@ protocols, reference-shell runners, panels, bounded watch history, recovery,
 and portable process backend work end to end. Public contract identities and
 migrations are reviewed in one golden manifest; compatibility, release
 performance, security, and accessibility evidence runs under the local gate.
-Isolated Wasm/out-of-process adapters are validated but deliberately cannot be
-enabled yet, so this checkpoint is not tagged as the 1.0 daily-driver contract.
+Wasm components remain validation-only. Checksummed out-of-process adapters now
+execute a narrow, versioned initialization handshake with exact launch grants,
+deadlines, output bounds, and process-tree containment. This checkpoint is not
+tagged as the 1.0 daily-driver contract while native Windows terminal evidence,
+the remaining compatibility surface, and current release measurements are open.
 The architecture and decisions behind it are documented in depth:
 
 - [Language & product design](docs/language-design.md) — the intended
@@ -181,16 +185,21 @@ runtime dependencies have been removed.
 - [x] Durable, searchable command history with the shared typed Ctrl-R picker.
 - [x] A shared typed picker spanning history, files, palette actions, jobs, and data.
 - [x] Named end-to-end PTY performance measurements with misses recorded.
-- [x] Deterministic Lua/`.quirl` run, format, check, lint, test, documentation,
+- [x] Deterministic Lua/native-Quirl (`.qrl`) run, format, check, lint, test, documentation,
   language-service, package, and agent-contract tooling.
 - [x] Permission-locked trusted-Lua plugins, typed events/actions, catalog,
   completion and panel contributions, and validated isolated-runtime boundaries.
 - [x] Bash/Zsh reference runners, bounded directory/process views and watch
   history, versioned recovery, and a contract-tested Windows process backend.
 - [x] Reviewed protocol identities and migrations, real Bash/Zsh differential
-  fixtures, terminal-safety and accessibility audits, and named 1.0 performance gates.
-- [ ] Executing isolated adapters, native Windows terminal validation, and the
-  explicitly deferred C1/C2 and asynchronous picker/completion contracts.
+  fixtures, terminal-safety and accessibility audits, and a reproducible named
+  1.0 performance-gate harness.
+- [ ] Refresh the named 1.0 performance record for the current `panic=unwind`
+  release profile.
+- [x] Executing isolated process adapters and versioned asynchronous
+  picker/completion request, cancellation, deadline, and stale-result contracts.
+- [ ] Native Windows terminal validation and the explicitly deferred native
+  compatibility forms.
 
 ## Quick start
 
@@ -227,7 +236,8 @@ shortcuts and textual mode commands remain usable without color.
 
 ```console
 cargo run -p quirl-cli -- run examples/hello.lua Codex
-cargo run -p quirl-cli -- new automation --lang lua
+cargo run -p quirl-cli -- new script
+cargo run -p quirl-cli -- new script --lang quirl
 cargo run -p quirl-cli -- check . --format json
 cargo run -p quirl-cli -- fmt . --check
 cargo run -p quirl-cli -- test
@@ -270,9 +280,10 @@ flag on `index build`, use `quirl index build -h` for that subcommand's usage.
 
 `quirl lsp` speaks standard LSP `Content-Length` framing over stdin/stdout.
 Lua editor intelligence is generated from the same `HOST_API` as the runtime;
-`.quirl` command intelligence is generated from the loaded semantic catalog.
+Native Quirl command intelligence is generated from the loaded semantic catalog.
+`.qrl` is the canonical extension; `.quirl` and `.🌀` are accepted input aliases.
 The server compiles and lints Lua but never invokes the compiled chunk or
-executes `.quirl` commands. See the [language-service protocol and editor
+executes native Quirl commands. See the [language-service protocol and editor
 contract](docs/language-service.md).
 
 The main benchmark accepts an official Fennel single-file library with
@@ -330,15 +341,29 @@ cargo run -p quirl-cli -- config check examples/config.lua
 cargo run -p quirl-cli -- config get examples/config.lua editor.keymap
 cargo run -p quirl-cli -- config set examples/config.lua picker.preview false
 cargo run -p quirl-cli -- config tui examples/config.lua
+cargo run -p quirl-cli -- config web examples/config.lua
+cargo run -p quirl-cli -- config fmt examples/config.lua --check
+cargo run -p quirl-cli -- config export examples/config.lua --format json
+cargo run -p quirl-cli -- config diff personal.lua work.lua
+cargo run -p quirl-cli -- config migrate examples/config.lua --dry-run
+cargo run -p quirl-cli -- config doctor examples/config.lua
 ```
 
-`config set` patches only recognized literal fields under `editor` and
-`picker`, preserves surrounding Lua source, validates the complete candidate
-before activation, replaces the file atomically, and retains the prior source
-as `config.lua.bak`. Values controlled by Lua expressions must be edited in
-code. The synchronized local web configuration view described in the design is
-still future work; `config tui` is an honest accessible text view, not a fake
-browser UI.
+`config set` and `config web` patch only recognized literal fields under
+`editor`, `picker`, and `prompt`, preserve surrounding Lua source, validate
+the complete candidate before activation, replace the file atomically, and
+retain the prior source as `config.lua.bak`. Values controlled by Lua
+expressions must be edited in code. `config web` binds only to `127.0.0.1`,
+prints a private tokenized URL, sends no-cache headers, bounds requests and
+read time, merges non-overlapping external edits, and rejects stale or
+conflicting source changes instead of silently overwriting them. Use `--port 8787` to choose a loopback port; the
+default selects one automatically.
+
+`config export`, `diff`, and `doctor` read only the authoritative Lua source
+and offer deterministic terminal-safe text or JSON where applicable. `config
+migrate` is deliberately preview-only in 0.1.0 and requires `--dry-run`; it
+never rewrites a configuration. `config fmt` writes only when explicitly
+invoked without `--check`.
 
 ## Workspace
 

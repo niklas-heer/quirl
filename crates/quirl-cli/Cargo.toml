@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+getrandom.workspace = true
 quirl-catalog = { path = "../quirl-catalog" }
 quirl-contract = { path = "../quirl-contract" }
 quirl-core = { path = "../quirl-core" }

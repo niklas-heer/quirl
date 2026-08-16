@@ -31,6 +31,7 @@ graph BT
     lsp["quirl-lsp"] --> core
     lsp --> catalog
     lsp --> lua["quirl-lua"]
+    lsp --> syntax["quirl-syntax"]
     cli["quirl-cli"] --> contract
     cli --> lsp
 ```
@@ -42,10 +43,12 @@ this keeps `quirl-contract` independent of `quirl-lua` and prevents a reverse
 edge into the runtime.
 
 `quirl-lsp` owns deterministic protocol framing and state, generated metadata
-projections, and structural `.quirl` diagnostics. It may call the public
+projections, and structural native Quirl diagnostics (`.qrl` canonical, with
+`.quirl` and `.🌀` accepted aliases). It may call the public
 `LuaRuntime::check_source` path, which parses and validates without evaluating
-document text. It does not depend on `quirl-ui`, `quirl-cli`, `quirl-process`,
-`quirl-data`, or `quirl-syntax`.
+document text, and reuses `quirl-syntax` for the same structural native Quirl
+diagnostics as the CLI. It does not depend on `quirl-ui`, `quirl-cli`,
+`quirl-process`, or `quirl-data`.
 
 `quirl-cli` remains the sole composition root. It supplies the installed
 catalog and host definitions, performs requested filesystem I/O, selects text

@@ -30,8 +30,8 @@ graph BT
 
 `quirl-plugin` owns versioned deny-unknown plugin and lockfile values,
 cryptographic source checksums, requested/granted permission diffs, pure
-copy-on-validate state transitions, doctor reports, and non-executing Wasm
-component/out-of-process boundary validation. It does not read or write files,
+copy-on-validate state transitions, doctor reports, and Wasm component/process
+adapter boundary validation. It does not read or write files,
 fetch sources, execute adapters, render UI, or construct language runtimes.
 
 The CLI remains the composition root. It resolves explicitly supplied local
@@ -47,19 +47,18 @@ manifests or lockfiles. No native Rust plugin ABI is introduced.
 The Wasm boundary uses `wasmparser` to validate the complete component and its
 exact WIT host import/guest export, binds the checked-in world hash into lock
 schema v2, and checks non-zero memory/fuel/deadline budgets without executing
-code. Non-executing runtimes cannot be enabled. The out-of-process boundary
-similarly validates a relative executable,
-protocol version, message limit, and deadline. A future engine or adapter
-process requires a separate ADR covering WIT, resource enforcement, and
-crash/cancellation behavior.
+code. Wasm components cannot be enabled. The out-of-process boundary validates
+a relative checksummed executable, protocol version, exact scoped launch grant,
+message limit, and deadline. ADR 0009 defines its executing v1 handshake,
+resource enforcement, and crash/cancellation behavior.
 
 ## Consequences
 
 - Permission escalation and source tampering are rejected before activation.
 - State transitions can be validated completely before the CLI replaces the
   current lockfile; failed candidates preserve the last-known-good state.
-- Wasm and process isolation remain honest, stable adapter contracts rather
-  than simulated execution.
+- Wasm remains a validated, non-executing boundary; process adapters have a
+  deliberately narrow executing handshake without a stable host callback ABI.
 - SHA-256 is an intentional new dependency for supply-chain integrity;
   FNV-based schema fingerprints remain identity checks, not authenticity.
 - Phase 3 panels, live pipelines, reference-shell runners, and Windows job

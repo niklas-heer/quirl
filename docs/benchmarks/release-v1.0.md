@@ -1,16 +1,28 @@
-# 1.0 release performance record
+# 0.1.0 release performance record
 
-**Measured:** 15 August 2026 at 21:49:13 UTC
-**Source state:** uncommitted Phase 4 worktree based on
-`0607b7f0d2ce76380c9e5e455906aa8ebb029751`
-**Release gate:** **passed — three independent 101-sample enforcing gates within target**
+**Measured:** 16 August 2026 at 00:49:55 UTC
 
-This is a release-build record from the named machine below. The harness runs
-the actual Quirl binary in a fresh pseudo-terminal for each end-to-end sample.
-It reconstructs terminal frames from the PTY byte stream; it does not claim
-terminal-emulator scheduling, GPU composition, or monitor-scanout latency.
+**Source:** `c5a8d757a35a92a9a269686a1cd166c5a486e2b3` (clean)
 
-## Reference machine
+**Artifact SHA-256:** `12989bce23eccda4330cd815f5b234fb7c59e5c5cc23f5f93987592af3f0341e`
+
+**Release gate:** **passed all release budgets**
+
+This record measures the exact `quirl 0.1.0` artifact named above. Report
+schema v5 rejects tracked or untracked source changes, requires an independently
+supplied SHA-256, copies the artifact into a private read-only staging directory,
+and verifies the staged copy before any execution. It also verifies the
+artifact's embedded source revision, profile, optimization level, panic
+strategy, operating system, and architecture. The report therefore does not
+trust the artifact's self-description as its identity and uses one read-only
+staged copy for metadata, timing, and size measurements.
+
+The harness runs the actual Quirl binary in a fresh pseudo-terminal for each
+end-to-end sample and reconstructs terminal frames from the PTY byte stream.
+It does not claim terminal-emulator scheduling, GPU composition, or physical
+monitor-scanout latency.
+
+## Reference machine and artifact
 
 | Field | Value |
 | --- | --- |
@@ -18,8 +30,8 @@ terminal-emulator scheduling, GPU composition, or monitor-scanout latency.
 | Platform | macOS 15.7.9 (24G830), `aarch64` |
 | Rust | `rustc 1.88.0 (6b00bc388 2025-06-23)`, LLVM 20.1.5 |
 | Cargo | `cargo 1.88.0 (873a06493 2025-05-10)` |
-| Build | Cargo `release`; fat LTO; one codegen unit; symbols stripped; `panic=abort` |
-| Quirl | `quirl 0.1.0`, 4,718,960-byte executable |
+| Build | Cargo `release`; `opt-level=z`; fat LTO; one codegen unit; symbols stripped; `panic=unwind` |
+| Quirl | `quirl 0.1.0`, 3,861,808-byte executable |
 | PTY | 120 columns × 40 rows, `TERM=xterm-256color`, truecolor advertised |
 
 The machine was not isolated. CPU frequency, thermal state, scheduler load,
@@ -27,61 +39,28 @@ and filesystem cache state were not controlled.
 
 ## End-to-end release budgets
 
-Times are wall-clock milliseconds. Enforcing release gates use nearest rank
-across 101 independent fresh processes; every sample completed before the
-2,000 ms phase timeout.
+Times are wall-clock milliseconds. The enforcing gate uses nearest rank over
+101 independent fresh processes; all samples completed before the 2,000 ms
+phase timeout.
 
 | Measurement | Valid samples | P50 | P95 | Target | Outcome |
 | --- | ---: | ---: | ---: | --- | --- |
-| Process start to editable prompt | 101/101 | 12.152 | 15.081 | P50 ≤25 ms | **Within** |
-| Final keystroke to corresponding frame | 101/101 | 0.125 | 0.161 | P95 ≤8 ms | **Within** |
-| Process start to first prompt frame | 101/101 | 11.995 | 14.876 | ≤16 ms | **Within (conservative P95)** |
-| Release executable size | — | 4,718,960 bytes | — | ≤5,242,880 bytes | **Within: 523,920 bytes headroom** |
+| Process start to editable prompt | 101/101 | 12.093 | 13.323 | P50 ≤25 ms | **Within** |
+| Final keystroke to corresponding frame | 101/101 | 0.187 | 0.237 | P95 ≤8 ms | **Within** |
+| Process start to first prompt frame | 101/101 | 11.936 | 13.145 | ≤16 ms | **Within (conservative P95)** |
+| Release executable size | — | 3,861,808 bytes | — | ≤5,242,880 bytes | **Within: 1,381,072 bytes headroom** |
 
-The language specification leaves the first-prompt percentile unspecified.
-The gate uses P95 conservatively rather than treating the P50 as sufficient.
-The 5 MiB binary budget is a Phase 4 release-tool default; it may be overridden
-explicitly for another frozen release budget.
-
-The release profile now uses `panic = "abort"`, `codegen-units = 1`, fat LTO,
-and stripped symbols. Together those settings reduce the executable from the
-earlier 7.4 MB measurement to 4,718,960 bytes. They substantially increase
-clean release-build time; the runtime figures above are measured rather than
-inferred from the smaller artifact.
-
-## Repeat stability audit
-
-The interactive composition path now discovers and loads the extension host
-once, reusing that host to build the catalog and start the REPL. This removes a
-duplicate source scan before the first prompt. The enforcing release default is
-101 independent PTY sessions: nearest-rank P95 is rank 96, rather than rank 30
-of 31, so it does not let a single scheduler outlier determine the tail.
-`preview` retains its 31-session diagnostic default, and `--pty-samples`
-remains an explicit override for either mode.
-
-Three independent, sequential 101-sample enforcing gates passed. Their
-first-prompt P95 values were 15.195, 14.500, and 14.876 ms; cold-start P50,
-keystroke P95, bounded-stream evidence, and binary size passed on every run.
-Earlier 31-sample diagnostic runs exposed occasional scheduler-tail misses.
-The target remains 16 ms P95; increasing the independent sample count makes
-the estimate steadier without changing the threshold. The machine remained
-non-isolated, so these figures are named-hardware evidence rather than a
-cross-machine guarantee.
-
-The readiness probe writes a single character after the first prompt rather
-than a multi-key marker, and it fails the sample if that character or the
-later `git commit --amend` text is already on screen. This measures the
-required editable state without accidentally measuring Reedline's intentional
-multi-event paste coalescing. The earlier 100+ ms readiness reading was
-therefore a probe artifact, not evidence that a single newly painted prompt
-cannot accept input.
+The language specification leaves the first-prompt percentile unspecified, so
+the gate conservatively enforces P95. The 5 MiB binary limit is the frozen
+release-tool default. `opt-level=z` reduces the complete artifact below that
+limit while the measured interactive timings retain substantial headroom.
 
 ## Stream retention evidence
 
 `LiveBuffer` received 100,000 bounded typed samples at each supported window
 capacity. Retained samples equal `min(input, capacity)` and dropped samples
-equal `input - capacity`; this demonstrates O(window) **sample retention**. It
-is not an RSS, allocator, record-size, or producer-backpressure claim.
+equal `input - capacity`; this demonstrates O(window) sample retention. It is
+not an RSS, allocator, record-size, or producer-backpressure claim.
 
 | Window capacity | Retained | Dropped | Serialized snapshot bytes |
 | ---: | ---: | ---: | ---: |
@@ -91,26 +70,34 @@ is not an RSS, allocator, record-size, or producer-backpressure claim.
 
 ## Supplementary diagnostics
 
-These probes are recorded for diagnosis and cannot satisfy an end-to-end
-release gate.
+These probes are diagnostic only and cannot satisfy an end-to-end release
+gate.
 
 | Probe | Samples | P50 | P95 | Scope |
 | --- | ---: | ---: | ---: | --- |
-| `quirl --version` subprocess | 31 | 2.824 ms | 4.487 ms | Process/loading/argument lower bound |
-| Completion, semantic-highlight proxy, prompt render | 2,000 | 0.0119 ms | 0.0135 ms | Headless CPU only |
-| Fresh prompt construction and render | 500 | 0.0067 ms | 0.0070 ms | Headless CPU only |
+| `quirl --version` subprocess | 31 | 3.571 ms | 5.325 ms | Process/loading/argument lower bound |
+| Completion, semantic-highlight proxy, prompt render | 2,000 | 0.0170 ms | 0.0214 ms | Headless CPU only |
+| Fresh prompt construction and render | 500 | 0.0072 ms | 0.0100 ms | Headless CPU only |
 
 ## Reproduce
 
 ```sh
 cargo build --release -p quirl-cli -p quirl-bench
+shasum -a 256 target/release/quirl
+# Copy the independently recorded digest; do not derive it from the binary's
+# self-reported metadata.
+QUIRL_EXPECTED_SHA256=<64-hex-digit-digest>
 target/release/quirl-bench release \
   --quirl target/release/quirl \
+  --expected-sha256 "$QUIRL_EXPECTED_SHA256" \
   --json
 ```
 
 `release` exits non-zero when any release budget misses, while still emitting
-the complete JSON evidence. `preview` emits the same report without enforcing
-the final pass/fail exit status. `release` defaults to 101 PTY samples;
-`preview` defaults to 31. Both use 31 version samples, 2,000 headless edit
-samples, 500 prompt samples, and 100,000 stream samples for each tested window.
+the complete JSON evidence. It requires the independently recorded SHA-256,
+copies the supplied binary into a private read-only staging directory, verifies
+the copy before executing it, and uses only that staged copy throughout the
+run. `preview` emits the same schema without enforcing the final exit status or
+requiring a digest. The release run defaults to 101 PTY samples; preview uses
+31. Both use 31 version samples, 2,000 headless edit samples, 500 prompt samples,
+and 100,000 stream samples for every tested window.

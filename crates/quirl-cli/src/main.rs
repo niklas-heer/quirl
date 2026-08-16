@@ -4,6 +4,7 @@ mod config;
 mod extensions;
 mod index;
 mod lsp;
+mod mcp;
 mod package;
 mod pick;
 mod platform;
@@ -18,6 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use config::ConfigCommand;
 use extensions::{LuaCompletionAdapter, LuaExtensionHost};
 use index::IndexCommand;
+use mcp::ServeCommand;
 use package::PackageCommand;
 use pick::PickCommand;
 use platform::{EventsCommand, ViewCommand, WatchCommand};
@@ -27,11 +29,11 @@ use quirl_core::{
     escape_json_terminal_controls, escape_terminal_controls, reject_terminal_controls,
     CommandOutcome, ErrorCode, ExtensionAction, ExtensionEventData, OutputStream, ShellError,
 };
-use quirl_data::DataRuntime;
+use quirl_data::{DataRenderFormat, DataRuntime};
 use quirl_lua::{
     sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig, MAX_LUA_SOURCE_BYTES,
 };
-use quirl_process::{JobStatus, NativeExecutor};
+use quirl_process::{sandboxed_process_host, JobStatus, NativeExecutor};
 use quirl_syntax::{classify, InteractiveLine, Mode};
 use quirl_ui::{
     editor_with_extensions_config_and_history, history_path, render_error, PromptContextScheduler,
@@ -45,13 +47,16 @@ use std::{
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc, Mutex},
     time::{Duration, Instant},
 };
 
 #[derive(Debug, Parser)]
 #[command(name = "quirl", version, about = "Everything you need, mixed in")]
 struct Cli {
+    /// Emit machine-readable metadata for release tooling.
+    #[arg(long, hide = true)]
+    build_info: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -75,8 +80,13 @@ enum Command {
     /// Evaluate Lua and print the returned value.
     Eval { expression: String },
     /// Evaluate a native structured-data expression or pipeline.
-    Data { expression: String },
-    /// Validate a Lua/.quirl file or directory without executing source.
+    Data {
+        expression: String,
+        /// Select a human table/plain renderer or the explicit machine envelope.
+        #[arg(long, value_enum, default_value_t = DataOutputFormat::Table)]
+        format: DataOutputFormat,
+    },
+    /// Validate Lua or native Quirl (.qrl, .quirl, .🌀) scripts without executing source.
     Check {
         /// Script file or recursively discovered directory.
         #[arg(value_name = "PATH")]
@@ -86,13 +96,13 @@ enum Command {
     },
     /// Deterministically format Lua files under a file or directory path.
     Fmt {
-        /// Lua/.quirl file or recursively discovered directory; .quirl is unchanged.
+        /// Lua or native Quirl script/directory; native source is unchanged.
         #[arg(value_name = "PATH")]
         file: PathBuf,
         #[arg(long)]
         check: bool,
     },
-    /// Lint Lua/.quirl files under a file or directory without execution.
+    /// Lint Lua or native Quirl (.qrl, .quirl, .🌀) scripts without execution.
     Lint {
         /// Script file or recursively discovered directory.
         #[arg(value_name = "PATH")]
@@ -146,8 +156,13 @@ enum Command {
         #[command(flatten)]
         command: DocCommand,
     },
-    /// Serve deterministic Lua and .quirl editor intelligence over stdio LSP.
+    /// Serve deterministic Lua and native Quirl (.qrl, .quirl, .🌀) intelligence over stdio LSP.
     Lsp,
+    /// Serve explicitly granted Quirl tooling to MCP clients over bounded stdio JSON-RPC.
+    Serve {
+        #[command(subcommand)]
+        command: ServeCommand,
+    },
     /// Build and inspect the attributed completion index.
     Index {
         #[command(subcommand)]
@@ -217,8 +232,33 @@ enum CompletionFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DataOutputFormat {
+    Json,
+    Plain,
+    Table,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.build_info {
+        print_json_value(serde_json::json!({
+            "schema_version": 2,
+            "version": env!("CARGO_PKG_VERSION"),
+            "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "optimization_level": env!("QUIRL_BUILD_OPT_LEVEL"),
+            "panic_strategy": if cfg!(panic = "unwind") { "unwind" } else { "abort" },
+            "operating_system": std::env::consts::OS,
+            "architecture": std::env::consts::ARCH,
+            "source_commit": env!("QUIRL_BUILD_COMMIT"),
+            "source_dirty": match env!("QUIRL_BUILD_DIRTY") {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            },
+        }));
+        return ExitCode::SUCCESS;
+    }
     let wants_json = cli.wants_json();
     match run(cli) {
         Ok(status) => ExitCode::from(status.clamp(0, 255) as u8),
@@ -249,12 +289,26 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             Ok(output.status)
         }
         Some(Command::Eval { expression }) => {
-            let lua = LuaRuntime::new(LuaPolicy::script())?;
+            let lua =
+                LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
             print_json_value(lua.eval(&expression)?);
             Ok(0)
         }
-        Some(Command::Data { expression }) => {
-            print_json_value(DataRuntime::new().eval(&expression)?);
+        Some(Command::Data { expression, format }) => {
+            let format = match format {
+                DataOutputFormat::Json => DataRenderFormat::Json,
+                DataOutputFormat::Plain => DataRenderFormat::Plain,
+                DataOutputFormat::Table => DataRenderFormat::Table,
+            };
+            let stdout = io::stdout();
+            let mut output = stdout.lock();
+            DataRuntime::with_process_host(sandboxed_process_host())
+                .render_to_with_cancellation_handle(
+                    &expression,
+                    format,
+                    Arc::new(AtomicBool::new(false)),
+                    &mut output,
+                )?;
             Ok(0)
         }
         Some(Command::Check { file, format }) => {
@@ -296,6 +350,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
         Some(Command::Describe { command }) => author::describe(command, &load_composed_catalog()),
         Some(Command::Doc { command }) => author::doc(command, &load_composed_catalog()),
         Some(Command::Lsp) => lsp::execute(load_composed_catalog()),
+        Some(Command::Serve { command }) => mcp::execute(command),
         Some(Command::Index { command }) => index::execute(command),
         Some(Command::Complete { input, format }) => {
             let mut catalog = index::load_default_catalog();
@@ -389,6 +444,10 @@ impl Command {
                 format: CompletionFormat::Json,
                 ..
             } => true,
+            Self::Data {
+                format: DataOutputFormat::Json,
+                ..
+            } => true,
             Self::Config { command } => config::wants_json(command),
             Self::Plugin { command } => plugin::wants_json(command),
             Self::Agent { command } => agent::wants_json(command),
@@ -472,7 +531,7 @@ fn execute_with_recovery(
         );
     }
     let started = Instant::now();
-    match executor.execute_capture(&source) {
+    match execute_command_or_dialect_island(executor, &source) {
         Ok(outcome) => {
             let duration = started.elapsed();
             if outcome.status != 0 {
@@ -534,6 +593,37 @@ fn execute_with_recovery(
     }
 }
 
+fn execute_command_or_dialect_island(
+    executor: &mut NativeExecutor,
+    source: &str,
+) -> Result<CommandOutcome, ShellError> {
+    if let Some((language, body)) = interactive_dialect_island(source) {
+        return script::run_interactive_island(
+            language,
+            body,
+            &script::ScriptCancellation::default(),
+        );
+    }
+    executor.execute_capture(source)
+}
+
+/// Recognize a deliberately tiny, explicit bridge form. The body is passed verbatim to the
+/// selected interpreter; Quirl does not try to parse or reinterpret its dialect grammar.
+fn interactive_dialect_island(source: &str) -> Option<(ScriptLanguage, &str)> {
+    let source = source.trim();
+    for (prefix, language) in [("bash", ScriptLanguage::Bash), ("zsh", ScriptLanguage::Zsh)] {
+        let Some(rest) = source.strip_prefix(prefix) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if !rest.starts_with('{') || !rest.ends_with('}') {
+            continue;
+        }
+        return Some((language, rest[1..rest.len().saturating_sub(1)].trim()));
+    }
+    None
+}
+
 fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     begin_extension_session(&extensions);
     emit_directory_snapshot(&extensions);
@@ -553,7 +643,7 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
     let mut mode = Mode::Command;
     let mut executor = NativeExecutor::default();
     let recovery = recovery::RecoveryJournal::discover()?;
-    let data = DataRuntime::new();
+    let data = DataRuntime::with_process_host(sandboxed_process_host());
     // Script evaluation remains lazy; extension VMs load before the first editor view.
     let mut lua = None;
     let mut last_status = 0;
@@ -1094,7 +1184,10 @@ fn eval_lua(
     source: &str,
 ) -> Result<serde_json::Value, ShellError> {
     if runtime.is_none() {
-        *runtime = Some(LuaRuntime::new(LuaPolicy::script())?);
+        *runtime = Some(LuaRuntime::new_with_process_host(
+            LuaPolicy::script(),
+            sandboxed_process_host(),
+        )?);
     }
     let runtime = runtime.as_ref().ok_or_else(|| {
         ShellError::new(ErrorCode::Lua, "could not initialize the Lua runtime")
@@ -1131,7 +1224,7 @@ fn run_stdin() -> Result<i32, ShellError> {
         .with_context(error.to_string())
         .with_help("Encode Lua source as UTF-8")
     })?;
-    let lua = LuaRuntime::new(LuaPolicy::script())?;
+    let lua = LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
     print_json_value(lua.eval(&source)?);
     Ok(0)
 }
@@ -1422,10 +1515,22 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["quirl", "lsp"]),
             Ok(Cli {
+                build_info: false,
                 command: Some(Command::Lsp)
             })
         ));
         assert!(Cli::try_parse_from(["quirl", "lsp", "--port", "9000"]).is_err());
+    }
+
+    #[test]
+    fn release_tooling_build_info_is_hidden_and_machine_selected() {
+        let cli = Cli::try_parse_from(["quirl", "--build-info"]).unwrap();
+        assert!(cli.build_info);
+        assert!(cli.command.is_none());
+        assert!(!<Cli as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string()
+            .contains("build-info"));
     }
 
     #[test]
@@ -1683,5 +1788,56 @@ mod tests {
             None,
         );
         std::env::remove_var(variable);
+
+        assert_native_and_reference_case(
+            "semicolon-list-and-here-string",
+            |_| "printf first; cat <<< second".to_owned(),
+            None,
+        );
+        assert_native_and_reference_case(
+            "parameter-and-arithmetic-expansion",
+            |_| {
+                "export QUIRL_C1_EXPANSION=value; printf '%s:%s' $QUIRL_C1_EXPANSION $((1 + 2))"
+                    .to_owned()
+            },
+            None,
+        );
+        assert_native_and_reference_case(
+            "bounded-command-substitution",
+            |_| "printf '%s' $(printf nested)".to_owned(),
+            None,
+        );
+        assert_native_and_reference_case(
+            "ordered-standard-descriptor-duplication",
+            |_| "sh -c 'printf output; printf error >&2' 2>&1".to_owned(),
+            None,
+        );
+    }
+
+    #[test]
+    fn explicit_dialect_islands_are_routed_without_reparsing_the_body() {
+        let (language, body) = interactive_dialect_island("bash { if true; then printf yes; fi; }")
+            .expect("bash island is recognized");
+        assert_eq!(language, ScriptLanguage::Bash);
+        assert_eq!(body, "if true; then printf yes; fi;");
+        assert!(matches!(
+            interactive_dialect_island("zsh { print value; }"),
+            Some((ScriptLanguage::Zsh, "print value;"))
+        ));
+        assert!(interactive_dialect_island("bash echo value").is_none());
+    }
+
+    #[test]
+    fn bash_island_preserves_reference_observable_output_when_available() {
+        if !shell_is_available("bash") {
+            return;
+        }
+        let native = execute_command_or_dialect_island(
+            &mut NativeExecutor::default(),
+            "bash { printf value; printf warning >&2; exit 7; }",
+        )
+        .unwrap();
+        let reference = reference_outcome("bash", "printf value; printf warning >&2; exit 7;");
+        assert_same_outcome("bash interactive island", &native, &reference);
     }
 }

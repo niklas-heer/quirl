@@ -19,15 +19,20 @@ mod platform {
         unistd::{tcgetpgrp, tcsetpgrp, Pid},
     };
     use os_pipe::{pipe, PipeReader, PipeWriter};
-    use quirl_core::{CommandOutcome, CommandRunner, ErrorCode, ShellError};
-    use quirl_syntax::{parse_command_list, ListConnector, Pipeline, RedirectKind, SimpleCommand};
+    use quirl_core::{CommandOutcome, CommandRunner, ErrorCode, ProcessRequest, ShellError};
+    use quirl_syntax::{
+        parse_command_list, ListConnector, Pipeline, Quoting, RedirectKind, SimpleCommand, Word,
+    };
     use serde::{Deserialize, Serialize};
     use std::{
         env,
         fs::{File, OpenOptions},
-        io::{IsTerminal, Read, Write},
+        io::{ErrorKind, IsTerminal, Read, Write},
+        path::{Path, PathBuf},
         process::{Child, Command, Stdio},
+        sync::atomic::Ordering,
         thread::{self, JoinHandle},
+        time::Instant,
     };
 
     #[cfg(unix)]
@@ -56,7 +61,7 @@ mod platform {
         children: Vec<JobChild>,
         capture: bool,
         stdout_reader: Option<ReaderTask>,
-        stderr_reader: Option<ReaderTask>,
+        stderr_readers: Vec<ReaderTask>,
         writers: Vec<WriterTask>,
     }
 
@@ -66,12 +71,19 @@ mod platform {
         exit_status: Option<i32>,
     }
 
-    type ReaderTask = JoinHandle<std::io::Result<Vec<u8>>>;
+    struct ReaderCapture {
+        bytes: Vec<u8>,
+        truncated: bool,
+    }
+
+    type ReaderTask = JoinHandle<std::io::Result<ReaderCapture>>;
     type WriterTask = JoinHandle<std::io::Result<()>>;
+    type OutputStdio = (Stdio, Option<PipeReader>, Option<PipeWriter>, Option<File>);
 
     pub struct NativeExecutor {
         jobs: Vec<Job>,
         next_job_id: u32,
+        substitution_depth: u8,
     }
 
     /// Cross-platform containment hook for a directly spawned child process.
@@ -86,8 +98,17 @@ mod platform {
             Ok(())
         }
 
-        pub fn terminate(&self, child: &mut Child) {
-            let _ = child.kill();
+        pub fn terminate(&self, child: &mut Child) -> Result<(), ShellError> {
+            match child.kill() {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::InvalidInput => Ok(()),
+                Err(error) => Err(ShellError::new(
+                    ErrorCode::ProcessSpawn,
+                    "could not terminate contained child process",
+                )
+                .with_context(error.to_string())
+                .with_help("Retry the command; report repeated process termination failures")),
+            }
         }
     }
 
@@ -96,6 +117,7 @@ mod platform {
             Self {
                 jobs: Vec::new(),
                 next_job_id: 1,
+                substitution_depth: 0,
             }
         }
     }
@@ -118,6 +140,15 @@ mod platform {
 
         pub fn execute_capture(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, true)
+        }
+
+        /// Execute a foreground command under a host-provided cancellation,
+        /// deadline, and retained-output budget.
+        pub fn execute_capture_request(
+            &mut self,
+            request: ProcessRequest,
+        ) -> Result<CommandOutcome, ShellError> {
+            self.execute_inner_with_request(&request.command, true, Some(&request))
         }
 
         pub fn jobs(&mut self) -> Vec<JobState> {
@@ -196,6 +227,15 @@ mod platform {
             input: &str,
             capture: bool,
         ) -> Result<CommandOutcome, ShellError> {
+            self.execute_inner_with_request(input, capture, None)
+        }
+
+        fn execute_inner_with_request(
+            &mut self,
+            input: &str,
+            capture: bool,
+            request: Option<&ProcessRequest>,
+        ) -> Result<CommandOutcome, ShellError> {
             let graph = parse_command_list(input).map_err(|error| {
                 ShellError::new(ErrorCode::InvalidCommand, error.message)
                     .with_label(
@@ -223,10 +263,18 @@ mod platform {
                         continue;
                     }
                 }
-                last = self.execute_pipeline(pipeline, input, capture)?;
+                last = self.execute_pipeline(pipeline, input, capture, request, last.status)?;
                 if capture {
-                    captured_stdout.push_str(last.stdout.as_deref().unwrap_or_default());
-                    captured_stderr.push_str(last.stderr.as_deref().unwrap_or_default());
+                    append_captured_output(
+                        &mut captured_stdout,
+                        last.stdout.as_deref().unwrap_or_default(),
+                        request.map_or(usize::MAX, |request| request.max_output_bytes),
+                    )?;
+                    append_captured_output(
+                        &mut captured_stderr,
+                        last.stderr.as_deref().unwrap_or_default(),
+                        request.map_or(usize::MAX, |request| request.max_output_bytes),
+                    )?;
                 }
             }
             if capture {
@@ -241,7 +289,11 @@ mod platform {
             pipeline: &Pipeline,
             source: &str,
             capture: bool,
+            request: Option<&ProcessRequest>,
+            previous_status: i32,
         ) -> Result<CommandOutcome, ShellError> {
+            let pipeline = self.expand_pipeline(pipeline, request, previous_status)?;
+            let pipeline = &pipeline;
             if pipeline.commands.len() == 1 {
                 if pipeline.background
                     && pipeline.commands[0].words.first().is_some_and(|name| {
@@ -261,7 +313,187 @@ mod platform {
                     return Ok(result);
                 }
             }
-            self.spawn_pipeline(pipeline, source, capture)
+            self.spawn_pipeline(pipeline, source, capture, request)
+        }
+
+        fn expand_pipeline(
+            &mut self,
+            pipeline: &Pipeline,
+            request: Option<&ProcessRequest>,
+            previous_status: i32,
+        ) -> Result<Pipeline, ShellError> {
+            const MAX_SUBSTITUTION_BYTES: usize = 16 * 1024;
+            if request.is_some_and(|request| request.cancelled.load(Ordering::Relaxed)) {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "command expansion was cancelled before execution",
+                )
+                .with_help("Run the command again when cancellation is no longer requested"));
+            }
+            let mut expanded = pipeline.clone();
+            for command in &mut expanded.commands {
+                let forms = command.word_ir.clone();
+                if forms.is_empty() {
+                    continue;
+                }
+                let mut words = Vec::new();
+                for word in &forms {
+                    let (value, glob) =
+                        self.expand_word(word, MAX_SUBSTITUTION_BYTES, request, previous_status)?;
+                    let matches = if glob {
+                        pathname_expand(&value)?
+                    } else {
+                        Vec::new()
+                    };
+                    if matches.is_empty() {
+                        words.push(value);
+                    } else {
+                        words.extend(matches);
+                    }
+                }
+                command.words = words;
+                for redirect in &mut command.redirects {
+                    let (path, _) = self.expand_word(
+                        &redirect.target,
+                        MAX_SUBSTITUTION_BYTES,
+                        request,
+                        previous_status,
+                    )?;
+                    redirect.path = path;
+                }
+            }
+            Ok(expanded)
+        }
+
+        fn expand_word(
+            &mut self,
+            word: &Word,
+            limit: usize,
+            request: Option<&ProcessRequest>,
+            previous_status: i32,
+        ) -> Result<(String, bool), ShellError> {
+            let mut value = String::new();
+            let mut pathname = false;
+            for part in &word.parts {
+                if matches!(part.quoting, Quoting::Single | Quoting::Escaped) {
+                    value.push_str(&part.text);
+                    continue;
+                }
+                pathname |= part.quoting == Quoting::Unquoted
+                    && part
+                        .text
+                        .chars()
+                        .any(|character| matches!(character, '*' | '?' | '['));
+                value.push_str(&self.expand_fragment(
+                    &part.text,
+                    limit,
+                    request,
+                    previous_status,
+                )?);
+            }
+            Ok((value, pathname))
+        }
+
+        fn expand_fragment(
+            &mut self,
+            text: &str,
+            limit: usize,
+            request: Option<&ProcessRequest>,
+            previous_status: i32,
+        ) -> Result<String, ShellError> {
+            let mut output = String::new();
+            let mut index = 0;
+            while index < text.len() {
+                let rest = &text[index..];
+                if let Some(arithmetic) = rest.strip_prefix("$((") {
+                    let Some(close) = matching_double_paren(arithmetic) else {
+                        return Err(expansion_error(
+                            "unclosed arithmetic expansion",
+                            "Close the `))` in `$((...))`",
+                        ));
+                    };
+                    output.push_str(&evaluate_arithmetic(&arithmetic[..close])?.to_string());
+                    index += 3 + close + 2;
+                    continue;
+                }
+                if let Some(after) = rest.strip_prefix("$(") {
+                    let Some(close) = matching_paren(after) else {
+                        return Err(expansion_error(
+                            "unclosed command substitution",
+                            "Close the `)` in `$(...)`",
+                        ));
+                    };
+                    let source = &after[..close];
+                    if source.len() > limit {
+                        return Err(expansion_error(
+                            "command substitution exceeds its source budget",
+                            "Keep `$(...)` below 16 KiB or use an explicit pipeline",
+                        ));
+                    }
+                    const MAX_COMMAND_SUBSTITUTION_DEPTH: u8 = 8;
+                    if self.substitution_depth >= MAX_COMMAND_SUBSTITUTION_DEPTH {
+                        return Err(expansion_error(
+                            "command substitution nesting exceeds the depth limit",
+                            "Flatten nested substitutions or use an explicit pipeline",
+                        ));
+                    }
+                    self.substitution_depth += 1;
+                    let nested = self.execute_inner_with_request(source, true, request);
+                    self.substitution_depth = self.substitution_depth.saturating_sub(1);
+                    let nested = nested?;
+                    let stdout = nested.stdout.unwrap_or_default();
+                    if stdout.len() > limit {
+                        return Err(expansion_error(
+                            "command substitution exceeded its output budget",
+                            "Write large output to a file before substituting it",
+                        ));
+                    }
+                    output.push_str(stdout.trim_end_matches('\n'));
+                    index += 2 + close + 1;
+                    continue;
+                }
+                if let Some(after) = rest.strip_prefix("${") {
+                    let Some(close) = after.find('}') else {
+                        return Err(expansion_error(
+                            "unclosed parameter expansion",
+                            "Close the `}` in `${...}`",
+                        ));
+                    };
+                    output.push_str(&parameter_value(&after[..close]));
+                    index += 3 + close;
+                    continue;
+                }
+                if let Some(after) = rest.strip_prefix('$') {
+                    let Some(character) = after.chars().next() else {
+                        output.push('$');
+                        break;
+                    };
+                    if character == '?' {
+                        output.push_str(&previous_status.to_string());
+                        index += 2;
+                        continue;
+                    }
+                    if character == '$' {
+                        output.push_str(&std::process::id().to_string());
+                        index += 2;
+                        continue;
+                    }
+                    if character == '_' || character.is_ascii_alphabetic() {
+                        let length = after
+                            .chars()
+                            .take_while(|value| *value == '_' || value.is_ascii_alphanumeric())
+                            .map(char::len_utf8)
+                            .sum();
+                        output.push_str(&parameter_value(&after[..length]));
+                        index += 1 + length;
+                        continue;
+                    }
+                }
+                let character = rest.chars().next().unwrap_or_default();
+                output.push(character);
+                index += character.len_utf8();
+            }
+            Ok(output)
         }
 
         fn execute_control_builtin(
@@ -349,10 +581,12 @@ mod platform {
             pipeline: &Pipeline,
             source: &str,
             capture: bool,
+            request: Option<&ProcessRequest>,
         ) -> Result<CommandOutcome, ShellError> {
             let mut spawned = SpawnGuard::default();
             let mut previous_reader: Option<PipeReader> = None;
             let mut capture_reader = None;
+            let mut stderr_readers = Vec::new();
             let mut builtin_writers: Vec<(PipeWriter, Vec<u8>)> = Vec::new();
             let capture_streams = capture && !pipeline.background;
 
@@ -366,8 +600,19 @@ mod platform {
                     .with_command(source)
                     .with_help("Move `ls` to the start of the pipeline or use `^ls`"));
                 }
+                if stderr_duplication_precedes_stdout_redirect(command) {
+                    return Err(ShellError::new(
+                        ErrorCode::InvalidCommand,
+                        "native C1 cannot preserve `2>&1` before a later stdout file redirect",
+                    )
+                    .with_command(source)
+                    .with_help(
+                        "Use `> file 2>&1` to merge both streams into the file, or use an explicit Bash/Zsh island for ordered descriptor routing",
+                    ));
+                }
                 let stdin = input_stdio(command, previous_reader.take(), index > 0)?;
-                let (stdout, next_reader, writer) = output_stdio(command, last, capture_streams)?;
+                let (stdout, next_reader, writer, redirected_stdout) =
+                    output_stdio(command, last, capture_streams)?;
                 if last && capture_streams {
                     capture_reader = next_reader;
                 } else {
@@ -400,17 +645,30 @@ mod platform {
                     })?;
                 let mut process = Command::new(executable);
                 process.args(command.words.iter().skip(1));
-                process
-                    .stdin(stdin)
-                    .stdout(stdout)
-                    .stderr(if capture_streams && last {
-                        Stdio::piped()
-                    } else {
+                let stderr = if command.redirects.iter().any(duplicates_stderr_to_stdout) {
+                    if let Some(writer) = writer.as_ref() {
+                        Stdio::from(writer.try_clone().map_err(|error| {
+                            ShellError::new(
+                                ErrorCode::Io,
+                                "could not duplicate the pipeline output descriptor",
+                            )
+                            .with_context(error.to_string())
+                            .with_help("Retry the command or use an explicit dialect island")
+                        })?)
+                    } else if let Some(file) = redirected_stdout {
+                        Stdio::from(file)
+                    } else if !capture_streams {
                         Stdio::inherit()
-                    });
+                    } else {
+                        Stdio::piped()
+                    }
+                } else {
+                    stderr_stdio(command, capture_streams)?
+                };
+                process.stdin(stdin).stdout(stdout).stderr(stderr);
                 #[cfg(unix)]
                 process.process_group(spawned.process_group.unwrap_or(0));
-                let child = process.spawn().map_err(|error| {
+                let mut child = process.spawn().map_err(|error| {
                     ShellError::new(
                         ErrorCode::ProcessSpawn,
                         format!("could not start `{executable}`"),
@@ -421,6 +679,14 @@ mod platform {
                         "Check that the command exists on PATH, or use `help` to inspect built-ins",
                     )
                 })?;
+                if capture_streams {
+                    if let Some(stderr) = child.stderr.take() {
+                        stderr_readers.push(spawn_reader(
+                            stderr,
+                            request.map_or(usize::MAX, |request| request.max_output_bytes),
+                        ));
+                    }
+                }
                 spawned.push(child)?;
             }
 
@@ -444,7 +710,7 @@ mod platform {
                     children: spawned.release(),
                     capture: false,
                     stdout_reader: None,
-                    stderr_reader: None,
+                    stderr_readers: Vec::new(),
                     writers,
                 });
                 return Ok(outcome(
@@ -455,33 +721,35 @@ mod platform {
             }
 
             let process_group = spawned.process_group;
-            let terminal = ForegroundTerminal::give_to(process_group)?;
+            let mut terminal = ForegroundTerminal::give_to(process_group)?;
             let mut children = spawned.release();
-            let stdout_reader = capture_reader.map(spawn_reader);
+            let output_limit = request.map_or(usize::MAX, |request| request.max_output_bytes);
+            let stdout_reader = capture_reader.map(|reader| spawn_reader(reader, output_limit));
             let child_count = children.len();
-            let stderr_reader = if capture {
-                children
-                    .last_mut()
-                    .and_then(|child| child.child.stderr.take())
-                    .map(spawn_reader)
-            } else {
-                None
-            };
             let mut wait_error = None;
-            for child in &mut children {
-                match wait_for_child(&mut child.child) {
-                    Ok(exit) => child.record(exit),
-                    Err(error) => {
-                        wait_error = Some(error);
-                        break;
+            if let Some(request) = request {
+                wait_error =
+                    wait_for_children_with_request(&mut children, process_group, request).err();
+            } else {
+                for child in &mut children {
+                    match wait_for_child(&mut child.child) {
+                        Ok(exit) => child.record(exit),
+                        Err(error) => {
+                            wait_error = Some(error);
+                            break;
+                        }
                     }
                 }
             }
             if let Some(error) = wait_error {
                 terminate_children(&mut children, process_group);
+                let _ = terminal.restore();
+                let _ = join_reader(stdout_reader, "pipeline output");
+                let _ = join_readers(stderr_readers, "command error output");
+                let _ = join_writers(writers);
                 return Err(error);
             }
-            drop(terminal);
+            terminal.restore()?;
             let status = children
                 .get(child_count.saturating_sub(1))
                 .and_then(|child| child.exit_status)
@@ -503,7 +771,7 @@ mod platform {
                     children,
                     capture: capture_streams,
                     stdout_reader,
-                    stderr_reader,
+                    stderr_readers,
                     writers,
                 });
                 return Ok(outcome(
@@ -512,9 +780,12 @@ mod platform {
                     capture.then(String::new),
                 ));
             }
-            let stdout = join_reader(stdout_reader, "pipeline output")?;
-            let stderr = join_reader(stderr_reader, "command error output")?;
-            join_writers(writers)?;
+            let stdout = join_reader(stdout_reader, "pipeline output");
+            let stderr = join_readers(stderr_readers, "command error output");
+            let writers = join_writers(writers);
+            let stdout = stdout?;
+            let stderr = stderr?;
+            writers?;
             Ok(outcome(
                 status,
                 capture.then_some(stdout),
@@ -557,7 +828,7 @@ mod platform {
         fn foreground(&mut self, id: Option<u32>) -> Result<CommandOutcome, ShellError> {
             self.refresh_jobs();
             let index = select_job(&self.jobs, id)?;
-            let terminal = ForegroundTerminal::give_to(self.jobs[index].state.process_group)?;
+            let mut terminal = ForegroundTerminal::give_to(self.jobs[index].state.process_group)?;
             resume_job(&self.jobs[index])?;
             let mut job = self.jobs.remove(index);
             let mut wait_error = None;
@@ -578,7 +849,7 @@ mod platform {
                 terminate_children(&mut job.children, job.state.process_group);
                 return Err(error);
             }
-            drop(terminal);
+            terminal.restore()?;
             let status = job
                 .children
                 .last()
@@ -595,9 +866,15 @@ mod platform {
             }
             job.state.status = JobStatus::Done;
             job.state.exit_status = Some(status);
-            let stdout = join_reader(job.stdout_reader.take(), "pipeline output")?;
-            let stderr = join_reader(job.stderr_reader.take(), "command error output")?;
-            join_writers(std::mem::take(&mut job.writers))?;
+            let stdout = join_reader(job.stdout_reader.take(), "pipeline output");
+            let stderr = join_readers(
+                std::mem::take(&mut job.stderr_readers),
+                "command error output",
+            );
+            let writers = join_writers(std::mem::take(&mut job.writers));
+            let stdout = stdout?;
+            let stderr = stderr?;
+            writers?;
             Ok(outcome(
                 status,
                 job.capture.then_some(stdout),
@@ -626,25 +903,388 @@ mod platform {
         }
     }
 
+    fn expansion_error(message: &str, help: &str) -> ShellError {
+        ShellError::new(ErrorCode::InvalidCommand, message).with_help(help)
+    }
+
+    fn parameter_value(name: &str) -> String {
+        std::env::var(name).unwrap_or_default()
+    }
+
+    fn matching_paren(source: &str) -> Option<usize> {
+        let mut depth = 1_u32;
+        let mut quote = None;
+        let mut escaped = false;
+        for (index, character) in source.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if character == '\\' && quote != Some('\'') {
+                escaped = true;
+                continue;
+            }
+            if let Some(active) = quote {
+                if character == active {
+                    quote = None;
+                }
+                continue;
+            }
+            if matches!(character, '\'' | '"') {
+                quote = Some(character);
+                continue;
+            }
+            match character {
+                '(' => depth = depth.saturating_add(1),
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn matching_double_paren(source: &str) -> Option<usize> {
+        let mut depth = 0_usize;
+        for (index, character) in source.char_indices() {
+            match character {
+                '(' => depth = depth.saturating_add(1),
+                ')' if depth > 0 => depth = depth.saturating_sub(1),
+                ')' if source[index..].starts_with("))") => return Some(index),
+                ')' => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn evaluate_arithmetic(source: &str) -> Result<i64, ShellError> {
+        #[derive(Clone, Copy)]
+        struct Parser<'a> {
+            input: &'a [u8],
+            index: usize,
+        }
+        impl<'a> Parser<'a> {
+            fn skip(&mut self) {
+                while self
+                    .input
+                    .get(self.index)
+                    .is_some_and(u8::is_ascii_whitespace)
+                {
+                    self.index += 1;
+                }
+            }
+            fn expression(&mut self) -> Result<i64, ShellError> {
+                let mut value = self.term()?;
+                loop {
+                    self.skip();
+                    match self.input.get(self.index).copied() {
+                        Some(b'+') => {
+                            self.index += 1;
+                            value = value.checked_add(self.term()?).ok_or_else(|| {
+                                expansion_error(
+                                    "arithmetic expansion overflowed",
+                                    "Use a smaller integer expression",
+                                )
+                            })?;
+                        }
+                        Some(b'-') => {
+                            self.index += 1;
+                            value = value.checked_sub(self.term()?).ok_or_else(|| {
+                                expansion_error(
+                                    "arithmetic expansion overflowed",
+                                    "Use a smaller integer expression",
+                                )
+                            })?;
+                        }
+                        _ => return Ok(value),
+                    }
+                }
+            }
+            fn term(&mut self) -> Result<i64, ShellError> {
+                let mut value = self.factor()?;
+                loop {
+                    self.skip();
+                    match self.input.get(self.index).copied() {
+                        Some(b'*') => {
+                            self.index += 1;
+                            value = value.checked_mul(self.factor()?).ok_or_else(|| {
+                                expansion_error(
+                                    "arithmetic expansion overflowed",
+                                    "Use a smaller integer expression",
+                                )
+                            })?;
+                        }
+                        Some(b'/') => {
+                            self.index += 1;
+                            let divisor = self.factor()?;
+                            if divisor == 0 {
+                                return Err(expansion_error(
+                                    "arithmetic expansion divides by zero",
+                                    "Use a non-zero divisor",
+                                ));
+                            }
+                            value /= divisor;
+                        }
+                        _ => return Ok(value),
+                    }
+                }
+            }
+            fn factor(&mut self) -> Result<i64, ShellError> {
+                self.skip();
+                if self.input.get(self.index) == Some(&b'(') {
+                    self.index += 1;
+                    let value = self.expression()?;
+                    self.skip();
+                    if self.input.get(self.index) != Some(&b')') {
+                        return Err(expansion_error(
+                            "invalid arithmetic expansion",
+                            "Balance parentheses in `$((...))`",
+                        ));
+                    }
+                    self.index += 1;
+                    return Ok(value);
+                }
+                let negative = if self.input.get(self.index) == Some(&b'-') {
+                    self.index += 1;
+                    true
+                } else {
+                    false
+                };
+                let start = self.index;
+                while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
+                    self.index += 1;
+                }
+                if start == self.index {
+                    return Err(expansion_error(
+                        "invalid arithmetic expansion",
+                        "Use integer literals and +, -, *, /, or parentheses",
+                    ));
+                }
+                let text = std::str::from_utf8(&self.input[start..self.index]).map_err(|_| {
+                    expansion_error("invalid arithmetic expansion", "Use ASCII integer literals")
+                })?;
+                let value = text.parse::<i64>().map_err(|_| {
+                    expansion_error(
+                        "arithmetic expansion overflowed",
+                        "Use a smaller integer expression",
+                    )
+                })?;
+                Ok(if negative { -value } else { value })
+            }
+        }
+        let mut parser = Parser {
+            input: source.as_bytes(),
+            index: 0,
+        };
+        let value = parser.expression()?;
+        parser.skip();
+        if parser.index != parser.input.len() {
+            return Err(expansion_error(
+                "invalid arithmetic expansion",
+                "Use integer literals and +, -, *, /, or parentheses",
+            ));
+        }
+        Ok(value)
+    }
+
+    fn pathname_expand(pattern: &str) -> Result<Vec<String>, ShellError> {
+        const MAX_GLOB_MATCHES: usize = 10_000;
+        let absolute = pattern.starts_with('/');
+        let mut paths = vec![if absolute {
+            PathBuf::from("/")
+        } else {
+            PathBuf::new()
+        }];
+        for component in pattern.split('/').filter(|component| !component.is_empty()) {
+            let has_pattern = component
+                .chars()
+                .any(|character| matches!(character, '*' | '?' | '['));
+            let mut next = Vec::new();
+            for prefix in &paths {
+                if !has_pattern {
+                    next.push(prefix.join(component));
+                    continue;
+                }
+                let directory = if prefix.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    prefix.as_path()
+                };
+                let Ok(entries) = std::fs::read_dir(directory) else {
+                    continue;
+                };
+                for entry in entries.filter_map(Result::ok) {
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    if glob_matches(component, &name) {
+                        next.push(prefix.join(name));
+                        if next.len() > MAX_GLOB_MATCHES {
+                            return Err(ShellError::new(
+                                ErrorCode::ResourceLimit,
+                                "pathname expansion exceeded its match budget",
+                            )
+                            .with_help(
+                                "Narrow the pattern below 10,000 matches or use an explicit data pipeline",
+                            ));
+                        }
+                    }
+                }
+            }
+            paths = next;
+            if paths.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        let mut matches = paths
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        matches.sort();
+        Ok(matches)
+    }
+
+    fn glob_matches(pattern: &str, candidate: &str) -> bool {
+        enum GlobAtom {
+            Star,
+            Any,
+            Literal(char),
+            Class {
+                negated: bool,
+                ranges: Vec<(char, char)>,
+            },
+        }
+
+        let characters = pattern.chars().collect::<Vec<_>>();
+        let mut atoms = Vec::new();
+        let mut index = 0;
+        while index < characters.len() {
+            match characters[index] {
+                '*' => atoms.push(GlobAtom::Star),
+                '?' => atoms.push(GlobAtom::Any),
+                '[' => {
+                    let Some(relative_end) = characters[index + 1..]
+                        .iter()
+                        .position(|character| *character == ']')
+                    else {
+                        atoms.push(GlobAtom::Literal('['));
+                        index += 1;
+                        continue;
+                    };
+                    let end = index + 1 + relative_end;
+                    let mut class = &characters[index + 1..end];
+                    let negated = class
+                        .first()
+                        .is_some_and(|character| matches!(character, '!' | '^'));
+                    if negated {
+                        class = &class[1..];
+                    }
+                    let mut ranges = Vec::new();
+                    let mut class_index = 0;
+                    while class_index < class.len() {
+                        if class_index + 2 < class.len() && class[class_index + 1] == '-' {
+                            ranges.push((class[class_index], class[class_index + 2]));
+                            class_index += 3;
+                        } else {
+                            ranges.push((class[class_index], class[class_index]));
+                            class_index += 1;
+                        }
+                    }
+                    atoms.push(GlobAtom::Class { negated, ranges });
+                    index = end;
+                }
+                character => atoms.push(GlobAtom::Literal(character)),
+            }
+            index += 1;
+        }
+        if candidate.starts_with('.') && !pattern.starts_with('.') {
+            return false;
+        }
+        let candidate = candidate.chars().collect::<Vec<_>>();
+        let mut previous = vec![false; candidate.len() + 1];
+        previous[0] = true;
+        for atom in atoms {
+            let mut current = vec![false; candidate.len() + 1];
+            match atom {
+                GlobAtom::Star => {
+                    current[0] = previous[0];
+                    for candidate_index in 1..=candidate.len() {
+                        current[candidate_index] =
+                            previous[candidate_index] || current[candidate_index - 1];
+                    }
+                }
+                GlobAtom::Any => {
+                    current[1..].copy_from_slice(&previous[..candidate.len()]);
+                }
+                GlobAtom::Literal(expected) => {
+                    for candidate_index in 1..=candidate.len() {
+                        current[candidate_index] = previous[candidate_index - 1]
+                            && candidate[candidate_index - 1] == expected;
+                    }
+                }
+                GlobAtom::Class { negated, ranges } => {
+                    for candidate_index in 1..=candidate.len() {
+                        let character = candidate[candidate_index - 1];
+                        let contained = ranges
+                            .iter()
+                            .any(|(start, end)| *start <= character && character <= *end);
+                        current[candidate_index] =
+                            previous[candidate_index - 1] && (contained != negated);
+                    }
+                }
+            }
+            previous = current;
+        }
+        previous[candidate.len()]
+    }
+
     fn input_stdio(
         command: &SimpleCommand,
         previous: Option<PipeReader>,
         has_upstream: bool,
     ) -> Result<Stdio, ShellError> {
         let mut redirected = None;
-        for redirect in command
-            .redirects
-            .iter()
-            .filter(|redirect| redirect.kind == RedirectKind::Input)
-        {
-            redirected = Some(File::open(&redirect.path).map_err(|error| {
-                ShellError::new(
-                    ErrorCode::Io,
-                    format!("cannot read redirected input {}", redirect.path),
-                )
-                .with_context(error.to_string())
-                .with_help("Check that the file exists and is readable")
-            })?);
+        let mut here_string = None;
+        for redirect in command.redirects.iter().filter(|redirect| {
+            matches!(
+                redirect.kind,
+                RedirectKind::Input | RedirectKind::HereString
+            )
+        }) {
+            if redirect.kind == RedirectKind::HereString {
+                here_string = Some(redirect.path.clone());
+            } else {
+                redirected = Some(File::open(&redirect.path).map_err(|error| {
+                    ShellError::new(
+                        ErrorCode::Io,
+                        format!("cannot read redirected input {}", redirect.path),
+                    )
+                    .with_context(error.to_string())
+                    .with_help("Check that the file exists and is readable")
+                })?);
+            }
+        }
+        if let Some(value) = here_string {
+            let (reader, mut writer) = pipe().map_err(|error| {
+                ShellError::new(ErrorCode::Io, "could not create here-string input")
+                    .with_context(error.to_string())
+                    .with_help("Retry the command or use an input file")
+            })?;
+            writer
+                .write_all(value.as_bytes())
+                .and_then(|()| writer.write_all(b"\n"))
+                .map_err(|error| {
+                    ShellError::new(ErrorCode::Io, "could not write here-string input")
+                        .with_context(error.to_string())
+                        .with_help("Retry the command or use an input file")
+                })?;
+            drop(writer);
+            return Ok(Stdio::from(reader));
         }
         if let Some(file) = redirected {
             return Ok(Stdio::from(file));
@@ -665,17 +1305,23 @@ mod platform {
         command: &SimpleCommand,
         last: bool,
         capture: bool,
-    ) -> Result<(Stdio, Option<PipeReader>, Option<PipeWriter>), ShellError> {
+    ) -> Result<OutputStdio, ShellError> {
         let mut redirected = None;
-        for redirect in command
-            .redirects
-            .iter()
-            .filter(|redirect| matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append))
-        {
+        for redirect in command.redirects.iter().filter(|redirect| {
+            redirect.fd == 1 && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+        }) {
             redirected = Some(open_redirected_output(redirect)?);
         }
         if let Some(file) = redirected {
-            return Ok((Stdio::from(file), None, None));
+            let duplicate = file.try_clone().map_err(|error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not duplicate the redirected output descriptor",
+                )
+                .with_context(error.to_string())
+                .with_help("Retry the command or use an explicit dialect island")
+            })?;
+            return Ok((Stdio::from(file), None, None, Some(duplicate)));
         }
         if !last || capture {
             let (reader, writer) = pipe().map_err(|error| {
@@ -688,9 +1334,41 @@ mod platform {
                     .with_context(error.to_string())
                     .with_help("Retry after closing unused processes or file descriptors")
             })?);
-            return Ok((stdout, Some(reader), Some(writer)));
+            return Ok((stdout, Some(reader), Some(writer), None));
         }
-        Ok((Stdio::inherit(), None, None))
+        Ok((Stdio::inherit(), None, None, None))
+    }
+
+    fn stderr_stdio(command: &SimpleCommand, capture: bool) -> Result<Stdio, ShellError> {
+        if let Some(redirect) = command.redirects.iter().rev().find(|redirect| {
+            redirect.fd == 2 && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+        }) {
+            return Ok(Stdio::from(open_redirected_output(redirect)?));
+        }
+        Ok(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+    }
+
+    fn duplicates_stderr_to_stdout(redirect: &quirl_syntax::Redirect) -> bool {
+        redirect.fd == 2 && redirect.kind == RedirectKind::DuplicateOutput && redirect.path == "1"
+    }
+
+    fn stderr_duplication_precedes_stdout_redirect(command: &SimpleCommand) -> bool {
+        let mut duplicated = false;
+        for redirect in &command.redirects {
+            if duplicates_stderr_to_stdout(redirect) {
+                duplicated = true;
+            } else if duplicated
+                && redirect.fd == 1
+                && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn finish_control_builtin(
@@ -931,11 +1609,22 @@ mod platform {
         }
     }
 
-    fn spawn_reader(mut reader: impl Read + Send + 'static) -> ReaderTask {
+    fn spawn_reader(mut reader: impl Read + Send + 'static, limit: usize) -> ReaderTask {
         thread::spawn(move || {
             let mut bytes = Vec::new();
-            reader.read_to_end(&mut bytes)?;
-            Ok(bytes)
+            let mut chunk = [0_u8; 8 * 1024];
+            let mut truncated = false;
+            loop {
+                let count = reader.read(&mut chunk)?;
+                if count == 0 {
+                    break;
+                }
+                let remaining = limit.saturating_sub(bytes.len());
+                let retained = remaining.min(count);
+                bytes.extend_from_slice(&chunk[..retained]);
+                truncated |= retained < count;
+            }
+            Ok(ReaderCapture { bytes, truncated })
         })
     }
 
@@ -954,7 +1643,27 @@ mod platform {
                     .with_context(error.to_string())
                     .with_help("Retry the command; report this if the pipeline is reproducible")
             })?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        if bytes.truncated {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                format!("{description} exceeded the retained output limit"),
+            )
+            .with_help("Reduce process output or write it to a file before returning it to Lua"));
+        }
+        Ok(String::from_utf8_lossy(&bytes.bytes).into_owned())
+    }
+
+    fn join_readers(readers: Vec<ReaderTask>, description: &str) -> Result<String, ShellError> {
+        let mut output = String::new();
+        let mut failure = None;
+        for reader in readers {
+            match join_reader(Some(reader), description) {
+                Ok(text) => output.push_str(&text),
+                Err(error) if failure.is_none() => failure = Some(error),
+                Err(_) => {}
+            }
+        }
+        failure.map_or(Ok(output), Err)
     }
 
     fn join_writers(writers: Vec<WriterTask>) -> Result<(), ShellError> {
@@ -981,7 +1690,10 @@ mod platform {
 
     fn finish_job_tasks_silently(job: &mut Job) {
         let _ = join_reader(job.stdout_reader.take(), "pipeline output");
-        let _ = join_reader(job.stderr_reader.take(), "command error output");
+        let _ = join_readers(
+            std::mem::take(&mut job.stderr_readers),
+            "command error output",
+        );
         let _ = join_writers(std::mem::take(&mut job.writers));
     }
 
@@ -1087,24 +1799,91 @@ mod platform {
                 restore_modes,
             })
         }
+
+        fn restore(&mut self) -> Result<(), ShellError> {
+            let Some(group) = self.restore_group else {
+                return Ok(());
+            };
+            let _blocked = BlockedTerminalSignals::new()?;
+            tcsetpgrp(std::io::stdin(), group).map_err(|error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not return the terminal to Quirl after the foreground job",
+                )
+                .with_context(error.to_string())
+                .with_help("Run `jobs`, then retry the command from a controlling terminal")
+            })?;
+            if let Some(modes) = &self.restore_modes {
+                tcsetattr(std::io::stdin(), SetArg::TCSADRAIN, modes).map_err(|error| {
+                    ShellError::new(
+                        ErrorCode::Io,
+                        "could not restore terminal modes after the foreground job",
+                    )
+                    .with_context(error.to_string())
+                    .with_help("Run `reset` in the controlling terminal, then restart Quirl")
+                })?;
+            }
+            self.restore_group = None;
+            self.restore_modes = None;
+            Ok(())
+        }
     }
 
     impl Drop for ForegroundTerminal {
         fn drop(&mut self) {
-            if let Some(group) = self.restore_group {
-                if let Ok(_blocked) = BlockedTerminalSignals::new() {
-                    let _ = tcsetpgrp(std::io::stdin(), group);
-                    if let Some(modes) = &self.restore_modes {
-                        let _ = tcsetattr(std::io::stdin(), SetArg::TCSADRAIN, modes);
-                    }
-                }
-            }
+            let _ = self.restore();
         }
     }
 
     struct ChildWait {
         status: i32,
         stopped: bool,
+    }
+
+    fn wait_for_children_with_request(
+        children: &mut [JobChild],
+        process_group: Option<i32>,
+        request: &ProcessRequest,
+    ) -> Result<(), ShellError> {
+        let deadline = Instant::now() + request.deadline;
+        loop {
+            for child in children
+                .iter_mut()
+                .filter(|child| child.status != JobStatus::Done)
+            {
+                match child.child.try_wait() {
+                    Ok(Some(status)) => child.record(ChildWait {
+                        status: status.code().unwrap_or(1),
+                        stopped: false,
+                    }),
+                    Ok(None) => {}
+                    Err(error) => {
+                        terminate_children(children, process_group);
+                        return Err(ShellError::new(ErrorCode::Io, "could not poll command")
+                            .with_context(error.to_string())
+                            .with_help("Retry the command; report this if the failure repeats"));
+                    }
+                }
+            }
+            if children.iter().all(|child| child.status == JobStatus::Done) {
+                return Ok(());
+            }
+            let cancelled = request.cancelled.load(Ordering::Relaxed);
+            if cancelled || Instant::now() >= deadline {
+                terminate_children(children, process_group);
+                let message = if cancelled {
+                    "process execution was cancelled"
+                } else {
+                    "process execution exceeded its deadline"
+                };
+                return Err(
+                    ShellError::new(ErrorCode::ResourceLimit, message).with_help(
+                        "Use a shorter-running command or increase the Lua policy deadline",
+                    ),
+                );
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     fn wait_for_child(child: &mut Child) -> Result<ChildWait, ShellError> {
@@ -1155,6 +1934,22 @@ mod platform {
         }
     }
 
+    fn append_captured_output(
+        retained: &mut String,
+        next: &str,
+        limit: usize,
+    ) -> Result<(), ShellError> {
+        if next.len() > limit.saturating_sub(retained.len()) {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "captured process output exceeded the retained output limit",
+            )
+            .with_help("Reduce process output or write it to a file before returning it to Lua"));
+        }
+        retained.push_str(next);
+        Ok(())
+    }
+
     fn io_write_all(mut writer: impl Write, bytes: &[u8], target: &str) -> Result<(), ShellError> {
         writer.write_all(bytes).map_err(|error| {
             ShellError::new(ErrorCode::Io, format!("could not write {target}"))
@@ -1191,6 +1986,17 @@ mod platform {
                 thread::sleep(Duration::from_millis(5));
             }
             executor.jobs()
+        }
+
+        #[test]
+        fn pathname_matching_is_unicode_aware_and_non_exponential() {
+            assert!(glob_matches("über-?.[rR][s-t]", "über-🌀.rs"));
+            assert!(glob_matches(".quirl*", ".quirl-history"));
+            assert!(!glob_matches("*", ".quirl-history"));
+            assert!(!glob_matches(
+                "********************************x",
+                "a-very-long-candidate-without-the-final-letter",
+            ));
         }
 
         #[test]
@@ -1268,6 +2074,48 @@ mod platform {
             assert_eq!(result.status, 0);
             assert_eq!(result.stdout.as_deref(), Some("done"));
             assert_eq!(result.stderr.as_deref().map(str::len), Some(160_000));
+        }
+
+        #[test]
+        fn capture_collects_stderr_from_every_pipeline_stage() {
+            let result = NativeExecutor::default()
+                .execute_capture(
+                    "sh -c 'printf first >&2' | sh -c 'cat >/dev/null; printf second >&2'",
+                )
+                .unwrap();
+            assert_eq!(result.status, 0);
+            assert_eq!(result.stderr.as_deref(), Some("firstsecond"));
+        }
+
+        #[test]
+        fn bounded_capture_cancels_a_process_tree_at_its_deadline() {
+            let request = ProcessRequest {
+                command: "sh -c 'sleep 5'".to_owned(),
+                deadline: Duration::from_millis(20),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: 1024,
+            };
+            let started = Instant::now();
+            let error = NativeExecutor::default()
+                .execute_capture_request(request)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn bounded_capture_drains_but_does_not_retain_unbounded_output() {
+            let request = ProcessRequest {
+                command: "sh -c 'yes x | head -c 65536'".to_owned(),
+                deadline: Duration::from_secs(1),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: 1024,
+            };
+            let error = NativeExecutor::default()
+                .execute_capture_request(request)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("output limit"));
         }
 
         #[test]
@@ -1390,7 +2238,7 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use quirl_core::{CommandOutcome, CommandRunner, ErrorCode, ShellError};
+    use quirl_core::{CommandOutcome, CommandRunner, ErrorCode, ProcessRequest, ShellError};
     use quirl_syntax::{parse_command_list, ListConnector, Pipeline, RedirectKind, SimpleCommand};
     use serde::{Deserialize, Serialize};
     use std::{
@@ -1399,7 +2247,9 @@ mod platform {
         io::{self, Read, Write},
         os::windows::io::AsRawHandle,
         process::{Child, ChildStdout, Command, Stdio},
+        sync::atomic::Ordering,
         thread::{self, JoinHandle},
+        time::Instant,
     };
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE},
@@ -1435,7 +2285,12 @@ mod platform {
         object: JobObject,
     }
 
-    type ReaderTask = JoinHandle<io::Result<Vec<u8>>>;
+    struct ReaderCapture {
+        bytes: Vec<u8>,
+        truncated: bool,
+    }
+
+    type ReaderTask = JoinHandle<io::Result<ReaderCapture>>;
 
     pub struct NativeExecutor {
         jobs: Vec<Job>,
@@ -1454,8 +2309,8 @@ mod platform {
             self.0.assign(child)
         }
 
-        pub fn terminate(&self, _child: &mut Child) {
-            let _ = self.0.terminate(130);
+        pub fn terminate(&self, _child: &mut Child) -> Result<(), ShellError> {
+            self.0.terminate(130)
         }
     }
 
@@ -1486,6 +2341,13 @@ mod platform {
 
         pub fn execute_capture(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, true)
+        }
+
+        pub fn execute_capture_request(
+            &mut self,
+            request: ProcessRequest,
+        ) -> Result<CommandOutcome, ShellError> {
+            self.execute_inner_with_request(&request.command, true, Some(&request))
         }
 
         pub fn jobs(&mut self) -> Vec<JobState> {
@@ -1532,6 +2394,15 @@ mod platform {
             input: &str,
             capture: bool,
         ) -> Result<CommandOutcome, ShellError> {
+            self.execute_inner_with_request(input, capture, None)
+        }
+
+        fn execute_inner_with_request(
+            &mut self,
+            input: &str,
+            capture: bool,
+            request: Option<&ProcessRequest>,
+        ) -> Result<CommandOutcome, ShellError> {
             let graph = parse_command_list(input).map_err(|error| {
                 ShellError::new(ErrorCode::InvalidCommand, error.message)
                     .with_label(
@@ -1559,10 +2430,18 @@ mod platform {
                         continue;
                     }
                 }
-                last = self.execute_pipeline(pipeline, input, capture)?;
+                last = self.execute_pipeline(pipeline, input, capture, request)?;
                 if capture {
-                    captured_stdout.push_str(last.stdout.as_deref().unwrap_or_default());
-                    captured_stderr.push_str(last.stderr.as_deref().unwrap_or_default());
+                    append_captured_output(
+                        &mut captured_stdout,
+                        last.stdout.as_deref().unwrap_or_default(),
+                        request.map_or(usize::MAX, |request| request.max_output_bytes),
+                    )?;
+                    append_captured_output(
+                        &mut captured_stderr,
+                        last.stderr.as_deref().unwrap_or_default(),
+                        request.map_or(usize::MAX, |request| request.max_output_bytes),
+                    )?;
                 }
             }
             if capture {
@@ -1577,6 +2456,7 @@ mod platform {
             pipeline: &Pipeline,
             source: &str,
             capture: bool,
+            request: Option<&ProcessRequest>,
         ) -> Result<CommandOutcome, ShellError> {
             if pipeline.commands.len() == 1 {
                 if pipeline.background
@@ -1600,7 +2480,7 @@ mod platform {
                     );
                 }
             }
-            self.spawn_pipeline(pipeline, source, capture)
+            self.spawn_pipeline(pipeline, source, capture, request)
         }
 
         fn execute_builtin(
@@ -1690,6 +2570,7 @@ mod platform {
             pipeline: &Pipeline,
             source: &str,
             capture: bool,
+            request: Option<&ProcessRequest>,
         ) -> Result<CommandOutcome, ShellError> {
             let object = JobObject::new()?;
             let mut children = Vec::with_capacity(pipeline.commands.len());
@@ -1749,13 +2630,20 @@ mod platform {
                 })?;
                 if capture && !pipeline.background {
                     if let Some(stderr) = child.stderr.take() {
-                        stderr_readers.push(spawn_reader(stderr));
+                        stderr_readers.push(spawn_reader(
+                            stderr,
+                            request.map_or(usize::MAX, |request| request.max_output_bytes),
+                        ));
                     }
                 }
                 if output.is_none() && !last {
                     previous_stdout = child.stdout.take();
                 } else if output.is_none() && last && capture && !pipeline.background {
-                    stdout_reader = child.stdout.take().map(spawn_reader);
+                    let limit = request.map_or(usize::MAX, |request| request.max_output_bytes);
+                    stdout_reader = child
+                        .stdout
+                        .take()
+                        .map(|stdout| spawn_reader(stdout, limit));
                 }
                 children.push(child);
                 exit_statuses.push(None);
@@ -1782,26 +2670,45 @@ mod platform {
                     stderr: None,
                 });
             }
-            wait_children(&mut children, &mut exit_statuses);
+            if let Some(request) = request {
+                if let Err(error) =
+                    wait_children_with_request(&object, &mut children, &mut exit_statuses, request)
+                {
+                    let _ = join_reader(stdout_reader, "pipeline stdout");
+                    for reader in stderr_readers {
+                        let _ = join_reader(Some(reader), "pipeline stderr");
+                    }
+                    return Err(error);
+                }
+            } else {
+                wait_children(&mut children, &mut exit_statuses);
+            }
             let status = exit_statuses.last().copied().flatten().unwrap_or(0);
             let stdout = if capture {
-                Some(join_reader(stdout_reader, "pipeline stdout")?)
+                Some(join_reader(stdout_reader, "pipeline stdout"))
             } else {
                 None
             };
             let stderr = if capture {
                 let mut bytes = Vec::new();
+                let mut failure = None;
                 for reader in stderr_readers {
-                    bytes.extend(join_reader(Some(reader), "pipeline stderr")?);
+                    match join_reader(Some(reader), "pipeline stderr") {
+                        Ok(output) => bytes.extend(output),
+                        Err(error) if failure.is_none() => failure = Some(error),
+                        Err(_) => {}
+                    }
                 }
-                Some(String::from_utf8_lossy(&bytes).into_owned())
+                failure.map_or(Ok(String::from_utf8_lossy(&bytes).into_owned()), Err)
             } else {
-                None
+                Ok(String::new())
             };
+            let stdout = stdout.transpose()?;
+            let stderr = stderr?;
             Ok(CommandOutcome {
                 status,
                 stdout: stdout.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
-                stderr,
+                stderr: capture.then_some(stderr),
             })
         }
     }
@@ -1947,11 +2854,22 @@ mod platform {
         .with_help("Check the redirect path and file permissions")
     }
 
-    fn spawn_reader(mut reader: impl Read + Send + 'static) -> ReaderTask {
+    fn spawn_reader(mut reader: impl Read + Send + 'static, limit: usize) -> ReaderTask {
         thread::spawn(move || {
             let mut bytes = Vec::new();
-            reader.read_to_end(&mut bytes)?;
-            Ok(bytes)
+            let mut chunk = [0_u8; 8 * 1024];
+            let mut truncated = false;
+            loop {
+                let count = reader.read(&mut chunk)?;
+                if count == 0 {
+                    break;
+                }
+                let remaining = limit.saturating_sub(bytes.len());
+                let retained = remaining.min(count);
+                bytes.extend_from_slice(&chunk[..retained]);
+                truncated |= retained < count;
+            }
+            Ok(ReaderCapture { bytes, truncated })
         })
     }
 
@@ -1960,7 +2878,12 @@ mod platform {
             return Ok(Vec::new());
         };
         match reader.join() {
-            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Ok(capture)) if capture.truncated => Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                format!("{description} exceeded the retained output limit"),
+            )
+            .with_help("Reduce process output or write it to a file before returning it to Lua")),
+            Ok(Ok(capture)) => Ok(capture.bytes),
             Ok(Err(error)) => Err(ShellError::new(
                 ErrorCode::Io,
                 format!("could not read {description}"),
@@ -1996,6 +2919,52 @@ mod platform {
                 );
             }
         }
+    }
+
+    fn wait_children_with_request(
+        object: &JobObject,
+        children: &mut [Child],
+        exit_statuses: &mut [Option<i32>],
+        request: &ProcessRequest,
+    ) -> Result<(), ShellError> {
+        let deadline = Instant::now() + request.deadline;
+        loop {
+            refresh_children(children, exit_statuses);
+            if exit_statuses.iter().all(Option::is_some) {
+                return Ok(());
+            }
+            if request.cancelled.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                object.terminate(130)?;
+                wait_children(children, exit_statuses);
+                let message = if request.cancelled.load(Ordering::Relaxed) {
+                    "process execution was cancelled"
+                } else {
+                    "process execution exceeded its deadline"
+                };
+                return Err(
+                    ShellError::new(ErrorCode::ResourceLimit, message).with_help(
+                        "Use a shorter-running command or increase the Lua policy deadline",
+                    ),
+                );
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn append_captured_output(
+        retained: &mut String,
+        next: &str,
+        limit: usize,
+    ) -> Result<(), ShellError> {
+        if next.len() > limit.saturating_sub(retained.len()) {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "captured process output exceeded the retained output limit",
+            )
+            .with_help("Reduce process output or write it to a file before returning it to Lua"));
+        }
+        retained.push_str(next);
+        Ok(())
     }
 
     fn missing_job_error(id: u32) -> ShellError {
@@ -2036,6 +3005,16 @@ mod platform {
 }
 
 pub use platform::{ChildProcessTree, JobState, JobStatus, NativeExecutor};
+
+/// Process host adapter for sandboxed callers.  A fresh executor keeps Lua
+/// process work isolated from the interactive job table while still using the
+/// platform backend's process-tree containment.
+pub fn sandboxed_process_host() -> quirl_core::ProcessHost {
+    std::sync::Arc::new(|request| {
+        let mut executor = NativeExecutor::default();
+        executor.execute_capture_request(request)
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobLifecycleEvent {
@@ -2109,7 +3088,13 @@ impl ProcessBackend for NativeExecutor {
 #[cfg(test)]
 mod backend_contract_tests {
     use super::*;
-    use std::{fs, path::PathBuf, time::Instant};
+    use quirl_core::ErrorCode;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{atomic::AtomicBool, Arc},
+        time::{Duration, Instant},
+    };
 
     fn temporary_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("quirl-backend-{name}-{}", std::process::id()))
@@ -2148,6 +3133,112 @@ mod backend_contract_tests {
         assert_eq!(outcome.status, 0);
         assert!(fs::read_to_string(&output).unwrap().contains("hello"));
         fs::remove_file(output).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_expands_parameters_arithmetic_substitutions_and_here_strings() {
+        std::env::set_var("QUIRL_C1_WORD", "expanded");
+        let mut backend = NativeExecutor::default();
+        let output = backend
+            .execute_capture(
+                "printf '%s|%s|%s|%s\\n' $QUIRL_C1_WORD $((1 + 2)) $((1 + ((2)))) $(printf nested); cat <<< value",
+            )
+            .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(
+            output.stdout.as_deref(),
+            Some("expanded|3|3|nested\nvalue\n")
+        );
+        std::env::remove_var("QUIRL_C1_WORD");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_preserves_single_quotes_and_descriptor_redirects() {
+        let output = temporary_path("c1-stderr");
+        let mut backend = NativeExecutor::default();
+        let command = format!(
+            "printf '%s' '$HOME'; sh -c 'printf err >&2' 2> {}",
+            output.display()
+        );
+        let result = backend.execute_capture(&command).unwrap();
+        assert_eq!(result.stdout.as_deref(), Some("$HOME"));
+        assert_eq!(fs::read_to_string(&output).unwrap(), "err");
+        fs::remove_file(output).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_file_redirect_and_stderr_duplication_share_one_output_handle() {
+        let output = temporary_path("c1-merged-output");
+        let command = format!(
+            "sh -c 'printf stdout; printf stderr >&2' > {} 2>&1",
+            output.display()
+        );
+        let result = NativeExecutor::default().execute_capture(&command).unwrap();
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout.as_deref(), Some(""));
+        assert_eq!(fs::read_to_string(&output).unwrap(), "stdoutstderr");
+        fs::remove_file(output).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_duplication_before_stdout_redirect_fails_closed() {
+        let output = temporary_path("c1-ordered-redirect");
+        let command = format!(
+            "sh -c 'printf stdout; printf stderr >&2' 2>&1 > {}",
+            output.display()
+        );
+        let error = NativeExecutor::default()
+            .execute_capture(&command)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert!(error.message.contains("before a later stdout"));
+        assert!(error.details.help[0].contains("> file 2>&1"));
+        assert!(!output.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_expands_the_actual_previous_status() {
+        let output = NativeExecutor::default()
+            .execute_capture("false; printf '%s' $?")
+            .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.as_deref(), Some("1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_substitution_honors_outer_cancellation_and_deadline() {
+        let mut backend = NativeExecutor::default();
+        let request = quirl_core::ProcessRequest {
+            command: "printf '%s' $(sleep 1)".to_owned(),
+            deadline: Duration::from_millis(20),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            max_output_bytes: 1024,
+        };
+        let started = Instant::now();
+        let error = backend.execute_capture_request(request).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_substitution_depth_is_bounded_before_stack_exhaustion() {
+        let mut source = "printf leaf".to_owned();
+        for _ in 0..9 {
+            source = format!("printf $({source})");
+        }
+        let error = NativeExecutor::default()
+            .execute_capture(&source)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert!(error.message.contains("depth limit"));
+        assert!(error.details.help[0].contains("Flatten nested"));
     }
 
     #[test]

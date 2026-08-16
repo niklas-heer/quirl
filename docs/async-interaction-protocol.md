@@ -1,0 +1,22 @@
+# Async picker and completion protocol
+
+The interactive picker and catalog completion engine use independently owned,
+versioned request/response envelopes. Both are protocol version 1 and have a
+`frozen_major` reader policy: only version 1 is readable. There is no
+pre-envelope wire format to migrate, so missing, expired, and future versions
+fail closed with a validation diagnostic. A future compatible shape requires a
+new major protocol version and an explicit migration range.
+
+Every request has a strictly increasing `request_id`, a positive bounded
+deadline, and a bounded result limit. Picker requests additionally bound the
+query, item count, total payload, each JSON value, and JSON nesting. Completion
+requests bound the input, cursor boundary, result count, and deadline.
+
+Workers compare each in-flight request against the newest ID and accept a
+versioned cancellation envelope. Results are published and consumed only when
+their request ID is still current; a delayed result can therefore never replace
+the display for newer input. Cancellation and deadline expiry have explicit
+typed response outcomes rather than partial selection or completion data.
+
+The exact descriptors and hashes are recorded in
+`protocol-freeze-v1.json` under the `picker` and `completion` contracts.

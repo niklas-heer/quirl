@@ -1,7 +1,8 @@
 # Quirl language service
 
 `quirl lsp` is Quirl's deterministic editor service for Lua extension files
-and `.quirl` scripts. It communicates over standard LSP `Content-Length`
+and native Quirl scripts. `.qrl` is the canonical native extension; `.quirl`
+and `.🌀` are accepted input aliases. It communicates over standard LSP `Content-Length`
 framing on stdin/stdout, so editors can launch the Quirl binary directly.
 
 The server accepts messages up to 4 MiB and implements:
@@ -18,7 +19,7 @@ but never call the resulting function or evaluate document text. This means
 editing a file containing `os.execute(...)`, an infinite loop, or plugin
 registration cannot cause the language server to perform that operation.
 
-For `.quirl` files, command and option intelligence comes from the same
+For native Quirl files, command and option intelligence comes from the same
 versioned `Catalog` used by the REPL and `quirl complete`. The Phase 2 service
 also reports deterministic structural diagnostics for mismatched delimiters,
 unterminated strings, and empty pipeline stages. It does not spawn commands or
@@ -32,7 +33,8 @@ Configure an LSP client with this stdio command:
 quirl lsp
 ```
 
-Use `lua` as the language id for Lua files and `quirl` for `.quirl` files.
+Use `lua` as the language id for Lua files and `quirl` for native Quirl files,
+regardless of whether they use `.qrl`, `.quirl`, or `.🌀`.
 The server uses UTF-16 LSP positions and publishes a complete replacement
 diagnostic set after every open or full-text change.
 

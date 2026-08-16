@@ -2,14 +2,15 @@ use clap::ValueEnum;
 use quirl_core::{escape_json_terminal_controls, ErrorCode, ShellError};
 use quirl_data::DataRuntime;
 use quirl_lua::{format_file, LuaPolicy, LuaRuntime, MAX_LUA_SOURCE_BYTES};
-use quirl_process::{ChildProcessTree, NativeExecutor};
-use quirl_syntax::check_script;
+use quirl_process::{sandboxed_process_host, ChildProcessTree, NativeExecutor};
+use quirl_syntax::{check_script, parse_command_list};
 use quirl_ui::render_error;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     fs,
     io::{self, Read},
+    ops::Range,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -24,6 +25,8 @@ use std::{
 use std::os::unix::process::CommandExt;
 
 const MAX_REFERENCE_CAPTURE_BYTES: usize = 64 * 1024;
+const QUIRL_CANONICAL_EXTENSION: &str = "qrl";
+const QUIRL_EXTENSION_ALIASES: [&str; 2] = ["quirl", "🌀"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ScriptLanguage {
@@ -192,7 +195,8 @@ pub fn test_paths(path: &Path) -> Result<i32, ShellError> {
     let mut total = 0;
     let mut failed = 0;
     for file in files {
-        let runtime = LuaRuntime::new(LuaPolicy::script())?;
+        let runtime =
+            LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
         match runtime.test_file(&file) {
             Ok(count) => {
                 total += count;
@@ -237,7 +241,7 @@ fn discover_supported_files(path: &Path) -> Result<Vec<PathBuf>, ShellError> {
             ErrorCode::InvalidArgument,
             format!("{} is not a regular file or directory", path.display()),
         )
-        .with_help("Pass a .lua/.quirl file or a directory containing scripts"));
+        .with_help("Pass a .lua, .qrl, .quirl, or .🌀 file, or a directory containing scripts"));
     }
     files.sort();
     if files.is_empty() {
@@ -245,7 +249,7 @@ fn discover_supported_files(path: &Path) -> Result<Vec<PathBuf>, ShellError> {
             ErrorCode::InvalidArgument,
             format!("no supported scripts found under {}", path.display()),
         )
-        .with_help("Add a .lua or .quirl file, or pass a different path"));
+        .with_help("Add a .lua, .qrl, .quirl, or .🌀 file, or pass a different path"));
     }
     Ok(files)
 }
@@ -288,9 +292,13 @@ fn path_error(path: &Path, error: io::Error) -> ShellError {
 fn script_language_for_path(path: &Path) -> Option<ScriptLanguage> {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("lua") => Some(ScriptLanguage::Lua),
-        Some("quirl") => Some(ScriptLanguage::Quirl),
+        Some(extension) if is_quirl_extension(extension) => Some(ScriptLanguage::Quirl),
         _ => None,
     }
+}
+
+fn is_quirl_extension(extension: &str) -> bool {
+    extension == QUIRL_CANONICAL_EXTENSION || QUIRL_EXTENSION_ALIASES.contains(&extension)
 }
 
 fn check_script_file(path: &Path) -> Result<(), ShellError> {
@@ -309,8 +317,17 @@ fn check_script_file(path: &Path) -> Result<(), ShellError> {
     }
 }
 
-fn check_quirl_source(source: &str, source_name: &str) -> Result<(), ShellError> {
-    let diagnostics = check_script(source);
+pub(crate) fn check_quirl_source(source: &str, source_name: &str) -> Result<(), ShellError> {
+    let statements = native_script_statements(source, source_name)?;
+    let mut diagnostics = check_script(&script_without_explicit_blocks(source, &statements));
+    for statement in &statements {
+        if statement.explicit && statement.kind == NativeStatementKind::Command {
+            diagnostics.extend(command_block_diagnostics(source, statement));
+        }
+    }
+    diagnostics.sort_by(|left, right| {
+        (left.start, left.end, &left.message).cmp(&(right.start, right.end, &right.message))
+    });
     if diagnostics.is_empty() {
         return Ok(());
     }
@@ -466,7 +483,8 @@ pub fn run_source_with_cancellation(
     let language = detect_language(source, path, requested_language)?;
     match language {
         ScriptLanguage::Lua => {
-            let runtime = LuaRuntime::new(LuaPolicy::script())?;
+            let runtime =
+                LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
             let value = runtime.run_source(source, source_name, arguments)?;
             let status = structured_status(&value)?;
             Ok(ScriptRunOutput { status, value })
@@ -481,6 +499,56 @@ pub fn run_source_with_cancellation(
             language.executable(),
         ),
     }
+}
+
+/// Run the body of an explicit interactive dialect island through the same bounded reference
+/// boundary used for Bash/Zsh scripts. The caller owns rendering, so this returns the common
+/// command outcome instead of script JSON.
+pub fn run_interactive_island(
+    language: ScriptLanguage,
+    source: &str,
+    cancellation: &ScriptCancellation,
+) -> Result<quirl_core::CommandOutcome, ShellError> {
+    let signal_id = signal_hook::flag::register(
+        signal_hook::consts::SIGINT,
+        Arc::clone(&cancellation.cancelled),
+    )
+    .map_err(|error| {
+        ShellError::new(
+            ErrorCode::Io,
+            "could not install interactive island cancellation handler",
+        )
+        .with_context(error.to_string())
+        .with_help("Retry the island; report repeated signal-handler failures")
+    })?;
+    let executable = language.executable();
+    let result = run_reference_script(
+        source,
+        "<interactive island>",
+        language,
+        &[],
+        cancellation,
+        executable,
+    );
+    signal_hook::low_level::unregister(signal_id);
+    let output = result?;
+    let stdout = output
+        .value
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let stderr = output
+        .value
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(quirl_core::CommandOutcome {
+        status: output.status,
+        stdout: Some(stdout),
+        stderr: Some(stderr),
+    })
 }
 
 impl ScriptLanguage {
@@ -517,7 +585,7 @@ pub fn detect_language(
     {
         return match extension {
             "lua" => Ok(ScriptLanguage::Lua),
-            "quirl" => Ok(ScriptLanguage::Quirl),
+            extension if is_quirl_extension(extension) => Ok(ScriptLanguage::Quirl),
             "sh" | "bash" => Ok(ScriptLanguage::Bash),
             "zsh" => Ok(ScriptLanguage::Zsh),
             _ => Err(unsupported_language_error(Some(extension))),
@@ -591,7 +659,7 @@ fn unsupported_language_error(extension: Option<&str>) -> ShellError {
     )
     .with_context(context)
     .with_help(
-        "Use a .lua/.quirl/.sh/.bash/.zsh file, a recognized shebang, or pass `--lang lua|quirl|bash|zsh`",
+        "Use a .lua, .qrl, .quirl, .🌀, .sh, .bash, or .zsh file, a recognized shebang, or pass `--lang lua|quirl|bash|zsh`",
     )
 }
 
@@ -648,6 +716,10 @@ fn run_reference_script(
             ))
         }
     }
+    // The syntax-error classifier matches untranslated interpreter
+    // diagnostics, so pin the message locale; localized environments would
+    // otherwise turn labeled syntax errors into plain nonzero statuses.
+    command.env("LC_ALL", "C");
     command
         .args(arguments)
         .stdin(Stdio::inherit())
@@ -686,9 +758,10 @@ fn run_reference_script(
     let stderr = child.stderr.take().map(spawn_stream_reader);
     let status = loop {
         if cancellation.cancelled.load(Ordering::Relaxed) {
-            terminate_reference_process(&mut child, &containment);
+            let termination = terminate_reference_process(&mut child, &containment);
             let _ = join_stream_reader(stdout, "reference runner stdout");
             let _ = join_stream_reader(stderr, "reference runner stderr");
+            termination?;
             return Err(ShellError::new(
                 ErrorCode::ResourceLimit,
                 format!("{executable} script execution was cancelled"),
@@ -705,7 +778,8 @@ fn run_reference_script(
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(Duration::from_millis(2)),
             Err(error) => {
-                terminate_reference_process(&mut child, &containment);
+                let termination = terminate_reference_process(&mut child, &containment);
+                termination?;
                 return Err(ShellError::new(
                     ErrorCode::Io,
                     format!("could not observe `{executable}` script status"),
@@ -750,7 +824,10 @@ fn run_reference_script(
     })
 }
 
-fn terminate_reference_process(child: &mut std::process::Child, containment: &ChildProcessTree) {
+fn terminate_reference_process(
+    child: &mut std::process::Child,
+    containment: &ChildProcessTree,
+) -> Result<(), ShellError> {
     #[cfg(unix)]
     if let Ok(process_group) = i32::try_from(child.id()) {
         let _ = nix::sys::signal::killpg(
@@ -758,9 +835,12 @@ fn terminate_reference_process(child: &mut std::process::Child, containment: &Ch
             nix::sys::signal::Signal::SIGKILL,
         );
     }
-    containment.terminate(child);
-    let _ = child.kill();
+    let result = containment.terminate(child);
+    if result.is_err() {
+        let _ = child.kill();
+    }
     let _ = child.wait();
+    result
 }
 
 #[derive(Debug)]
@@ -870,54 +950,348 @@ fn run_quirl_source(
     let mut executor = NativeExecutor::default();
     let data = DataRuntime::new();
     let mut value = json!({ "args": arguments, "status": 0 });
-    for (line_index, line) in source.lines().enumerate() {
-        if line_index == 0 && line.starts_with("#!") {
-            continue;
-        }
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(expression) = line.strip_prefix("data ") {
-            value = data.eval(expression).map_err(|error| {
-                error.with_label(
-                    Some(source_name.to_owned()),
-                    line_offset(source, line_index),
-                    line_offset(source, line_index) + line.len(),
-                    "failed Quirl data statement",
-                )
-            })?;
-            continue;
-        }
-        let outcome = executor.execute_capture(line).map_err(|error| {
-            error.with_label(
-                Some(source_name.to_owned()),
-                line_offset(source, line_index),
-                line_offset(source, line_index) + line.len(),
-                "failed Quirl command statement",
-            )
-        })?;
-        value = json!({
-            "status": outcome.status,
-            "stdout": outcome.stdout.unwrap_or_default(),
-            "stderr": outcome.stderr.unwrap_or_default(),
-        });
-        if outcome.status != 0 {
-            return Ok(ScriptRunOutput {
-                status: outcome.status,
-                value,
-            });
+    for statement in native_script_statements(source, source_name)? {
+        let statement_source = &source[statement.body.clone()];
+        match statement.kind {
+            NativeStatementKind::Data => {
+                value = data.eval(statement_source.trim()).map_err(|error| {
+                    error.with_label(
+                        Some(source_name.to_owned()),
+                        statement.body.start,
+                        statement.body.end,
+                        "failed Quirl data statement",
+                    )
+                })?;
+            }
+            NativeStatementKind::Command => {
+                let outcome = if statement.explicit {
+                    execute_command_block(
+                        &mut executor,
+                        source,
+                        source_name,
+                        statement.body.clone(),
+                    )?
+                } else {
+                    execute_native_command(
+                        &mut executor,
+                        statement_source,
+                        source_name,
+                        statement.body.clone(),
+                    )?
+                };
+                value = json!({
+                    "status": outcome.status,
+                    "stdout": outcome.stdout.unwrap_or_default(),
+                    "stderr": outcome.stderr.unwrap_or_default(),
+                });
+                if outcome.status != 0 {
+                    return Ok(ScriptRunOutput {
+                        status: outcome.status,
+                        value,
+                    });
+                }
+            }
         }
     }
     Ok(ScriptRunOutput { status: 0, value })
 }
 
-fn line_offset(source: &str, line_index: usize) -> usize {
-    source
-        .split_inclusive('\n')
-        .take(line_index)
-        .map(str::len)
-        .sum()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeStatementKind {
+    Data,
+    Command,
+}
+
+#[derive(Debug, Clone)]
+struct NativeScriptStatement {
+    kind: NativeStatementKind,
+    /// The source range that identifies this statement, including explicit delimiters.
+    span: Range<usize>,
+    /// The expression or command text, excluding explicit block delimiters.
+    body: Range<usize>,
+    explicit: bool,
+}
+
+#[derive(Debug)]
+struct OpenNativeBlock {
+    kind: NativeStatementKind,
+    span_start: usize,
+    opener_span: Range<usize>,
+    body_start: usize,
+    indentation: String,
+}
+
+/// Parse explicit native script boundaries before handing command text to the shared grammar.
+///
+/// Delimiters intentionally occupy complete lines. A closing `}` must have the same indentation
+/// as its opening `data {` or `command {`; this keeps indented JSON/object syntax in a data body
+/// unambiguous without introducing another escaping convention.
+fn native_script_statements(
+    source: &str,
+    source_name: &str,
+) -> Result<Vec<NativeScriptStatement>, ShellError> {
+    let mut statements = Vec::new();
+    let mut open: Option<OpenNativeBlock> = None;
+    let mut offset = 0;
+
+    for (line_index, raw_line) in source.split_inclusive('\n').enumerate() {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let leading_len = line.len().saturating_sub(line.trim_start().len());
+        let trimmed = line.trim();
+        let trimmed_start = offset + leading_len;
+        let trimmed_end = trimmed_start + trimmed.len();
+
+        if let Some(block) = &open {
+            if is_native_block_opener(trimmed).is_some() {
+                return Err(native_block_error(
+                    source_name,
+                    trimmed_start..trimmed_end,
+                    "native script blocks cannot nest",
+                    "Close the current block before opening another `data {` or `command {` block",
+                ));
+            }
+            if is_aligned_block_closer(line, &block.indentation) {
+                let Some(block) = open.take() else {
+                    return Err(native_block_error(
+                        source_name,
+                        trimmed_start..trimmed_end,
+                        "native script block state was lost",
+                        "Retry the script; report this internal parser state failure",
+                    ));
+                };
+                if source[block.body_start..offset].trim().is_empty() {
+                    return Err(native_block_error(
+                        source_name,
+                        block.opener_span,
+                        "native script block is empty",
+                        "Put a data expression or command statement between the delimiters",
+                    ));
+                }
+                statements.push(NativeScriptStatement {
+                    kind: block.kind,
+                    span: block.span_start..(offset + raw_line.len()),
+                    body: block.body_start..offset,
+                    explicit: true,
+                });
+                offset += raw_line.len();
+                continue;
+            }
+            if block.kind == NativeStatementKind::Command && trimmed == "}" {
+                return Err(native_block_error(
+                    source_name,
+                    trimmed_start..trimmed_end,
+                    "command block terminator is ambiguously indented",
+                    "Align the closing `}` with the `command {` line",
+                ));
+            }
+            offset += raw_line.len();
+            continue;
+        }
+
+        if line_index == 0 && trimmed.starts_with("#!") {
+            offset += raw_line.len();
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            offset += raw_line.len();
+            continue;
+        }
+        if let Some(kind) = is_native_block_opener(trimmed) {
+            open = Some(OpenNativeBlock {
+                kind,
+                span_start: trimmed_start,
+                opener_span: trimmed_start..trimmed_end,
+                body_start: offset + raw_line.len(),
+                indentation: line[..leading_len].to_owned(),
+            });
+            offset += raw_line.len();
+            continue;
+        }
+        if trimmed == "}" {
+            return Err(native_block_error(
+                source_name,
+                trimmed_start..trimmed_end,
+                "native script block closes without an opening delimiter",
+                "Open a `data {` or `command {` block first, or remove this `}`",
+            ));
+        }
+        if looks_like_ambiguous_command_block(trimmed) {
+            return Err(native_block_error(
+                source_name,
+                trimmed_start..trimmed_end,
+                "explicit command blocks must open on their own line",
+                "Write `command {` on one line, put commands below it, and align a closing `}`",
+            ));
+        }
+
+        let kind = if quirl_syntax::data_statement_expression(trimmed).is_some() {
+            NativeStatementKind::Data
+        } else {
+            NativeStatementKind::Command
+        };
+        let body_start = match kind {
+            NativeStatementKind::Data => {
+                trimmed_start + trimmed.len()
+                    - quirl_syntax::data_statement_expression(trimmed).map_or(0, str::len)
+            }
+            NativeStatementKind::Command => trimmed_start,
+        };
+        statements.push(NativeScriptStatement {
+            kind,
+            span: trimmed_start..trimmed_end,
+            body: body_start..trimmed_end,
+            explicit: false,
+        });
+        offset += raw_line.len();
+    }
+
+    if let Some(block) = open {
+        return Err(native_block_error(
+            source_name,
+            block.opener_span,
+            "native script block is not closed",
+            "Add an aligned closing `}` for this `data {` or `command {` block",
+        ));
+    }
+    Ok(statements)
+}
+
+fn is_native_block_opener(line: &str) -> Option<NativeStatementKind> {
+    [
+        ("data", NativeStatementKind::Data),
+        ("command", NativeStatementKind::Command),
+    ]
+    .into_iter()
+    .find_map(|(keyword, kind)| {
+        line.strip_prefix(keyword)
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .and_then(|rest| (rest.trim() == "{").then_some(kind))
+    })
+}
+
+fn looks_like_ambiguous_command_block(line: &str) -> bool {
+    line.strip_prefix("command")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .is_some_and(|rest| rest.trim_start().starts_with('{'))
+}
+
+fn is_aligned_block_closer(line: &str, indentation: &str) -> bool {
+    line.strip_suffix('\r').unwrap_or(line).trim_end() == format!("{indentation}}}")
+}
+
+fn native_block_error(
+    source_name: &str,
+    span: Range<usize>,
+    message: impl Into<String>,
+    help: impl Into<String>,
+) -> ShellError {
+    ShellError::new(ErrorCode::InvalidCommand, message)
+        .with_label(
+            Some(source_name.to_owned()),
+            span.start,
+            span.end,
+            "native script block",
+        )
+        .with_help(help)
+}
+
+fn script_without_explicit_blocks(source: &str, statements: &[NativeScriptStatement]) -> String {
+    let mut bytes = source.as_bytes().to_vec();
+    for statement in statements.iter().filter(|statement| statement.explicit) {
+        for byte in &mut bytes[statement.span.clone()] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+    }
+    // Replacing valid UTF-8 bytes only with ASCII space preserves UTF-8 validity.
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn command_block_diagnostics(
+    source: &str,
+    statement: &NativeScriptStatement,
+) -> Vec<quirl_syntax::CommandSyntaxError> {
+    let mut diagnostics = Vec::new();
+    let mut offset = statement.body.start;
+    for raw_line in source[statement.body.clone()].split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let leading = line.len().saturating_sub(line.trim_start().len());
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Err(mut error) = parse_command_list(trimmed) {
+                error.start += offset + leading;
+                error.end += offset + leading;
+                diagnostics.push(error);
+            }
+        }
+        offset += raw_line.len();
+    }
+    diagnostics
+}
+
+fn execute_command_block(
+    executor: &mut NativeExecutor,
+    source: &str,
+    source_name: &str,
+    body: Range<usize>,
+) -> Result<quirl_core::CommandOutcome, ShellError> {
+    let mut outcome = quirl_core::CommandOutcome {
+        status: 0,
+        stdout: Some(String::new()),
+        stderr: Some(String::new()),
+    };
+    let mut offset = body.start;
+    for raw_line in source[body].split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let leading = line.len().saturating_sub(line.trim_start().len());
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            let line_outcome = execute_native_command(
+                executor,
+                trimmed,
+                source_name,
+                (offset + leading)..(offset + leading + trimmed.len()),
+            )?;
+            outcome.status = line_outcome.status;
+            if let Some(stdout) = line_outcome.stdout {
+                outcome
+                    .stdout
+                    .get_or_insert_with(String::new)
+                    .push_str(&stdout);
+            }
+            if let Some(stderr) = line_outcome.stderr {
+                outcome
+                    .stderr
+                    .get_or_insert_with(String::new)
+                    .push_str(&stderr);
+            }
+            if outcome.status != 0 {
+                return Ok(outcome);
+            }
+        }
+        offset += raw_line.len();
+    }
+    Ok(outcome)
+}
+
+fn execute_native_command(
+    executor: &mut NativeExecutor,
+    command: &str,
+    source_name: &str,
+    span: Range<usize>,
+) -> Result<quirl_core::CommandOutcome, ShellError> {
+    executor.execute_capture(command).map_err(|error| {
+        error.with_label(
+            Some(source_name.to_owned()),
+            span.start,
+            span.end,
+            "failed Quirl command statement",
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1003,6 +1377,17 @@ mod tests {
             detect_language("#!/usr/bin/env zsh\necho zsh", None, None).unwrap(),
             ScriptLanguage::Zsh
         );
+    }
+
+    #[test]
+    fn native_quirl_extensions_select_the_same_language() {
+        for path in ["script.qrl", "script.quirl", "script.🌀"] {
+            assert_eq!(
+                detect_language("pwd", Some(Path::new(path)), None).unwrap(),
+                ScriptLanguage::Quirl,
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -1130,6 +1515,24 @@ mod tests {
     }
 
     #[test]
+    fn interactive_dialect_island_observes_cancellation() {
+        if !reference_interpreter_available("bash") {
+            eprintln!("skipping bash: interpreter is unavailable");
+            return;
+        }
+        let cancellation = ScriptCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            run_interactive_island(ScriptLanguage::Bash, "sleep 10", &worker_cancellation)
+        });
+        thread::sleep(Duration::from_millis(20));
+        cancellation.cancelled.store(true, Ordering::Relaxed);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.message.contains("cancelled"));
+    }
+
+    #[test]
     fn lua_stdin_source_runs_with_arguments_under_script_policy() {
         let output = run_source(
             "return { main = function(ctx) return { value = ctx.args[1] } end }",
@@ -1163,8 +1566,8 @@ mod tests {
     fn quirl_script_stops_at_a_failed_command() {
         let output = run_source(
             "false\nprintf should-not-run",
-            "failure.quirl",
-            Some(Path::new("failure.quirl")),
+            "failure.qrl",
+            Some(Path::new("failure.qrl")),
             None,
             &[],
         )
@@ -1174,16 +1577,147 @@ mod tests {
     }
 
     #[test]
-    fn recursive_discovery_is_sorted_and_skips_git_target_and_symlink_directories() {
-        let root = test_directory("discover");
+    fn quirl_script_executes_data_statements_separated_by_tabs() {
+        let output = run_source(
+            "data\t[1, 2, 3] | length",
+            "tabbed-data.qrl",
+            Some(Path::new("tabbed-data.qrl")),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.value, json!(3));
+    }
+
+    #[test]
+    fn native_aliases_run_canonical_multiline_data_blocks() {
+        let source = "data {\n  [1, 2, 3] | length\n}\n";
+        for path in ["workflow.qrl", "workflow.quirl", "workflow.🌀"] {
+            let output = run_source(source, path, Some(Path::new(path)), None, &[]).unwrap();
+            assert_eq!(output.status, 0, "{path}");
+            assert_eq!(output.value, json!(3), "{path}");
+        }
+    }
+
+    #[test]
+    fn native_command_blocks_execute_each_nonempty_line_in_order() {
+        let output = run_source(
+            "command {\n  printf first\n  # deliberately ignored\n  printf second\n}\n",
+            "workflow.qrl",
+            Some(Path::new("workflow.qrl")),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.value["stdout"], "firstsecond");
+    }
+
+    #[test]
+    fn indented_data_braces_do_not_close_the_outer_block() {
+        let output = run_source(
+            "data {\n  {\n    \"value\": [1, 2, 3]\n  } | get value | length\n}\n",
+            "object.qrl",
+            Some(Path::new("object.qrl")),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(output.value, json!(3));
+    }
+
+    #[test]
+    fn legacy_data_object_expression_remains_line_oriented_compatible() {
+        let output = run_source(
+            "data {\"value\": [1, 2]} | get value | length",
+            "legacy.qrl",
+            Some(Path::new("legacy.qrl")),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(output.value, json!(2));
+    }
+
+    #[test]
+    fn unclosed_native_block_has_a_labeled_actionable_diagnostic() {
+        let source = "data {\n  [1, 2]\n";
+        let error = run_source(
+            source,
+            "broken.qrl",
+            Some(Path::new("broken.qrl")),
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert_eq!(
+            error.details.labels[0].source.as_deref(),
+            Some("broken.qrl")
+        );
+        assert_eq!(error.details.labels[0].start, 0);
+        assert!(error.details.help[0].contains("closing `}`"));
+    }
+
+    #[test]
+    fn nested_native_blocks_are_rejected_at_the_nested_opener() {
+        let source = "data {\n  command {\n    printf no\n  }\n}\n";
+        let error = check_quirl_source(source, "nested.qrl").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert_eq!(
+            error.details.labels[0].start,
+            source.find("command {").unwrap()
+        );
+        assert!(error.message.contains("cannot nest"));
+        assert!(error.details.help[0].contains("Close the current block"));
+    }
+
+    #[test]
+    fn inline_command_block_is_rejected_as_ambiguous() {
+        let source = "command { printf no }";
+        let error = check_quirl_source(source, "ambiguous.qrl").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert_eq!(error.details.labels[0].start, 0);
+        assert!(error.message.contains("own line"));
+        assert!(error.details.help[0].contains("command {`"));
+    }
+
+    #[test]
+    fn command_block_check_offsets_a_body_syntax_error() {
+        let source = "command {\n  printf okay |\n}\n";
+        let error = check_quirl_source(source, "invalid-command.qrl").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        let label = &error.details.labels[0];
+        assert_eq!(label.source.as_deref(), Some("invalid-command.qrl"));
+        assert!(label.start >= source.find("printf").unwrap());
+        assert!(error.details.help[0].contains("command"));
+    }
+
+    #[test]
+    fn block_and_compatibility_diagnostics_are_ordered_by_source_span() {
+        let source = "command {\n  printf okay |\n}\nprintf later |\n";
+        let error = check_quirl_source(source, "ordered.qrl").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert_eq!(error.details.labels.len(), 2);
+        assert!(error.details.labels[0].start < error.details.labels[1].start);
+        assert_eq!(error.details.labels[0].start, source.find("|\n}").unwrap());
+        assert_eq!(error.details.labels[1].start, source.rfind('|').unwrap());
+    }
+
+    #[test]
+    fn recursive_discovery_accepts_native_aliases_on_unicode_paths() {
+        let root = test_directory("discover-über-🌀");
         fs::create_dir_all(root.join("nested")).unwrap();
         fs::create_dir_all(root.join("target")).unwrap();
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join("z.lua"), "return 1").unwrap();
-        fs::write(root.join("a.quirl"), "pwd").unwrap();
+        fs::write(root.join("a.qrl"), "pwd").unwrap();
+        fs::write(root.join("readable.quirl"), "pwd").unwrap();
+        fs::write(root.join("novelty.🌀"), "pwd").unwrap();
         fs::write(root.join("nested/m.lua"), "return 2").unwrap();
         fs::write(root.join("target/ignored.lua"), "invalid(").unwrap();
-        fs::write(root.join(".git/ignored.quirl"), "echo ignored").unwrap();
+        fs::write(root.join(".git/ignored.qrl"), "echo ignored").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("nested"), root.join("linked")).unwrap();
 
@@ -1195,8 +1729,10 @@ mod tests {
         assert_eq!(
             relative,
             vec![
-                PathBuf::from("a.quirl"),
+                PathBuf::from("a.qrl"),
                 PathBuf::from("nested/m.lua"),
+                PathBuf::from("novelty.🌀"),
+                PathBuf::from("readable.quirl"),
                 PathBuf::from("z.lua")
             ]
         );
@@ -1212,7 +1748,7 @@ mod tests {
             "---@parm value string\nreturn value\n",
         )
         .unwrap();
-        fs::write(root.join("bad.quirl"), "printf ok |\n").unwrap();
+        fs::write(root.join("bad.qrl"), "printf ok |\n").unwrap();
 
         let report = analysis_report(&root, "check").unwrap();
         assert!(!report.valid);
@@ -1236,7 +1772,7 @@ mod tests {
             "return { test_ok = function() assert(true) end }\n",
         )
         .unwrap();
-        let quirl = root.join("workflow.quirl");
+        let quirl = root.join("workflow.qrl");
         let quirl_source = "printf preserved  \n";
         fs::write(&quirl, quirl_source).unwrap();
 

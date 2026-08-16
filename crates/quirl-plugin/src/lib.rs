@@ -1,7 +1,7 @@
-//! Stable, non-executing contracts for Quirl's Phase 3 plugin platform.
+//! Versioned contracts for Quirl's Phase 3 plugin platform.
 //!
 //! This crate validates plugin identity, permissions, reproducible lock state,
-//! and isolated runtime boundaries. Filesystem mutation and runtime composition
+//! and isolated runtime boundaries. Filesystem mutation and process execution
 //! remain in `quirl-cli`; trusted Lua execution remains in `quirl-lua`.
 
 use quirl_catalog::{
@@ -22,6 +22,10 @@ pub const PLUGIN_LOCK_FILE: &str = "plugins.lock.json";
 pub const WASM_WORLD: &str = "quirl:plugin/api@0.1.0";
 pub const WASM_HOST_IMPORT: &str = "quirl:plugin/host@0.1.0";
 pub const WASM_GUEST_EXPORT: &str = "quirl:plugin/guest@0.1.0";
+pub const ADAPTER_PROTOCOL: &str = "quirl.plugin.v1";
+pub const ADAPTER_SCHEMA_VERSION: u32 = 1;
+pub const MAX_ADAPTER_MESSAGE_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_ADAPTER_CALLBACK_TIMEOUT_MS: u64 = 60_000;
 /// Checked-in WIT world. WIT cannot express recursive `Value` or the full
 /// `ShellError` shape, so this is a narrower projection of
 /// `quirl_core::COMMON_ABI_SCHEMA_DESCRIPTOR`: wasm `value` drops nested
@@ -136,6 +140,72 @@ pub struct OutOfProcessBoundary {
     pub arguments: Vec<String>,
     pub callback_timeout_ms: u64,
     pub max_message_bytes: u64,
+}
+
+/// The only request currently admitted to an isolated process adapter. The
+/// narrow handshake deliberately exposes no host callbacks or ambient shell
+/// state: it proves executable isolation before command/event delegation is
+/// added in a future protocol version.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterInitializeRequest {
+    pub protocol: String,
+    pub schema_version: u32,
+    pub api_version: String,
+    pub operation: String,
+    pub plugin: AdapterPluginIdentity,
+    pub granted_capabilities: Vec<String>,
+}
+
+impl AdapterInitializeRequest {
+    pub fn new(name: String, version: String) -> Self {
+        Self {
+            protocol: ADAPTER_PROTOCOL.to_owned(),
+            schema_version: ADAPTER_SCHEMA_VERSION,
+            api_version: PLUGIN_API_VERSION.to_owned(),
+            operation: "initialize".to_owned(),
+            plugin: AdapterPluginIdentity { name, version },
+            // v1 does not expose host authority to child processes. The
+            // process.spawn grant authorizes this one host-side launch only.
+            granted_capabilities: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterPluginIdentity {
+    pub name: String,
+    pub version: String,
+}
+
+/// A successful adapter response is intentionally assertion-only. Returning
+/// arbitrary registrations here would create an unvalidated authority channel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterInitializeResponse {
+    pub protocol: String,
+    pub schema_version: u32,
+    pub api_version: String,
+    pub operation: String,
+    pub status: String,
+}
+
+impl AdapterInitializeResponse {
+    pub fn validate_for(&self, request: &AdapterInitializeRequest) -> Result<(), ShellError> {
+        if self.protocol != ADAPTER_PROTOCOL
+            || self.schema_version != ADAPTER_SCHEMA_VERSION
+            || self.api_version != PLUGIN_API_VERSION
+            || self.operation != request.operation
+            || self.status != "ready"
+        {
+            return Err(validation_error(
+                "out-of-process adapter returned an incompatible initialization response",
+                "Return exactly protocol `quirl.plugin.v1`, schema_version = 1, api_version = `0.1.0`, operation = `initialize`, and status = `ready`",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -262,10 +332,10 @@ impl PluginLockfile {
             ));
         }
         for plugin in &self.plugins {
-            if plugin.enabled && plugin.runtime != PluginRuntime::TrustedLua {
+            if plugin.enabled && plugin.runtime == PluginRuntime::WasmComponent {
                 return Err(validation_error(
-                    "non-executing plugin boundaries cannot be marked enabled",
-                    "Keep Wasm and out-of-process entries disabled until an isolated adapter is installed",
+                    "non-executing Wasm component boundaries cannot be marked enabled",
+                    "Keep Wasm entries disabled until a component runtime is installed",
                 ));
             }
             if plugin.resolved_api_version != PLUGIN_API_VERSION || plugin.source.trim().is_empty()
@@ -993,13 +1063,23 @@ fn validate_out_of_process(manifest: &PluginManifest) -> Result<(), ShellError> 
     })?;
     validate_relative_path(&adapter.executable)?;
     if manifest.wasm.is_some()
-        || adapter.protocol != "quirl.plugin.v1"
+        || manifest.plugin.entry != adapter.executable
+        || adapter.protocol != ADAPTER_PROTOCOL
         || adapter.callback_timeout_ms == 0
+        || adapter.callback_timeout_ms > MAX_ADAPTER_CALLBACK_TIMEOUT_MS
         || adapter.max_message_bytes == 0
+        || adapter.max_message_bytes > MAX_ADAPTER_MESSAGE_BYTES
     {
         return Err(validation_error(
             "invalid or unbounded out-of-process adapter boundary",
-            "Use protocol `quirl.plugin.v1` with non-zero message and callback limits",
+            format!("Use the entry itself as the relative executable, protocol `quirl.plugin.v1`, a callback deadline at most {MAX_ADAPTER_CALLBACK_TIMEOUT_MS} ms, and a message limit at most {MAX_ADAPTER_MESSAGE_BYTES} bytes"),
+        ));
+    }
+    let launch_grant = format!("process.spawn:{}", adapter.executable);
+    if manifest.capabilities.request != [launch_grant.clone()] {
+        return Err(validation_error(
+            "out-of-process adapters must request only their scoped launch capability",
+            format!("Set capabilities.request = [\"{launch_grant}\"]; protocol v1 exposes no other host capabilities"),
         ));
     }
     Ok(())
@@ -1498,6 +1578,68 @@ callback_timeout_ms = 25
         .unwrap();
         assert!(validate_plugin_manifest(&manifest, &wrong_world, "0.1.0").is_err());
         assert!(wasm_world_hash().starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn process_adapter_requires_an_exact_scoped_launch_grant_and_bounded_contract() {
+        let manifest = r#"schema_version = 1
+[plugin]
+name = "adapter"
+version = "0.1.0"
+entry = "adapter"
+quirl = ">=0.1, <0.2"
+api = "0.1.0"
+runtime = "out_of_process"
+summary = "Bounded process adapter"
+[capabilities]
+request = ["process.spawn:adapter"]
+[adapter]
+protocol = "quirl.plugin.v1"
+executable = "adapter"
+callback_timeout_ms = 25
+max_message_bytes = 1024
+"#;
+        let manifest = parse_plugin_manifest(manifest, "plugin.toml").unwrap();
+        assert!(validate_plugin_manifest(&manifest, b"adapter", "0.1.0").is_ok());
+
+        let extra_capability = r#"schema_version = 1
+[plugin]
+name = "adapter"
+version = "0.1.0"
+entry = "adapter"
+quirl = ">=0.1, <0.2"
+api = "0.1.0"
+runtime = "out_of_process"
+summary = "Bounded process adapter"
+[capabilities]
+request = ["process.spawn:adapter", "output.read"]
+[adapter]
+protocol = "quirl.plugin.v1"
+executable = "adapter"
+callback_timeout_ms = 25
+max_message_bytes = 1024"#;
+        let extra_capability = parse_plugin_manifest(extra_capability, "plugin.toml").unwrap();
+        assert!(validate_plugin_manifest(&extra_capability, b"adapter", "0.1.0").is_err());
+
+        let request = AdapterInitializeRequest::new("adapter".to_owned(), "0.1.0".to_owned());
+        let forged = serde_json::json!({
+            "protocol": ADAPTER_PROTOCOL,
+            "schema_version": ADAPTER_SCHEMA_VERSION,
+            "api_version": PLUGIN_API_VERSION,
+            "operation": "initialize",
+            "status": "ready",
+            "forged": true,
+        });
+        assert!(serde_json::from_value::<AdapterInitializeResponse>(forged).is_err());
+        assert!(AdapterInitializeResponse {
+            protocol: ADAPTER_PROTOCOL.to_owned(),
+            schema_version: ADAPTER_SCHEMA_VERSION,
+            api_version: PLUGIN_API_VERSION.to_owned(),
+            operation: "initialize".to_owned(),
+            status: "ready".to_owned(),
+        }
+        .validate_for(&request)
+        .is_ok());
     }
 
     #[test]

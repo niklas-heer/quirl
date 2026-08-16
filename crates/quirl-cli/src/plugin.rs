@@ -6,15 +6,27 @@ use quirl_core::{
 use quirl_lua::{LuaPolicy, LuaRuntime};
 use quirl_plugin::{
     doctor_plugin, parse_plugin_manifest, permission_diff, resolve_plugin,
-    validate_plugin_manifest, DoctorReport, PermissionDiff, PluginLockfile, PluginManifest,
-    PluginRuntime, PLUGIN_LOCK_FILE,
+    validate_plugin_manifest, AdapterInitializeRequest, AdapterInitializeResponse, DoctorReport,
+    PermissionDiff, PluginLockfile, PluginManifest, PluginRuntime, ADAPTER_PROTOCOL,
+    PLUGIN_LOCK_FILE,
 };
+use quirl_process::{sandboxed_process_host, ChildProcessTree};
 use serde::Serialize;
 use std::{
     env, fs,
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const MANIFEST_FILE: &str = "plugin.toml";
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
@@ -342,6 +354,25 @@ fn read_source_package(source: &str) -> Result<SourcePackage, ShellError> {
     })
 }
 
+/// Builds the restricted runtime for a trusted-Lua plugin. This is the single
+/// place that maps `process.spawn` grants onto `LuaPolicy::allow_process`, so
+/// activation and validation cannot drift apart.
+pub(crate) fn trusted_lua_runtime(grants: &[String]) -> Result<LuaRuntime, ShellError> {
+    let mut policy = LuaPolicy::config();
+    policy.allow_process = grants
+        .iter()
+        .any(|grant| grant == "process.spawn" || grant.starts_with("process.spawn:"));
+    if policy.allow_process {
+        LuaRuntime::new_with_capabilities_and_process_host(
+            policy,
+            grants,
+            Some(sandboxed_process_host()),
+        )
+    } else {
+        LuaRuntime::new_with_capabilities(policy, grants)
+    }
+}
+
 fn validate_runtime(
     manifest: &PluginManifest,
     entry_path: &Path,
@@ -355,27 +386,30 @@ fn validate_runtime(
         "Restore a locked entry smaller than 4 MiB before activation",
     )?;
     validate_plugin_manifest(manifest, &entry_bytes, env!("CARGO_PKG_VERSION"))?;
-    if manifest.plugin.runtime != PluginRuntime::TrustedLua {
-        if require_runnable {
-            return Err(ShellError::new(
-                ErrorCode::Validation,
-                format!(
-                    "plugin `{}` has a validated but non-executing {:?} boundary",
-                    manifest.plugin.name, manifest.plugin.runtime
-                ),
-            )
-            .with_help(
-                "Keep it disabled until an isolated Wasm or out-of-process adapter is installed",
-            ));
+    match manifest.plugin.runtime {
+        PluginRuntime::OutOfProcess => {
+            if require_runnable {
+                execute_out_of_process_adapter(manifest, entry_path, grants, None)?;
+            }
+            return Ok(());
         }
-        return Ok(());
+        PluginRuntime::WasmComponent => {
+            if require_runnable {
+                return Err(ShellError::new(
+                    ErrorCode::Validation,
+                    format!(
+                        "plugin `{}` has a validated but non-executing Wasm component boundary",
+                        manifest.plugin.name
+                    ),
+                )
+                .with_help("Keep it disabled until a component runtime is installed"));
+            }
+            return Ok(());
+        }
+        PluginRuntime::TrustedLua => {}
     }
     LuaRuntime::check_file(entry_path)?;
-    let mut policy = LuaPolicy::config();
-    policy.allow_process = grants
-        .iter()
-        .any(|grant| grant == "process.spawn" || grant.starts_with("process.spawn:"));
-    let runtime = LuaRuntime::new_with_capabilities(policy, grants)?;
+    let runtime = trusted_lua_runtime(grants)?;
     let registrations = runtime.load_plugin_file(entry_path)?;
     let registered_commands = registrations
         .commands
@@ -447,6 +481,320 @@ fn validate_runtime(
         ));
     }
     Ok(())
+}
+
+/// Execute the narrow v1 initialization handshake for a locked process
+/// adapter. This lives in the CLI composition root because it owns process
+/// creation; `quirl-plugin` owns the typed protocol and boundary validation.
+pub(crate) fn execute_out_of_process_adapter(
+    manifest: &PluginManifest,
+    entry_path: &Path,
+    grants: &[String],
+    cancellation: Option<&AtomicBool>,
+) -> Result<(), ShellError> {
+    let adapter = manifest.adapter.as_ref().ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "out-of-process adapter boundary is absent",
+        )
+        .with_help("Restore a plugin.toml with a valid [adapter] section")
+    })?;
+    let required_grant = format!("process.spawn:{}", adapter.executable);
+    if grants != [required_grant.clone()] {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "out-of-process adapter does not have its exact locked launch grant",
+        )
+        .with_context(format!("required grant: {required_grant}"))
+        .with_context(format!("locked grants: {grants:?}"))
+        .with_help("Re-add the plugin and approve only its scoped process.spawn capability"));
+    }
+    if manifest.plugin.entry != adapter.executable || adapter.protocol != ADAPTER_PROTOCOL {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "out-of-process adapter boundary no longer matches its executable contract",
+        )
+        .with_help("Restore the locked plugin manifest and run plugin doctor"));
+    }
+    let request = AdapterInitializeRequest::new(
+        manifest.plugin.name.clone(),
+        manifest.plugin.version.clone(),
+    );
+    let request = serde_json::to_vec(&request).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Io,
+            "cannot serialize adapter initialization request",
+        )
+        .with_context(error.to_string())
+        .with_help("Report this as an adapter protocol defect")
+    })?;
+    if request.len() > adapter.max_message_bytes as usize {
+        return Err(adapter_limit_error(
+            "initialization request exceeds the adapter message limit",
+            adapter.max_message_bytes,
+        ));
+    }
+
+    let package_root = entry_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut command = Command::new(entry_path);
+    command
+        .args(&adapter.arguments)
+        .current_dir(package_root)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let containment = ChildProcessTree::new()?;
+    let mut child = command.spawn().map_err(|error| {
+        ShellError::new(
+            ErrorCode::ProcessSpawn,
+            format!(
+                "could not start isolated adapter `{}`",
+                manifest.plugin.name
+            ),
+        )
+        .with_context(error.to_string())
+        .with_help("Restore the executable bit and locked adapter entry, then run plugin doctor")
+    })?;
+    containment.assign(&mut child).map_err(|error| {
+        let _ = child.kill();
+        let _ = child.wait();
+        error.with_help("Retry after restoring the adapter; process containment is required")
+    })?;
+    let output_budget = Arc::new(AdapterOutputBudget::new(adapter.max_message_bytes as usize));
+    let stdout = child
+        .stdout
+        .take()
+        .map(|stream| spawn_adapter_reader(stream, output_budget.clone()));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stream| spawn_adapter_reader(stream, output_budget));
+    let write_result = if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(&request)
+            .and_then(|()| stdin.write_all(b"\n"))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "adapter stdin pipe is unavailable",
+        ))
+    };
+    if let Err(error) = write_result {
+        let termination = terminate_adapter(&mut child, &containment);
+        let _ = join_adapter_reader(stdout, "adapter stdout");
+        let _ = join_adapter_reader(stderr, "adapter stderr");
+        termination?;
+        return Err(ShellError::new(
+            ErrorCode::Io,
+            "could not send initialization request to isolated adapter",
+        )
+        .with_context(error.to_string())
+        .with_help("Ensure the adapter accepts one JSON request on standard input"));
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(adapter.callback_timeout_ms);
+    let status = loop {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            let termination = terminate_adapter(&mut child, &containment);
+            let _ = join_adapter_reader(stdout, "adapter stdout");
+            let _ = join_adapter_reader(stderr, "adapter stderr");
+            termination?;
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "isolated adapter initialization was cancelled",
+            )
+            .with_help("Retry when cancellation is no longer requested"));
+        }
+        if Instant::now() >= deadline {
+            let termination = terminate_adapter(&mut child, &containment);
+            let _ = join_adapter_reader(stdout, "adapter stdout");
+            let _ = join_adapter_reader(stderr, "adapter stderr");
+            termination?;
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "isolated adapter initialization exceeded its callback deadline",
+            )
+            .with_context(format!("deadline: {} ms", adapter.callback_timeout_ms))
+            .with_help("Reduce initialization work or raise callback_timeout_ms after review"));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(1)),
+            Err(error) => {
+                let termination = terminate_adapter(&mut child, &containment);
+                let _ = join_adapter_reader(stdout, "adapter stdout");
+                let _ = join_adapter_reader(stderr, "adapter stderr");
+                termination?;
+                return Err(ShellError::new(
+                    ErrorCode::Io,
+                    "could not observe isolated adapter status",
+                )
+                .with_context(error.to_string())
+                .with_help("Retry the adapter; report repeated process observation failures"));
+            }
+        }
+    };
+    let stdout = join_adapter_reader(stdout, "adapter stdout")?;
+    let stderr = join_adapter_reader(stderr, "adapter stderr")?;
+    if stdout.exceeded || stderr.exceeded {
+        return Err(adapter_limit_error(
+            "isolated adapter exceeded its output message limit",
+            adapter.max_message_bytes,
+        ));
+    }
+    if !status.success() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "isolated adapter initialization failed",
+        )
+        .with_context(format!("exit status: {}", status.code().unwrap_or(1)))
+        .with_context(truncate_adapter_diagnostic(&stderr.bytes))
+        .with_help("Make the adapter return a ready response and exit successfully"));
+    }
+    if !stderr.bytes.is_empty() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "isolated adapter wrote unexpected diagnostic output during initialization",
+        )
+        .with_context(truncate_adapter_diagnostic(&stderr.bytes))
+        .with_help(
+            "Return protocol data only on stdout and reserve a clean initialization for activation",
+        ));
+    }
+    let response_bytes = newline_delimited_adapter_response(&stdout.bytes)?;
+    let response =
+        serde_json::from_slice::<AdapterInitializeResponse>(response_bytes).map_err(|error| {
+            ShellError::new(
+                ErrorCode::Validation,
+                "isolated adapter returned an invalid initialization response",
+            )
+            .with_context(error.to_string())
+            .with_help("Return one deny-unknown JSON AdapterInitializeResponse object on stdout")
+        })?;
+    response.validate_for(&AdapterInitializeRequest::new(
+        manifest.plugin.name.clone(),
+        manifest.plugin.version.clone(),
+    ))
+}
+
+#[derive(Debug)]
+struct AdapterOutput {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+#[derive(Debug)]
+struct AdapterOutputBudget {
+    limit: usize,
+    consumed: AtomicUsize,
+}
+
+impl AdapterOutputBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            consumed: AtomicUsize::new(0),
+        }
+    }
+}
+
+fn spawn_adapter_reader(
+    mut stream: impl Read + Send + 'static,
+    budget: Arc<AdapterOutputBudget>,
+) -> thread::JoinHandle<io::Result<AdapterOutput>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(budget.limit.min(8 * 1024));
+        let mut exceeded = false;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let previously_consumed = budget.consumed.fetch_add(read, Ordering::Relaxed);
+            let available = budget.limit.saturating_sub(previously_consumed);
+            let retained = available.min(read);
+            bytes.extend_from_slice(&buffer[..retained]);
+            exceeded |= retained != read;
+        }
+        Ok(AdapterOutput { bytes, exceeded })
+    })
+}
+
+fn newline_delimited_adapter_response(bytes: &[u8]) -> Result<&[u8], ShellError> {
+    let Some(response) = bytes.strip_suffix(b"\n") else {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "isolated adapter response is not newline-delimited",
+        )
+        .with_help("Write exactly one JSON response followed by a single newline"));
+    };
+    if response.is_empty() || response.contains(&b'\n') || response.contains(&b'\r') {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "isolated adapter emitted multiple or malformed initialization responses",
+        )
+        .with_help("Write exactly one compact JSON response followed by a single newline"));
+    }
+    Ok(response)
+}
+
+fn join_adapter_reader(
+    reader: Option<thread::JoinHandle<io::Result<AdapterOutput>>>,
+    description: &str,
+) -> Result<AdapterOutput, ShellError> {
+    let Some(reader) = reader else {
+        return Ok(AdapterOutput {
+            bytes: Vec::new(),
+            exceeded: false,
+        });
+    };
+    match reader.join() {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(ShellError::new(
+            ErrorCode::Io,
+            format!("could not read {description}"),
+        )
+        .with_context(error.to_string())
+        .with_help("Retry the adapter; report repeated output capture failures")),
+        Err(_) => Err(
+            ShellError::new(ErrorCode::Io, format!("{description} reader task failed"))
+                .with_help("Retry the adapter; report repeated output capture failures"),
+        ),
+    }
+}
+
+fn terminate_adapter(
+    child: &mut std::process::Child,
+    containment: &ChildProcessTree,
+) -> Result<(), ShellError> {
+    #[cfg(unix)]
+    if let Ok(group) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(group),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    let result = containment.terminate(child);
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    result
+}
+
+fn adapter_limit_error(message: &str, limit: u64) -> ShellError {
+    ShellError::new(ErrorCode::ResourceLimit, message)
+        .with_context(format!("message limit: {limit} bytes"))
+        .with_help("Reduce adapter input/output or raise max_message_bytes after review")
+}
+
+fn truncate_adapter_diagnostic(bytes: &[u8]) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+    String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DIAGNOSTIC_BYTES)]).into_owned()
 }
 
 fn contribution_names(
@@ -887,17 +1235,22 @@ summary = "Bounded plugin"
         fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn validated_nonexecuting_adapter_cannot_be_enabled() {
-        let directory = env::temp_dir().join(format!(
-            "quirl-plugin-adapter-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        fs::create_dir_all(&directory).unwrap();
+    #[cfg(unix)]
+    fn write_isolated_adapter(
+        directory: &Path,
+        body: &str,
+        timeout_ms: u64,
+        max_bytes: u64,
+    ) -> PluginManifest {
+        use std::os::unix::fs::PermissionsExt;
+
         let entry = directory.join("adapter");
-        fs::write(&entry, []).unwrap();
-        let source = r#"schema_version = 1
+        fs::write(&entry, body).unwrap();
+        let mut permissions = fs::metadata(&entry).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&entry, permissions).unwrap();
+        let source = format!(
+            r#"schema_version = 1
 [plugin]
 name = "adapter"
 version = "0.1.0"
@@ -906,17 +1259,178 @@ quirl = ">=0.1, <0.2"
 api = "0.1.0"
 runtime = "out_of_process"
 summary = "Isolation adapter contract"
+[capabilities]
+request = ["process.spawn:adapter"]
 [adapter]
 protocol = "quirl.plugin.v1"
 executable = "adapter"
 arguments = []
-callback_timeout_ms = 25
-max_message_bytes = 65536
-"#;
-        let manifest = parse_plugin_manifest(source, "plugin.toml").unwrap();
+callback_timeout_ms = {timeout_ms}
+max_message_bytes = {max_bytes}
+"#
+        );
+        parse_plugin_manifest(&source, "plugin.toml").unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_adapter_executes_a_bounded_versioned_handshake() {
+        let directory = env::temp_dir().join(format!(
+            "quirl-plugin-adapter-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let manifest = write_isolated_adapter(
+            &directory,
+            "#!/bin/sh\nread request\nprintf '%s\\n' '{\"protocol\":\"quirl.plugin.v1\",\"schema_version\":1,\"api_version\":\"0.1.0\",\"operation\":\"initialize\",\"status\":\"ready\"}'\n",
+            1_000,
+            65_536,
+        );
+        let entry = directory.join("adapter");
         assert!(validate_runtime(&manifest, &entry, &[], false).is_ok());
-        let error = validate_runtime(&manifest, &entry, &[], true).unwrap_err();
-        assert!(error.message.contains("non-executing"));
+        let result = validate_runtime(
+            &manifest,
+            &entry,
+            &["process.spawn:adapter".to_owned()],
+            true,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_adapter_refuses_unlocked_capability_and_unknown_response_fields() {
+        let directory = test_package_directory("adapter-refusal");
+        fs::create_dir_all(&directory).unwrap();
+        let manifest = write_isolated_adapter(
+            &directory,
+            "#!/bin/sh\nread request\nprintf '%s\\n' '{\"protocol\":\"quirl.plugin.v1\",\"schema_version\":1,\"api_version\":\"0.1.0\",\"operation\":\"initialize\",\"status\":\"ready\",\"forged\":true}'\n",
+            1_000,
+            65_536,
+        );
+        let entry = directory.join("adapter");
+        let grant_error = validate_runtime(&manifest, &entry, &[], true).unwrap_err();
+        assert_eq!(grant_error.code, ErrorCode::Validation);
+        assert!(grant_error.message.contains("exact locked launch grant"));
+        let response_error = validate_runtime(
+            &manifest,
+            &entry,
+            &["process.spawn:adapter".to_owned()],
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            response_error.code,
+            ErrorCode::Validation,
+            "{response_error:?}"
+        );
+        assert!(response_error
+            .message
+            .contains("invalid initialization response"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_adapter_deadline_and_output_limits_terminate_the_process() {
+        let directory = test_package_directory("adapter-limits");
+        fs::create_dir_all(&directory).unwrap();
+        let timeout =
+            write_isolated_adapter(&directory, "#!/bin/sh\nwhile :; do :; done\n", 5, 512);
+        let entry = directory.join("adapter");
+        let deadline = validate_runtime(
+            &timeout,
+            &entry,
+            &["process.spawn:adapter".to_owned()],
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(deadline.code, ErrorCode::ResourceLimit, "{deadline:?}");
+        assert!(deadline.message.contains("deadline"), "{deadline:?}");
+
+        let output = write_isolated_adapter(
+            &directory,
+            "#!/bin/sh\nread request\nprintf '%s' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\nprintf '%s' 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' >&2\n",
+            1_000,
+            512,
+        );
+        let output_error =
+            validate_runtime(&output, &entry, &["process.spawn:adapter".to_owned()], true)
+                .unwrap_err();
+        assert_eq!(output_error.code, ErrorCode::ResourceLimit);
+        assert!(output_error.message.contains("output message limit"));
+
+        let cancelled = AtomicBool::new(true);
+        let cancellation_error = execute_out_of_process_adapter(
+            &timeout,
+            &entry,
+            &["process.spawn:adapter".to_owned()],
+            Some(&cancelled),
+        )
+        .unwrap_err();
+        assert_eq!(cancellation_error.code, ErrorCode::ResourceLimit);
+        assert!(cancellation_error.message.contains("cancelled"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn granted_trusted_plugin_process_runs_through_the_bounded_host() {
+        let directory = test_package_directory("trusted-process");
+        fs::create_dir_all(&directory).unwrap();
+        let entry = directory.join("plugin.lua");
+        fs::write(
+            &entry,
+            r#"local result = quirl.process.run("printf bounded")
+quirl.plugin.command {
+  name = "trusted run", signature = "trusted run", summary = "Run trusted process",
+  details = "Runs a bounded process through the host.", input_type = "Nothing",
+  output_type = "String", examples = { "trusted run" }, effects = { "spawn_process" },
+  error_codes = { resource_limit = "bounded" }, run = function(_) return result.value end,
+}
+"#,
+        )
+        .unwrap();
+        let manifest = parse_plugin_manifest(
+            r#"schema_version = 1
+[plugin]
+name = "trusted"
+version = "0.1.0"
+entry = "plugin.lua"
+quirl = ">=0.1, <0.2"
+api = "0.1.0"
+runtime = "trusted_lua"
+summary = "Trusted bounded process plugin"
+[capabilities]
+request = ["commands.register", "process.spawn:printf"]
+[contributes]
+commands = ["trusted run"]
+[[public_commands]]
+path = "trusted run"
+signature = "trusted run"
+summary = "Run trusted process"
+details = "Runs a bounded process through the host."
+input_type = "Nothing"
+output_type = "String"
+examples = ["trusted run"]
+effects = ["spawn_process"]
+error_codes = { "resource_limit" = "bounded" }
+"#,
+            "plugin.toml",
+        )
+        .unwrap();
+        let result = validate_runtime(
+            &manifest,
+            &entry,
+            &[
+                "commands.register".to_owned(),
+                "process.spawn:printf".to_owned(),
+            ],
+            true,
+        );
+        assert!(result.is_ok(), "{result:?}");
         fs::remove_dir_all(directory).unwrap();
     }
 

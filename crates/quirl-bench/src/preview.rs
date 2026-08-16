@@ -4,7 +4,8 @@ use quirl_lua::QuirlConfig;
 use quirl_syntax::Mode;
 use quirl_ui::{CatalogCompleter, LiveBuffer, LiveSample, QuirlPrompt};
 use reedline::{Completer, Prompt, PromptEditMode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     env,
     error::Error,
@@ -57,10 +58,32 @@ struct Environment {
     memory_bytes: Option<u64>,
     rustc: String,
     cargo: String,
-    build_profile: &'static str,
+    source_commit: String,
+    source_dirty: Option<bool>,
+    artifact_digest_verified: bool,
+    artifact_profile_verified: bool,
+    artifact_source_verified: bool,
+    build_profile: String,
+    optimization_level: String,
+    panic_strategy: String,
     quirl_binary: String,
     quirl_binary_bytes: Option<u64>,
+    quirl_binary_sha256: Option<String>,
     quirl_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuirlBuildInfo {
+    schema_version: u32,
+    version: String,
+    build_profile: String,
+    optimization_level: String,
+    panic_strategy: String,
+    operating_system: String,
+    architecture: String,
+    source_commit: String,
+    source_dirty: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,11 +217,28 @@ enum HighlightClass {
 pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     if enforce && cfg!(debug_assertions) {
         return Err(
-            "the release gate must be run from a release-built quirl-bench; use `cargo build --release -p quirl-cli -p quirl-bench` followed by `target/release/quirl-bench release --quirl target/release/quirl`"
+            "the release gate must be run from a release-built quirl-bench; use `cargo build --release -p quirl-cli -p quirl-bench`, record the Quirl binary's SHA-256, then run `target/release/quirl-bench release --quirl target/release/quirl --expected-sha256 <sha256>`"
                 .into(),
         );
     }
-    let quirl = quirl_binary()?;
+    let source_quirl = quirl_binary()?;
+    let expected_sha256 = expected_sha256_argument(enforce)?;
+    let staged_quirl = StagedArtifact::copy_from(&source_quirl)?;
+    if let Some(expected) = expected_sha256.as_deref() {
+        verify_expected_sha256(expected, staged_quirl.sha256())?;
+    }
+    let artifact_digest_verified = expected_sha256.is_some();
+    let quirl = staged_quirl.path().to_path_buf();
+    let build_info = quirl_build_info(&quirl);
+    let artifact_profile_verified = build_info
+        .as_ref()
+        .is_some_and(build_info_matches_benchmark);
+    if enforce && !artifact_profile_verified {
+        return Err(
+            "the release gate requires the measured quirl binary to report the canonical build profile, optimization level, panic strategy, operating system, and architecture matching quirl-bench; build both together with `cargo build --release -p quirl-cli -p quirl-bench` and pass that build's quirl binary"
+                .into(),
+        );
+    }
     let pty_samples = sample_argument("--pty-samples", default_pty_samples(enforce))?;
     let pty_timeout_ms = sample_argument("--pty-timeout-ms", DEFAULT_PTY_TIMEOUT_MS)?;
     let cold_samples = sample_argument("--cold-samples", DEFAULT_COLD_SAMPLES)?;
@@ -217,12 +257,24 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     let prompt = measure_first_prompt(prompt_samples)?;
     let stream_window = measure_stream_window(stream_samples)?;
     let binary_size = measure_binary_size(&quirl, binary_budget);
+    let mut environment = discover_environment(
+        &quirl,
+        build_info.as_ref(),
+        artifact_digest_verified,
+        artifact_profile_verified,
+    );
+    environment.artifact_source_verified = build_info.as_ref().is_some_and(|info| {
+        info.source_dirty == Some(false)
+            && info.source_commit != "unknown"
+            && info.source_commit == environment.source_commit
+    });
     let pty_valid = pty.requested_samples >= MINIMUM_ACCEPTED_PTY_SAMPLES
         && pty.successful_samples == pty.requested_samples
         && pty.prompt_paint.is_some()
         && pty.cold_to_editable.is_some()
         && pty.keystroke_to_frame.is_some()
-        && !cfg!(debug_assertions);
+        && !cfg!(debug_assertions)
+        && artifact_profile_verified;
     let measurements = vec![
         pty_measurement(
             PtyMeasurementSpec {
@@ -326,8 +378,15 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     ];
 
     let timing_failures = timing_gate_failures(&measurements);
-    let evidence_gate_passed =
-        pty_valid && stream_window.release_gate_accepted && binary_size.release_gate_accepted;
+    let source_identity_valid = environment.source_commit != "unknown"
+        && environment.source_dirty == Some(false)
+        && environment.artifact_digest_verified
+        && environment.artifact_source_verified
+        && environment.quirl_binary_sha256.is_some();
+    let evidence_gate_passed = pty_valid
+        && stream_window.release_gate_accepted
+        && binary_size.release_gate_accepted
+        && source_identity_valid;
     let mut gate_failures = timing_failures;
     if !stream_window.release_gate_accepted {
         gate_failures
@@ -341,6 +400,32 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     } else if !binary_size.measurement_valid {
         gate_failures.push("release binary size could not be measured".to_owned());
     }
+    if environment.source_commit == "unknown" {
+        gate_failures.push("source commit could not be identified".to_owned());
+    }
+    if !environment.artifact_digest_verified {
+        gate_failures.push(
+            "release binary SHA-256 was not compared with an independently supplied digest"
+                .to_owned(),
+        );
+    }
+    if !environment.artifact_source_verified {
+        gate_failures.push(
+            "the measured quirl binary was not built cleanly from the recorded source commit"
+                .to_owned(),
+        );
+    }
+    match environment.source_dirty {
+        Some(false) => {}
+        Some(true) => gate_failures.push(
+            "source tree contains tracked or untracked changes, so the artifact is not reproducible from its recorded commit"
+                .to_owned(),
+        ),
+        None => gate_failures.push("source dirty state could not be determined".to_owned()),
+    }
+    if environment.quirl_binary_sha256.is_none() {
+        gate_failures.push("release binary SHA-256 could not be measured".to_owned());
+    }
     let performance_gate_passed = evidence_gate_passed && gate_failures.is_empty();
     let release_gate_status = if performance_gate_passed {
         "passed_all_release_budgets"
@@ -351,10 +436,10 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     };
 
     let report = PreviewReport {
-        schema_version: 2,
+        schema_version: 5,
         suite: "quirl_1.0_release_performance",
         measured_at_utc: measured_at_utc(),
-        environment: discover_environment(&quirl),
+        environment,
         methodology: Methodology {
             percentile_method: "nearest-rank over independently timed wall-clock samples",
             pty_end_to_end: "Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with one input character, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
@@ -362,7 +447,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
             headless_edit_frame: "Calls Quirl's real CatalogCompleter and Prompt render methods, plus a benchmark-owned equivalent of the current semantic token classification, for `git commit --am`. No Reedline layout or terminal I/O occurs.",
             first_prompt: "Constructs a fresh configured QuirlPrompt and renders left, right, and indicator strings for every sample. Filesystem metadata may be served from OS cache. No terminal I/O occurs.",
             stream_window: "Pushes a fixed-size typed sample sequence through Quirl's production LiveBuffer at capacities 1, 16, and 256, then verifies retained and dropped counts and records serialized snapshot bytes. This proves retention is bounded by window size for bounded records; it is not a producer-backpressure or allocator-RSS measurement.",
-            binary_size: "Reads the exact release executable passed with `--quirl` and compares its filesystem length with the explicit `--max-binary-bytes` budget (default 5 MiB).",
+            binary_size: "Copies the executable passed with `--quirl` into a private read-only staging directory, verifies its SHA-256 when enforcing the release gate, then measures that exact staged executable against the explicit `--max-binary-bytes` budget (default 5 MiB).",
             limitations: vec![
                 "A completed frame means the expected screen state was reconstructed from the PTY byte stream; physical terminal-emulator scheduling, GPU composition, and monitor scanout are not measured.",
                 "The UI highlighter is private; the edit proxy reproduces its command/option/quote classification but not StyledText allocation or rendering.",
@@ -1047,6 +1132,162 @@ fn byte_argument(name: &str, default: u64) -> Result<u64, Box<dyn Error>> {
     Ok(bytes)
 }
 
+struct StagedArtifact {
+    directory: PathBuf,
+    path: PathBuf,
+    sha256: String,
+}
+
+impl StagedArtifact {
+    fn copy_from(source: &Path) -> Result<Self, Box<dyn Error>> {
+        let directory = create_staging_directory()?;
+        let filename = if cfg!(windows) {
+            "quirl-staged.exe"
+        } else {
+            "quirl-staged"
+        };
+        let path = directory.join(filename);
+        if let Err(error) = fs::copy(source, &path) {
+            let _ = fs::remove_dir(&directory);
+            return Err(format!(
+                "could not stage Quirl artifact {}: {error}",
+                source.display()
+            )
+            .into());
+        }
+        if let Err(error) = make_staged_artifact_read_only(&path) {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_dir(&directory);
+            return Err(error);
+        }
+        let Some(sha256) = binary_sha256(&path) else {
+            make_staged_artifact_writable_for_cleanup(&path);
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_dir(&directory);
+            return Err(format!("could not hash staged Quirl artifact {}", path.display()).into());
+        };
+        Ok(Self {
+            directory,
+            path,
+            sha256,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+impl Drop for StagedArtifact {
+    fn drop(&mut self) {
+        make_staged_artifact_writable_for_cleanup(&self.path);
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_dir(&self.directory);
+    }
+}
+
+fn create_staging_directory() -> Result<PathBuf, Box<dyn Error>> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    for attempt in 0..32_u8 {
+        let directory = env::temp_dir().join(format!(
+            "quirl-release-artifact-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&directory) {
+            Ok(()) => {
+                if let Err(error) = make_staging_directory_private(&directory) {
+                    let _ = fs::remove_dir(&directory);
+                    return Err(error);
+                }
+                return Ok(directory);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not create private artifact staging directory: {error}"
+                )
+                .into());
+            }
+        }
+    }
+    Err("could not allocate a unique artifact staging directory".into())
+}
+
+#[cfg(unix)]
+fn make_staging_directory_private(path: &Path) -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_staging_directory_private(_path: &Path) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_staged_artifact_read_only(path: &Path) -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o500))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_staged_artifact_read_only(path: &Path) -> Result<(), Box<dyn Error>> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn make_staged_artifact_writable_for_cleanup(path: &Path) {
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
+    }
+}
+
+#[cfg(not(windows))]
+fn make_staged_artifact_writable_for_cleanup(_path: &Path) {}
+
+fn expected_sha256_argument(enforce: bool) -> Result<Option<String>, Box<dyn Error>> {
+    let value = argument_value("--expected-sha256");
+    if enforce && value.is_none() {
+        return Err(
+            "the release gate requires `--expected-sha256 <64-hex-digit digest>` from a trusted, independently recorded artifact hash"
+                .into(),
+        );
+    }
+    value.map(|value| normalize_sha256(&value)).transpose()
+}
+
+fn normalize_sha256(value: &str) -> Result<String, Box<dyn Error>> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("--expected-sha256 must be exactly 64 hexadecimal digits".into());
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn verify_expected_sha256(expected: &str, actual: &str) -> Result<(), Box<dyn Error>> {
+    if expected == actual {
+        return Ok(());
+    }
+    Err(
+        format!("staged Quirl artifact SHA-256 mismatch: expected {expected}, measured {actual}")
+            .into(),
+    )
+}
+
 fn quirl_binary() -> Result<PathBuf, Box<dyn Error>> {
     let path = argument_value("--quirl").map_or_else(
         || {
@@ -1079,7 +1320,12 @@ fn argument_value(name: &str) -> Option<String> {
     None
 }
 
-fn discover_environment(quirl: &Path) -> Environment {
+fn discover_environment(
+    quirl: &Path,
+    build_info: Option<&QuirlBuildInfo>,
+    artifact_digest_verified: bool,
+    artifact_profile_verified: bool,
+) -> Environment {
     Environment {
         hostname: command_output("hostname", &[]).unwrap_or_else(|| "unknown".to_owned()),
         operating_system: operating_system(),
@@ -1090,21 +1336,78 @@ fn discover_environment(quirl: &Path) -> Environment {
         rustc: command_output("rustc", &["--version", "--verbose"])
             .unwrap_or_else(|| "unknown".to_owned()),
         cargo: command_output("cargo", &["--version"]).unwrap_or_else(|| "unknown".to_owned()),
-        build_profile: if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        },
+        source_commit: command_output("git", &["rev-parse", "HEAD"])
+            .unwrap_or_else(|| "unknown".to_owned()),
+        source_dirty: source_dirty(),
+        artifact_digest_verified,
+        artifact_profile_verified,
+        artifact_source_verified: false,
+        build_profile: build_info
+            .map(|info| info.build_profile.clone())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        optimization_level: build_info
+            .map(|info| info.optimization_level.clone())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        panic_strategy: build_info
+            .map(|info| info.panic_strategy.clone())
+            .unwrap_or_else(|| "unknown".to_owned()),
         quirl_binary: quirl.display().to_string(),
         quirl_binary_bytes: fs::metadata(quirl).ok().map(|metadata| metadata.len()),
-        quirl_version: Command::new(quirl)
-            .arg("--version")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        quirl_binary_sha256: binary_sha256(quirl),
+        quirl_version: build_info
+            .map(|info| format!("quirl {}", info.version))
             .unwrap_or_else(|| "unknown".to_owned()),
     }
+}
+
+fn source_dirty() -> Option<bool> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .output()
+        .ok()?;
+    output.status.success().then_some(!output.stdout.is_empty())
+}
+
+fn quirl_build_info(quirl: &Path) -> Option<QuirlBuildInfo> {
+    let output = Command::new(quirl).arg("--build-info").output().ok()?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return None;
+    }
+    let info: QuirlBuildInfo = serde_json::from_slice(&output.stdout).ok()?;
+    (info.schema_version == 2).then_some(info)
+}
+
+fn build_info_matches_benchmark(info: &QuirlBuildInfo) -> bool {
+    let expected_profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let expected_panic = if cfg!(panic = "unwind") {
+        "unwind"
+    } else {
+        "abort"
+    };
+    let expected_optimization = if cfg!(debug_assertions) { "0" } else { "z" };
+    info.build_profile == expected_profile
+        && info.optimization_level == expected_optimization
+        && info.panic_strategy == expected_panic
+        && info.operating_system == env::consts::OS
+        && info.architecture == env::consts::ARCH
+}
+
+fn binary_sha256(path: &Path) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Some(format!("{:x}", digest.finalize()))
 }
 
 fn measured_at_utc() -> String {
@@ -1189,11 +1492,27 @@ fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
 fn print_text(report: &PreviewReport) {
     println!("Quirl 1.0 release performance gate\n");
     println!(
-        "{} · {} · {} · {}",
+        "{} · {} · {} · {} (opt={})",
         report.environment.operating_system,
         report.environment.architecture,
         report.environment.cpu,
-        report.environment.build_profile
+        report.environment.build_profile,
+        report.environment.optimization_level
+    );
+    println!(
+        "source {}{} · panic={} · binary sha256={}",
+        report.environment.source_commit,
+        match report.environment.source_dirty {
+            Some(true) => " (dirty)",
+            Some(false) => "",
+            None => " (dirty=unknown)",
+        },
+        report.environment.panic_strategy,
+        report
+            .environment
+            .quirl_binary_sha256
+            .as_deref()
+            .unwrap_or("unknown")
     );
     println!(
         "{:<42} {:>10} {:>10} {:>10}",
@@ -1336,6 +1655,84 @@ mod tests {
         let rejected = measure_binary_size(&fixture, bytes.saturating_sub(1));
         assert_eq!(rejected.target_result, "measured_miss");
         assert!(rejected.release_gate_accepted);
+    }
+
+    #[test]
+    fn artifact_identity_hashes_the_exact_measured_binary() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let hash = binary_sha256(&fixture).unwrap();
+
+        assert_eq!(hash.len(), 64);
+        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(binary_sha256(Path::new("/definitely/missing/quirl")).is_none());
+    }
+
+    #[test]
+    fn release_digest_must_be_independent_and_exact() {
+        let digest = "A".repeat(64);
+        let normalized = normalize_sha256(&digest).unwrap();
+        assert_eq!(normalized, "a".repeat(64));
+        assert!(verify_expected_sha256(&normalized, &normalized).is_ok());
+        assert!(verify_expected_sha256(&normalized, &"b".repeat(64)).is_err());
+        assert!(normalize_sha256("self-reported").is_err());
+        assert!(normalize_sha256(&"g".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn staged_artifact_isolated_from_source_mutation_and_cleaned_up() {
+        let source_directory = create_staging_directory().unwrap();
+        let source = source_directory.join("source");
+        fs::write(&source, b"reviewed artifact").unwrap();
+        let source_hash = binary_sha256(&source).unwrap();
+        let (staged_path, staged_directory) = {
+            let staged = StagedArtifact::copy_from(&source).unwrap();
+            let staged_path = staged.path.clone();
+            let staged_directory = staged.directory.clone();
+            assert_eq!(staged.sha256(), source_hash);
+            fs::write(&source, b"mutated after staging").unwrap();
+            assert_eq!(
+                binary_sha256(staged.path()).as_deref(),
+                Some(source_hash.as_str())
+            );
+            (staged_path, staged_directory)
+        };
+        assert!(!staged_path.exists());
+        assert!(!staged_directory.exists());
+        fs::remove_file(source).unwrap();
+        fs::remove_dir(source_directory).unwrap();
+    }
+
+    #[test]
+    fn artifact_metadata_requires_matching_binary_report() {
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let panic_strategy = if cfg!(panic = "unwind") {
+            "unwind"
+        } else {
+            "abort"
+        };
+        let matching = QuirlBuildInfo {
+            schema_version: 2,
+            version: "0.1.0".to_owned(),
+            build_profile: profile.to_owned(),
+            optimization_level: if cfg!(debug_assertions) { "0" } else { "z" }.to_owned(),
+            panic_strategy: panic_strategy.to_owned(),
+            operating_system: env::consts::OS.to_owned(),
+            architecture: env::consts::ARCH.to_owned(),
+            source_commit: "abc123".to_owned(),
+            source_dirty: Some(false),
+        };
+
+        assert!(build_info_matches_benchmark(&matching));
+
+        let mismatched = QuirlBuildInfo {
+            build_profile: "other".to_owned(),
+            ..matching
+        };
+        assert!(!build_info_matches_benchmark(&mismatched));
     }
 
     #[test]

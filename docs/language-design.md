@@ -52,7 +52,7 @@ Compatibility, structured data, rich UI, and a real extension language pull in d
 
 > **Product anchor: Helix’s coherence, Bun’s completeness.** Quirl ships one deliberately integrated workflow: install one binary and immediately get editing, completion, fuzzy discovery, prompt context, structured tools, scripting, testing, formatting, documentation, and configuration. “Batteries included” means designed together and supported together—not a bundle of unrelated replacements for every Unix tool.
 
-> **Name decision: Quirl.** A *Quirl* is a German kitchen whisk—roughly pronounced “kvirl”—from a word family associated with turning and stirring. Product name: **Quirl**; binary: `quirl`; native data scripts: `.quirl`; extension scripts and configuration: `.lua`; environment prefix: `QUIRL_`.
+> **Name decision: Quirl.** A *Quirl* is a German kitchen whisk—roughly pronounced “kvirl”—from a word family associated with turning and stirring. Product name: **Quirl**; binary: `quirl`; native scripts: canonical `.qrl` (with readable `.quirl` and novelty `.🌀` input aliases); Lua scripts and configuration: `.lua`; environment prefix: `QUIRL_`.
 
 ## 3. Interaction model
 
@@ -72,7 +72,23 @@ Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unl
   }
 ```
 
-> **Scripts never depend on invisible mode.** Interactive mode is session state. In files, `data { ... }`, `command { ... }`, and command literals make every grammar boundary explicit.
+> **Scripts never depend on invisible mode.** Interactive mode is session state. In native Quirl files, `data { ... }` and `command { ... }` make every grammar boundary explicit. Their opening and closing delimiters occupy their own lines, with the closing `}` aligned to the opener; commands inside a `command` block run one non-comment line at a time. The older one-line `data <expression>` and command form remains accepted for compatibility. Lua remains the general-purpose scripting language.
+
+```quirl
+data {
+  [1, 2, 3] | length
+}
+
+command {
+  printf 'native command block\n'
+}
+```
+
+`quirl check` and `quirl lint` validate native block delimiters and command
+grammar without running source. Data expressions are deliberately not evaluated
+during those checks: the data runtime has no side-effect-free parser yet, and a
+check must never open files or invoke an adapter. Their semantic diagnostics are
+therefore reported by `quirl run` with the data-statement span.
 
 ## 4. Command intelligence
 
@@ -118,7 +134,7 @@ Quirl imports existing definitions at index time and records source and confiden
 | Bash completions | Read `complete -p`; instrument common helpers and capture candidate metadata | Never implicitly source user RC files; sandbox dynamic functions |
 | Fish completions | Import declarative `complete` definitions and descriptions | High-confidence translation; worker for dynamic values |
 | Help and man pages | Parse usage, headings, options, subcommands, defaults, enums, examples | Heuristic, labeled with provenance and confidence |
-| Project manifests | Cargo, package scripts, task runners, containers, project-local `.quirl` commands | Scoped to the trusted project root |
+| Project manifests | Cargo, package scripts, task runners, containers, project-local `.qrl` commands | Scoped to the trusted project root |
 
 ```sh
 quirl index build                  # scan PATH and project sources
@@ -183,7 +199,8 @@ quirl serve mcp --capabilities catalog,complete,check,format
 ### The complete authoring toolchain ships with the shell
 
 ```sh
-quirl new automation --lang lua
+quirl new script
+quirl new script --lang quirl
 quirl check src/main.lua
 quirl run src/main.lua
 quirl fmt .
@@ -283,10 +300,10 @@ Quirl’s `ls` is a built-in producer of `Entry` records. Rendering occurs only 
 ```text
 type Entry = {
   name: String, path: Path,
-  type: file | dir | symlink | device,
-  size: Size?, modified: DateTime,
-  mode: Permissions, owner: String?,
-  git: GitState?, target: Path?,
+  type: file | dir | symlink | other,
+  size: Size, modified: DateTime?,
+  hidden: Bool, readonly: Bool,
+  target: Path?,
 }
 
 ◆ ls                         # adaptive human view
@@ -297,10 +314,19 @@ type Entry = {
 ❯ ^ls -la                    # bypass built-in; run system ls
 ```
 
-- **Fast path:** names and basic metadata render first; Git state, owners, MIME types, and directory sizes are lazy columns with cancellation and cache budgets.
-- **Stable paths:** machine pipelines receive exact `Path` values, never icon-decorated or shell-escaped display strings. Non-UTF-8 paths survive on Unix.
-- **Adaptive rendering:** width, terminal capability, and requested fields choose grid, table, or lines. `--plain` and non-TTY output are deterministic.
-- **Interactive upgrade:** `ls --browse` opens a Ratatui panel for preview, selection, bulk actions, and piping selected `Entry` values back into the prompt.
+- **Bounded fast path:** names, kind, size, modified time, hidden state, and
+  readonly state are collected non-recursively under an explicit entry limit;
+  symlink targets are read only with `--resolve-links`.
+- **Stable values:** JSON and typed pipelines receive undecorated entry values;
+  human output escapes terminal controls and stays one row per entry. The 0.1
+  string ABI lossily represents non-UTF-8 Unix names and records that limit
+  rather than claiming byte-perfect paths.
+- **Deterministic rendering:** `--plain`/`--format plain`, long rows, JSON,
+  sorting, reversal, and directory grouping are stable across filesystem
+  iteration order.
+- **Explicit residual:** `ls --browse`, Git/owner/MIME enrichment, and adaptive
+  grid rendering remain future UI work; the existing directory panel is a
+  safe read-only view, not a substitute claim.
 
 ## 8. Error model
 
@@ -339,7 +365,7 @@ Diagnostic rendering supports human, compact, JSON, and GitHub Actions formats f
 
 Quirl needs one canonical general-purpose language for scripts, configuration, custom commands, prompt components, keymaps, and trusted UI extensions. The concise command/data notation remains the interactive shell surface; it does not grow into a second general-purpose language.
 
-> **Accepted: Lua 5.4.** Rust remains Quirl’s implementation language; Lua is the sole first-class language for configuration, automation, and trusted plugins. Familiarity, a measured 0.58 MiB runtime probe, longevity, and the mature `mlua` bridge outweigh Luau’s stronger analyzer for this extension-only role. Read the [decision report](embedded-language-decision.md) and [ADR 0001](decisions/0001-lua-extension-language.md).
+> **Accepted: Lua 5.4.** Rust remains Quirl’s implementation language; Lua is the sole first-class language for configuration, scripts, and trusted plugins. Familiarity, a measured 0.58 MiB runtime probe, longevity, and the mature `mlua` bridge outweigh Luau’s stronger analyzer for this extension-only role. Read the [decision report](embedded-language-decision.md) and [ADR 0001](decisions/0001-lua-extension-language.md).
 
 The first Lua slice embeds restricted Lua 5.4; generates LuaLS/JSON/Markdown SDK views; validates configuration with Rust schemas; atomically reloads config and plugins at safe prompt boundaries; and applies keymap, prompt, picker, and extension settings to the editor. The rejected prototype runtime and all executable/dependency paths are removed.
 
@@ -391,7 +417,7 @@ quirl run --lang zsh release.zsh
 | Script kind | Execution model | Status |
 | --- | --- | --- |
 | `.lua` | Pinned Lua 5.4 through `mlua`; generated annotations/bindings; restricted modules and explicit capabilities | Core commitment |
-| `.quirl` | Focused command/data automation lowered to the shared execution plan | Core commitment |
+| `.qrl` | Focused command/data scripts lowered to the shared execution plan; `.quirl` and `.🌀` are input aliases | Core commitment |
 | `.luau` / `.rhai` / `.ts` | Measured alternatives; no second core SDK or config ecosystem | Research or future optional runners |
 | `.fnl` | Compile to cached Lua, then use the Lua engine and same host adapter | Companion to Lua |
 | `.py` | Optional PocketPy with explicit compatibility manifest; never presented as full CPython | Research candidate |
@@ -458,7 +484,7 @@ fzf proves fuzzy selection is a terminal primitive. Quirl includes a native, typ
 
 ### Lua configuration with synchronized views
 
-`quirl config` opens a polished local configuration app; `quirl config tui` presents the same model in the terminal. `config.lua` is the source of truth. Browser and TUI are synchronized, schema-backed views of that file—not separate stores.
+`quirl config web <file>` opens a polished local configuration app; `quirl config tui <file>` presents the same model in the terminal. `config.lua` is the source of truth. Browser and TUI are schema-backed views of that file—not separate stores. The web view refreshes from the file on each page load and checks the source again before saving; it does not claim a background file watcher.
 
 ```lua
 ---@type quirl.Config
@@ -482,7 +508,7 @@ return config
 | --- | --- |
 | One language | Settings, prompt logic, keymaps, hooks, commands, extensions use Lua 5.4. `quirl.config` is ordinary Lua backed by generated annotations and authoritative Rust schemas. |
 | Round trip | A concrete-syntax-tree patcher changes only recognized literal arguments, preserving comments, layout, unknown plugin forms, and surrounding code. Writes are atomic and retain a recoverable prior version. |
-| Live synchronization | File watching updates browser and active shell. Unsaved browser changes use a three-way merge; conflicts show a diff instead of silently winning. |
+| Live synchronization | Browser reads refresh from the authoritative file and saves re-check it before writing. Unsaved browser changes use a three-way merge; conflicts show a diff instead of silently winning. No background watcher is claimed. |
 | Validation | Versioned schema supplies types, ranges, deprecations, platform support, examples, plugin settings. `quirl config check` parses/lints Lua, validates known annotations and returned config through Rust schema, and never activates invalid state. |
 | Preview | Theme, prompt, keymap, completion, picker, accessibility changes render against sample and live contexts before Apply. |
 | Dynamic values | UI shows evaluated value, source span, documentation, and marks code-controlled expressions; “Open in code” never silently replaces one. |
@@ -491,15 +517,24 @@ return config
 | Portability | `export`, `diff`, `migrate`, `doctor` work without a browser; synchronization is file ↔ UI, never mandatory cloud storage. |
 
 ```sh
-quirl config                 # local web app; watches config.lua
+quirl config web config.lua  # local loopback web app; config.lua remains authoritative
 quirl config tui             # same schema, terminal presentation
 quirl config get editor.keymap
 quirl config set picker.layout adaptive
-quirl config diff --profile work
+quirl config diff personal.lua work.lua
 quirl config check --format json
-quirl config fmt
-quirl config migrate --dry-run
+quirl config fmt config.lua --check
+quirl config export config.lua --format json
+quirl config migrate config.lua --dry-run
+quirl config doctor config.lua
 ```
+
+`quirl config web <file>` uses a tokenized, loopback-only session and renders
+the complete current schema as an accessible HTML form. It does not create a
+second configuration store: every save conservatively patches literal Lua
+values, validates the full candidate, preserves a backup, and reports a
+conflict if the source changed since the form loaded. Code-computed values are
+never overwritten by the form.
 
 > **No first-run wizard tax.** Quirl starts with a carefully chosen default theme, prompt, keymap, picker, and compatibility profile. Configuration helps explore and personalize a working product; it never assembles one.
 
@@ -608,7 +643,7 @@ quirl plugin disable kubernetes-workbench
 quirl plugin remove kubernetes-workbench
 ```
 
-> **Long-term direction:** a focused plugin can add commands, data types, views, automation, completions, docs, and AI-discoverable capabilities together. External programs stay first class; plugins integrate the Unix ecosystem rather than forcing a rewrite.
+> **Long-term direction:** a focused plugin can add commands, data types, views, scripts, completions, docs, and AI-discoverable capabilities together. External programs stay first class; plugins integrate the Unix ecosystem rather than forcing a rewrite.
 
 ## 12. Architecture and budgets
 
@@ -669,10 +704,14 @@ list:
 - **Completion ingestion.** Fish declarative completions plus at least one
   of Bash/Zsh translate into `CommandSpec` entries with provenance and
   confidence recorded, and the index can explain every fact's source.
-- **C1 subset with evidence.** The supported interactive syntax subset is
-  listed in a machine-readable matrix backed by differential tests against
-  Bash and Zsh; unsupported constructs produce a mismatch diagnostic that
-  names the exact dialect form instead of silently reinterpreting it.
+- **C1 core with evidence.** On Unix, the quote-aware command IR supports
+  lists, standard-descriptor redirects, here-strings, bounded command
+  substitution, parameter/arithmetic expansion, and pathname expansion. The
+  matrix records exact Bash/Zsh evidence; here-documents, process substitution,
+  and dialect control forms remain explicit bounded `bash { ... }` / `zsh {
+  ... }` islands rather than an implied native promise. Windows retains the
+  portable C0 process graph plus those reference islands until its C1 executor
+  is implemented.
 - **Budgets measured.** Cold start, keystroke-to-frame, and first prompt
   paint are measured against the §12 budgets on named hardware and
   recorded — including where they currently miss.
@@ -683,7 +722,8 @@ and accessible text output, per the release criterion in §10.
 ### Phase 2 acceptance evidence
 
 - **One script entry point.** `quirl run` selects Lua or the line-oriented
-  `.quirl` grammar by explicit `--lang`, shebang, or extension, accepts stdin,
+  native Quirl grammar by explicit `--lang`, shebang, or extension. `.qrl` is
+  canonical; `.quirl` and `.🌀` are accepted aliases. It accepts stdin,
   preserves Lua resource policy, and reports labeled native command/data
   failures. Unsupported Bash/Zsh runners remain an explicit Phase 3 surface.
 - **Deterministic authoring tools.** `fmt`, `check`, `lint`, and `test` accept
@@ -696,7 +736,7 @@ and accessible text output, per the release criterion in §10.
   same `HOST_API` definitions.
 - **Language service.** `quirl lsp` implements a bounded stdio LSP subset with
   UTF-16 positions and deterministic document state. Lua diagnostics compile
-  and lint without invoking chunks; `.quirl` intelligence consumes the loaded
+  and lint without invoking chunks; native Quirl intelligence consumes the loaded
   catalog without executing commands.
 - **Agent and package contracts.** Versioned deny-unknown documents carry
   installed versions, named schema/content hashes, capabilities, validators,
@@ -717,10 +757,11 @@ and accessible text output, per the release criterion in §10.
   actions cover the execution lifecycle. Catalog, completion, and panel
   contributions reach real consumers through deny-unknown, terminal-safe
   boundaries with deadlines, collision checks, and failure isolation.
-- **Portable isolation is honest.** Wasm components and out-of-process adapters
-  have bounded, versioned validation contracts. The CLI refuses to enable them
-  until an executing isolated adapter exists; the checked-in WIT world and its
-  hash bind the future implementation without claiming one today.
+- **Portable isolation is honest.** Out-of-process adapters execute the bounded,
+  versioned `quirl.plugin.v1` initialization handshake with an exact scoped
+  launch grant, deny-unknown messages, output/deadline limits, and containment.
+  Wasm components remain validated but disabled until a component runtime is
+  selected; the checked-in WIT world and its hash bind that future work.
 - **Platform processes and recovery are bounded.** Bash/Zsh runners preserve
   arguments, environment, status, cancellation, and fixed-size output windows.
   Recovery is versioned, atomic, quota-limited, terminal-safe in text mode, and
@@ -745,7 +786,8 @@ and accessible text output, per the release criterion in §10.
   every visible Clap leaf's options, positionals, requiredness, repeatability,
   fixed value domains, and signature with the exact catalog contract.
 - **Compatibility evidence executes both sides.** The frozen matrix gives every
-  C0/C1/C2 form a native, reference-runner, or explicitly deferred disposition.
+  C0/C1-core/C2 form a native, reference-runner, or explicitly deferred
+  disposition.
   Composition tests compare Quirl's status, stdout, stderr, and redirected file
   effects with Bash and Zsh for the supported native subset.
 - **Release budgets are enforced.** A named-hardware PTY harness measures 101
@@ -756,11 +798,12 @@ and accessible text output, per the release criterion in §10.
   path containment, capability smuggling, cancellation, hostile C0/C1 terminal
   text, JSON semantic preservation, `NO_COLOR`, `TERM=dumb`, plain fallbacks,
   and private recovery storage have executable tests and a checked-in audit.
-- **The remaining line is explicit.** Non-executing isolated adapters, native
-  Windows terminal/suspend validation, full native C1 and interactive C2 islands,
-  and versioned asynchronous picker/completion envelopes remain review blockers
-  before Quirl may claim the 1.0 contract; this Phase 4 checkpoint does not hide
-  them behind a successful test suite.
+- **The remaining line is explicit.** Process adapters execute a deliberately
+  narrow bounded v1 handshake, and picker/completion envelopes are frozen with
+  cancellation, deadlines, and stale-result evidence. Native Windows
+  terminal/suspend validation and the explicitly deferred native compatibility
+  forms remain review blockers before Quirl may claim the 1.0 contract; this
+  checkpoint does not hide them behind a successful test suite.
 
 ## 14. Review decisions
 

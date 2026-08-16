@@ -82,11 +82,13 @@ WIT world's hash into the lock, and enforces explicit memory, fuel, and callback
 budgets. The non-executing validator does not claim generated Rust bindings or
 full WIT structural type equivalence; selecting an execution adapter must add
 that proof. It does not claim to execute components, and the CLI refuses to mark
-one enabled until an isolated adapter exists. The
-out-of-process adapter contract likewise validates protocol
-`quirl.plugin.v1`, a package-relative executable, message bound, and callback
-deadline without spawning it. A future runtime implementation must preserve
-the same value/catalog/capability model and isolate crashes from the shell.
+one enabled until a component runtime exists. The out-of-process adapter
+executes the deliberately narrow `quirl.plugin.v1` initialization handshake
+defined by ADR 0009. It launches only the locked package-relative executable
+under the exact scoped grant, scrubbed environment, controlled working
+directory, message/deadline limits, and process-tree containment. Wasm still
+requires a future runtime implementation that preserves the same
+value/catalog/capability model and isolates crashes from the shell.
 
 `doctor` verifies locked checksums and the runtime/WIT schema hash, then
 validates the declared runtime boundary. Any mismatch prevents enablement and
