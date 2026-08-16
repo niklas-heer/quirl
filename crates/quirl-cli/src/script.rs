@@ -716,6 +716,10 @@ fn run_reference_script(
             ))
         }
     }
+    // The syntax-error classifier matches untranslated interpreter
+    // diagnostics, so pin the message locale; localized environments would
+    // otherwise turn labeled syntax errors into plain nonzero statuses.
+    command.env("LC_ALL", "C");
     command
         .args(arguments)
         .stdin(Stdio::inherit())
