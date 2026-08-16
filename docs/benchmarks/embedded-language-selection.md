@@ -182,8 +182,12 @@ trusted-plugin language is not the recommended outcome.
 
 ## Reproduce
 
+The Rhai measurements above are retained as historical selection evidence. The
+active workspace no longer builds Rhai; its isolated footprint probe remains in
+`spikes/footprint` for explicit research runs.
+
 ```console
-# Steel, Lua, Rhai, and optional Fennel
+# Lua and optional Fennel
 cargo run --release -p quirl-bench -- \
   --fennel /tmp/quirl-fennel-1.6.1.lua --json
 

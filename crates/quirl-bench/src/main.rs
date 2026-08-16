@@ -1,5 +1,4 @@
 use mlua::{Function, Lua, Table};
-use rhai::{Engine as RhaiEngine, Scope as RhaiScope};
 use serde::Serialize;
 use std::{
     fs,
@@ -61,11 +60,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         black_box(Lua::new());
         Ok(())
     })?);
-    measurements.push(measure("rhai", "cold_start", COLD_SAMPLES, || {
-        black_box(RhaiEngine::new());
-        Ok(())
-    })?);
-
     let lua_eval = Lua::new();
     measurements.push(measure("lua", "expression_eval", EVAL_SAMPLES, || {
         black_box(
@@ -76,16 +70,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         Ok(())
     })?);
-    let rhai_eval = RhaiEngine::new();
-    measurements.push(measure("rhai", "expression_eval", EVAL_SAMPLES, || {
-        black_box(
-            rhai_eval
-                .eval::<i64>("20 + 22")
-                .map_err(|error| error.to_string())?,
-        );
-        Ok(())
-    })?);
-
     let (lua_host, lua_bench) = lua_host()?;
     measurements.push(measure("lua", "warm_host_call", WARM_SAMPLES, || {
         black_box(
@@ -96,17 +80,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })?);
     black_box(lua_host);
-    let (rhai_host, rhai_ast) = rhai_host()?;
-    let mut rhai_scope = RhaiScope::new();
-    measurements.push(measure("rhai", "warm_host_call", WARM_SAMPLES, || {
-        black_box(
-            rhai_host
-                .call_fn::<i64>(&mut rhai_scope, &rhai_ast, "bench", (41_i64,))
-                .map_err(|error| error.to_string())?,
-        );
-        Ok(())
-    })?);
-
     let fennel =
         if let (Some(path), Some(source)) = (fennel_path.as_deref(), fennel_source.as_deref()) {
             let probe = Lua::new();
@@ -192,18 +165,6 @@ fn lua_host() -> Result<(Lua, Function), mlua::Error> {
         .exec()?;
     let bench = lua.globals().get("bench")?;
     Ok((lua, bench))
-}
-
-fn rhai_host() -> Result<(RhaiEngine, rhai::AST), String> {
-    fn host_add(value: i64) -> i64 {
-        value + 1
-    }
-    let mut engine = RhaiEngine::new();
-    engine.register_fn("host_add", host_add);
-    let ast = engine
-        .compile("fn bench(value) { host_add(value) }")
-        .map_err(|error| error.to_string())?;
-    Ok((engine, ast))
 }
 
 fn load_fennel(lua: &Lua, source: &str) -> Result<Table, mlua::Error> {

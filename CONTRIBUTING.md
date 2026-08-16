@@ -43,6 +43,21 @@ is in [`docs/testing-strategy.md`](docs/testing-strategy.md). The project
 intentionally does not use CI while its traffic is low, so include the local
 result in your pull request.
 
+Prefer package-targeted commands during iteration so research-only workspace
+members such as `quirl-bench` are not rebuilt unnecessarily:
+
+```sh
+cargo check -p quirl-ui
+cargo test -p quirl-ui
+cargo build -p quirl-cli
+```
+
+At the workspace root, a bare `cargo build` defaults to `quirl-cli`; use an
+explicit `-p` selection or `--workspace` when another scope is intended.
+The default development profile keeps line numbers for workspace backtraces
+while omitting dependency debug data. Use `cargo build --profile debugging`
+when a full-debug build is needed.
+
 Useful focused tasks are typed Rust subcommands in [`xtask`](xtask/src/main.rs):
 
 ```sh

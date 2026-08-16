@@ -19,7 +19,6 @@ quirl-lua = { path = "../quirl-lua" }
 quirl-syntax = { path = "../quirl-syntax" }
 quirl-ui = { path = "../quirl-ui" }
 reedline.workspace = true
-rhai.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
