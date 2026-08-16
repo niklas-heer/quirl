@@ -14,6 +14,37 @@ quirl data 'open users.json' --format json
 quirl data '^external printf "{\"ok\":true}" | from json'
 ```
 
+## Syntax ownership and analysis
+
+`quirl-data` owns the focused data lexer, AST, inert diagnostics, formatter,
+and data-token highlighting because those contracts name data sources,
+byte/value bridges, transforms, predicates, and data-domain types.
+`quirl-syntax` remains the independent command-grammar foundation. This keeps
+the accepted ADR 0016 dependency graph unchanged: the CLI composition root
+maps data diagnostics into `ShellError` for execution and check/format
+boundaries, and injects a side-effect-free native analyzer callback into
+`quirl-lsp` rather than adding an LSP-to-data dependency.
+
+Parsing never opens a path, reads the current directory, invokes an adapter, or
+calls an external process. The iterative lexer and literal parser preserve
+half-open UTF-8 byte spans and reject input before retaining more than 256 KiB
+of source, 32,768 tokens, 64 levels of nesting, 100,000 AST nodes, 256 fields
+per record/field list, or 64 KiB per decoded literal by default. Library
+callers can replace every syntax budget through `DataSyntaxLimits`.
+
+The AST describes the currently implemented `pwd`, `files`/`ls`, `open`, JSON
+literal, and `^external` sources; `lines`, `from json`, and `to json` bridges;
+and `get`, `where`, `select`, `sort`, `take`, `first`, and `length` transforms.
+Its `DataType` surface names existing scalar/domain `DataValue` forms plus
+`List`, `Record`, `Table`, `Option`, `Result`, `Task`, `Stream`, and `Command`.
+Those type nodes are semantic vocabulary only; they do not claim P09 evaluator
+inference, scheduling, or stream behavior.
+
+An empty expression is now a syntax diagnostic instead of the earlier
+implementation accident that produced `null`; write `null` explicitly. Bare
+paths containing whitespace also receive a migration diagnostic directing the
+author to quote the complete path.
+
 `--format json` emits a tagged `Value` or `Stream` envelope so a script
 does not need to infer whether an array is an ordinary value or a pipeline
 stream. Values themselves retain an ABI tag (`int`, `decimal`, `path`, `size`,
@@ -38,9 +69,10 @@ their current underlying parsers expose whole-document APIs.
 
 Every adapter enforces the default 8 MiB file size, 100,000 row, 256 field,
 64 nesting-depth, and 256 KiB expression limits. Library callers can set
-`DataLimits` explicitly. CSV requires a single unique header row and does not
-support multiline quoted fields. Tar inspection lists headers only: it never
-extracts entries and intentionally supports only uncompressed POSIX `.tar`
+`DataLimits` explicitly; evaluator entry points derive matching syntax byte,
+depth, and field limits before parsing. CSV requires a single unique header row
+and does not support multiline quoted fields. Tar inspection lists headers
+only: it never extracts entries and intentionally supports only uncompressed POSIX `.tar`
 archives (not zip, gzip, bzip2, xz, or PAX/GNU extended-name semantics); each
 header checksum is verified before the entry is reported.
 

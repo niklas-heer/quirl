@@ -87,10 +87,12 @@ command {
 ```
 
 `quirl check` and `quirl lint` validate native block delimiters and command
-grammar without running source. Data expressions are deliberately not evaluated
-during those checks: the data runtime has no side-effect-free parser yet, and a
-check must never open files or invoke an adapter. Their semantic diagnostics are
-therefore reported by `quirl run` with the data-statement span.
+grammar without running source. They also use `quirl-data`'s bounded,
+side-effect-free parser for data bodies, so syntax diagnostics preserve the
+data-statement span without opening files, invoking adapters, resolving the
+current directory, or executing `^external`. Formatting and data-token
+highlighting consume the same AST. Evaluation semantics beyond the focused
+surface remain owned by the later typed evaluator work.
 
 ## 4. Command intelligence
 

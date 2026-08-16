@@ -5,6 +5,8 @@
 //! YAML, TOML, CSV, POSIX tar headers, and filesystem rows become structured
 //! values at `open`/`files`.
 
+pub mod syntax;
+
 use quirl_core::{
     directory_entries, escape_terminal_controls, ErrorCode, ProcessHost, ProcessRequest,
     ShellError, StructuredValue,
@@ -22,6 +24,11 @@ use std::{
         Arc,
     },
     time::Duration,
+};
+use syntax::{
+    BooleanOperator as SyntaxBooleanOperator, ComparisonOperator as SyntaxComparisonOperator,
+    DataPredicate as SyntaxPredicate, DataSource, DataSyntaxDiagnostic, DataSyntaxDiagnosticKind,
+    DataSyntaxLimits, DataTransform, SortDirection, Spanned,
 };
 
 /// Resource limits applied before data enters the evaluator.
@@ -536,24 +543,17 @@ impl DataRuntime {
         cancelled: &AtomicBool,
         cancellation_handle: Option<Arc<AtomicBool>>,
     ) -> Result<DataOutput, ShellError> {
-        if source.len() > self.limits.max_source_bytes {
-            return Err(limit_error(
-                "data expression exceeds the source-size limit",
-                "Put large data in a file and use `open <path>`",
-            ));
-        }
-        let stages = split_pipeline(source)?;
-        let Some((first, transforms)) = stages.split_first() else {
-            return Ok(DataOutput::Value(Value::Null));
-        };
+        let syntax_limits = syntax_limits(self.limits);
+        let expression = syntax::parse_data_expression(source, syntax_limits)
+            .map_err(|diagnostic| syntax_shell_error(source, diagnostic))?;
         check_cancelled(cancelled)?;
         let mut output = evaluate_source_output(
-            first,
+            &expression.source,
             self.limits,
             self.process_host.as_ref(),
             cancellation_handle,
         )?;
-        for transform in transforms {
+        for transform in &expression.transforms {
             check_cancelled(cancelled)?;
             output = apply_output_transform(output, transform, self.limits, cancelled)?;
         }
@@ -688,20 +688,19 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), ShellError> {
     }
 }
 
-fn evaluate_source(stage: &str, limits: DataLimits) -> Result<Value, ShellError> {
-    let words = shlex::split(stage).ok_or_else(|| data_error(stage, "unclosed quote"))?;
-    match words.first().map(String::as_str) {
-        Some("pwd") if words.len() == 1 => std::env::current_dir()
+fn evaluate_source(source: &Spanned<DataSource>, limits: DataLimits) -> Result<Value, ShellError> {
+    match &source.value {
+        DataSource::Pwd => std::env::current_dir()
             .map(|path| Value::String(path.display().to_string()))
             .map_err(|error| {
                 ShellError::new(ErrorCode::Io, "cannot read the current directory")
                     .with_context(error.to_string())
                     .with_help("Check that the current directory still exists and is accessible")
             }),
-        Some("ls") | Some("files") if words.len() <= 2 => {
-            let path = words
-                .get(1)
-                .map_or_else(|| PathBuf::from("."), PathBuf::from);
+        DataSource::Files { path } => {
+            let path = path
+                .as_ref()
+                .map_or_else(|| PathBuf::from("."), |path| PathBuf::from(&path.value));
             let entries = directory_entries(&path, false)?;
             if entries.len() > limits.max_rows {
                 return Err(limit_error(
@@ -715,39 +714,29 @@ fn evaluate_source(stage: &str, limits: DataLimits) -> Result<Value, ShellError>
                     .with_help("Try a directory whose entries can be represented as typed values")
             })
         }
-        Some("open") if words.len() == 2 => {
-            let path = PathBuf::from(&words[1]);
+        DataSource::Open { path } => {
+            let path = PathBuf::from(&path.value);
             DataRuntime::with_limits(limits).open_value(&path)
         }
-        Some("open") => Err(data_error(stage, "usage: open <path>")),
-        Some("ls") | Some("files") => Err(data_error(stage, "usage: files [path]")),
-        _ => {
-            let value = serde_json::from_str(stage).map_err(|error| {
-                data_error(
-                    stage,
-                    format!("expected `pwd`, `files`, `open`, or a JSON value: {error}"),
-                )
-            })?;
+        DataSource::Literal(literal) => {
+            let value = literal.to_json();
             validate_value(&value, limits)?;
             Ok(value)
         }
+        DataSource::External { .. } => Err(data_error(
+            "^external",
+            "external sources require the explicit process-host output boundary",
+        )),
     }
 }
 
 fn evaluate_source_output(
-    stage: &str,
+    source: &Spanned<DataSource>,
     limits: DataLimits,
     process_host: Option<&ProcessHost>,
     cancellation_handle: Option<Arc<AtomicBool>>,
 ) -> Result<DataOutput, ShellError> {
-    if let Some(command) = stage
-        .strip_prefix("^external")
-        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-    {
-        let command = command.trim_start();
-        if command.is_empty() {
-            return Err(data_error(stage, "usage: ^external <command>"));
-        }
+    if let DataSource::External { command } = &source.value {
         let process_host = process_host.ok_or_else(|| {
             ShellError::new(
                 ErrorCode::Validation,
@@ -763,7 +752,7 @@ fn evaluate_source_output(
             .with_help("Use `eval_output_with_cancellation_handle` for cancellable external data")
         })?;
         let outcome = process_host(ProcessRequest {
-            command: command.to_owned(),
+            command: command.value.clone(),
             deadline: limits.external_deadline,
             cancelled,
             max_output_bytes: limits.max_external_output_bytes,
@@ -773,7 +762,7 @@ fn evaluate_source_output(
                 ErrorCode::Data,
                 format!("external data source exited with status {}", outcome.status),
             )
-            .with_command(command)
+            .with_command(&command.value)
             .with_help(
                 "Inspect the command's stderr, fix the input, then run the data pipeline again",
             );
@@ -787,10 +776,9 @@ fn evaluate_source_output(
             outcome.stdout.unwrap_or_default(),
         )));
     }
-    let words = shlex::split(stage).ok_or_else(|| data_error(stage, "unclosed quote"))?;
-    match words.first().map(String::as_str) {
-        Some("open") if words.len() == 2 => {
-            let path = PathBuf::from(&words[1]);
+    match &source.value {
+        DataSource::Open { path } => {
+            let path = PathBuf::from(&path.value);
             let runtime = DataRuntime::with_limits(limits);
             match extension(&path).as_deref() {
                 Some("csv") | Some("tar") => Ok(DataOutput::Stream(runtime.open_stream(path)?)),
@@ -802,10 +790,8 @@ fn evaluate_source_output(
                 },
             }
         }
-        Some("open") => Err(data_error(stage, "usage: open <path>")),
-        Some("pwd") if words.len() == 1 => Ok(DataOutput::Value(evaluate_source(stage, limits)?)),
-        Some("ls") | Some("files") if words.len() <= 2 => {
-            let Value::Array(rows) = evaluate_source(stage, limits)? else {
+        DataSource::Files { .. } => {
+            let Value::Array(rows) = evaluate_source(source, limits)? else {
                 return Err(ShellError::new(
                     ErrorCode::Data,
                     "filesystem source did not produce directory rows",
@@ -814,47 +800,53 @@ fn evaluate_source_output(
             };
             Ok(DataOutput::Stream(DataStream::from_values(rows, limits)))
         }
-        Some("ls") | Some("files") => Err(data_error(stage, "usage: files [path]")),
-        _ => match evaluate_source(stage, limits)? {
+        DataSource::Pwd | DataSource::Literal(_) => match evaluate_source(source, limits)? {
             Value::Array(rows) => Ok(DataOutput::Stream(DataStream::from_values(rows, limits))),
             value => Ok(DataOutput::Value(value)),
         },
+        DataSource::External { .. } => Err(ShellError::new(
+            ErrorCode::Data,
+            "external data source escaped its explicit evaluation boundary",
+        )
+        .with_help("Report this internal data runtime invariant failure")),
     }
 }
 
 fn apply_output_transform(
     output: DataOutput,
-    stage: &str,
+    transform: &Spanned<DataTransform>,
     limits: DataLimits,
     cancelled: &AtomicBool,
 ) -> Result<DataOutput, ShellError> {
-    let words = shlex::split(stage).ok_or_else(|| data_error(stage, "unclosed quote"))?;
     if let DataOutput::Value(value) = output {
-        match words.first().map(String::as_str) {
-            Some("lines") if words.len() == 1 => {
+        match &transform.value {
+            DataTransform::Lines => {
                 let Value::String(bytes) = value else {
-                    return Err(data_error(stage, "lines expects a string byte value"));
+                    return Err(data_error("lines", "lines expects a string byte value"));
                 };
                 return Ok(DataOutput::Stream(DataStream::from_lines(bytes, limits)));
             }
-            Some("from") if words.len() == 2 && words[1] == "json" => {
+            DataTransform::FromJson => {
                 let Value::String(bytes) = value else {
-                    return Err(data_error(stage, "from json expects a string byte value"));
+                    return Err(data_error(
+                        "from json",
+                        "from json expects a string byte value",
+                    ));
                 };
-                return match parse_json_boundary(&bytes, stage, limits)? {
+                return match parse_json_boundary(&bytes, "from json", limits)? {
                     Value::Array(rows) => {
                         Ok(DataOutput::Stream(DataStream::from_values(rows, limits)))
                     }
                     value => Ok(DataOutput::Value(value)),
                 };
             }
-            Some("to") if words.len() == 2 && words[1] == "json" => {
+            DataTransform::ToJson => {
                 return Ok(DataOutput::Value(Value::String(to_json_boundary(
-                    &value, stage,
+                    &value, "to json",
                 )?)));
             }
             _ => {
-                let value = apply_transform(value, stage)?;
+                let value = apply_transform(value, &transform.value)?;
                 validate_value(&value, limits)?;
                 return Ok(DataOutput::Value(value));
             }
@@ -863,69 +855,62 @@ fn apply_output_transform(
     let DataOutput::Stream(mut stream) = output else {
         unreachable!();
     };
-    match words.first().map(String::as_str) {
-        Some("lines") if words.len() == 1 => Err(data_error(
-            stage,
+    match &transform.value {
+        DataTransform::Lines => Err(data_error(
+            "lines",
             "lines expects one string value; apply it immediately after ^external or from json",
         )),
-        Some("from") if words.len() == 2 && words[1] == "json" => {
-            let stage = stage.to_owned();
+        DataTransform::FromJson => Ok(DataOutput::Stream(stream.map(move |value| {
+            let Value::String(bytes) = value else {
+                return Err(data_error(
+                    "from json",
+                    "from json expects string stream items",
+                ));
+            };
+            parse_json_boundary(&bytes, "from json", limits)
+        }))),
+        DataTransform::ToJson => {
             Ok(DataOutput::Stream(stream.map(move |value| {
-                let Value::String(bytes) = value else {
-                    return Err(data_error(&stage, "from json expects string stream items"));
-                };
-                parse_json_boundary(&bytes, &stage, limits)
+                to_json_boundary(&value, "to json").map(Value::String)
             })))
         }
-        Some("to") if words.len() == 2 && words[1] == "json" => {
-            let stage = stage.to_owned();
-            Ok(DataOutput::Stream(stream.map(move |value| {
-                to_json_boundary(&value, &stage).map(Value::String)
-            })))
-        }
-        Some("where") => {
-            let expression = stage
-                .strip_prefix("where")
-                .filter(|rest| rest.starts_with(char::is_whitespace))
-                .ok_or_else(|| {
-                    data_error(
-                        stage,
-                        "usage: where <field> <comparison> <value> [and|or ...]",
-                    )
-                })?;
-            let predicate = Predicate::parse(expression, stage)?;
-            let stage = stage.to_owned();
+        DataTransform::Where(predicate) => {
+            let predicate = predicate.clone();
             Ok(DataOutput::Stream(stream.filter(move |row| {
                 if !row.is_object() {
-                    return Err(data_error(&stage, "where expects object rows"));
+                    return Err(data_error("where", "where expects object rows"));
                 }
-                predicate.matches(row, &stage)
+                predicate_matches(&predicate, row, "where")
             })))
         }
-        Some("select") if words.len() >= 2 => {
-            let fields = words[1..].to_vec();
-            let stage = stage.to_owned();
+        DataTransform::Select { fields } => {
+            let fields = fields
+                .iter()
+                .map(|field| field.value.clone())
+                .collect::<Vec<_>>();
             Ok(DataOutput::Stream(
-                stream.map(move |row| select_fields(row, &fields, &stage)),
+                stream.map(move |row| select_fields(row, &fields, "select")),
             ))
         }
-        Some("get") if words.len() == 2 => {
-            let field = words[1].clone();
-            let stage = stage.to_owned();
+        DataTransform::Get { path } => {
+            let field = path.value.clone();
             Ok(DataOutput::Stream(
-                stream.map(move |row| get_field(row, &field, &stage)),
+                stream.map(move |row| get_field(row, &field, "get")),
             ))
         }
-        Some("take") if words.len() == 2 => {
-            let count = words[1]
-                .parse::<usize>()
-                .map_err(|_| data_error(stage, "take count must be a non-negative integer"))?;
+        DataTransform::Take { count } => {
+            let count = usize::try_from(count.value).map_err(|_| {
+                limit_error(
+                    "take count exceeds the platform index range",
+                    "Use a smaller non-negative count",
+                )
+            })?;
             Ok(DataOutput::Stream(stream.take(count)))
         }
-        Some("first") if words.len() == 1 => Ok(DataOutput::Value(
+        DataTransform::First => Ok(DataOutput::Value(
             stream.next(cancelled)?.unwrap_or(Value::Null),
         )),
-        Some("length") if words.len() == 1 => {
+        DataTransform::Length => {
             let mut length = 0_u64;
             while stream.next(cancelled)?.is_some() {
                 length = length.checked_add(1).ok_or_else(|| {
@@ -937,12 +922,12 @@ fn apply_output_transform(
             }
             Ok(DataOutput::Value(Value::from(length)))
         }
-        Some("sort") => {
+        DataTransform::Sort { field, direction } => {
             // Sorting is intentionally a collection boundary. The row limit is
             // still enforced by `collect`, and callers can make it explicit
             // with `take` before sorting.
             let rows = stream.collect(cancelled)?;
-            let sorted = sort_rows(Value::Array(rows), &words, stage)?;
+            let sorted = sort_rows(Value::Array(rows), &field.value, *direction, "sort")?;
             let Value::Array(rows) = sorted else {
                 return Err(ShellError::new(
                     ErrorCode::Data,
@@ -952,11 +937,6 @@ fn apply_output_transform(
             };
             Ok(DataOutput::Stream(DataStream::from_values(rows, limits)))
         }
-        Some(command) => Err(data_error(
-            stage,
-            format!("unknown data transform `{command}`"),
-        )),
-        None => Err(data_error(stage, "empty pipeline stage")),
     }
 }
 
@@ -1600,32 +1580,41 @@ fn render_table_rows(rows: &[Value]) -> String {
     output
 }
 
-fn apply_transform(value: Value, stage: &str) -> Result<Value, ShellError> {
-    let words = shlex::split(stage).ok_or_else(|| data_error(stage, "unclosed quote"))?;
-    match words.first().map(String::as_str) {
-        Some("length") if words.len() == 1 => match value {
+fn apply_transform(value: Value, transform: &DataTransform) -> Result<Value, ShellError> {
+    match transform {
+        DataTransform::Length => match value {
             Value::Array(values) => Ok(Value::from(values.len())),
             Value::Object(values) => Ok(Value::from(values.len())),
             Value::String(value) => Ok(Value::from(value.chars().count())),
             _ => Err(data_error(
-                stage,
+                "length",
                 "length expects an array, object, or string",
             )),
         },
-        Some("first") if words.len() == 1 => match value {
+        DataTransform::First => match value {
             Value::Array(values) => Ok(values.into_iter().next().unwrap_or(Value::Null)),
-            _ => Err(data_error(stage, "first expects an array")),
+            _ => Err(data_error("first", "first expects an array")),
         },
-        Some("get") if words.len() == 2 => get_field(value, &words[1], stage),
-        Some("where") => filter_where(value, stage),
-        Some("select") if words.len() >= 2 => select_fields(value, &words[1..], stage),
-        Some("sort") => sort_rows(value, &words, stage),
-        Some("take") => take_values(value, &words, stage),
-        Some(command) => Err(data_error(
-            stage,
-            format!("unknown data transform `{command}`"),
-        )),
-        None => Err(data_error(stage, "empty pipeline stage")),
+        DataTransform::Get { path } => get_field(value, &path.value, "get"),
+        DataTransform::Where(predicate) => filter_where(value, predicate, "where"),
+        DataTransform::Select { fields } => {
+            let fields = fields
+                .iter()
+                .map(|field| field.value.clone())
+                .collect::<Vec<_>>();
+            select_fields(value, &fields, "select")
+        }
+        DataTransform::Sort { field, direction } => {
+            sort_rows(value, &field.value, *direction, "sort")
+        }
+        DataTransform::Take { count } => take_values(value, count.value, "take"),
+        DataTransform::Lines | DataTransform::FromJson | DataTransform::ToJson => {
+            Err(ShellError::new(
+                ErrorCode::Data,
+                "byte/value bridge escaped its explicit output boundary",
+            )
+            .with_help("Report this internal data runtime invariant failure"))
+        }
     }
 }
 
@@ -1653,17 +1642,11 @@ fn get_field(value: Value, field: &str, stage: &str) -> Result<Value, ShellError
     }
 }
 
-fn filter_where(value: Value, stage: &str) -> Result<Value, ShellError> {
-    let expression = stage
-        .strip_prefix("where")
-        .filter(|rest| rest.starts_with(char::is_whitespace))
-        .ok_or_else(|| {
-            data_error(
-                stage,
-                "usage: where <field> <comparison> <value> [and|or ...]",
-            )
-        })?;
-    let predicate = Predicate::parse(expression, stage)?;
+fn filter_where(
+    value: Value,
+    predicate: &SyntaxPredicate,
+    stage: &str,
+) -> Result<Value, ShellError> {
     let Value::Array(values) = value else {
         return Err(data_error(stage, "where expects an array of objects"));
     };
@@ -1673,242 +1656,69 @@ fn filter_where(value: Value, stage: &str) -> Result<Value, ShellError> {
         if !value.is_object() {
             return Err(data_error(stage, "where expects object rows"));
         }
-        if predicate.matches(&value, stage)? {
+        if predicate_matches(predicate, &value, stage)? {
             filtered.push(value);
         }
     }
     Ok(Value::Array(filtered))
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Comparison {
-    Equal,
-    NotEqual,
-    Less,
-    LessOrEqual,
-    Greater,
-    GreaterOrEqual,
-}
-
-#[derive(Debug)]
-struct Condition {
-    field: String,
-    comparison: Comparison,
-    expected: Value,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum BooleanOperator {
-    And,
-    Or,
-}
-
-#[derive(Debug)]
-struct Predicate {
-    conditions: Vec<Condition>,
-    operators: Vec<BooleanOperator>,
-}
-
-impl Predicate {
-    fn parse(expression: &str, stage: &str) -> Result<Self, ShellError> {
-        let tokens = predicate_tokens(expression, stage)?;
-        if tokens.is_empty() {
-            return Err(data_error(stage, "where requires a predicate"));
-        }
-
-        let mut conditions = Vec::new();
-        let mut operators = Vec::new();
-        let mut index = 0;
-        loop {
-            let Some(field) = tokens.get(index) else {
-                return Err(data_error(stage, "expected a field after boolean operator"));
-            };
-            let Some(operator) = tokens.get(index + 1) else {
-                return Err(data_error(stage, "expected a comparison after field"));
-            };
-            let Some(expected) = tokens.get(index + 2) else {
-                return Err(data_error(stage, "expected a value after comparison"));
-            };
-            if field.quoted {
-                return Err(data_error(stage, "predicate fields must be bare names"));
+fn predicate_matches(
+    predicate: &SyntaxPredicate,
+    row: &Value,
+    stage: &str,
+) -> Result<bool, ShellError> {
+    let Some(first) = predicate.conditions.first() else {
+        return Err(ShellError::new(
+            ErrorCode::Data,
+            "parsed data predicate contains no conditions",
+        )
+        .with_help("Report this internal parser invariant failure"));
+    };
+    let mut group = evaluate_condition(first, row, stage)?;
+    let mut result = false;
+    for (operator, condition) in predicate
+        .operators
+        .iter()
+        .zip(predicate.conditions.iter().skip(1))
+    {
+        match operator.value {
+            SyntaxBooleanOperator::And => {
+                group = group && evaluate_condition(condition, row, stage)?;
             }
-            let comparison = match operator.text.as_str() {
-                "==" => Comparison::Equal,
-                "!=" => Comparison::NotEqual,
-                "<" => Comparison::Less,
-                "<=" => Comparison::LessOrEqual,
-                ">" => Comparison::Greater,
-                ">=" => Comparison::GreaterOrEqual,
-                _ => {
-                    return Err(data_error(
-                        stage,
-                        format!("unsupported comparison `{}`", operator.text),
-                    ))
-                }
-            };
-            conditions.push(Condition {
-                field: field.text.clone(),
-                comparison,
-                expected: expected.as_value(),
-            });
-            index += 3;
-
-            let Some(boolean) = tokens.get(index) else {
-                break;
-            };
-            if boolean.quoted {
-                return Err(data_error(
-                    stage,
-                    "expected `and` or `or` between comparisons",
-                ));
+            SyntaxBooleanOperator::Or => {
+                result = result || group;
+                group = evaluate_condition(condition, row, stage)?;
             }
-            operators.push(match boolean.text.as_str() {
-                "and" => BooleanOperator::And,
-                "or" => BooleanOperator::Or,
-                _ => {
-                    return Err(data_error(
-                        stage,
-                        "expected `and` or `or` between comparisons",
-                    ))
-                }
-            });
-            index += 1;
-        }
-
-        Ok(Self {
-            conditions,
-            operators,
-        })
-    }
-
-    fn matches(&self, row: &Value, stage: &str) -> Result<bool, ShellError> {
-        let mut group = evaluate_condition(&self.conditions[0], row, stage)?;
-        let mut result = false;
-        for (operator, condition) in self.operators.iter().zip(&self.conditions[1..]) {
-            match operator {
-                BooleanOperator::And => {
-                    group = group && evaluate_condition(condition, row, stage)?;
-                }
-                BooleanOperator::Or => {
-                    result = result || group;
-                    group = evaluate_condition(condition, row, stage)?;
-                }
-            }
-        }
-        Ok(result || group)
-    }
-}
-
-#[derive(Debug)]
-struct PredicateToken {
-    text: String,
-    quoted: bool,
-}
-
-impl PredicateToken {
-    fn as_value(&self) -> Value {
-        if self.quoted {
-            Value::String(self.text.clone())
-        } else {
-            serde_json::from_str(&self.text).unwrap_or_else(|_| Value::String(self.text.clone()))
         }
     }
+    Ok(result || group)
 }
 
-fn predicate_tokens(expression: &str, stage: &str) -> Result<Vec<PredicateToken>, ShellError> {
-    let mut tokens = Vec::new();
-    let mut characters = expression.char_indices().peekable();
-    while let Some((_, character)) = characters.peek().copied() {
-        if character.is_whitespace() {
-            characters.next();
-            continue;
-        }
-
-        if character == '\'' || character == '"' {
-            characters.next();
-            let quote = character;
-            let mut text = String::new();
-            let mut closed = false;
-            while let Some((_, character)) = characters.next() {
-                if character == quote {
-                    closed = true;
-                    break;
-                }
-                if character == '\\' {
-                    let Some((_, escaped)) = characters.next() else {
-                        return Err(data_error(stage, "unfinished escape in quoted value"));
-                    };
-                    text.push(match escaped {
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        other => other,
-                    });
-                } else {
-                    text.push(character);
-                }
-            }
-            if !closed {
-                return Err(data_error(stage, "unclosed quote in predicate"));
-            }
-            tokens.push(PredicateToken { text, quoted: true });
-            continue;
-        }
-
-        if matches!(character, '=' | '!' | '<' | '>') {
-            let Some((_, first)) = characters.next() else {
-                return Err(data_error(
-                    stage,
-                    "predicate operator is missing its first character",
-                ));
-            };
-            let mut text = first.to_string();
-            if characters.peek().is_some_and(|(_, next)| *next == '=') {
-                text.push('=');
-                characters.next();
-            }
-            tokens.push(PredicateToken {
-                text,
-                quoted: false,
-            });
-            continue;
-        }
-
-        let mut text = String::new();
-        while let Some((_, character)) = characters.peek().copied() {
-            if character.is_whitespace() || matches!(character, '=' | '!' | '<' | '>') {
-                break;
-            }
-            text.push(character);
-            characters.next();
-        }
-        tokens.push(PredicateToken {
-            text,
-            quoted: false,
-        });
-    }
-    Ok(tokens)
-}
-
-fn evaluate_condition(condition: &Condition, row: &Value, stage: &str) -> Result<bool, ShellError> {
-    let Some(actual) = get_path(row, &condition.field) else {
+fn evaluate_condition(
+    condition: &syntax::DataCondition,
+    row: &Value,
+    stage: &str,
+) -> Result<bool, ShellError> {
+    let Some(actual) = get_path(row, &condition.field.value) else {
         return Ok(false);
     };
-    match condition.comparison {
-        Comparison::Equal => Ok(actual == &condition.expected),
-        Comparison::NotEqual => Ok(actual != &condition.expected),
-        Comparison::Less => {
-            Ok(compare_values(actual, &condition.expected, stage)? == Ordering::Less)
+    let expected = condition.expected.to_json();
+    match condition.comparison.value {
+        SyntaxComparisonOperator::Equal => Ok(actual == &expected),
+        SyntaxComparisonOperator::NotEqual => Ok(actual != &expected),
+        SyntaxComparisonOperator::Less => {
+            Ok(compare_values(actual, &expected, stage)? == Ordering::Less)
         }
-        Comparison::LessOrEqual => Ok(matches!(
-            compare_values(actual, &condition.expected, stage)?,
+        SyntaxComparisonOperator::LessOrEqual => Ok(matches!(
+            compare_values(actual, &expected, stage)?,
             Ordering::Less | Ordering::Equal
         )),
-        Comparison::Greater => {
-            Ok(compare_values(actual, &condition.expected, stage)? == Ordering::Greater)
+        SyntaxComparisonOperator::Greater => {
+            Ok(compare_values(actual, &expected, stage)? == Ordering::Greater)
         }
-        Comparison::GreaterOrEqual => Ok(matches!(
-            compare_values(actual, &condition.expected, stage)?,
+        SyntaxComparisonOperator::GreaterOrEqual => Ok(matches!(
+            compare_values(actual, &expected, stage)?,
             Ordering::Greater | Ordering::Equal
         )),
     }
@@ -1970,15 +1780,13 @@ fn get_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
         .try_fold(value, |value, field| value.as_object()?.get(field))
 }
 
-fn sort_rows(value: Value, words: &[String], stage: &str) -> Result<Value, ShellError> {
-    if !(words.len() == 2 || words.len() == 3) {
-        return Err(data_error(stage, "usage: sort <field> [asc|desc]"));
-    }
-    let descending = match words.get(2).map(String::as_str) {
-        None | Some("asc") => false,
-        Some("desc") => true,
-        Some(_) => return Err(data_error(stage, "sort direction must be `asc` or `desc`")),
-    };
+fn sort_rows(
+    value: Value,
+    field: &str,
+    direction: SortDirection,
+    stage: &str,
+) -> Result<Value, ShellError> {
+    let descending = direction == SortDirection::Descending;
     let Value::Array(mut values) = value else {
         return Err(data_error(stage, "sort expects an array of objects"));
     };
@@ -1986,11 +1794,8 @@ fn sort_rows(value: Value, words: &[String], stage: &str) -> Result<Value, Shell
         if !value.is_object() {
             return Err(data_error(stage, "sort expects object rows"));
         }
-        if get_path(value, &words[1]).is_none() {
-            return Err(data_error(
-                stage,
-                format!("row has no field `{}`", words[1]),
-            ));
+        if get_path(value, field).is_none() {
+            return Err(data_error(stage, format!("row has no field `{field}`")));
         }
     }
 
@@ -1999,12 +1804,8 @@ fn sort_rows(value: Value, words: &[String], stage: &str) -> Result<Value, Shell
         if comparison_error.is_some() {
             return Ordering::Equal;
         }
-        let (Some(left), Some(right)) = (get_path(left, &words[1]), get_path(right, &words[1]))
-        else {
-            comparison_error = Some(data_error(
-                stage,
-                format!("row has no field `{}`", words[1]),
-            ));
+        let (Some(left), Some(right)) = (get_path(left, field), get_path(right, field)) else {
+            comparison_error = Some(data_error(stage, format!("row has no field `{field}`")));
             return Ordering::Equal;
         };
         match compare_values(left, right, stage) {
@@ -2022,13 +1823,13 @@ fn sort_rows(value: Value, words: &[String], stage: &str) -> Result<Value, Shell
     Ok(Value::Array(values))
 }
 
-fn take_values(value: Value, words: &[String], stage: &str) -> Result<Value, ShellError> {
-    if words.len() != 2 {
-        return Err(data_error(stage, "usage: take <count>"));
-    }
-    let count = words[1]
-        .parse::<usize>()
-        .map_err(|_| data_error(stage, "take count must be a non-negative integer"))?;
+fn take_values(value: Value, count: u64, stage: &str) -> Result<Value, ShellError> {
+    let count = usize::try_from(count).map_err(|_| {
+        limit_error(
+            "take count exceeds the platform index range",
+            "Use a smaller non-negative count",
+        )
+    })?;
     let Value::Array(mut values) = value else {
         return Err(data_error(stage, "take expects an array"));
     };
@@ -2066,68 +1867,6 @@ fn select_fields(value: Value, fields: &[String], stage: &str) -> Result<Value, 
     }
 }
 
-fn split_pipeline(source: &str) -> Result<Vec<&str>, ShellError> {
-    let mut stages = Vec::new();
-    let mut start = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    let mut delimiters = Vec::new();
-    for (index, character) in source.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' && quote.is_some() {
-            escaped = true;
-            continue;
-        }
-        if let Some(active_quote) = quote {
-            if character == active_quote {
-                quote = None;
-            }
-            continue;
-        }
-        match character {
-            '\'' | '"' => quote = Some(character),
-            '[' | '{' | '(' => delimiters.push(character),
-            ']' | '}' | ')' => {
-                let expected = match character {
-                    ']' => '[',
-                    '}' => '{',
-                    ')' => '(',
-                    _ => unreachable!(),
-                };
-                if delimiters.pop() != Some(expected) {
-                    return Err(data_error(
-                        source,
-                        "unmatched or mismatched closing delimiter",
-                    ));
-                }
-            }
-            '|' if delimiters.is_empty() => {
-                let stage = source[start..index].trim();
-                if stage.is_empty() {
-                    return Err(data_error(source, "empty pipeline stage"));
-                }
-                stages.push(stage);
-                start = index + 1;
-            }
-            _ => {}
-        }
-    }
-    if quote.is_some() {
-        return Err(data_error(source, "unclosed quote"));
-    }
-    if !delimiters.is_empty() {
-        return Err(data_error(source, "unclosed delimiter"));
-    }
-    let final_stage = source[start..].trim();
-    if !final_stage.is_empty() {
-        stages.push(final_stage);
-    }
-    Ok(stages)
-}
-
 fn parse_json_boundary(bytes: &str, stage: &str, limits: DataLimits) -> Result<Value, ShellError> {
     if bytes.len() > limits.max_source_bytes {
         return Err(limit_error(
@@ -2149,6 +1888,34 @@ fn to_json_boundary(value: &Value, stage: &str) -> Result<String, ShellError> {
             .with_context(error.to_string())
             .with_help("Select JSON-compatible fields before crossing the byte boundary")
     })
+}
+
+fn syntax_limits(limits: DataLimits) -> DataSyntaxLimits {
+    DataSyntaxLimits {
+        input_bytes_max: limits.max_source_bytes,
+        nesting_depth_max: limits.max_depth,
+        fields_max: limits.max_fields,
+        literal_bytes_max: DataSyntaxLimits::DEFAULT
+            .literal_bytes_max
+            .min(limits.max_source_bytes),
+        ..DataSyntaxLimits::DEFAULT
+    }
+}
+
+fn syntax_shell_error(source: &str, diagnostic: DataSyntaxDiagnostic) -> ShellError {
+    let code = match diagnostic.kind {
+        DataSyntaxDiagnosticKind::ResourceLimit => ErrorCode::ResourceLimit,
+        DataSyntaxDiagnosticKind::Encoding | DataSyntaxDiagnosticKind::Syntax => ErrorCode::Data,
+    };
+    ShellError::new(code, diagnostic.message)
+        .with_label(
+            None,
+            diagnostic.start,
+            diagnostic.end,
+            "invalid data syntax",
+        )
+        .with_context(format!("expression bytes: {}", source.len()))
+        .with_help(diagnostic.help)
 }
 
 fn data_error(source: &str, message: impl Into<String>) -> ShellError {

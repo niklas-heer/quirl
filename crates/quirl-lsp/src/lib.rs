@@ -32,10 +32,27 @@ struct Document {
     text: String,
 }
 
+/// Inert native-language diagnostic supplied by the CLI composition root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeDiagnostic {
+    /// Concise diagnostic message.
+    pub message: String,
+    /// Inclusive UTF-8 byte offset in the complete document.
+    pub start: usize,
+    /// Exclusive UTF-8 byte offset in the complete document.
+    pub end: usize,
+    /// Stable producer name shown to LSP clients.
+    pub source: &'static str,
+}
+
+/// Side-effect-free native document analyzer injected without adding an LSP-to-data edge.
+pub type NativeAnalyzer = fn(&str) -> Vec<NativeDiagnostic>;
+
 /// Stateful language-service protocol implementation.
 #[derive(Debug, Clone)]
 pub struct LanguageService {
     catalog: Catalog,
+    native_analyzer: Option<NativeAnalyzer>,
     documents: HashMap<String, Document>,
     retained_document_bytes: usize,
     shutdown: bool,
@@ -53,11 +70,23 @@ impl LanguageService {
     pub fn new(catalog: Catalog) -> Self {
         Self {
             catalog,
+            native_analyzer: None,
             documents: HashMap::new(),
             retained_document_bytes: 0,
             shutdown: false,
             exit: false,
         }
+    }
+
+    /// Create a session with a composition-root native analyzer.
+    ///
+    /// The callback must only inspect the supplied bounded UTF-8 document. The
+    /// LSP invokes it after enforcing the 1 MiB document limit and never grants
+    /// filesystem, process, adapter, or runtime capabilities.
+    pub fn new_with_native_analyzer(catalog: Catalog, analyzer: NativeAnalyzer) -> Self {
+        let mut service = Self::new(catalog);
+        service.native_analyzer = Some(analyzer);
+        service
     }
 
     /// Handle one JSON-RPC message and return zero or more response/notification messages.
@@ -173,7 +202,7 @@ impl LanguageService {
             version: item.get("version").and_then(Value::as_i64).unwrap_or(0),
             text: text.to_owned(),
         };
-        let diagnostics = diagnostics(uri, &document);
+        let diagnostics = diagnostics(uri, &document, self.native_analyzer);
         let version = document.version;
         self.documents.insert(uri.to_owned(), document);
         self.retained_document_bytes = next_retained_bytes;
@@ -218,7 +247,7 @@ impl LanguageService {
             version,
             text: text.to_owned(),
         };
-        let diagnostics = diagnostics(uri, &document);
+        let diagnostics = diagnostics(uri, &document, self.native_analyzer);
         self.documents.insert(uri.to_owned(), document);
         self.retained_document_bytes = next_retained_bytes;
         Ok(Dispatch::Messages(vec![publish_diagnostics(
@@ -288,7 +317,7 @@ impl LanguageService {
             .ok_or_else(|| invalid_params("diagnostic refers to a document that is not open"))?;
         Ok(Dispatch::Result(json!({
             "kind": "full",
-            "items": diagnostics(uri, document),
+            "items": diagnostics(uri, document, self.native_analyzer),
         })))
     }
 
@@ -335,6 +364,25 @@ pub fn serve<R: BufRead, W: Write>(
     Ok(())
 }
 
+/// Serve LSP with a side-effect-free native analyzer supplied by the composition root.
+pub fn serve_with_native_analyzer<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    catalog: Catalog,
+    analyzer: NativeAnalyzer,
+) -> Result<(), ShellError> {
+    let mut service = LanguageService::new_with_native_analyzer(catalog, analyzer);
+    while let Some(message) = read_message(reader)? {
+        for outgoing in service.handle(message) {
+            write_message(writer, &outgoing)?;
+        }
+        if service.should_exit() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn initialize_result() -> Value {
     json!({
         "capabilities": {
@@ -352,14 +400,18 @@ fn initialize_result() -> Value {
     })
 }
 
-fn diagnostics(uri: &str, document: &Document) -> Vec<Value> {
+fn diagnostics(
+    uri: &str,
+    document: &Document,
+    native_analyzer: Option<NativeAnalyzer>,
+) -> Vec<Value> {
     if is_lua(uri, document) {
         match LuaRuntime::check_source(&document.text, uri) {
             Ok(()) => Vec::new(),
             Err(error) => shell_error_diagnostics(&document.text, &error),
         }
     } else {
-        quirl_diagnostics(&document.text)
+        quirl_diagnostics(&document.text, native_analyzer)
     }
 }
 
@@ -389,19 +441,34 @@ fn shell_error_diagnostics(text: &str, error: &ShellError) -> Vec<Value> {
         .collect()
 }
 
-fn quirl_diagnostics(text: &str) -> Vec<Value> {
-    check_script(text)
-        .into_iter()
-        .map(|diagnostic| {
-            diagnostic_value(
-                text,
-                diagnostic.start,
-                diagnostic.end,
-                &diagnostic.message,
-                "quirl-syntax",
-            )
-        })
-        .collect()
+fn quirl_diagnostics(text: &str, native_analyzer: Option<NativeAnalyzer>) -> Vec<Value> {
+    if let Some(analyzer) = native_analyzer {
+        analyzer(text)
+            .into_iter()
+            .map(|diagnostic| {
+                diagnostic_value(
+                    text,
+                    diagnostic.start,
+                    diagnostic.end,
+                    &diagnostic.message,
+                    diagnostic.source,
+                )
+            })
+            .collect()
+    } else {
+        check_script(text)
+            .into_iter()
+            .map(|diagnostic| {
+                diagnostic_value(
+                    text,
+                    diagnostic.start,
+                    diagnostic.end,
+                    &diagnostic.message,
+                    "quirl-syntax",
+                )
+            })
+            .collect()
+    }
 }
 
 fn diagnostic_value(text: &str, start: usize, end: usize, message: &str, source: &str) -> Value {
@@ -1054,6 +1121,29 @@ mod tests {
     }
 
     #[test]
+    fn injected_native_analyzer_reports_data_diagnostics_without_execution() {
+        fn analyzer(source: &str) -> Vec<NativeDiagnostic> {
+            let start = source.find("[1, 2").unwrap_or(0);
+            vec![NativeDiagnostic {
+                message: "data expression has an unclosed delimiter".to_owned(),
+                start,
+                end: start + 1,
+                source: "quirl-data",
+            }]
+        }
+
+        let source = "data [1, 2 | ^external touch /tmp/never-run";
+        let mut service = LanguageService::new_with_native_analyzer(Catalog::builtin(), analyzer);
+        let messages = open(&mut service, "file:///data.qrl", "quirl", source);
+        let diagnostic = &messages[0]["params"]["diagnostics"][0];
+        assert_eq!(diagnostic["source"], "quirl-data");
+        assert_eq!(
+            diagnostic["message"],
+            "data expression has an unclosed delimiter"
+        );
+    }
+
+    #[test]
     fn native_alias_documents_use_quirl_language_services() {
         for uri in ["file:///flow.quirl", "file:///flow.%F0%9F%8C%80"] {
             let mut service = LanguageService::default();
@@ -1095,7 +1185,7 @@ mod tests {
     fn quirl_diagnostics_share_native_unsupported_constructs_and_spans() {
         let source = "echo $HOME\nprintf ok |\n";
         let expected = check_script(source);
-        let actual = quirl_diagnostics(source);
+        let actual = quirl_diagnostics(source, None);
         assert_eq!(actual.len(), expected.len());
         for (actual, expected) in actual.iter().zip(expected) {
             assert_eq!(actual["message"], expected.message);

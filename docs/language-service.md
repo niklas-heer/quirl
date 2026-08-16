@@ -27,6 +27,13 @@ also reports deterministic structural diagnostics for mismatched delimiters,
 unterminated strings, and empty pipeline stages. It does not spawn commands or
 resolve ambient shell state.
 
+The CLI composition root supplies the complete native analyzer to the LSP.
+Command blocks continue to use `quirl-syntax`; inline and explicit data bodies
+use `quirl-data`'s bounded parser and retain its UTF-8 byte spans and
+`quirl-data` diagnostic source. The callback receives only the already-bounded
+document text and has no process, filesystem, adapter, or evaluator capability.
+This preserves ADR 0016: `quirl-lsp` does not depend on `quirl-data`.
+
 ## Editor command
 
 Configure an LSP client with this stdio command:

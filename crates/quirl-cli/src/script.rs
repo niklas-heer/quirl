@@ -1,6 +1,11 @@
 use clap::ValueEnum;
 use quirl_core::{escape_json_terminal_controls, ErrorCode, ShellError};
-use quirl_data::DataRuntime;
+use quirl_data::{
+    syntax::{
+        format_data_expression, parse_data_expression, DataSyntaxDiagnosticKind, DataSyntaxLimits,
+    },
+    DataRuntime,
+};
 use quirl_lua::{format_file, LuaPolicy, LuaRuntime, MAX_LUA_SOURCE_BYTES};
 use quirl_process::{sandboxed_process_host, ChildProcessTree, NativeExecutor};
 use quirl_syntax::{check_script, parse_command_list};
@@ -69,6 +74,16 @@ struct AnalysisEntry {
     valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ShellError>,
+}
+
+#[derive(Debug, Clone)]
+struct QuirlSyntaxDiagnostic {
+    message: String,
+    start: usize,
+    end: usize,
+    help: String,
+    resource_limit: bool,
+    source: &'static str,
 }
 
 pub fn analyze(path: &Path, json_output: bool, lint: bool) -> Result<i32, ShellError> {
@@ -146,11 +161,12 @@ pub fn format_paths(path: &Path, check: bool) -> Result<i32, ShellError> {
     let mut drift = Vec::new();
     let mut failures = Vec::new();
     for file in files {
-        if script_language_for_path(&file) == Some(ScriptLanguage::Quirl) {
-            println!("unchanged {}", file.display());
-            continue;
-        }
-        match format_file(&file, check) {
+        let result = if script_language_for_path(&file) == Some(ScriptLanguage::Quirl) {
+            format_quirl_file(&file, check)
+        } else {
+            format_file(&file, check)
+        };
+        match result {
             Ok(true) => {
                 drift.push(file.clone());
                 println!(
@@ -180,6 +196,69 @@ pub fn format_paths(path: &Path, check: bool) -> Result<i32, ShellError> {
     Ok(i32::from(
         !failures.is_empty() || (check && !drift.is_empty()),
     ))
+}
+
+fn format_quirl_file(path: &Path, check: bool) -> Result<bool, ShellError> {
+    let source = read_script_file(path)?;
+    let formatted = format_quirl_source(&source, &path.display().to_string())?;
+    let changed = source != formatted;
+    if changed && !check {
+        fs::write(path, formatted).map_err(|error| {
+            ShellError::new(
+                ErrorCode::Io,
+                format!("cannot write formatted Quirl file {}", path.display()),
+            )
+            .with_context(error.to_string())
+            .with_help("Check file permissions and retry `quirl fmt`")
+        })?;
+    }
+    Ok(changed)
+}
+
+fn format_quirl_source(source: &str, source_name: &str) -> Result<String, ShellError> {
+    let statements = native_script_statements(source, source_name)?;
+    let mut replacements = Vec::new();
+    for statement in statements
+        .iter()
+        .filter(|statement| statement.kind == NativeStatementKind::Data)
+    {
+        let body = &source[statement.body.clone()];
+        let formatted = format_data_expression(body.trim(), DataSyntaxLimits::DEFAULT).map_err(
+            |diagnostic| {
+                let leading_bytes = body.len().saturating_sub(body.trim_start().len());
+                let code = if diagnostic.kind == DataSyntaxDiagnosticKind::ResourceLimit {
+                    ErrorCode::ResourceLimit
+                } else {
+                    ErrorCode::InvalidCommand
+                };
+                ShellError::new(code, diagnostic.message)
+                    .with_label(
+                        Some(source_name.to_owned()),
+                        statement.body.start + leading_bytes + diagnostic.start,
+                        statement.body.start + leading_bytes + diagnostic.end,
+                        "invalid data expression",
+                    )
+                    .with_help(diagnostic.help)
+            },
+        )?;
+        let replacement = if statement.explicit {
+            let indentation = body
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| &line[..line.len().saturating_sub(line.trim_start().len())])
+                .unwrap_or("  ");
+            let newline = if body.contains("\r\n") { "\r\n" } else { "\n" };
+            format!("{indentation}{formatted}{newline}")
+        } else {
+            formatted
+        };
+        replacements.push((statement.body.clone(), replacement));
+    }
+    let mut output = source.to_owned();
+    for (range, replacement) in replacements.into_iter().rev() {
+        output.replace_range(range, &replacement);
+    }
+    Ok(output)
 }
 
 pub fn test_paths(path: &Path) -> Result<i32, ShellError> {
@@ -325,20 +404,19 @@ fn check_script_file(path: &Path) -> Result<(), ShellError> {
 }
 
 pub(crate) fn check_quirl_source(source: &str, source_name: &str) -> Result<(), ShellError> {
-    let statements = native_script_statements(source, source_name)?;
-    let mut diagnostics = check_script(&script_without_explicit_blocks(source, &statements));
-    for statement in &statements {
-        if statement.explicit && statement.kind == NativeStatementKind::Command {
-            diagnostics.extend(command_block_diagnostics(source, statement));
-        }
-    }
-    diagnostics.sort_by(|left, right| {
-        (left.start, left.end, &left.message).cmp(&(right.start, right.end, &right.message))
-    });
+    let diagnostics = quirl_source_diagnostics(source, source_name)?;
     if diagnostics.is_empty() {
         return Ok(());
     }
-    let mut error = ShellError::new(ErrorCode::InvalidCommand, "Quirl script validation failed");
+    let code = if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.resource_limit)
+    {
+        ErrorCode::ResourceLimit
+    } else {
+        ErrorCode::InvalidCommand
+    };
+    let mut error = ShellError::new(code, "Quirl script validation failed");
     for diagnostic in diagnostics {
         error = error
             .with_label(
@@ -350,6 +428,94 @@ pub(crate) fn check_quirl_source(source: &str, source_name: &str) -> Result<(), 
             .with_help(diagnostic.help);
     }
     Err(error)
+}
+
+fn quirl_source_diagnostics(
+    source: &str,
+    source_name: &str,
+) -> Result<Vec<QuirlSyntaxDiagnostic>, ShellError> {
+    let statements = native_script_statements(source, source_name)?;
+    let mut diagnostics = check_script(&script_without_explicit_blocks(source, &statements))
+        .into_iter()
+        .map(|diagnostic| QuirlSyntaxDiagnostic {
+            message: diagnostic.message,
+            start: diagnostic.start,
+            end: diagnostic.end,
+            help: diagnostic.help,
+            resource_limit: false,
+            source: "quirl-syntax",
+        })
+        .collect::<Vec<_>>();
+    for statement in &statements {
+        if statement.explicit && statement.kind == NativeStatementKind::Command {
+            diagnostics.extend(
+                command_block_diagnostics(source, statement)
+                    .into_iter()
+                    .map(|diagnostic| QuirlSyntaxDiagnostic {
+                        message: diagnostic.message,
+                        start: diagnostic.start,
+                        end: diagnostic.end,
+                        help: diagnostic.help,
+                        resource_limit: false,
+                        source: "quirl-syntax",
+                    }),
+            );
+        }
+        if statement.kind == NativeStatementKind::Data {
+            let body = &source[statement.body.clone()];
+            let trimmed = body.trim();
+            let leading_bytes = body.len().saturating_sub(body.trim_start().len());
+            if let Err(diagnostic) = parse_data_expression(trimmed, DataSyntaxLimits::DEFAULT) {
+                diagnostics.push(QuirlSyntaxDiagnostic {
+                    message: diagnostic.message,
+                    start: statement.body.start + leading_bytes + diagnostic.start,
+                    end: statement.body.start + leading_bytes + diagnostic.end,
+                    help: diagnostic.help,
+                    resource_limit: diagnostic.kind == DataSyntaxDiagnosticKind::ResourceLimit,
+                    source: "quirl-data",
+                });
+            }
+        }
+    }
+    diagnostics.sort_by(|left, right| {
+        (left.start, left.end, &left.message).cmp(&(right.start, right.end, &right.message))
+    });
+    Ok(diagnostics)
+}
+
+pub(crate) fn lsp_native_diagnostics(source: &str) -> Vec<quirl_lsp::NativeDiagnostic> {
+    match quirl_source_diagnostics(source, "language-service document") {
+        Ok(diagnostics) => diagnostics
+            .into_iter()
+            .map(|diagnostic| quirl_lsp::NativeDiagnostic {
+                message: diagnostic.message,
+                start: diagnostic.start,
+                end: diagnostic.end,
+                source: diagnostic.source,
+            })
+            .collect(),
+        Err(error) => {
+            if error.details.labels.is_empty() {
+                return vec![quirl_lsp::NativeDiagnostic {
+                    message: error.message,
+                    start: 0,
+                    end: source.chars().next().map(char::len_utf8).unwrap_or(0),
+                    source: "quirl-script",
+                }];
+            }
+            error
+                .details
+                .labels
+                .into_iter()
+                .map(|label| quirl_lsp::NativeDiagnostic {
+                    message: format!("{}: {}", error.message, label.message),
+                    start: label.start,
+                    end: label.end,
+                    source: "quirl-script",
+                })
+                .collect()
+        }
+    }
 }
 
 fn is_test_module(path: &Path) -> bool {
@@ -1827,6 +1993,42 @@ mod tests {
         assert_eq!(format_paths(&quirl, false).unwrap(), 0);
         assert_eq!(fs::read_to_string(&quirl).unwrap(), quirl_source);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quirl_check_parses_data_bodies_without_executing_sources() {
+        let root = test_directory("data-check-nonexecution");
+        let marker = root.join("must-not-exist");
+        let source = format!("data ^external touch {} | from\n", marker.display());
+        let error = check_quirl_source(&source, "check.qrl").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert!(error
+            .details
+            .labels
+            .iter()
+            .any(|label| label.message.contains("invalid arguments for `from`")));
+        let lsp = lsp_native_diagnostics(&source);
+        assert!(lsp.iter().any(|diagnostic| {
+            diagnostic.source == "quirl-data"
+                && diagnostic.message.contains("invalid arguments for `from`")
+        }));
+        assert!(!marker.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quirl_formatter_canonicalizes_inline_and_block_data_only() {
+        let source =
+            "data {\n    { \"x\" :[1,2]}|get x\n}\nprintf preserved  \ndata [1,2]|length\n";
+        let formatted = format_quirl_source(source, "format.qrl").unwrap();
+        assert_eq!(
+            formatted,
+            "data {\n    {\"x\": [1, 2]} | get x\n}\nprintf preserved  \ndata [1, 2] | length\n"
+        );
+        assert_eq!(
+            format_quirl_source(&formatted, "format.qrl").unwrap(),
+            formatted
+        );
     }
 
     #[test]
