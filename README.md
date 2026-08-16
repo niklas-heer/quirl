@@ -104,9 +104,13 @@ Important current limits:
   control forms remain explicit reference-shell islands.
 - Windows interactive terminal behavior is outside the 0.1 release gate.
 
-The checked-in performance record is historical evidence for its named commit
-and digest, not evidence for this candidate. Remaining release work includes
-refreshing that record against the exact artifact and completing the human
+<!-- BEGIN QUIRL RELEASE EVIDENCE STATUS -->
+> **Release evidence status — historical.** P14 evidence for measured candidate `7bf188344ca61798a3cd8657787eacb8ec26ef84` and artifact `81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6` is historical.
+> Evidence commit `05df4b09349394cfd34f24d514e0e005365d0ed8` documents that measurement. It is not evidence for the corrected implementation, which has no fresh exact-candidate measurement.
+> Human review on named Linux and macOS terminals, remote-PTY review, and real-terminal demo review remain incomplete.
+<!-- END QUIRL RELEASE EVIDENCE STATUS -->
+
+The operational requirements and commands remain in the human
 [release checklist](docs/release-checklist.md).
 
 | Platform | Support level | Promise |

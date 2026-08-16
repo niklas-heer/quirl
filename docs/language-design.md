@@ -35,10 +35,16 @@ that a release artifact has been measured or published:
 
 The current release remains **unreleased 0.1**. In this document, “1.0” is
 either a historical/accepted scope label from an ADR or a long-term direction;
-it is not a current version, distribution, or support claim. The historical
-benchmark record belongs only to commit `c5a8d757` and is not evidence for this
-candidate. The source-of-truth and evidence order is defined in
-[the documentation system](documentation-system.md).
+it is not a current version, distribution, or support claim. Historical
+benchmark records apply only to their named candidates, artifacts, environments,
+and methods. The source-of-truth and evidence order is defined in [the
+documentation system](documentation-system.md).
+
+<!-- BEGIN QUIRL RELEASE EVIDENCE STATUS -->
+> **Release evidence status — historical.** P14 evidence for measured candidate `7bf188344ca61798a3cd8657787eacb8ec26ef84` and artifact `81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6` is historical.
+> Evidence commit `05df4b09349394cfd34f24d514e0e005365d0ed8` documents that measurement. It is not evidence for the corrected implementation, which has no fresh exact-candidate measurement.
+> Human review on named Linux and macOS terminals, remote-PTY review, and real-terminal demo review remain incomplete.
+<!-- END QUIRL RELEASE EVIDENCE STATUS -->
 
 ## Long-term direction and illustrative design
 

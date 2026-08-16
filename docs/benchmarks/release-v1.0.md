@@ -1,5 +1,20 @@
 # 0.1.0 exact-candidate performance record
 
+<!-- quirl-release-evidence:v1
+status: historical
+measured-candidate-commit: 7bf188344ca61798a3cd8657787eacb8ec26ef84
+evidence-documentation-commit: 05df4b09349394cfd34f24d514e0e005365d0ed8
+artifact-sha256: 81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6
+measured-at: 2026-08-16T18:51:07Z
+measurement-platform-scope: macos-15.7.9-24g830-apple-m2-pro-aarch64-apple-darwin-automated-pty
+-->
+
+> **Historical P14 evidence.** This immutable measurement record applies to
+> candidate `7bf188344ca61798a3cd8657787eacb8ec26ef84` and its named artifact.
+> Evidence commit `05df4b09349394cfd34f24d514e0e005365d0ed8` documented the run. Later
+> implementation changes invalidated it as current evidence; the corrected
+> implementation has not yet received a fresh exact-candidate measurement.
+
 **Measured:** 16 August 2026 at 18:51:07 UTC
 
 **Candidate A:** `7bf188344ca61798a3cd8657787eacb8ec26ef84`
@@ -8,21 +23,24 @@
 **Artifact SHA-256:**
 `81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6`
 
-**Automated performance gate:** **passed all release budgets**
+**Measurement platform scope:**
+`macos-15.7.9-24g830-apple-m2-pro-aarch64-apple-darwin-automated-pty`
+
+**Historical automated performance gate:** **passed all release budgets**
 
 **Overall release readiness:** **blocked**. The automated macOS evidence below
 does not replace the named human terminal review required by the release
 checklist, and no actual Linux hardware run was available. No tag, release,
 upload, deployment, or publication was performed.
 
-This record measures the exact `quirl 0.1.0` artifact named above. Evidence
-commit B only records candidate A's results; it is not the measured binary
-source. Report schema v7 rejects tracked or untracked source changes, requires
-an independently supplied SHA-256, copies the artifact into a private read-only
-staging directory, and verifies the staged copy before execution. It also
-verifies the artifact's embedded source revision, profile, optimization level,
-panic strategy, operating system, architecture, and the independently embedded
-source identity of `quirl-bench`.
+This historical record measures the exact `quirl 0.1.0` artifact named above.
+Evidence commit B only records candidate A's results; it is not the measured
+binary source. Report schema v7 rejects tracked or untracked source changes,
+requires an independently supplied SHA-256, copies the artifact into a private
+read-only staging directory, and verifies the staged copy before execution. It
+also verifies the artifact's embedded source revision, profile, optimization
+level, panic strategy, operating system, architecture, and the independently
+embedded source identity of `quirl-bench`.
 
 The harness runs the actual release binary in a fresh pseudo-terminal for every
 end-to-end sample and reconstructs terminal frames from the PTY byte stream. It
@@ -162,6 +180,11 @@ Release readiness remains blocked on:
   hardware; and
 - human review of a candidate-derived real-terminal demo before any README or
   release asset is published.
+
+The P14 evidence above is historical only. Its timings, pass state, environment,
+and artifact identity remain exact facts for candidate
+`7bf188344ca61798a3cd8657787eacb8ec26ef84`; they do not transfer to the
+corrected implementation.
 
 The earlier record for commit
 `c5a8d757a35a92a9a269686a1cd166c5a486e2b3` and artifact

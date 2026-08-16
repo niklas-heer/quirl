@@ -7,13 +7,21 @@ description: "Canonical Quirl project documentation synced from docs/security-ac
 
 Date: 2026-08-16
 Scope: Linux/macOS v0.1 release candidate plus portable Windows contracts
-Result: exact-candidate automated checks pass; release readiness remains blocked
-on named human macOS and actual Linux terminal evidence
+Result: release readiness remains blocked; canonical automated evidence
+attribution and outstanding human requirements follow below
 
-Exact automated evidence in this refresh belongs only to candidate
+{/* BEGIN QUIRL RELEASE EVIDENCE STATUS */}
+> **Release evidence status — historical.** P14 evidence for measured candidate `7bf188344ca61798a3cd8657787eacb8ec26ef84` and artifact `81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6` is historical.
+> Evidence commit `05df4b09349394cfd34f24d514e0e005365d0ed8` documents that measurement. It is not evidence for the corrected implementation, which has no fresh exact-candidate measurement.
+> Human review on named Linux and macOS terminals, remote-PTY review, and real-terminal demo review remain incomplete.
+{/* END QUIRL RELEASE EVIDENCE STATUS */}
+
+Exact automated evidence in the historical P14 refresh belongs only to candidate
 `7bf188344ca61798a3cd8657787eacb8ec26ef84` and release artifact SHA-256
 `81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6`.
-Evidence commit B is documentation only and is not the measured artifact.
+Evidence commit `05df4b09349394cfd34f24d514e0e005365d0ed8` is documentation
+only and is not the measured artifact. Later implementation changes mean these
+results are not evidence for the corrected code.
 
 This audit treats Lua source, plugin packages and registrations, child-process
 output, recovery files, event traces, catalog text, and terminal capabilities
@@ -29,10 +37,11 @@ not a claim of native terminal validation or a Windows release gate. See
 The rich/default and simple/fallback terminal split follows
 [ADR 0012](/docs/architecture/decisions/0012-ratatui-interactive-surface).
 
-The candidate ran on actual Apple Mac14,9 hardware with an Apple M2 Pro,
-macOS 15.7.9 (24G830), Darwin 24.6.0, and the `aarch64-apple-darwin`
-Rust target. The release artifact passed all nine programmatic real-PTY
-scenarios at 120×40 and the security/accessibility-focused commands below.
+The historical P14 candidate ran on actual Apple Mac14,9 hardware with an Apple
+M2 Pro, macOS 15.7.9 (24G830), Darwin 24.6.0, and the
+`aarch64-apple-darwin` Rust target. The release artifact passed all nine
+programmatic real-PTY scenarios at 120×40 and the
+security/accessibility-focused commands below.
 No human reviewer or graphical terminal application was used, and no actual
 Linux hardware was available. This automated result therefore does not close
 the release checklist's named terminal or Linux signoffs.
@@ -83,8 +92,8 @@ cargo clippy -p quirl-core -p quirl-lua -p quirl-plugin -p quirl-process -p quir
 cargo xtask check
 ```
 
-The exact-candidate refresh additionally ran these focused commands after the
-canonical gate and before any evidence document was edited:
+The historical P14 exact-candidate refresh additionally ran these focused
+commands after the canonical gate and before any evidence document was edited:
 
 ```sh
 python3 scripts/check-rich-pty.py target/release/quirl
@@ -123,9 +132,9 @@ TTY, `NO_COLOR=1` keeps the Ratatui inline layout while removing color styling;
 mode and editor state remain textual. The piped command is noninteractive and
 prints only `plain` plus a newline.
 
-The candidate's release binary passed these three smoke checks. A Unicode-aware
-scan found zero active C0/C1 controls in all three outputs; the piped result was
-exactly `plain\n`.
+The historical P14 candidate's release binary passed these three smoke checks.
+A Unicode-aware scan found zero active C0/C1 controls in all three outputs; the
+piped result was exactly `plain\n`.
 
 ## Explicit residual risks
 

@@ -51,9 +51,9 @@ Notable user-visible changes to Quirl are recorded here. The format follows
   explicit v1/v2 configurations migrate to v3 defaults before validation, while
   future versions fail closed.
 - Added a release-only website gate with non-mutating generated-mirror
-  freshness, lint, route type checking, and a production build. It uses the
-  exact `website/package-lock.json` dependency graph and is not part of narrow
-  Rust-only checks.
+  freshness, semantic release-evidence attribution, lint, route type checking,
+  and a production build. It uses the exact `website/package-lock.json`
+  dependency graph and is not part of narrow Rust-only checks.
 
 ### Known limitations
 
@@ -63,11 +63,15 @@ Notable user-visible changes to Quirl are recorded here. The format follows
   dialect control forms require an explicit Bash or Zsh island.
 - Wasm components are validated but not executed, and publishing remains a
   local dry-run workflow rather than a remote registry.
-- The rich and Reedline editor cores intentionally coexist. Rich-keymap parity,
-  named real-terminal evidence, and a replacement minimal fallback are required
-  before Reedline can be removed.
-- The checked-in performance record applies only to commit `c5a8d757` and its
-  named artifact. A current candidate needs fresh measured release evidence.
+- The rich and Reedline editor cores intentionally coexist. Rich-keymap parity
+  and a replacement minimal fallback are required before Reedline can be
+  removed.
+
+<!-- BEGIN QUIRL RELEASE EVIDENCE STATUS -->
+> **Release evidence status — historical.** P14 evidence for measured candidate `7bf188344ca61798a3cd8657787eacb8ec26ef84` and artifact `81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6` is historical.
+> Evidence commit `05df4b09349394cfd34f24d514e0e005365d0ed8` documents that measurement. It is not evidence for the corrected implementation, which has no fresh exact-candidate measurement.
+> Human review on named Linux and macOS terminals, remote-PTY review, and real-terminal demo review remain incomplete.
+<!-- END QUIRL RELEASE EVIDENCE STATUS -->
 
 The first version entry will be cut only after the exact candidate passes the
 [release checklist](docs/release-checklist.md). Until then, everything above is

@@ -94,13 +94,33 @@ generated MDX page directly. Run the appropriate sync command, review the
 canonical source and generated diff, then run both syncs a second time to prove
 byte idempotence.
 
+Release evidence status has an additional semantic source of truth: the strict
+`quirl-release-evidence:v1` header in
+`docs/benchmarks/release-v1.0.md`. The shared website parser accepts only the
+closed `historical`/`current` states, exact commit and digest shapes, a UTC
+measurement timestamp, and a bounded platform scope. `sync-docs.mjs` derives
+the marked README, changelog, language-design, checklist, audit, and website
+status regions from that header. The release-attribution check also verifies
+named Git objects and, for current evidence, the evidence-only direct child of
+the measured candidate. A byte-fresh mirror cannot therefore override or
+contradict the canonical evidence state.
+
+An evidence commit cannot embed its own Git object ID. A new `current` record
+may therefore use `evidence-documentation-commit: none`; normal generation may
+project that transitional form before commit, but it does not attest it. The
+post-commit check resolves the checked-out `HEAD` as the evidence commit and
+proves its parent and diff. Once named, an evidence commit must use its full
+lowercase ID and exist locally; any later path through `HEAD` must remain
+evidence-only. This keeps the next evidence transition possible without
+weakening the relationship check or inventing a self-hash.
+
 With dependencies installed by the lock-preserving `npm ci --prefix website`,
 `npm --prefix website run check:generated` is the deterministic, non-mutating
-freshness check. `npm --prefix website run check` adds lint, Next route type
-checking, and the production build. `cargo xtask website-check` exposes that
-website gate explicitly, and `cargo xtask release-gate` runs it as part of the
-release workflow; `cargo xtask check` intentionally remains Rust-focused and
-does not require Node.
+freshness and semantic-attribution check. `npm --prefix website run check` adds
+lint, Next route type checking, and the production build. `cargo xtask
+website-check` exposes that website gate explicitly, and `cargo xtask
+release-gate` runs it as part of the release workflow; `cargo xtask check`
+intentionally remains Rust-focused and does not require Node.
 
 ## Adding or changing an interface
 

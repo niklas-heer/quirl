@@ -34,10 +34,11 @@ npm run sync:reference
 
 Both `npm run dev` and `npm run build` run this sync automatically. The sync
 adds frontmatter, rewrites internal Markdown links to website routes, marks
-historical benchmark pages, and substitutes plain-text highlighting for Quirl
-code until a Shiki grammar is available. `sync:reference` is intentionally
-manual because it compiles Quirl, then regenerates the CLI catalog and Lua API
-pages from the installed Rust definitions.
+the release benchmark from its canonical structured evidence status, and
+substitutes plain-text highlighting for Quirl code until a Shiki grammar is
+available. `sync:reference` is intentionally manual because it compiles Quirl,
+then regenerates the CLI catalog and Lua API pages from the installed Rust
+definitions.
 
 `npm run check:generated` is non-mutating: it renders both mirror classes in
 memory and fails if any tracked output would change. Use it in reviews and
@@ -51,10 +52,10 @@ npm ci
 npm run check
 ```
 
-`npm run check` verifies generated-mirror freshness, lint, route type checking,
-and a production build without rewriting tracked files. It uses the exact
-dependency graph in `package-lock.json`; do not substitute `npm install` for
-release validation.
+`npm run check` verifies generated-mirror freshness, semantic release-evidence
+attribution, lint, route type checking, and a production build without rewriting
+tracked files. It uses the exact dependency graph in `package-lock.json`; do not
+substitute `npm install` for release validation.
 
 Set `NEXT_PUBLIC_SITE_URL` to the canonical production origin when deployment is
 configured. Until then, metadata uses the local development origin and makes no
