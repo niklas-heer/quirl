@@ -5,14 +5,29 @@ use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Terminal-independent table model with a mandatory plain-text fallback.
+///
+/// Titles, headings, and cells are single-line typed text and may not contain
+/// terminal controls. Callers that mutate public fields after construction must
+/// call [`Self::validate`] again before rendering or crossing a trust boundary.
 pub struct PanelModel {
+    /// Single-line panel heading.
     pub title: String,
+    /// Non-empty ordered column headings.
     pub columns: Vec<String>,
+    /// Table rows, each containing exactly one cell per column.
     pub rows: Vec<Vec<String>>,
+    /// Non-empty terminal-safe text used when typed/table rendering is unavailable.
     pub plain_fallback: String,
 }
 
 impl PanelModel {
+    /// Construct and validate a complete panel atomically.
+    ///
+    /// Returns [`ErrorCode::Validation`] for terminal controls, multi-line table
+    /// text, an empty fallback or column set, or a row-width mismatch. This
+    /// model does not impose row or byte limits; the owning provider must bound
+    /// those before construction.
     pub fn new(
         title: impl Into<String>,
         columns: Vec<String>,
@@ -29,6 +44,11 @@ impl PanelModel {
         Ok(panel)
     }
 
+    /// Validate text safety and the rectangular table invariant.
+    ///
+    /// The plain fallback may contain newlines and tabs, but all table fields
+    /// must occupy one line. Returns [`ErrorCode::Validation`] on the first
+    /// invalid field.
     pub fn validate(&self) -> Result<(), ShellError> {
         reject_panel_text("panel title", &self.title)?;
         reject_terminal_controls("panel plain fallback", &self.plain_fallback)?;
@@ -56,6 +76,11 @@ impl PanelModel {
         Ok(())
     }
 
+    /// Render a deterministic terminal-safe table or the empty-state fallback.
+    ///
+    /// An empty row set returns the trimmed fallback plus one newline. Otherwise
+    /// headings and rows are padded using UTF-8 byte widths and the result ends
+    /// with a newline. Call [`Self::validate`] after any direct field mutation.
     pub fn render_plain(&self) -> String {
         if self.rows.is_empty() {
             return format!("{}\n", self.plain_fallback.trim_end());
@@ -85,6 +110,13 @@ impl PanelModel {
     }
 }
 
+/// Convert bounded directory entries into a terminal-safe metadata panel.
+///
+/// Filenames and `path` are escaped before inclusion. Modification timestamps
+/// are whole Unix seconds and sizes are bytes. Returns [`ErrorCode::Validation`]
+/// only if the constructed panel violates [`PanelModel`] invariants; the entry
+/// count is inherited from the caller and should already be bounded by the
+/// directory-listing API.
 pub fn directory_panel(path: &str, entries: &[Entry]) -> Result<PanelModel, ShellError> {
     let rows = entries
         .iter()
@@ -118,13 +150,23 @@ fn panel_line(value: &str) -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// One process-table row supplied by a platform-specific process collector.
 pub struct ProcessPanelRow {
+    /// Process identifier.
     pub pid: u32,
+    /// Parent process identifier when the platform exposes it.
     pub parent_pid: Option<u32>,
+    /// Single-line terminal-safe platform state label.
     pub state: String,
+    /// Single-line terminal-safe command description.
     pub command: String,
 }
 
+/// Convert process rows into a validated process table.
+///
+/// Returns [`ErrorCode::Validation`] if collector-provided state or command
+/// text contains terminal controls/newlines. The caller owns process-count and
+/// field-size bounds before invoking this allocation-producing function.
 pub fn process_panel(rows: &[ProcessPanelRow]) -> Result<PanelModel, ShellError> {
     PanelModel::new(
         "processes",
@@ -151,21 +193,33 @@ pub fn process_panel(rows: &[ProcessPanelRow]) -> Result<PanelModel, ShellError>
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+/// One ordered typed value retained by a [`LiveBuffer`].
 pub struct LiveSample {
+    /// Producer-assigned sequence identity; the buffer stores it without enforcing order.
     pub sequence: u64,
+    /// Structured sample value.
     pub value: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+/// Immutable serializable view of a live sample buffer.
 pub struct LiveSnapshot {
+    /// Maximum sample count retained by the source buffer.
     pub capacity: usize,
+    /// Number of oldest samples evicted since buffer creation.
     pub dropped: u64,
+    /// Whether the source buffer permanently stopped accepting samples.
     pub cancelled: bool,
+    /// Retained samples from oldest to newest, never exceeding [`Self::capacity`].
     pub samples: Vec<LiveSample>,
 }
 
 #[derive(Debug)]
+/// Fixed-capacity, cancellation-aware retention buffer for live panel values.
+///
+/// Capacity is restricted to `1..=256`. Once cancelled, the buffer remains
+/// cancelled and rejects all subsequent samples without changing retained data.
 pub struct LiveBuffer {
     capacity: usize,
     samples: VecDeque<LiveSample>,
@@ -174,6 +228,9 @@ pub struct LiveBuffer {
 }
 
 impl LiveBuffer {
+    /// Construct an empty buffer with a sample-count bound in `1..=256`.
+    ///
+    /// Returns [`ErrorCode::Validation`] when `capacity` is outside that range.
     pub fn new(capacity: usize) -> Result<Self, ShellError> {
         if !(1..=256).contains(&capacity) {
             return Err(panel_error(
@@ -188,6 +245,10 @@ impl LiveBuffer {
         })
     }
 
+    /// Retain a sample, evicting the oldest when the buffer is full.
+    ///
+    /// Returns `false` without mutation after cancellation; otherwise returns
+    /// `true`. Sequence ordering is the producer's responsibility.
     pub fn push(&mut self, sample: LiveSample) -> bool {
         if self.cancelled {
             return false;
@@ -200,10 +261,12 @@ impl LiveBuffer {
         true
     }
 
+    /// Permanently stop accepting new samples while preserving retained history.
     pub fn cancel(&mut self) {
         self.cancelled = true;
     }
 
+    /// Clone retained state into an immutable oldest-to-newest snapshot.
     pub fn snapshot(&self) -> LiveSnapshot {
         LiveSnapshot {
             capacity: self.capacity,

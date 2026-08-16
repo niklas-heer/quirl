@@ -14,19 +14,37 @@ use std::{
 /// code out of the extension runtime's dependency graph.
 #[derive(Clone)]
 pub struct ProcessRequest {
+    /// Complete command source interpreted by the composed process backend.
     pub command: String,
+    /// Remaining wall-time budget for this request.
+    ///
+    /// The backend starts this relative duration when it accepts the request;
+    /// a zero duration must fail with [`ErrorCode::ResourceLimit`].
     pub deadline: Duration,
+    /// Shared cancellation flag that the backend must observe during execution.
     pub cancelled: Arc<AtomicBool>,
+    /// Maximum bytes the caller permits the backend to retain per captured stream.
+    ///
+    /// A backend may impose a tighter limit. It must continue draining excess
+    /// child output to avoid deadlock before returning a resource-limit error.
     pub max_output_bytes: usize,
 }
 
+/// Thread-safe process capability injected into runtimes that cannot own host processes.
+///
+/// Implementations must enforce every bound in [`ProcessRequest`], reap all
+/// children on every exit path, and report operating failures as [`ShellError`].
 pub type ProcessHost =
     Arc<dyn Fn(ProcessRequest) -> Result<CommandOutcome, ShellError> + Send + Sync>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Process-style result shared by native, data, Lua, and recovery surfaces.
 pub struct CommandOutcome {
+    /// Exit status reported by the command; zero conventionally indicates success.
     pub status: i32,
+    /// Captured standard output, or `None` when output was inherited.
     pub stdout: Option<String>,
+    /// Captured standard error, or `None` when output was inherited.
     pub stderr: Option<String>,
 }
 
@@ -41,15 +59,24 @@ impl CommandOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Filesystem metadata for one immediate child of a listed directory.
+///
+/// Paths and names remain machine data. Human-facing renderers must escape them
+/// before writing to a terminal.
 pub struct Entry {
     /// The filename as supplied by the filesystem. This is machine data, not
     /// terminal text: use [`Entry::display_name`] when rendering it for a
     /// person.
     pub name: String,
+    /// Full path produced by joining the requested directory and entry name.
     pub path: PathBuf,
+    /// Kind derived from symlink metadata without following links.
     pub kind: EntryKind,
+    /// Metadata length in bytes; directory and special-file meanings are platform-defined.
     pub size: u64,
+    /// Whole seconds since the Unix epoch, or `None` when unavailable or pre-epoch.
     pub modified_unix_seconds: Option<u64>,
+    /// Whether the filename begins with `.` under Quirl's portable hidden-file rule.
     pub hidden: bool,
     /// A link target only when it was explicitly requested through
     /// [`DirectoryOptions::resolve_symlink_targets`]. Keeping this optional
@@ -64,10 +91,15 @@ pub struct Entry {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+/// Non-following filesystem classification for a directory entry.
 pub enum EntryKind {
+    /// A directory.
     Directory,
+    /// A regular file.
     File,
+    /// A symbolic link, regardless of its target kind.
     Symlink,
+    /// A socket, device, FIFO, or another platform-specific file type.
     Other,
 }
 
@@ -75,10 +107,14 @@ pub enum EntryKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DirectorySort {
+    /// Case-folded filename, with exact name and path as deterministic tie-breakers.
     #[default]
     Name,
+    /// Metadata length in ascending byte order before tie-breakers.
     Size,
+    /// Optional Unix modification time in ascending order before tie-breakers.
     Modified,
+    /// Directory, file, symlink, then other before tie-breakers.
     Kind,
 }
 
@@ -89,11 +125,17 @@ pub enum DirectorySort {
 /// is an opt-in enrichment because it performs an additional filesystem read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryOptions {
+    /// Include dot-prefixed entries when `true`.
     pub show_all: bool,
+    /// Primary deterministic ordering key.
     pub sort: DirectorySort,
+    /// Reverse the selected ordering within directory/file groups.
     pub reverse: bool,
+    /// Keep directories ahead of non-directories independently of [`Self::reverse`].
     pub directories_first: bool,
+    /// Maximum number of retained entries; zero is invalid.
     pub max_entries: usize,
+    /// Read symbolic-link targets as an explicit additional filesystem operation.
     pub resolve_symlink_targets: bool,
 }
 
@@ -123,6 +165,11 @@ impl Entry {
 }
 
 #[derive(Debug, Clone)]
+/// Small legacy command adapter for direct shell execution plus native `cd` and `ls`.
+///
+/// The richer bounded process graph lives in `quirl-process`. This adapter is
+/// retained for simple composition and does not impose capture or wall-time
+/// limits on external commands; untrusted runtimes should use [`ProcessHost`].
 pub struct CommandRunner {
     shell: PathBuf,
 }
@@ -138,6 +185,10 @@ impl Default for CommandRunner {
 }
 
 impl CommandRunner {
+    /// Construct a runner that invokes external source through `shell -c`.
+    ///
+    /// The path is stored without validation. Spawn failures are reported by
+    /// [`Self::execute`] or [`Self::execute_capture`].
     pub fn new(shell: impl Into<PathBuf>) -> Self {
         Self {
             shell: shell.into(),
@@ -145,11 +196,19 @@ impl CommandRunner {
     }
 
     /// Execute a command with inherited terminal streams, as an interactive shell should.
+    ///
+    /// Empty input succeeds without spawning. Unprefixed `cd` and `ls` use the
+    /// native implementations; a leading `^` forces external execution. Spawn,
+    /// argument, and filesystem failures are returned as [`ShellError`].
     pub fn execute(&self, input: &str) -> Result<CommandOutcome, ShellError> {
         self.execute_inner(input, false)
     }
 
     /// Execute a command with captured streams for tools and tests.
+    ///
+    /// Captured bytes are decoded lossily as UTF-8. This legacy helper does not
+    /// bound retained output; do not use it for untrusted or potentially large
+    /// commands. Parsing and error behavior otherwise match [`Self::execute`].
     pub fn execute_capture(&self, input: &str) -> Result<CommandOutcome, ShellError> {
         self.execute_inner(input, true)
     }
@@ -359,6 +418,13 @@ impl CommandRunner {
     }
 }
 
+/// Enumerate one directory using the bounded default options.
+///
+/// Results are non-recursive, capped at 10,000 retained entries, sorted by name
+/// with directories first, and do not resolve symlink targets. Dot-prefixed
+/// names are included only when `show_all` is true. Returns [`ErrorCode::Io`]
+/// for directory or metadata failures and [`ErrorCode::ResourceLimit`] when the
+/// retained-entry limit is exceeded.
 pub fn directory_entries(path: &Path, show_all: bool) -> Result<Vec<Entry>, ShellError> {
     directory_entries_with_options(
         path,
@@ -372,6 +438,12 @@ pub fn directory_entries(path: &Path, show_all: bool) -> Result<Vec<Entry>, Shel
 }
 
 /// Enumerate a single directory with a bounded, deterministic result.
+///
+/// The function never recurses or follows symlinks for classification. Entries
+/// that vanish concurrently are skipped; other filesystem failures are
+/// returned as [`ErrorCode::Io`]. A zero `max_entries` returns
+/// [`ErrorCode::InvalidArgument`], while observing more retained entries than
+/// the configured bound returns [`ErrorCode::ResourceLimit`].
 pub fn directory_entries_with_options(
     path: &Path,
     options: &DirectoryOptions,

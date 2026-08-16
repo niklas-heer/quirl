@@ -31,24 +31,45 @@ const COMPLETION_CALLBACK_DEADLINE: Duration = Duration::from_millis(50);
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_LUA_COMPLETION_RESULTS: usize = 1_000;
 const MAX_LUA_COMPLETION_ITEM_BYTES: usize = 16 * 1024;
+/// Configuration schema version emitted after validation and migration.
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+/// Oldest configuration version accepted by the deterministic migration path.
+///
+/// Version zero represents an unversioned legacy configuration.
 pub const CONFIG_OLDEST_READABLE_VERSION: u32 = 0;
+/// Maximum UTF-8 source size, in bytes, accepted by runtime, check, and file-format paths.
 pub const MAX_LUA_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+/// Canonical structural descriptor for the deny-unknown configuration contract.
+///
+/// The descriptor includes defaults, value domains, and migration policy so its
+/// fingerprint changes whenever a reader-visible configuration rule changes.
 pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@2{QuirlConfig{deny_unknown;schema_version:u32(default=2,legacy=0|1-migrates-to-2);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=full)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);statusline:StatuslineConfig(default)};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=false);min_chars:u16(0..=4096,default=2)};migration:unversioned-or-v1-to-v2}";
 
+/// Return the deterministic fingerprint of [`CONFIG_SCHEMA_DESCRIPTOR`].
 pub fn config_schema_hash() -> String {
     quirl_core::schema_fingerprint(CONFIG_SCHEMA_DESCRIPTOR)
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Resource and capability policy applied to every [`LuaRuntime`] execution.
+///
+/// The runtime enforces memory, approximate instruction, wall-time, and
+/// cancellation checks together. Process access additionally requires a granted
+/// capability and an explicitly composed bounded process host.
 pub struct LuaPolicy {
+    /// Whether the default capability set may include `process.spawn`.
     pub allow_process: bool,
+    /// Maximum bytes the embedded Lua allocator may retain for this VM.
     pub memory_limit_bytes: usize,
+    /// Approximate Lua instruction budget reset before each top-level invocation.
     pub instruction_limit: u64,
+    /// Maximum wall-clock duration of one top-level invocation.
     pub wall_time: Duration,
 }
 
 impl LuaPolicy {
+    /// Policy for user scripts: process-capable with an 8 MiB memory limit,
+    /// two-million-instruction budget, and 250 ms wall deadline.
     pub const fn script() -> Self {
         Self {
             allow_process: true,
@@ -58,6 +79,10 @@ impl LuaPolicy {
         }
     }
 
+    /// Stricter policy for configuration and static checks.
+    ///
+    /// Process access is disabled; memory is limited to 4 MiB, execution to
+    /// 500,000 instructions, and wall time to 100 ms.
     pub const fn config() -> Self {
         Self {
             allow_process: false,
@@ -76,17 +101,27 @@ impl Default for LuaPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Validated top-level Quirl configuration returned across the Lua boundary.
+///
+/// Unknown fields are rejected. Versions zero and one are migrated to the current
+/// schema only after Lua evaluation and typed deserialization succeed.
 pub struct QuirlConfig {
+    /// Serialized configuration version; validated against [`CONFIG_SCHEMA_VERSION`].
     #[serde(default = "default_config_schema_version")]
     pub schema_version: u32,
+    /// Interactive editor behavior.
     #[serde(default)]
     pub editor: EditorConfig,
+    /// Fuzzy picker presentation behavior.
     #[serde(default)]
     pub picker: PickerConfig,
+    /// Prompt segments, symbols, and scrollback behavior.
     #[serde(default)]
     pub prompt: PromptConfig,
+    /// Terminal surface and status-line behavior.
     #[serde(default)]
     pub ui: UiConfig,
+    /// Automatic semantic-completion behavior.
     #[serde(default)]
     pub completion: CompletionConfig,
 }
@@ -110,9 +145,13 @@ const fn default_config_schema_version() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+/// Configuration for the interactive input editor.
 pub struct EditorConfig {
+    /// Editing model: `emacs`, `vim`, or experimental `helix`.
     pub keymap: String,
+    /// Whether the editor displays catalog-backed semantic hints while typing.
     pub semantic_hints: bool,
+    /// Welcome presentation: `full`, `compact`, or `none`.
     pub banner: String,
 }
 
@@ -128,8 +167,11 @@ impl Default for EditorConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+/// Presentation configuration for Quirl's shared fuzzy picker.
 pub struct PickerConfig {
+    /// Picker placement: `adaptive`, `bottom`, or `full`.
     pub layout: String,
+    /// Whether a provider-specific preview pane may be shown.
     pub preview: bool,
 }
 
@@ -144,12 +186,16 @@ impl Default for PickerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+/// Ordered prompt composition and scrollback behavior.
 pub struct PromptConfig {
     /// Visual symbol profile. `auto` uses broadly supported Unicode and never
     /// assumes a patched font; `nerd_font` is an explicit opt-in.
     pub symbols: String,
+    /// Segment names rendered before the command buffer, in display order.
     pub left: Vec<String>,
+    /// Segment names rendered on the right side, in display order.
     pub right: Vec<String>,
+    /// Whether accepted input collapses to a compact scrollback line before execution.
     pub transient: bool,
 }
 
@@ -174,8 +220,11 @@ impl Default for PromptConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+/// Selection of terminal UI surface and its persistent status line.
 pub struct UiConfig {
+    /// Surface policy: `auto`, `rich`, or `simple`.
     pub surface: String,
+    /// Status-line visibility settings.
     pub statusline: StatuslineConfig,
 }
 
@@ -190,7 +239,9 @@ impl Default for UiConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+/// Persistent status-line presentation settings.
 pub struct StatuslineConfig {
+    /// Whether shortcut and mode hints are included in the status line.
     pub hints: bool,
 }
 
@@ -202,8 +253,11 @@ impl Default for StatuslineConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+/// Policy controlling automatic semantic completion in the editor.
 pub struct CompletionConfig {
+    /// Whether the completion menu may open without an explicit completion action.
     pub auto: bool,
+    /// Minimum typed character count before automatic completion, from 0 through 4096.
     pub min_chars: u16,
 }
 
@@ -273,62 +327,112 @@ impl QuirlConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Metadata for a named plugin prompt callback.
 pub struct PromptRegistration {
+    /// Unique callback name used by the UI to request this segment.
     pub name: String,
+    /// Per-render wall deadline in milliseconds, from 1 through 100.
+    ///
+    /// Omitted values default to 8 ms. The runtime also caps this deadline by the
+    /// enclosing [`LuaPolicy::wall_time`].
     #[serde(default = "default_prompt_deadline_ms")]
     pub deadline_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Metadata for a plugin completion callback registered for one command.
 pub struct CompletionRegistration {
+    /// Unique command path whose completion context is handled by the provider.
     pub command: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Typed public contract for a command implemented by a Lua plugin callback.
+///
+/// Registration rejects empty core fields and requires examples, effects, and
+/// error codes before the callback becomes visible to higher catalog consumers.
 pub struct CommandRegistration {
+    /// Unique command path used to dispatch the registered callback.
     pub name: String,
+    /// Human-readable invocation syntax including arguments and options.
     pub signature: String,
+    /// Short description for completion lists and tool manifests.
     pub summary: String,
+    /// Longer behavioral documentation for help, hover, and agent context.
     pub details: String,
+    /// Semantic type accepted from the preceding typed pipeline stage.
     pub input_type: String,
+    /// Semantic type returned to the following typed pipeline stage.
     pub output_type: String,
+    /// Complete invocation examples required by the public-command quality gate.
     pub examples: Vec<String>,
+    /// Declared external effects, normalized by the catalog boundary.
     pub effects: Vec<String>,
+    /// Stable error-code names mapped to human-readable meanings.
     pub error_codes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Snapshot of metadata registered while loading one Lua plugin source.
+///
+/// Callback functions remain in the runtime registry; this serializable value
+/// exposes only validated declarations to catalog, UI, and extension consumers.
 pub struct PluginRegistrations {
+    /// Prompt callbacks registered under the `prompt.register` capability.
     pub prompt_segments: Vec<PromptRegistration>,
+    /// Completion callbacks registered under the `completion.register` capability.
     pub completion_providers: Vec<CompletionRegistration>,
+    /// Public commands registered under the `commands.register` capability.
     pub commands: Vec<CommandRegistration>,
+    /// Typed event subscriptions and their requested mutation capabilities.
     pub events: Vec<EventSubscription>,
+    /// Catalog, completion, and panel contribution declarations.
     pub contributions: Vec<ContributionRegistration>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Isolated result of dispatching one typed event to one plugin handler.
+///
+/// A handler failure is retained beside an empty action list so later independent
+/// handlers still run and the caller can report partial failure deterministically.
 pub struct EventHandlerReport {
+    /// Registered handler name.
     pub handler: String,
+    /// Actions whose required capabilities were validated successfully.
     pub actions: Vec<ExtensionAction>,
+    /// Callback, deserialization, deadline, cancellation, or capability error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ShellError>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// One named Lua parameter in a generated host API signature.
 pub struct HostParameter {
+    /// Parameter identifier emitted into LuaLS stubs and human documentation.
     pub name: &'static str,
+    /// Lua-facing type expression emitted without runtime interpretation.
     pub lua_type: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Single source-of-truth declaration for one function in Quirl's Lua host module.
+///
+/// [`HOST_API`] drives LuaLS stubs, stable JSON, Markdown, LSP intelligence, and
+/// agent capability discovery. Runtime installation must preserve the same paths
+/// and capability checks.
 pub struct HostApiSpec {
+    /// Fully qualified Lua function path, such as `quirl.process.run`.
     pub path: &'static str,
+    /// Concise behavioral documentation shared by every generated view.
     pub summary: &'static str,
+    /// Ordered Lua-facing parameters in the callable signature.
     pub parameters: &'static [HostParameter],
+    /// Lua-facing return type, or `nil` for registration functions.
     pub returns: &'static str,
+    /// Capability grant required to expose or call this function, when privileged.
     pub capability: Option<&'static str>,
 }
 
@@ -361,6 +465,10 @@ const CONTRIBUTION_PARAMETER: &[HostParameter] = &[HostParameter {
     lua_type: "quirl.Contribution",
 }];
 
+/// Canonical host API used to generate editor, documentation, and agent surfaces.
+///
+/// This table describes availability, but grants no authority by itself. Each
+/// privileged runtime function independently verifies its capability before use.
 pub const HOST_API: &[HostApiSpec] = &[
     HostApiSpec {
         path: "quirl.cwd",
@@ -462,26 +570,39 @@ struct ContributionCallback {
 }
 
 #[derive(Debug, Clone)]
+/// Cloneable cancellation handle shared with one [`LuaRuntime`].
+///
+/// Cancellation is cooperative: Lua observes it from the instruction hook and
+/// composed process hosts receive the same atomic flag.
 pub struct LuaCancellation {
     cancelled: Arc<AtomicBool>,
 }
 
 impl LuaCancellation {
+    /// Request cancellation of current and subsequent work on the associated runtime.
+    ///
+    /// The flag remains set until [`LuaRuntime::clear_cancellation`] is called.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
     }
 }
 
 #[derive(Debug, Clone, Default)]
+/// Last-known-good configuration holder for atomic in-memory reload semantics.
 pub struct ConfigStore {
     active: QuirlConfig,
 }
 
 impl ConfigStore {
+    /// Borrow the currently active validated configuration.
     pub fn active(&self) -> &QuirlConfig {
         &self.active
     }
 
+    /// Load and validate a candidate file, replacing the active value only on success.
+    ///
+    /// I/O, Lua, resource-limit, migration, or schema failures leave the previous
+    /// configuration unchanged.
     pub fn reload(
         &mut self,
         runtime: &LuaRuntime,
@@ -493,6 +614,12 @@ impl ConfigStore {
     }
 }
 
+/// Sandboxed Lua 5.4 VM with explicit policy, capabilities, and callback registries.
+///
+/// Only table, string, math, and UTF-8 standard libraries are installed. `io`,
+/// `os`, `debug`, `package`, and `require` remain unavailable. All public execution
+/// paths reset bounded instruction and wall budgets and return [`ShellError`] rather
+/// than exposing raw Lua values to higher crates.
 pub struct LuaRuntime {
     lua: Lua,
     policy: LuaPolicy,
@@ -504,6 +631,10 @@ pub struct LuaRuntime {
 }
 
 impl LuaRuntime {
+    /// Construct a restricted runtime with standard capabilities derived from `policy`.
+    ///
+    /// A process-capable policy grants the name `process.spawn`, but without an
+    /// explicitly composed process host process calls still fail closed.
     pub fn new(policy: LuaPolicy) -> Result<Self, ShellError> {
         Self::new_with_capabilities(policy, &default_capabilities(policy))
     }
@@ -596,6 +727,11 @@ fn default_capabilities(policy: LuaPolicy) -> Vec<String> {
 }
 
 impl LuaRuntime {
+    /// Evaluate bounded Lua source and deserialize its result to JSON.
+    ///
+    /// Source larger than [`MAX_LUA_SOURCE_BYTES`], resource exhaustion,
+    /// cancellation, Lua errors, and non-serializable return values become
+    /// [`ShellError`] values.
     pub fn eval(&self, source: &str) -> Result<serde_json::Value, ShellError> {
         validate_source_length(source, Path::new("eval"))?;
         self.reset_budget();
@@ -608,6 +744,10 @@ impl LuaRuntime {
         self.value_to_json(value, None, source.len())
     }
 
+    /// Read and execute a Lua module under this runtime's policy.
+    ///
+    /// Shebangs are normalized, restricted APIs are linted, and a returned module
+    /// table's optional `main` function receives `{ args = arguments }`.
     pub fn run_file(
         &self,
         path: &Path,
@@ -639,6 +779,11 @@ impl LuaRuntime {
         self.value_to_json(value, Some(path), source.len())
     }
 
+    /// Evaluate a configuration file and validate it against the Rust schema.
+    ///
+    /// Unknown fields are rejected, legacy versions are migrated to
+    /// [`CONFIG_SCHEMA_VERSION`], and invalid enum domains or bounds fail before a
+    /// [`QuirlConfig`] crosses the Lua boundary.
     pub fn load_config_file(&self, path: &Path) -> Result<QuirlConfig, ShellError> {
         let source = read_source(path)?;
         lint_source(&source, path)?;
@@ -666,6 +811,10 @@ impl LuaRuntime {
         clippy::expect_used,
         reason = "a poisoned plugin registry mutex may contain inconsistent registrations after a host callback panic"
     )]
+    /// Read and load a plugin file, returning only its validated registration metadata.
+    ///
+    /// Managed integrity-sensitive callers should prefer [`LuaRuntime::load_plugin_source`]
+    /// with bytes captured after lock verification.
     pub fn load_plugin_file(&self, path: &Path) -> Result<PluginRegistrations, ShellError> {
         let source = read_source(path)?;
         self.load_plugin_source(&source, &path.display().to_string())
@@ -737,6 +886,9 @@ impl LuaRuntime {
         clippy::expect_used,
         reason = "a poisoned plugin registry mutex may contain inconsistent registrations after a host callback panic"
     )]
+    /// Clone the current plugin's validated registration metadata.
+    ///
+    /// Callback functions themselves remain private registry keys inside the VM.
     pub fn registrations(&self) -> PluginRegistrations {
         self.registrations
             .lock()
@@ -748,6 +900,10 @@ impl LuaRuntime {
         clippy::expect_used,
         reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
     )]
+    /// Invoke a named prompt callback with JSON context.
+    ///
+    /// The callback receives its declared 1–100 ms deadline, capped by the runtime
+    /// policy, and may return no segment. Unknown names and callback failures are errors.
     pub fn render_prompt_segment(
         &self,
         name: &str,
@@ -781,6 +937,11 @@ impl LuaRuntime {
         clippy::expect_used,
         reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
     )]
+    /// Invoke a registered completion provider and validate its JSON result.
+    ///
+    /// Execution is capped at 50 ms and by the runtime policy. Results must be an
+    /// array of at most 1,000 scalar or typed completion items, with each item
+    /// retaining no more than 16 KiB of string content.
     pub fn complete_with_provider(
         &self,
         command: &str,
@@ -815,6 +976,11 @@ impl LuaRuntime {
         clippy::expect_used,
         reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
     )]
+    /// Invoke a named catalog, completion, or panel contribution callback.
+    ///
+    /// Registration kind and name select the callback. Its declared deadline is
+    /// capped by the runtime policy, and the JSON result is rejected if it contains
+    /// terminal control text before it reaches higher consumers.
     pub fn invoke_contribution(
         &self,
         kind: ContributionKind,
@@ -853,6 +1019,10 @@ impl LuaRuntime {
         clippy::expect_used,
         reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
     )]
+    /// Dispatch a registered plugin command with JSON arguments.
+    ///
+    /// The callback runs under a 50 ms deadline capped by the runtime policy, and
+    /// its Lua return value must deserialize into JSON.
     pub fn run_plugin_command(
         &self,
         name: &str,
@@ -885,6 +1055,12 @@ impl LuaRuntime {
         clippy::expect_used,
         reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
     )]
+    /// Dispatch one immutable, strictly sequenced event to subscribed handlers.
+    ///
+    /// Handlers run in name order under individual declared deadlines. Output text
+    /// is redacted unless `output_read` was granted, and every returned action is
+    /// validated against the handler's declared capabilities. Individual handler
+    /// failures are reported in [`EventHandlerReport`] rather than aborting later handlers.
     pub fn dispatch_extension_event(
         &self,
         event: &ExtensionEvent,
@@ -1009,11 +1185,18 @@ impl LuaRuntime {
         Ok(values)
     }
 
+    /// Read and execute a Lua test module, returning the number of tests run.
+    ///
+    /// The module must return a table containing at least one `test_*` function.
+    /// Tests execute in sorted name order with a fresh policy budget for each test.
     pub fn test_file(&self, path: &Path) -> Result<usize, ShellError> {
         let source = read_source(path)?;
         self.test_source(&source, &path.display().to_string())
     }
 
+    /// Execute an in-memory Lua test module under the same contract as [`Self::test_file`].
+    ///
+    /// `source_name` is used for diagnostics; it does not grant filesystem access.
     pub fn test_source(&self, source: &str, source_name: &str) -> Result<usize, ShellError> {
         let path = Path::new(source_name);
         validate_source_length(source, path)?;
@@ -1058,6 +1241,7 @@ impl LuaRuntime {
         Ok(count)
     }
 
+    /// Read, lint, and parse a Lua file without executing it.
     pub fn check_file(path: &Path) -> Result<(), ShellError> {
         let source = read_source(path)?;
         Self::check_source(&source, &path.display().to_string())
@@ -1079,12 +1263,17 @@ impl LuaRuntime {
             .map_err(|error| lua_error(error, Some(path), source.len()))
     }
 
+    /// Return a cloneable handle that can cooperatively cancel this runtime.
     pub fn cancellation_token(&self) -> LuaCancellation {
         LuaCancellation {
             cancelled: Arc::clone(&self.cancelled),
         }
     }
 
+    /// Clear a prior cancellation request before deliberately reusing the runtime.
+    ///
+    /// Clearing does not reset instruction or wall budgets; the next public
+    /// invocation performs its normal budget reset.
     pub fn clear_cancellation(&self) {
         self.cancelled.store(false, Ordering::Relaxed);
     }
@@ -1153,6 +1342,12 @@ impl LuaRuntime {
     }
 }
 
+/// Format Lua source with Quirl's deterministic, literal-aware indentation rules.
+///
+/// The formatter preserves shebangs, ignores keywords inside quoted strings and
+/// comments, uses two-space indentation, trims trailing whitespace, and emits one
+/// final newline. Sources containing Lua long brackets are conservatively left
+/// unchanged except for ensuring that final newline.
 pub fn format_source(source: &str) -> String {
     if contains_long_bracket(source) {
         return format_trailing_whitespace(source);
@@ -1416,6 +1611,10 @@ fn blocks_opened(shape: &str) -> usize {
     usize::from(keyword_block).saturating_add(braces.saturating_sub(closing_braces))
 }
 
+/// Format one bounded Lua file and report whether its contents differed.
+///
+/// With `check` set, no write occurs. Otherwise changed content replaces the file.
+/// Inputs larger than [`MAX_LUA_SOURCE_BYTES`] fail with a resource-limit error.
 pub fn format_file(path: &Path, check: bool) -> Result<bool, ShellError> {
     let source = read_source_bounded(path)?;
     let formatted = format_source(&source);
@@ -1432,6 +1631,10 @@ pub fn format_file(path: &Path, check: bool) -> Result<bool, ShellError> {
     Ok(changed)
 }
 
+/// Generate deterministic LuaLS annotations and stubs from [`HOST_API`].
+///
+/// The returned source is the canonical editor SDK checked into `docs/quirl.lua`;
+/// callers should regenerate it rather than hand-editing that artifact.
 pub fn sdk_lua() -> String {
     let mut output = String::from(
         "---@meta quirl\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? string\n\n---@alias quirl.PromptSymbols 'auto'|'plain'|'unicode'|'nerd_font'\n---@alias quirl.WelcomeBanner 'full'|'compact'|'none'\n---@alias quirl.Surface 'auto'|'rich'|'simple'\n\n---@class quirl.EditorConfig\n---@field keymap? 'emacs'|'vim'|'helix' Emacs is the complete default.\n---@field semantic_hints? boolean\n---@field banner? quirl.WelcomeBanner\n\n---@class quirl.PickerConfig\n---@field layout? 'adaptive'|'bottom'|'full'\n---@field preview? boolean\n\n---@class quirl.PromptConfig\n---@field symbols? quirl.PromptSymbols Auto never assumes a patched font; nerd_font enables Powerline glyphs explicitly.\n---@field left? string[] Ordered prompt segments before the input.\n---@field right? string[] Ordered prompt segments aligned on the right.\n---@field transient? boolean Collapse accepted input to one scrollback line before execution.\n\n---@class quirl.StatuslineConfig\n---@field hints? boolean\n\n---@class quirl.UiConfig\n---@field surface? quirl.Surface\n---@field statusline? quirl.StatuslineConfig\n\n---@class quirl.CompletionConfig\n---@field auto? boolean\n---@field min_chars? integer\n\n---@class quirl.Config\n---@field schema_version? integer\n---@field editor? quirl.EditorConfig\n---@field picker? quirl.PickerConfig\n---@field prompt? quirl.PromptConfig\n---@field ui? quirl.UiConfig\n---@field completion? quirl.CompletionConfig\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
@@ -1459,6 +1662,7 @@ pub fn sdk_lua() -> String {
     output
 }
 
+/// Serialize [`HOST_API`] as the stable, versioned JSON document used by agents.
 pub fn sdk_json() -> Result<String, ShellError> {
     #[derive(Serialize)]
     struct HostApiDocument<'a> {
@@ -1481,6 +1685,9 @@ pub fn sdk_json() -> Result<String, ShellError> {
     })
 }
 
+/// Render human-readable host API signatures, parameter types, and capabilities.
+///
+/// All function facts are projected directly from [`HOST_API`] in table order.
 pub fn sdk_markdown() -> String {
     let mut output = format!(
         "# Quirl Lua SDK\n\nModule: `quirl`\n\nVersion: `{}`\n\nSchema version: `1`\n\n",

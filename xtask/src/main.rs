@@ -1,3 +1,5 @@
+//! Reproducible development, documentation, test, and release tasks for Quirl.
+
 use clap::{Parser, Subcommand};
 use std::{
     env,
@@ -43,6 +45,8 @@ enum Task {
         #[arg(long, default_value_t = DEFAULT_TEST_CASES, value_parser = parse_test_cases)]
         cases: usize,
     },
+    /// Build all public Rust API documentation with warnings denied.
+    Docs,
     /// Regenerate the checked-in LuaLS SDK atomically.
     Sdk,
     /// Start Quirl, forwarding remaining arguments after `--`.
@@ -80,6 +84,7 @@ fn execute(cli: Cli) -> Result<(), Box<dyn Error>> {
         Task::Lint => task_lint(&root),
         Task::Test { seed, cases } => task_test(&root, seed, cases),
         Task::Check { seed, cases } => task_check(&root, seed, cases),
+        Task::Docs => task_docs(&root),
         Task::Sdk => task_sdk(&root),
         Task::Run { arguments } => task_run(&root, &arguments),
         Task::Demo => task_demo(&root),
@@ -168,7 +173,17 @@ fn task_check(root: &Path, seed: u64, cases: usize) -> Result<(), Box<dyn Error>
         &[],
     )?;
     task_lint(root)?;
+    task_docs(root)?;
     task_test(root, seed, cases)
+}
+
+fn task_docs(root: &Path) -> Result<(), Box<dyn Error>> {
+    run(
+        root,
+        "cargo",
+        ["doc", "--workspace", "--no-deps"],
+        &[("RUSTDOCFLAGS", "-D warnings")],
+    )
 }
 
 fn task_sdk(root: &Path) -> Result<(), Box<dyn Error>> {

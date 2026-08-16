@@ -17,28 +17,36 @@ use std::{
 pub enum AgentCommand {
     /// Export the installed command and Lua host capability catalog.
     Catalog {
+        /// Output representation for the complete installed catalog.
         #[arg(long, value_enum, default_value_t = AgentOutputFormat::Json)]
         format: AgentOutputFormat,
     },
     /// Select the smallest relevant installed subtree within a deterministic budget.
     Context {
+        /// Search terms used to rank installed commands and host capabilities.
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
+        /// Maximum estimated tokens retained in the selected context.
         #[arg(long, default_value_t = DEFAULT_TOKEN_BUDGET)]
         token_budget: usize,
+        /// Output representation for the bounded context document.
         #[arg(long, value_enum, default_value_t = ContextOutputFormat::Markdown)]
         format: ContextOutputFormat,
     },
     /// Export installed versions, schema hashes, capabilities, tools, and validators.
     Manifest {
+        /// Output representation for the installed agent manifest.
         #[arg(long, value_enum, default_value_t = AgentOutputFormat::Json)]
         format: AgentOutputFormat,
     },
     /// Validate a versioned agent document without executing code.
     Validate {
+        /// JSON agent catalog, context, or manifest to validate.
         file: PathBuf,
+        /// Schema contract expected for the input document.
         #[arg(long, value_enum)]
         kind: AgentKind,
+        /// Output representation for the validation report.
         #[arg(long, value_enum, default_value_t = AgentOutputFormat::Text)]
         format: AgentOutputFormat,
     },

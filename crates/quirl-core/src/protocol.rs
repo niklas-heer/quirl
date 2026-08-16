@@ -1,12 +1,19 @@
 use crate::{ErrorCode, ShellError};
 use serde::{Deserialize, Serialize};
 
+/// Project-wide major version at which the initial machine contracts were frozen.
 pub const PROTOCOL_FREEZE_VERSION: u32 = 1;
+/// Current version of the value, stream, result, and error ABI shared by crates.
 pub const COMMON_ABI_SCHEMA_VERSION: u32 = 1;
+/// Canonical structural description used to fingerprint the common ABI.
+///
+/// Any serialized-shape or semantic change must update this descriptor and the
+/// corresponding schema version; [`schema_fingerprint`] derives its identity.
 pub const COMMON_ABI_SCHEMA_DESCRIPTOR: &str = "quirl.abi@1{Value:null|bool|i64|f64|string|list<Value>|record<string,Value>;Stream:bounded ordered Value sequence with cancellation;Result:ok(Value)|error(ShellError);ShellError{unknown_fields:currently-accepted;code:enum[invalid_command,invalid_argument,data,io,process_spawn,script_read,lua,validation,resource_limit];message:string;labels:array<{source:null|string,start:usize,end:usize,message:string}>;context:array<string>;help:array<string>;command:null|string;exit_status:null|i32}}";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Compatibility rule used when accepting a versioned machine document.
 pub enum CompatibilityPolicy {
     /// Serialized shape and semantics cannot change without a new major version.
     FrozenMajor,
@@ -16,13 +23,21 @@ pub enum CompatibilityPolicy {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Inclusive readable-version range and its advertised compatibility rule.
+///
+/// Writers emit [`Self::current`]. Readers accept values from
+/// [`Self::oldest_readable`] through `current`, inclusive.
 pub struct VersionPolicy {
+    /// Version emitted by the current writer and newest version this reader accepts.
     pub current: u32,
+    /// Oldest version for which the reader has an explicit compatibility path.
     pub oldest_readable: u32,
+    /// Stability promise explaining whether older readable versions are migrated.
     pub compatibility: CompatibilityPolicy,
 }
 
 impl VersionPolicy {
+    /// Construct a policy that accepts exactly one frozen major version.
     pub const fn frozen(current: u32) -> Self {
         Self {
             current,
@@ -31,6 +46,10 @@ impl VersionPolicy {
         }
     }
 
+    /// Construct a policy for an explicitly migrated inclusive version range.
+    ///
+    /// Callers must keep `oldest_readable <= current`; an inverted range rejects
+    /// every version when passed to [`Self::validate`].
     pub const fn migrated(current: u32, oldest_readable: u32) -> Self {
         Self {
             current,
@@ -39,6 +58,10 @@ impl VersionPolicy {
         }
     }
 
+    /// Check that `found` lies in this policy's inclusive readable range.
+    ///
+    /// `name` identifies the schema in diagnostics. Out-of-range versions return
+    /// [`ErrorCode::Validation`] with upgrade or migration guidance.
     pub fn validate(self, name: &str, found: u32) -> Result<(), ShellError> {
         if found < self.oldest_readable || found > self.current {
             return Err(ShellError::new(

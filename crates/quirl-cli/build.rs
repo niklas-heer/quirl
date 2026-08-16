@@ -1,3 +1,5 @@
+//! Embeds reproducible build metadata in the Quirl command-line executable.
+
 use std::{env, path::PathBuf, process::Command};
 
 fn git_output(arguments: &[&str]) -> Option<String> {
@@ -30,7 +32,7 @@ fn watch_git_path(path: Option<PathBuf>) {
     }
 }
 
-fn main() {
+pub(crate) fn main() {
     // Ask Git for every path instead of assuming a repository-local `.git`
     // directory. That covers linked worktrees, a `.git` gitdir file, and
     // separate common object directories.

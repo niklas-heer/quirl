@@ -65,35 +65,58 @@ const PICKER_ITEMS_MAX: usize = 4_096;
 const PICKER_RESULTS_MAX: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Semantic source category for an item passed to [`PickerRanker`].
 pub enum PickerItemKind {
+    /// Previously accepted command or expression.
     History,
+    /// Filesystem regular-file candidate.
     File,
+    /// Filesystem directory candidate.
     Directory,
+    /// Built-in command or editor action.
     Action,
+    /// Semantic command-completion candidate.
     Completion,
+    /// Background-job candidate.
     Job,
+    /// Structured-data value candidate.
     Data,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Terminal-independent value and presentation metadata supplied to a picker.
 pub struct PickerItem {
+    /// Stable identity used to distinguish equal display labels.
     pub id: String,
+    /// Source category used for glyphs and filtering.
     pub kind: PickerItemKind,
+    /// Primary single-line text searched and displayed by the picker.
     pub label: String,
+    /// Secondary searchable explanation.
     pub description: String,
+    /// Optional bounded detail text for a preview pane.
     pub preview: Option<String>,
+    /// Exact value returned when the item is accepted.
     pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Ranked reference into the immutable input slice passed to [`PickerRanker::rank`].
 pub struct PickerMatch {
+    /// Zero-based index into the original item slice.
     pub index: usize,
+    /// Zero-based character positions in the item's label selected for emphasis.
     pub match_indices: Vec<usize>,
 }
 
 /// Ranking stays behind this terminal-independent boundary so `quirl-cli` can
 /// inject the shared `quirl-picker` engine without inverting the crate graph.
 pub trait PickerRanker: Send + Sync {
+    /// Return at most `limit` ranked matches for `query`.
+    ///
+    /// Every returned index must refer to `items`; match positions are character,
+    /// not byte, offsets into the corresponding label. Implementations run on UI
+    /// paths and must keep work bounded by the supplied slice and result limit.
     fn rank(&self, items: &[PickerItem], query: &str, limit: usize) -> Vec<PickerMatch>;
 }
 
@@ -186,10 +209,15 @@ const fn unicode_is_safe(dumb: bool, unicode_locale: bool) -> bool {
     !dumb && unicode_locale
 }
 
+/// Create a Reedline editor with default configuration and in-memory history.
 pub fn editor(catalog: Catalog) -> Reedline {
     editor_with_config(catalog, QuirlConfig::default())
 }
 
+/// Create a default Reedline editor with optional extension completions.
+///
+/// Extension callbacks execute through the completion boundary and must return
+/// bounded, terminal-safe suggestions. History remains in memory.
 pub fn editor_with_extensions(
     catalog: Catalog,
     extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
@@ -242,6 +270,12 @@ pub fn editor_with_extensions_config_and_history(
     )
 }
 
+/// Create a configured durable-history editor with an injected picker ranker.
+///
+/// Reedline retains at most 50,000 history entries; picker materialization later
+/// caps candidates at 4,096 and results at 256. Returns [`ErrorCode::Io`] when
+/// the history backend cannot open `history_path`. Callers rebuilding a live
+/// editor should synchronize the old backend before replacement.
 pub fn editor_with_extensions_config_history_and_picker(
     catalog: Catalog,
     extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
@@ -729,31 +763,42 @@ fn configured_menu(config: &QuirlConfig, name: &str) -> IdeMenu {
 /// Native prompt values collected without running a shell command.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NativePromptContext {
+    /// Display form of the working directory captured for this sample.
     pub directory: String,
+    /// Current Git branch, detached identifier, or `None` outside a discovered repository.
     pub git_branch: Option<String>,
+    /// Bounded native state label such as `dirty`, `merging`, or `rebasing`.
     pub git_state: Option<String>,
 }
 
 /// Instrumentation for one non-blocking native prompt context lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PromptTimingSample {
+    /// Time spent obtaining the immediate cached/fallback response.
     pub elapsed: Duration,
+    /// Caller-configured first-paint latency budget used for instrumentation.
     pub budget: Duration,
+    /// Whether the returned context came from a completed cache entry.
     pub cache_hit: bool,
     /// The returned value was usable but a newer value is being collected.
     pub stale: bool,
+    /// Whether this call queued a background validation or refresh.
     pub refresh_started: bool,
 }
 
 impl PromptTimingSample {
+    /// Whether immediate lookup latency did not exceed [`Self::budget`].
     pub fn within_budget(self) -> bool {
         self.elapsed <= self.budget
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// Prompt context paired with instrumentation for the non-blocking lookup.
 pub struct PromptContextSample {
+    /// Immediately usable cached or fallback prompt values.
     pub context: NativePromptContext,
+    /// Lookup latency and cache/refresh disposition.
     pub timing: PromptTimingSample,
 }
 
@@ -832,6 +877,13 @@ impl Default for PromptContextScheduler {
 }
 
 impl PromptContextScheduler {
+    /// Start a stale-while-refresh scheduler with a reporting budget.
+    ///
+    /// The budget measures only immediate lookup latency; background filesystem
+    /// work does not run on the caller. Worker creation is best-effort: if the
+    /// thread cannot start, samples still return directory fallbacks without
+    /// scheduling refreshes. The cache retains at most 64 working directories,
+    /// and each Git worktree scan inspects at most 4,096 entries.
     pub fn new(first_paint_budget: Duration) -> Self {
         Self::with_context_loader(first_paint_budget, Arc::new(load_prompt_context))
     }
@@ -885,11 +937,22 @@ impl PromptContextScheduler {
         }
     }
 
+    /// Sample the process working directory without waiting for filesystem analysis.
+    ///
+    /// If the host cannot resolve the current directory, `/` is used as the
+    /// conservative display fallback.
     pub fn sample_current_dir(&self) -> PromptContextSample {
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         self.sample(&cwd)
     }
 
+    /// Return cached/fallback context for `cwd` and schedule one bounded refresh.
+    ///
+    /// A cold call returns the directory immediately. A cache hit may be marked
+    /// stale while a newer snapshot is collected. At most one pending path is
+    /// retained; a newer request replaces older queued work, while active work
+    /// completes in the persistent worker. This method never waits for Git or
+    /// filesystem I/O.
     pub fn sample(&self, cwd: &Path) -> PromptContextSample {
         let started = Instant::now();
         let cwd = cwd.to_path_buf();
@@ -1174,6 +1237,11 @@ fn render_native_git_state(dependencies: &PromptDependencies) -> Option<String> 
 }
 
 #[derive(Clone)]
+/// Reedline and rich-surface prompt assembled from sanitized native and extension data.
+///
+/// Terminal-derived text is escaped before storage. Symbol selection degrades
+/// to plain ASCII for dumb terminals or non-Unicode locales unless an explicit
+/// supported profile is configured, and styling respects `NO_COLOR`.
 pub struct QuirlPrompt {
     mode: Mode,
     cwd: String,
@@ -1304,6 +1372,10 @@ impl PromptSymbols {
 }
 
 impl QuirlPrompt {
+    /// Construct a prompt for `mode` using the current directory and safe defaults.
+    ///
+    /// Failure to read the working directory falls back to `/`. Git, status,
+    /// duration, jobs, and extension segments remain absent until supplied.
     pub fn new(mode: Mode) -> Self {
         let cwd_path = env::current_dir().ok();
         let cwd = cwd_path
@@ -1345,6 +1417,10 @@ impl QuirlPrompt {
         prompt
     }
 
+    /// Append legacy positional extension segments after neutralizing terminal controls.
+    ///
+    /// Prefer [`Self::with_named_extension_segments`] when configuration must
+    /// place individual contributions deterministically.
     pub fn with_extension_segments(mut self, segments: Vec<String>) -> Self {
         self.extension_segments = segments
             .into_iter()
@@ -1650,6 +1726,11 @@ struct HistoryPickerCache {
     items: Vec<PickerItem>,
 }
 
+/// Reedline adapter for the semantic catalog, optional extensions, and picker sources.
+///
+/// Catalog facts remain authoritative for replacement spans and descriptions.
+/// Picker candidate sets are capped before ranking; extension providers are
+/// responsible for returning bounded suggestions with valid UTF-8 byte spans.
 pub struct CatalogCompleter {
     catalog: Catalog,
     extensions: Option<Box<dyn ExtensionCompleter + Send>>,
@@ -1661,6 +1742,7 @@ pub struct CatalogCompleter {
 }
 
 impl CatalogCompleter {
+    /// Construct a catalog-only completer with the built-in stable picker ranker.
     pub fn new(catalog: Catalog) -> Self {
         Self {
             catalog,
@@ -1673,6 +1755,10 @@ impl CatalogCompleter {
         }
     }
 
+    /// Construct a completer that appends optional extension suggestions.
+    ///
+    /// Catalog and extension values are deduplicated by replacement value, with
+    /// the catalog result retaining precedence.
     pub fn with_extensions(
         catalog: Catalog,
         extensions: Option<Box<dyn ExtensionCompleter + Send>>,
@@ -1729,16 +1815,29 @@ impl CatalogCompleter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Completion candidate returned by an [`ExtensionCompleter`].
 pub struct ExtensionSuggestion {
+    /// Exact text inserted into the input buffer when accepted.
     pub value: String,
+    /// Terminal-facing label; the UI escapes controls before rendering.
     pub display: String,
+    /// Concise terminal-facing explanation.
     pub summary: String,
+    /// Optional longer terminal-facing context.
     pub detail: String,
+    /// Inclusive UTF-8 byte offset of the replaced input range.
     pub replace_start: usize,
+    /// Exclusive UTF-8 byte offset of the replaced input range.
     pub replace_end: usize,
 }
 
+/// Stateful extension completion boundary used by Reedline and the rich surface.
 pub trait ExtensionCompleter {
+    /// Produce suggestions for the input prefix ending at byte offset `pos`.
+    ///
+    /// Implementations must return promptly with bounded output. Replacement
+    /// ranges must satisfy `start <= end <= line.len()` and fall on UTF-8
+    /// boundaries. Display text is treated as untrusted and escaped by the UI.
     fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion>;
 }
 
@@ -1753,6 +1852,12 @@ struct CompletionQueue {
     shutdown: bool,
 }
 
+/// Single-threaded, latest-generation-only catalog completion worker.
+///
+/// The queue holds at most one pending request and one response. Submitting a
+/// newer generation replaces queued work and makes older in-flight results
+/// unobservable. Drop records shutdown and detaches rather than waiting on
+/// catalog work, keeping terminal teardown bounded.
 pub struct CompletionWorker {
     queue: Arc<(Mutex<CompletionQueue>, Condvar)>,
     response: Arc<Mutex<Option<CompletionResponse>>>,
@@ -1762,6 +1867,7 @@ pub struct CompletionWorker {
 }
 
 impl CompletionWorker {
+    /// Start a persistent worker owning the supplied immutable catalog.
     pub fn new(catalog: Catalog) -> Self {
         // Failure model: input can arrive faster than catalog work completes,
         // and a terminal error can drop the editor while work is in flight.
@@ -1834,6 +1940,13 @@ impl CompletionWorker {
         }
     }
 
+    /// Validate and enqueue a strictly newer completion request.
+    ///
+    /// Query text is limited to the catalog protocol byte bound, cursor offsets
+    /// must be valid UTF-8 boundaries, result count is bounded, and deadlines
+    /// are milliseconds in `1..=250`. Returns [`ErrorCode::Validation`] for
+    /// invalid protocol/order/offsets and [`ErrorCode::ResourceLimit`] for size,
+    /// count, or unavailable-worker failures.
     pub fn submit(&mut self, request: CompletionRequest) -> Result<(), ShellError> {
         validate_completion_request(&request)?;
         if request.request_id <= self.submitted_request_id {
@@ -1856,6 +1969,11 @@ impl CompletionWorker {
         Ok(())
     }
 
+    /// Make a matching pending, in-flight, or completed generation unobservable.
+    ///
+    /// Cancellation is idempotent and does not synchronously interrupt catalog
+    /// code already running. An unsupported protocol version returns
+    /// [`ErrorCode::Validation`].
     pub fn cancel(&self, cancellation: CompletionCancellation) -> Result<(), ShellError> {
         COMPLETION_VERSION_POLICY
             .validate("completion cancellation", cancellation.protocol_version)?;
@@ -1884,6 +2002,10 @@ impl CompletionWorker {
         Ok(())
     }
 
+    /// Consume the response only if it belongs to the newest submitted generation.
+    ///
+    /// Stale responses are discarded and never returned. `None` means work is
+    /// pending, cancelled, stale, or already consumed; this method never blocks.
     pub fn try_recv_latest(&self) -> Option<CompletionResponse> {
         let expected = self.submitted_request_id;
         let mut response = lock_recover(&self.response);
@@ -2388,6 +2510,12 @@ fn split_preserving_whitespace(input: &str) -> Vec<&str> {
     segments
 }
 
+/// Render structured shell diagnostics as terminal-safe text.
+///
+/// All untrusted messages, source labels, context, and help are escaped before
+/// output. When `color` is true, only Quirl-owned ANSI styles and Unicode label
+/// chrome are added; otherwise the result contains no styling escapes. The
+/// returned string has no trailing newline so the caller controls framing.
 pub fn render_error(error: &ShellError, color: bool) -> String {
     let code = format!("{:?}", error.code).to_lowercase();
     let heading = format!("error[{code}]");

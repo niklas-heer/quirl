@@ -10,15 +10,25 @@ const MAX_HELP_LINES: usize = 20_000;
 const MAX_HELP_OPTIONS: usize = 2_048;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Non-fatal problem encountered while importing external command metadata.
+///
+/// Importers retain valid facts from the same source, allowing callers to report
+/// degraded coverage without discarding the complete bounded import.
 pub struct ImportDiagnostic {
+    /// File path or logical provider identity supplied to the importer.
     pub origin: String,
+    /// One-based source line associated with the diagnostic.
     pub line: usize,
+    /// Human-readable explanation of the skipped, truncated, or dynamic construct.
     pub message: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Bounded result of parsing one external completion or documentation source.
 pub struct ImportReport {
+    /// Normalized command contracts recovered from supported static declarations.
     pub commands: Vec<CommandSpec>,
+    /// Ordered non-fatal observations about unsupported or malformed source content.
     pub diagnostics: Vec<ImportDiagnostic>,
 }
 

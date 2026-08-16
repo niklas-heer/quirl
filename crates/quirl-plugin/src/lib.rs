@@ -15,16 +15,27 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use wasmparser::{Encoding, Parser, Payload, Validator};
 
+/// Current version of the deny-unknown plugin manifest contract.
 pub const PLUGIN_SCHEMA_VERSION: u32 = 1;
+/// Current lockfile version; version 1 is accepted only through explicit migration.
 pub const LOCK_SCHEMA_VERSION: u32 = 2;
+/// Plugin host API version required by manifests and lock entries.
 pub const PLUGIN_API_VERSION: &str = "0.1.0";
+/// Canonical filename used when persisting the deterministic plugin lock.
 pub const PLUGIN_LOCK_FILE: &str = "plugins.lock.json";
+/// WIT world a WebAssembly component manifest must declare.
 pub const WASM_WORLD: &str = "quirl:plugin/api@0.1.0";
+/// Sole component import admitted at the WebAssembly security boundary.
 pub const WASM_HOST_IMPORT: &str = "quirl:plugin/host@0.1.0";
+/// Sole component export required at the WebAssembly security boundary.
 pub const WASM_GUEST_EXPORT: &str = "quirl:plugin/guest@0.1.0";
+/// Wire-protocol discriminator for isolated adapter initialization.
 pub const ADAPTER_PROTOCOL: &str = "quirl.plugin.v1";
+/// Version of the adapter initialization request and response schema.
 pub const ADAPTER_SCHEMA_VERSION: u32 = 1;
+/// Hard upper bound for any message accepted from an isolated adapter.
 pub const MAX_ADAPTER_MESSAGE_BYTES: u64 = 4 * 1024 * 1024;
+/// Hard upper bound, in milliseconds, for an isolated adapter callback.
 pub const MAX_ADAPTER_CALLBACK_TIMEOUT_MS: u64 = 60_000;
 /// Checked-in WIT world. WIT cannot express recursive `Value` or the full
 /// `ShellError` shape, so this is a narrower projection of
@@ -33,10 +44,14 @@ pub const MAX_ADAPTER_CALLBACK_TIMEOUT_MS: u64 = 60_000;
 /// `shell-error` omits `labels`, `command`, and `exit_status`.
 pub const WASM_WIT: &str = include_str!("../wit/quirl-plugin.wit");
 
+/// Canonical structural description used to fingerprint [`PluginManifest`].
 pub const PLUGIN_SCHEMA_DESCRIPTOR: &str = "PluginManifest{deny_unknown;schema_version:u32;plugin:PluginMetadata{deny_unknown;name:string;version:string;entry:relative-path;quirl:version-range;api:string;runtime:trusted_lua|wasm_component|out_of_process;summary:string};capabilities:PluginCapabilities{deny_unknown;request:array<capability>};contributes:PluginContributions{deny_unknown;commands:array<string>;completions:array<string>;events:array<string>;panels:array<string>;indexers:array<string>};public_commands:array<PackageCommand@quirl.package@1>;wasm:null|WasmComponentBoundary{deny_unknown;world:string;max_memory_bytes:u64;fuel:u64;callback_timeout_ms:u64};adapter:null|OutOfProcessBoundary{deny_unknown;protocol:string;executable:string;arguments:array<string>;callback_timeout_ms:u64;max_message_bytes:u64}}";
+/// Canonical structural description used to fingerprint current [`PluginLockfile`] data.
 pub const LOCK_SCHEMA_DESCRIPTOR: &str = "PluginLockfile{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;resolved_api_version:string;plugins:array<LockedPlugin{deny_unknown;name:string;version:string;source:string;runtime:PluginRuntime;resolved_api_version:string;runtime_schema_hash:string;manifest_checksum:string;entry_checksum:string;source_checksum:string;requested_capabilities:array<string>;granted_capabilities:array<string>;enabled:bool}>}";
+/// Historical descriptor used exclusively to authenticate and migrate lock schema v1.
 pub const LOCK_SCHEMA_V1_DESCRIPTOR: &str = "PluginLockfile{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;resolved_api_version:string;plugins:array<LockedPlugin{deny_unknown;name:string;version:string;source:string;runtime:PluginRuntime;resolved_api_version:string;manifest_checksum:string;entry_checksum:string;source_checksum:string;requested_capabilities:array<string>;granted_capabilities:array<string>;enabled:bool}>}";
 
+/// Computes the structural identity of the plugin manifest and embedded command schema.
 pub fn plugin_manifest_schema_hash() -> String {
     stable_hash(
         format!(
@@ -47,19 +62,25 @@ pub fn plugin_manifest_schema_hash() -> String {
     )
 }
 
+/// Computes the structural identity expected in current plugin lockfiles.
 pub fn plugin_lock_schema_hash() -> String {
     stable_hash(LOCK_SCHEMA_DESCRIPTOR.as_bytes())
 }
 
+/// Computes the content identity of the exact checked-in WIT contract.
 pub fn wasm_world_hash() -> String {
     stable_hash(WASM_WIT.as_bytes())
 }
 
+/// Execution isolation boundary selected by a plugin manifest.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginRuntime {
+    /// Lua executed in Quirl's policy-restricted trusted extension runtime.
     TrustedLua,
+    /// Validated component-model binary constrained by an explicit WIT world and budgets.
     WasmComponent,
+    /// Relative executable contacted only through the bounded adapter protocol.
     OutOfProcess,
 }
 
@@ -69,76 +90,111 @@ impl Default for PluginRuntime {
     }
 }
 
+/// Strict, deny-unknown declaration of plugin identity, authority, and runtime bounds.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PluginManifest {
+    /// Manifest version required to equal [`PLUGIN_SCHEMA_VERSION`].
     pub schema_version: u32,
+    /// Plugin identity, compatibility, entry point, and runtime selection.
     pub plugin: PluginMetadata,
     #[serde(default)]
+    /// Explicit host authorities requested by the plugin.
     pub capabilities: PluginCapabilities,
     #[serde(default)]
+    /// Runtime registrations requested by the plugin.
     pub contributes: PluginContributions,
     #[serde(default)]
+    /// Complete machine contracts corresponding one-to-one with contributed commands.
     pub public_commands: Vec<PackageCommand>,
     #[serde(default)]
+    /// Required bounds and WIT identity for a WebAssembly component runtime.
     pub wasm: Option<WasmComponentBoundary>,
     #[serde(default)]
+    /// Required wire, process, and resource bounds for an out-of-process runtime.
     pub adapter: Option<OutOfProcessBoundary>,
 }
 
+/// Validated plugin identity, compatibility range, and selected runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PluginMetadata {
+    /// Lowercase registry-style name and mandatory command namespace.
     pub name: String,
+    /// Three-component semantic plugin version.
     pub version: String,
+    /// Relative, package-contained runtime entry path.
     pub entry: String,
+    /// Version requirement that the installed Quirl release must satisfy.
     pub quirl: String,
     #[serde(default = "default_api_version")]
+    /// Exact plugin host API version required by this plugin.
     pub api: String,
     #[serde(default)]
+    /// Isolation boundary under which the entry is interpreted.
     pub runtime: PluginRuntime,
+    /// Non-empty public description used in discovery and review.
     pub summary: String,
 }
 
+/// Explicit capabilities requested at the host security boundary.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PluginCapabilities {
     #[serde(default)]
+    /// Sorted, unique capability names or validated path-scoped authorities.
     pub request: Vec<String>,
 }
 
+/// Named extension points a plugin asks the host to register.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PluginContributions {
     #[serde(default)]
+    /// Sorted, unique command paths, each requiring a public command contract.
     pub commands: Vec<String>,
     #[serde(default)]
+    /// Sorted, unique completion providers requiring `completion.register`.
     pub completions: Vec<String>,
     #[serde(default)]
+    /// Sorted, unique event observers requiring `events.observe`.
     pub events: Vec<String>,
     #[serde(default)]
+    /// Sorted, unique UI panels requiring both UI and extension authority.
     pub panels: Vec<String>,
     #[serde(default)]
+    /// Sorted, unique catalog indexers requiring both catalog and extension authority.
     pub indexers: Vec<String>,
 }
 
+/// Resource and interface bounds for an untrusted WebAssembly component.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WasmComponentBoundary {
+    /// WIT world identity; validation requires exact equality with [`WASM_WORLD`].
     pub world: String,
+    /// Non-zero runtime memory ceiling in bytes.
     pub max_memory_bytes: u64,
+    /// Non-zero instruction/fuel budget enforced per runtime policy.
     pub fuel: u64,
+    /// Non-zero callback wall-time deadline in milliseconds.
     pub callback_timeout_ms: u64,
 }
 
+/// Process, protocol, and I/O bounds for an isolated executable adapter.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OutOfProcessBoundary {
+    /// Wire protocol identity; validation requires [`ADAPTER_PROTOCOL`].
     pub protocol: String,
+    /// Relative executable path, required to equal the plugin entry point.
     pub executable: String,
     #[serde(default)]
+    /// Fixed arguments passed by the CLI when starting the executable.
     pub arguments: Vec<String>,
+    /// Callback deadline bounded by [`MAX_ADAPTER_CALLBACK_TIMEOUT_MS`].
     pub callback_timeout_ms: u64,
+    /// Message-size ceiling bounded by [`MAX_ADAPTER_MESSAGE_BYTES`].
     pub max_message_bytes: u64,
 }
 
@@ -149,15 +205,25 @@ pub struct OutOfProcessBoundary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterInitializeRequest {
+    /// Wire protocol discriminator required to equal [`ADAPTER_PROTOCOL`].
     pub protocol: String,
+    /// Request schema version required to equal [`ADAPTER_SCHEMA_VERSION`].
     pub schema_version: u32,
+    /// Host API version the adapter must implement exactly.
     pub api_version: String,
+    /// Requested operation; protocol v1 admits only `initialize`.
     pub operation: String,
+    /// Locked plugin identity the child process is being asked to initialize.
     pub plugin: AdapterPluginIdentity,
+    /// Host authorities delegated through the protocol; always empty in version 1.
     pub granted_capabilities: Vec<String>,
 }
 
 impl AdapterInitializeRequest {
+    /// Constructs the sole protocol-v1 request with no delegated host capabilities.
+    ///
+    /// The caller-provided identity is informational and must come from a validated
+    /// lock entry. Launch authority is consumed by the host and is not passed onward.
     pub fn new(name: String, version: String) -> Self {
         Self {
             protocol: ADAPTER_PROTOCOL.to_owned(),
@@ -172,10 +238,13 @@ impl AdapterInitializeRequest {
     }
 }
 
+/// Minimal locked identity sent across the adapter process boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterPluginIdentity {
+    /// Validated plugin name from the lock entry.
     pub name: String,
+    /// Validated plugin version from the lock entry.
     pub version: String,
 }
 
@@ -184,14 +253,24 @@ pub struct AdapterPluginIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterInitializeResponse {
+    /// Echoed wire protocol identity.
     pub protocol: String,
+    /// Response schema version matching the request contract.
     pub schema_version: u32,
+    /// Exact plugin host API version implemented by the adapter.
     pub api_version: String,
+    /// Echoed initialization operation.
     pub operation: String,
+    /// Assertion-only readiness status; protocol v1 requires `ready`.
     pub status: String,
 }
 
 impl AdapterInitializeResponse {
+    /// Validates the complete assertion-only response against a request.
+    ///
+    /// Any mismatched discriminator, version, operation, or status returns
+    /// [`ErrorCode::Validation`]. No response field can grant authority or register
+    /// plugin contributions.
     pub fn validate_for(&self, request: &AdapterInitializeRequest) -> Result<(), ShellError> {
         if self.protocol != ADAPTER_PROTOCOL
             || self.schema_version != ADAPTER_SCHEMA_VERSION
@@ -208,30 +287,49 @@ impl AdapterInitializeResponse {
     }
 }
 
+/// Reproducible, deny-unknown record of resolved plugin content and granted authority.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PluginLockfile {
+    /// Discriminator; current lockfiles use `quirl.plugin.lock`.
     pub document_type: String,
+    /// Lock contract version required to equal [`LOCK_SCHEMA_VERSION`].
     pub schema_version: u32,
+    /// Structural identity computed by [`plugin_lock_schema_hash`].
     pub schema_hash: String,
+    /// Plugin API version against which all entries were resolved.
     pub resolved_api_version: String,
+    /// Entries sorted uniquely by plugin name for deterministic serialization.
     pub plugins: Vec<LockedPlugin>,
 }
 
+/// Content-addressed plugin resolution and its reviewed capability grant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LockedPlugin {
+    /// Validated plugin name and unique key within the lockfile.
     pub name: String,
+    /// Exact resolved plugin version.
     pub version: String,
+    /// Non-empty canonical source identity used during resolution.
     pub source: String,
+    /// Isolation boundary under which this entry may run.
     pub runtime: PluginRuntime,
+    /// Exact plugin API version accepted during resolution.
     pub resolved_api_version: String,
+    /// Manifest schema hash or WIT content hash governing the runtime boundary.
     pub runtime_schema_hash: String,
+    /// SHA-256 identity of the exact manifest bytes reviewed for installation.
     pub manifest_checksum: String,
+    /// SHA-256 identity of the exact entry bytes reviewed for installation.
     pub entry_checksum: String,
+    /// SHA-256 identity binding manifest, entry, and source identities together.
     pub source_checksum: String,
+    /// Sorted capabilities declared by the reviewed manifest.
     pub requested_capabilities: Vec<String>,
+    /// Sorted subset of requested authority explicitly granted by the user.
     pub granted_capabilities: Vec<String>,
+    /// Whether the host may activate this entry after all integrity checks pass.
     pub enabled: bool,
 }
 
@@ -261,41 +359,60 @@ struct LegacyLockedPluginV1 {
     enabled: bool,
 }
 
+/// Deterministic change set used to require review of newly requested authority.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionDiff {
+    /// Capabilities present only in the new request and requiring approval.
     pub added: Vec<String>,
+    /// Previously requested capabilities no longer present.
     pub removed: Vec<String>,
+    /// Capabilities present in both sets.
     pub unchanged: Vec<String>,
 }
 
+/// Importance of a plugin health finding.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DoctorSeverity {
+    /// Integrity or compatibility failure that makes activation unsafe.
     Error,
+    /// Non-fatal condition that should be reviewed.
     Warning,
 }
 
+/// Machine-readable integrity or compatibility finding from plugin diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DoctorDiagnostic {
+    /// Whether the finding makes the plugin unhealthy.
     pub severity: DoctorSeverity,
+    /// Stable identifier for automation and remediation routing.
     pub code: String,
+    /// Human-readable description of the observed mismatch.
     pub message: String,
+    /// Actionable guidance for restoring a trusted state.
     pub help: String,
 }
 
+/// Complete deterministic health report for one locked plugin.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DoctorReport {
+    /// Discriminator; reports use `quirl.plugin.doctor`.
     pub document_type: String,
+    /// Plugin contract version used for the checks.
     pub schema_version: u32,
+    /// Name of the locked plugin that was checked.
     pub plugin: String,
+    /// `true` exactly when no integrity or runtime-schema errors were found.
     pub healthy: bool,
+    /// All findings in deterministic check order.
     pub diagnostics: Vec<DoctorDiagnostic>,
 }
 
 impl PluginLockfile {
+    /// Constructs a valid current lockfile with no installed plugins.
     pub fn empty() -> Self {
         Self {
             document_type: "quirl.plugin.lock".to_owned(),
@@ -306,6 +423,11 @@ impl PluginLockfile {
         }
     }
 
+    /// Validates lock identity, ordering, runtime compatibility, authority, and checksums.
+    ///
+    /// The method does not read plugin files or recompute content checksums; use
+    /// [`doctor_plugin`] with trusted bytes for that integrity check. All malformed or
+    /// incompatible state is reported as [`ErrorCode::Validation`].
     pub fn validate(&self) -> Result<(), ShellError> {
         if self.document_type != "quirl.plugin.lock"
             || self.schema_version != LOCK_SCHEMA_VERSION
@@ -381,6 +503,12 @@ impl PluginLockfile {
         Ok(())
     }
 
+    /// Parses, migrates, and validates a deny-unknown JSON lockfile.
+    ///
+    /// Current version-2 data is validated directly. Authenticated version-1 data is
+    /// migrated in memory by adding the runtime schema identity, then subjected to
+    /// current validation. Unsupported versions and malformed JSON return
+    /// [`ErrorCode::Validation`].
     pub fn from_json(bytes: &[u8]) -> Result<Self, ShellError> {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
             validation_error(
@@ -464,6 +592,10 @@ impl PluginLockfile {
         }
     }
 
+    /// Returns a validated lockfile with one new, uniquely named entry installed.
+    ///
+    /// Both the existing lock and resulting candidate are validated. The receiver is
+    /// unchanged on failure, and the returned entries are sorted by name.
     pub fn install(&self, plugin: LockedPlugin) -> Result<Self, ShellError> {
         self.validate()?;
         if self.plugins.iter().any(|item| item.name == plugin.name) {
@@ -481,6 +613,11 @@ impl PluginLockfile {
         Ok(candidate)
     }
 
+    /// Updates only the source identity of an existing locked resolution.
+    ///
+    /// Version, reviewed bytes, runtime schema, requested authority, and grants must
+    /// remain unchanged. The supplied source checksum must bind the new source to the
+    /// locked manifest and entry checksums or validation fails.
     pub fn replace_locked(&self, plugin: LockedPlugin) -> Result<Self, ShellError> {
         self.validate()?;
         let Some(existing) = self.plugins.iter().find(|item| item.name == plugin.name) else {
@@ -527,6 +664,10 @@ impl PluginLockfile {
         Ok(candidate)
     }
 
+    /// Returns a validated copy with the named plugin enabled or disabled.
+    ///
+    /// Enabling a WebAssembly component is rejected while its runtime remains a
+    /// non-executing validation boundary. Unknown names return an invalid-command error.
     pub fn set_enabled(&self, name: &str, enabled: bool) -> Result<Self, ShellError> {
         self.validate()?;
         let mut candidate = self.clone();
@@ -540,6 +681,9 @@ impl PluginLockfile {
         Ok(candidate)
     }
 
+    /// Returns a copy without the named plugin after validating the source lock.
+    ///
+    /// An unknown name returns an invalid-command error and leaves the receiver intact.
     pub fn remove(&self, name: &str) -> Result<Self, ShellError> {
         self.validate()?;
         let mut candidate = self.clone();
@@ -551,6 +695,10 @@ impl PluginLockfile {
         Ok(candidate)
     }
 
+    /// Looks up an installed entry by its unique plugin name.
+    ///
+    /// This is a lookup only; callers requiring a trust decision should first call
+    /// [`Self::validate`] and, when bytes are available, [`doctor_plugin`].
     pub fn find(&self, name: &str) -> Result<&LockedPlugin, ShellError> {
         self.plugins
             .iter()
@@ -559,6 +707,11 @@ impl PluginLockfile {
     }
 }
 
+/// Parses a strict TOML plugin manifest and rejects unknown fields.
+///
+/// `origin` is included in the returned [`ShellError`] so the CLI can identify the
+/// untrusted source. Semantic, capability, and runtime-boundary checks are performed
+/// separately by [`validate_plugin_manifest`].
 pub fn parse_plugin_manifest(source: &str, origin: &str) -> Result<PluginManifest, ShellError> {
     toml::from_str::<PluginManifest>(source).map_err(|error| {
         ShellError::new(
@@ -570,6 +723,12 @@ pub fn parse_plugin_manifest(source: &str, origin: &str) -> Result<PluginManifes
     })
 }
 
+/// Validates manifest identity, compatibility, authority, contributions, and runtime bounds.
+///
+/// For WebAssembly, `entry_bytes` must be the exact candidate component and are
+/// structurally validated against the sole admitted import/export contract. Trusted
+/// Lua is not executed here. Every expected rejection is returned as
+/// [`ErrorCode::Validation`].
 pub fn validate_plugin_manifest(
     manifest: &PluginManifest,
     entry_bytes: &[u8],
@@ -617,6 +776,12 @@ pub fn validate_plugin_manifest(
     Ok(())
 }
 
+/// Resolves reviewed manifest and entry bytes into a disabled, content-addressed lock entry.
+///
+/// Every newly requested capability must appear in `approved_capabilities`; approval
+/// never grants authority absent from the manifest. On success, SHA-256 checksums bind
+/// the exact source bytes and source identity, and the plugin remains disabled until a
+/// separate enable transition.
 pub fn resolve_plugin(
     manifest: &PluginManifest,
     manifest_bytes: &[u8],
@@ -674,6 +839,7 @@ pub fn resolve_plugin(
     ))
 }
 
+/// Computes sorted capability additions, removals, and intersections as mathematical sets.
 pub fn permission_diff(previous: &[String], requested: &[String]) -> PermissionDiff {
     let previous = previous.iter().cloned().collect::<BTreeSet<_>>();
     let requested = requested.iter().cloned().collect::<BTreeSet<_>>();
@@ -814,6 +980,11 @@ pub fn normalize_plugin_commands(
     Ok(commands)
 }
 
+/// Checks locked manifest, entry, source, and runtime-schema identities without execution.
+///
+/// The caller supplies bytes read through its own containment-safe filesystem boundary.
+/// Any mismatch makes `healthy` false and produces a stable error diagnostic; this
+/// function performs no Lua, WebAssembly, process, or network operation.
 pub fn doctor_plugin(
     locked: &LockedPlugin,
     manifest_bytes: &[u8],

@@ -13,26 +13,44 @@ use std::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Version of the serialized picker request and response protocol.
 pub const PICKER_PROTOCOL_VERSION: u32 = 1;
+/// Compatibility policy for picker protocol documents.
 pub const PICKER_VERSION_POLICY: VersionPolicy = VersionPolicy::frozen(PICKER_PROTOCOL_VERSION);
+/// Maximum UTF-8 bytes accepted in a picker query.
 pub const MAX_PICKER_QUERY_BYTES: usize = 4 * 1024;
+/// Maximum candidates accepted in one picker request.
 pub const MAX_PICKER_ITEMS: usize = 20_000;
+/// Maximum total JSON-encoded bytes across one item's text fields.
 pub const MAX_PICKER_ITEM_TEXT_BYTES: usize = 16 * 1024;
+/// Maximum encoded bytes accepted in one item's typed JSON value.
 pub const MAX_PICKER_ITEM_VALUE_BYTES: usize = 16 * 1024;
+/// Maximum estimated encoded bytes accepted in a complete request.
 pub const MAX_PICKER_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum nesting depth accepted in an item's JSON value.
 pub const MAX_PICKER_VALUE_DEPTH: usize = 64;
+/// Maximum ranking deadline accepted from a caller, in milliseconds.
 pub const MAX_PICKER_DEADLINE_MS: u64 = 250;
+/// Canonical descriptor hashed to identify the picker protocol contract.
 pub const PICKER_SCHEMA_DESCRIPTOR: &str = "quirl.picker@1{PickItem{deny_unknown;id:string;kind:history|file|directory|action|completion|job|data;label:string;description:string;preview:null|string;value:json(depth<=64,value<=16384-bytes)};PickMatch{deny_unknown;index:usize;score:i32;match_indices:array<usize>};PickerRequest{deny_unknown;protocol_version:u32;request_id:u64(strictly-increasing);query:utf8<=4096-bytes;items:array<PickItem><=20000;limit:usize<=20000;deadline_ms:1..250;total<=4194304-bytes};PickerCancellation{deny_unknown;protocol_version:u32;request_id:u64};PickerResponse{deny_unknown;protocol_version:u32;request_id:u64;outcome:PickerOutcome};PickerOutcome:tag(status)[ready{matches:array<PickMatch>}|cancelled{}|deadline_exceeded{}];policy:frozen-major-v1;query:space-separated-AND,apostrophe-exact,bang-exclude;ordering:score-desc,label-asc,id-asc;selection:stable-index-into-input;worker:newer-request-or-cancellation-never-overwrites-newer-result}";
 
+/// Domain of the typed value offered for selection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemKind {
+    /// A previously executed command line.
     History,
+    /// A filesystem file.
     File,
+    /// A filesystem directory.
     Directory,
+    /// A command or UI action.
     Action,
+    /// A semantic command-completion candidate.
     Completion,
+    /// A native process job.
     Job,
+    /// A structured data value.
     Data,
 }
 
@@ -40,21 +58,31 @@ pub enum ItemKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PickItem {
+    /// Stable identity used for deterministic tie-breaking.
     pub id: String,
+    /// Domain of the original typed value.
     pub kind: ItemKind,
+    /// Primary user-visible text used for matching.
     pub label: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Optional secondary searchable and display text.
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional preview rendered by the owning UI and covered by request text bounds.
     pub preview: Option<String>,
+    /// Original typed value returned when this item is selected.
     pub value: serde_json::Value,
 }
 
+/// Deterministic ranking result referencing an input item by index.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PickMatch {
+    /// Stable zero-based index into the request's input items.
     pub index: usize,
+    /// Ranking score; larger values sort before smaller values.
     pub score: i32,
+    /// Grapheme indices to highlight in the item's primary label.
     pub match_indices: Vec<usize>,
 }
 
@@ -64,15 +92,25 @@ pub struct PickMatch {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PickerRequest {
+    /// Picker protocol version supplied by the caller.
     pub protocol_version: u32,
+    /// Session-local identity that [`PickerWorker`] requires to increase per submission.
     pub request_id: u64,
+    /// Space-separated fuzzy, exact, or exclusion terms.
     pub query: String,
+    /// Candidates limited to [`MAX_PICKER_ITEMS`] by [`Self::validate`].
     pub items: Vec<PickItem>,
+    /// Maximum ranked matches to return.
     pub limit: usize,
+    /// Wall-clock ranking deadline in milliseconds.
     pub deadline_ms: u64,
 }
 
 impl PickerRequest {
+    /// Validate protocol compatibility and all size and deadline bounds.
+    ///
+    /// Request-ID ordering is session state and is enforced by
+    /// [`PickerWorker::submit`], not by this method.
     pub fn validate(&self) -> Result<(), ShellError> {
         PICKER_VERSION_POLICY.validate("picker request", self.protocol_version)?;
         if self.query.len() > MAX_PICKER_QUERY_BYTES {
@@ -133,32 +171,47 @@ impl PickerRequest {
     }
 }
 
+/// Versioned cancellation targeting one picker request ID.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PickerCancellation {
+    /// Picker protocol version supplied by the caller.
     pub protocol_version: u32,
+    /// Request to invalidate if it is still the newest request.
     pub request_id: u64,
 }
 
 impl PickerCancellation {
+    /// Validate cancellation protocol compatibility.
     pub fn validate(&self) -> Result<(), ShellError> {
         PICKER_VERSION_POLICY.validate("picker cancellation", self.protocol_version)
     }
 }
 
+/// Terminal outcome of one bounded ranking request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "status", content = "data")]
 pub enum PickerOutcome {
-    Ready { matches: Vec<PickMatch> },
+    /// Ranking completed before cancellation and its deadline.
+    Ready {
+        /// Deterministically ordered matches, bounded by the request limit.
+        matches: Vec<PickMatch>,
+    },
+    /// A newer request or explicit cancellation invalidated this work.
     Cancelled,
+    /// The request exhausted its wall-clock deadline.
     DeadlineExceeded,
 }
 
+/// Versioned response associated with exactly one picker request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PickerResponse {
+    /// Picker protocol version used to encode this response.
     pub protocol_version: u32,
+    /// Request identity whose work produced this response.
     pub request_id: u64,
+    /// Ready, cancelled, or deadline-exceeded result.
     pub outcome: PickerOutcome,
 }
 
@@ -173,6 +226,7 @@ pub struct PickerWorker {
 }
 
 impl PickerWorker {
+    /// Spawn a worker with no submitted request IDs.
     pub fn new() -> Self {
         let (requests, request_receiver) = mpsc::channel();
         let (response_sender, responses) = mpsc::channel();
@@ -190,6 +244,7 @@ impl PickerWorker {
         }
     }
 
+    /// Validate and submit a request whose ID is newer than every prior request.
     pub fn submit(&mut self, request: PickerRequest) -> Result<(), ShellError> {
         request.validate()?;
         if request.request_id <= self.submitted_request_id {
@@ -215,6 +270,7 @@ impl PickerWorker {
             })
     }
 
+    /// Invalidate `cancellation.request_id` if it is still current.
     pub fn cancel(&self, cancellation: PickerCancellation) -> Result<(), ShellError> {
         cancellation.validate()?;
         let _ = self.latest_request_id.compare_exchange(
@@ -282,8 +338,11 @@ fn picker_worker_loop(
     }
 }
 
-/// Execute a request synchronously for hosts that already own a worker. The
-/// cancellation probe is checked between items, bounding cancellation latency.
+/// Execute a request synchronously for hosts that already own a worker.
+///
+/// The cancellation probe is checked between items. Callers must first use
+/// [`PickerRequest::validate`]; this function assumes its size, depth, limit,
+/// and deadline invariants already hold.
 pub fn execute_request(
     request: &PickerRequest,
     mut cancelled: impl FnMut() -> bool,
@@ -405,12 +464,16 @@ fn json_string_bytes(value: &str) -> usize {
         .sum::<usize>()
 }
 
+/// Stateless deterministic fuzzy ranker for synchronous callers.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Picker;
 
 impl Picker {
     /// Rank items deterministically. Space-separated terms are ANDed, a leading `'`
     /// requests an exact substring, and `!` excludes matching items.
+    ///
+    /// This synchronous helper does not apply [`PickerRequest`] resource bounds
+    /// or cancellation; use it only with inputs already bounded by the caller.
     pub fn rank(&self, items: &[PickItem], query: &str) -> Vec<PickMatch> {
         let terms = query
             .split_whitespace()
@@ -436,6 +499,9 @@ impl Picker {
         matches
     }
 
+    /// Return at most `limit` input items in deterministic rank order.
+    ///
+    /// Like [`Self::rank`], this helper assumes caller-bounded inputs.
     pub fn select<'items>(
         &self,
         items: &'items [PickItem],

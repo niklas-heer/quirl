@@ -30,6 +30,7 @@ pub(crate) enum NewLanguage {
 pub(crate) struct DescribeCommand {
     /// Exact catalog path, such as `quirl run`.
     pub(crate) topic: String,
+    /// Output representation for the selected command contract.
     #[arg(long, value_enum, default_value_t = DocumentationFormat::Text)]
     pub(crate) format: DocumentationFormat,
 }
@@ -39,6 +40,7 @@ pub(crate) struct DocCommand {
     /// Write generated documentation to this file instead of stdout.
     #[arg(long)]
     pub(crate) output: Option<PathBuf>,
+    /// Output representation for the generated catalog documentation.
     #[arg(long, value_enum, default_value_t = DocumentationFormat::Markdown)]
     pub(crate) format: DocumentationFormat,
     /// Open the generated file with the platform's default viewer.

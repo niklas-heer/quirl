@@ -4,6 +4,7 @@ use quirl_core::{ErrorCode, ShellError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Current version of package manifests, builds, and publish-plan documents.
 pub const PACKAGE_SCHEMA_VERSION: u32 = 1;
 
 const PACKAGE_METADATA_SCHEMA: &str = "PackageMetadata{deny_unknown;name:string;version:string;entry:string;quirl:string;summary:string(default-empty);license:string(default-empty)}";
@@ -12,9 +13,12 @@ const PACKAGE_CAPABILITY_SCHEMA: &str =
 const PACKAGE_CONTRIBUTION_SCHEMA: &str = "PackageContributions{deny_unknown;commands:array<string>(default-empty);panels:array<string>(default-empty);indexers:array<string>(default-empty)}";
 const PACKAGE_ARGUMENT_SCHEMA: &str = "PackageArgument{deny_unknown;names:array<string>;kind:enum[positional,option,flag];value_type:string;required:bool;repeatable:bool(default-false);documentation:string}";
 const PACKAGE_COMMAND_SCHEMA: &str = "PackageCommand{deny_unknown;path:string;signature:string;summary:string;details:string;input_type:string;output_type:string;arguments:array<PackageArgument>(default-empty);examples:array<string>;effects:array<enum[read_filesystem,write_filesystem,spawn_process,change_directory]>;error_codes:map<string,string>}";
+/// Canonical structural description used to fingerprint [`PackageManifest`].
 pub const PACKAGE_SCHEMA_DESCRIPTOR: &str = "PackageManifest{deny_unknown;schema_version:u32;package:PackageMetadata;capabilities:PackageCapabilitySection(default);contributes:PackageContributions(default);public_commands:array<PackageCommand>(default-empty)}";
+/// Canonical structural description used to fingerprint [`PackageBuild`].
 pub const PACKAGE_BUILD_SCHEMA_DESCRIPTOR: &str = "PackageBuild{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;manifest_schema_hash:string;package_name:string;package_version:string;resolved_quirl_version:string;manifest_hash:string;entry_hash:string;host_api_hash:string;capabilities:array<string>;public_commands:array<PackageCommand>;files:array<string>}";
 
+/// Computes the structural schema identity expected by package manifests.
 pub fn package_manifest_schema_hash() -> String {
     package_structural_hash(&[
         PACKAGE_SCHEMA_DESCRIPTOR,
@@ -26,6 +30,7 @@ pub fn package_manifest_schema_hash() -> String {
     ])
 }
 
+/// Computes the structural schema identity embedded in package build records.
 pub fn package_build_schema_hash() -> String {
     package_structural_hash(&[
         PACKAGE_BUILD_SCHEMA_DESCRIPTOR,
@@ -43,136 +48,216 @@ fn package_structural_hash(parts: &[&str]) -> String {
     stable_hash(&descriptor)
 }
 
+/// Strict, deny-unknown representation of a package's `plugin.toml` contract.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PackageManifest {
+    /// Manifest contract version; currently required to equal [`PACKAGE_SCHEMA_VERSION`].
     pub schema_version: u32,
+    /// Package identity, compatibility, and entry-point metadata.
     pub package: PackageMetadata,
     #[serde(default)]
+    /// Authorities the package requests from the sandboxed host.
     pub capabilities: PackageCapabilitySection,
     #[serde(default)]
+    /// Runtime objects registered by the package.
     pub contributes: PackageContributions,
     #[serde(default)]
+    /// Complete agent-facing contracts for every contributed command.
     pub public_commands: Vec<PackageCommand>,
 }
 
+/// Package identity, compatibility, and Lua entry-point metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PackageMetadata {
+    /// Registry-style lowercase ASCII name validated by this crate.
     pub name: String,
+    /// Three-component semantic package version.
     pub version: String,
+    /// Relative, package-contained `.lua` entry path.
     pub entry: String,
+    /// Version requirement that the installed Quirl release must satisfy.
     pub quirl: String,
     #[serde(default)]
+    /// Concise public description; validation requires a non-empty value.
     pub summary: String,
     #[serde(default)]
+    /// Package license identifier or expression supplied by the author.
     pub license: String,
 }
 
+/// Explicit sandbox authorities requested by a package.
+/// Explicit sandbox authorities requested by a package.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PackageCapabilitySection {
     #[serde(default)]
+    /// Sorted, unique capability names that must exist in the installed host API.
     pub request: Vec<String>,
 }
 
+/// Runtime objects a package asks Quirl to register.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PackageContributions {
     #[serde(default)]
+    /// Sorted, unique command paths implemented by the package.
     pub commands: Vec<String>,
     #[serde(default)]
+    /// Reserved Phase 3 panel identifiers; non-empty lists currently fail validation.
     pub panels: Vec<String>,
     #[serde(default)]
+    /// Reserved Phase 3 indexer identifiers; non-empty lists currently fail validation.
     pub indexers: Vec<String>,
 }
 
+/// Invocation role of a package command argument.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ArgumentKind {
+    /// Value identified by its position in the invocation.
     Positional,
+    /// Named argument that consumes a value.
     Option,
+    /// Named boolean switch that consumes no value.
     Flag,
 }
 
+/// Typed public contract for one package command argument.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PackageArgument {
+    /// Accepted spellings, with the canonical or positional name first.
     pub names: Vec<String>,
+    /// Invocation role controlling how names and values are interpreted.
     pub kind: ArgumentKind,
+    /// Stable, human-readable type of the accepted value.
     pub value_type: String,
+    /// Whether omission makes an invocation invalid.
     pub required: bool,
     #[serde(default)]
+    /// Whether the argument may occur more than once.
     pub repeatable: bool,
+    /// Usage guidance required for the public command contract.
     pub documentation: String,
 }
 
+/// Agent-facing behavioral and invocation contract for a contributed command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PackageCommand {
+    /// Canonical space-separated path, matching one `contributes.commands` entry.
     pub path: String,
+    /// Compact invocation grammar for display and planning.
     pub signature: String,
+    /// One-line description used for discovery.
     pub summary: String,
+    /// Extended behavioral contract and usage guidance.
     pub details: String,
+    /// Typed-data pipeline value accepted by the command.
     pub input_type: String,
+    /// Typed-data pipeline value produced by the command.
     pub output_type: String,
     #[serde(default)]
+    /// Typed metadata for each argument represented in the signature.
     pub arguments: Vec<PackageArgument>,
+    /// At least one copyable normal-use invocation.
     pub examples: Vec<String>,
+    /// Observable behavior that callers must account for.
     pub effects: Vec<Effect>,
+    /// Numeric process status strings mapped to stable explanations.
     pub error_codes: BTreeMap<String, String>,
 }
 
+/// Deterministic, content-addressed record of a successfully validated package.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PackageBuild {
+    /// Discriminator; valid records use `quirl.package.build`.
     pub document_type: String,
+    /// Version governing this build-record contract.
     pub schema_version: u32,
+    /// Structural identity computed by [`package_build_schema_hash`].
     pub schema_hash: String,
+    /// Structural identity expected for the source manifest.
     pub manifest_schema_hash: String,
+    /// Validated package name copied from the manifest.
     pub package_name: String,
+    /// Validated package version copied from the manifest.
     pub package_version: String,
+    /// Installed Quirl version against which compatibility was checked.
     pub resolved_quirl_version: String,
+    /// Content identity of the exact manifest bytes used for the build.
     pub manifest_hash: String,
+    /// Content identity of the exact Lua entry bytes used for the build.
     pub entry_hash: String,
+    /// Installed host API identity against which capabilities were checked.
     pub host_api_hash: String,
+    /// Sorted capabilities granted to the package.
     pub capabilities: Vec<String>,
+    /// Validated command contracts sorted by path.
     pub public_commands: Vec<PackageCommand>,
+    /// Sorted, unique package-relative files included by this build phase.
     pub files: Vec<String>,
 }
 
+/// Validation result that contains a build record only after every gate succeeds.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PackageBuildOutcome {
+    /// Discriminator; outcomes use `quirl.package.build_outcome`.
     pub document_type: String,
+    /// Version of the package contract used for validation.
     pub schema_version: u32,
+    /// `true` exactly when no error-severity diagnostics were produced.
     pub valid: bool,
+    /// Manifest, source-audit, and reconciliation findings.
     pub diagnostics: Vec<ValidationDiagnostic>,
+    /// Deterministic record present only when `valid` is `true`.
     pub build: Option<PackageBuild>,
 }
 
+/// Non-executing inspection results supplied by the Lua-owning integration layer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PackageSourceAudit {
+    /// Parse, lint, or resource-limit findings from inspecting the entry source.
     pub diagnostics: Vec<ValidationDiagnostic>,
+    /// Capabilities statically observed in the Lua source.
     pub detected_capabilities: Vec<String>,
+    /// Observable effects statically inferred from the Lua source.
     pub detected_effects: Vec<Effect>,
 }
 
+/// Network-free preview of the exact package payload a publisher would submit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PackagePublishPlan {
+    /// Discriminator; plans use `quirl.package.publish_plan`.
     pub document_type: String,
+    /// Version governing the publish-plan contract.
     pub schema_version: u32,
+    /// Whether this record is guaranteed to be a non-publishing preview.
     pub dry_run: bool,
+    /// Validated package name from the build record.
     pub package_name: String,
+    /// Validated package version from the build record.
     pub package_version: String,
+    /// Content identity of the complete serialized build record.
     pub build_hash: String,
+    /// Sorted files that would be included in publication.
     pub files: Vec<String>,
+    /// Capabilities a reviewer must approve for the package.
     pub requested_capabilities: Vec<String>,
+    /// Records whether any network operation occurred while making this plan.
     pub network_performed: bool,
 }
 
+/// Parses a strict TOML manifest, rejecting unknown fields and malformed values.
+///
+/// `origin` is included in the returned [`ShellError`] and source label so callers
+/// can render an actionable diagnostic for the correct file.
 pub fn parse_package_manifest(source: &str, origin: &str) -> Result<PackageManifest, ShellError> {
     toml::from_str(source).map_err(|error| {
         let mut diagnostic = ShellError::new(
@@ -193,6 +278,10 @@ pub fn parse_package_manifest(source: &str, origin: &str) -> Result<PackageManif
     })
 }
 
+/// Validates manifest semantics against installed capabilities and a Quirl version.
+///
+/// `entry_available` must reflect a containment-safe filesystem check performed by
+/// the integration layer. All expected failures are returned as diagnostics.
 pub fn validate_package_manifest(
     manifest: &PackageManifest,
     entry_available: bool,
@@ -244,6 +333,11 @@ pub fn validate_package_manifest(
 // These inputs deliberately cross the dependency boundary as plain data: the
 // CLI owns filesystem/Lua inspection while this crate owns deterministic build validation.
 #[allow(clippy::too_many_arguments)]
+/// Reconciles manifest claims with a non-executing source audit and builds a record.
+///
+/// The function performs no filesystem, Lua, or network operations. Invalid input
+/// produces diagnostics and no [`PackageBuild`]; valid input is normalized and
+/// content-addressed using the exact source bytes supplied by the caller.
 pub fn build_package(
     manifest: &PackageManifest,
     manifest_source: &[u8],
@@ -314,6 +408,10 @@ pub fn build_package(
 }
 
 impl PackagePublishPlan {
+    /// Creates a deterministic preview without performing a network operation.
+    ///
+    /// Returns [`ShellError`] if the already-validated build record cannot be
+    /// serialized for content hashing, which indicates an internal schema defect.
     pub fn dry_run(build: &PackageBuild) -> Result<Self, ShellError> {
         let build_bytes = serde_json::to_vec(build).map_err(|error| {
             ShellError::new(ErrorCode::Io, "could not serialize package build plan")

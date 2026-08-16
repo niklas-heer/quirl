@@ -1,11 +1,21 @@
 use std::{env, io::IsTerminal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Interactive rendering implementation selected for current terminal capabilities.
 pub enum SurfaceKind {
+    /// Inline raw-mode interface with completion, highlighting, and overlays.
     Rich,
+    /// Conservative line editor that avoids the inline terminal surface.
     Simple,
 }
 
+/// Select the safe interactive surface from configuration and host capabilities.
+///
+/// `"simple"` always selects [`SurfaceKind::Simple`]. Any other request may use
+/// [`SurfaceKind::Rich`] only when stderr is a terminal, `TERM` is not `dumb`,
+/// terminal dimensions are available, and height is at least five rows. Missing
+/// or inadequate capability information fails closed to the simple surface,
+/// including when the caller explicitly requested `"rich"`.
 pub fn select_surface(requested: &str) -> SurfaceKind {
     let stderr_is_terminal = std::io::stderr().is_terminal();
     let term_is_dumb = env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb"));

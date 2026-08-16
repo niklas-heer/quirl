@@ -8,8 +8,11 @@ use quirl_core::{ErrorCode, ShellError};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Current version of every agent-facing JSON document owned by this crate.
 pub const AGENT_SCHEMA_VERSION: u32 = 1;
+/// Default maximum estimated token count used when selecting agent context.
 pub const DEFAULT_TOKEN_BUDGET: usize = 6_000;
+/// Smallest accepted context budget, below which useful schema context cannot fit.
 pub const MINIMUM_TOKEN_BUDGET: usize = 64;
 
 const PROVENANCE_SCHEMA: &str = "AgentProvenance{deny_unknown;source:enum[builtin,external,lua,plugin,fish,bash,zsh,help,man];confidence:enum[low,medium,high,exact];trust:enum[builtin,trusted,declared,imported,heuristic];origin:null|string;fingerprint:null|string;generated_at:null|string}";
@@ -20,11 +23,15 @@ const IO_SCHEMA: &str = "IoContract{deny_unknown;input:string;output:string;stre
 const COMMAND_SCHEMA: &str = "AgentCommand{deny_unknown;id:string;version:null|string;path:string;aliases:array<string>;parent:null|string;signature:string;summary:string;details:string;options:array<AgentOption>;examples:array<string>;io:IoContract;effects:array<enum[read_filesystem,write_filesystem,spawn_process,change_directory]>;exit_codes:map<i32,string>;provenance:AgentProvenance}";
 const HOST_SCHEMA: &str = "HostCapability{deny_unknown;path:string;summary:string;parameters:array<HostParameter{deny_unknown;name:string;value_type:string}>;returns:string;capability:null|string}";
 const CAPABILITY_SCHEMA: &str = "InstalledCapability{deny_unknown;name:string;version:u32;schema_hash:string;providers:array<string>}";
+/// Canonical structural description used to fingerprint [`AgentCatalog`] documents.
 pub const AGENT_CATALOG_SCHEMA_DESCRIPTOR: &str = "AgentCatalog{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;quirl_version:string;catalog_schema_version:u32;catalog_hash:string;host_api_schema_version:u32;host_api_hash:string;commands:array<AgentCommand>;host_api:array<HostCapability>;capabilities:array<InstalledCapability>}";
+/// Canonical structural description used to fingerprint [`AgentContext`] documents.
 pub const AGENT_CONTEXT_SCHEMA_DESCRIPTOR: &str = "AgentContext{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;query:string;token_budget:usize;estimated_tokens:usize;token_estimator:string;truncated:bool;catalog_hash:string;host_api_hash:string;commands:array<AgentCommand>;host_api:array<HostCapability>}";
 const MANIFEST_COMPONENT_SCHEMA: &str = "AgentManifestComponents{SchemaDescriptor{deny_unknown;name:string;version:u32;schema_hash:string;content_hash:string};AgentTool{deny_unknown;name:string;version:string;summary:string;effects:array<Effect>};AgentValidator{deny_unknown;name:string;command:string;schema_version:u32;schema_hash:string}}";
+/// Canonical structural description used to fingerprint [`AgentManifest`] documents.
 pub const AGENT_MANIFEST_SCHEMA_DESCRIPTOR: &str = "AgentManifest{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;content_hash:string;quirl_version:string;schemas:array<SchemaDescriptor>;capabilities:array<InstalledCapability>;tools:array<AgentTool>;validators:array<AgentValidator>}";
 
+/// Computes the structural schema identity expected in an [`AgentCatalog`].
 pub fn agent_catalog_schema_hash() -> String {
     structural_schema_hash(&[
         AGENT_CATALOG_SCHEMA_DESCRIPTOR,
@@ -38,6 +45,7 @@ pub fn agent_catalog_schema_hash() -> String {
     ])
 }
 
+/// Computes the structural schema identity expected in an [`AgentContext`].
 pub fn agent_context_schema_hash() -> String {
     structural_schema_hash(&[
         AGENT_CONTEXT_SCHEMA_DESCRIPTOR,
@@ -50,6 +58,7 @@ pub fn agent_context_schema_hash() -> String {
     ])
 }
 
+/// Computes the structural schema identity expected in an [`AgentManifest`].
 pub fn agent_manifest_schema_hash() -> String {
     structural_schema_hash(&[
         AGENT_MANIFEST_SCHEMA_DESCRIPTOR,
@@ -67,162 +76,266 @@ fn structural_schema_hash(parts: &[&str]) -> String {
     stable_hash(&descriptor)
 }
 
+/// Describes one typed input accepted by a Lua host API function.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HostParameter {
+    /// Parameter name exposed to Lua and agent tooling.
     pub name: String,
+    /// Stable, human-readable value type used by generated documentation.
     pub value_type: String,
 }
 
+/// Machine-readable description of one callable Lua host API function.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HostCapability {
+    /// Dot-separated host API path, such as `quirl.fs.read`.
     pub path: String,
+    /// Concise description suitable for context selection and tool discovery.
     pub summary: String,
+    /// Ordered parameters in the function's call contract.
     pub parameters: Vec<HostParameter>,
+    /// Stable, human-readable description of the returned value.
     pub returns: String,
+    /// Authority that must be granted before the host function may be used.
     pub capability: Option<String>,
 }
 
+/// Agent-facing argument metadata for a command-line option or positional value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentOption {
+    /// Accepted spellings, with the canonical or positional name first.
     pub names: Vec<String>,
+    /// Whether the argument is positional, value-taking, or a flag.
     pub kind: ArgumentKind,
+    /// Stable, human-readable type of the accepted value.
     pub value_type: String,
+    /// Whether omission makes the invocation invalid.
     pub required: bool,
+    /// Whether the argument may occur more than once.
     pub repeatable: bool,
+    /// Optional source from which valid or suggested values can be completed.
     pub values: Option<CompletionSource>,
+    /// Other option names that cannot be used in the same invocation.
     pub conflicts: Vec<String>,
+    /// Detailed usage guidance beyond the containing command's summary.
     pub documentation: String,
+    /// Copyable examples focused on this argument.
     pub examples: Vec<String>,
+    /// Origin and reliability metadata for these facts.
     pub provenance: AgentProvenance,
 }
 
+/// Records where a machine-contract fact came from and how strongly to trust it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentProvenance {
+    /// Mechanism or source class that supplied the fact.
     pub source: Provenance,
+    /// Estimated certainty that the fact accurately describes the command.
     pub confidence: Confidence,
+    /// Trust classification applied before exposing the fact to an agent.
     pub trust: Trust,
+    /// Optional source-specific location, command, or file identifier.
     pub origin: Option<String>,
+    /// Optional source fingerprint for freshness and drift detection.
     pub fingerprint: Option<String>,
+    /// Optional generation timestamp supplied by the source.
     pub generated_at: Option<String>,
 }
 
+/// Complete machine-readable invocation contract for one command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCommand {
+    /// Stable catalog identifier, independent of presentation ordering.
     pub id: String,
+    /// Optional version of an external command or provider.
     pub version: Option<String>,
+    /// Canonical space-separated command path used to invoke the command.
     pub path: String,
+    /// Alternate invocations accepted for the same command.
     pub aliases: Vec<String>,
+    /// Parent command path for hierarchical command catalogs.
     pub parent: Option<String>,
+    /// Compact invocation grammar intended for display and planning.
     pub signature: String,
+    /// One-line description used in discovery and relevance ranking.
     pub summary: String,
+    /// Extended behavioral contract and usage guidance.
     pub details: String,
+    /// Typed positional arguments, options, and flags.
     pub options: Vec<AgentOption>,
+    /// Copyable examples of valid invocations.
     pub examples: Vec<String>,
+    /// Typed pipeline input, output, and streaming behavior.
     pub io: IoContract,
+    /// Observable side effects an agent must account for before invocation.
     pub effects: Vec<Effect>,
+    /// Process exit statuses mapped to their stable meanings.
     pub exit_codes: BTreeMap<i32, String>,
+    /// Origin and reliability metadata for the command contract.
     pub provenance: AgentProvenance,
 }
 
+/// Installed authority together with the host functions that provide it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledCapability {
+    /// Stable capability identifier referenced by package requests.
     pub name: String,
+    /// Version of the capability contract, not of an individual provider.
     pub version: u32,
+    /// Structural/content identity of the sorted provider set.
     pub schema_hash: String,
+    /// Sorted host API paths available under this authority.
     pub providers: Vec<String>,
 }
 
+/// Deterministic snapshot of commands and Lua host functions available to agents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCatalog {
+    /// Discriminator; valid catalogs use `quirl.agent.catalog`.
     pub document_type: String,
+    /// Version governing this outer document contract.
     pub schema_version: u32,
+    /// Structural identity computed by [`agent_catalog_schema_hash`].
     pub schema_hash: String,
+    /// Quirl release that produced the snapshot.
     pub quirl_version: String,
+    /// Version of the source command catalog schema.
     pub catalog_schema_version: u32,
+    /// Content identity of the normalized command list.
     pub catalog_hash: String,
+    /// Version of the adapted Lua host API contract.
     pub host_api_schema_version: u32,
+    /// Content identity of the normalized host API list.
     pub host_api_hash: String,
+    /// Commands sorted into deterministic canonical order.
     pub commands: Vec<AgentCommand>,
+    /// Lua host functions sorted by path.
     pub host_api: Vec<HostCapability>,
+    /// Authorities derived from the installed host API.
     pub capabilities: Vec<InstalledCapability>,
 }
 
+/// Relevance-selected subset of an [`AgentCatalog`] bounded by an estimated token budget.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentContext {
+    /// Discriminator; valid context documents use `quirl.agent.context`.
     pub document_type: String,
+    /// Version governing this outer document contract.
     pub schema_version: u32,
+    /// Structural identity computed by [`agent_context_schema_hash`].
     pub schema_hash: String,
+    /// Original query used to rank catalog entries.
     pub query: String,
+    /// Maximum token estimate requested by the caller.
     pub token_budget: usize,
+    /// Estimate for the selected query and payload, never above the budget.
     pub estimated_tokens: usize,
+    /// Identifier for the estimation algorithm so consumers can interpret the bound.
     pub token_estimator: String,
+    /// Whether otherwise-relevant entries were omitted to respect the budget.
     pub truncated: bool,
+    /// Source catalog content identity used as a freshness anchor.
     pub catalog_hash: String,
+    /// Source host API content identity used as a freshness anchor.
     pub host_api_hash: String,
+    /// Selected command contracts in deterministic path order.
     pub commands: Vec<AgentCommand>,
+    /// Selected host functions in deterministic path order.
     pub host_api: Vec<HostCapability>,
 }
 
+/// Identifies a versioned schema and the installed content represented through it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SchemaDescriptor {
+    /// Stable document-type name.
     pub name: String,
+    /// Version of the named document contract.
     pub version: u32,
+    /// Structural identity of the schema.
     pub schema_hash: String,
+    /// Identity of the installed content available under the schema.
     pub content_hash: String,
 }
 
+/// Command exposed to an agent as an executable Quirl tool.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTool {
+    /// Canonical command path used for invocation.
     pub name: String,
+    /// Quirl version providing the command.
     pub version: String,
+    /// Concise behavioral description for tool discovery.
     pub summary: String,
+    /// Observable effects requiring planning or confirmation.
     pub effects: Vec<Effect>,
 }
 
+/// Validator an agent can invoke to check a generated machine document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentValidator {
+    /// Stable document type accepted by the validator.
     pub name: String,
+    /// Copyable Quirl command that performs validation.
     pub command: String,
+    /// Supported version of the validated document.
     pub schema_version: u32,
+    /// Structural identity expected by the validator.
     pub schema_hash: String,
 }
 
+/// Compact discovery document for schemas, capabilities, tools, and validators.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentManifest {
+    /// Discriminator; valid manifests use `quirl.agent.manifest`.
     pub document_type: String,
+    /// Version governing this outer document contract.
     pub schema_version: u32,
+    /// Structural identity computed by [`agent_manifest_schema_hash`].
     pub schema_hash: String,
+    /// Identity of the manifest payload for freshness checks.
     pub content_hash: String,
+    /// Quirl release whose installed surface is described.
     pub quirl_version: String,
+    /// Machine schemas agents may request or validate.
     pub schemas: Vec<SchemaDescriptor>,
+    /// Installed authorities and their provider functions.
     pub capabilities: Vec<InstalledCapability>,
+    /// Quirl commands suitable for agent tool invocation.
     pub tools: Vec<AgentTool>,
+    /// Commands that validate generated contract documents.
     pub validators: Vec<AgentValidator>,
 }
 
+/// Selects the typed schema used to validate an agent JSON document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentDocumentKind {
+    /// A complete installed command and host API snapshot.
     Catalog,
+    /// A query-focused, token-bounded catalog subset.
     Context,
+    /// A compact discovery manifest for the installed agent surface.
     Manifest,
 }
 
+/// Trusted installed-content identities used to reject stale agent documents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentValidationAnchors {
+    /// Expected normalized command catalog identity.
     pub catalog_hash: String,
+    /// Expected normalized Lua host API identity.
     pub host_api_hash: String,
 }
 
@@ -235,32 +348,50 @@ impl From<&AgentCatalog> for AgentValidationAnchors {
     }
 }
 
+/// Importance of a validation finding when deciding whether a document is usable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
+    /// Contract violation that makes the document invalid.
     Error,
+    /// Non-fatal condition that callers should review.
     Warning,
 }
 
+/// Structured, path-addressable explanation of one contract validation finding.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationDiagnostic {
+    /// Stable machine-readable identifier for the validation rule.
     pub code: String,
+    /// Whether the finding invalidates the document.
     pub severity: DiagnosticSeverity,
+    /// Human-readable description of the observed problem.
     pub message: String,
+    /// Logical field path associated with the finding.
     pub path: String,
+    /// Actionable guidance for correcting the document.
     pub help: String,
 }
 
+/// Complete deterministic result of validating a machine-contract document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationReport {
+    /// Type of validation result, distinct from the input document discriminator.
     pub document_type: String,
+    /// Contract version used by the validator.
     pub schema_version: u32,
+    /// `true` exactly when no error-severity diagnostics were produced.
     pub valid: bool,
+    /// All findings in deterministic validation order.
     pub diagnostics: Vec<ValidationDiagnostic>,
 }
 
+/// Builds a canonical installed-surface snapshot from catalog and host API facts.
+///
+/// Serialization failures while hashing normalized content are returned as
+/// [`ShellError`] values. The result is sorted so identical inputs have stable hashes.
 pub fn build_agent_catalog(
     catalog: &Catalog,
     host_api: &[HostCapability],
@@ -299,6 +430,10 @@ pub fn build_agent_catalog(
     })
 }
 
+/// Derives the compact agent discovery manifest from an installed catalog snapshot.
+///
+/// Returns a [`ShellError`] only if the deterministic manifest payload cannot be
+/// serialized for its content hash.
 pub fn build_agent_manifest(catalog: &AgentCatalog) -> Result<AgentManifest, ShellError> {
     let mut tools = catalog
         .commands
@@ -382,6 +517,11 @@ pub fn build_agent_manifest(catalog: &AgentCatalog) -> Result<AgentManifest, She
     })
 }
 
+/// Selects the most relevant catalog entries that fit within `token_budget`.
+///
+/// Budgets below [`MINIMUM_TOKEN_BUDGET`] fail with
+/// [`quirl_core::ErrorCode::ResourceLimit`]. Serialization failures encountered by
+/// the documented token estimator are also returned as [`ShellError`] values.
 pub fn build_agent_context(
     catalog: &AgentCatalog,
     query: &str,
@@ -511,6 +651,7 @@ fn compact_agent_command(mut command: AgentCommand) -> AgentCommand {
     command
 }
 
+/// Renders an agent context as deterministic, human-readable Markdown.
 pub fn render_context_markdown(context: &AgentContext) -> String {
     let mut output = format!(
         "# Quirl agent context\n\nTask: {}\n\nCatalog: `{}`  \nHost API: `{}`  \nBudget: {} estimated tokens ({})\n\n",
@@ -557,10 +698,17 @@ pub fn render_context_markdown(context: &AgentContext) -> String {
     output
 }
 
+/// Validates an agent JSON document's syntax, type contract, and internal hashes.
+///
+/// This form does not compare content hashes with the currently installed catalog.
 pub fn validate_agent_document(source: &[u8], kind: AgentDocumentKind) -> ValidationReport {
     validate_agent_document_with_anchors(source, kind, None)
 }
 
+/// Validates an agent JSON document and optionally enforces installed-content anchors.
+///
+/// Anchors let callers reject a structurally valid but stale catalog, context, or
+/// manifest without trusting hash values supplied by that same document.
 pub fn validate_agent_document_with_anchors(
     source: &[u8],
     kind: AgentDocumentKind,
@@ -1167,6 +1315,35 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.host_api[0].path, "quirl.cwd");
         assert_eq!(first.capabilities[0].name, "process.spawn");
+    }
+
+    #[test]
+    fn command_documentation_flows_unchanged_into_ai_catalog_and_context() {
+        let source = Catalog::builtin();
+        let source_command = source.find("quirl doc").unwrap();
+        let catalog = build_agent_catalog(&source, &host_api(), "0.1.0").unwrap();
+        let exported = catalog
+            .commands
+            .iter()
+            .find(|command| command.path == "quirl doc")
+            .unwrap();
+
+        assert_eq!(exported.summary, source_command.summary);
+        assert_eq!(exported.details, source_command.details);
+        assert_eq!(
+            exported.options[0].documentation,
+            source_command.options[0].documentation
+        );
+
+        let context =
+            build_agent_context(&catalog, "generate installed documentation", 1_000).unwrap();
+        let selected = context
+            .commands
+            .iter()
+            .find(|command| command.path == "quirl doc")
+            .unwrap();
+        assert_eq!(selected.details, source_command.details);
+        assert!(render_context_markdown(&context).contains(&source_command.details));
     }
 
     #[test]

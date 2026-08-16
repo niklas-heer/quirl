@@ -39,52 +39,69 @@ const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 pub enum PluginCommand {
     /// Validate a legacy trusted Lua plugin registration file.
     Check {
+        /// Lua plugin registration file to validate without installing it.
         file: PathBuf,
+        /// Output representation for the validation result.
         #[arg(long, value_enum, default_value_t = PluginOutputFormat::Text)]
         format: PluginOutputFormat,
     },
     /// Add a local package after an explicit permission review.
     Add {
+        /// Local plugin source directory or manifest location.
         source: String,
+        /// Capability approved for this installation; repeat for each grant.
         #[arg(long = "allow")]
         allow: Vec<String>,
+        /// Output representation for the installation result.
         #[arg(long, value_enum, default_value_t = PluginOutputFormat::Text)]
         format: PluginOutputFormat,
     },
     /// Show requested, granted, and currently missing permissions.
     Permissions {
+        /// Installed plugin name.
         name: String,
+        /// Output representation for the permission report.
         #[arg(long, value_enum, default_value_t = PluginOutputFormat::Text)]
         format: PluginOutputFormat,
     },
     /// Enable an installed plugin after checksum verification.
     Enable {
+        /// Installed plugin name.
         name: String,
+        /// Output representation for the updated lock state.
         #[arg(long, value_enum, default_value_t = PluginOutputFormat::Text)]
         format: PluginOutputFormat,
     },
     /// Disable an installed plugin without deleting its permission record.
     Disable {
+        /// Installed plugin name.
         name: String,
+        /// Output representation for the updated lock state.
         #[arg(long, value_enum, default_value_t = PluginOutputFormat::Text)]
         format: PluginOutputFormat,
     },
     /// Verify schema, source checksums, permissions, and runtime boundary.
     Doctor {
+        /// Installed plugin name.
         name: String,
+        /// Output representation for the integrity report.
         #[arg(long, value_enum, default_value_t = PluginOutputFormat::Text)]
         format: PluginOutputFormat,
     },
     /// Verify installed sources without changing the locked resolution.
     Update {
+        /// Require every resolved version and permission grant to remain unchanged.
         #[arg(long)]
         locked: bool,
+        /// Output representation for the verification result.
         #[arg(long, value_enum, default_value_t = PluginOutputFormat::Text)]
         format: PluginOutputFormat,
     },
     /// Remove an installed plugin record without deleting its source.
     Remove {
+        /// Installed plugin name.
         name: String,
+        /// Output representation for the updated lock state.
         #[arg(long, value_enum, default_value_t = PluginOutputFormat::Text)]
         format: PluginOutputFormat,
     },

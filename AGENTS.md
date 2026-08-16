@@ -113,6 +113,24 @@ APIs; convert at a checked boundary rather than with unchecked `as` casts.
 - Order files for a top-down first read: public contract and principal control
   flow before implementation details, with tests last.
 
+### Documentation is part of the interface
+
+Documentation is a required correctness property, not optional follow-up work.
+Every public Rust crate, module, type, field, variant, constant, trait, and
+function must have `//!` or `///` documentation that explains its contract.
+Document invariants, units, resource bounds, side effects, errors, and security
+assumptions where they matter; do not merely restate the identifier. The
+workspace denies `missing_docs`, and `cargo xtask check` builds all Rustdoc with
+warnings denied, so undocumented or broken public APIs cannot land.
+
+Rustdoc describes the Rust API. User- and AI-facing command documentation has a
+separate runtime source of truth: `Catalog::builtin()` supplies help,
+completion, `quirl describe`, `quirl doc`, LSP, MCP catalog data, and
+`quirl agent`; `HOST_API` supplies the Lua SDK and AI capability catalog. Keep
+those records complete when behavior changes. Never copy command contracts into
+a parallel documentation table or assume Rust `///` comments are available via
+runtime reflection. See [`docs/documentation-system.md`](docs/documentation-system.md).
+
 Use `rustfmt`; do not hand-align code against the formatter. Workspace warnings
 and Clippy lints are part of the design contract, not optional polish.
 
@@ -192,6 +210,8 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
 - Command metadata (help, completions, docs, AI export) comes from
   `Catalog::builtin()` in `quirl-catalog`. New commands and flags are added
   there once — never hardcode help strings or completion lists elsewhere.
+- Rust API documentation is generated directly from `//!` and `///` comments by
+  `cargo xtask docs`; never hand-edit files under `target/doc`.
 
 ## Workspace hygiene
 
@@ -224,9 +244,10 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
 
 ## Process
 
-- `cargo xtask check` is the canonical local quality gate and must pass before every
-  commit. Do not add CI workflows; local Cargo tasks deliberately replace CI
-  while project traffic is low.
+- `cargo xtask check` is the canonical local quality gate and must pass before
+  every commit. It includes the workspace Rustdoc build and missing-public-docs
+  enforcement. Do not add CI workflows; local Cargo tasks deliberately replace
+  CI while project traffic is low.
 - Conventional commits (`feat`, `fix`, `docs`, `refactor`, `chore`, `bench`),
   present tense, optionally scoped, e.g. `feat(lua): add completion budgets`.
 - Significant design choices go through an ADR in `docs/decisions/`.

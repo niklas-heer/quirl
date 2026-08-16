@@ -7,9 +7,10 @@ canonical gate is:
 cargo xtask check
 ```
 
-It checks Rust and Quirl formatting, denies every Clippy warning, runs the full
-workspace, executes 128 deterministic generated C1 differential cases against
-each available reference shell, and runs guest-side Lua tests.
+It checks Rust and Quirl formatting, denies every Clippy warning, rejects
+undocumented public Rust APIs, builds workspace Rustdoc with warnings denied,
+runs the full workspace, executes 128 deterministic generated C1 differential
+cases against each available reference shell, and runs guest-side Lua tests.
 
 ## Layers
 

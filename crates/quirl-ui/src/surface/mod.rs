@@ -60,14 +60,27 @@ const HELP_DETAIL_SCROLL_MAX: u16 = 4_096;
 static HISTORY_COMPACTION_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Result of one rich-surface input session after terminal ownership is released.
 pub enum InteractiveSignal {
+    /// User accepted the complete input buffer.
     Success(String),
+    /// Ctrl-C cancelled editing and discarded the current buffer.
     CtrlC,
+    /// Ctrl-D was pressed while the input buffer was empty.
     CtrlD,
+    /// Opaque command for the composition root rather than child-process execution.
     HostCommand(String),
+    /// The host should suspend the shell after performing platform job control.
     Suspend,
 }
 
+/// Stateful inline terminal editor with completion, pickers, history, and diagnostics.
+///
+/// The surface owns raw mode, bracketed paste, cursor shape, and its ratatui
+/// viewport only while [`Self::read_line`] is active. Normal returns restore all
+/// terminal state; error unwinding and drop make a final best-effort restoration.
+/// Completion and prompt-analysis queues retain at most one pending generation,
+/// preventing stale work from repainting newer input.
 pub struct RichSurface {
     catalog: Arc<Catalog>,
     completion: CompletionState,
@@ -92,6 +105,13 @@ pub struct RichSurface {
 }
 
 impl RichSurface {
+    /// Construct a rich surface without entering raw terminal mode.
+    ///
+    /// Existing history is loaded through a bounded, best-effort tail read;
+    /// missing, unreadable, invalid, and oversized entries are skipped. The
+    /// configured picker ranker and optional extension completer are retained for
+    /// subsequent input sessions. Terminal capability failures are reported only
+    /// when [`Self::read_line`] tries to acquire the terminal.
     pub fn new(
         catalog: Arc<Catalog>,
         extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
@@ -125,6 +145,15 @@ impl RichSurface {
         })
     }
 
+    /// Run one blocking interactive edit session and return after terminal release.
+    ///
+    /// Input is polled every 16 ms so completion and PATH-analysis results can be
+    /// observed without blocking keyboard handling. Accepted non-empty input is
+    /// appended and flushed to bounded history before returning. Ctrl-C, empty-buffer
+    /// Ctrl-D, mode toggles, and suspension return explicit signals only after
+    /// cooked mode, cursor visibility, bracketed paste, and the inline viewport
+    /// have been restored. Terminal/history I/O and invalid completion requests
+    /// return [`ShellError`]; the drop guard retries terminal cleanup on error.
     pub fn read_line(&mut self, prompt: &QuirlPrompt) -> Result<InteractiveSignal, ShellError> {
         self.dismiss_picker();
         self.expand_completion_pending = false;
@@ -482,6 +511,12 @@ impl RichSurface {
         self.help_detail_scroll = 0;
     }
 
+    /// Compact an oversized on-disk history file to the bounded in-memory tail.
+    ///
+    /// Files at or below the encoded limit are left untouched. Compaction writes
+    /// a create-new sibling, flushes and syncs it, then atomically renames it over
+    /// the history path; temporary data is removed on failure. Returns
+    /// [`ErrorCode::Io`] when durable replacement fails.
     pub fn sync_history(&mut self) -> Result<(), ShellError> {
         if fs::metadata(&self.history_path)
             .is_ok_and(|metadata| metadata.len() > MAX_HISTORY_FILE_BYTES as u64)

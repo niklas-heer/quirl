@@ -6,41 +6,76 @@ use std::{fmt, ops::Range, str::FromStr};
 /// Versioned, machine-readable evidence for Quirl's current native compatibility subset and
 /// the frozen 1.0 C1/C2 disposition.
 pub const COMPATIBILITY_MATRIX_JSON: &str = include_str!("../compatibility-v0.1.json");
+/// Current serialized version of the native command grammar.
 pub const GRAMMAR_PROTOCOL_VERSION: u32 = 2;
+/// Schema version of the JSON evidence embedded in [`COMPATIBILITY_MATRIX_JSON`].
 pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 3;
+/// Canonical structural description used to fingerprint the command grammar.
+///
+/// Any change to serialized shapes, token semantics, supported expansions, or
+/// the referenced compatibility matrix must update this descriptor and the
+/// corresponding protocol version.
 pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@2{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or|sequence>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;word_ir:array<Word>;redirects:array<Redirect>};Word{deny_unknown;parts:nonempty-array<WordPart>};WordPart{deny_unknown;text:string;quoting:unquoted|single|double|escaped};Redirect{deny_unknown;fd:u8;kind:input|output|append|here_string|duplicate_input|duplicate_output;path:string;target:Word};tokens:word|pipe|and|or|semicolon|input|output|append|here_string|fd_duplicate|background;expansion:parameter|special|arithmetic|command|pathname;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema3}";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Parsed native command list composed of pipelines and their control connectors.
+///
+/// Empty input is represented by two empty vectors. For a non-empty list,
+/// `connectors.len() + 1 == pipelines.len()` and connector `i` controls whether
+/// pipeline `i + 1` runs after pipeline `i`.
 pub struct CommandList {
+    /// Pipelines in source and execution order.
     pub pipelines: Vec<Pipeline>,
+    /// Boolean or sequential relationships between adjacent pipelines.
     pub connectors: Vec<ListConnector>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// One byte-stream pipeline of simple commands.
+///
+/// Parsed pipelines contain at least one command. A background pipeline can
+/// only occur at the end of a command list because `&` terminates native input.
 pub struct Pipeline {
+    /// Non-empty command stages in left-to-right pipe order.
     pub commands: Vec<SimpleCommand>,
+    /// Whether the host should start the pipeline without foreground waiting.
     pub background: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Command name, arguments, and redirections without executing expansions.
 pub struct SimpleCommand {
+    /// Quote-stripped text for the command name and arguments.
+    ///
+    /// Parsed commands contain at least one word. This compatibility view loses
+    /// quoting origin; execution must use [`Self::word_ir`].
     pub words: Vec<String>,
     /// Quote-aware form of `words`. `words` remains a convenient lossless joined view for
     /// built-ins and protocol consumers from grammar v1; execution uses this field.
     pub word_ir: Vec<Word>,
+    /// Redirections in source order, separate from argument words.
     pub redirects: Vec<Redirect>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// One lexical shell word split whenever its quoting context changes.
+///
+/// Quote delimiters and escape backslashes are not retained; each part records
+/// how its text appeared so the process layer can decide which expansions apply.
 pub struct Word {
+    /// Contiguous fragments in source order.
     pub parts: Vec<WordPart>,
 }
 
 impl Word {
+    /// Concatenate fragment text into the quote-stripped compatibility view.
+    ///
+    /// This intentionally performs no parameter, command, arithmetic, or
+    /// pathname expansion.
     pub fn text(&self) -> String {
         self.parts.iter().map(|part| part.text.as_str()).collect()
     }
@@ -48,53 +83,89 @@ impl Word {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Contiguous text within one source quoting context.
 pub struct WordPart {
+    /// Decoded fragment text without quote delimiters or an escape backslash.
     pub text: String,
+    /// Source context that controls later expansion.
     pub quoting: Quoting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Source quoting context retained for expansion and display semantics.
 pub enum Quoting {
+    /// Ordinary shell text eligible for every supported native expansion.
     Unquoted,
+    /// Single-quoted literal text; no expansion is permitted.
     Single,
+    /// Double-quoted text; parameter, arithmetic, and command expansion may apply.
     Double,
+    /// A character made literal by a preceding backslash.
     Escaped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Execution relationship between adjacent pipelines in a [`CommandList`].
 pub enum ListConnector {
+    /// Run the following pipeline only when the preceding status is zero (`&&`).
     And,
+    /// Run the following pipeline only when the preceding status is non-zero (`||`).
     Or,
+    /// Run the following pipeline regardless of the preceding status (`;`).
     Sequence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Redirection attached to a [`SimpleCommand`].
+///
+/// Native C1 accepts descriptors 0, 1, and 2 with kind-specific constraints;
+/// descriptor duplication is limited to `2>&1` by [`parse_command_list`].
 pub struct Redirect {
+    /// Source or destination file descriptor.
     pub fd: u8,
+    /// Operation applied to the descriptor.
     pub kind: RedirectKind,
+    /// Quote-stripped compatibility view of [`Self::target`].
     pub path: String,
+    /// Quote-aware target used by execution-time expansion.
     pub target: Word,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Supported redirection operators in the native command graph.
 pub enum RedirectKind {
+    /// Read descriptor 0 from a file (`<`).
     Input,
+    /// Replace descriptor 1 or 2 with a newly truncated file (`>`).
     Output,
+    /// Append descriptor 1 or 2 to a file (`>>`).
     Append,
+    /// Feed one expanded word plus a newline to descriptor 0 (`<<<`).
     HereString,
+    /// Duplicate an input descriptor (`<&`); reserved by the IR but rejected in native C1.
     DuplicateInput,
+    /// Duplicate an output descriptor (`>&`); native C1 accepts only `2>&1`.
     DuplicateOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Recoverable command-grammar diagnostic over a half-open UTF-8 byte range.
+///
+/// Offsets refer to the exact input passed to the producing parser, except that
+/// [`check_script`] rebases them to the complete script. Ranges may be empty at
+/// end-of-input and are always suitable for slicing when `start < end`.
 pub struct CommandSyntaxError {
+    /// Concise explanation of the invalid or unsupported form.
     pub message: String,
+    /// Inclusive diagnostic start byte offset.
     pub start: usize,
+    /// Exclusive diagnostic end byte offset.
     pub end: usize,
+    /// Actionable guidance for expressing the intended operation safely.
     pub help: String,
 }
 
@@ -131,23 +202,38 @@ struct Token {
 /// same syntax truth without inverting the workspace dependency graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HighlightSpan {
+    /// Half-open UTF-8 byte range into the exact line passed to [`highlight`].
     pub range: Range<usize>,
+    /// Presentation classification for every byte in [`Self::range`].
     pub kind: HighlightKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Lexer-derived presentation role independent of any terminal color theme.
 pub enum HighlightKind {
+    /// First word of a command or pipeline stage.
     Command,
+    /// Non-command word whose raw source starts with `-`.
     Flag,
+    /// Ordinary argument text, including whitespace and neutral data-mode text.
     Argument,
+    /// Redirection target or word resembling a filesystem/glob path.
     PathLike,
+    /// Word consisting of a single-quoted fragment.
     StringSingle,
+    /// Word consisting of a double-quoted fragment.
     StringDouble,
+    /// Word consisting of a backslash-escaped fragment.
     Escaped,
+    /// Pipe, boolean connector, semicolon, or background marker.
     Operator,
+    /// Redirection operator, excluding its target word.
     Redirect,
+    /// Word whose raw source contains a parameter or command-expansion marker.
     Expansion,
+    /// Word accepted by Rust's floating-point parser.
     Number,
+    /// Lexer diagnostic range for invalid or incomplete input.
     Error,
 }
 
@@ -156,7 +242,10 @@ pub enum HighlightKind {
 /// Command-mode classification is built on the parser's lexer tokens. Invalid or
 /// incomplete input remains renderable: the valid prefix keeps its neutral style
 /// and the lexer diagnostic range becomes an error span. Data mode intentionally
-/// stays neutral until its expression grammar exposes tokens.
+/// stays neutral until its expression grammar exposes tokens. Returned ranges
+/// use UTF-8 byte offsets, cover `0..line.len()` without gaps for non-empty
+/// input, and require memory proportional to the line length. This function does
+/// not impose an input-size limit; interactive callers must bound edit buffers.
 pub fn highlight(line: &str, mode: Mode) -> Vec<HighlightSpan> {
     if line.is_empty() {
         return Vec::new();
@@ -287,6 +376,13 @@ fn classify_word(raw: &str, word: &Word) -> HighlightKind {
 /// Parsing deliberately does not execute expansion.  The IR preserves the origin of every
 /// fragment so the process boundary can expand unquoted/double quoted parameters while keeping
 /// single quoted and escaped text literal.
+///
+/// Empty or whitespace-only input succeeds with an empty [`CommandList`].
+/// Invalid quoting, unsupported C1 dialect forms, malformed control operators,
+/// or unsupported descriptor graphs return [`CommandSyntaxError`] with UTF-8
+/// byte offsets into `input`. Parsing is non-recursive and retains data
+/// proportional to the input; the owning ingestion boundary must enforce its
+/// configured source-byte and command-count limits.
 pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError> {
     let tokens = lex_command(input)?;
     reject_reserved_dialect_forms(&tokens)?;
@@ -552,7 +648,9 @@ fn contains_unquoted_brace_expansion(word: &Word) -> bool {
 /// Return the expression from a `data` statement.
 ///
 /// The keyword must be followed by whitespace or the end of the line. Callers
-/// share this classifier so checking and execution cannot disagree.
+/// share this classifier so checking and execution cannot disagree. The returned
+/// slice borrows `line`, excludes the keyword and following leading whitespace,
+/// and may be empty.
 pub fn data_statement_expression(line: &str) -> Option<&str> {
     let rest = line.strip_prefix("data")?;
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim_start())
@@ -565,7 +663,9 @@ pub fn data_statement_expression(line: &str) -> Option<&str> {
 ///
 /// Command statements use the same compatibility parser as interactive execution. `data`
 /// statements are recognized as a separate language island and require a non-empty expression.
-/// Every returned span is absolute within `source` and diagnostics retain source order.
+/// Every returned span is absolute within `source` and diagnostics retain source order. The
+/// checker scans linearly, does not execute source or recurse, and does not impose a byte limit;
+/// file-reading callers must reject oversized source before invoking it.
 pub fn check_script(source: &str) -> Vec<CommandSyntaxError> {
     let mut diagnostics = Vec::new();
     let mut offset = 0;
@@ -955,12 +1055,15 @@ fn push_word(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
+    /// Byte-oriented native commands, pipelines, redirects, and process status.
     #[default]
     Command,
+    /// Native typed-data expressions and value pipelines.
     Data,
 }
 
 impl Mode {
+    /// Return the other interactive grammar without mutating session state.
     pub const fn toggled(self) -> Self {
         match self {
             Self::Command => Self::Data,
@@ -968,6 +1071,10 @@ impl Mode {
         }
     }
 
+    /// Return the built-in visible prompt marker for this grammar.
+    ///
+    /// Hosts may replace this marker through configuration, but should keep mode
+    /// identity visible by another accessible means.
     pub const fn prompt(self) -> &'static str {
         match self {
             Self::Command => "❯",
@@ -1002,16 +1109,32 @@ impl FromStr for Mode {
 /// A line classified without guessing between two full languages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InteractiveLine<'a> {
+    /// Empty or whitespace-only input.
     Empty,
+    /// The mode-independent `exit` or `quit` command.
     Exit,
+    /// A valid explicit `mode command`, `mode cmd`, or `mode data` request.
     ChangeMode(Mode),
+    /// The explicit `mode toggle` request.
     ToggleMode,
+    /// Help request with an optional trimmed topic borrowed from the input.
     Help(Option<&'a str>),
+    /// Trimmed source to parse and execute with the native command grammar.
     Command(&'a str),
+    /// Trimmed source to evaluate with the native typed-data grammar.
     Data(&'a str),
+    /// Expression following the mode-independent `lua ` prefix.
     Lua(&'a str),
 }
 
+/// Classify one interactive line using explicit built-ins and the active mode.
+///
+/// Leading and trailing whitespace is removed before classification. Exit,
+/// mode, help, and Lua bridge forms take precedence over the active grammar;
+/// all other input is returned as [`InteractiveLine::Command`] or
+/// [`InteractiveLine::Data`]. An invalid `mode <value>` is deliberately left to
+/// the active grammar instead of being silently accepted. Returned string
+/// slices borrow `input`, and this function performs no allocation on success.
 pub fn classify(mode: Mode, input: &str) -> InteractiveLine<'_> {
     let input = input.trim();
     if input.is_empty() {

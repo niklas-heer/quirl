@@ -19,24 +19,31 @@ const DEFAULT_MANIFEST: &str = "plugin.toml";
 pub enum PackageCommand {
     /// Parse and normalize a project package manifest.
     Manifest {
+        /// Package manifest to parse; defaults to `plugin.toml`.
         #[arg(long, default_value = DEFAULT_MANIFEST)]
         manifest: PathBuf,
+        /// Output representation for the normalized manifest.
         #[arg(long, value_enum, default_value_t = PackageOutputFormat::Text)]
         format: PackageOutputFormat,
     },
     /// Validate the entry, capabilities, and public command metadata quality gate.
     Build {
+        /// Package manifest whose project entry is validated.
         #[arg(long, default_value = DEFAULT_MANIFEST)]
         manifest: PathBuf,
+        /// Output representation for the build outcome.
         #[arg(long, value_enum, default_value_t = PackageOutputFormat::Text)]
         format: PackageOutputFormat,
     },
     /// Produce a deterministic publish plan without network access.
     Publish {
+        /// Package manifest used to construct the publish plan.
         #[arg(long, default_value = DEFAULT_MANIFEST)]
         manifest: PathBuf,
+        /// Require the network-free preview path; publication is not yet enabled.
         #[arg(long)]
         dry_run: bool,
+        /// Output representation for the publish plan.
         #[arg(long, value_enum, default_value_t = PackageOutputFormat::Text)]
         format: PackageOutputFormat,
     },

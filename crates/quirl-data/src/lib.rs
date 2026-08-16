@@ -26,16 +26,24 @@ use std::{
 /// Resource limits applied before data enters the evaluator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataLimits {
+    /// Maximum UTF-8 bytes accepted in one data expression.
     pub max_source_bytes: usize,
+    /// Maximum bytes read from one input file.
     pub max_file_bytes: u64,
+    /// Maximum rows emitted by a source or retained by a collecting operation.
     pub max_rows: usize,
+    /// Maximum fields accepted in a record or tabular row.
     pub max_fields: usize,
+    /// Maximum nesting depth accepted in structured input.
     pub max_depth: usize,
+    /// Wall-clock deadline applied to an explicitly injected external process.
     pub external_deadline: Duration,
+    /// Maximum bytes retained for each captured output stream of an external process.
     pub max_external_output_bytes: usize,
 }
 
 impl DataLimits {
+    /// Conservative limits used by a default [`DataRuntime`].
     pub const DEFAULT: Self = Self {
         max_source_bytes: 256 * 1024,
         max_file_bytes: 8 * 1024 * 1024,
@@ -64,22 +72,44 @@ impl Default for DataLimits {
     deny_unknown_fields
 )]
 pub enum DataValue {
+    /// Absence of a value, equivalent to JSON `null`.
     Nothing,
+    /// A Boolean value.
     Bool(bool),
+    /// A signed 64-bit integer.
     Int(i64),
+    /// An unsigned 64-bit integer.
     UInt(u64),
+    /// A decimal represented as text without conversion through binary floating point.
     Decimal(String),
+    /// UTF-8 text without domain-specific semantics.
     String(String),
+    /// An ordered sequence of typed values.
     List(Vec<DataValue>),
+    /// A deterministically ordered mapping from field names to values.
     Record(BTreeMap<String, DataValue>),
+    /// A filesystem path represented as UTF-8 text.
+    ///
+    /// Human-facing renderers are responsible for escaping terminal controls.
     Path(String),
-    Duration { nanoseconds: u64 },
-    Size { bytes: u64 },
+    /// An elapsed duration represented in nanoseconds.
+    Duration {
+        /// Unsigned duration magnitude in nanoseconds.
+        nanoseconds: u64,
+    },
+    /// A byte size.
+    Size {
+        /// Unsigned size magnitude in bytes.
+        bytes: u64,
+    },
+    /// A date and time represented as UTF-8 text; consumers define the accepted syntax.
     DateTime(String),
+    /// A pattern preserved in its source representation.
     Pattern(String),
 }
 
 impl DataValue {
+    /// Convert a JSON-compatible value into Quirl's stable typed representation.
     pub fn from_json(value: Value) -> Self {
         match value {
             Value::Null => Self::Nothing,
@@ -154,62 +184,89 @@ impl DataValue {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DataEnvelope {
+    /// One scalar or structured value.
     Value {
+        /// The contained typed value.
         value: DataValue,
     },
+    /// A finite, already-materialized sequence of values.
     Stream {
+        /// Values in source order.
         items: Vec<DataValue>,
     },
+    /// Explicit optional control flow.
     Option {
+        /// The present envelope, or `None` for an absent value.
         value: Option<Box<DataEnvelope>>,
     },
+    /// Explicit success or failure control flow.
     Result {
+        /// Whether the operation succeeded or failed.
         state: ResultState,
+        /// Successful payload when `state` is [`ResultState::Ok`].
         value: Option<Box<DataEnvelope>>,
+        /// Failure payload when `state` is [`ResultState::Error`].
         error: Option<ShellError>,
     },
+    /// Explicit asynchronous task state.
     Task {
+        /// Current task lifecycle state.
         state: TaskState,
+        /// Completed task payload, when available.
         value: Option<Box<DataEnvelope>>,
+        /// Failed task diagnostic, when available.
         error: Option<ShellError>,
     },
 }
 
+/// Completion state for an explicit data result envelope.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResultState {
+    /// The result contains a successful value.
     Ok,
+    /// The result contains a [`ShellError`].
     Error,
 }
 
+/// Lifecycle state for an explicit task envelope.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
+    /// The task has not completed yet.
     Pending,
+    /// The task completed with a value.
     Complete,
+    /// Cancellation stopped the task before completion.
     Cancelled,
+    /// The task completed with an error.
     Failed,
 }
 
 impl DataEnvelope {
+    /// Wrap a JSON-compatible value in a typed value envelope.
     pub fn value(value: Value) -> Self {
         Self::Value {
             value: DataValue::from_json(value),
         }
     }
+    /// Wrap materialized JSON-compatible rows in a stream envelope.
     pub fn stream(items: Vec<Value>) -> Self {
         Self::Stream {
             items: items.into_iter().map(DataValue::from_json).collect(),
         }
     }
+    /// Construct a present optional envelope.
     pub fn some(value: Self) -> Self {
         Self::Option {
             value: Some(Box::new(value)),
         }
     }
+    /// Construct an absent optional envelope.
     pub fn none() -> Self {
         Self::Option { value: None }
     }
+    /// Construct a successful result envelope.
     pub fn result(value: Self) -> Self {
         Self::Result {
             state: ResultState::Ok,
@@ -217,6 +274,7 @@ impl DataEnvelope {
             error: None,
         }
     }
+    /// Construct a failed result envelope carrying `error`.
     pub fn result_error(error: ShellError) -> Self {
         Self::Result {
             state: ResultState::Error,
@@ -224,6 +282,7 @@ impl DataEnvelope {
             error: Some(error),
         }
     }
+    /// Construct a completed task envelope.
     pub fn task(value: Self) -> Self {
         Self::Task {
             state: TaskState::Complete,
@@ -231,6 +290,7 @@ impl DataEnvelope {
             error: None,
         }
     }
+    /// Construct a task that has not completed.
     pub fn pending_task() -> Self {
         Self::Task {
             state: TaskState::Pending,
@@ -238,6 +298,7 @@ impl DataEnvelope {
             error: None,
         }
     }
+    /// Construct a task stopped by cancellation.
     pub fn cancelled_task() -> Self {
         Self::Task {
             state: TaskState::Cancelled,
@@ -245,6 +306,7 @@ impl DataEnvelope {
             error: None,
         }
     }
+    /// Construct a failed task carrying `error`.
     pub fn failed_task(error: ShellError) -> Self {
         Self::Task {
             state: TaskState::Failed,
@@ -252,15 +314,20 @@ impl DataEnvelope {
             error: Some(error),
         }
     }
+    /// Render this envelope in the selected stable human or machine format.
     pub fn render(&self, format: DataRenderFormat) -> Result<String, ShellError> {
         render_envelope(self, format)
     }
 }
 
+/// Output representation selected at a data-rendering boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataRenderFormat {
+    /// Stable typed JSON suitable for machine consumers.
     Json,
+    /// Terminal-safe line-oriented text.
     Plain,
+    /// A human-readable table that collects streams within their configured row bound.
     Table,
 }
 
@@ -269,6 +336,7 @@ pub enum DataRenderFormat {
 /// configured row budget.
 type StreamPull = dyn FnMut(&AtomicBool) -> Result<Option<Value>, ShellError> + Send;
 
+/// A bounded, pull-based sequence of JSON-compatible rows.
 pub struct DataStream {
     pull: Box<StreamPull>,
     emitted: usize,
@@ -385,6 +453,7 @@ impl DataStream {
         self.limits
     }
 
+    /// Pull at most one row, observing cancellation and the configured row limit.
     pub fn next(&mut self, cancelled: &AtomicBool) -> Result<Option<Value>, ShellError> {
         check_cancelled(cancelled)?;
         if self.emitted == self.limits.max_rows {
@@ -403,6 +472,7 @@ impl DataStream {
         Ok(value)
     }
 
+    /// Consume the stream into memory within its configured row bound.
     pub fn collect(mut self, cancelled: &AtomicBool) -> Result<Vec<Value>, ShellError> {
         let mut values = Vec::new();
         while let Some(value) = self.next(cancelled)? {
@@ -413,6 +483,7 @@ impl DataStream {
 }
 
 #[derive(Clone)]
+/// Evaluates bounded native data expressions and explicitly granted processes.
 pub struct DataRuntime {
     limits: DataLimits,
     process_host: Option<ProcessHost>,
@@ -422,7 +493,9 @@ pub struct DataRuntime {
 /// A stream deliberately has no `Clone` implementation: duplicating a live
 /// reader would hide an I/O or memory boundary from callers.
 pub enum DataOutput {
+    /// An already-materialized scalar or structured value.
     Value(Value),
+    /// A pull-based stream whose rows have not necessarily been read yet.
     Stream(DataStream),
 }
 
@@ -443,6 +516,11 @@ impl DataOutput {
         }
     }
 
+    /// Render this output into an owned UTF-8 string.
+    ///
+    /// This convenience boundary buffers the rendered bytes. Stream rows are
+    /// still pulled individually, while table rendering materializes rows
+    /// within the stream's configured limit.
     pub fn render(
         self,
         format: DataRenderFormat,
@@ -484,6 +562,7 @@ impl Default for DataRuntime {
 }
 
 impl DataRuntime {
+    /// Create a runtime with [`DataLimits::DEFAULT`] and no process capability.
     pub const fn new() -> Self {
         Self {
             limits: DataLimits::DEFAULT,
@@ -491,6 +570,7 @@ impl DataRuntime {
         }
     }
 
+    /// Create a runtime with caller-supplied limits and no process capability.
     pub const fn with_limits(limits: DataLimits) -> Self {
         Self {
             limits,
@@ -507,16 +587,19 @@ impl DataRuntime {
         }
     }
 
+    /// Create a bounded runtime with an explicitly injected process capability.
     pub fn with_limits_and_process_host(limits: DataLimits, process_host: ProcessHost) -> Self {
         Self {
             limits,
             process_host: Some(process_host),
         }
     }
+    /// Return the immutable limits applied by this runtime.
     pub const fn limits(&self) -> DataLimits {
         self.limits
     }
 
+    /// Evaluate `source` and return a stable typed envelope.
     pub fn eval_envelope(&self, source: &str) -> Result<DataEnvelope, ShellError> {
         self.eval_output(source)?
             .into_envelope(&AtomicBool::new(false))
@@ -530,6 +613,10 @@ impl DataRuntime {
         self.eval_output_with_token(source, &cancelled, Some(Arc::clone(&cancelled)))
     }
 
+    /// Evaluate while observing a borrowed cancellation flag.
+    ///
+    /// A borrowed flag cannot be forwarded to a spawned external process; use
+    /// [`Self::eval_output_with_cancellation_handle`] for that boundary.
     pub fn eval_output_with_cancellation(
         &self,
         source: &str,
@@ -579,6 +666,7 @@ impl DataRuntime {
         Ok(output)
     }
 
+    /// Evaluate and render `source` into an owned UTF-8 string.
     pub fn render(
         &self,
         source: &str,
@@ -629,12 +717,14 @@ impl DataRuntime {
         }
     }
 
+    /// Evaluate `source` and collect its result into a JSON-compatible value.
     pub fn eval(&self, source: &str) -> Result<Value, ShellError> {
         let cancelled = Arc::new(AtomicBool::new(false));
         self.eval_output_with_token(source, &cancelled, Some(Arc::clone(&cancelled)))?
             .into_value(&cancelled)
     }
 
+    /// Evaluate and collect a result while observing cancellation.
     pub fn eval_with_cancellation(
         &self,
         source: &str,

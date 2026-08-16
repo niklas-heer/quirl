@@ -29,12 +29,15 @@ const CANCELLATION_POLL_MS: u64 = 25;
 pub enum EventsCommand {
     /// Print the installed immutable event/action/contribution protocol.
     Schema {
+        /// Output representation for the protocol schema.
         #[arg(long, value_enum, default_value_t = PlatformOutputFormat::Text)]
         format: PlatformOutputFormat,
     },
     /// Validate a versioned event trace without invoking extensions.
     Validate {
+        /// JSON event trace to validate.
         file: PathBuf,
+        /// Output representation for the validation result.
         #[arg(long, value_enum, default_value_t = PlatformOutputFormat::Text)]
         format: PlatformOutputFormat,
     },
@@ -44,21 +47,27 @@ pub enum EventsCommand {
 pub enum ViewCommand {
     /// Render a directory as an escape-safe typed panel or JSON model.
     Directory {
+        /// Directory to enumerate; defaults to the current directory.
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Include entries conventionally hidden by a leading dot.
         #[arg(long)]
         all: bool,
+        /// Output representation for the directory panel.
         #[arg(long, value_enum, default_value_t = PlatformOutputFormat::Text)]
         format: PlatformOutputFormat,
     },
     /// Render the process table as an escape-safe typed panel or JSON model.
     Processes {
+        /// Output representation for the bounded process panel.
         #[arg(long, value_enum, default_value_t = PlatformOutputFormat::Text)]
         format: PlatformOutputFormat,
     },
     /// Render one enabled plugin's typed panel contribution.
     Panel {
+        /// Registered plugin panel name to render.
         name: String,
+        /// Output representation for the plugin panel.
         #[arg(long, value_enum, default_value_t = PlatformOutputFormat::Text)]
         format: PlatformOutputFormat,
     },
@@ -77,6 +86,7 @@ pub struct WatchCommand {
     /// Retained sample bound; older completed samples are dropped from history.
     #[arg(long, default_value_t = 32)]
     pub capacity: usize,
+    /// Output representation for completed samples.
     #[arg(long, value_enum, default_value_t = PlatformOutputFormat::Text)]
     pub format: PlatformOutputFormat,
 }

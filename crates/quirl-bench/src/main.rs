@@ -1,3 +1,5 @@
+//! Reproducible research benchmarks and release measurements for Quirl.
+
 use mlua::{Function, Lua, Table};
 use serde::Serialize;
 use std::{

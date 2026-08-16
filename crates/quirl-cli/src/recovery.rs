@@ -32,12 +32,15 @@ static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
 pub enum RecoveryCommand {
     /// List recoverable failure snapshots, newest first.
     List {
+        /// Output representation for the snapshot list.
         #[arg(long, value_enum, default_value_t = RecoveryFormat::Text)]
         format: RecoveryFormat,
     },
     /// Inspect one snapshot, or the newest snapshot when ID is omitted.
     Show {
+        /// Snapshot identifier; omit to select the newest snapshot.
         id: Option<String>,
+        /// Output representation for the snapshot details.
         #[arg(long, value_enum, default_value_t = RecoveryFormat::Text)]
         format: RecoveryFormat,
     },

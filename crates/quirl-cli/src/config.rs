@@ -19,12 +19,15 @@ use std::{
 pub enum ConfigCommand {
     /// Parse, evaluate under config restrictions, and validate against Rust schemas.
     Check {
+        /// Lua configuration file to validate.
         file: PathBuf,
+        /// Output representation for the validation result.
         #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Text)]
         format: ConfigOutputFormat,
     },
     /// Open a loopback-only, schema-backed configuration form.
     Web {
+        /// Lua configuration file edited by the local form.
         file: PathBuf,
         /// Loopback TCP port; 0 selects an available port.
         #[arg(long, default_value_t = 0)]
@@ -32,12 +35,14 @@ pub enum ConfigCommand {
     },
     /// Print one evaluated, schema-backed configuration value.
     Get {
+        /// Lua configuration file to evaluate.
         file: PathBuf,
         /// Recognized field such as editor.keymap or prompt.symbols.
         key: String,
     },
     /// Patch one recognized literal, validate the candidate, and retain a .bak.
     Set {
+        /// Lua configuration file to update atomically.
         file: PathBuf,
         /// Recognized literal field; use prompt.symbols for prompt glyphs.
         key: String,
@@ -45,9 +50,13 @@ pub enum ConfigCommand {
         value: String,
     },
     /// Show the current schema and values as an accessible line-oriented view.
-    Tui { file: PathBuf },
+    Tui {
+        /// Lua configuration file to inspect.
+        file: PathBuf,
+    },
     /// Format a configuration file with Quirl's deterministic Lua formatter.
     Fmt {
+        /// Lua configuration file to format.
         file: PathBuf,
         /// Report formatting drift without writing the source file.
         #[arg(long)]
@@ -55,29 +64,38 @@ pub enum ConfigCommand {
     },
     /// Export the evaluated, schema-backed configuration without modifying its source.
     Export {
+        /// Lua configuration file to evaluate and export.
         file: PathBuf,
+        /// Output representation for the evaluated configuration.
         #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Json)]
         format: ConfigOutputFormat,
     },
     /// Compare two evaluated configuration files field by field.
     Diff {
+        /// Baseline Lua configuration file.
         file: PathBuf,
+        /// Candidate Lua configuration file compared with the baseline.
         other: PathBuf,
+        /// Output representation for the field-level differences.
         #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Text)]
         format: ConfigOutputFormat,
     },
     /// Preview the source migration required by the current configuration schema.
     Migrate {
+        /// Lua configuration file to analyze for migration.
         file: PathBuf,
         /// Migration is preview-only in 0.1.0; this flag is required to make that explicit.
         #[arg(long)]
         dry_run: bool,
+        /// Output representation for the migration preview.
         #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Text)]
         format: ConfigOutputFormat,
     },
     /// Diagnose schema validity and which settings can be safely patched as literals.
     Doctor {
+        /// Lua configuration file to diagnose.
         file: PathBuf,
+        /// Output representation for the diagnostic report.
         #[arg(long, value_enum, default_value_t = ConfigOutputFormat::Text)]
         format: ConfigOutputFormat,
     },

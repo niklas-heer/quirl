@@ -38,6 +38,7 @@ pub enum IndexCommand {
         /// Index destination. Defaults to Quirl's user cache directory.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Output representation for the build report.
         #[arg(long, value_enum, default_value_t = IndexOutputFormat::Text)]
         format: IndexOutputFormat,
     },
@@ -49,6 +50,7 @@ pub enum IndexCommand {
         /// Read a specific index instead of Quirl's user cache.
         #[arg(long)]
         index: Option<PathBuf>,
+        /// Output representation for the provenance explanation.
         #[arg(long, value_enum, default_value_t = IndexOutputFormat::Text)]
         format: IndexOutputFormat,
     },

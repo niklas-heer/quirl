@@ -40,6 +40,7 @@ impl Default for LanguageService {
 }
 
 impl LanguageService {
+    /// Create an empty language-service session backed by `catalog`.
     pub fn new(catalog: Catalog) -> Self {
         Self {
             catalog,
@@ -82,6 +83,7 @@ impl LanguageService {
         }
     }
 
+    /// Return whether the client has sent the terminal `exit` notification.
     pub fn should_exit(&self) -> bool {
         self.exit
     }

@@ -1,3 +1,5 @@
+//! Quirl's command-line composition root and interactive shell executable.
+
 mod agent;
 mod author;
 mod config;
@@ -75,15 +77,21 @@ enum Command {
     Run {
         /// Script file, or - for standard input with --lang or a recognized shebang.
         file: PathBuf,
+        /// Explicit script engine; required when standard input has no recognized shebang.
         #[arg(long, value_enum)]
         lang: Option<ScriptLanguage>,
+        /// Arguments made available to the selected script engine.
         #[arg(trailing_var_arg = true)]
         arguments: Vec<String>,
     },
     /// Evaluate Lua and print the returned value.
-    Eval { expression: String },
+    Eval {
+        /// Lua expression or chunk to evaluate under Quirl's runtime policy.
+        expression: String,
+    },
     /// Evaluate a native structured-data expression or pipeline.
     Data {
+        /// Native typed-data expression or pipeline to evaluate.
         expression: String,
         /// Select a human table/plain renderer or the explicit machine envelope.
         #[arg(long, value_enum, default_value_t = DataOutputFormat::Table)]
@@ -94,6 +102,7 @@ enum Command {
         /// Script file or recursively discovered directory.
         #[arg(value_name = "PATH")]
         file: PathBuf,
+        /// Diagnostic renderer; JSON emits the stable machine envelope.
         #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
         format: DiagnosticFormat,
     },
@@ -102,6 +111,7 @@ enum Command {
         /// Lua or native Quirl script/directory; native source is unchanged.
         #[arg(value_name = "PATH")]
         file: PathBuf,
+        /// Report formatting drift without modifying any file.
         #[arg(long)]
         check: bool,
     },
@@ -110,6 +120,7 @@ enum Command {
         /// Script file or recursively discovered directory.
         #[arg(value_name = "PATH")]
         file: PathBuf,
+        /// Diagnostic renderer; JSON emits the stable machine envelope.
         #[arg(long, value_enum, default_value_t = DiagnosticFormat::Text)]
         format: DiagnosticFormat,
     },
@@ -131,11 +142,13 @@ enum Command {
     },
     /// Export the generated Lua SDK used by editors, docs, and AI.
     Sdk {
+        /// Output representation for the generated host API contract.
         #[arg(long, value_enum, default_value_t = SdkFormat::Text)]
         format: SdkFormat,
     },
     /// Export the semantic command catalog used by completion, docs, and AI.
     Catalog {
+        /// Output representation for the installed command catalog.
         #[arg(long, value_enum, default_value_t = CatalogFormat::Json)]
         format: CatalogFormat,
     },
@@ -173,7 +186,9 @@ enum Command {
     },
     /// Ask the same completion engine used by the interactive IDE menu.
     Complete {
+        /// Partial command line to complete.
         input: String,
+        /// Output representation for ranked completion candidates.
         #[arg(long, value_enum, default_value_t = CompletionFormat::Text)]
         format: CompletionFormat,
     },
@@ -204,6 +219,7 @@ enum Command {
     },
     /// Execute one command through Quirl's native pipeline and job graph.
     Exec {
+        /// Command and arguments to execute without shell string parsing.
         #[arg(required = true, trailing_var_arg = true)]
         command: Vec<String>,
     },
@@ -2067,6 +2083,11 @@ mod tests {
         let cli = Cli::command();
         leaves(&cli, "quirl", &mut cli_leaves);
         for (path, cli) in cli_leaves {
+            assert!(
+                cli.get_about()
+                    .is_some_and(|about| !about.to_string().trim().is_empty()),
+                "CLI leaf `{path}` has no parser-facing summary"
+            );
             let contract = catalog
                 .commands
                 .iter()
@@ -2097,6 +2118,13 @@ mod tests {
             );
 
             for argument in visible_arguments {
+                assert!(
+                    argument
+                        .get_help()
+                        .is_some_and(|help| !help.to_string().trim().is_empty()),
+                    "visible Clap argument `{}` for `{path}` has no parser-facing documentation",
+                    argument.get_id()
+                );
                 if argument.is_positional() {
                     let id = argument.get_id().as_str();
                     let mut matching = contract

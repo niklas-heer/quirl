@@ -1,8 +1,9 @@
 //! Native command graph execution and background-job lifecycle.
 
+/// Version of the serialized native runner contract.
 pub const RUNNER_PROTOCOL_VERSION: u32 = 1;
-/// Maximum bytes retained per captured output stream when a caller does not
-/// provide the tighter sandboxed-process budget.
+/// Default bytes retained for final stdout and, separately, aggregate stderr
+/// when a caller does not provide a tighter sandboxed-process budget.
 pub const DEFAULT_CAPTURE_BYTES: usize = 1024 * 1024;
 /// Maximum UTF-8 bytes accepted by one native command-list execution.
 pub const NATIVE_COMMAND_BYTES_MAX: usize = 1024 * 1024;
@@ -16,8 +17,10 @@ pub const HERE_STRING_BYTES_MAX: usize = 256 * 1024;
 pub const ARITHMETIC_SOURCE_BYTES_MAX: usize = 16 * 1024;
 /// Maximum nested unary/parenthesized arithmetic expressions.
 pub const ARITHMETIC_DEPTH_MAX: usize = 64;
+/// Canonical descriptor hashed to identify the native runner contract.
 pub const RUNNER_SCHEMA_DESCRIPTOR: &str = "quirl.runner@1{input:quirl.command-grammar@1,native-source-bytes<=1048576,native-pipelines<=256,native-stages-per-pipeline<=64,here-string-bytes-including-newline<=262144,arithmetic-source-bytes<=16384,arithmetic-depth<=64;ProcessBackend{execute_capture(source)->CommandOutcome;execute_interactive(source)->CommandOutcome;jobs()->array<JobState>;foreground_job(id)->JobState;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};capture:default-retained-per-stream=1048576|caller-tighter,drain-excess-then-ResourceLimit-with-retained-and-discarded-byte-context;interactive:inherit-streams-without-retention-limit;byte-pipeline:ordered;redirection:input|output|append|here-string;background:terminal-ampersand;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows}";
 
+/// Return the deterministic fingerprint of [`RUNNER_SCHEMA_DESCRIPTOR`].
 pub fn runner_schema_hash() -> String {
     quirl_core::schema_fingerprint(RUNNER_SCHEMA_DESCRIPTOR)
 }
@@ -68,13 +71,18 @@ fn validate_native_plan(graph: &quirl_syntax::CommandList) -> Result<(), quirl_c
 
 #[cfg(test)]
 mod simulation_support {
+    /// Default generated lifecycle cases used by the deterministic test suite.
     pub const DEFAULT_SIMULATION_CASES: usize = 128;
+    /// Default reproducible seed used by lifecycle simulations.
     pub const DEFAULT_SIMULATION_SEED: u64 = 7_640_891_576_956_012_809;
+    /// Maximum generated lifecycle cases accepted from the environment.
     pub const SIMULATION_CASES_MAX: usize = 10_000;
 
+    /// Small deterministic generator used only for reproducible test schedules.
     pub struct DeterministicRng(u64);
 
     impl DeterministicRng {
+        /// Initialize the generator, mapping zero to a fixed nonzero state.
         pub fn new(seed: u64) -> Self {
             // Xorshift cannot advance from zero, so map that valid CLI seed to
             // a fixed non-zero state while preserving deterministic replay.
@@ -85,6 +93,11 @@ mod simulation_support {
             })
         }
 
+        /// Return an index in `0..upper` and advance the deterministic state.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `upper` is zero.
         pub fn index(&mut self, upper: usize) -> usize {
             assert!(upper > 0);
             let mut value = self.0;
@@ -97,6 +110,7 @@ mod simulation_support {
         }
     }
 
+    /// Read the bounded seed and case count used by the test harness.
     pub fn configuration() -> (u64, usize) {
         let seed = std::env::var("QUIRL_TEST_SEED")
             .ok()
@@ -150,21 +164,31 @@ mod platform {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
 
+    /// Aggregate lifecycle state for a native job.
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "snake_case")]
     pub enum JobStatus {
+        /// At least one child is executing.
         Running,
+        /// Every live child is stopped.
         Stopped,
+        /// Every child has exited or been reaped.
         Done,
     }
 
+    /// Serializable snapshot of a native job and its process group.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub struct JobState {
+        /// Stable session-local job identifier.
         pub id: u32,
+        /// Original command source associated with the job.
         pub command: String,
+        /// Aggregate lifecycle state of the job's children.
         pub status: JobStatus,
+        /// Operating-system process-group identifier, when one exists.
         pub process_group: Option<i32>,
+        /// Final shell status after the job reaches [`JobStatus::Done`].
         pub exit_status: Option<i32>,
     }
 
@@ -265,6 +289,7 @@ mod platform {
         }
     }
 
+    /// Unix native process executor with owned foreground and background jobs.
     pub struct NativeExecutor {
         jobs: Vec<Job>,
         next_job_id: u32,
@@ -275,14 +300,20 @@ mod platform {
     pub struct ChildProcessTree;
 
     impl ChildProcessTree {
+        /// Create the Unix containment hook.
         pub fn new() -> Result<Self, ShellError> {
             Ok(Self)
         }
 
+        /// Complete Unix containment setup for `child`.
+        ///
+        /// Unix callers establish the process group while spawning, so this
+        /// cross-platform hook requires no additional post-spawn operation.
         pub fn assign(&self, _child: &mut Child) -> Result<(), ShellError> {
             Ok(())
         }
 
+        /// Terminate a directly spawned child if it is still live.
         pub fn terminate(&self, child: &mut Child) -> Result<(), ShellError> {
             match child.kill() {
                 Ok(()) => Ok(()),
@@ -326,10 +357,12 @@ mod platform {
             self.execute(input)
         }
 
+        /// Execute `input` in the foreground with inherited terminal streams.
         pub fn execute(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, false)
         }
 
+        /// Execute `input` while retaining bounded stdout and stderr.
         pub fn execute_capture(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, true)
         }
@@ -344,11 +377,13 @@ mod platform {
             self.execute_inner_with_request(&request.command, true, Some(context))
         }
 
+        /// Refresh and return snapshots for every job owned by this executor.
         pub fn jobs(&mut self) -> Vec<JobState> {
             self.refresh_jobs();
             self.jobs.iter().map(|job| job.state.clone()).collect()
         }
 
+        /// Terminate job `id`, reap its children, and return the final snapshot.
         pub fn cancel_job(&mut self, id: u32) -> Result<JobState, ShellError> {
             let job = self
                 .jobs
@@ -370,6 +405,7 @@ mod platform {
             Ok(job.state.clone())
         }
 
+        /// Stop every live process in job `id` and return its snapshot.
         pub fn suspend_job(&mut self, id: u32) -> Result<JobState, ShellError> {
             let job = self
                 .jobs
@@ -2997,21 +3033,31 @@ mod platform {
         },
     };
 
+    /// Aggregate lifecycle state for a native job.
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "snake_case")]
     pub enum JobStatus {
+        /// At least one child is executing.
         Running,
+        /// Every live child is stopped.
         Stopped,
+        /// Every child has exited or been reaped.
         Done,
     }
 
+    /// Serializable snapshot of a Windows native job.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
     pub struct JobState {
+        /// Stable session-local job identifier.
         pub id: u32,
+        /// Original command source associated with the job.
         pub command: String,
+        /// Aggregate lifecycle state of the job's children.
         pub status: JobStatus,
+        /// Reserved cross-platform process-group field; always `None` on Windows.
         pub process_group: Option<i32>,
+        /// Final shell status after the job reaches [`JobStatus::Done`].
         pub exit_status: Option<i32>,
     }
 
@@ -3095,6 +3141,7 @@ mod platform {
         }
     }
 
+    /// Windows native process executor with kill-on-close Job Object ownership.
     pub struct NativeExecutor {
         jobs: Vec<Job>,
         next_job_id: u32,
@@ -3104,14 +3151,17 @@ mod platform {
     pub struct ChildProcessTree(JobObject);
 
     impl ChildProcessTree {
+        /// Create an empty kill-on-close Job Object.
         pub fn new() -> Result<Self, ShellError> {
             JobObject::new().map(Self)
         }
 
+        /// Assign `child` to this containment object.
         pub fn assign(&self, child: &mut Child) -> Result<(), ShellError> {
             self.0.assign(child)
         }
 
+        /// Terminate every process assigned to this containment object.
         pub fn terminate(&self, _child: &mut Child) -> Result<(), ShellError> {
             self.0.terminate(130)
         }
@@ -3145,14 +3195,17 @@ mod platform {
             self.execute(input)
         }
 
+        /// Execute `input` in the foreground with inherited terminal streams.
         pub fn execute(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, false)
         }
 
+        /// Execute `input` while retaining bounded stdout and stderr.
         pub fn execute_capture(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, true)
         }
 
+        /// Execute a capture request with explicit cancellation, deadline, and output bounds.
         pub fn execute_capture_request(
             &mut self,
             request: ProcessRequest,
@@ -3161,6 +3214,7 @@ mod platform {
             self.execute_inner_with_request(&request.command, true, Some(context))
         }
 
+        /// Refresh and return snapshots for every job owned by this executor.
         pub fn jobs(&mut self) -> Vec<JobState> {
             for job in &mut self.jobs {
                 if job.state.status == JobStatus::Running {
@@ -3174,6 +3228,7 @@ mod platform {
             self.jobs.iter().map(|job| job.state.clone()).collect()
         }
 
+        /// Terminate job `id`, reap its children, and return the final snapshot.
         pub fn cancel_job(&mut self, id: u32) -> Result<JobState, ShellError> {
             let job = self
                 .jobs
@@ -3189,6 +3244,7 @@ mod platform {
             Ok(job.state.clone())
         }
 
+        /// Report that job suspension is unavailable on Windows.
         pub fn suspend_job(&mut self, id: u32) -> Result<JobState, ShellError> {
             if !self.jobs.iter().any(|job| job.state.id == id) {
                 return Err(missing_job_error(id));
@@ -3882,10 +3938,14 @@ pub fn sandboxed_process_host() -> quirl_core::ProcessHost {
     })
 }
 
+/// Portable event applied to a native job's aggregate lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobLifecycleEvent {
+    /// Stop a running job.
     Stop,
+    /// Resume a stopped job.
     Continue,
+    /// Record process completion with the supplied shell status.
     Exit(i32),
 }
 
@@ -3910,16 +3970,21 @@ pub fn transition_job_state(
 
 /// Stable process backend contract used by the CLI independently of the host platform.
 pub trait ProcessBackend {
+    /// Execute a foreground command with inherited terminal streams.
     fn execute(
         &mut self,
         input: &str,
     ) -> Result<quirl_core::CommandOutcome, quirl_core::ShellError>;
+    /// Execute a command and retain output within [`DEFAULT_CAPTURE_BYTES`].
     fn execute_capture(
         &mut self,
         input: &str,
     ) -> Result<quirl_core::CommandOutcome, quirl_core::ShellError>;
+    /// Refresh and return all jobs owned by the backend.
     fn jobs(&mut self) -> Vec<JobState>;
+    /// Cancel job `id` and return its final state.
     fn cancel_job(&mut self, id: u32) -> Result<JobState, quirl_core::ShellError>;
+    /// Suspend job `id` when supported by the host platform.
     fn suspend_job(&mut self, id: u32) -> Result<JobState, quirl_core::ShellError>;
 }
 

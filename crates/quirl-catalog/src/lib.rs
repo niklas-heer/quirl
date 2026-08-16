@@ -3,13 +3,27 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Schema version emitted by [`Catalog`] serialization and by built-in catalogs.
 pub const CATALOG_SCHEMA_VERSION: u32 = 4;
+/// Oldest catalog schema version that [`Catalog::from_json`] can migrate.
 pub const CATALOG_OLDEST_READABLE_VERSION: u32 = 2;
+/// Wire version for asynchronous completion request and response envelopes.
 pub const COMPLETION_PROTOCOL_VERSION: u32 = 1;
+/// Maximum UTF-8 byte length accepted for one asynchronous completion query.
 pub const MAX_COMPLETION_QUERY_BYTES: usize = 4 * 1024;
+/// Maximum number of completion candidates one request may ask a worker to return.
 pub const MAX_COMPLETION_RESULTS: usize = 1_000;
+/// Maximum completion-worker deadline, in milliseconds.
 pub const MAX_COMPLETION_DEADLINE_MS: u64 = 250;
+/// Canonical structural descriptor whose fingerprint identifies the catalog schema.
+///
+/// This is a protocol description, not a JSON Schema document. Readers use it to
+/// bind caches and agent contracts to the exact field and migration policy.
 pub const CATALOG_SCHEMA_DESCRIPTOR: &str = "quirl.catalog@4{Catalog{deny_unknown;schema_version:4;commands:array<CommandSpec>};CommandSpec{deny_unknown;id:string;version:null|string;path:string;aliases:array<string>;parent:null|string;signature:string;summary:string;details:string;arguments:array<ArgumentSpec>;examples:array<string>;io:IoContract;effects:array<Effect>;exit_codes:map<i32,string>;provenance:ProvenanceInfo};ArgumentSpec{deny_unknown;names:array<string>;kind:positional|option|flag;value_type:string;required:bool;repeatable:bool;values:null|CompletionSource;conflicts:array<string>;documentation:string;examples:array<string>;provenance:ProvenanceInfo};CompletionSource:tag(kind)[static{values:array<string>}|dynamic{provider:string}];IoContract{deny_unknown;input:string;output:string;streaming:bool};Effect:read_filesystem|write_filesystem|spawn_process|change_directory;ProvenanceInfo{deny_unknown;source:builtin|external|lua|plugin|fish|bash|zsh|help|man;confidence:low|medium|high|exact;trust:builtin|trusted|declared|imported|heuristic;origin:null|string;fingerprint:null|string;generated_at:null|string};migration:read-v2-v3-to-v4}";
+/// Canonical structural descriptor for completion items and worker envelopes.
+///
+/// The descriptor includes query, result, and deadline bounds so a fingerprint
+/// change also captures changes to completion resource policy.
 pub const COMPLETION_SCHEMA_DESCRIPTOR: &str = "quirl.completion@1{Completion{deny_unknown;value:string;display:string;summary:string;detail:string;replace_start:usize;replace_end:usize;match_indices:array<usize>};CompletionRequest{deny_unknown;protocol_version:u32;request_id:u64(strictly-increasing);line:utf8<=4096-bytes;cursor:usize(char-boundary);limit:usize<=1000;deadline_ms:1..250};CompletionCancellation{deny_unknown;protocol_version:u32;request_id:u64};CompletionResponse{deny_unknown;protocol_version:u32;request_id:u64;outcome:CompletionOutcome};CompletionOutcome:tag(status);content(data)[ready{items:array<Completion>}|cancelled{}|deadline_exceeded{}];policy:frozen-major-v1;ordering:score-desc-then-display-value;catalog_source:quirl.catalog@4;static_values:CompletionSource.static;dynamic_values:provider-identity-only;worker:newer-request-or-cancellation-never-overwrites-newer-result}";
 
 mod import;
@@ -20,13 +34,23 @@ pub use import::{
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Versioned collection of normalized command contracts.
+///
+/// Built-in, imported, and extension records share this representation so help,
+/// completion, generated documentation, and machine clients consume identical facts.
 pub struct Catalog {
+    /// Version governing the serialized shape and reader migration policy.
     pub schema_version: u32,
+    /// Normalized command contracts retained by this catalog.
     pub commands: Vec<CommandSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Complete semantic contract for one command path.
+///
+/// Exact records must satisfy [`Catalog::quality_issues`]; imported observations
+/// may explicitly retain unknown or incomplete facts at lower confidence.
 pub struct CommandSpec {
     /// Stable semantic identity, independent of display aliases.
     #[serde(default)]
@@ -36,64 +60,107 @@ pub struct CommandSpec {
     pub version: Option<String>,
     /// Space-separated command path, such as `git commit`.
     pub path: String,
+    /// Alternative invocations that resolve to this same semantic command.
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Stable [`CommandSpec::id`] of the containing command, when one is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// Human-readable usage form, including argument and option placeholders.
     pub signature: String,
+    /// Short description suitable for lists, completion rows, and tool manifests.
     pub summary: String,
+    /// Longer behavioral documentation suitable for help and hover views.
     pub details: String,
+    /// Positional arguments, valued options, and flags accepted by the command.
+    ///
+    /// The serialized field is named `arguments`; `options` remains the Rust name
+    /// for compatibility with earlier catalog APIs.
     #[serde(default, rename = "arguments", alias = "options")]
     pub options: Vec<ArgumentSpec>,
+    /// Complete invocation examples that consumers may render verbatim as code.
     pub examples: Vec<String>,
+    /// Typed input, output, and streaming behavior at the command boundary.
     #[serde(default)]
     pub io: IoContract,
+    /// Observable authority or state effects that callers should account for.
     pub effects: Vec<Effect>,
+    /// Process exit statuses mapped to stable human-readable meanings.
     #[serde(default)]
     pub exit_codes: BTreeMap<i32, String>,
+    /// Attribution, trust, and confidence for command-level facts.
     pub provenance: ProvenanceInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Semantic contract for one positional argument, valued option, or flag.
 pub struct ArgumentSpec {
+    /// Accepted spellings, such as `-f` and `--format`, or a positional name.
     pub names: Vec<String>,
+    /// How the parser places or consumes this argument.
     pub kind: ArgumentKind,
+    /// Stable semantic type name for the consumed value, or `Bool` for a flag.
     pub value_type: String,
+    /// Whether a valid invocation must supply this argument.
     pub required: bool,
+    /// Whether the argument may occur more than once in one invocation.
     pub repeatable: bool,
+    /// Optional finite values or identity of a bounded dynamic provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<CompletionSource>,
+    /// Argument names that cannot be supplied together with this argument.
     #[serde(default)]
     pub conflicts: Vec<String>,
+    /// Help and completion prose describing the argument's semantics.
     pub documentation: String,
+    /// Complete command invocations demonstrating this argument.
     #[serde(default)]
     pub examples: Vec<String>,
+    /// Attribution, trust, and confidence for argument-level facts.
     pub provenance: ProvenanceInfo,
 }
 
+/// Compatibility name for [`ArgumentSpec`] retained for callers using the v3 API.
 pub type OptionSpec = ArgumentSpec;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Parser role of an [`ArgumentSpec`].
 pub enum ArgumentKind {
+    /// Value selected by its position rather than by a leading option name.
     Positional,
+    /// Named argument that consumes a value.
     Option,
+    /// Named boolean switch that consumes no separate value.
     Flag,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+/// Source from which completion values for an argument may be obtained.
 pub enum CompletionSource {
-    Static { values: Vec<String> },
-    Dynamic { provider: String },
+    /// Finite values embedded in the catalog and safe to return without execution.
+    Static {
+        /// Finite candidate values returned without invoking a provider.
+        values: Vec<String>,
+    },
+    /// External provider identified for a bounded completion worker to invoke.
+    Dynamic {
+        /// Stable provider identity; this field is not executable source code.
+        provider: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Typed data contract at a command's standard-input and standard-output boundary.
 pub struct IoContract {
+    /// Type accepted from the preceding pipeline stage, or `Nothing` when absent.
     pub input: String,
+    /// Type produced for the following pipeline stage.
     pub output: String,
+    /// Whether output values can be consumed incrementally rather than after collection.
     pub streaming: bool,
 }
 
@@ -109,43 +176,71 @@ impl Default for IoContract {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Observable resource or process effect declared by a command.
 pub enum Effect {
+    /// Reads filesystem data without intentionally changing it.
     ReadFilesystem,
+    /// Creates, replaces, removes, or otherwise changes filesystem data.
     WriteFilesystem,
+    /// Starts or delegates work to an operating-system process.
     SpawnProcess,
+    /// Changes the working directory used by subsequent commands.
     ChangeDirectory,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+/// Kind of source from which a catalog fact was obtained.
 pub enum Provenance {
+    /// Command contract compiled into Quirl itself.
     Builtin,
+    /// External executable observed through non-native metadata.
     External,
+    /// Contract declared at Quirl's validated Lua boundary.
     Lua,
+    /// Contract contributed by a validated Quirl plugin.
     Plugin,
+    /// Declarative Fish completion definition.
     Fish,
+    /// Declarative Bash completion definition.
     Bash,
+    /// Declarative Zsh completion definition.
     Zsh,
+    /// Supplied command-help text parsed heuristically.
     Help,
+    /// Supplied rendered or simple roff manual text parsed heuristically.
     Man,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
+/// Strength of evidence supporting a catalog fact.
+///
+/// Variant order is meaningful: merge resolution prefers greater confidence.
 pub enum Confidence {
+    /// Weak observation that may be incomplete or ambiguous.
     Low,
+    /// Useful heuristic observation without a declarative contract.
     Medium,
+    /// Declarative fact that is reliable but not owned by Quirl's exact schema.
     High,
+    /// Fact validated against an authoritative, versioned Quirl contract.
     Exact,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// Trust relationship between Quirl and the producer of a catalog fact.
 pub enum Trust {
+    /// Fact is compiled into the Quirl binary.
     Builtin,
+    /// Fact crossed a validated trusted-language or plugin boundary.
     Trusted,
+    /// Fact came from a declarative external completion format.
     Declared,
+    /// Fact was imported from an external observation.
     Imported,
+    /// Fact was inferred from prose or another ambiguous representation.
     Heuristic,
 }
 
@@ -160,19 +255,31 @@ impl Default for Trust {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceInfo {
+    /// Format or runtime boundary that produced the fact.
     pub source: Provenance,
+    /// Strength of evidence used when resolving merges and quality requirements.
     pub confidence: Confidence,
+    /// Authority relationship with the producer, independent of evidence strength.
     #[serde(default)]
     pub trust: Trust,
+    /// Human-readable source path or identity, when the fact was imported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Stable content identity of the source used for cache invalidation and explanation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// Deterministic source timestamp, when one is supplied by the producer.
+    ///
+    /// Importers omit ambient wall-clock time so unchanged catalogs remain byte-stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_at: Option<String>,
 }
 
 impl ProvenanceInfo {
+    /// Construct attribution for a command known directly by the running composition.
+    ///
+    /// Built-in, Lua, and plugin sources become exact facts; external formats receive
+    /// confidence and trust appropriate to their declaration or inference mechanism.
     pub fn builtin(source: Provenance) -> Self {
         let confidence = match source {
             Provenance::Builtin | Provenance::Lua | Provenance::Plugin => Confidence::Exact,
@@ -196,6 +303,10 @@ impl ProvenanceInfo {
         }
     }
 
+    /// Construct attribution for content imported from an identified source.
+    ///
+    /// `origin` should identify the file or logical provider, while `fingerprint`
+    /// should change whenever the imported bytes that support the fact change.
     pub fn imported(
         source: Provenance,
         confidence: Confidence,
@@ -219,28 +330,43 @@ impl ProvenanceInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Provenance-expanded view of all retained facts for one command.
 pub struct CatalogExplanation {
+    /// Canonical command path whose facts are explained.
     pub command: String,
+    /// Command- and argument-level facts in deterministic presentation order.
     pub facts: Vec<FactExplanation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// One rendered catalog fact paired with its source attribution.
 pub struct FactExplanation {
+    /// Stable category name such as `signature` or `argument_documentation`.
     pub fact: String,
+    /// Human-readable value retained for this fact.
     pub value: String,
+    /// Source, confidence, trust, and optional import identity for the value.
     pub provenance: ProvenanceInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// One deterministic completion candidate and its replacement span.
 pub struct Completion {
+    /// Exact text to insert into the input buffer.
     pub value: String,
+    /// Human-readable candidate label, which may include a usage placeholder.
     pub display: String,
+    /// Short documentation shown alongside the candidate.
     pub summary: String,
+    /// Longer signature, type, provenance, or behavioral context.
     pub detail: String,
+    /// Inclusive UTF-8 byte offset at which replacement begins.
     pub replace_start: usize,
+    /// Exclusive UTF-8 byte offset at which replacement ends.
     pub replace_end: usize,
+    /// Character indices in [`Completion::value`] that contributed to the fuzzy match.
     pub match_indices: Vec<usize>,
 }
 
@@ -249,34 +375,55 @@ pub struct Completion {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CompletionRequest {
+    /// Completion wire version; must equal [`COMPLETION_PROTOCOL_VERSION`].
     pub protocol_version: u32,
+    /// Strictly increasing client identifier used to suppress stale worker results.
     pub request_id: u64,
+    /// Complete UTF-8 input buffer, bounded by [`MAX_COMPLETION_QUERY_BYTES`].
     pub line: String,
+    /// UTF-8 byte offset of the cursor; callers must supply a character boundary.
     pub cursor: usize,
+    /// Maximum requested candidates, no greater than [`MAX_COMPLETION_RESULTS`].
     pub limit: usize,
+    /// Requested wall deadline in milliseconds, from 1 through
+    /// [`MAX_COMPLETION_DEADLINE_MS`].
     pub deadline_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Request to stop outstanding completion work for one request identifier.
 pub struct CompletionCancellation {
+    /// Completion wire version; must equal [`COMPLETION_PROTOCOL_VERSION`].
     pub protocol_version: u32,
+    /// Identifier of the request whose result must no longer be published.
     pub request_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "status", content = "data")]
+/// Terminal state of one bounded asynchronous completion request.
 pub enum CompletionOutcome {
-    Ready { items: Vec<Completion> },
+    /// Completion finished within its cancellation and deadline constraints.
+    Ready {
+        /// Deterministically ranked candidates, capped by the request limit.
+        items: Vec<Completion>,
+    },
+    /// Client cancellation became observable before a result was committed.
     Cancelled,
+    /// The configured wall deadline elapsed before completion finished.
     DeadlineExceeded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// Versioned response envelope correlated with one [`CompletionRequest`].
 pub struct CompletionResponse {
+    /// Completion wire version; must equal [`COMPLETION_PROTOCOL_VERSION`].
     pub protocol_version: u32,
+    /// Request identifier copied unchanged from the corresponding request.
     pub request_id: u64,
+    /// Result state produced by the completion worker.
     pub outcome: CompletionOutcome,
 }
 
@@ -367,6 +514,11 @@ impl Catalog {
         ))
     }
 
+    /// Build the deterministic catalog compiled into this Quirl version.
+    ///
+    /// Exact built-in records include version, typed I/O, examples, effects, and
+    /// exit-code metadata. Callers may subsequently merge imported or plugin facts
+    /// without allowing lower-confidence observations to replace exact contracts.
     pub fn builtin() -> Self {
         let mut catalog = Self {
             schema_version: CATALOG_SCHEMA_VERSION,
@@ -1379,6 +1531,10 @@ impl Catalog {
         choices.into_iter().map(|(_, item)| item).collect()
     }
 
+    /// Resolve a trimmed command path or alias, falling back to the first path prefix.
+    ///
+    /// Exact path and alias matches take precedence. The prefix fallback preserves
+    /// catalog order and is intended for interactive help, not stable identity lookup.
     pub fn find(&self, topic: &str) -> Option<&CommandSpec> {
         let topic = topic.trim();
         self.commands
@@ -1442,6 +1598,10 @@ impl Catalog {
             .sort_by(|left, right| left.path.cmp(&right.path));
     }
 
+    /// Merge all commands from an import report and return its diagnostics unchanged.
+    ///
+    /// Command facts follow [`Catalog::merge`] confidence rules; diagnostics remain
+    /// available to the caller even when useful partial metadata was retained.
     pub fn merge_report(&mut self, report: ImportReport) -> Vec<ImportDiagnostic> {
         self.merge(report.commands);
         report.diagnostics
@@ -1664,6 +1824,10 @@ impl Catalog {
         })
     }
 
+    /// Render command summaries, details, and argument documentation as Markdown.
+    ///
+    /// Commands retain catalog order. The returned text is not terminal-sanitized;
+    /// terminal consumers must escape imported content at their output boundary.
     pub fn to_markdown(&self) -> String {
         let mut output = String::from("# Quirl command catalog\n\n");
         for command in &self.commands {
