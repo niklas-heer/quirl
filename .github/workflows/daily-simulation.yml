@@ -1,0 +1,116 @@
+name: Daily shell simulation
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Reproducible unsigned 64-bit simulation seed
+        required: false
+        type: string
+      sessions:
+        description: Number of generated sessions
+        required: false
+        default: "2048"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-shell-simulation
+  cancel-in-progress: false
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: write
+    env:
+      SIMULATION_SEED: ${{ inputs.seed || github.run_id }}
+      SIMULATION_SESSIONS: ${{ inputs.sessions || '2048' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal
+
+      - name: Install both reference shells
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes zsh
+          bash --version | head -n 1
+          zsh --version
+
+      - name: Run the replayable session swarm
+        id: simulation
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          cargo xtask simulate \
+            --seed "$SIMULATION_SEED" \
+            --sessions "$SIMULATION_SESSIONS" \
+            --steps 12 \
+            --output target/simulations 2>&1 | tee simulation.log
+          simulation_status="${PIPESTATUS[0]}"
+          set -e
+
+          run_directory="target/simulations/seed-${SIMULATION_SEED}"
+          echo "run_directory=$run_directory" >> "$GITHUB_OUTPUT"
+          if test -f "$run_directory/summary.json" && \
+            jq -e '.result == "mismatch" and .mismatch_count > 0' \
+              "$run_directory/summary.json" >/dev/null
+          then
+            echo "mismatch=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "mismatch=false" >> "$GITHUB_OUTPUT"
+          exit "$simulation_status"
+
+      - name: Upload the complete simulation trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-simulation-${{ env.SIMULATION_SEED }}
+          path: |
+            target/simulations
+            simulation.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Open one replayable compatibility issue
+        if: steps.simulation.outputs.mismatch == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_DIRECTORY: ${{ steps.simulation.outputs.run_directory }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="[simulation] Compatibility mismatch (seed ${SIMULATION_SEED})"
+          existing="$(gh issue list --state open --search "${title} in:title" --json number --jq 'length')"
+          if test "$existing" -eq 0
+          then
+            body="$(<"${RUN_DIRECTORY}/issue.md")"
+            body+=$'\nWorkflow run and downloadable trace: '
+            body+="$RUN_URL"
+            gh issue create --title "$title" --body "$body"
+          fi
+
+      - name: Fail after preserving and reporting a mismatch
+        if: steps.simulation.outputs.mismatch == 'true'
+        shell: bash
+        run: exit 1

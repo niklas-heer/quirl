@@ -225,8 +225,9 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
 ## Process
 
 - `cargo xtask check` is the canonical local quality gate and must pass before every
-  commit. Do not add CI workflows; local Cargo tasks deliberately replace CI
-  while project traffic is low.
+  commit. The only CI workflow is the bounded daily Bash/Zsh simulation swarm;
+  other local Cargo tasks deliberately remain local while project traffic is
+  low.
 - Conventional commits (`feat`, `fix`, `docs`, `refactor`, `chore`, `bench`),
   present tense, optionally scoped, e.g. `feat(lua): add completion budgets`.
 - Significant design choices go through an ADR in `docs/decisions/`.
@@ -235,6 +236,23 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
   dependency graph. `docs/language-design.md` is the product specification;
   its §13 delivery sequence and acceptance gates define what each phase
   must prove.
+
+### `xtask` command conventions
+
+- Use the stable workspace `xshell` dependency, `Shell`, and `cmd!` for linear
+  development-task orchestration. Set the workspace directory once on the
+  `Shell`, interpolate arguments instead of formatting a command string, and
+  let `xshell` reject nonzero statuses.
+- Keep `std::process::Command` for subprocess boundaries that require exact
+  byte capture, custom stdin/stdout ownership, polling, deadlines,
+  process-group containment, cancellation, or deliberate nonzero-status
+  inspection. The compatibility simulator is the reference for this case.
+- Do not invoke a platform shell merely to join commands or expand arguments.
+  Express sequencing in Rust and pass every dynamic argument through `cmd!`
+  interpolation so it cannot become shell syntax.
+- Keep filesystem transactions in Rust. `xshell` improves command
+  orchestration; it does not replace atomic writes, explicit bounds, RAII
+  cleanup, or structured error context.
 - Quirl is a prototype moving fast: prefer extending the existing patterns
   (`ShellError`, `HOST_API`, `Catalog::builtin`, `LuaPolicy`) over inventing
   parallel mechanisms. Breaking changes are fine; drift is not.
