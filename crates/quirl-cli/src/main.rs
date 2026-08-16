@@ -765,7 +765,11 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
         let signal = line_editor.read_line(&prompt);
         first_prompt = false;
         if prompt_context.is_none() {
-            prompt_context = Some(PromptContextScheduler::default());
+            let scheduler = PromptContextScheduler::default();
+            // Start the bounded refresh after the first input so command execution can
+            // overlap it and the second prompt can consume the completed snapshot.
+            let _ = scheduler.sample_current_dir();
+            prompt_context = Some(scheduler);
         }
         match signal {
             Ok(InteractiveSignal::Success(buffer)) => {
