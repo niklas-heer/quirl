@@ -14,6 +14,7 @@ workspace = true
 quirl-core = { path = "../quirl-core" }
 quirl-syntax = { path = "../quirl-syntax" }
 serde.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true

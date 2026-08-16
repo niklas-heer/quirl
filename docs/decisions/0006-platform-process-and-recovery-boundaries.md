@@ -47,8 +47,9 @@ without containment. Removing the race would require a larger native
 
 `quirl run` invokes `bash --noprofile --norc` or `zsh -f` for explicitly
 selected reference scripts. It removes environment hooks that can source
-startup files, inherits the current directory, environment, and standard
-input, forwards arguments, captures both output streams concurrently, reports
+startup files, inherits the current directory and environment, closes standard
+input under an explicit noninteractive policy, forwards arguments, captures
+both output streams concurrently, reports
 the exact status, and maps interpreter syntax failures and missing executables
 to labeled `ShellError` values. SIGINT becomes the runner's cancellation token
 for the duration of a reference script. Each output stream is continuously

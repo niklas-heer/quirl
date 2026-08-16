@@ -956,13 +956,6 @@ fn terminate_adapter(
     child: &mut std::process::Child,
     containment: &ChildProcessTree,
 ) -> Result<(), ShellError> {
-    #[cfg(unix)]
-    if let Ok(group) = i32::try_from(child.id()) {
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(group),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
     let result = containment.terminate(child);
     if result.is_err() {
         let _ = child.kill();

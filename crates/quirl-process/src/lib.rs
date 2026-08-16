@@ -1,7 +1,11 @@
 //! Native command graph execution and background-job lifecycle.
 
+mod builtin;
+
 /// Version of the serialized native runner contract.
-pub const RUNNER_PROTOCOL_VERSION: u32 = 1;
+pub const RUNNER_PROTOCOL_VERSION: u32 = 2;
+/// Historical runner version retained as fail-closed compatibility evidence.
+pub const RUNNER_PROTOCOL_VERSION_V1: u32 = 1;
 /// Default bytes retained for final stdout and, separately, aggregate stderr
 /// when a caller does not provide a tighter sandboxed-process budget.
 pub const DEFAULT_CAPTURE_BYTES: usize = 1024 * 1024;
@@ -17,12 +21,61 @@ pub const HERE_STRING_BYTES_MAX: usize = 256 * 1024;
 pub const ARITHMETIC_SOURCE_BYTES_MAX: usize = 16 * 1024;
 /// Maximum nested unary/parenthesized arithmetic expressions.
 pub const ARITHMETIC_DEPTH_MAX: usize = 64;
+/// Maximum active and completed job records retained by one executor.
+pub const RETAINED_JOBS_MAX: usize = 1024;
+/// Historical runner-v1 descriptor retained verbatim for compatibility review.
+pub const RUNNER_SCHEMA_DESCRIPTOR_V1: &str = "quirl.runner@1{input:quirl.command-grammar@1,native-source-bytes<=1048576,native-pipelines<=256,native-stages-per-pipeline<=64,here-string-bytes-including-newline<=262144,arithmetic-source-bytes<=16384,arithmetic-depth<=64;ProcessBackend{execute_capture(source)->CommandOutcome;execute_interactive(source)->CommandOutcome;jobs()->array<JobState>;foreground_job(id)->JobState;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};capture:default-retained-per-stream=1048576|caller-tighter,drain-excess-then-ResourceLimit-with-retained-and-discarded-byte-context;interactive:inherit-streams-without-retention-limit;byte-pipeline:ordered;redirection:input|output|append|here-string;background:terminal-ampersand;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows}";
 /// Canonical descriptor hashed to identify the native runner contract.
-pub const RUNNER_SCHEMA_DESCRIPTOR: &str = "quirl.runner@1{input:quirl.command-grammar@1,native-source-bytes<=1048576,native-pipelines<=256,native-stages-per-pipeline<=64,here-string-bytes-including-newline<=262144,arithmetic-source-bytes<=16384,arithmetic-depth<=64;ProcessBackend{execute_capture(source)->CommandOutcome;execute_interactive(source)->CommandOutcome;jobs()->array<JobState>;foreground_job(id)->JobState;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};capture:default-retained-per-stream=1048576|caller-tighter,drain-excess-then-ResourceLimit-with-retained-and-discarded-byte-context;interactive:inherit-streams-without-retention-limit;byte-pipeline:ordered;redirection:input|output|append|here-string;background:terminal-ampersand;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows}";
+pub const RUNNER_SCHEMA_DESCRIPTOR: &str = "quirl.runner@2{input:quirl.command-grammar@2,native-source-bytes<=1048576,native-pipelines<=256,native-stages-per-pipeline<=64,retained-jobs<=1024,job-id:u32-nonzero-wrap-skip-visible,here-string-bytes-including-newline<=262144,arithmetic-source-bytes<=16384,arithmetic-depth<=64;ProcessBackend{execute(source)->CommandOutcome;execute_capture(source)->CommandOutcome;jobs()->array<JobState>;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32-nonzero;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};capture:default-retained-per-stream=1048576|caller-tighter,drain-excess-then-ResourceLimit-with-retained-and-discarded-byte-context;interactive:inherit-streams-without-retention-limit;byte-pipeline:ordered;redirection:input-source-order-last-wins|output|append|here-string;background:terminal-ampersand;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows;compatibility:frozen-major-v1-fails-closed}";
+
+/// Historical encoded runner-v1 job fixture retained for compatibility evidence.
+pub const RUNNER_JOB_STATE_FIXTURE_V1: &str =
+    r#"{"id":1,"command":"sleep 1 &","status":"running","process_group":123,"exit_status":null}"#;
+/// Current encoded runner-v2 job fixture used to verify the authoritative shape.
+pub const RUNNER_JOB_STATE_FIXTURE: &str =
+    r#"{"id":1,"command":"sleep 1 &","status":"running","process_group":123,"exit_status":null}"#;
 
 /// Return the deterministic fingerprint of [`RUNNER_SCHEMA_DESCRIPTOR`].
 pub fn runner_schema_hash() -> String {
     quirl_core::schema_fingerprint(RUNNER_SCHEMA_DESCRIPTOR)
+}
+
+/// Validate a runner protocol identity at an authoritative reader boundary.
+///
+/// Runner v1 cannot be migrated because its descriptor names a stale grammar
+/// and methods that never matched the public backend trait. It therefore fails
+/// closed with an actionable version error, as do unknown future versions.
+pub fn validate_runner_protocol_version(version: u32) -> Result<(), quirl_core::ShellError> {
+    if version == RUNNER_PROTOCOL_VERSION {
+        return Ok(());
+    }
+    let relation = if version < RUNNER_PROTOCOL_VERSION {
+        "expired"
+    } else {
+        "future"
+    };
+    Err(quirl_core::ShellError::new(
+        quirl_core::ErrorCode::Validation,
+        format!("{relation} runner protocol version {version}"),
+    )
+    .with_context(format!(
+        "supported runner protocol version: {RUNNER_PROTOCOL_VERSION}"
+    ))
+    .with_help("Use a client and Quirl build that both implement runner protocol v2"))
+}
+
+fn allocate_job_id(next_job_id: &mut u32, visible_ids: &[u32]) -> u32 {
+    let mut candidate = (*next_job_id).max(1);
+    for _ in 0..=visible_ids.len() {
+        if !visible_ids.contains(&candidate) {
+            *next_job_id = candidate.checked_add(1).unwrap_or(1);
+            return candidate;
+        }
+        candidate = candidate.checked_add(1).unwrap_or(1);
+    }
+    // The retained table is much smaller than the nonzero u32 ID space, so a
+    // free candidate must exist after at most visible_ids.len() + 1 probes.
+    unreachable!("bounded job id search exhausted the nonzero u32 space")
 }
 
 fn validate_native_source(input: &str) -> Result<(), quirl_core::ShellError> {
@@ -64,6 +117,19 @@ fn validate_native_plan(graph: &quirl_syntax::CommandList) -> Result<(), quirl_c
                 pipeline.commands.len()
             ))
             .with_help("Split the pipeline or use intermediate files"));
+        }
+        for command in &pipeline.commands {
+            if command
+                .redirects
+                .iter()
+                .any(|redirect| redirect.kind == quirl_syntax::RedirectKind::DuplicateInput)
+            {
+                return Err(quirl_core::ShellError::new(
+                    quirl_core::ErrorCode::InvalidCommand,
+                    "native C1 does not support input-descriptor duplication",
+                )
+                .with_help("Use an input file, a here-string, or an explicit Bash/Zsh island"));
+            }
         }
     }
     Ok(())
@@ -128,8 +194,9 @@ mod simulation_support {
 #[cfg(unix)]
 mod platform {
     use super::{
-        validate_native_plan, validate_native_source, ARITHMETIC_DEPTH_MAX,
-        ARITHMETIC_SOURCE_BYTES_MAX, DEFAULT_CAPTURE_BYTES, HERE_STRING_BYTES_MAX,
+        allocate_job_id, builtin, validate_native_plan, validate_native_source,
+        ARITHMETIC_DEPTH_MAX, ARITHMETIC_SOURCE_BYTES_MAX, DEFAULT_CAPTURE_BYTES,
+        HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
     };
 
     use nix::{
@@ -139,10 +206,10 @@ mod platform {
             termios::{tcgetattr, tcsetattr, SetArg, Termios},
             wait::{waitpid, WaitPidFlag, WaitStatus},
         },
-        unistd::{tcgetpgrp, tcsetpgrp, Pid},
+        unistd::{getpgid, setpgid, tcgetpgrp, tcsetpgrp, Pid},
     };
     use os_pipe::{pipe, PipeReader, PipeWriter};
-    use quirl_core::{CommandOutcome, CommandRunner, ErrorCode, ProcessRequest, ShellError};
+    use quirl_core::{CommandOutcome, ErrorCode, ProcessRequest, ShellError};
     use quirl_syntax::{
         parse_command_list, ListConnector, Pipeline, Quoting, RedirectKind, SimpleCommand, Word,
     };
@@ -195,6 +262,7 @@ mod platform {
     struct Job {
         state: JobState,
         children: Vec<JobChild>,
+        terminal_modes: Option<Termios>,
         capture: bool,
         stdout_reader: Option<ReaderTask>,
         stderr_readers: Vec<ReaderTask>,
@@ -297,33 +365,74 @@ mod platform {
     }
 
     /// Cross-platform containment hook for a directly spawned child process.
-    pub struct ChildProcessTree;
+    pub struct ChildProcessTree {
+        process_group: Mutex<Option<i32>>,
+    }
 
     impl ChildProcessTree {
         /// Create the Unix containment hook.
         pub fn new() -> Result<Self, ShellError> {
-            Ok(Self)
+            Ok(Self {
+                process_group: Mutex::new(None),
+            })
         }
 
         /// Complete Unix containment setup for `child`.
         ///
         /// Unix callers establish the process group while spawning, so this
         /// cross-platform hook requires no additional post-spawn operation.
-        pub fn assign(&self, _child: &mut Child) -> Result<(), ShellError> {
+        pub fn assign(&self, child: &mut Child) -> Result<(), ShellError> {
+            let process_id = i32::try_from(child.id()).map_err(|error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "child process id is outside the platform range",
+                )
+                .with_context(error.to_string())
+                .with_help("Report this platform-specific process error")
+            })?;
+            verify_process_group(child, process_id, process_id)?;
+            let mut group = self.process_group.lock().map_err(|_| {
+                ShellError::new(ErrorCode::Io, "process containment state is unavailable")
+                    .with_help("Restart Quirl before launching another contained process")
+            })?;
+            if group.replace(process_id).is_some() {
+                return Err(ShellError::new(
+                    ErrorCode::InvalidArgument,
+                    "process containment object already owns a child",
+                )
+                .with_help("Create one containment object for each direct child tree"));
+            }
             Ok(())
         }
 
         /// Terminate a directly spawned child if it is still live.
         pub fn terminate(&self, child: &mut Child) -> Result<(), ShellError> {
-            match child.kill() {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == ErrorKind::InvalidInput => Ok(()),
-                Err(error) => Err(ShellError::new(
+            let group = self.process_group.lock().ok().and_then(|group| *group);
+            let group_result = group.map(|group| killpg(Pid::from_raw(group), Signal::SIGKILL));
+            let child_result = child.kill();
+            let group_ok = matches!(group_result, None | Some(Ok(())) | Some(Err(Errno::ESRCH)));
+            let child_ok = match &child_result {
+                Ok(()) => true,
+                Err(error) => error.kind() == ErrorKind::InvalidInput,
+            };
+            if group_ok && child_ok {
+                Ok(())
+            } else {
+                let context = group_result.and_then(Result::err).map_or_else(
+                    || {
+                        child_result.err().map_or_else(
+                            || "unknown termination failure".to_owned(),
+                            |error| error.to_string(),
+                        )
+                    },
+                    |error| error.to_string(),
+                );
+                Err(ShellError::new(
                     ErrorCode::ProcessSpawn,
-                    "could not terminate contained child process",
+                    "could not terminate contained child process tree",
                 )
-                .with_context(error.to_string())
-                .with_help("Retry the command; report repeated process termination failures")),
+                .with_context(context)
+                .with_help("Retry the command; report repeated process termination failures"))
             }
         }
     }
@@ -381,6 +490,32 @@ mod platform {
         pub fn jobs(&mut self) -> Vec<JobState> {
             self.refresh_jobs();
             self.jobs.iter().map(|job| job.state.clone()).collect()
+        }
+
+        fn reserve_job_id(&mut self) -> Result<u32, ShellError> {
+            self.refresh_jobs();
+            self.reserve_refreshed_job_id()
+        }
+
+        fn reserve_refreshed_job_id(&mut self) -> Result<u32, ShellError> {
+            if self.jobs.len() >= RETAINED_JOBS_MAX {
+                self.jobs.retain(|job| job.state.status != JobStatus::Done);
+            }
+            if self.jobs.len() >= RETAINED_JOBS_MAX {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "native job table reached its retention limit",
+                )
+                .with_context(format!(
+                    "limit {RETAINED_JOBS_MAX} jobs; observed {} live jobs",
+                    self.jobs.len()
+                ))
+                .with_help(
+                    "Finish or cancel an active job before starting another background job",
+                ));
+            }
+            let visible_ids = self.jobs.iter().map(|job| job.state.id).collect::<Vec<_>>();
+            Ok(allocate_job_id(&mut self.next_job_id, &visible_ids))
         }
 
         /// Terminate job `id`, reap its children, and return the final snapshot.
@@ -745,14 +880,8 @@ mod platform {
             }
             validate_control_redirects(command)?;
             let result = match name {
-                "cd" => Some(
-                    CommandRunner::default()
-                        .execute_capture(&join_command_words(&command.words))?,
-                ),
-                "ls" => Some(
-                    CommandRunner::default()
-                        .execute_capture(&join_command_words(&command.words))?,
-                ),
+                "cd" => Some(builtin::execute_cd(&command.words)?),
+                "ls" => Some(builtin::execute_ls(&command.words)?),
                 "export" => {
                     if command.words.len() == 1 {
                         return Err(ShellError::new(
@@ -873,8 +1002,7 @@ mod platform {
                 }
 
                 if command.words.first().is_some_and(|word| word == "ls") {
-                    let result = CommandRunner::default()
-                        .execute_capture(&join_command_words(&command.words))?;
+                    let result = builtin::execute_ls(&command.words)?;
                     let bytes = result.stdout.unwrap_or_default().into_bytes();
                     if command.redirects.iter().any(|redirect| {
                         matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
@@ -944,6 +1072,14 @@ mod platform {
                 }
             }
 
+            // Reserve background retention before writer threads start. A
+            // full job table therefore unwinds only transaction-owned children
+            // and descriptors, without detaching a writer task.
+            let background_job_id = if pipeline.background {
+                Some(self.reserve_job_id()?)
+            } else {
+                None
+            };
             // Start writers only after every child exists. A pending writer is
             // owned by this construction transaction until then, so any spawn
             // failure closes the descriptor without leaving a detached task.
@@ -953,8 +1089,9 @@ mod platform {
                 .collect::<Vec<_>>();
 
             if pipeline.background {
-                let id = self.next_job_id;
-                self.next_job_id = self.next_job_id.saturating_add(1);
+                let Some(id) = background_job_id else {
+                    unreachable!("background pipeline reserved no job id");
+                };
                 let process_group = spawned.process_group;
                 self.jobs.push(Job {
                     state: JobState {
@@ -965,6 +1102,7 @@ mod platform {
                         exit_status: None,
                     },
                     children: spawned.release(),
+                    terminal_modes: None,
                     capture: false,
                     stdout_reader: None,
                     stderr_readers: Vec::new(),
@@ -992,17 +1130,33 @@ mod platform {
                 let _ = join_writers(writers);
                 return Err(error);
             }
+            let stopped = children
+                .iter()
+                .any(|child| child.status == JobStatus::Stopped);
+            if !stopped {
+                terminate_group_descendants(process_group)?;
+            }
+            let stopped_terminal_modes = if stopped {
+                terminal.current_modes()?
+            } else {
+                None
+            };
             terminal.restore()?;
             let status = children
                 .get(child_count.saturating_sub(1))
                 .and_then(|child| child.exit_status)
                 .unwrap_or(0);
-            if children
-                .iter()
-                .any(|child| child.status == JobStatus::Stopped)
-            {
-                let id = self.next_job_id;
-                self.next_job_id = self.next_job_id.saturating_add(1);
+            if stopped {
+                let id = match self.reserve_job_id() {
+                    Ok(id) => id,
+                    Err(error) => {
+                        terminate_children(&mut children, process_group);
+                        let _ = join_reader(stdout_reader, "pipeline output");
+                        let _ = join_readers(stderr_readers, "command error output");
+                        let _ = join_writers(writers);
+                        return Err(error);
+                    }
+                };
                 self.jobs.push(Job {
                     state: JobState {
                         id,
@@ -1012,6 +1166,7 @@ mod platform {
                         exit_status: None,
                     },
                     children,
+                    terminal_modes: stopped_terminal_modes,
                     capture: capture_streams,
                     stdout_reader,
                     stderr_readers,
@@ -1066,6 +1221,7 @@ mod platform {
             let terminal_lease = ForegroundTerminalLease::acquire(None)?;
             let mut terminal =
                 ForegroundTerminal::give_to(self.jobs[index].state.process_group, terminal_lease)?;
+            terminal.apply_modes(self.jobs[index].terminal_modes.as_ref())?;
             resume_job(&self.jobs[index])?;
             let mut job = self.jobs.remove(index);
             for child in &mut job.children {
@@ -1079,9 +1235,10 @@ mod platform {
                 wait_for_foreground_children(&mut job.children, job.state.process_group, None)
             {
                 terminate_children(&mut job.children, job.state.process_group);
+                let _ = terminal.restore();
+                finish_job_tasks_silently(&mut job);
                 return Err(error);
             }
-            terminal.restore()?;
             let status = job
                 .children
                 .last()
@@ -1092,10 +1249,14 @@ mod platform {
                 .iter()
                 .any(|child| child.status == JobStatus::Stopped)
             {
+                job.terminal_modes = terminal.current_modes()?;
+                terminal.restore()?;
                 job.state.status = JobStatus::Stopped;
                 self.jobs.push(job);
                 return Ok(outcome(status, None, None));
             }
+            terminate_group_descendants(job.state.process_group)?;
+            terminal.restore()?;
             job.state.status = JobStatus::Done;
             job.state.exit_status = Some(status);
             let stdout = join_reader(job.stdout_reader.take(), "pipeline output");
@@ -1517,8 +1678,12 @@ mod platform {
         previous: Option<PipeReader>,
         has_upstream: bool,
     ) -> Result<PreparedInput, ShellError> {
-        let mut redirected = None;
-        let mut here_string = None;
+        enum InputSource {
+            File(File),
+            HereString(String),
+        }
+
+        let mut selected = None;
         for redirect in command.redirects.iter().filter(|redirect| {
             matches!(
                 redirect.kind,
@@ -1526,62 +1691,63 @@ mod platform {
             )
         }) {
             if redirect.kind == RedirectKind::HereString {
-                here_string = Some(redirect.path.clone());
+                selected = Some(InputSource::HereString(redirect.path.clone()));
             } else {
-                redirected = Some(File::open(&redirect.path).map_err(|error| {
+                let file = File::open(&redirect.path).map_err(|error| {
                     ShellError::new(
                         ErrorCode::Io,
                         format!("cannot read redirected input {}", redirect.path),
                     )
                     .with_context(error.to_string())
                     .with_help("Check that the file exists and is readable")
-                })?);
+                })?;
+                selected = Some(InputSource::File(file));
             }
         }
-        if let Some(value) = here_string {
-            let observed_bytes = value.len().saturating_add(1);
-            if observed_bytes > HERE_STRING_BYTES_MAX {
-                return Err(ShellError::new(
-                    ErrorCode::ResourceLimit,
-                    "here-string input exceeds its byte limit",
-                )
-                .with_context(format!(
-                    "limit {HERE_STRING_BYTES_MAX} bytes; observed {observed_bytes} bytes including the trailing newline"
-                ))
-                .with_help("Use an input file or pipeline for larger input"));
+        match selected {
+            Some(InputSource::HereString(value)) => {
+                let observed_bytes = value.len().saturating_add(1);
+                if observed_bytes > HERE_STRING_BYTES_MAX {
+                    return Err(ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "here-string input exceeds its byte limit",
+                    )
+                    .with_context(format!(
+                        "limit {HERE_STRING_BYTES_MAX} bytes; observed {observed_bytes} bytes including the trailing newline"
+                    ))
+                    .with_help("Use an input file or pipeline for larger input"));
+                }
+                let mut bytes = Vec::with_capacity(observed_bytes);
+                bytes.extend_from_slice(value.as_bytes());
+                bytes.push(b'\n');
+                let (reader, writer) = pipe().map_err(|error| {
+                    ShellError::new(ErrorCode::Io, "could not create here-string input")
+                        .with_context(error.to_string())
+                        .with_help("Retry the command or use an input file")
+                })?;
+                Ok(PreparedInput {
+                    stdio: Stdio::from(reader),
+                    writer: Some((writer, bytes)),
+                })
             }
-            let mut bytes = Vec::with_capacity(observed_bytes);
-            bytes.extend_from_slice(value.as_bytes());
-            bytes.push(b'\n');
-            let (reader, writer) = pipe().map_err(|error| {
-                ShellError::new(ErrorCode::Io, "could not create here-string input")
-                    .with_context(error.to_string())
-                    .with_help("Retry the command or use an input file")
-            })?;
-            return Ok(PreparedInput {
-                stdio: Stdio::from(reader),
-                writer: Some((writer, bytes)),
-            });
-        }
-        if let Some(file) = redirected {
-            return Ok(PreparedInput {
+            Some(InputSource::File(file)) => Ok(PreparedInput {
                 stdio: Stdio::from(file),
                 writer: None,
-            });
+            }),
+            None => Ok(PreparedInput {
+                stdio: previous.map_or_else(
+                    || {
+                        if has_upstream {
+                            Stdio::null()
+                        } else {
+                            Stdio::inherit()
+                        }
+                    },
+                    Stdio::from,
+                ),
+                writer: None,
+            }),
         }
-        Ok(PreparedInput {
-            stdio: previous.map_or_else(
-                || {
-                    if has_upstream {
-                        Stdio::null()
-                    } else {
-                        Stdio::inherit()
-                    }
-                },
-                Stdio::from,
-            ),
-            writer: None,
-        })
     }
 
     fn output_stdio(
@@ -1707,22 +1873,6 @@ mod platform {
         Ok(())
     }
 
-    fn join_command_words(words: &[String]) -> String {
-        words
-            .iter()
-            .map(|word| {
-                if word.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || "_./-".contains(character)
-                }) {
-                    word.clone()
-                } else {
-                    format!("'{}'", word.replace('\'', "'\\''"))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-
     fn write_redirected_output(command: &SimpleCommand, bytes: &[u8]) -> Result<(), ShellError> {
         let redirect = command
             .redirects
@@ -1823,6 +1973,30 @@ mod platform {
         Ok(())
     }
 
+    fn verify_process_group(
+        child: &mut Child,
+        process_id: i32,
+        process_group: i32,
+    ) -> Result<(), ShellError> {
+        let process_id = Pid::from_raw(process_id);
+        let expected_group = Pid::from_raw(process_group);
+        let set_result = setpgid(process_id, expected_group);
+        let observed_group = getpgid(Some(process_id));
+        if observed_group == Ok(expected_group) {
+            return Ok(());
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Err(ShellError::new(
+            ErrorCode::ProcessSpawn,
+            "could not establish the native pipeline process group",
+        )
+        .with_context(format!(
+            "pid {process_id}; expected group {expected_group}; setpgid={set_result:?}; getpgid={observed_group:?}"
+        ))
+        .with_help("Retry the command; report repeated process-group construction failures"))
+    }
+
     #[derive(Default)]
     struct PipelineConstructionGuard {
         children: Vec<JobChild>,
@@ -1841,7 +2015,9 @@ mod platform {
                 .with_context(error.to_string())
                 .with_help("Report this platform-specific process error")
             })?;
-            self.process_group.get_or_insert(process_id);
+            let process_group = self.process_group.unwrap_or(process_id);
+            verify_process_group(&mut child, process_id, process_group)?;
+            self.process_group.get_or_insert(process_group);
             self.children.push(JobChild {
                 child,
                 status: JobStatus::Running,
@@ -1872,12 +2048,28 @@ mod platform {
         }
         for child in children {
             if child.status != JobStatus::Done {
-                if process_group.is_none() {
-                    let _ = child.child.kill();
-                }
+                // Group cleanup contains descendants; the direct fallback is
+                // still required when a leader exited before the group became
+                // observable or the kernel rejects a group operation.
+                let _ = child.child.kill();
                 let _ = child.child.wait();
                 child.status = JobStatus::Done;
             }
+        }
+    }
+
+    fn terminate_group_descendants(process_group: Option<i32>) -> Result<(), ShellError> {
+        let Some(process_group) = process_group else {
+            return Ok(());
+        };
+        match killpg(Pid::from_raw(process_group), Signal::SIGKILL) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(error) => Err(ShellError::new(
+                ErrorCode::Io,
+                "could not terminate remaining pipeline descendants",
+            )
+            .with_context(error.to_string())
+            .with_help("Retry the command; report repeated process-group cleanup failures")),
         }
     }
 
@@ -2193,6 +2385,32 @@ mod platform {
                 restore_group,
                 restore_modes,
                 lease,
+            })
+        }
+
+        fn current_modes(&self) -> Result<Option<Termios>, ShellError> {
+            if self.restore_group.is_none() {
+                return Ok(None);
+            }
+            tcgetattr(std::io::stdin()).map(Some).map_err(|error| {
+                ShellError::new(ErrorCode::Io, "could not save stopped job terminal modes")
+                    .with_context(error.to_string())
+                    .with_help("Run `reset`, then cancel or foreground the stopped job")
+            })
+        }
+
+        fn apply_modes(&self, modes: Option<&Termios>) -> Result<(), ShellError> {
+            let Some(modes) = modes else {
+                return Ok(());
+            };
+            let _blocked = BlockedTerminalSignals::new()?;
+            tcsetattr(std::io::stdin(), SetArg::TCSADRAIN, modes).map_err(|error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not restore stopped job terminal modes",
+                )
+                .with_context(error.to_string())
+                .with_help("Run `reset`, then cancel the stopped job and retry")
             })
         }
 
@@ -2626,6 +2844,16 @@ mod platform {
         }
 
         #[test]
+        fn exited_leader_cannot_leave_a_descendant_holding_capture_open() {
+            let started = Instant::now();
+            let outcome = NativeExecutor::default()
+                .execute_capture("sh -c 'sleep 10 & exec true'")
+                .unwrap();
+            assert_eq!(outcome.status, 0);
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
         fn one_absolute_deadline_bounds_the_complete_command_list() {
             let request = ProcessRequest {
                 command: "sh -c 'sleep 0.07'; sh -c 'sleep 0.07'".to_owned(),
@@ -2840,6 +3068,29 @@ mod platform {
         }
 
         #[test]
+        fn input_redirects_apply_in_source_order_and_last_redirect_wins() {
+            let input = temporary_path("ordered-input");
+            let missing = temporary_path("ordered-missing");
+            fs::write(&input, "from-file").unwrap();
+
+            let from_file = NativeExecutor::default()
+                .execute_capture(&format!("cat <<< inline < {}", input.display()))
+                .unwrap();
+            assert_eq!(from_file.stdout.as_deref(), Some("from-file"));
+
+            let from_here_string = NativeExecutor::default()
+                .execute_capture(&format!("cat < {} <<< inline", input.display()))
+                .unwrap();
+            assert_eq!(from_here_string.stdout.as_deref(), Some("inline\n"));
+
+            let error = NativeExecutor::default()
+                .execute_capture(&format!("cat < {} <<< inline", missing.display()))
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::Io);
+            fs::remove_file(input).unwrap();
+        }
+
+        #[test]
         fn builtin_redirects_are_opened_before_state_mutation() {
             let variable = format!(
                 "QUIRL_PROCESS_REDIRECT_{}",
@@ -2964,6 +3215,81 @@ mod platform {
         }
 
         #[test]
+        fn immediate_leader_exit_does_not_break_verified_group_construction() {
+            for _ in 0..64 {
+                let outcome = NativeExecutor::default()
+                    .execute_capture("true | cat")
+                    .unwrap();
+                assert_eq!(outcome.status, 0);
+            }
+        }
+
+        #[test]
+        fn later_stage_spawn_failure_reaps_started_stage_and_preserves_spawn_error() {
+            let process_id_path = temporary_path("construction-child");
+            let command = format!(
+                "sh -c 'printf %s $$ > {}; sleep 10' | /definitely/missing/quirl-stage",
+                process_id_path.display()
+            );
+            let error = NativeExecutor::default()
+                .execute_capture(&command)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ProcessSpawn);
+            assert!(error.message.contains("/definitely/missing/quirl-stage"));
+
+            for _ in 0..100 {
+                if process_id_path.exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            if let Ok(value) = fs::read_to_string(&process_id_path) {
+                let process_id = value.trim().parse::<i32>().unwrap();
+                assert!(kill(Pid::from_raw(process_id), None).is_err());
+                fs::remove_file(process_id_path).unwrap();
+            }
+        }
+
+        #[test]
+        fn job_table_prunes_done_records_and_rejects_a_full_live_table() {
+            fn empty_job(id: u32, status: JobStatus) -> Job {
+                Job {
+                    state: JobState {
+                        id,
+                        command: "synthetic".to_owned(),
+                        status,
+                        process_group: None,
+                        exit_status: (status == JobStatus::Done).then_some(0),
+                    },
+                    children: Vec::new(),
+                    terminal_modes: None,
+                    capture: false,
+                    stdout_reader: None,
+                    stderr_readers: Vec::new(),
+                    writers: Vec::new(),
+                }
+            }
+
+            let mut executor = NativeExecutor::default();
+            executor.jobs = (1..=u32::try_from(RETAINED_JOBS_MAX).unwrap())
+                .map(|id| empty_job(id, JobStatus::Done))
+                .collect();
+            executor.next_job_id = u32::MAX;
+            assert_eq!(executor.reserve_refreshed_job_id().unwrap(), u32::MAX);
+            assert!(executor.jobs.is_empty());
+
+            executor.jobs = (1..=u32::try_from(RETAINED_JOBS_MAX).unwrap())
+                .map(|id| empty_job(id, JobStatus::Running))
+                .collect();
+            let error = executor.reserve_refreshed_job_id().unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.details.context.iter().any(|context| {
+                context.contains(&format!("limit {RETAINED_JOBS_MAX} jobs"))
+                    && context.contains(&format!("observed {RETAINED_JOBS_MAX} live jobs"))
+            }));
+        }
+
+        #[test]
         fn seeded_construction_fault_schedule_reaps_every_started_child() {
             const PROCESS_CASES_MAX: usize = 32;
             const PIPELINE_STAGES_MAX: usize = 4;
@@ -3007,8 +3333,11 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use super::{validate_native_plan, validate_native_source, DEFAULT_CAPTURE_BYTES};
-    use quirl_core::{CommandOutcome, CommandRunner, ErrorCode, ProcessRequest, ShellError};
+    use super::{
+        allocate_job_id, builtin, validate_native_plan, validate_native_source,
+        DEFAULT_CAPTURE_BYTES, HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
+    };
+    use quirl_core::{CommandOutcome, ErrorCode, ProcessRequest, ShellError};
     use quirl_syntax::{parse_command_list, ListConnector, Pipeline, RedirectKind, SimpleCommand};
     use serde::{Deserialize, Serialize};
     use std::{
@@ -3066,6 +3395,7 @@ mod platform {
         children: Vec<Child>,
         exit_statuses: Vec<Option<i32>>,
         object: JobObject,
+        writers: Vec<WriterTask>,
     }
 
     struct ReaderCapture {
@@ -3104,6 +3434,7 @@ mod platform {
     }
 
     type ReaderTask = JoinHandle<io::Result<ReaderCapture>>;
+    type WriterTask = JoinHandle<io::Result<()>>;
 
     #[derive(Clone, Copy)]
     struct RequestContext<'a> {
@@ -3183,6 +3514,7 @@ mod platform {
                     let _ = job.object.terminate(130);
                     wait_children(&mut job.children, &mut job.exit_statuses);
                 }
+                finish_writers_silently(&mut job.writers);
             }
         }
     }
@@ -3222,10 +3554,37 @@ mod platform {
                     if job.exit_statuses.iter().all(Option::is_some) {
                         job.state.status = JobStatus::Done;
                         job.state.exit_status = job.exit_statuses.last().copied().flatten();
+                        finish_writers_silently(&mut job.writers);
                     }
                 }
             }
             self.jobs.iter().map(|job| job.state.clone()).collect()
+        }
+
+        fn reserve_job_id(&mut self) -> Result<u32, ShellError> {
+            let _ = self.jobs();
+            self.reserve_refreshed_job_id()
+        }
+
+        fn reserve_refreshed_job_id(&mut self) -> Result<u32, ShellError> {
+            if self.jobs.len() >= RETAINED_JOBS_MAX {
+                self.jobs.retain(|job| job.state.status != JobStatus::Done);
+            }
+            if self.jobs.len() >= RETAINED_JOBS_MAX {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "native job table reached its retention limit",
+                )
+                .with_context(format!(
+                    "limit {RETAINED_JOBS_MAX} jobs; observed {} live jobs",
+                    self.jobs.len()
+                ))
+                .with_help(
+                    "Finish or cancel an active job before starting another background job",
+                ));
+            }
+            let visible_ids = self.jobs.iter().map(|job| job.state.id).collect::<Vec<_>>();
+            Ok(allocate_job_id(&mut self.next_job_id, &visible_ids))
         }
 
         /// Terminate job `id`, reap its children, and return the final snapshot.
@@ -3238,6 +3597,7 @@ mod platform {
             if job.state.status != JobStatus::Done {
                 job.object.terminate(130)?;
                 wait_children(&mut job.children, &mut job.exit_statuses);
+                finish_writers_silently(&mut job.writers);
                 job.state.status = JobStatus::Done;
                 job.state.exit_status = Some(130);
             }
@@ -3349,6 +3709,7 @@ mod platform {
                     .with_command(source)
                     .with_help("Run the built-in without `&`"));
                 }
+                validate_builtin_redirects(&pipeline.commands[0], source)?;
                 if let Some(outcome) = self.execute_builtin(&pipeline.commands[0], capture)? {
                     return apply_builtin_redirects(
                         &pipeline.commands[0],
@@ -3374,11 +3735,8 @@ mod platform {
                 }));
             };
             match name {
-                "cd" | "ls" => {
-                    let runner = CommandRunner::default();
-                    let line = command.words.join(" ");
-                    Ok(Some(runner.execute_capture(&line)?))
-                }
+                "cd" => Ok(Some(builtin::execute_cd(&command.words)?)),
+                "ls" => Ok(Some(builtin::execute_ls(&command.words)?)),
                 "export" => {
                     for assignment in command.words.iter().skip(1) {
                         let Some((name, value)) = assignment.split_once('=') else {
@@ -3427,6 +3785,7 @@ mod platform {
                         })?;
                     let mut job = self.jobs.remove(index);
                     wait_children(&mut job.children, &mut job.exit_statuses);
+                    join_writers(std::mem::take(&mut job.writers))?;
                     let status = job.exit_statuses.last().copied().flatten().unwrap_or(1);
                     Ok(Some(CommandOutcome {
                         status,
@@ -3450,12 +3809,18 @@ mod platform {
             capture: bool,
             request: Option<RequestContext<'_>>,
         ) -> Result<CommandOutcome, ShellError> {
+            let background_job_id = if pipeline.background {
+                Some(self.reserve_job_id()?)
+            } else {
+                None
+            };
             let object = JobObject::new()?;
             let mut children = Vec::with_capacity(pipeline.commands.len());
             let mut exit_statuses = Vec::with_capacity(pipeline.commands.len());
             let mut previous_stdout: Option<ChildStdout> = None;
             let mut stdout_reader = None;
             let mut stderr_readers = Vec::new();
+            let mut writers = Vec::new();
             let output_limit = retained_output_limit(request.map(|request| request.request));
             let stderr_budget = Arc::new(CaptureBudget::new(output_limit));
 
@@ -3464,26 +3829,34 @@ mod platform {
                     continue;
                 };
                 let last = index + 1 == pipeline.commands.len();
-                let input = command
-                    .redirects
-                    .iter()
-                    .rev()
-                    .find(|redirect| redirect.kind == RedirectKind::Input);
+                let input = prepare_windows_input(command, source)?;
                 let output = command.redirects.iter().rev().find(|redirect| {
                     matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
                 });
                 let mut process = Command::new(program);
                 process.args(command.words.iter().skip(1));
-                if let Some(redirect) = input {
-                    drop(previous_stdout.take());
-                    process.stdin(Stdio::from(open_input(&redirect.path, source)?));
-                } else if let Some(stdout) = previous_stdout.take() {
-                    process.stdin(Stdio::from(stdout));
-                } else if index > 0 {
-                    process.stdin(Stdio::null());
-                } else {
-                    process.stdin(Stdio::inherit());
-                }
+                let here_string = match input {
+                    Some(WindowsInput::File(file)) => {
+                        drop(previous_stdout.take());
+                        process.stdin(Stdio::from(file));
+                        None
+                    }
+                    Some(WindowsInput::HereString(bytes)) => {
+                        drop(previous_stdout.take());
+                        process.stdin(Stdio::piped());
+                        Some(bytes)
+                    }
+                    None => {
+                        if let Some(stdout) = previous_stdout.take() {
+                            process.stdin(Stdio::from(stdout));
+                        } else if index > 0 {
+                            process.stdin(Stdio::null());
+                        } else {
+                            process.stdin(Stdio::inherit());
+                        }
+                        None
+                    }
+                };
                 if let Some(redirect) = output {
                     process.stdout(Stdio::from(open_output(
                         &redirect.path,
@@ -3508,6 +3881,14 @@ mod platform {
                     let _ = child.wait();
                     error.with_command(source)
                 })?;
+                if let Some(bytes) = here_string {
+                    let mut stdin = child.stdin.take().ok_or_else(|| {
+                        ShellError::new(ErrorCode::Io, "here-string stdin pipe is unavailable")
+                            .with_command(source)
+                            .with_help("Retry the command or use an input file")
+                    })?;
+                    writers.push(thread::spawn(move || stdin.write_all(&bytes)));
+                }
                 if capture && !pipeline.background {
                     if let Some(stderr) = child.stderr.take() {
                         stderr_readers
@@ -3527,8 +3908,9 @@ mod platform {
             }
 
             if pipeline.background {
-                let id = self.next_job_id;
-                self.next_job_id = self.next_job_id.saturating_add(1);
+                let Some(id) = background_job_id else {
+                    unreachable!("background pipeline reserved no job id");
+                };
                 self.jobs.push(Job {
                     state: JobState {
                         id,
@@ -3540,6 +3922,7 @@ mod platform {
                     children,
                     exit_statuses,
                     object,
+                    writers,
                 });
                 return Ok(CommandOutcome {
                     status: 0,
@@ -3560,6 +3943,8 @@ mod platform {
             } else {
                 wait_children(&mut children, &mut exit_statuses);
             }
+            let _ = object.terminate(0);
+            join_writers(writers)?;
             let status = exit_statuses.last().copied().flatten().unwrap_or(0);
             let stdout = if capture {
                 Some(join_reader(stdout_reader, "pipeline stdout"))
@@ -3650,6 +4035,46 @@ mod platform {
         }
     }
 
+    enum WindowsInput {
+        File(File),
+        HereString(Vec<u8>),
+    }
+
+    fn prepare_windows_input(
+        command: &SimpleCommand,
+        source: &str,
+    ) -> Result<Option<WindowsInput>, ShellError> {
+        let mut selected = None;
+        for redirect in &command.redirects {
+            match redirect.kind {
+                RedirectKind::Input => {
+                    selected = Some(WindowsInput::File(open_input(&redirect.path, source)?));
+                }
+                RedirectKind::HereString => {
+                    let observed_bytes = redirect.path.len().saturating_add(1);
+                    if observed_bytes > HERE_STRING_BYTES_MAX {
+                        return Err(ShellError::new(
+                            ErrorCode::ResourceLimit,
+                            "here-string input exceeds its byte limit",
+                        )
+                        .with_context(format!(
+                            "limit {HERE_STRING_BYTES_MAX} bytes; observed {observed_bytes} bytes including the trailing newline"
+                        ))
+                        .with_help("Use an input file or pipeline for larger input"));
+                    }
+                    let mut bytes = redirect.path.as_bytes().to_vec();
+                    bytes.push(b'\n');
+                    selected = Some(WindowsInput::HereString(bytes));
+                }
+                RedirectKind::Output
+                | RedirectKind::Append
+                | RedirectKind::DuplicateInput
+                | RedirectKind::DuplicateOutput => {}
+            }
+        }
+        Ok(selected)
+    }
+
     fn apply_builtin_redirects(
         command: &SimpleCommand,
         mut outcome: CommandOutcome,
@@ -3705,6 +4130,30 @@ mod platform {
             outcome.stderr = None;
         }
         Ok(outcome)
+    }
+
+    fn validate_builtin_redirects(command: &SimpleCommand, source: &str) -> Result<(), ShellError> {
+        for redirect in &command.redirects {
+            match redirect.kind {
+                RedirectKind::Input | RedirectKind::HereString | RedirectKind::DuplicateInput => {
+                    return Err(ShellError::new(
+                        ErrorCode::InvalidArgument,
+                        "input redirection is not supported for stateful built-ins",
+                    )
+                    .with_command(source)
+                    .with_help("Redirect input to an external command instead"));
+                }
+                RedirectKind::Output | RedirectKind::Append => {
+                    drop(open_output(
+                        &redirect.path,
+                        redirect.kind == RedirectKind::Append,
+                        source,
+                    )?);
+                }
+                RedirectKind::DuplicateOutput => {}
+            }
+        }
+        Ok(())
     }
 
     fn open_input(path: &str, source: &str) -> Result<File, ShellError> {
@@ -3788,6 +4237,30 @@ mod platform {
                     .with_help("Retry the command; report repeated pipeline capture failures"),
             ),
         }
+    }
+
+    fn join_writers(writers: Vec<WriterTask>) -> Result<(), ShellError> {
+        for writer in writers {
+            let result = writer.join().map_err(|_| {
+                ShellError::new(ErrorCode::Io, "pipeline writer task failed")
+                    .with_help("Retry the command; report repeated pipeline failures")
+            })?;
+            if let Err(error) = result {
+                if error.kind() == io::ErrorKind::BrokenPipe {
+                    continue;
+                }
+                return Err(
+                    ShellError::new(ErrorCode::Io, "could not write pipeline input")
+                        .with_context(error.to_string())
+                        .with_help("Retry the command; report repeated pipeline failures"),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_writers_silently(writers: &mut Vec<WriterTask>) {
+        let _ = join_writers(std::mem::take(writers));
     }
 
     fn refresh_children(children: &mut [Child], exit_statuses: &mut [Option<i32>]) {
@@ -4048,6 +4521,59 @@ mod backend_contract_tests {
         );
         assert!(transition_job_state(JobStatus::Done, JobLifecycleEvent::Continue).is_err());
         assert!(transition_job_state(JobStatus::Stopped, JobLifecycleEvent::Stop).is_err());
+    }
+
+    #[test]
+    fn runner_v1_evidence_is_frozen_and_v2_fails_closed_across_versions() {
+        assert_eq!(
+            quirl_core::schema_fingerprint(RUNNER_SCHEMA_DESCRIPTOR_V1),
+            "fnv1a64:131ea5b3e770b424"
+        );
+        assert!(RUNNER_SCHEMA_DESCRIPTOR.contains("quirl.command-grammar@2"));
+        assert!(RUNNER_SCHEMA_DESCRIPTOR.contains("execute(source)"));
+        assert!(!RUNNER_SCHEMA_DESCRIPTOR.contains("foreground_job"));
+        assert!(!RUNNER_SCHEMA_DESCRIPTOR.contains("execute_interactive"));
+        assert!(validate_runner_protocol_version(RUNNER_PROTOCOL_VERSION).is_ok());
+        for version in [RUNNER_PROTOCOL_VERSION_V1, RUNNER_PROTOCOL_VERSION + 1] {
+            let error = validate_runner_protocol_version(version).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Validation);
+            assert!(!error.details.help.is_empty());
+        }
+    }
+
+    #[test]
+    fn runner_job_fixtures_round_trip_and_reject_malformed_or_unknown_fields() {
+        for fixture in [RUNNER_JOB_STATE_FIXTURE_V1, RUNNER_JOB_STATE_FIXTURE] {
+            let state: JobState = serde_json::from_str(fixture).unwrap();
+            assert_eq!(state.id, 1);
+            assert_eq!(state.status, JobStatus::Running);
+        }
+        for fixture in [
+            r#"{"id":1,"command":"x","status":"unknown","process_group":null,"exit_status":null}"#,
+            r#"{"id":1,"command":"x","status":"done","process_group":null,"exit_status":0,"extra":true}"#,
+            r#"{"id":"bad"}"#,
+        ] {
+            assert!(serde_json::from_str::<JobState>(fixture).is_err());
+        }
+    }
+
+    #[test]
+    fn reserved_input_descriptor_duplication_fails_closed() {
+        let error = NativeExecutor::default()
+            .execute_capture("cat 0<&1")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert!(error.message.contains("descriptor duplication"));
+        assert!(!error.details.help.is_empty());
+    }
+
+    #[test]
+    fn job_id_allocation_wraps_and_skips_every_visible_id() {
+        let mut next = u32::MAX;
+        assert_eq!(allocate_job_id(&mut next, &[1, 2]), u32::MAX);
+        assert_eq!(next, 1);
+        assert_eq!(allocate_job_id(&mut next, &[1, 2, u32::MAX]), 3);
+        assert_eq!(next, 4);
     }
 
     #[test]

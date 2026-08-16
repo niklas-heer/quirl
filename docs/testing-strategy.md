@@ -108,9 +108,11 @@ cases are capped at 32 per run even when the pure simulator is asked to run more
 cases; both bounds are intentional so the canonical gate remains predictable.
 
 The model is not a replacement for real PTY evidence. It makes state-machine
-and cleanup schedules cheap to explore and replay; the PTY suite separately
-proves signals, foreground ownership, termios restoration, and rendering against
-the operating system.
+and cleanup schedules cheap to explore and replay; `scripts/check-rich-pty.py`
+separately proves native Ctrl-C/Ctrl-Z, jobs/bg/fg transitions, process-group
+construction cleanup, foreground ownership, stopped-job and prompt termios
+restoration, dialect-island noninteraction, and rendering against the operating
+system.
 
 ## Adding coverage
 

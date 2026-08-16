@@ -41,5 +41,6 @@
   "architecture/decisions/0012-ratatui-interactive-surface.mdx",
   "architecture/decisions/0013-lua-config-themes.mdx",
   "architecture/decisions/0014-external-history-provider-boundary.mdx",
-  "architecture/decisions/0015-bounded-theme-preview-gallery.mdx"
+  "architecture/decisions/0015-bounded-theme-preview-gallery.mdx",
+  "architecture/decisions/0016-runtime-layering-contract.mdx"
 ]

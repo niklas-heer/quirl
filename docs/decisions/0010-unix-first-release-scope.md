@@ -47,9 +47,12 @@ The 1.0 compatibility boundary is also frozen:
   parameter/arithmetic/command expansion, and pathname expansion.
 - Here-documents, process substitution, loops, functions, conditionals, and
   dialect-specific control forms are C2 reference-shell islands for 1.0. They
-  are not promised as future native syntax. Interactive use must select
-  `bash { ... }` or `zsh { ... }`; scripts select an interpreter through their
-  shebang, `quirl run --lang bash`, or `quirl run --lang zsh`.
+  are not promised as future native syntax. Prompt use selects `bash { ... }`
+  or `zsh { ... }`; scripts select an interpreter through their shebang,
+  `quirl run --lang bash`, or `quirl run --lang zsh`. Both boundaries are
+  explicitly noninteractive with closed standard input. Ctrl-C cancels them;
+  on Unix, Ctrl-Z also cancels a prompt island instead of creating an
+  untracked stopped process group.
 - Unsupported dialect input receives an actionable diagnostic. Quirl never
   silently retries it in a reference shell, loads user startup files, or changes
   interpreter authority behind the user's back.

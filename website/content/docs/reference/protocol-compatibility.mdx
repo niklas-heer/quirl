@@ -22,6 +22,13 @@ Unknown fields and future versions are rejected at authoritative Rust
 boundaries. Descriptor hashes use named FNV-1a for deterministic identity, not
 security. Plugin file integrity continues to use SHA-256 and explicit grants.
 
+Runner protocol v2 binds command grammar v2 and the actual `ProcessBackend`
+methods. It also freezes bounded job retention, wrap-safe non-colliding job
+IDs, and source-ordered input redirects. Runner v1 is retained as an exact
+historical descriptor and job-state fixture, but fails closed because its
+descriptor named grammar v1 and methods that did not match the public trait;
+there is no safe semantic migration from that false contract.
+
 ## Persisted migrations
 
 | Document | Current | Oldest readable | Migration guarantee |

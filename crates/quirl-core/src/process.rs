@@ -2,9 +2,8 @@ use crate::{ErrorCode, ShellError};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
-    env, fs,
+    fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{atomic::AtomicBool, Arc},
     time::{Duration, UNIX_EPOCH},
 };
@@ -46,16 +45,6 @@ pub struct CommandOutcome {
     pub stdout: Option<String>,
     /// Captured standard error, or `None` when output was inherited.
     pub stderr: Option<String>,
-}
-
-impl CommandOutcome {
-    fn success_with_output(output: String) -> Self {
-        Self {
-            status: 0,
-            stdout: Some(output),
-            stderr: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,260 +150,6 @@ impl Entry {
     /// controls correctly); human renderers must use this representation.
     pub fn display_name(&self) -> String {
         crate::escape_terminal_line(&self.name)
-    }
-}
-
-#[derive(Debug, Clone)]
-/// Small legacy command adapter for direct shell execution plus native `cd` and `ls`.
-///
-/// The richer bounded process graph lives in `quirl-process`. This adapter is
-/// retained for simple composition and does not impose capture or wall-time
-/// limits on external commands; untrusted runtimes should use [`ProcessHost`].
-pub struct CommandRunner {
-    shell: PathBuf,
-}
-
-impl Default for CommandRunner {
-    fn default() -> Self {
-        Self::new(
-            env::var_os("SHELL")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/bin/sh")),
-        )
-    }
-}
-
-impl CommandRunner {
-    /// Construct a runner that invokes external source through `shell -c`.
-    ///
-    /// The path is stored without validation. Spawn failures are reported by
-    /// [`Self::execute`] or [`Self::execute_capture`].
-    pub fn new(shell: impl Into<PathBuf>) -> Self {
-        Self {
-            shell: shell.into(),
-        }
-    }
-
-    /// Execute a command with inherited terminal streams, as an interactive shell should.
-    ///
-    /// Empty input succeeds without spawning. Unprefixed `cd` and `ls` use the
-    /// native implementations; a leading `^` forces external execution. Spawn,
-    /// argument, and filesystem failures are returned as [`ShellError`].
-    pub fn execute(&self, input: &str) -> Result<CommandOutcome, ShellError> {
-        self.execute_inner(input, false)
-    }
-
-    /// Execute a command with captured streams for tools and tests.
-    ///
-    /// Captured bytes are decoded lossily as UTF-8. This legacy helper does not
-    /// bound retained output; do not use it for untrusted or potentially large
-    /// commands. Parsing and error behavior otherwise match [`Self::execute`].
-    pub fn execute_capture(&self, input: &str) -> Result<CommandOutcome, ShellError> {
-        self.execute_inner(input, true)
-    }
-
-    fn execute_inner(&self, input: &str, capture: bool) -> Result<CommandOutcome, ShellError> {
-        let input = input.trim();
-        if input.is_empty() {
-            return Ok(CommandOutcome {
-                status: 0,
-                stdout: None,
-                stderr: None,
-            });
-        }
-
-        let forced_external = input.starts_with('^');
-        let external_input = input.strip_prefix('^').unwrap_or(input);
-        let words = shlex::split(input);
-        if !forced_external {
-            if let Some(words) = words.as_deref() {
-                match words.first().map(String::as_str) {
-                    Some("cd") => return self.change_directory(words),
-                    Some("ls") => return self.list_directory(words),
-                    _ => {}
-                }
-            }
-        }
-
-        self.execute_external(external_input, capture)
-    }
-
-    fn execute_external(&self, input: &str, capture: bool) -> Result<CommandOutcome, ShellError> {
-        let mut command = Command::new(&self.shell);
-        command.arg("-c").arg(input).stdin(Stdio::inherit());
-        if capture {
-            let output = command.output().map_err(|error| {
-                ShellError::new(
-                    ErrorCode::ProcessSpawn,
-                    format!("could not start {}", self.shell.display()),
-                )
-                .with_command(input)
-                .with_context(error.to_string())
-                .with_help("Check that $SHELL names an executable shell")
-            })?;
-            Ok(CommandOutcome {
-                status: output.status.code().unwrap_or(1),
-                stdout: Some(String::from_utf8_lossy(&output.stdout).into_owned()),
-                stderr: Some(String::from_utf8_lossy(&output.stderr).into_owned()),
-            })
-        } else {
-            let status = command
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .map_err(|error| {
-                    ShellError::new(
-                        ErrorCode::ProcessSpawn,
-                        format!("could not start {}", self.shell.display()),
-                    )
-                    .with_command(input)
-                    .with_context(error.to_string())
-                    .with_help("Check that $SHELL names an executable shell")
-                })?;
-            Ok(CommandOutcome {
-                status: status.code().unwrap_or(1),
-                stdout: None,
-                stderr: None,
-            })
-        }
-    }
-
-    fn change_directory(&self, words: &[String]) -> Result<CommandOutcome, ShellError> {
-        if words.len() > 2 {
-            return Err(
-                ShellError::new(ErrorCode::InvalidArgument, "cd accepts at most one path")
-                    .with_command(words.join(" "))
-                    .with_help("Usage: cd [path]"),
-            );
-        }
-        let path = words
-            .get(1)
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(PathBuf::from))
-            .ok_or_else(|| {
-                ShellError::new(
-                    ErrorCode::InvalidArgument,
-                    "cd needs a path because no home directory is configured",
-                )
-                .with_help("Pass a path explicitly: cd /some/directory")
-            })?;
-        env::set_current_dir(&path).map_err(|error| {
-            ShellError::new(ErrorCode::Io, format!("cannot enter {}", path.display()))
-                .with_command(words.join(" "))
-                .with_context(error.to_string())
-        })?;
-        Ok(CommandOutcome {
-            status: 0,
-            stdout: None,
-            stderr: None,
-        })
-    }
-
-    fn list_directory(&self, words: &[String]) -> Result<CommandOutcome, ShellError> {
-        let mut options = DirectoryOptions::default();
-        let mut long = false;
-        let mut json = false;
-        let mut path = None;
-        let mut index = 1;
-        while let Some(word) = words.get(index) {
-            match word.as_str() {
-                "-a" | "--all" => options.show_all = true,
-                "-l" | "--long" => long = true,
-                "--json" => json = true,
-                "--plain" => json = false,
-                "-r" | "--reverse" => options.reverse = true,
-                "--directories-first" | "--dirs-first" => options.directories_first = true,
-                "--resolve-links" => options.resolve_symlink_targets = true,
-                "--sort" => {
-                    index += 1;
-                    let value = words.get(index).ok_or_else(|| {
-                        ShellError::new(ErrorCode::InvalidArgument, "ls --sort needs a value")
-                            .with_command(words.join(" "))
-                            .with_help("Use one of: name, size, modified, kind")
-                    })?;
-                    options.sort = parse_directory_sort(value, words)?;
-                }
-                value if value.starts_with("--sort=") => {
-                    let sort = value.strip_prefix("--sort=").unwrap_or_default();
-                    options.sort = parse_directory_sort(sort, words)?;
-                }
-                "--max-entries" => {
-                    index += 1;
-                    let value = words.get(index).ok_or_else(|| {
-                        ShellError::new(
-                            ErrorCode::InvalidArgument,
-                            "ls --max-entries needs a positive value",
-                        )
-                        .with_command(words.join(" "))
-                        .with_help("Use a positive bound, for example `ls --max-entries 1000`")
-                    })?;
-                    options.max_entries = parse_max_entries(value, words)?;
-                }
-                value if value.starts_with("--max-entries=") => {
-                    let limit = value.strip_prefix("--max-entries=").unwrap_or_default();
-                    options.max_entries = parse_max_entries(limit, words)?;
-                }
-                "--format" => {
-                    index += 1;
-                    let value = words.get(index).ok_or_else(|| {
-                        ShellError::new(ErrorCode::InvalidArgument, "ls --format needs a value")
-                            .with_command(words.join(" "))
-                            .with_help("Use `--format plain` or `--format json`")
-                    })?;
-                    json = parse_ls_format(value, words)?;
-                }
-                value if value.starts_with("--format=") => {
-                    let format = value.strip_prefix("--format=").unwrap_or_default();
-                    json = parse_ls_format(format, words)?;
-                }
-                short if short.starts_with('-') && !short.starts_with("--") => {
-                    for flag in short[1..].chars() {
-                        match flag {
-                            'a' => options.show_all = true,
-                            'l' => long = true,
-                            'r' => options.reverse = true,
-                            _ => {
-                                return Err(ShellError::new(
-                                    ErrorCode::InvalidArgument,
-                                    format!("unknown ls option `-{flag}` in `{short}`"),
-                                )
-                                .with_command(words.join(" "))
-                                .with_help("Use `ls --help` to inspect supported options"));
-                            }
-                        }
-                    }
-                }
-                option if option.starts_with('-') => {
-                    return Err(ShellError::new(
-                        ErrorCode::InvalidArgument,
-                        format!("unknown ls option `{option}`"),
-                    )
-                    .with_command(words.join(" "))
-                    .with_help("Try `help ls` to see Quirl's native options")
-                    .with_help("Use `^ls ...` to force the external ls"));
-                }
-                value if path.is_none() => path = Some(PathBuf::from(value)),
-                value => {
-                    return Err(ShellError::new(
-                        ErrorCode::InvalidArgument,
-                        format!("unexpected second path `{value}`"),
-                    )
-                    .with_command(words.join(" ")));
-                }
-            }
-            index += 1;
-        }
-        let path = path.unwrap_or_else(|| PathBuf::from("."));
-        let entries = directory_entries_with_options(&path, &options)?;
-        let output = if json {
-            serde_json::to_string_pretty(&entries).map_err(|error| {
-                ShellError::new(ErrorCode::Io, "could not serialize directory entries")
-                    .with_context(error.to_string())
-            })?
-        } else {
-            render_entries(&entries, long)
-        };
-        Ok(CommandOutcome::success_with_output(output))
     }
 }
 
@@ -545,48 +280,8 @@ pub fn directory_entries_with_options(
     Ok(entries)
 }
 
-fn parse_directory_sort(value: &str, words: &[String]) -> Result<DirectorySort, ShellError> {
-    match value {
-        "name" => Ok(DirectorySort::Name),
-        "size" => Ok(DirectorySort::Size),
-        "modified" | "time" => Ok(DirectorySort::Modified),
-        "kind" | "type" => Ok(DirectorySort::Kind),
-        _ => Err(ShellError::new(
-            ErrorCode::InvalidArgument,
-            format!("unknown ls sort `{value}`"),
-        )
-        .with_command(words.join(" "))
-        .with_help("Use one of: name, size, modified, kind")),
-    }
-}
-
-fn parse_max_entries(value: &str, words: &[String]) -> Result<usize, ShellError> {
-    let parsed = value.parse::<usize>().ok().filter(|value| *value > 0);
-    parsed.ok_or_else(|| {
-        ShellError::new(
-            ErrorCode::InvalidArgument,
-            format!("ls --max-entries needs a positive integer, got `{value}`"),
-        )
-        .with_command(words.join(" "))
-        .with_help("Use a positive bound, for example `ls --max-entries=1000`")
-    })
-}
-
 fn is_not_found(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound
-}
-
-fn parse_ls_format(value: &str, words: &[String]) -> Result<bool, ShellError> {
-    match value {
-        "plain" | "text" => Ok(false),
-        "json" => Ok(true),
-        _ => Err(ShellError::new(
-            ErrorCode::InvalidArgument,
-            format!("unknown ls format `{value}`"),
-        )
-        .with_command(words.join(" "))
-        .with_help("Use `--format plain` or `--format json`")),
-    }
 }
 
 fn compare_entries(left: &Entry, right: &Entry, options: &DirectoryOptions) -> Ordering {
@@ -625,41 +320,11 @@ fn entry_kind_rank(kind: EntryKind) -> u8 {
     }
 }
 
-fn render_entries(entries: &[Entry], long: bool) -> String {
-    let mut output = String::new();
-    for entry in entries {
-        if long {
-            let kind = match entry.kind {
-                EntryKind::Directory => "dir",
-                EntryKind::File => "file",
-                EntryKind::Symlink => "link",
-                EntryKind::Other => "other",
-            };
-            let modified = entry
-                .modified_unix_seconds
-                .map_or_else(|| "-".to_owned(), |seconds| seconds.to_string());
-            output.push_str(&format!(
-                "{kind:<5}  {:>10}  {:>10}  {}\n",
-                entry.size,
-                modified,
-                entry.display_name()
-            ));
-        } else {
-            output.push_str(&entry.display_name());
-            if matches!(entry.kind, EntryKind::Directory) {
-                output.push('/');
-            }
-            output.push('\n');
-        }
-    }
-    output.trim_end_matches('\n').to_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{
-        fs,
+        env, fs,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -674,84 +339,6 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         directory
-    }
-
-    #[test]
-    fn external_commands_keep_shell_syntax() {
-        let runner = CommandRunner::new("/bin/sh");
-        let result = runner
-            .execute_capture("printf 'hello' | tr a-z A-Z")
-            .unwrap();
-        assert_eq!(result.status, 0);
-        assert_eq!(result.stdout.as_deref(), Some("HELLO"));
-    }
-
-    #[test]
-    fn native_ls_can_emit_json() {
-        let runner = CommandRunner::new("/bin/sh");
-        let result = runner.execute_capture("ls --json .").unwrap();
-        let entries: Vec<Entry> = serde_json::from_str(result.stdout.as_deref().unwrap()).unwrap();
-        assert!(entries.iter().any(|entry| entry.name == "Cargo.toml"));
-    }
-
-    #[test]
-    fn native_ls_accepts_explicit_formats_and_sort_controls() {
-        let directory = test_directory("native-options");
-        fs::write(directory.join("small"), "x").unwrap();
-        fs::write(directory.join("large"), "xxxx").unwrap();
-        let runner = CommandRunner::new("/bin/sh");
-
-        let command = format!(
-            "ls --format json --sort=size --reverse {path}",
-            path = directory.display()
-        );
-        let result = runner.execute_capture(&command).unwrap();
-        let entries: Vec<Entry> = serde_json::from_str(result.stdout.as_deref().unwrap()).unwrap();
-        assert_eq!(entries[0].name, "large");
-
-        let result = runner
-            .execute_capture(&format!("ls -lr {path}", path = directory.display()))
-            .unwrap();
-        // kind, byte count, modification time, and terminal-safe name.
-        assert_eq!(result.stdout.unwrap().split_whitespace().count(), 8);
-
-        let limited = runner
-            .execute_capture(&format!(
-                "ls --max-entries 1 {path}",
-                path = directory.display()
-            ))
-            .unwrap_err();
-        assert_eq!(limited.code, ErrorCode::ResourceLimit);
-
-        let one = runner
-            .execute_capture(&format!(
-                "ls --max-entries=2 --format json {path}",
-                path = directory.display()
-            ))
-            .unwrap();
-        let entries: Vec<Entry> = serde_json::from_str(one.stdout.as_deref().unwrap()).unwrap();
-        assert_eq!(entries.len(), 2);
-
-        for value in ["0", "not-a-number"] {
-            let error = runner
-                .execute_capture(&format!(
-                    "ls --max-entries={value} {path}",
-                    path = directory.display()
-                ))
-                .unwrap_err();
-            assert_eq!(error.code, ErrorCode::InvalidArgument);
-            assert!(!error.details.help.is_empty());
-        }
-
-        let error = runner
-            .execute_capture(&format!(
-                "ls --sort nonsense {path}",
-                path = directory.display()
-            ))
-            .unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidArgument);
-        assert!(!error.details.help.is_empty());
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -811,53 +398,6 @@ mod tests {
         assert_eq!(directories_first[0].name, "middle");
         assert_eq!(directories_first[1].name, "zebra");
         fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn plain_rendering_neutralizes_hostile_and_unicode_filenames() {
-        let directory = test_directory("terminal-names");
-        let hostile = "\u{1b}[2Jüber\nname";
-        fs::write(directory.join(hostile), "content").unwrap();
-        let entries =
-            directory_entries_with_options(&directory, &DirectoryOptions::default()).unwrap();
-        let output = render_entries(&entries, false);
-        assert!(output.contains("\\u{1b}[2Jüber"));
-        assert!(!output.contains('\u{1b}'));
-        assert!(output.contains("name"));
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn long_listing_uses_a_fixed_width_kind_column() {
-        let entries = [
-            Entry {
-                name: "directory".to_owned(),
-                path: PathBuf::from("directory"),
-                kind: EntryKind::Directory,
-                size: 1,
-                modified_unix_seconds: Some(2),
-                hidden: false,
-                symlink_target: None,
-                readonly: false,
-            },
-            Entry {
-                name: "other".to_owned(),
-                path: PathBuf::from("other"),
-                kind: EntryKind::Other,
-                size: 1,
-                modified_unix_seconds: Some(2),
-                hidden: false,
-                symlink_target: None,
-                readonly: false,
-            },
-        ];
-        let output = render_entries(&entries, true);
-        let columns = output
-            .lines()
-            .map(|line| line.find("         1").unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(columns, vec![7, 7]);
     }
 
     #[test]

@@ -2700,9 +2700,10 @@ fn process_capability_granted(grants: &HashSet<String>, command: &str) -> bool {
     if grants.contains("process.spawn") {
         return true;
     }
-    // Scoped grants describe exactly one executable invocation. CommandRunner
-    // uses a shell, so accept only one physical line and a deliberately small
-    // argv alphabet; tabs/newlines and shell operators must never reach it.
+    // Scoped grants describe exactly one executable invocation. The injected
+    // native host accepts command source, so allow only one physical line and
+    // a deliberately small argv alphabet; tabs/newlines and shell operators
+    // must never reach it.
     if command.is_empty()
         || command.trim() != command
         || command.chars().any(|character| character.is_control())

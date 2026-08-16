@@ -104,6 +104,7 @@ return quirl.config {{
 
         self.pid = pid
         self.master = master
+        self.private = private
         self.binary = binary
         self.root = root
         self.output = bytearray()
@@ -113,6 +114,20 @@ return quirl.config {{
         fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
     def close(self) -> None:
+        try:
+            foreground_group = os.tcgetpgrp(self.master)
+        except OSError:
+            foreground_group = -1
+        if foreground_group > 0 and foreground_group != os.getpgrp():
+            try:
+                os.killpg(foreground_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if self.pid > 0:
+            try:
+                os.killpg(self.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         try:
             os.close(self.master)
         except OSError:
@@ -200,6 +215,19 @@ def enter_and_wait(session: Session, command: str, marker: bytes) -> bytes:
     session.type(command)
     session.send(b"\r")
     return session.wait_for(marker)
+
+
+def wait_for_prompt(session: Session) -> None:
+    if not (
+        os.tcgetpgrp(session.master) == session.pid
+        and STARTUP_MARKER in session.output[-2000:]
+    ):
+        session.wait_for(STARTUP_MARKER)
+    deadline = time.monotonic() + TIMEOUT
+    while os.tcgetpgrp(session.master) != session.pid and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if os.tcgetpgrp(session.master) != session.pid:
+        raise AssertionError("Quirl did not recover terminal ownership at the prompt")
 
 
 def check_rich_editing(binary: Path, root: Path) -> None:
@@ -388,6 +416,143 @@ def check_suspend_resume(binary: Path, root: Path) -> None:
         session.close()
 
 
+def check_native_job_control(binary: Path, root: Path) -> None:
+    session = Session(binary, root)
+    try:
+        session.wait_for(STARTUP_MARKER)
+        prompt_modes = termios.tcgetattr(session.master)
+        if os.tcgetpgrp(session.master) != session.pid:
+            raise AssertionError("Quirl did not own the terminal at the prompt")
+
+        enter_and_wait(
+            session,
+            "/bin/sh -c 'test \"$(ps -o tpgid= -p $$)\" -eq $$ && printf TTY_%s OWNED'",
+            b"TTY_OWNED",
+        )
+        wait_for_prompt(session)
+        race = "; ".join(["/usr/bin/true | /bin/cat" for _ in range(8)])
+        enter_and_wait(
+            session,
+            f"{race}; /usr/bin/printf LEADER_%s RACE_OK",
+            b"LEADER_RACE_OK",
+        )
+        wait_for_prompt(session)
+
+        pid_path = session.private / "construction.pid"
+        gate_path = session.private / "construction.gate"
+        os.mkfifo(gate_path, 0o600)
+        session.type(
+            f"/bin/sh -c 'printf %s $$ > {pid_path}; printf x > {gate_path}; sleep 30' | "
+            f"/bin/cat < {gate_path} > /definitely/missing/quirl-construction-output"
+        )
+        session.send(b"\r")
+        session.wait_for(b"cannot write redirected output")
+        wait_for_prompt(session)
+        observed_child = int(pid_path.read_text(encoding="utf-8").strip())
+        try:
+            os.kill(observed_child, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError(f"partial construction leaked child {observed_child}")
+        enter_and_wait(
+            session,
+            "/usr/bin/printf AFTER_%s CONSTRUCTION_CLEANUP",
+            b"AFTER_CONSTRUCTION_CLEANUP",
+        )
+        wait_for_prompt(session)
+
+        session.type("/bin/sleep 30")
+        session.send(b"\r")
+        child_group = session.pid
+        deadline = time.monotonic() + 2.0
+        while child_group == session.pid and time.monotonic() < deadline:
+            session.read(0.02)
+            child_group = os.tcgetpgrp(session.master)
+        if child_group <= 0 or child_group == session.pid:
+            raise AssertionError(
+                "foreground child did not receive the terminal; "
+                f"tpgid={child_group} tail={bytes(session.output[-1200:])!r}"
+            )
+        session.send(b"\x1a")
+        wait_for_prompt(session)
+        if os.tcgetpgrp(session.master) != session.pid:
+            raise AssertionError("Quirl did not recover the terminal after Ctrl-Z")
+        enter_and_wait(session, "jobs", b"stopped")
+        wait_for_prompt(session)
+        session.type("bg %1")
+        session.send(b"\r")
+        wait_for_prompt(session)
+        enter_and_wait(session, "jobs", b"running")
+        wait_for_prompt(session)
+        session.type("fg %1")
+        session.send(b"\r")
+        deadline = time.monotonic() + 2.0
+        while os.tcgetpgrp(session.master) == session.pid and time.monotonic() < deadline:
+            session.read(0.02)
+        if os.tcgetpgrp(session.master) == session.pid:
+            raise AssertionError(
+                "fg did not return the terminal to the job; "
+                f"tail={bytes(session.output[-1200:])!r}"
+            )
+        session.send(b"\x03")
+        wait_for_prompt(session)
+        enter_and_wait(
+            session,
+            "/usr/bin/printf AFTER_%s JOB_CTRLC",
+            b"AFTER_JOB_CTRLC",
+        )
+        wait_for_prompt(session)
+
+        session.type(
+            "/bin/sh -c 'stty -echo; kill -STOP $$; "
+            "stty -a | grep -q -- \"-echo\" && printf JOB_%s MODES_OK'"
+        )
+        session.send(b"\r")
+        wait_for_prompt(session)
+        if termios.tcgetattr(session.master) != prompt_modes:
+            raise AssertionError("stopped child modes leaked into the Quirl prompt")
+        session.type("fg %2")
+        session.send(b"\r")
+        session.wait_for(b"JOB_MODES_OK")
+        wait_for_prompt(session)
+        if termios.tcgetattr(session.master) != prompt_modes:
+            raise AssertionError("Quirl did not restore termios after fg completion")
+
+        session.send(b"\x04")
+        session.wait_exit()
+    finally:
+        session.close()
+
+
+def check_noninteractive_dialect_islands(binary: Path, root: Path) -> None:
+    session = Session(binary, root)
+    try:
+        session.wait_for(STARTUP_MARKER)
+        enter_and_wait(
+            session,
+            "bash { read value || printf ISLAND_%s STDIN_CLOSED; }",
+            b"ISLAND_STDIN_CLOSED",
+        )
+        wait_for_prompt(session)
+        session.type("bash { sleep 30; }")
+        session.send(b"\r")
+        session.read(0.2)
+        session.send(b"\x1a")
+        session.wait_for(b"cancelled")
+        wait_for_prompt(session)
+        enter_and_wait(
+            session,
+            "/usr/bin/printf AFTER_%s ISLAND_CTRLZ",
+            b"AFTER_ISLAND_CTRLZ",
+        )
+        wait_for_prompt(session)
+        session.send(b"\x04")
+        session.wait_exit()
+    finally:
+        session.close()
+
+
 def check_fallbacks(binary: Path, root: Path) -> None:
     dumb = Session(binary, root, term="dumb")
     try:
@@ -441,6 +606,8 @@ def main() -> None:
         check_rich_editing,
         check_completion,
         check_rich_review_regressions,
+        check_native_job_control,
+        check_noninteractive_dialect_islands,
         check_suspend_resume,
         check_fallbacks,
         check_no_color_preserves_semantic_hints,

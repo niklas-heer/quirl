@@ -501,9 +501,11 @@ pub fn run_source_with_cancellation(
     }
 }
 
-/// Run the body of an explicit interactive dialect island through the same bounded reference
-/// boundary used for Bash/Zsh scripts. The caller owns rendering, so this returns the common
-/// command outcome instead of script JSON.
+/// Run an explicit dialect island through the bounded, noninteractive reference boundary.
+///
+/// Standard input is closed. `SIGINT` cancels the interpreter, and on Unix
+/// `SIGTSTP` also cancels instead of suspending Quirl without a retained job.
+/// The caller owns rendering, so this returns the common command outcome.
 pub fn run_interactive_island(
     language: ScriptLanguage,
     source: &str,
@@ -521,6 +523,20 @@ pub fn run_interactive_island(
         .with_context(error.to_string())
         .with_help("Retry the island; report repeated signal-handler failures")
     })?;
+    #[cfg(unix)]
+    let stop_signal_id = signal_hook::flag::register(
+        signal_hook::consts::SIGTSTP,
+        Arc::clone(&cancellation.cancelled),
+    )
+    .map_err(|error| {
+        signal_hook::low_level::unregister(signal_id);
+        ShellError::new(
+            ErrorCode::Io,
+            "could not install dialect-island stop handler",
+        )
+        .with_context(error.to_string())
+        .with_help("Retry the island; report repeated signal-handler failures")
+    })?;
     let executable = language.executable();
     let result = run_reference_script(
         source,
@@ -531,6 +547,8 @@ pub fn run_interactive_island(
         executable,
     );
     signal_hook::low_level::unregister(signal_id);
+    #[cfg(unix)]
+    signal_hook::low_level::unregister(stop_signal_id);
     let output = result?;
     let stdout = output
         .value
@@ -722,7 +740,10 @@ fn run_reference_script(
     command.env("LC_ALL", "C");
     command
         .args(arguments)
-        .stdin(Stdio::inherit())
+        // Reference runners are a bounded compatibility service, not a second
+        // interactive job-control implementation. Closing stdin prevents a
+        // background process group from stopping forever on a terminal read.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -791,6 +812,7 @@ fn run_reference_script(
             }
         }
     };
+    containment.terminate(&mut child)?;
     let stdout = join_stream_reader(stdout, "reference runner stdout")?;
     let stderr = join_stream_reader(stderr, "reference runner stderr")?;
     let status_code = status.code().unwrap_or(1);
@@ -828,13 +850,6 @@ fn terminate_reference_process(
     child: &mut std::process::Child,
     containment: &ChildProcessTree,
 ) -> Result<(), ShellError> {
-    #[cfg(unix)]
-    if let Ok(process_group) = i32::try_from(child.id()) {
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(process_group),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
     let result = containment.terminate(child);
     if result.is_err() {
         let _ = child.kill();
@@ -1450,6 +1465,24 @@ mod tests {
             output.value["stderr_discarded_bytes"],
             70_000 - MAX_REFERENCE_CAPTURE_BYTES
         );
+    }
+
+    #[test]
+    fn reference_runners_close_stdin_under_the_noninteractive_policy() {
+        if !reference_interpreter_available("bash") {
+            eprintln!("skipping bash: interpreter is unavailable");
+            return;
+        }
+        let output = run_source(
+            "if read -r value; then printf unexpected; else printf stdin-closed; fi",
+            "noninteractive.bash",
+            None,
+            Some(ScriptLanguage::Bash),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.value["stdout"], "stdin-closed");
     }
 
     #[test]
