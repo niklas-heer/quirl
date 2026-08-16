@@ -14,7 +14,8 @@ pub use extension::{
     EXTENSION_PROTOCOL_VERSION, EXTENSION_SCHEMA_DESCRIPTOR, MAX_EXTENSION_DEADLINE_MS,
 };
 pub use process::{
-    directory_entries, CommandOutcome, CommandRunner, Entry, EntryKind, ProcessHost, ProcessRequest,
+    directory_entries, directory_entries_with_options, CommandOutcome, CommandRunner,
+    DirectoryOptions, DirectorySort, Entry, EntryKind, ProcessHost, ProcessRequest,
 };
 pub use protocol::{
     schema_fingerprint, CompatibilityPolicy, VersionPolicy, COMMON_ABI_SCHEMA_DESCRIPTOR,

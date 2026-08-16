@@ -20,12 +20,15 @@ mod platform {
     };
     use os_pipe::{pipe, PipeReader, PipeWriter};
     use quirl_core::{CommandOutcome, CommandRunner, ErrorCode, ProcessRequest, ShellError};
-    use quirl_syntax::{parse_command_list, ListConnector, Pipeline, RedirectKind, SimpleCommand};
+    use quirl_syntax::{
+        parse_command_list, ListConnector, Pipeline, Quoting, RedirectKind, SimpleCommand, Word,
+    };
     use serde::{Deserialize, Serialize};
     use std::{
         env,
         fs::{File, OpenOptions},
         io::{IsTerminal, Read, Write},
+        path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         sync::atomic::Ordering,
         thread::{self, JoinHandle},
@@ -248,7 +251,7 @@ mod platform {
                         continue;
                     }
                 }
-                last = self.execute_pipeline(pipeline, input, capture, request)?;
+                last = self.execute_pipeline(pipeline, input, capture, request, last.status)?;
                 if capture {
                     append_captured_output(
                         &mut captured_stdout,
@@ -275,7 +278,10 @@ mod platform {
             source: &str,
             capture: bool,
             request: Option<&ProcessRequest>,
+            previous_status: i32,
         ) -> Result<CommandOutcome, ShellError> {
+            let pipeline = self.expand_pipeline(pipeline, request, previous_status)?;
+            let pipeline = &pipeline;
             if pipeline.commands.len() == 1 {
                 if pipeline.background
                     && pipeline.commands[0].words.first().is_some_and(|name| {
@@ -296,6 +302,176 @@ mod platform {
                 }
             }
             self.spawn_pipeline(pipeline, source, capture, request)
+        }
+
+        fn expand_pipeline(
+            &mut self,
+            pipeline: &Pipeline,
+            request: Option<&ProcessRequest>,
+            previous_status: i32,
+        ) -> Result<Pipeline, ShellError> {
+            const MAX_SUBSTITUTION_BYTES: usize = 16 * 1024;
+            if request.is_some_and(|request| request.cancelled.load(Ordering::Relaxed)) {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "command expansion was cancelled before execution",
+                )
+                .with_help("Run the command again when cancellation is no longer requested"));
+            }
+            let mut expanded = pipeline.clone();
+            for command in &mut expanded.commands {
+                let forms = command.word_ir.clone();
+                if forms.is_empty() {
+                    continue;
+                }
+                let mut words = Vec::new();
+                for word in &forms {
+                    let (value, glob) =
+                        self.expand_word(word, MAX_SUBSTITUTION_BYTES, request, previous_status)?;
+                    let matches = if glob {
+                        pathname_expand(&value)?
+                    } else {
+                        Vec::new()
+                    };
+                    if matches.is_empty() {
+                        words.push(value);
+                    } else {
+                        words.extend(matches);
+                    }
+                }
+                command.words = words;
+                for redirect in &mut command.redirects {
+                    let (path, _) = self.expand_word(
+                        &redirect.target,
+                        MAX_SUBSTITUTION_BYTES,
+                        request,
+                        previous_status,
+                    )?;
+                    redirect.path = path;
+                }
+            }
+            Ok(expanded)
+        }
+
+        fn expand_word(
+            &mut self,
+            word: &Word,
+            limit: usize,
+            request: Option<&ProcessRequest>,
+            previous_status: i32,
+        ) -> Result<(String, bool), ShellError> {
+            let mut value = String::new();
+            let mut pathname = false;
+            for part in &word.parts {
+                if matches!(part.quoting, Quoting::Single | Quoting::Escaped) {
+                    value.push_str(&part.text);
+                    continue;
+                }
+                pathname |= part.quoting == Quoting::Unquoted
+                    && part
+                        .text
+                        .chars()
+                        .any(|character| matches!(character, '*' | '?' | '['));
+                value.push_str(&self.expand_fragment(
+                    &part.text,
+                    limit,
+                    request,
+                    previous_status,
+                )?);
+            }
+            Ok((value, pathname))
+        }
+
+        fn expand_fragment(
+            &mut self,
+            text: &str,
+            limit: usize,
+            request: Option<&ProcessRequest>,
+            previous_status: i32,
+        ) -> Result<String, ShellError> {
+            let mut output = String::new();
+            let mut index = 0;
+            while index < text.len() {
+                let rest = &text[index..];
+                if let Some(arithmetic) = rest.strip_prefix("$((") {
+                    let Some(close) = matching_double_paren(arithmetic) else {
+                        return Err(expansion_error(
+                            "unclosed arithmetic expansion",
+                            "Close the `))` in `$((...))`",
+                        ));
+                    };
+                    output.push_str(&evaluate_arithmetic(&arithmetic[..close])?.to_string());
+                    index += 3 + close + 2;
+                    continue;
+                }
+                if let Some(after) = rest.strip_prefix("$(") {
+                    let Some(close) = matching_paren(after) else {
+                        return Err(expansion_error(
+                            "unclosed command substitution",
+                            "Close the `)` in `$(...)`",
+                        ));
+                    };
+                    let source = &after[..close];
+                    if source.len() > limit {
+                        return Err(expansion_error(
+                            "command substitution exceeds its source budget",
+                            "Keep `$(...)` below 16 KiB or use an explicit pipeline",
+                        ));
+                    }
+                    let nested = self.execute_inner_with_request(source, true, request)?;
+                    let stdout = nested.stdout.unwrap_or_default();
+                    if stdout.len() > limit {
+                        return Err(expansion_error(
+                            "command substitution exceeded its output budget",
+                            "Write large output to a file before substituting it",
+                        ));
+                    }
+                    output.push_str(stdout.trim_end_matches('\n'));
+                    index += 2 + close + 1;
+                    continue;
+                }
+                if let Some(after) = rest.strip_prefix("${") {
+                    let Some(close) = after.find('}') else {
+                        return Err(expansion_error(
+                            "unclosed parameter expansion",
+                            "Close the `}` in `${...}`",
+                        ));
+                    };
+                    output.push_str(&parameter_value(&after[..close]));
+                    index += 3 + close;
+                    continue;
+                }
+                if let Some(after) = rest.strip_prefix('$') {
+                    let Some(character) = after.chars().next() else {
+                        output.push('$');
+                        break;
+                    };
+                    if character == '?' {
+                        output.push_str(&previous_status.to_string());
+                        index += 2;
+                        continue;
+                    }
+                    if character == '$' {
+                        output.push_str(&std::process::id().to_string());
+                        index += 2;
+                        continue;
+                    }
+                    if character == '_' || character.is_ascii_alphabetic() {
+                        let length = after
+                            .chars()
+                            .take_while(|value| *value == '_' || value.is_ascii_alphanumeric())
+                            .map(char::len_utf8)
+                            .sum();
+                        output.push_str(&parameter_value(&after[..length]));
+                        index += 1 + length;
+                        continue;
+                    }
+                }
+                let character = rest.chars().next().unwrap_or_default();
+                output.push(character);
+                index += character.len_utf8();
+            }
+            Ok(output)
         }
 
         fn execute_control_builtin(
@@ -436,14 +612,32 @@ mod platform {
                     })?;
                 let mut process = Command::new(executable);
                 process.args(command.words.iter().skip(1));
-                process
-                    .stdin(stdin)
-                    .stdout(stdout)
-                    .stderr(if capture_streams {
-                        Stdio::piped()
-                    } else {
+                let stderr = if command.redirects.iter().any(duplicates_stderr_to_stdout) {
+                    if let Some(writer) = writer.as_ref() {
+                        Stdio::from(writer.try_clone().map_err(|error| {
+                            ShellError::new(
+                                ErrorCode::Io,
+                                "could not duplicate the pipeline output descriptor",
+                            )
+                            .with_context(error.to_string())
+                            .with_help("Retry the command or use an explicit dialect island")
+                        })?)
+                    } else if !capture_streams {
                         Stdio::inherit()
-                    });
+                    } else {
+                        return Err(ShellError::new(
+                            ErrorCode::InvalidCommand,
+                            "native C1 cannot capture `2>&1` after a stdout file redirect",
+                        )
+                        .with_command(source)
+                        .with_help(
+                            "Use `bash { ... }` or `zsh { ... }` for ordered descriptor redirects",
+                        ));
+                    }
+                } else {
+                    stderr_stdio(command, capture_streams)?
+                };
+                process.stdin(stdin).stdout(stdout).stderr(stderr);
                 #[cfg(unix)]
                 process.process_group(spawned.process_group.unwrap_or(0));
                 let mut child = process.spawn().map_err(|error| {
@@ -681,25 +875,378 @@ mod platform {
         }
     }
 
+    fn expansion_error(message: &str, help: &str) -> ShellError {
+        ShellError::new(ErrorCode::InvalidCommand, message).with_help(help)
+    }
+
+    fn parameter_value(name: &str) -> String {
+        std::env::var(name).unwrap_or_default()
+    }
+
+    fn matching_paren(source: &str) -> Option<usize> {
+        let mut depth = 1_u32;
+        let mut quote = None;
+        let mut escaped = false;
+        for (index, character) in source.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if character == '\\' && quote != Some('\'') {
+                escaped = true;
+                continue;
+            }
+            if let Some(active) = quote {
+                if character == active {
+                    quote = None;
+                }
+                continue;
+            }
+            if matches!(character, '\'' | '"') {
+                quote = Some(character);
+                continue;
+            }
+            match character {
+                '(' => depth = depth.saturating_add(1),
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn matching_double_paren(source: &str) -> Option<usize> {
+        source.find("))")
+    }
+
+    fn evaluate_arithmetic(source: &str) -> Result<i64, ShellError> {
+        #[derive(Clone, Copy)]
+        struct Parser<'a> {
+            input: &'a [u8],
+            index: usize,
+        }
+        impl<'a> Parser<'a> {
+            fn skip(&mut self) {
+                while self
+                    .input
+                    .get(self.index)
+                    .is_some_and(u8::is_ascii_whitespace)
+                {
+                    self.index += 1;
+                }
+            }
+            fn expression(&mut self) -> Result<i64, ShellError> {
+                let mut value = self.term()?;
+                loop {
+                    self.skip();
+                    match self.input.get(self.index).copied() {
+                        Some(b'+') => {
+                            self.index += 1;
+                            value = value.checked_add(self.term()?).ok_or_else(|| {
+                                expansion_error(
+                                    "arithmetic expansion overflowed",
+                                    "Use a smaller integer expression",
+                                )
+                            })?;
+                        }
+                        Some(b'-') => {
+                            self.index += 1;
+                            value = value.checked_sub(self.term()?).ok_or_else(|| {
+                                expansion_error(
+                                    "arithmetic expansion overflowed",
+                                    "Use a smaller integer expression",
+                                )
+                            })?;
+                        }
+                        _ => return Ok(value),
+                    }
+                }
+            }
+            fn term(&mut self) -> Result<i64, ShellError> {
+                let mut value = self.factor()?;
+                loop {
+                    self.skip();
+                    match self.input.get(self.index).copied() {
+                        Some(b'*') => {
+                            self.index += 1;
+                            value = value.checked_mul(self.factor()?).ok_or_else(|| {
+                                expansion_error(
+                                    "arithmetic expansion overflowed",
+                                    "Use a smaller integer expression",
+                                )
+                            })?;
+                        }
+                        Some(b'/') => {
+                            self.index += 1;
+                            let divisor = self.factor()?;
+                            if divisor == 0 {
+                                return Err(expansion_error(
+                                    "arithmetic expansion divides by zero",
+                                    "Use a non-zero divisor",
+                                ));
+                            }
+                            value /= divisor;
+                        }
+                        _ => return Ok(value),
+                    }
+                }
+            }
+            fn factor(&mut self) -> Result<i64, ShellError> {
+                self.skip();
+                if self.input.get(self.index) == Some(&b'(') {
+                    self.index += 1;
+                    let value = self.expression()?;
+                    self.skip();
+                    if self.input.get(self.index) != Some(&b')') {
+                        return Err(expansion_error(
+                            "invalid arithmetic expansion",
+                            "Balance parentheses in `$((...))`",
+                        ));
+                    }
+                    self.index += 1;
+                    return Ok(value);
+                }
+                let negative = if self.input.get(self.index) == Some(&b'-') {
+                    self.index += 1;
+                    true
+                } else {
+                    false
+                };
+                let start = self.index;
+                while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
+                    self.index += 1;
+                }
+                if start == self.index {
+                    return Err(expansion_error(
+                        "invalid arithmetic expansion",
+                        "Use integer literals and +, -, *, /, or parentheses",
+                    ));
+                }
+                let text = std::str::from_utf8(&self.input[start..self.index]).map_err(|_| {
+                    expansion_error("invalid arithmetic expansion", "Use ASCII integer literals")
+                })?;
+                let value = text.parse::<i64>().map_err(|_| {
+                    expansion_error(
+                        "arithmetic expansion overflowed",
+                        "Use a smaller integer expression",
+                    )
+                })?;
+                Ok(if negative { -value } else { value })
+            }
+        }
+        let mut parser = Parser {
+            input: source.as_bytes(),
+            index: 0,
+        };
+        let value = parser.expression()?;
+        parser.skip();
+        if parser.index != parser.input.len() {
+            return Err(expansion_error(
+                "invalid arithmetic expansion",
+                "Use integer literals and +, -, *, /, or parentheses",
+            ));
+        }
+        Ok(value)
+    }
+
+    fn pathname_expand(pattern: &str) -> Result<Vec<String>, ShellError> {
+        const MAX_GLOB_MATCHES: usize = 10_000;
+        let absolute = pattern.starts_with('/');
+        let mut paths = vec![if absolute {
+            PathBuf::from("/")
+        } else {
+            PathBuf::new()
+        }];
+        for component in pattern.split('/').filter(|component| !component.is_empty()) {
+            let has_pattern = component
+                .chars()
+                .any(|character| matches!(character, '*' | '?' | '['));
+            let mut next = Vec::new();
+            for prefix in &paths {
+                if !has_pattern {
+                    next.push(prefix.join(component));
+                    continue;
+                }
+                let directory = if prefix.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    prefix.as_path()
+                };
+                let Ok(entries) = std::fs::read_dir(directory) else {
+                    continue;
+                };
+                for entry in entries.filter_map(Result::ok) {
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    if glob_matches(component, &name) {
+                        next.push(prefix.join(name));
+                        if next.len() > MAX_GLOB_MATCHES {
+                            return Err(ShellError::new(
+                                ErrorCode::ResourceLimit,
+                                "pathname expansion exceeded its match budget",
+                            )
+                            .with_help(
+                                "Narrow the pattern below 10,000 matches or use an explicit data pipeline",
+                            ));
+                        }
+                    }
+                }
+            }
+            paths = next;
+            if paths.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        let mut matches = paths
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        matches.sort();
+        Ok(matches)
+    }
+
+    fn glob_matches(pattern: &str, candidate: &str) -> bool {
+        enum GlobAtom {
+            Star,
+            Any,
+            Literal(char),
+            Class {
+                negated: bool,
+                ranges: Vec<(char, char)>,
+            },
+        }
+
+        let characters = pattern.chars().collect::<Vec<_>>();
+        let mut atoms = Vec::new();
+        let mut index = 0;
+        while index < characters.len() {
+            match characters[index] {
+                '*' => atoms.push(GlobAtom::Star),
+                '?' => atoms.push(GlobAtom::Any),
+                '[' => {
+                    let Some(relative_end) = characters[index + 1..]
+                        .iter()
+                        .position(|character| *character == ']')
+                    else {
+                        atoms.push(GlobAtom::Literal('['));
+                        index += 1;
+                        continue;
+                    };
+                    let end = index + 1 + relative_end;
+                    let mut class = &characters[index + 1..end];
+                    let negated = class
+                        .first()
+                        .is_some_and(|character| matches!(character, '!' | '^'));
+                    if negated {
+                        class = &class[1..];
+                    }
+                    let mut ranges = Vec::new();
+                    let mut class_index = 0;
+                    while class_index < class.len() {
+                        if class_index + 2 < class.len() && class[class_index + 1] == '-' {
+                            ranges.push((class[class_index], class[class_index + 2]));
+                            class_index += 3;
+                        } else {
+                            ranges.push((class[class_index], class[class_index]));
+                            class_index += 1;
+                        }
+                    }
+                    atoms.push(GlobAtom::Class { negated, ranges });
+                    index = end;
+                }
+                character => atoms.push(GlobAtom::Literal(character)),
+            }
+            index += 1;
+        }
+        if candidate.starts_with('.') && !pattern.starts_with('.') {
+            return false;
+        }
+        let candidate = candidate.chars().collect::<Vec<_>>();
+        let mut previous = vec![false; candidate.len() + 1];
+        previous[0] = true;
+        for atom in atoms {
+            let mut current = vec![false; candidate.len() + 1];
+            match atom {
+                GlobAtom::Star => {
+                    current[0] = previous[0];
+                    for candidate_index in 1..=candidate.len() {
+                        current[candidate_index] =
+                            previous[candidate_index] || current[candidate_index - 1];
+                    }
+                }
+                GlobAtom::Any => {
+                    current[1..].copy_from_slice(&previous[..candidate.len()]);
+                }
+                GlobAtom::Literal(expected) => {
+                    for candidate_index in 1..=candidate.len() {
+                        current[candidate_index] = previous[candidate_index - 1]
+                            && candidate[candidate_index - 1] == expected;
+                    }
+                }
+                GlobAtom::Class { negated, ranges } => {
+                    for candidate_index in 1..=candidate.len() {
+                        let character = candidate[candidate_index - 1];
+                        let contained = ranges
+                            .iter()
+                            .any(|(start, end)| *start <= character && character <= *end);
+                        current[candidate_index] =
+                            previous[candidate_index - 1] && (contained != negated);
+                    }
+                }
+            }
+            previous = current;
+        }
+        previous[candidate.len()]
+    }
+
     fn input_stdio(
         command: &SimpleCommand,
         previous: Option<PipeReader>,
         has_upstream: bool,
     ) -> Result<Stdio, ShellError> {
         let mut redirected = None;
-        for redirect in command
-            .redirects
-            .iter()
-            .filter(|redirect| redirect.kind == RedirectKind::Input)
-        {
-            redirected = Some(File::open(&redirect.path).map_err(|error| {
-                ShellError::new(
-                    ErrorCode::Io,
-                    format!("cannot read redirected input {}", redirect.path),
-                )
-                .with_context(error.to_string())
-                .with_help("Check that the file exists and is readable")
-            })?);
+        let mut here_string = None;
+        for redirect in command.redirects.iter().filter(|redirect| {
+            matches!(
+                redirect.kind,
+                RedirectKind::Input | RedirectKind::HereString
+            )
+        }) {
+            if redirect.kind == RedirectKind::HereString {
+                here_string = Some(redirect.path.clone());
+            } else {
+                redirected = Some(File::open(&redirect.path).map_err(|error| {
+                    ShellError::new(
+                        ErrorCode::Io,
+                        format!("cannot read redirected input {}", redirect.path),
+                    )
+                    .with_context(error.to_string())
+                    .with_help("Check that the file exists and is readable")
+                })?);
+            }
+        }
+        if let Some(value) = here_string {
+            let (reader, mut writer) = pipe().map_err(|error| {
+                ShellError::new(ErrorCode::Io, "could not create here-string input")
+                    .with_context(error.to_string())
+                    .with_help("Retry the command or use an input file")
+            })?;
+            writer
+                .write_all(value.as_bytes())
+                .and_then(|()| writer.write_all(b"\n"))
+                .map_err(|error| {
+                    ShellError::new(ErrorCode::Io, "could not write here-string input")
+                        .with_context(error.to_string())
+                        .with_help("Retry the command or use an input file")
+                })?;
+            drop(writer);
+            return Ok(Stdio::from(reader));
         }
         if let Some(file) = redirected {
             return Ok(Stdio::from(file));
@@ -722,11 +1269,9 @@ mod platform {
         capture: bool,
     ) -> Result<(Stdio, Option<PipeReader>, Option<PipeWriter>), ShellError> {
         let mut redirected = None;
-        for redirect in command
-            .redirects
-            .iter()
-            .filter(|redirect| matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append))
-        {
+        for redirect in command.redirects.iter().filter(|redirect| {
+            redirect.fd == 1 && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+        }) {
             redirected = Some(open_redirected_output(redirect)?);
         }
         if let Some(file) = redirected {
@@ -746,6 +1291,23 @@ mod platform {
             return Ok((stdout, Some(reader), Some(writer)));
         }
         Ok((Stdio::inherit(), None, None))
+    }
+
+    fn stderr_stdio(command: &SimpleCommand, capture: bool) -> Result<Stdio, ShellError> {
+        if let Some(redirect) = command.redirects.iter().rev().find(|redirect| {
+            redirect.fd == 2 && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+        }) {
+            return Ok(Stdio::from(open_redirected_output(redirect)?));
+        }
+        Ok(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+    }
+
+    fn duplicates_stderr_to_stdout(redirect: &quirl_syntax::Redirect) -> bool {
+        redirect.fd == 2 && redirect.kind == RedirectKind::DuplicateOutput && redirect.path == "1"
     }
 
     fn finish_control_builtin(
@@ -1342,6 +1904,17 @@ mod platform {
                 thread::sleep(Duration::from_millis(5));
             }
             executor.jobs()
+        }
+
+        #[test]
+        fn pathname_matching_is_unicode_aware_and_non_exponential() {
+            assert!(glob_matches("über-?.[rR][s-t]", "über-🌀.rs"));
+            assert!(glob_matches(".quirl*", ".quirl-history"));
+            assert!(!glob_matches("*", ".quirl-history"));
+            assert!(!glob_matches(
+                "********************************x",
+                "a-very-long-candidate-without-the-final-letter",
+            ));
         }
 
         #[test]
@@ -2433,7 +3006,13 @@ impl ProcessBackend for NativeExecutor {
 #[cfg(test)]
 mod backend_contract_tests {
     use super::*;
-    use std::{fs, path::PathBuf, time::Instant};
+    use quirl_core::ErrorCode;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{atomic::AtomicBool, Arc},
+        time::{Duration, Instant},
+    };
 
     fn temporary_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("quirl-backend-{name}-{}", std::process::id()))
@@ -2472,6 +3051,62 @@ mod backend_contract_tests {
         assert_eq!(outcome.status, 0);
         assert!(fs::read_to_string(&output).unwrap().contains("hello"));
         fs::remove_file(output).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_expands_parameters_arithmetic_substitutions_and_here_strings() {
+        std::env::set_var("QUIRL_C1_WORD", "expanded");
+        let mut backend = NativeExecutor::default();
+        let output = backend
+            .execute_capture(
+                "printf '%s|%s|%s\\n' $QUIRL_C1_WORD $((1 + 2)) $(printf nested); cat <<< value",
+            )
+            .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.as_deref(), Some("expanded|3|nested\nvalue\n"));
+        std::env::remove_var("QUIRL_C1_WORD");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_preserves_single_quotes_and_descriptor_redirects() {
+        let output = temporary_path("c1-stderr");
+        let mut backend = NativeExecutor::default();
+        let command = format!(
+            "printf '%s' '$HOME'; sh -c 'printf err >&2' 2> {}",
+            output.display()
+        );
+        let result = backend.execute_capture(&command).unwrap();
+        assert_eq!(result.stdout.as_deref(), Some("$HOME"));
+        assert_eq!(fs::read_to_string(&output).unwrap(), "err");
+        fs::remove_file(output).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_expands_the_actual_previous_status() {
+        let output = NativeExecutor::default()
+            .execute_capture("false; printf '%s' $?")
+            .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.as_deref(), Some("1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_substitution_honors_outer_cancellation_and_deadline() {
+        let mut backend = NativeExecutor::default();
+        let request = quirl_core::ProcessRequest {
+            command: "printf '%s' $(sleep 1)".to_owned(),
+            deadline: Duration::from_millis(20),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            max_output_bytes: 1024,
+        };
+        let started = Instant::now();
+        let error = backend.execute_capture_request(request).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

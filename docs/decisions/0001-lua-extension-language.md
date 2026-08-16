@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-08-15
 - Decision owners: Quirl maintainers
-- Applies to: configuration, automation scripts, trusted plugins, prompt components, completion providers, and keymaps
+- Applies to: configuration, scripts, trusted plugins, prompt components, completion providers, and keymaps
 
 ## Context
 

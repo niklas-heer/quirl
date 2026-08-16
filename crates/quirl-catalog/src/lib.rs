@@ -393,30 +393,52 @@ impl Catalog {
                 ),
                 command(
                     "quirl data",
-                    "quirl data <source> [| transform ...]",
+                    "quirl data <source> [| transform ...] [--format table|plain|json]",
                     "Evaluate a native structured-data pipeline",
-                    "Sources are `pwd`, `ls [path]`, `open <path>`, or JSON. Transforms include typed `where` comparisons with `and`/`or`, dotted `get`, `select`, `sort`, `take`, `first`, and `length`.",
-                    vec![],
+                    "Sources are `pwd`, `files [path]` (or `ls`), `open <path>`, JSON, or explicit `^external <command>`. `open` adapts JSON, YAML, TOML, CSV, and uncompressed POSIX tar headers; unknown extensions remain text. `lines`, `from json`, and `to json` make byte/value conversions visible. The CLI injects a deadline-, cancellation-, and output-bounded external host; library runtimes fail closed without one. CSV/tar rows are pulled lazily and all adapters enforce file, row, field, and depth limits. `sort` and table output intentionally collect within those limits. Transforms include typed `where` comparisons with `and`/`or`, dotted `get`, `select`, `sort`, `take`, `first`, and `length`. HTTP is not an implicit source.",
+                    vec![option_with_static_values(
+                        &["--format"],
+                        "table|plain|json",
+                        &["table", "plain", "json"],
+                        "Choose a human table/plain renderer or the stable typed JSON envelope",
+                    )],
                     &[
                         "mode data",
-                        "ls . | select name kind size",
+                        "files . | select name kind size",
                         "ls . | where kind == file and size > 1024 | sort size desc | take 10",
                         "quirl data '[1,2,3] | length'",
+                        "quirl data 'open users.csv' --format table",
+                        "quirl data '^external printf \"{\\\"ok\\\":true}\" | from json'",
                     ],
-                    &[Effect::ReadFilesystem],
+                    &[Effect::ReadFilesystem, Effect::SpawnProcess],
                     Provenance::Builtin,
                 ),
                 command(
                     "ls",
                     "ls [path] [options]",
                     "List a directory as structured entries",
-                    "Quirl's native ls renders a table for humans and stable JSON for tools.",
+                    "Quirl's bounded native ls renders terminal-safe plain rows for humans and preserves exact entry values in stable JSON. Sorting is deterministic; symlink targets are lazy and opt-in.",
                     vec![
                         option(&["-a", "--all"], None, "Include hidden entries"),
                         option(&["-l", "--long"], None, "Show size, kind, and modified time"),
+                        option(&["-r", "--reverse"], None, "Reverse the selected sort within directory/file groups"),
+                        option(&["--directories-first", "--dirs-first"], None, "Keep directories before other entry kinds"),
+                        option(&["--resolve-links"], None, "Read symlink targets as an explicit metadata enrichment"),
                         option(&["--json"], None, "Emit stable structured JSON"),
+                        option_with_static_values(
+                            &["--format"],
+                            "plain|json",
+                            &["plain", "json"],
+                            "Choose terminal-safe plain output or stable JSON",
+                        ),
+                        option_with_static_values(
+                            &["--sort"],
+                            "name|size|modified|kind",
+                            &["name", "size", "modified", "kind"],
+                            "Choose the deterministic entry ordering",
+                        ),
                     ],
-                    &["ls", "ls --long src", "ls --json | jq"],
+                    &["ls", "ls -la src", "ls --sort size --reverse", "ls --format json | jq"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
@@ -580,12 +602,75 @@ impl Catalog {
                     Provenance::Builtin,
                 ),
                 command(
+                    "quirl config web",
+                    "quirl config web <file> [--port <port>]",
+                    "Open the local schema-backed configuration form",
+                    "Serves an accessible configuration form only on IPv4 loopback. The private session URL carries a CSRF token; saves validate the complete Lua configuration, retain a `.bak`, preserve non-overlapping concurrent source edits, and reject conflicting or code-controlled fields.",
+                    vec![option(&["--port"], Some("port"), "Loopback port; 0 selects an available port")],
+                    &["quirl config web ~/.config/quirl/config.lua", "quirl config web examples/config.lua --port 8787"],
+                    &[Effect::ReadFilesystem, Effect::WriteFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
                     "quirl config tui",
                     "quirl config tui <file>",
                     "Inspect schema-backed configuration in the terminal",
                     "Shows current editor and picker values, allowed values, and textual editing guidance in an accessible line-oriented view.",
                     vec![],
                     &["quirl config tui ~/.config/quirl/config.lua"],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl config fmt",
+                    "quirl config fmt <file> [--check]",
+                    "Format a Lua configuration deterministically",
+                    "Validates the authoritative configuration, then applies Quirl's deterministic Lua formatter. `--check` reports drift and never writes.",
+                    vec![option(&["--check"], None, "Report formatting drift without writing")],
+                    &["quirl config fmt ~/.config/quirl/config.lua --check"],
+                    &[Effect::ReadFilesystem, Effect::WriteFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl config export",
+                    "quirl config export <file> [--format text|json]",
+                    "Export evaluated schema-backed configuration",
+                    "Reads and validates config.lua, then emits a deterministic terminal-safe text view or versioned JSON document without modifying source.",
+                    vec![option(&["--format"], Some("text|json"), "Choose output format")],
+                    &["quirl config export ~/.config/quirl/config.lua --format json"],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl config diff",
+                    "quirl config diff <file> <other> [--format text|json]",
+                    "Compare two evaluated configurations",
+                    "Loads both authoritative Lua files under the restricted schema policy and reports deterministic field-level differences without changing either file.",
+                    vec![option(&["--format"], Some("text|json"), "Choose output format")],
+                    &["quirl config diff personal.lua work.lua --format json"],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl config migrate",
+                    "quirl config migrate <file> --dry-run [--format text|json]",
+                    "Preview a schema migration without rewriting configuration",
+                    "0.1.0 only previews the unversioned-to-v1 schema insertion. `--dry-run` is required and no source or backup file is written.",
+                    vec![
+                        option(&["--dry-run"], None, "Require a non-mutating migration preview"),
+                        option(&["--format"], Some("text|json"), "Choose output format"),
+                    ],
+                    &["quirl config migrate ~/.config/quirl/config.lua --dry-run"],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl config doctor",
+                    "quirl config doctor <file> [--format text|json]",
+                    "Diagnose configuration schema and editability",
+                    "Validates the authoritative configuration and reports which recognized settings are safe literal patches versus code-controlled expressions; it never writes source.",
+                    vec![option(&["--format"], Some("text|json"), "Choose output format")],
+                    &["quirl config doctor ~/.config/quirl/config.lua"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
@@ -852,6 +937,21 @@ impl Catalog {
                     "Speaks a deterministic LSP subset over stdio, using the generated Lua HOST_API and semantic command catalog for diagnostics, completion, hover, signatures, and module docs without evaluating documents.",
                     vec![],
                     &["quirl lsp"],
+                    &[],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl serve mcp",
+                    "quirl serve mcp --capabilities catalog|complete|check|format",
+                    "Serve explicitly granted source intelligence over MCP stdio",
+                    "Supports modern 2026-07-28 discovery and explicitly negotiated legacy clients. Each process exposes only the requested bounded catalog, completion, source-check, and source-format tools; it grants no filesystem, network, plugin, or command-execution authority.",
+                    vec![required_repeatable_option_with_static_values(
+                        &["--capabilities"],
+                        "catalog|complete|check|format",
+                        &["catalog", "complete", "check", "format"],
+                        "Grant one or more comma-separated MCP tools",
+                    )],
+                    &["quirl serve mcp --capabilities catalog,complete,check,format"],
                     &[],
                     Provenance::Builtin,
                 ),
@@ -1743,6 +1843,18 @@ fn repeatable_option(names: &[&str], value_type: &str, summary: &str) -> OptionS
 fn required_option(names: &[&str], value_type: &str, summary: &str) -> OptionSpec {
     let mut option = option(names, Some(value_type), summary);
     option.required = true;
+    option
+}
+
+fn required_repeatable_option_with_static_values(
+    names: &[&str],
+    value_type: &str,
+    values: &[&str],
+    summary: &str,
+) -> OptionSpec {
+    let mut option = option_with_static_values(names, value_type, values, summary);
+    option.required = true;
+    option.repeatable = true;
     option
 }
 

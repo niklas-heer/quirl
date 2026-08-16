@@ -3,13 +3,14 @@ use quirl_core::{escape_json_terminal_controls, ErrorCode, ShellError};
 use quirl_data::DataRuntime;
 use quirl_lua::{format_file, LuaPolicy, LuaRuntime, MAX_LUA_SOURCE_BYTES};
 use quirl_process::{sandboxed_process_host, ChildProcessTree, NativeExecutor};
-use quirl_syntax::check_script;
+use quirl_syntax::{check_script, parse_command_list};
 use quirl_ui::render_error;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     fs,
     io::{self, Read},
+    ops::Range,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -316,8 +317,17 @@ fn check_script_file(path: &Path) -> Result<(), ShellError> {
     }
 }
 
-fn check_quirl_source(source: &str, source_name: &str) -> Result<(), ShellError> {
-    let diagnostics = check_script(source);
+pub(crate) fn check_quirl_source(source: &str, source_name: &str) -> Result<(), ShellError> {
+    let statements = native_script_statements(source, source_name)?;
+    let mut diagnostics = check_script(&script_without_explicit_blocks(source, &statements));
+    for statement in &statements {
+        if statement.explicit && statement.kind == NativeStatementKind::Command {
+            diagnostics.extend(command_block_diagnostics(source, statement));
+        }
+    }
+    diagnostics.sort_by(|left, right| {
+        (left.start, left.end, &left.message).cmp(&(right.start, right.end, &right.message))
+    });
     if diagnostics.is_empty() {
         return Ok(());
     }
@@ -489,6 +499,41 @@ pub fn run_source_with_cancellation(
             language.executable(),
         ),
     }
+}
+
+/// Run the body of an explicit interactive dialect island through the same bounded reference
+/// boundary used for Bash/Zsh scripts. The caller owns rendering, so this returns the common
+/// command outcome instead of script JSON.
+pub fn run_interactive_island(
+    language: ScriptLanguage,
+    source: &str,
+) -> Result<quirl_core::CommandOutcome, ShellError> {
+    let executable = language.executable();
+    let output = run_reference_script(
+        source,
+        "<interactive island>",
+        language,
+        &[],
+        &ScriptCancellation::default(),
+        executable,
+    )?;
+    let stdout = output
+        .value
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let stderr = output
+        .value
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(quirl_core::CommandOutcome {
+        status: output.status,
+        stdout: Some(stdout),
+        stderr: Some(stderr),
+    })
 }
 
 impl ScriptLanguage {
@@ -878,54 +923,335 @@ fn run_quirl_source(
     let mut executor = NativeExecutor::default();
     let data = DataRuntime::new();
     let mut value = json!({ "args": arguments, "status": 0 });
-    for (line_index, line) in source.lines().enumerate() {
-        if line_index == 0 && line.starts_with("#!") {
-            continue;
-        }
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(expression) = quirl_syntax::data_statement_expression(line) {
-            value = data.eval(expression).map_err(|error| {
-                error.with_label(
-                    Some(source_name.to_owned()),
-                    line_offset(source, line_index),
-                    line_offset(source, line_index) + line.len(),
-                    "failed Quirl data statement",
-                )
-            })?;
-            continue;
-        }
-        let outcome = executor.execute_capture(line).map_err(|error| {
-            error.with_label(
-                Some(source_name.to_owned()),
-                line_offset(source, line_index),
-                line_offset(source, line_index) + line.len(),
-                "failed Quirl command statement",
-            )
-        })?;
-        value = json!({
-            "status": outcome.status,
-            "stdout": outcome.stdout.unwrap_or_default(),
-            "stderr": outcome.stderr.unwrap_or_default(),
-        });
-        if outcome.status != 0 {
-            return Ok(ScriptRunOutput {
-                status: outcome.status,
-                value,
-            });
+    for statement in native_script_statements(source, source_name)? {
+        let statement_source = &source[statement.body.clone()];
+        match statement.kind {
+            NativeStatementKind::Data => {
+                value = data.eval(statement_source.trim()).map_err(|error| {
+                    error.with_label(
+                        Some(source_name.to_owned()),
+                        statement.body.start,
+                        statement.body.end,
+                        "failed Quirl data statement",
+                    )
+                })?;
+            }
+            NativeStatementKind::Command => {
+                let outcome = if statement.explicit {
+                    execute_command_block(
+                        &mut executor,
+                        source,
+                        source_name,
+                        statement.body.clone(),
+                    )?
+                } else {
+                    execute_native_command(
+                        &mut executor,
+                        statement_source,
+                        source_name,
+                        statement.body.clone(),
+                    )?
+                };
+                value = json!({
+                    "status": outcome.status,
+                    "stdout": outcome.stdout.unwrap_or_default(),
+                    "stderr": outcome.stderr.unwrap_or_default(),
+                });
+                if outcome.status != 0 {
+                    return Ok(ScriptRunOutput {
+                        status: outcome.status,
+                        value,
+                    });
+                }
+            }
         }
     }
     Ok(ScriptRunOutput { status: 0, value })
 }
 
-fn line_offset(source: &str, line_index: usize) -> usize {
-    source
-        .split_inclusive('\n')
-        .take(line_index)
-        .map(str::len)
-        .sum()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeStatementKind {
+    Data,
+    Command,
+}
+
+#[derive(Debug, Clone)]
+struct NativeScriptStatement {
+    kind: NativeStatementKind,
+    /// The source range that identifies this statement, including explicit delimiters.
+    span: Range<usize>,
+    /// The expression or command text, excluding explicit block delimiters.
+    body: Range<usize>,
+    explicit: bool,
+}
+
+#[derive(Debug)]
+struct OpenNativeBlock {
+    kind: NativeStatementKind,
+    span_start: usize,
+    opener_span: Range<usize>,
+    body_start: usize,
+    indentation: String,
+}
+
+/// Parse explicit native script boundaries before handing command text to the shared grammar.
+///
+/// Delimiters intentionally occupy complete lines. A closing `}` must have the same indentation
+/// as its opening `data {` or `command {`; this keeps indented JSON/object syntax in a data body
+/// unambiguous without introducing another escaping convention.
+fn native_script_statements(
+    source: &str,
+    source_name: &str,
+) -> Result<Vec<NativeScriptStatement>, ShellError> {
+    let mut statements = Vec::new();
+    let mut open: Option<OpenNativeBlock> = None;
+    let mut offset = 0;
+
+    for (line_index, raw_line) in source.split_inclusive('\n').enumerate() {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let leading_len = line.len().saturating_sub(line.trim_start().len());
+        let trimmed = line.trim();
+        let trimmed_start = offset + leading_len;
+        let trimmed_end = trimmed_start + trimmed.len();
+
+        if let Some(block) = &open {
+            if is_native_block_opener(trimmed).is_some() {
+                return Err(native_block_error(
+                    source_name,
+                    trimmed_start..trimmed_end,
+                    "native script blocks cannot nest",
+                    "Close the current block before opening another `data {` or `command {` block",
+                ));
+            }
+            if is_aligned_block_closer(line, &block.indentation) {
+                let Some(block) = open.take() else {
+                    return Err(native_block_error(
+                        source_name,
+                        trimmed_start..trimmed_end,
+                        "native script block state was lost",
+                        "Retry the script; report this internal parser state failure",
+                    ));
+                };
+                if source[block.body_start..offset].trim().is_empty() {
+                    return Err(native_block_error(
+                        source_name,
+                        block.opener_span,
+                        "native script block is empty",
+                        "Put a data expression or command statement between the delimiters",
+                    ));
+                }
+                statements.push(NativeScriptStatement {
+                    kind: block.kind,
+                    span: block.span_start..(offset + raw_line.len()),
+                    body: block.body_start..offset,
+                    explicit: true,
+                });
+                offset += raw_line.len();
+                continue;
+            }
+            if block.kind == NativeStatementKind::Command && trimmed == "}" {
+                return Err(native_block_error(
+                    source_name,
+                    trimmed_start..trimmed_end,
+                    "command block terminator is ambiguously indented",
+                    "Align the closing `}` with the `command {` line",
+                ));
+            }
+            offset += raw_line.len();
+            continue;
+        }
+
+        if line_index == 0 && trimmed.starts_with("#!") {
+            offset += raw_line.len();
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            offset += raw_line.len();
+            continue;
+        }
+        if let Some(kind) = is_native_block_opener(trimmed) {
+            open = Some(OpenNativeBlock {
+                kind,
+                span_start: trimmed_start,
+                opener_span: trimmed_start..trimmed_end,
+                body_start: offset + raw_line.len(),
+                indentation: line[..leading_len].to_owned(),
+            });
+            offset += raw_line.len();
+            continue;
+        }
+        if trimmed == "}" {
+            return Err(native_block_error(
+                source_name,
+                trimmed_start..trimmed_end,
+                "native script block closes without an opening delimiter",
+                "Open a `data {` or `command {` block first, or remove this `}`",
+            ));
+        }
+        if looks_like_ambiguous_command_block(trimmed) {
+            return Err(native_block_error(
+                source_name,
+                trimmed_start..trimmed_end,
+                "explicit command blocks must open on their own line",
+                "Write `command {` on one line, put commands below it, and align a closing `}`",
+            ));
+        }
+
+        let kind = if quirl_syntax::data_statement_expression(trimmed).is_some() {
+            NativeStatementKind::Data
+        } else {
+            NativeStatementKind::Command
+        };
+        let body_start = match kind {
+            NativeStatementKind::Data => {
+                trimmed_start + trimmed.len()
+                    - quirl_syntax::data_statement_expression(trimmed).map_or(0, str::len)
+            }
+            NativeStatementKind::Command => trimmed_start,
+        };
+        statements.push(NativeScriptStatement {
+            kind,
+            span: trimmed_start..trimmed_end,
+            body: body_start..trimmed_end,
+            explicit: false,
+        });
+        offset += raw_line.len();
+    }
+
+    if let Some(block) = open {
+        return Err(native_block_error(
+            source_name,
+            block.opener_span,
+            "native script block is not closed",
+            "Add an aligned closing `}` for this `data {` or `command {` block",
+        ));
+    }
+    Ok(statements)
+}
+
+fn is_native_block_opener(line: &str) -> Option<NativeStatementKind> {
+    [
+        ("data", NativeStatementKind::Data),
+        ("command", NativeStatementKind::Command),
+    ]
+    .into_iter()
+    .find_map(|(keyword, kind)| {
+        line.strip_prefix(keyword)
+            .filter(|rest| rest.starts_with(char::is_whitespace))
+            .and_then(|rest| (rest.trim() == "{").then_some(kind))
+    })
+}
+
+fn looks_like_ambiguous_command_block(line: &str) -> bool {
+    line.strip_prefix("command")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .is_some_and(|rest| rest.trim_start().starts_with('{'))
+}
+
+fn is_aligned_block_closer(line: &str, indentation: &str) -> bool {
+    line.strip_suffix('\r').unwrap_or(line).trim_end() == format!("{indentation}}}")
+}
+
+fn native_block_error(
+    source_name: &str,
+    span: Range<usize>,
+    message: impl Into<String>,
+    help: impl Into<String>,
+) -> ShellError {
+    ShellError::new(ErrorCode::InvalidCommand, message)
+        .with_label(
+            Some(source_name.to_owned()),
+            span.start,
+            span.end,
+            "native script block",
+        )
+        .with_help(help)
+}
+
+fn script_without_explicit_blocks(source: &str, statements: &[NativeScriptStatement]) -> String {
+    let mut bytes = source.as_bytes().to_vec();
+    for statement in statements.iter().filter(|statement| statement.explicit) {
+        for byte in &mut bytes[statement.span.clone()] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+    }
+    // Replacing valid UTF-8 bytes only with ASCII space preserves UTF-8 validity.
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn command_block_diagnostics(
+    source: &str,
+    statement: &NativeScriptStatement,
+) -> Vec<quirl_syntax::CommandSyntaxError> {
+    let mut diagnostics = Vec::new();
+    let mut offset = statement.body.start;
+    for raw_line in source[statement.body.clone()].split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let leading = line.len().saturating_sub(line.trim_start().len());
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Err(mut error) = parse_command_list(trimmed) {
+                error.start += offset + leading;
+                error.end += offset + leading;
+                diagnostics.push(error);
+            }
+        }
+        offset += raw_line.len();
+    }
+    diagnostics
+}
+
+fn execute_command_block(
+    executor: &mut NativeExecutor,
+    source: &str,
+    source_name: &str,
+    body: Range<usize>,
+) -> Result<quirl_core::CommandOutcome, ShellError> {
+    let mut outcome = quirl_core::CommandOutcome {
+        status: 0,
+        stdout: Some(String::new()),
+        stderr: Some(String::new()),
+    };
+    let mut offset = body.start;
+    for raw_line in source[body].split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let leading = line.len().saturating_sub(line.trim_start().len());
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            outcome = execute_native_command(
+                executor,
+                trimmed,
+                source_name,
+                (offset + leading)..(offset + leading + trimmed.len()),
+            )?;
+            if outcome.status != 0 {
+                return Ok(outcome);
+            }
+        }
+        offset += raw_line.len();
+    }
+    Ok(outcome)
+}
+
+fn execute_native_command(
+    executor: &mut NativeExecutor,
+    command: &str,
+    source_name: &str,
+    span: Range<usize>,
+) -> Result<quirl_core::CommandOutcome, ShellError> {
+    executor.execute_capture(command).map_err(|error| {
+        error.with_label(
+            Some(source_name.to_owned()),
+            span.start,
+            span.end,
+            "failed Quirl command statement",
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1204,6 +1530,121 @@ mod tests {
         .unwrap();
         assert_eq!(output.status, 0);
         assert_eq!(output.value, json!(3));
+    }
+
+    #[test]
+    fn native_aliases_run_canonical_multiline_data_blocks() {
+        let source = "data {\n  [1, 2, 3] | length\n}\n";
+        for path in ["workflow.qrl", "workflow.quirl", "workflow.🌀"] {
+            let output = run_source(source, path, Some(Path::new(path)), None, &[]).unwrap();
+            assert_eq!(output.status, 0, "{path}");
+            assert_eq!(output.value, json!(3), "{path}");
+        }
+    }
+
+    #[test]
+    fn native_command_blocks_execute_each_nonempty_line_in_order() {
+        let output = run_source(
+            "command {\n  printf first\n  # deliberately ignored\n  printf second\n}\n",
+            "workflow.qrl",
+            Some(Path::new("workflow.qrl")),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.value["stdout"], "second");
+    }
+
+    #[test]
+    fn indented_data_braces_do_not_close_the_outer_block() {
+        let output = run_source(
+            "data {\n  {\n    \"value\": [1, 2, 3]\n  } | get value | length\n}\n",
+            "object.qrl",
+            Some(Path::new("object.qrl")),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(output.value, json!(3));
+    }
+
+    #[test]
+    fn legacy_data_object_expression_remains_line_oriented_compatible() {
+        let output = run_source(
+            "data {\"value\": [1, 2]} | get value | length",
+            "legacy.qrl",
+            Some(Path::new("legacy.qrl")),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(output.value, json!(2));
+    }
+
+    #[test]
+    fn unclosed_native_block_has_a_labeled_actionable_diagnostic() {
+        let source = "data {\n  [1, 2]\n";
+        let error = run_source(
+            source,
+            "broken.qrl",
+            Some(Path::new("broken.qrl")),
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert_eq!(
+            error.details.labels[0].source.as_deref(),
+            Some("broken.qrl")
+        );
+        assert_eq!(error.details.labels[0].start, 0);
+        assert!(error.details.help[0].contains("closing `}`"));
+    }
+
+    #[test]
+    fn nested_native_blocks_are_rejected_at_the_nested_opener() {
+        let source = "data {\n  command {\n    printf no\n  }\n}\n";
+        let error = check_quirl_source(source, "nested.qrl").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert_eq!(
+            error.details.labels[0].start,
+            source.find("command {").unwrap()
+        );
+        assert!(error.message.contains("cannot nest"));
+        assert!(error.details.help[0].contains("Close the current block"));
+    }
+
+    #[test]
+    fn inline_command_block_is_rejected_as_ambiguous() {
+        let source = "command { printf no }";
+        let error = check_quirl_source(source, "ambiguous.qrl").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert_eq!(error.details.labels[0].start, 0);
+        assert!(error.message.contains("own line"));
+        assert!(error.details.help[0].contains("command {`"));
+    }
+
+    #[test]
+    fn command_block_check_offsets_a_body_syntax_error() {
+        let source = "command {\n  printf okay |\n}\n";
+        let error = check_quirl_source(source, "invalid-command.qrl").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        let label = &error.details.labels[0];
+        assert_eq!(label.source.as_deref(), Some("invalid-command.qrl"));
+        assert!(label.start >= source.find("printf").unwrap());
+        assert!(error.details.help[0].contains("command"));
+    }
+
+    #[test]
+    fn block_and_compatibility_diagnostics_are_ordered_by_source_span() {
+        let source = "command {\n  printf okay |\n}\nprintf later |\n";
+        let error = check_quirl_source(source, "ordered.qrl").unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert_eq!(error.details.labels.len(), 2);
+        assert!(error.details.labels[0].start < error.details.labels[1].start);
+        assert_eq!(error.details.labels[0].start, source.find("|\n}").unwrap());
+        assert_eq!(error.details.labels[1].start, source.rfind('|').unwrap());
     }
 
     #[test]

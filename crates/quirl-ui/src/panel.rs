@@ -1,4 +1,6 @@
-use quirl_core::{reject_terminal_controls, Entry, ErrorCode, ShellError};
+use quirl_core::{
+    escape_terminal_controls, reject_terminal_controls, Entry, ErrorCode, ShellError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -90,7 +92,7 @@ pub fn directory_panel(path: &str, entries: &[Entry]) -> Result<PanelModel, Shel
         .iter()
         .map(|entry| {
             vec![
-                entry.name.clone(),
+                entry.display_name(),
                 format!("{:?}", entry.kind).to_lowercase(),
                 entry.size.to_string(),
                 entry
@@ -100,7 +102,7 @@ pub fn directory_panel(path: &str, entries: &[Entry]) -> Result<PanelModel, Shel
         })
         .collect();
     PanelModel::new(
-        format!("directory {path}"),
+        format!("directory {}", panel_line(path)),
         vec![
             "name".to_owned(),
             "kind".to_owned(),
@@ -108,8 +110,14 @@ pub fn directory_panel(path: &str, entries: &[Entry]) -> Result<PanelModel, Shel
             "modified".to_owned(),
         ],
         rows,
-        format!("directory {path} has no visible entries"),
+        format!("directory {} has no visible entries", panel_line(path)),
     )
+}
+
+fn panel_line(value: &str) -> String {
+    escape_terminal_controls(value)
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -261,6 +269,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(empty.render_plain(), "nothing to show\n");
+    }
+
+    #[test]
+    fn directory_panel_renders_hostile_names_as_safe_single_lines() {
+        let entry = Entry {
+            name: "\u{1b}[2Jüber\nname".to_owned(),
+            path: "ignored".into(),
+            kind: quirl_core::EntryKind::File,
+            size: 1,
+            modified_unix_seconds: None,
+            hidden: false,
+            symlink_target: None,
+            readonly: false,
+        };
+        let panel = directory_panel("root\npath", &[entry]).unwrap();
+        assert_eq!(panel.rows[0][0], "\\u{1b}[2Jüber\\nname");
+        assert_eq!(panel.title, "directory root\\npath");
     }
 
     #[test]

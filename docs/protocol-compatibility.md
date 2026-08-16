@@ -29,9 +29,16 @@ security. Plugin file integrity continues to use SHA-256 and explicit grants.
 ## Deliberate pre-1.0 surfaces
 
 The freeze manifest names limitations rather than hiding them. Native command
-grammar still advertises a preview compatibility subset, picker/completion lack
-full versioned asynchronous request envelopes, the runner result is text-only,
-and Wasm/out-of-process boundaries are non-executing. These contracts may be
-versioned again before the Phase 4 release gate is accepted. Windows suspend,
-full C1 differential conformance, performance, accessibility, and security
-evidence are tracked independently from schema identity.
+grammar v2 records the quote-aware Unix C1-core executor and explicit
+cross-platform C2 dialect islands. Here-documents, process substitution, and
+dialect control forms remain explicit reference islands, rather than an
+implied native compatibility promise. Picker and completion now use separately
+frozen asynchronous request/cancellation/response envelopes with bounded
+workers, deadlines, and stale-result suppression. The runner result remains
+text-only, Wasm remains validation-only, and the process-adapter v1 handshake
+is executable under its scoped launch grant. The MCP stdio surface freezes its
+bounded source-only tool set and keeps the modern 2026-07-28 discovery era
+strictly separate from explicitly negotiated legacy sessions. These contracts
+may be versioned again before the Phase 4 release gate is accepted.
+Windows suspend, differential conformance, performance, accessibility, and
+security evidence are tracked independently from schema identity.

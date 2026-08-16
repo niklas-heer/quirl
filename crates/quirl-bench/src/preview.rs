@@ -4,7 +4,7 @@ use quirl_lua::QuirlConfig;
 use quirl_syntax::Mode;
 use quirl_ui::{CatalogCompleter, LiveBuffer, LiveSample, QuirlPrompt};
 use reedline::{Completer, Prompt, PromptEditMode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     env,
@@ -60,12 +60,27 @@ struct Environment {
     cargo: String,
     source_commit: String,
     source_dirty: Option<bool>,
-    build_profile: &'static str,
-    panic_strategy: &'static str,
+    artifact_profile_verified: bool,
+    artifact_source_verified: bool,
+    build_profile: String,
+    panic_strategy: String,
     quirl_binary: String,
     quirl_binary_bytes: Option<u64>,
     quirl_binary_sha256: Option<String>,
     quirl_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuirlBuildInfo {
+    schema_version: u32,
+    version: String,
+    build_profile: String,
+    panic_strategy: String,
+    operating_system: String,
+    architecture: String,
+    source_commit: String,
+    source_dirty: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +219,16 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
         );
     }
     let quirl = quirl_binary()?;
+    let build_info = quirl_build_info(&quirl);
+    let artifact_profile_verified = build_info
+        .as_ref()
+        .is_some_and(build_info_matches_benchmark);
+    if enforce && !artifact_profile_verified {
+        return Err(
+            "the release gate requires the measured quirl binary to report build profile, panic strategy, operating system, and architecture matching quirl-bench; build both together with `cargo build --release -p quirl-cli -p quirl-bench` and pass that build's quirl binary"
+                .into(),
+        );
+    }
     let pty_samples = sample_argument("--pty-samples", default_pty_samples(enforce))?;
     let pty_timeout_ms = sample_argument("--pty-timeout-ms", DEFAULT_PTY_TIMEOUT_MS)?;
     let cold_samples = sample_argument("--cold-samples", DEFAULT_COLD_SAMPLES)?;
@@ -222,12 +247,20 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     let prompt = measure_first_prompt(prompt_samples)?;
     let stream_window = measure_stream_window(stream_samples)?;
     let binary_size = measure_binary_size(&quirl, binary_budget);
+    let mut environment =
+        discover_environment(&quirl, build_info.as_ref(), artifact_profile_verified);
+    environment.artifact_source_verified = build_info.as_ref().is_some_and(|info| {
+        info.source_dirty == Some(false)
+            && info.source_commit != "unknown"
+            && info.source_commit == environment.source_commit
+    });
     let pty_valid = pty.requested_samples >= MINIMUM_ACCEPTED_PTY_SAMPLES
         && pty.successful_samples == pty.requested_samples
         && pty.prompt_paint.is_some()
         && pty.cold_to_editable.is_some()
         && pty.keystroke_to_frame.is_some()
-        && !cfg!(debug_assertions);
+        && !cfg!(debug_assertions)
+        && artifact_profile_verified;
     let measurements = vec![
         pty_measurement(
             PtyMeasurementSpec {
@@ -331,8 +364,14 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     ];
 
     let timing_failures = timing_gate_failures(&measurements);
-    let evidence_gate_passed =
-        pty_valid && stream_window.release_gate_accepted && binary_size.release_gate_accepted;
+    let source_identity_valid = environment.source_commit != "unknown"
+        && environment.source_dirty == Some(false)
+        && environment.artifact_source_verified
+        && environment.quirl_binary_sha256.is_some();
+    let evidence_gate_passed = pty_valid
+        && stream_window.release_gate_accepted
+        && binary_size.release_gate_accepted
+        && source_identity_valid;
     let mut gate_failures = timing_failures;
     if !stream_window.release_gate_accepted {
         gate_failures
@@ -346,6 +385,26 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     } else if !binary_size.measurement_valid {
         gate_failures.push("release binary size could not be measured".to_owned());
     }
+    if environment.source_commit == "unknown" {
+        gate_failures.push("source commit could not be identified".to_owned());
+    }
+    if !environment.artifact_source_verified {
+        gate_failures.push(
+            "the measured quirl binary was not built cleanly from the recorded source commit"
+                .to_owned(),
+        );
+    }
+    match environment.source_dirty {
+        Some(false) => {}
+        Some(true) => gate_failures.push(
+            "source tree contains tracked or untracked changes, so the artifact is not reproducible from its recorded commit"
+                .to_owned(),
+        ),
+        None => gate_failures.push("source dirty state could not be determined".to_owned()),
+    }
+    if environment.quirl_binary_sha256.is_none() {
+        gate_failures.push("release binary SHA-256 could not be measured".to_owned());
+    }
     let performance_gate_passed = evidence_gate_passed && gate_failures.is_empty();
     let release_gate_status = if performance_gate_passed {
         "passed_all_release_budgets"
@@ -356,10 +415,10 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     };
 
     let report = PreviewReport {
-        schema_version: 3,
+        schema_version: 4,
         suite: "quirl_1.0_release_performance",
         measured_at_utc: measured_at_utc(),
-        environment: discover_environment(&quirl),
+        environment,
         methodology: Methodology {
             percentile_method: "nearest-rank over independently timed wall-clock samples",
             pty_end_to_end: "Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with one input character, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
@@ -1084,7 +1143,11 @@ fn argument_value(name: &str) -> Option<String> {
     None
 }
 
-fn discover_environment(quirl: &Path) -> Environment {
+fn discover_environment(
+    quirl: &Path,
+    build_info: Option<&QuirlBuildInfo>,
+    artifact_profile_verified: bool,
+) -> Environment {
     Environment {
         hostname: command_output("hostname", &[]).unwrap_or_else(|| "unknown".to_owned()),
         operating_system: operating_system(),
@@ -1098,35 +1161,55 @@ fn discover_environment(quirl: &Path) -> Environment {
         source_commit: command_output("git", &["rev-parse", "HEAD"])
             .unwrap_or_else(|| "unknown".to_owned()),
         source_dirty: source_dirty(),
-        build_profile: if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        },
-        panic_strategy: if cfg!(panic = "unwind") {
-            "unwind"
-        } else {
-            "abort"
-        },
+        artifact_profile_verified,
+        artifact_source_verified: false,
+        build_profile: build_info
+            .map(|info| info.build_profile.clone())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        panic_strategy: build_info
+            .map(|info| info.panic_strategy.clone())
+            .unwrap_or_else(|| "unknown".to_owned()),
         quirl_binary: quirl.display().to_string(),
         quirl_binary_bytes: fs::metadata(quirl).ok().map(|metadata| metadata.len()),
         quirl_binary_sha256: binary_sha256(quirl),
-        quirl_version: Command::new(quirl)
-            .arg("--version")
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        quirl_version: build_info
+            .map(|info| format!("quirl {}", info.version))
             .unwrap_or_else(|| "unknown".to_owned()),
     }
 }
 
 fn source_dirty() -> Option<bool> {
     let output = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=no"])
+        .args(["status", "--porcelain", "--untracked-files=normal"])
         .output()
         .ok()?;
     output.status.success().then_some(!output.stdout.is_empty())
+}
+
+fn quirl_build_info(quirl: &Path) -> Option<QuirlBuildInfo> {
+    let output = Command::new(quirl).arg("--build-info").output().ok()?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return None;
+    }
+    let info: QuirlBuildInfo = serde_json::from_slice(&output.stdout).ok()?;
+    (info.schema_version == 1).then_some(info)
+}
+
+fn build_info_matches_benchmark(info: &QuirlBuildInfo) -> bool {
+    let expected_profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    let expected_panic = if cfg!(panic = "unwind") {
+        "unwind"
+    } else {
+        "abort"
+    };
+    info.build_profile == expected_profile
+        && info.panic_strategy == expected_panic
+        && info.operating_system == env::consts::OS
+        && info.architecture == env::consts::ARCH
 }
 
 fn binary_sha256(path: &Path) -> Option<String> {
@@ -1225,10 +1308,10 @@ fn print_text(report: &PreviewReport) {
     println!(
         "source {}{} · panic={} · binary sha256={}",
         report.environment.source_commit,
-        if report.environment.source_dirty == Some(true) {
-            " (dirty)"
-        } else {
-            ""
+        match report.environment.source_dirty {
+            Some(true) => " (dirty)",
+            Some(false) => "",
+            None => " (dirty=unknown)",
         },
         report.environment.panic_strategy,
         report
@@ -1388,6 +1471,38 @@ mod tests {
         assert_eq!(hash.len(), 64);
         assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(binary_sha256(Path::new("/definitely/missing/quirl")).is_none());
+    }
+
+    #[test]
+    fn artifact_metadata_requires_matching_binary_report() {
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        let panic_strategy = if cfg!(panic = "unwind") {
+            "unwind"
+        } else {
+            "abort"
+        };
+        let matching = QuirlBuildInfo {
+            schema_version: 1,
+            version: "0.1.0".to_owned(),
+            build_profile: profile.to_owned(),
+            panic_strategy: panic_strategy.to_owned(),
+            operating_system: env::consts::OS.to_owned(),
+            architecture: env::consts::ARCH.to_owned(),
+            source_commit: "abc123".to_owned(),
+            source_dirty: Some(false),
+        };
+
+        assert!(build_info_matches_benchmark(&matching));
+
+        let mismatched = QuirlBuildInfo {
+            build_profile: "other".to_owned(),
+            ..matching
+        };
+        assert!(!build_info_matches_benchmark(&mismatched));
     }
 
     #[test]

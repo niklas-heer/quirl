@@ -73,7 +73,7 @@ fn current_manifest() -> Result<ProtocolFreezeManifest, quirl_core::ShellError> 
             quirl_syntax::GRAMMAR_PROTOCOL_VERSION,
             CompatibilityPolicy::FrozenMajor,
             schema_fingerprint(quirl_syntax::GRAMMAR_SCHEMA_DESCRIPTOR),
-            "preview_subset",
+            "c1_core_unix_c2_runner",
         ),
         contract(
             "common_abi",
@@ -119,6 +119,15 @@ fn current_manifest() -> Result<ProtocolFreezeManifest, quirl_core::ShellError> 
             CompatibilityPolicy::FrozenMajor,
             quirl_core::extension_schema_hash(),
             "frozen",
+        ),
+        contract(
+            "mcp",
+            "quirl-cli",
+            super::mcp::MCP_SCHEMA_VERSION,
+            super::mcp::MCP_SCHEMA_VERSION,
+            CompatibilityPolicy::FrozenMajor,
+            schema_fingerprint(super::mcp::MCP_SCHEMA_DESCRIPTOR),
+            "modern_2026_07_28_and_legacy_negotiated",
         ),
         contract(
             "package",

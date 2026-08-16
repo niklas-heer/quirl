@@ -56,8 +56,9 @@ authoritative validation. Future versions always fail closed.
   locks and do not establish trust.
 - The manifest is a **1.0 freeze candidate**, not proof that Phase 4 is accepted.
   Command grammar remains a documented preview subset; completion and picker
-  currently freeze their Rust shapes rather than full asynchronous envelopes;
-  runner output remains text-shaped; Wasm remains non-executing and its full WIT
-  structural binding is pending, while the separate process-adapter v1
-  initialization handshake is executable. Performance, security, accessibility, and C1
-  compatibility evidence remain separate release gates.
+  have separately frozen asynchronous envelopes with bounded worker and
+  stale-result evidence. Runner output remains text-shaped; Wasm remains
+  non-executing and its full WIT structural binding is pending, while the
+  separate process-adapter v1 initialization handshake is executable.
+  Performance, security, accessibility, and compatibility evidence remain
+  separate release gates.

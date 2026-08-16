@@ -6,9 +6,9 @@ use std::{fmt, str::FromStr};
 /// Versioned, machine-readable evidence for Quirl's current native compatibility subset and
 /// the frozen 1.0 C1/C2 disposition.
 pub const COMPATIBILITY_MATRIX_JSON: &str = include_str!("../compatibility-v0.1.json");
-pub const GRAMMAR_PROTOCOL_VERSION: u32 = 1;
-pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 2;
-pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@1{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;redirects:array<Redirect>};Redirect{deny_unknown;kind:input|output|append;path:string};tokens:word|pipe|and|or|input|output|append|background;quoting:single|double|backslash;expansion:none;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema2}";
+pub const GRAMMAR_PROTOCOL_VERSION: u32 = 2;
+pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 3;
+pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@2{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or|sequence>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;word_ir:array<Word>;redirects:array<Redirect>};Word{deny_unknown;parts:nonempty-array<WordPart>};WordPart{deny_unknown;text:string;quoting:unquoted|single|double|escaped};Redirect{deny_unknown;fd:u8;kind:input|output|append|here_string|duplicate_input|duplicate_output;path:string;target:Word};tokens:word|pipe|and|or|semicolon|input|output|append|here_string|fd_duplicate|background;expansion:parameter|special|arithmetic|command|pathname;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema3}";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,7 +28,38 @@ pub struct Pipeline {
 #[serde(deny_unknown_fields)]
 pub struct SimpleCommand {
     pub words: Vec<String>,
+    /// Quote-aware form of `words`. `words` remains a convenient lossless joined view for
+    /// built-ins and protocol consumers from grammar v1; execution uses this field.
+    pub word_ir: Vec<Word>,
     pub redirects: Vec<Redirect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Word {
+    pub parts: Vec<WordPart>,
+}
+
+impl Word {
+    pub fn text(&self) -> String {
+        self.parts.iter().map(|part| part.text.as_str()).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WordPart {
+    pub text: String,
+    pub quoting: Quoting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quoting {
+    Unquoted,
+    Single,
+    Double,
+    Escaped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,13 +67,16 @@ pub struct SimpleCommand {
 pub enum ListConnector {
     And,
     Or,
+    Sequence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Redirect {
+    pub fd: u8,
     pub kind: RedirectKind,
     pub path: String,
+    pub target: Word,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +85,9 @@ pub enum RedirectKind {
     Input,
     Output,
     Append,
+    HereString,
+    DuplicateInput,
+    DuplicateOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,13 +108,12 @@ impl std::error::Error for CommandSyntaxError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TokenKind {
-    Word(String),
+    Word(Word),
     Pipe,
     And,
     Or,
-    Input,
-    Output,
-    Append,
+    Redirect { fd: u8, kind: RedirectKind },
+    Semicolon,
     Background,
 }
 
@@ -88,13 +124,14 @@ struct Token {
     end: usize,
 }
 
-/// Parse Quirl's native command-mode C0 graph and the Preview C1 `&&`/`||` subset.
+/// Parse Quirl's quote-aware C1 command graph.
 ///
-/// Expansion is intentionally not performed here. The executor receives exact words after
-/// quoting and escaping have been resolved, while redirects and control operators remain typed.
+/// Parsing deliberately does not execute expansion.  The IR preserves the origin of every
+/// fragment so the process boundary can expand unquoted/double quoted parameters while keeping
+/// single quoted and escaped text literal.
 pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError> {
-    reject_unsupported_constructs(input)?;
     let tokens = lex_command(input)?;
+    reject_reserved_dialect_forms(&tokens)?;
     if tokens.is_empty() {
         return Ok(CommandList {
             pipelines: Vec::new(),
@@ -105,14 +142,37 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
     let mut connectors = Vec::new();
     let mut commands = Vec::new();
     let mut words = Vec::new();
+    let mut word_ir = Vec::new();
     let mut redirects = Vec::new();
     let mut index = 0;
 
     while index < tokens.len() {
         let token = &tokens[index];
         match &token.kind {
-            TokenKind::Word(word) => words.push(word.clone()),
-            TokenKind::Input | TokenKind::Output | TokenKind::Append => {
+            TokenKind::Word(word) => {
+                words.push(word.text());
+                word_ir.push(word.clone());
+            }
+            TokenKind::Redirect { fd, kind } => {
+                if *fd > 2 {
+                    return Err(syntax_error(
+                        token,
+                        "native C1 supports only file descriptors 0, 1, and 2",
+                        "Use `bash { ... }` or `zsh { ... }` for non-standard descriptor routing",
+                    ));
+                }
+                let descriptor_matches_kind = match kind {
+                    RedirectKind::Input | RedirectKind::HereString => *fd == 0,
+                    RedirectKind::Output | RedirectKind::Append => matches!(*fd, 1 | 2),
+                    RedirectKind::DuplicateInput | RedirectKind::DuplicateOutput => true,
+                };
+                if !descriptor_matches_kind {
+                    return Err(syntax_error(
+                        token,
+                        "native C1 does not support this descriptor and redirect combination",
+                        "Use descriptor 0 for input, 1 or 2 for output, or an explicit `bash { ... }`/`zsh { ... }` island",
+                    ));
+                }
                 let Some(next) = tokens.get(index + 1) else {
                     return Err(syntax_error(
                         token,
@@ -120,41 +180,64 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                         "Add a file path after the redirection operator",
                     ));
                 };
-                let TokenKind::Word(path) = &next.kind else {
+                let TokenKind::Word(target) = &next.kind else {
                     return Err(syntax_error(
                         next,
                         "redirection path must be a word",
                         "Quote the path if it contains shell operators",
                     ));
                 };
+                if *kind == RedirectKind::DuplicateInput
+                    || (*kind == RedirectKind::DuplicateOutput
+                        && (*fd != 2 || target.text() != "1"))
+                {
+                    return Err(syntax_error(
+                        token,
+                        "native C1 supports only `2>&1` descriptor duplication",
+                        "Use `bash { ... }` or `zsh { ... }` for this descriptor graph",
+                    ));
+                }
                 redirects.push(Redirect {
-                    kind: match token.kind {
-                        TokenKind::Input => RedirectKind::Input,
-                        TokenKind::Output => RedirectKind::Output,
-                        TokenKind::Append => RedirectKind::Append,
-                        _ => unreachable!(),
-                    },
-                    path: path.clone(),
+                    fd: *fd,
+                    kind: *kind,
+                    path: target.text(),
+                    target: target.clone(),
                 });
                 index += 1;
             }
             TokenKind::Pipe => {
-                commands.push(finish_command(&mut words, &mut redirects, token)?);
+                commands.push(finish_command(
+                    &mut words,
+                    &mut word_ir,
+                    &mut redirects,
+                    token,
+                )?);
             }
-            TokenKind::And | TokenKind::Or => {
-                commands.push(finish_command(&mut words, &mut redirects, token)?);
+            TokenKind::And | TokenKind::Or | TokenKind::Semicolon => {
+                commands.push(finish_command(
+                    &mut words,
+                    &mut word_ir,
+                    &mut redirects,
+                    token,
+                )?);
                 pipelines.push(Pipeline {
                     commands: std::mem::take(&mut commands),
                     background: false,
                 });
-                connectors.push(if matches!(token.kind, TokenKind::And) {
-                    ListConnector::And
-                } else {
-                    ListConnector::Or
+                connectors.push(match token.kind {
+                    TokenKind::And => ListConnector::And,
+                    TokenKind::Or => ListConnector::Or,
+                    TokenKind::Semicolon => ListConnector::Sequence,
+                    _ => unreachable!(),
                 });
             }
             TokenKind::Background => {
-                commands.push(finish_command(&mut words, &mut redirects, token)?);
+                commands.push(finish_command(
+                    &mut words,
+                    &mut word_ir,
+                    &mut redirects,
+                    token,
+                )?);
                 pipelines.push(Pipeline {
                     commands: std::mem::take(&mut commands),
                     background: true,
@@ -171,10 +254,12 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
         index += 1;
     }
 
-    if tokens
-        .last()
-        .is_some_and(|token| matches!(token.kind, TokenKind::Pipe | TokenKind::And | TokenKind::Or))
-    {
+    if tokens.last().is_some_and(|token| {
+        matches!(
+            token.kind,
+            TokenKind::Pipe | TokenKind::And | TokenKind::Or | TokenKind::Semicolon
+        )
+    }) {
         let token = tokens.last().ok_or_else(|| CommandSyntaxError {
             message: "command list is empty".to_owned(),
             start: 0,
@@ -194,7 +279,12 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
             start: end,
             end,
         };
-        commands.push(finish_command(&mut words, &mut redirects, &sentinel)?);
+        commands.push(finish_command(
+            &mut words,
+            &mut word_ir,
+            &mut redirects,
+            &sentinel,
+        )?);
     }
     if !commands.is_empty() {
         pipelines.push(Pipeline {
@@ -207,6 +297,47 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
         pipelines,
         connectors,
     })
+}
+
+/// Keep the native grammar deliberately unambiguous: compound dialect syntax cannot silently
+/// become a process name. Those forms retain exact Bash/Zsh semantics only inside an explicit
+/// bounded island.
+fn reject_reserved_dialect_forms(tokens: &[Token]) -> Result<(), CommandSyntaxError> {
+    let mut command_position = true;
+    let mut redirect_target = false;
+    for token in tokens {
+        if redirect_target {
+            redirect_target = false;
+            continue;
+        }
+        match &token.kind {
+            TokenKind::Redirect { .. } => redirect_target = true,
+            TokenKind::Pipe | TokenKind::And | TokenKind::Or | TokenKind::Semicolon => {
+                command_position = true;
+            }
+            TokenKind::Background => command_position = true,
+            TokenKind::Word(word) if command_position => {
+                let value = word.text();
+                let reserved = matches!(
+                    value.as_str(),
+                    "for" | "while" | "until" | "if" | "case" | "select" | "function"
+                ) || value == "[["
+                    || value == "(("
+                    || value.ends_with("()");
+                if reserved {
+                    return Err(CommandSyntaxError {
+                        message: format!("unsupported C1 dialect control form `{value}`"),
+                        start: token.start,
+                        end: token.end,
+                        help: "Run it as `bash { ... }` or `zsh { ... }`; the bounded reference island preserves the selected dialect's control semantics".to_owned(),
+                    });
+                }
+                command_position = false;
+            }
+            TokenKind::Word(_) => command_position = false,
+        }
+    }
+    Ok(())
 }
 
 /// Return the expression from a `data` statement.
@@ -262,170 +393,9 @@ pub fn check_script(source: &str) -> Vec<CommandSyntaxError> {
     diagnostics
 }
 
-fn reject_unsupported_constructs(input: &str) -> Result<(), CommandSyntaxError> {
-    let trimmed = input.trim_start();
-    let leading_whitespace = input.len() - trimmed.len();
-    for keyword in ["for", "while", "until", "if", "case", "select", "function"] {
-        if trimmed == keyword
-            || trimmed
-                .strip_prefix(keyword)
-                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-        {
-            return Err(dialect_mismatch(
-                leading_whitespace,
-                leading_whitespace + keyword.len(),
-                &format!("compound command `{keyword}`"),
-            ));
-        }
-    }
-    if trimmed.starts_with("[[") || trimmed.starts_with("((") {
-        let form = if trimmed.starts_with("[[") {
-            "conditional command `[[ ... ]]`"
-        } else {
-            "arithmetic command `(( ... ))`"
-        };
-        return Err(dialect_mismatch(
-            leading_whitespace,
-            leading_whitespace + 2,
-            form,
-        ));
-    }
-
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, character) in input.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' && quote != Some('\'') {
-            escaped = true;
-            continue;
-        }
-        if quote == Some('\'') {
-            if character == '\'' {
-                quote = None;
-            }
-            continue;
-        }
-        if quote.is_none() && character == '\'' {
-            quote = Some('\'');
-            continue;
-        }
-        if character == '"' {
-            quote = if quote == Some('"') { None } else { Some('"') };
-            continue;
-        }
-
-        let rest = &input[index..];
-        if quote.is_none()
-            && (rest.starts_with("<<")
-                || rest.starts_with(">&")
-                || rest.starts_with("<&")
-                || (character.is_ascii_digit()
-                    && rest
-                        .chars()
-                        .nth(1)
-                        .is_some_and(|next| matches!(next, '>' | '<'))))
-        {
-            let form = if rest.starts_with("<<<") {
-                "here-string redirection `<<<`".to_owned()
-            } else if rest.starts_with("<<") {
-                "here-document redirection `<<`".to_owned()
-            } else if rest.starts_with(">&") {
-                "file-descriptor duplication `>&`".to_owned()
-            } else if rest.starts_with("<&") {
-                "file-descriptor duplication `<&`".to_owned()
-            } else {
-                format!("file-descriptor redirection `{}`", &rest[..2])
-            };
-            return Err(dialect_mismatch(index, index + 2, &form));
-        }
-        if rest.starts_with("$(") {
-            let form = if rest.starts_with("$((") {
-                "arithmetic expansion `$((...))`"
-            } else {
-                "command substitution `$(...)`"
-            };
-            return Err(dialect_mismatch(index, index + 2, form));
-        }
-        if character == '$' {
-            let form = parameter_expansion_form(rest);
-            return Err(dialect_mismatch(index, index + character.len_utf8(), form));
-        }
-        if character == '`' {
-            return Err(dialect_mismatch(
-                index,
-                index + character.len_utf8(),
-                "backtick command substitution `` `...` ``",
-            ));
-        }
-        if quote.is_none() && (rest.starts_with("<(") || rest.starts_with(">(")) {
-            let form = if rest.starts_with("<(") {
-                "process substitution `<(...)`"
-            } else {
-                "process substitution `>(...)`"
-            };
-            return Err(dialect_mismatch(index, index + 2, form));
-        }
-        if quote.is_none() && matches!(character, '*' | '?') {
-            return Err(dialect_mismatch(
-                index,
-                index + character.len_utf8(),
-                &format!("pathname expansion `{character}`"),
-            ));
-        }
-        if quote.is_none() && character == '[' && rest.contains(']') {
-            return Err(dialect_mismatch(
-                index,
-                index + character.len_utf8(),
-                "pathname expansion `[...]`",
-            ));
-        }
-        if quote.is_none() && character == ';' {
-            return Err(dialect_mismatch(
-                index,
-                index + character.len_utf8(),
-                "semicolon-separated command list `;`",
-            ));
-        }
-        if quote.is_none() && matches!(character, '(' | ')' | '{' | '}') {
-            return Err(dialect_mismatch(
-                index,
-                index + character.len_utf8(),
-                &format!("compound-command token `{character}`"),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn parameter_expansion_form(rest: &str) -> &'static str {
-    if rest.starts_with("${") {
-        "parameter expansion `${...}`"
-    } else if rest
-        .chars()
-        .nth(1)
-        .is_some_and(|character| character.is_ascii_digit() || "?@*#$!-".contains(character))
-    {
-        "special parameter expansion `$?`/`$1`"
-    } else {
-        "parameter expansion `$NAME`"
-    }
-}
-
-fn dialect_mismatch(start: usize, end: usize, form: &str) -> CommandSyntaxError {
-    CommandSyntaxError {
-        message: format!("unsupported Bash/Zsh construct: {form}"),
-        start,
-        end,
-        help: "Run this form explicitly with `bash -c '...'` or `zsh -c '...'`; its native C1 disposition is recorded in the versioned compatibility matrix"
-            .to_owned(),
-    }
-}
-
 fn finish_command(
     words: &mut Vec<String>,
+    word_ir: &mut Vec<Word>,
     redirects: &mut Vec<Redirect>,
     operator: &Token,
 ) -> Result<SimpleCommand, CommandSyntaxError> {
@@ -438,6 +408,7 @@ fn finish_command(
     }
     Ok(SimpleCommand {
         words: std::mem::take(words),
+        word_ir: std::mem::take(word_ir),
         redirects: std::mem::take(redirects),
     })
 }
@@ -453,41 +424,143 @@ fn syntax_error(token: &Token, message: &str, help: &str) -> CommandSyntaxError 
 
 fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
     let mut tokens = Vec::new();
-    let mut word = String::new();
     let mut word_start = None;
     let mut quote = None;
-    let mut escaped = false;
+    let mut parts = Vec::new();
+    let mut fragment = String::new();
+    let mut fragment_quoting = Quoting::Unquoted;
+    let mut substitution_depth = 0_u32;
     let mut characters = input.char_indices().peekable();
 
     while let Some((index, character)) = characters.next() {
-        if escaped {
-            word.push(character);
-            escaped = false;
-            continue;
-        }
         if character == '\\' && quote != Some('\'') {
             word_start.get_or_insert(index);
-            escaped = true;
+            let Some((_, escaped)) = characters.next() else {
+                return Err(CommandSyntaxError {
+                    message: "command ends with an escape".to_owned(),
+                    start: index,
+                    end: input.len(),
+                    help: "Add the escaped character or remove the trailing backslash".to_owned(),
+                });
+            };
+            append_fragment(
+                &mut parts,
+                &mut fragment,
+                &mut fragment_quoting,
+                escaped,
+                Quoting::Escaped,
+            );
             continue;
         }
         if let Some(active) = quote {
+            let quoting = if active == '\'' {
+                Quoting::Single
+            } else {
+                Quoting::Double
+            };
+            if active != '\'' && character == '(' && fragment.ends_with('$') {
+                substitution_depth = substitution_depth.saturating_add(1);
+                append_fragment(
+                    &mut parts,
+                    &mut fragment,
+                    &mut fragment_quoting,
+                    character,
+                    quoting,
+                );
+                continue;
+            }
+            if substitution_depth > 0 {
+                match character {
+                    '(' => substitution_depth = substitution_depth.saturating_add(1),
+                    ')' => substitution_depth = substitution_depth.saturating_sub(1),
+                    _ => {}
+                }
+                append_fragment(
+                    &mut parts,
+                    &mut fragment,
+                    &mut fragment_quoting,
+                    character,
+                    quoting,
+                );
+                continue;
+            }
             if character == active {
+                push_fragment(&mut parts, &mut fragment, fragment_quoting);
                 quote = None;
             } else {
-                word.push(character);
+                append_fragment(
+                    &mut parts,
+                    &mut fragment,
+                    &mut fragment_quoting,
+                    character,
+                    quoting,
+                );
             }
             continue;
         }
         if matches!(character, '\'' | '"') {
             word_start.get_or_insert(index);
+            push_fragment(&mut parts, &mut fragment, fragment_quoting);
             quote = Some(character);
             continue;
         }
+        if character == '(' && fragment.ends_with('$') {
+            substitution_depth = substitution_depth.saturating_add(1);
+            append_fragment(
+                &mut parts,
+                &mut fragment,
+                &mut fragment_quoting,
+                character,
+                Quoting::Unquoted,
+            );
+            continue;
+        }
+        if substitution_depth > 0 {
+            match character {
+                '(' => substitution_depth = substitution_depth.saturating_add(1),
+                ')' => substitution_depth = substitution_depth.saturating_sub(1),
+                _ => {}
+            }
+            append_fragment(
+                &mut parts,
+                &mut fragment,
+                &mut fragment_quoting,
+                character,
+                Quoting::Unquoted,
+            );
+            continue;
+        }
         if character.is_whitespace() {
-            push_word(&mut tokens, &mut word, &mut word_start, index);
+            push_word(
+                &mut tokens,
+                &mut parts,
+                &mut fragment,
+                &mut fragment_quoting,
+                &mut word_start,
+                index,
+            );
             continue;
         }
 
+        let mut redirect_fd = 0;
+        if matches!(character, '<' | '>')
+            && !fragment.is_empty()
+            && parts.is_empty()
+            && fragment.chars().all(|value| value.is_ascii_digit())
+        {
+            redirect_fd = fragment.parse::<u8>().map_err(|_| CommandSyntaxError {
+                message: "file descriptor is outside the supported range".to_owned(),
+                start: word_start.unwrap_or(index),
+                end: index,
+                help: "Use a descriptor from 0 through 255".to_owned(),
+            })?;
+            fragment.clear();
+            word_start = None;
+        } else if character == '<' {
+            redirect_fd = 0;
+        } else if character == '>' {
+            redirect_fd = 1;
+        }
         let operator = match character {
             '|' if characters.peek().is_some_and(|(_, next)| *next == '|') => {
                 characters.next();
@@ -499,16 +572,93 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                 Some((TokenKind::And, 2))
             }
             '&' => Some((TokenKind::Background, 1)),
+            ';' => Some((TokenKind::Semicolon, 1)),
+            '<' if characters.peek().is_some_and(|(_, next)| *next == '(') => {
+                return Err(CommandSyntaxError {
+                    message: "process substitution requires an explicit dialect island".to_owned(),
+                    start: index,
+                    end: index + 2,
+                    help: "Use `bash { ... }` or `zsh { ... }` so the selected dialect owns file-descriptor lifecycle semantics".to_owned(),
+                });
+            }
+            '>' if characters.peek().is_some_and(|(_, next)| *next == '(') => {
+                return Err(CommandSyntaxError {
+                    message: "process substitution requires an explicit dialect island".to_owned(),
+                    start: index,
+                    end: index + 2,
+                    help: "Use `bash { ... }` or `zsh { ... }` so the selected dialect owns file-descriptor lifecycle semantics".to_owned(),
+                });
+            }
+            '<' if characters.peek().is_some_and(|(_, next)| *next == '<') => {
+                characters.next();
+                if characters.peek().is_some_and(|(_, next)| *next == '<') {
+                    characters.next();
+                    Some((
+                        TokenKind::Redirect {
+                            fd: redirect_fd,
+                            kind: RedirectKind::HereString,
+                        },
+                        3,
+                    ))
+                } else {
+                    return Err(CommandSyntaxError { message: "here-documents require a multiline script parser".to_owned(), start: index, end: index + 2, help: "Use a here-string (`<<< value`) or an explicit `bash { ... }`/`zsh { ... }` island".to_owned() });
+                }
+            }
+            '<' if characters.peek().is_some_and(|(_, next)| *next == '&') => {
+                characters.next();
+                Some((
+                    TokenKind::Redirect {
+                        fd: redirect_fd,
+                        kind: RedirectKind::DuplicateInput,
+                    },
+                    2,
+                ))
+            }
             '>' if characters.peek().is_some_and(|(_, next)| *next == '>') => {
                 characters.next();
-                Some((TokenKind::Append, 2))
+                Some((
+                    TokenKind::Redirect {
+                        fd: redirect_fd,
+                        kind: RedirectKind::Append,
+                    },
+                    2,
+                ))
             }
-            '>' => Some((TokenKind::Output, 1)),
-            '<' => Some((TokenKind::Input, 1)),
+            '>' if characters.peek().is_some_and(|(_, next)| *next == '&') => {
+                characters.next();
+                Some((
+                    TokenKind::Redirect {
+                        fd: redirect_fd,
+                        kind: RedirectKind::DuplicateOutput,
+                    },
+                    2,
+                ))
+            }
+            '>' => Some((
+                TokenKind::Redirect {
+                    fd: redirect_fd,
+                    kind: RedirectKind::Output,
+                },
+                1,
+            )),
+            '<' => Some((
+                TokenKind::Redirect {
+                    fd: redirect_fd,
+                    kind: RedirectKind::Input,
+                },
+                1,
+            )),
             _ => None,
         };
         if let Some((kind, width)) = operator {
-            push_word(&mut tokens, &mut word, &mut word_start, index);
+            push_word(
+                &mut tokens,
+                &mut parts,
+                &mut fragment,
+                &mut fragment_quoting,
+                &mut word_start,
+                index,
+            );
             tokens.push(Token {
                 kind,
                 start: index,
@@ -516,17 +666,14 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             });
         } else {
             word_start.get_or_insert(index);
-            word.push(character);
+            append_fragment(
+                &mut parts,
+                &mut fragment,
+                &mut fragment_quoting,
+                character,
+                Quoting::Unquoted,
+            );
         }
-    }
-
-    if escaped {
-        return Err(CommandSyntaxError {
-            message: "command ends with an escape".to_owned(),
-            start: input.len().saturating_sub(1),
-            end: input.len(),
-            help: "Add the escaped character or remove the trailing backslash".to_owned(),
-        });
     }
     if let Some(active) = quote {
         return Err(CommandSyntaxError {
@@ -536,14 +683,54 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             help: format!("Close the quote with {active}"),
         });
     }
-    push_word(&mut tokens, &mut word, &mut word_start, input.len());
+    push_word(
+        &mut tokens,
+        &mut parts,
+        &mut fragment,
+        &mut fragment_quoting,
+        &mut word_start,
+        input.len(),
+    );
     Ok(tokens)
 }
 
-fn push_word(tokens: &mut Vec<Token>, word: &mut String, start: &mut Option<usize>, end: usize) {
+fn append_fragment(
+    parts: &mut Vec<WordPart>,
+    fragment: &mut String,
+    quoting: &mut Quoting,
+    character: char,
+    next_quoting: Quoting,
+) {
+    if !fragment.is_empty() && *quoting != next_quoting {
+        push_fragment(parts, fragment, *quoting);
+    }
+    *quoting = next_quoting;
+    fragment.push(character);
+}
+
+fn push_fragment(parts: &mut Vec<WordPart>, fragment: &mut String, quoting: Quoting) {
+    if !fragment.is_empty() {
+        parts.push(WordPart {
+            text: std::mem::take(fragment),
+            quoting,
+        });
+    }
+}
+
+fn push_word(
+    tokens: &mut Vec<Token>,
+    parts: &mut Vec<WordPart>,
+    fragment: &mut String,
+    quoting: &mut Quoting,
+    start: &mut Option<usize>,
+    end: usize,
+) {
     if let Some(start_index) = start.take() {
+        push_fragment(parts, fragment, *quoting);
         tokens.push(Token {
-            kind: TokenKind::Word(std::mem::take(word)),
+            kind: TokenKind::Word(Word {
+                parts: std::mem::take(parts),
+            }),
             start: start_index,
             end,
         });
@@ -688,14 +875,7 @@ mod tests {
         level: String,
         dialects: Vec<String>,
         reason: String,
-        fixtures: Vec<MismatchFixture>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct MismatchFixture {
-        source: String,
-        diagnostic: String,
+        fixtures: Vec<serde_json::Value>,
     }
 
     #[test]
@@ -736,8 +916,15 @@ mod tests {
         assert_eq!(
             graph.pipelines[0].commands[1].redirects,
             [Redirect {
+                fd: 1,
                 kind: RedirectKind::Append,
                 path: "out.txt".to_owned(),
+                target: Word {
+                    parts: vec![WordPart {
+                        text: "out.txt".to_owned(),
+                        quoting: Quoting::Unquoted
+                    }]
+                },
             }]
         );
     }
@@ -761,14 +948,13 @@ mod tests {
     }
 
     #[test]
-    fn script_checker_reuses_command_dialect_rules_with_absolute_spans() {
+    fn script_checker_reuses_command_syntax_with_absolute_spans() {
         let source =
             "#!/usr/bin/env -S quirl run\ndata {\"ok\":true}\n  echo $HOME\nprintf ok |\ndata\n";
         let diagnostics = check_script(source);
-        assert_eq!(diagnostics.len(), 3);
-        assert_eq!(&source[diagnostics[0].start..diagnostics[0].end], "$");
-        assert_eq!(&source[diagnostics[1].start..diagnostics[1].end], "|");
-        assert_eq!(&source[diagnostics[2].start..diagnostics[2].end], "data");
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(&source[diagnostics[0].start..diagnostics[0].end], "|");
+        assert_eq!(&source[diagnostics[1].start..diagnostics[1].end], "data");
     }
 
     #[test]
@@ -785,10 +971,10 @@ mod tests {
     #[test]
     fn compatibility_matrix_is_versioned_complete_and_schema_checked() {
         let matrix: CompatibilityMatrix = serde_json::from_str(COMPATIBILITY_MATRIX_JSON).unwrap();
-        assert_eq!(matrix.schema_version, 2);
+        assert_eq!(matrix.schema_version, 3);
         assert_eq!(matrix.matrix_version, "0.1");
         assert_eq!(matrix.target_contract_version, "1.0");
-        assert_eq!(matrix.compatibility_level, "C1-partial+C2-runner");
+        assert_eq!(matrix.compatibility_level, "C1-core-unix+C2-runner");
         assert_eq!(matrix.contract_status, "frozen_disposition");
         assert!(!matrix.scope.is_empty());
         assert!(!matrix.differential_fixtures.is_empty());
@@ -813,10 +999,13 @@ mod tests {
             HashSet::from([
                 "quoting",
                 "byte_pipes",
-                "redirects",
+                "redirects_and_here_strings",
                 "background_marker",
-                "boolean_lists",
+                "lists_and_boolean_connectors",
                 "export_assignment",
+                "expansions",
+                "conditionals_and_control",
+                "interactive_dialect_islands",
                 "bash_script_runner",
                 "zsh_script_runner",
                 "script_shebang_dispatch",
@@ -842,11 +1031,7 @@ mod tests {
             .map(|feature| feature.id.as_str())
             .collect::<HashSet<_>>();
         assert_eq!(deferred.len(), matrix.deferred.len());
-        assert!(deferred.contains("pathname_expansion"));
-        assert!(deferred.contains("command_and_process_substitution"));
-        assert!(deferred.contains("compound_commands"));
-        assert!(deferred.contains("parameter_and_arithmetic_expansion"));
-        assert!(deferred.contains("interactive_dialect_islands"));
+        assert!(deferred.contains("here_documents_and_process_substitution"));
         for feature in &matrix.deferred {
             assert!(matches!(feature.level.as_str(), "C1" | "C2"));
             assert_eq!(feature.dialects, ["bash", "zsh"]);
@@ -860,21 +1045,81 @@ mod tests {
     }
 
     #[test]
-    fn every_deferred_form_produces_its_frozen_exact_mismatch_diagnostic() {
+    fn quote_aware_ir_preserves_expansion_boundaries() {
         let matrix: CompatibilityMatrix = serde_json::from_str(COMPATIBILITY_MATRIX_JSON).unwrap();
-        for fixture in matrix.deferred.iter().flat_map(|feature| &feature.fixtures) {
-            let error = parse_command_list(&fixture.source).unwrap_err();
-            assert_eq!(
-                error.message, fixture.diagnostic,
-                "source: {}",
-                fixture.source
-            );
-            assert!(error.help.contains("bash -c"));
-            assert!(error.help.contains("zsh -c"));
-        }
-
+        assert_eq!(matrix.deferred.len(), 1);
         let quoted = parse_command_list("printf '%s' '*.rs $HOME'").unwrap();
         assert_eq!(quoted.pipelines[0].commands[0].words[2], "*.rs $HOME");
+        assert_eq!(
+            quoted.pipelines[0].commands[0].word_ir[2].parts[0].quoting,
+            Quoting::Single
+        );
+
+        let graph = parse_command_list("cat <<< \"$HOME\"; echo $((1 + 2)) 2>&1").unwrap();
+        assert_eq!(graph.connectors, [ListConnector::Sequence]);
+        assert_eq!(
+            graph.pipelines[0].commands[0].redirects[0].kind,
+            RedirectKind::HereString
+        );
+        assert_eq!(
+            graph.pipelines[1].commands[0].redirects[0].kind,
+            RedirectKind::DuplicateOutput
+        );
+        for fixture in matrix.deferred.iter().flat_map(|feature| &feature.fixtures) {
+            let source = fixture
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            let diagnostic = fixture
+                .get("diagnostic")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            assert_eq!(parse_command_list(source).unwrap_err().message, diagnostic);
+        }
+    }
+
+    #[test]
+    fn unsupported_descriptor_directions_fail_closed() {
+        for source in ["cat 1<input", "printf ok 0>output", "cat 3>output"] {
+            let error = parse_command_list(source).unwrap_err();
+            assert!(error.message.contains("descriptor"), "{source}: {error}");
+            assert!(error.help.contains("bash { ... }") || error.help.contains("descriptor 0"));
+        }
+    }
+
+    #[test]
+    fn dialect_control_forms_fail_closed_with_an_explicit_island_remedy() {
+        for source in [
+            "for item in a; do echo $item; done",
+            "while true; do break; done",
+            "until false; do break; done",
+            "if true; then echo yes; fi",
+            "case value in value) echo yes;; esac",
+            "function greeting { echo hello; }",
+            "greeting() { echo hello; }",
+            "[[ -n value ]]",
+            "(( 1 + 1 ))",
+        ] {
+            let error = parse_command_list(source).unwrap_err();
+            assert!(error
+                .message
+                .starts_with("unsupported C1 dialect control form"));
+            assert!(error.help.contains("bash { ... }"));
+            assert!(error.help.contains("zsh { ... }"));
+        }
+    }
+
+    #[test]
+    fn double_quoted_substitution_stays_double_quoted_and_invalid_descriptors_fail_closed() {
+        let graph = parse_command_list("printf '%s' \"$(printf '*.qrl')\"").unwrap();
+        assert!(graph.pipelines[0].commands[0].word_ir[2]
+            .parts
+            .iter()
+            .all(|part| part.quoting == Quoting::Double));
+        for source in ["echo nope 3> output", "echo nope 1>&2", "cat 0<&1"] {
+            let error = parse_command_list(source).unwrap_err();
+            assert!(error.help.contains("bash { ... }"));
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 > **Outcome:** Quirl’s extension language is **Lua 5.4**.
 
-Rust owns Quirl’s shell, executor, built-ins, value model, and performance-critical logic. Lua 5.4 is the deliberately small, recognizable extension language for configuration, automation, and trusted plugins. Quirl supplies a modern experience with generated annotations, completion, linting, formatting, schema validation, and strict Rust boundary checks.
+Rust owns Quirl’s shell, executor, built-ins, value model, and performance-critical logic. Lua 5.4 is the deliberately small, recognizable extension language for configuration, scripts, and trusted plugins. Quirl supplies a modern experience with generated annotations, completion, linting, formatting, schema validation, and strict Rust boundary checks.
 
 ## 1. Outcome
 
@@ -18,7 +18,7 @@ Rust owns Quirl’s shell, executor, built-ins, value model, and performance-cri
 
 ### Rust is the product language; the guest is an extension language
 
-The guest must be good at readable configuration, small automation scripts, prompt and completion extensions, typed command definitions, plugin hooks, fast reloads, capability-limited host calls, and actionable diagnostics.
+The guest must be good at readable configuration, small scripts, prompt and completion extensions, typed command definitions, plugin hooks, fast reloads, capability-limited host calls, and actionable diagnostics.
 
 It does **not** need to own process-execution internals, job control, parsing, rendering, core data structures, performance-critical transforms, or the built-in command catalog. Those stay in Rust.
 

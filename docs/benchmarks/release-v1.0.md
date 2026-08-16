@@ -4,8 +4,12 @@
 > used `panic=abort`; commit `0fb047d` changed the release profile to
 > `panic=unwind` so Lua callback panics remain recoverable. Rebuild and rerun the
 > enforcing gate before using this record for a release decision. Benchmark
-> report schema v3 now records the source commit, dirty state, panic strategy,
-> and exact binary SHA-256 so future evidence cannot silently drift.
+> report schema v4 now records the source commit, tracked and untracked dirty
+> state and exact binary SHA-256. The measured `quirl` binary reports its own
+> profile, panic strategy, operating system, architecture, source commit, and
+> build-time dirty state. The gate verifies them against `quirl-bench` and the
+> current clean checkout before accepting evidence. Future evidence therefore
+> fails closed instead of silently drifting.
 
 **Measured:** 15 August 2026 at 21:49:13 UTC
 **Source state:** uncommitted Phase 4 worktree based on
