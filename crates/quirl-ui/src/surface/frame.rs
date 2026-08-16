@@ -570,7 +570,7 @@ mod tests {
                     mode,
                     diagnostic: diagnostic.as_ref(),
                     highlight_spans: &highlight_spans,
-                    theme: Theme::new(true),
+                    theme: Theme::new(true, "quirl"),
                     unicode: true,
                     symbols: SurfaceSymbols::Unicode,
                     semantic_hints: true,
@@ -622,7 +622,7 @@ mod tests {
         assert!(row(&terminal, 2).contains("command"));
         assert_eq!(
             terminal.backend().buffer().cell((2, 1)).unwrap().fg,
-            Color::Green
+            Color::Rgb(95, 215, 135)
         );
     }
 
@@ -649,7 +649,7 @@ mod tests {
                     mode: Mode::Command,
                     diagnostic: None,
                     highlight_spans: &spans,
-                    theme: Theme::new(true),
+                    theme: Theme::new(true, "quirl"),
                     unicode: true,
                     symbols: SurfaceSymbols::Unicode,
                     semantic_hints: true,
@@ -675,7 +675,7 @@ mod tests {
                 .cell((u16::try_from(end_x).unwrap(), 1))
                 .unwrap()
                 .fg,
-            Color::Yellow
+            Color::Rgb(249, 226, 175)
         );
         let cursor = terminal.get_cursor_position().unwrap();
         assert!(cursor.x < 24);
@@ -703,7 +703,7 @@ mod tests {
                     mode: Mode::Command,
                     diagnostic: None,
                     highlight_spans: &spans,
-                    theme: Theme::new(true),
+                    theme: Theme::new(true, "quirl"),
                     unicode: false,
                     symbols: SurfaceSymbols::Plain,
                     semantic_hints: false,
@@ -722,7 +722,7 @@ mod tests {
         assert!(!row(&terminal, 1).contains("status"));
         assert_eq!(
             terminal.backend().buffer().cell((2, 1)).unwrap().fg,
-            Color::Reset
+            Color::Rgb(232, 232, 240)
         );
     }
 
@@ -808,7 +808,7 @@ mod tests {
                     mode: Mode::Command,
                     diagnostic: None,
                     highlight_spans: &[],
-                    theme: Theme::new(true),
+                    theme: Theme::new(true, "quirl"),
                     unicode: true,
                     symbols: SurfaceSymbols::Unicode,
                     semantic_hints: true,
@@ -926,7 +926,7 @@ mod tests {
                     mode: Mode::Command,
                     diagnostic: Some(&diagnostic),
                     highlight_spans: &spans,
-                    theme: Theme::new(true),
+                    theme: Theme::new(true, "quirl"),
                     unicode: true,
                     symbols: SurfaceSymbols::Unicode,
                     semantic_hints: true,
@@ -946,7 +946,7 @@ mod tests {
             .buffer()
             .cell((u16::try_from(range.start + 2).unwrap(), 1))
             .unwrap();
-        assert_eq!(flag_cell.fg, Color::Yellow);
+        assert_eq!(flag_cell.fg, Color::Rgb(255, 215, 95));
         assert!(flag_cell.modifier.contains(Modifier::UNDERLINED));
         assert!(row(&terminal, 2).contains("▲ unknown flag"));
     }

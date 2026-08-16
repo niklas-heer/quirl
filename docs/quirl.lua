@@ -8,6 +8,7 @@
 ---@alias quirl.PromptSymbols 'auto'|'plain'|'unicode'|'nerd_font'
 ---@alias quirl.WelcomeBanner 'full'|'compact'|'none'
 ---@alias quirl.Surface 'auto'|'rich'|'simple'
+---@alias quirl.Theme 'quirl'|'catppuccin_mocha'|'dracula'|'gruvbox_dark'|'nord'|'solarized_dark'|'tokyo_night'|'one_dark'
 
 ---@class quirl.EditorConfig
 ---@field keymap? 'emacs'|'vim'|'helix' Emacs is the complete default.
@@ -29,6 +30,7 @@
 
 ---@class quirl.UiConfig
 ---@field surface? quirl.Surface
+---@field theme? quirl.Theme Built-in color theme; NO_COLOR still disables color.
 ---@field statusline? quirl.StatuslineConfig
 
 ---@class quirl.CompletionConfig

@@ -3,6 +3,7 @@ use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorC
 use quirl_lua::{
     format_source, LuaPolicy, LuaRuntime, QuirlConfig, CONFIG_SCHEMA_VERSION, MAX_LUA_SOURCE_BYTES,
 };
+use quirl_ui::THEME_DEFINITIONS;
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -208,6 +209,15 @@ fn tui(file: &Path) -> Result<i32, ShellError> {
         config.prompt.transient
     );
     println!("\n[ui]");
+    println!(
+        "ui.theme = {}  ({})",
+        escape_terminal_controls(&config.ui.theme),
+        THEME_DEFINITIONS
+            .iter()
+            .map(|theme| theme.id)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
     println!(
         "ui.surface = {}  (auto | rich | simple)",
         escape_terminal_controls(&config.ui.surface)
@@ -867,6 +877,12 @@ fn apply_web_form(
     )?;
     collect_web_change(
         &mut replacements,
+        ConfigField::UiTheme,
+        required_form_value(form, "ui_theme")?,
+        &session.config.ui.theme,
+    )?;
+    collect_web_change(
+        &mut replacements,
         ConfigField::UiStatuslineHints,
         required_form_value(form, "ui_statusline_hints")?,
         &session.config.ui.statusline.hints.to_string(),
@@ -999,6 +1015,31 @@ impl HttpResponse {
     }
 }
 
+fn render_theme_cards(selected_theme: &str) -> String {
+    let cards = THEME_DEFINITIONS
+        .iter()
+        .map(|theme| {
+            let checked = if theme.id == selected_theme { " checked" } else { "" };
+            format!(
+                "<label class=\"theme-card\" style=\"--bg:{background};--fg:{foreground};--command:{command};--context:{context};--secondary:{secondary};--string:{string};--dim:{dim};--error:{error}\"><input type=\"radio\" name=\"ui_theme\" value=\"{id}\"{checked}><span class=\"theme-name\">{name}</span><span class=\"terminal\"><span class=\"term-context\">~/src/quirl</span> <span class=\"term-secondary\">on main ≡ dirty</span><br><span class=\"term-command\">❯ git</span> <span class=\"term-flag\">status</span> <span class=\"term-string\">--short</span><br><span class=\"term-dim\">Alt-M mode · ^R history</span> <span class=\"term-error\">status:1</span></span></label>",
+                background = theme.background.css(),
+                foreground = theme.foreground.css(),
+                command = theme.command.css(),
+                context = theme.context.css(),
+                secondary = theme.secondary.css(),
+                string = theme.string.css(),
+                dim = theme.dim.css(),
+                error = theme.error.css(),
+                id = html_escape(theme.id),
+                name = html_escape(theme.name),
+            )
+        })
+        .collect::<String>();
+    format!(
+        "<fieldset><legend>Theme</legend><p>Eight built-in palettes preview prompt context, syntax, status, and accessibility roles. <code>NO_COLOR</code> still wins.</p><div class=\"theme-grid\">{cards}</div></fieldset>"
+    )
+}
+
 fn render_form(session: &WebSession, notice: Option<&str>) -> String {
     let config = &session.config;
     let selected = |value: &str, option: &str| if value == option { " selected" } else { "" };
@@ -1008,13 +1049,14 @@ fn render_form(session: &WebSession, notice: Option<&str>) -> String {
             html_escape(message)
         )
     });
+    let theme_cards = render_theme_cards(&config.ui.theme);
     format!(
         "<!doctype html>
 <html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <meta name=\"referrer\" content=\"no-referrer\"><title>Quirl configuration</title>
-<style>body{{font:1rem system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem}}fieldset{{margin:1rem 0;padding:1rem}}label{{display:block;margin:.75rem 0}}select,textarea{{font:inherit;max-width:100%;width:24rem}}textarea{{height:7rem}}button{{font:inherit;padding:.5rem 1rem}}[role=status]{{padding:.75rem;background:#eef}}</style></head>
-<body><main><h1>Quirl configuration</h1><p><code>config.lua</code> is the source of truth. Saves validate Lua, retain a <code>.bak</code>, and refuse concurrent edits.</p>{notice}
-<form method=\"post\" action=\"/\"><input type=\"hidden\" name=\"csrf\" value=\"{token}\"><input type=\"hidden\" name=\"revision\" value=\"{revision}\">
+<style>:root{{color-scheme:dark}}*{{box-sizing:border-box}}body{{font:1rem system-ui,sans-serif;max-width:72rem;margin:0 auto;padding:2rem 1rem 5rem;background:#101014;color:#ededf2}}main>p{{color:#a9a9b3}}code{{color:#b9a8ff}}fieldset{{margin:1.25rem 0;padding:1.25rem;border:1px solid #383842;border-radius:.8rem;background:#18181e}}legend{{font-weight:700;padding:0 .4rem}}label{{display:block;margin:.75rem 0}}select,input,textarea,button{{font:inherit}}select,input,textarea{{max-width:100%;width:26rem;padding:.45rem;border:1px solid #555563;border-radius:.4rem;background:#101014;color:#ededf2}}textarea{{height:7rem}}button{{padding:.7rem 1.2rem;border:0;border-radius:.45rem;background:#8f7cf7;color:#fff;font-weight:700;cursor:pointer}}[role=status]{{padding:.75rem;border-radius:.5rem;background:#29304a}}.theme-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(17rem,1fr));gap:.9rem}}.theme-card{{position:relative;margin:0;padding:.85rem;border:2px solid #3c3c45;border-radius:.7rem;cursor:pointer}}.theme-card:has(input:checked){{border-color:#b9a8ff;box-shadow:0 0 0 2px #6d58db}}.theme-card input{{position:absolute;width:1rem;right:.7rem;top:.3rem}}.theme-name{{display:block;margin:0 1.5rem .65rem 0;font-weight:700}}.terminal{{display:block;padding:.8rem;border-radius:.45rem;background:var(--bg);color:var(--fg);font:500 .82rem/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;overflow:hidden}}.terminal span{{white-space:nowrap}}.term-context{{color:var(--context)}}.term-secondary{{color:var(--secondary)}}.term-command{{color:var(--command);font-weight:700}}.term-flag{{color:var(--context)}}.term-string{{color:var(--string)}}.term-dim{{color:var(--dim)}}.term-error{{color:var(--error)}}@media(max-width:36rem){{body{{padding-top:1rem}}fieldset{{padding:.9rem}}}}</style></head>
+<body><main><h1>Make Quirl yours</h1><p>Preview a complete shell appearance, then save it back to <code>config.lua</code>. Saves validate Lua, retain a <code>.bak</code>, and refuse concurrent edits.</p>{notice}
+<form method=\"post\" action=\"/\"><input type=\"hidden\" name=\"csrf\" value=\"{token}\"><input type=\"hidden\" name=\"revision\" value=\"{revision}\">{theme_cards}
 <fieldset><legend>Schema</legend><p>Version <output>{schema}</output> (managed by Quirl; not edited by this form).</p></fieldset>
 <fieldset><legend>Editor</legend><label for=\"editor-keymap\">Keymap <select id=\"editor-keymap\" name=\"editor_keymap\"><option value=\"emacs\"{key_emacs}>emacs — complete default</option><option value=\"vim\"{key_vim}>vim</option><option value=\"helix\"{key_helix}>helix — experimental</option></select></label><label for=\"editor-semantic-hints\">Semantic hints <select id=\"editor-semantic-hints\" name=\"editor_semantic_hints\"><option value=\"true\"{semantic_true}>true</option><option value=\"false\"{semantic_false}>false</option></select></label><label for=\"editor-banner\">Welcome <select id=\"editor-banner\" name=\"editor_banner\"><option value=\"full\"{banner_full}>full</option><option value=\"compact\"{banner_compact}>compact</option><option value=\"none\"{banner_none}>none</option></select></label></fieldset>
 <fieldset><legend>Picker</legend><label for=\"picker-layout\">Layout <select id=\"picker-layout\" name=\"picker_layout\"><option value=\"adaptive\"{layout_adaptive}>adaptive</option><option value=\"bottom\"{layout_bottom}>bottom</option><option value=\"full\"{layout_full}>full</option></select></label><label for=\"picker-preview\">Preview <select id=\"picker-preview\" name=\"picker_preview\"><option value=\"true\"{preview_true}>true</option><option value=\"false\"{preview_false}>false</option></select></label></fieldset>
@@ -1024,6 +1066,7 @@ fn render_form(session: &WebSession, notice: Option<&str>) -> String {
 <button type=\"submit\">Save configuration</button></form></main></body></html>",
         token = html_escape(&session.token),
         revision = html_escape(&source_revision(&session.source)),
+        theme_cards = theme_cards,
         schema = config.schema_version,
         key_helix = selected(&config.editor.keymap, "helix"),
         key_emacs = selected(&config.editor.keymap, "emacs"),
@@ -1786,13 +1829,14 @@ enum ConfigField {
     PromptRight,
     PromptTransient,
     UiSurface,
+    UiTheme,
     UiStatuslineHints,
     CompletionAuto,
     CompletionMinChars,
 }
 
 impl ConfigField {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::EditorKeymap,
         Self::EditorSemanticHints,
         Self::EditorBanner,
@@ -1803,6 +1847,7 @@ impl ConfigField {
         Self::PromptRight,
         Self::PromptTransient,
         Self::UiSurface,
+        Self::UiTheme,
         Self::UiStatuslineHints,
         Self::CompletionAuto,
         Self::CompletionMinChars,
@@ -1820,6 +1865,7 @@ impl ConfigField {
             Self::PromptRight => "prompt.right",
             Self::PromptTransient => "prompt.transient",
             Self::UiSurface => "ui.surface",
+            Self::UiTheme => "ui.theme",
             Self::UiStatuslineHints => "ui.statusline.hints",
             Self::CompletionAuto => "completion.auto",
             Self::CompletionMinChars => "completion.min_chars",
@@ -1838,6 +1884,7 @@ impl ConfigField {
             "prompt.right" => Ok(Self::PromptRight),
             "prompt.transient" => Ok(Self::PromptTransient),
             "ui.surface" => Ok(Self::UiSurface),
+            "ui.theme" => Ok(Self::UiTheme),
             "ui.statusline.hints" => Ok(Self::UiStatuslineHints),
             "completion.auto" => Ok(Self::CompletionAuto),
             "completion.min_chars" => Ok(Self::CompletionMinChars),
@@ -1849,7 +1896,7 @@ impl ConfigField {
         }
     }
 
-    const KEYS: [&'static str; 13] = [
+    const KEYS: [&'static str; 14] = [
         "editor.keymap",
         "editor.semantic_hints",
         "editor.banner",
@@ -1860,6 +1907,7 @@ impl ConfigField {
         "prompt.right",
         "prompt.transient",
         "ui.surface",
+        "ui.theme",
         "ui.statusline.hints",
         "completion.auto",
         "completion.min_chars",
@@ -1877,6 +1925,7 @@ impl ConfigField {
             Self::PromptRight => ("prompt", "right"),
             Self::PromptTransient => ("prompt", "transient"),
             Self::UiSurface => ("ui", "surface"),
+            Self::UiTheme => ("ui", "theme"),
             Self::UiStatuslineHints => ("ui.statusline", "hints"),
             Self::CompletionAuto => ("completion", "auto"),
             Self::CompletionMinChars => ("completion", "min_chars"),
@@ -1892,6 +1941,7 @@ impl ConfigField {
                 matches!(value, "auto" | "plain" | "unicode" | "nerd_font")
             }
             Self::UiSurface => matches!(value, "auto" | "rich" | "simple"),
+            Self::UiTheme => THEME_DEFINITIONS.iter().any(|theme| theme.id == value),
             Self::CompletionMinChars => value.parse::<u16>().is_ok_and(|value| value <= 4096),
             Self::EditorSemanticHints
             | Self::PickerPreview
@@ -1909,6 +1959,7 @@ impl ConfigField {
                 Self::PickerLayout => "adaptive, bottom, or full",
                 Self::PromptSymbols => "auto, plain, unicode, or nerd_font",
                 Self::UiSurface => "auto, rich, or simple",
+                Self::UiTheme => "a built-in theme name shown by `quirl config web`",
                 Self::CompletionMinChars => "an integer from 0 through 4096",
                 Self::EditorSemanticHints
                 | Self::PickerPreview
@@ -1930,7 +1981,8 @@ impl ConfigField {
             | Self::EditorBanner
             | Self::PickerLayout
             | Self::PromptSymbols
-            | Self::UiSurface => {
+            | Self::UiSurface
+            | Self::UiTheme => {
                 format!("\"{value}\"")
             }
             Self::EditorSemanticHints
@@ -1961,6 +2013,7 @@ impl ConfigField {
             Self::PromptRight => serde_json::to_string(&config.prompt.right).unwrap_or_default(),
             Self::PromptTransient => config.prompt.transient.to_string(),
             Self::UiSurface => config.ui.surface.clone(),
+            Self::UiTheme => config.ui.theme.clone(),
             Self::UiStatuslineHints => config.ui.statusline.hints.to_string(),
             Self::CompletionAuto => config.completion.auto.to_string(),
             Self::CompletionMinChars => config.completion.min_chars.to_string(),
@@ -1999,7 +2052,14 @@ fn patch_literals(
     source: &str,
     replacements: &[(ConfigField, String)],
 ) -> Result<String, ShellError> {
-    let mut candidate = source.to_owned();
+    let mut candidate = if replacements
+        .iter()
+        .any(|(field, _)| *field == ConfigField::UiTheme)
+    {
+        migration_candidate(source)?.1
+    } else {
+        source.to_owned()
+    };
     for (field, replacement) in replacements {
         candidate = patch_literal(&candidate, *field, replacement)?;
     }
@@ -2031,6 +2091,14 @@ fn patch_literal(
         section_open = *section_value;
     }
     let values = field_values(&tokens, section_open, name);
+    if values.is_empty() && field == ConfigField::UiTheme {
+        let insert_at = tokens[section_open].end;
+        let mut patched = String::with_capacity(source.len() + replacement.len() + 12);
+        patched.push_str(&source[..insert_at]);
+        patched.push_str(&format!(" theme = {replacement},"));
+        patched.push_str(&source[insert_at..]);
+        return Ok(patched);
+    }
     let [value] = values.as_slice() else {
         return Err(patch_error(&format!(
             "expected exactly one literal `{section}.{name}` field"
@@ -2047,7 +2115,8 @@ fn patch_literal(
         | ConfigField::EditorBanner
         | ConfigField::PickerLayout
         | ConfigField::PromptSymbols
-        | ConfigField::UiSurface => {
+        | ConfigField::UiSurface
+        | ConfigField::UiTheme => {
             matches!(&tokens[*value].kind, TokenKind::String)
         }
         ConfigField::EditorSemanticHints
@@ -2447,10 +2516,29 @@ return config
         assert_eq!(set(&file, "completion.min_chars", "4").unwrap(), 0);
 
         let config = load(&file).unwrap();
-        assert_eq!(config.schema_version, 2);
+        assert_eq!(config.schema_version, 3);
         assert_eq!(config.ui.surface, "rich");
         assert!(!config.ui.statusline.hints);
         assert_eq!(config.completion.min_chars, 4);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn theme_selection_migrates_v2_and_inserts_the_new_literal() {
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("config.lua");
+        let source = include_str!("../../../examples/config.lua")
+            .replace("schema_version = 3", "schema_version = 2")
+            .replace(" theme = \"quirl\",", "");
+        fs::write(&file, source).unwrap();
+
+        assert_eq!(set(&file, "ui.theme", "nord").unwrap(), 0);
+
+        let installed = fs::read_to_string(&file).unwrap();
+        assert!(installed.contains("schema_version = 3"));
+        assert!(installed.contains("theme = \"nord\""));
+        assert_eq!(load(&file).unwrap().ui.theme, "nord");
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2474,7 +2562,7 @@ return config
     }
 
     #[test]
-    fn migration_preview_inserts_v2_without_mutating_the_source() {
+    fn migration_preview_inserts_v3_without_mutating_the_source() {
         let directory = test_directory();
         fs::create_dir_all(&directory).unwrap();
         let file = directory.join("config.lua");
@@ -2484,7 +2572,7 @@ return config
         let (version, candidate) = migration_candidate(&source).unwrap();
 
         assert_eq!(version, None);
-        assert!(candidate.contains("schema_version = 2"));
+        assert!(candidate.contains("schema_version = 3"));
         assert_eq!(read_config_source(&file).unwrap(), source);
         assert!(!backup_path(&file).exists());
         fs::remove_dir_all(directory).unwrap();
@@ -2494,7 +2582,7 @@ return config
     fn migration_preview_rejects_a_future_schema_instead_of_calling_it_current() {
         let source = example_source().replace(
             "editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
-            "schema_version = 3,\n  editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
+            "schema_version = 4,\n  editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
         );
 
         let error = migration_candidate(&source).unwrap_err();
@@ -2505,7 +2593,7 @@ return config
     }
 
     #[test]
-    fn migration_preview_projects_v1_to_v2_without_rewriting_other_source() {
+    fn migration_preview_projects_v1_to_v3_without_rewriting_other_source() {
         let source = example_source().replace(
             "editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
             "schema_version = 1,\n  editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
@@ -2514,7 +2602,7 @@ return config
         let (version, candidate) = migration_candidate(&source).unwrap();
 
         assert_eq!(version, Some(1));
-        assert!(candidate.contains("schema_version = 2"));
+        assert!(candidate.contains("schema_version = 3"));
         assert!(candidate.contains("-- Keep this comment"));
         assert!(candidate.contains("render = function() return \"ok\" end"));
     }
@@ -2618,6 +2706,7 @@ return config
             ("prompt_right".to_owned(), String::new()),
             ("prompt_transient".to_owned(), "true".to_owned()),
             ("ui_surface".to_owned(), "auto".to_owned()),
+            ("ui_theme".to_owned(), "quirl".to_owned()),
             ("ui_statusline_hints".to_owned(), "true".to_owned()),
             ("completion_auto".to_owned(), "false".to_owned()),
             ("completion_min_chars".to_owned(), "2".to_owned()),
@@ -2639,6 +2728,9 @@ return config
         assert!(page.contains("picker_layout"));
         assert!(page.contains("prompt_left"));
         assert!(page.contains("ui_surface"));
+        assert!(page.contains("ui_theme"));
+        assert!(page.contains("Catppuccin Mocha"));
+        assert!(page.contains("class=\"terminal\""));
         assert!(page.contains("completion_min_chars"));
         assert!(!page.contains("Cache-Control"));
         assert!(!page.contains("<script"));
@@ -2665,6 +2757,38 @@ return config
         let installed = fs::read_to_string(&file).unwrap();
         assert!(installed.contains("keymap = \"vim\""));
         assert!(installed.contains("-- external note"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn web_theme_selection_patches_the_authoritative_lua_source() {
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("config.lua");
+        fs::write(&file, include_str!("../../../examples/config.lua")).unwrap();
+        let original = fs::read_to_string(&file).unwrap();
+        let mut session = WebSession {
+            token: "private".to_owned(),
+            source: original.clone(),
+            config: load(&file).unwrap(),
+        };
+        let mut form = web_form("private", &original, "emacs");
+        form.insert(
+            "prompt_left".to_owned(),
+            "directory\ngit_branch\ngit_state".to_owned(),
+        );
+        form.insert(
+            "prompt_right".to_owned(),
+            "jobs\nduration\nstatus".to_owned(),
+        );
+        form.insert("ui_theme".to_owned(), "tokyo_night".to_owned());
+
+        apply_web_form(&file, &mut session, &form).unwrap();
+
+        assert_eq!(load(&file).unwrap().ui.theme, "tokyo_night");
+        assert!(fs::read_to_string(&file)
+            .unwrap()
+            .contains("theme = \"tokyo_night\""));
         fs::remove_dir_all(directory).unwrap();
     }
 

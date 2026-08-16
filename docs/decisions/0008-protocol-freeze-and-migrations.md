@@ -50,6 +50,10 @@ version is legacy v0; both v0 and explicit v1 deterministically receive v2
 defaults and become v2 before authoritative validation. Config versions newer
 than v2, like future versions of every frozen-major surface, fail closed.
 
+ADR 0013 subsequently moves configuration to schema v3 for the closed
+`ui.theme` catalog. Legacy v0/v1/v2 documents receive the Quirl theme default
+before v3 validation; versions newer than v3 fail closed.
+
 ## Consequences
 
 - A reviewed golden change is required when any public contract identity moves.

@@ -24,7 +24,7 @@ security. Plugin file integrity continues to use SHA-256 and explicit grants.
 | Catalog cache | 4 | 2 | v2/v3 facts are assigned explicit lower-confidence defaults, then current builtins merge |
 | Plugin lock | 2 | 1 | Identity, sources, checksums, permissions, grants, and enable state are preserved; runtime schema identity is derived deterministically |
 | Recovery snapshot | 2 | 1 | Existing redacted output/errors are preserved; unavailable command/cwd/environment facts stay unavailable and replay is never inferred |
-| Lua config | 2 | legacy unversioned (v0) | Missing `schema_version` and explicit v1 documents migrate deterministically to v2 defaults before Rust validation; explicit unknown/future versions fail |
+| Lua config | 3 | legacy unversioned (v0) | Missing `schema_version` and explicit v1/v2 documents migrate deterministically to v3 defaults before Rust validation; v3 adds the closed built-in `ui.theme` catalog, and explicit unknown/future versions fail |
 
 ## Deliberate 1.0 boundaries
 

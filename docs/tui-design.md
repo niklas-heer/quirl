@@ -622,6 +622,9 @@ local config = quirl.config {
 }
 ```
 
+ADR 0013 later adds the closed `ui.theme` field as config schema v3; v0/v1/v2
+documents migrate to the Quirl palette default.
+
 `ui.surface = "auto"` applies the §9 probe. Everything else in the frame
 derives from existing config (keymap, picker layout, prompt segments,
 symbols).

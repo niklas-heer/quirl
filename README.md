@@ -180,6 +180,10 @@ The architecture and decisions behind it are documented in depth:
 - [ADR 0012: Ratatui interactive surface](docs/decisions/0012-ratatui-interactive-surface.md) —
   capable-TTY default selection, inline-terminal lifecycle, Reedline fallback,
   and config schema v2 migration.
+- [ADR 0013: built-in theme catalog](docs/decisions/0013-built-in-theme-catalog.md) —
+  config schema v3, shared semantic palettes, and deterministic web previews.
+- [ADR 0014: external history provider boundary](docs/decisions/0014-external-history-provider-boundary.md) —
+  proposed bounded interoperability for tools such as Atuin.
 - [Security and accessibility audit](docs/security-accessibility-audit-v0.1.md)
   and [1.0 performance record](docs/benchmarks/release-v1.0.md) — adversarial
   boundaries, text fallbacks, named hardware, reproducible budgets, and outcomes.
@@ -354,7 +358,7 @@ Configuration, scripts, and plugins share the same Lua 5.4 SDK. A minimal
 ```lua
 ---@type quirl.Config
 local config = quirl.config {
-  schema_version = 2,
+  schema_version = 3,
   editor = { keymap = "emacs", semantic_hints = true, banner = "full" },
   picker = { layout = "adaptive", preview = true },
   prompt = {
@@ -363,7 +367,7 @@ local config = quirl.config {
     right = { "jobs", "duration", "status" },
     transient = true,
   },
-  ui = { surface = "auto", statusline = { hints = true } },
+  ui = { theme = "quirl", surface = "auto", statusline = { hints = true } },
   completion = { auto = false, min_chars = 2 },
 }
 
@@ -378,10 +382,10 @@ experimental compatibility option.
 The welcome is shown on every interactive launch by default; set
 `editor.banner` to `compact` or `none` if you prefer less startup chrome.
 
-Config schema v2 introduced the rich-surface, status-line, transient-prompt,
-and automatic-completion settings above. Unversioned v0 and explicit v1
-configuration migrate deterministically to v2 defaults before validation;
-future versions fail closed. `ui.surface = "auto"` prefers Ratatui only when
+Config schema v3 adds `ui.theme` to the v2 rich-surface, status-line,
+transient-prompt, and automatic-completion settings. Unversioned v0 and
+explicit v1/v2 configuration migrate deterministically to v3 defaults before
+validation; future versions fail closed. `ui.surface = "auto"` prefers Ratatui only when
 terminal capabilities are sufficient, `rich` requests that same rich path, and
 `simple` selects Reedline explicitly.
 
@@ -396,6 +400,11 @@ terminal capabilities are sufficient, `rich` requests that same rich path, and
 Symbols are decoration, not state: mode, status, job count, duration, Git state,
 and directory context retain textual meaning. `NO_COLOR` independently disables
 styling without removing prompt information.
+
+`ui.theme` selects one of eight built-in palettes: `quirl`,
+`catppuccin_mocha`, `dracula`, `gruvbox_dark`, `nord`, `solarized_dark`,
+`tokyo_night`, or `one_dark`. The rich surface, simple prompt, semantic
+highlighter, and web previews share the same semantic color roles.
 
 Plugins register prompt segments and completion providers against the same
 capability-checked API:
@@ -437,14 +446,18 @@ cargo run -p quirl-cli -- config doctor examples/config.lua
 ```
 
 `config set` and `config web` patch only recognized literal fields under
-`editor`, `picker`, and `prompt`, preserve surrounding Lua source, validate
-the complete candidate before activation, replace the file atomically, and
+`editor`, `picker`, `prompt`, `ui`, and `completion`, preserve surrounding Lua
+source, validate the complete candidate before activation, replace the file atomically, and
 retain the prior source as `config.lua.bak`. Values controlled by Lua
 expressions must be edited in code. `config web` binds only to `127.0.0.1`,
 prints a private tokenized URL, sends no-cache headers, bounds requests and
 read time, merges non-overlapping external edits, and rejects stale or
 conflicting source changes instead of silently overwriting them. Use `--port 8787` to choose a loopback port; the
 default selects one automatically.
+
+The web form includes a Fish-inspired gallery that previews all built-in
+themes against deterministic prompt, syntax, history-hint, and status samples.
+It uses no JavaScript, remote assets, shell execution, or second settings store.
 
 `config export`, `diff`, and `doctor` read only the authoritative Lua source
 and offer deterministic terminal-safe text or JSON where applicable. `config

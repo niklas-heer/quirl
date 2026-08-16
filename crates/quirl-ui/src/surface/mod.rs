@@ -8,6 +8,7 @@ mod statusbar;
 mod theme;
 
 pub use degrade::{select_surface, SurfaceKind};
+pub use theme::{theme_definition, RgbColor, ThemeDefinition, THEME_DEFINITIONS};
 
 use self::{
     completion::CompletionState,
@@ -74,6 +75,7 @@ pub struct RichSurface {
     picker: PickerOverlay,
     picker_layout: PickerLayout,
     picker_preview: bool,
+    theme: String,
     expand_completion_pending: bool,
     keymap: String,
     history_path: PathBuf,
@@ -106,6 +108,7 @@ impl RichSurface {
             picker: PickerOverlay::new(picker_ranker),
             picker_layout: PickerLayout::from_config(&config.picker.layout),
             picker_preview: config.picker.preview,
+            theme: config.ui.theme.clone(),
             expand_completion_pending: false,
             catalog,
             keymap: config.editor.keymap.clone(),
@@ -135,7 +138,7 @@ impl RichSurface {
         let color = std::io::stderr().is_terminal()
             && env::var_os("NO_COLOR").is_none()
             && !env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb"));
-        let theme = Theme::new(color);
+        let theme = Theme::new(color, &self.theme);
         let mut dirty = true;
         let mut prompt_prepared = false;
 

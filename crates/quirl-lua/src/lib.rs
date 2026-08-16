@@ -31,10 +31,21 @@ const COMPLETION_CALLBACK_DEADLINE: Duration = Duration::from_millis(50);
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_LUA_COMPLETION_RESULTS: usize = 1_000;
 const MAX_LUA_COMPLETION_ITEM_BYTES: usize = 16 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 pub const CONFIG_OLDEST_READABLE_VERSION: u32 = 0;
 pub const MAX_LUA_SOURCE_BYTES: usize = 4 * 1024 * 1024;
-pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@2{QuirlConfig{deny_unknown;schema_version:u32(default=2,legacy=0|1-migrates-to-2);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=full)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);statusline:StatuslineConfig(default)};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=false);min_chars:u16(0..=4096,default=2)};migration:unversioned-or-v1-to-v2}";
+pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@3{QuirlConfig{deny_unknown;schema_version:u32(default=3,legacy=0|1|2-migrates-to-3);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=full)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);theme:quirl|catppuccin_mocha|dracula|gruvbox_dark|nord|solarized_dark|tokyo_night|one_dark(default=quirl);statusline:StatuslineConfig(default)};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=false);min_chars:u16(0..=4096,default=2)};migration:unversioned-or-v1-or-v2-to-v3}";
+
+pub const UI_THEME_NAMES: [&str; 8] = [
+    "quirl",
+    "catppuccin_mocha",
+    "dracula",
+    "gruvbox_dark",
+    "nord",
+    "solarized_dark",
+    "tokyo_night",
+    "one_dark",
+];
 
 pub fn config_schema_hash() -> String {
     quirl_core::schema_fingerprint(CONFIG_SCHEMA_DESCRIPTOR)
@@ -176,6 +187,7 @@ impl Default for PromptConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
     pub surface: String,
+    pub theme: String,
     pub statusline: StatuslineConfig,
 }
 
@@ -183,6 +195,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             surface: "auto".to_owned(),
+            theme: "quirl".to_owned(),
             statusline: StatuslineConfig::default(),
         }
     }
@@ -259,6 +272,12 @@ impl QuirlConfig {
             return Err(validation_error(
                 source,
                 "ui.surface must be `auto`, `rich`, or `simple`",
+            ));
+        }
+        if !UI_THEME_NAMES.contains(&self.ui.theme.as_str()) {
+            return Err(validation_error(
+                source,
+                format!("ui.theme must be one of: {}", UI_THEME_NAMES.join(", ")),
             ));
         }
         if self.completion.min_chars > 4096 {
@@ -1436,6 +1455,14 @@ pub fn sdk_lua() -> String {
     let mut output = String::from(
         "---@meta quirl\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? string\n\n---@alias quirl.PromptSymbols 'auto'|'plain'|'unicode'|'nerd_font'\n---@alias quirl.WelcomeBanner 'full'|'compact'|'none'\n---@alias quirl.Surface 'auto'|'rich'|'simple'\n\n---@class quirl.EditorConfig\n---@field keymap? 'emacs'|'vim'|'helix' Emacs is the complete default.\n---@field semantic_hints? boolean\n---@field banner? quirl.WelcomeBanner\n\n---@class quirl.PickerConfig\n---@field layout? 'adaptive'|'bottom'|'full'\n---@field preview? boolean\n\n---@class quirl.PromptConfig\n---@field symbols? quirl.PromptSymbols Auto never assumes a patched font; nerd_font enables Powerline glyphs explicitly.\n---@field left? string[] Ordered prompt segments before the input.\n---@field right? string[] Ordered prompt segments aligned on the right.\n---@field transient? boolean Collapse accepted input to one scrollback line before execution.\n\n---@class quirl.StatuslineConfig\n---@field hints? boolean\n\n---@class quirl.UiConfig\n---@field surface? quirl.Surface\n---@field statusline? quirl.StatuslineConfig\n\n---@class quirl.CompletionConfig\n---@field auto? boolean\n---@field min_chars? integer\n\n---@class quirl.Config\n---@field schema_version? integer\n---@field editor? quirl.EditorConfig\n---@field picker? quirl.PickerConfig\n---@field prompt? quirl.PromptConfig\n---@field ui? quirl.UiConfig\n---@field completion? quirl.CompletionConfig\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
     );
+    output = output.replace(
+        "---@alias quirl.Surface 'auto'|'rich'|'simple'\n",
+        "---@alias quirl.Surface 'auto'|'rich'|'simple'\n---@alias quirl.Theme 'quirl'|'catppuccin_mocha'|'dracula'|'gruvbox_dark'|'nord'|'solarized_dark'|'tokyo_night'|'one_dark'\n",
+    );
+    output = output.replace(
+        "---@field surface? quirl.Surface\n",
+        "---@field surface? quirl.Surface\n---@field theme? quirl.Theme Built-in color theme; NO_COLOR still disables color.\n",
+    );
     for spec in HOST_API {
         output.push_str(&format!("---{}\n", spec.summary));
         for parameter in spec.parameters {
@@ -2464,7 +2491,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_unversioned_config_migrates_to_v2_and_future_versions_fail() {
+    fn legacy_unversioned_config_defaults_to_v3_and_future_versions_fail() {
         let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
         let legacy = runtime
             .lua
@@ -2477,7 +2504,7 @@ mod tests {
 
         let future = runtime
             .lua
-            .load("return quirl.config { schema_version = 3 }")
+            .load("return quirl.config { schema_version = 4 }")
             .eval::<Value>()
             .unwrap();
         let future = runtime.lua.from_value::<QuirlConfig>(future).unwrap();
@@ -2485,10 +2512,42 @@ mod tests {
     }
 
     #[test]
+    fn explicit_v2_file_migrates_to_the_v3_theme_default() {
+        let path = std::env::temp_dir().join(format!(
+            "quirl-config-v2-migration-{}.lua",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "return quirl.config { schema_version = 2, ui = { surface = 'simple' } }",
+        )
+        .unwrap();
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+
+        let config = runtime.load_config_file(&path).unwrap();
+
+        assert_eq!(config.schema_version, 3);
+        assert_eq!(config.ui.theme, "quirl");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn config_schema_descriptor_has_a_stable_identity() {
         assert_eq!(CONFIG_OLDEST_READABLE_VERSION, 0);
-        assert!(CONFIG_SCHEMA_DESCRIPTOR.contains("migration:unversioned-or-v1-to-v2"));
+        assert!(CONFIG_SCHEMA_DESCRIPTOR.contains("migration:unversioned-or-v1-or-v2-to-v3"));
         assert!(config_schema_hash().starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn theme_requires_a_built_in_name() {
+        let mut config = QuirlConfig::default();
+        config.ui.theme = "remote-css".to_owned();
+
+        let error = config.validate("config.lua").unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.details.context[0].contains("ui.theme"));
+        assert!(error.details.context[0].contains("catppuccin_mocha"));
     }
 
     #[test]

@@ -7,7 +7,10 @@ pub use panel::{
     directory_panel, process_panel, LiveBuffer, LiveSample, LiveSnapshot, PanelModel,
     ProcessPanelRow,
 };
-pub use surface::{select_surface, InteractiveSignal, RichSurface, SurfaceKind};
+pub use surface::{
+    select_surface, theme_definition, InteractiveSignal, RgbColor, RichSurface, SurfaceKind,
+    ThemeDefinition, THEME_DEFINITIONS,
+};
 
 use crossterm::{
     cursor::SetCursorStyle,
@@ -285,6 +288,7 @@ fn configured_editor(
         env::var_os("NO_COLOR").is_some(),
         dumb_terminal(),
     );
+    let theme = theme_definition(&config.ui.theme);
     let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::None as u8));
     let completer = Box::new(CatalogCompleter::with_extensions_and_picker(
         catalog.clone(),
@@ -323,7 +327,7 @@ fn configured_editor(
         .with_menu(ReedlineMenu::EngineCompleter(action_picker_menu))
         .with_hinter(Box::new(DefaultHinter::default().with_style(
             if terminal_styles {
-                Style::new().italic().fg(Color::DarkGray)
+                Style::new().italic().fg(prompt_color(theme.dim))
             } else {
                 Style::new()
             },
@@ -342,7 +346,8 @@ fn configured_editor(
         line_editor = line_editor.with_cursor_config(editor_cursor_config());
     }
     if config.editor.semantic_hints && terminal_styles {
-        line_editor = line_editor.with_highlighter(Box::new(SemanticHighlighter::new(catalog)));
+        line_editor =
+            line_editor.with_highlighter(Box::new(SemanticHighlighter::new(catalog, theme)));
     }
     line_editor
 }
@@ -1186,6 +1191,7 @@ pub struct QuirlPrompt {
     configured_left: Option<Vec<String>>,
     configured_right: Vec<String>,
     configured_symbols: String,
+    theme: ThemeDefinition,
     named_extension_segments: HashMap<String, String>,
     styled: bool,
 }
@@ -1323,6 +1329,7 @@ impl QuirlPrompt {
             configured_left: None,
             configured_right: Vec::new(),
             configured_symbols: "auto".to_owned(),
+            theme: theme_definition("quirl"),
             named_extension_segments: HashMap::new(),
             styled: terminal_styling_enabled(
                 std::io::stdout().is_terminal(),
@@ -1342,6 +1349,7 @@ impl QuirlPrompt {
         prompt.configured_left = Some(config.prompt.left.clone());
         prompt.configured_right = config.prompt.right.clone();
         prompt.configured_symbols.clone_from(&config.prompt.symbols);
+        prompt.theme = theme_definition(&config.ui.theme);
         prompt
     }
 
@@ -1441,10 +1449,12 @@ impl QuirlPrompt {
             return value;
         }
         let style = match name {
-            "directory" => Style::new().bold().fg(Color::Cyan),
-            "git_branch" | "git_state" => Style::new().bold().fg(Color::Purple),
-            "status" => Style::new().bold().fg(Color::Red),
-            "duration" | "jobs" => Style::new().fg(Color::Purple),
+            "directory" => Style::new().bold().fg(prompt_color(self.theme.context)),
+            "git_branch" | "git_state" => {
+                Style::new().bold().fg(prompt_color(self.theme.secondary))
+            }
+            "status" => Style::new().bold().fg(prompt_color(self.theme.error)),
+            "duration" | "jobs" => Style::new().fg(prompt_color(self.theme.data)),
             _ => Style::new(),
         };
         style.paint(value).to_string()
@@ -1530,6 +1540,18 @@ fn locale_name_supports_unicode(locale: &std::ffi::OsStr) -> bool {
 
 fn terminal_styling_enabled(terminal: bool, no_color_is_set: bool, dumb: bool) -> bool {
     terminal && !no_color_is_set && !dumb
+}
+
+const fn prompt_color(color: RgbColor) -> Color {
+    Color::Rgb(color.red, color.green, color.blue)
+}
+
+const fn prompt_reedline_color(color: RgbColor) -> reedline::Color {
+    reedline::Color::Rgb {
+        r: color.red,
+        g: color.green,
+        b: color.blue,
+    }
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -1629,13 +1651,13 @@ impl Prompt for QuirlPrompt {
     }
 
     fn get_prompt_right_color(&self) -> reedline::Color {
-        reedline::Color::Magenta
+        prompt_reedline_color(self.theme.secondary)
     }
 
     fn get_indicator_color(&self) -> reedline::Color {
         match self.mode {
-            Mode::Command => reedline::Color::Green,
-            Mode::Data => reedline::Color::Cyan,
+            Mode::Command => prompt_reedline_color(self.theme.command),
+            Mode::Data => prompt_reedline_color(self.theme.data),
         }
     }
 
@@ -2329,11 +2351,12 @@ fn picker_item(index: usize, kind: PickerItemKind, value: &str, description: &st
 
 struct SemanticHighlighter {
     catalog: Catalog,
+    theme: ThemeDefinition,
 }
 
 impl SemanticHighlighter {
-    fn new(catalog: Catalog) -> Self {
-        Self { catalog }
+    fn new(catalog: Catalog, theme: ThemeDefinition) -> Self {
+        Self { catalog, theme }
     }
 }
 
@@ -2354,16 +2377,16 @@ impl Highlighter for SemanticHighlighter {
             } else if first_word {
                 first_word = false;
                 if known {
-                    Style::new().bold().fg(Color::Green)
+                    Style::new().bold().fg(prompt_color(self.theme.command))
                 } else {
-                    Style::new().bold().fg(Color::Red)
+                    Style::new().bold().fg(prompt_color(self.theme.error))
                 }
             } else if segment.starts_with('-') {
-                Style::new().fg(Color::Cyan)
+                Style::new().fg(prompt_color(self.theme.context))
             } else if segment.starts_with('"') || segment.starts_with('\'') {
-                Style::new().fg(Color::Yellow)
+                Style::new().fg(prompt_color(self.theme.string))
             } else {
-                Style::new().fg(Color::White)
+                Style::new().fg(prompt_color(self.theme.foreground))
             };
             highlighted.push((style, segment.to_owned()));
         }
@@ -3323,8 +3346,9 @@ mod tests {
     }
 
     #[test]
-    fn styled_default_prompt_uses_only_fixed_quirl_color_sequences() {
-        let config = QuirlConfig::default();
+    fn styled_prompt_uses_only_the_selected_built_in_theme_sequences() {
+        let mut config = QuirlConfig::default();
+        config.ui.theme = "nord".to_owned();
         let mut prompt = QuirlPrompt::with_config(Mode::Command, &config).with_native_context(
             NativePromptContext {
                 directory: "~/P/g/n/quirl".to_owned(),
@@ -3336,8 +3360,8 @@ mod tests {
 
         let rendered = prompt.render_prompt_left();
 
-        assert!(rendered.starts_with("\u{1b}[1;36m~/P/g/n/quirl"));
-        assert!(rendered.contains("\u{1b}[1;35mon main"));
+        assert!(rendered.starts_with("\u{1b}[1;38;2;136;192;208m~/P/g/n/quirl"));
+        assert!(rendered.contains("\u{1b}[1;38;2;129;161;193mon main"));
         assert!(rendered.contains("dirty"));
         assert!(rendered.ends_with('\n'));
         assert!(!rendered.contains("\u{1b}]"));
