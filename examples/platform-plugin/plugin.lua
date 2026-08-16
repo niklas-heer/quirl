@@ -8,7 +8,21 @@ quirl.plugin.command {
   examples = { "platform-demo run" },
   effects = { "read_filesystem" },
   error_codes = { ["0"] = "success" },
-  run = function()
-    return { platform = "quirl", version = 1 }
+  run = function(_ctx)
+    return {
+      abi_version = 1,
+      ok = true,
+      status = 0,
+      output = {
+        kind = "value",
+        value = {
+          type = "record",
+          value = {
+            platform = { type = "string", value = "quirl" },
+            version = { type = "int", value = 1 },
+          },
+        },
+      },
+    }
   end,
 }

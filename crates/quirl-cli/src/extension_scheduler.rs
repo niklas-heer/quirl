@@ -57,6 +57,7 @@ type WorkCallback = Box<dyn FnOnce(ExtensionWorkContext) + Send + 'static>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkPriority {
+    Command,
     Event,
     Prompt,
 }
@@ -346,6 +347,11 @@ impl ExtensionScheduler {
             });
         }
         match priority {
+            WorkPriority::Command => {
+                for (offset, work) in queued.into_iter().enumerate() {
+                    state.queue.insert(offset, work);
+                }
+            }
             WorkPriority::Event => {
                 let insertion = state
                     .queue

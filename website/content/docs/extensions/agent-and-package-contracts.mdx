@@ -48,6 +48,9 @@ their catalog and host-API hashes with trusted anchors rebuilt from the running
 binary; the lower-level unanchored validator rejects those document kinds.
 Manifest content and nested capability hashes are also recomputed. Validation
 parses data only and does not grant authority or execute commands/Lua.
+Validation reads at most 4 MiB from a regular file. Larger inputs fail with a
+resource-limit diagnostic before JSON parsing or allocation proportional to
+the declared file size.
 
 ## Package manifest
 
@@ -116,5 +119,11 @@ Package file lists contain normalized package-relative paths, so invoking the
 build with an absolute or relative manifest path produces the same build
 record. The record includes the resolved Quirl version and installed host-API
 hash.
+Package manifests are UTF-8 regular files limited to 256 KiB. Lua entries are
+regular files limited to 4 MiB. Entry containment is checked against the
+canonical package directory; parent traversal, external symlink targets,
+directory or special-file entries, identity changes during resolution, and
+growth beyond the read limit fail closed. The bytes read from the verified
+handle are the bytes linted and hashed.
 `package publish` is deliberately limited to `--dry-run` in v0.1: it emits a
 deterministic plan and performs no network operation.

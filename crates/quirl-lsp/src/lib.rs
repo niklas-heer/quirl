@@ -1207,6 +1207,33 @@ mod tests {
     }
 
     #[test]
+    fn validated_plugin_catalog_entries_reach_docs_and_completion_without_execution() {
+        let mut catalog = Catalog::builtin();
+        let mut plugin = catalog.find("ls").unwrap().clone();
+        plugin.id = "plugin:demo/demo/run".to_owned();
+        plugin.path = "demo run".to_owned();
+        plugin.signature = "demo run".to_owned();
+        plugin.parent = None;
+        plugin.provenance =
+            quirl_catalog::ProvenanceInfo::builtin(quirl_catalog::Provenance::Plugin);
+        for argument in &mut plugin.options {
+            argument.provenance = plugin.provenance.clone();
+        }
+        catalog.merge(vec![plugin]);
+        let mut service = LanguageService::new(catalog);
+
+        let docs = request(&mut service, 1, "quirl/moduleDocs", json!({}));
+        assert!(docs["result"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("demo run"));
+        let completions = quirl_completions(&service.catalog, "demo r", "demo r".len(), "r");
+        assert!(completions
+            .iter()
+            .any(|completion| completion["label"] == "demo run"));
+    }
+
+    #[test]
     fn stdio_server_reads_and_writes_lsp_framing() {
         let body = serde_json::to_vec(&json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}

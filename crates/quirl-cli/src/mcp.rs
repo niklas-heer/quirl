@@ -713,6 +713,17 @@ mod tests {
     }
 
     #[test]
+    fn mcp_metadata_is_truthfully_builtin_only_and_nonexecuting() {
+        let server = McpServer::new(vec![McpCapability::Catalog]);
+        assert_eq!(server.catalog, Catalog::builtin());
+        assert!(server
+            .catalog
+            .commands
+            .iter()
+            .all(|command| command.provenance.source != quirl_catalog::Provenance::Plugin));
+    }
+
+    #[test]
     fn modern_discovery_requires_metadata_on_every_request_and_stamps_responses() {
         let mut server = McpServer::new(vec![McpCapability::Catalog]);
         let discovery = server

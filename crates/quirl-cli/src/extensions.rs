@@ -3,27 +3,30 @@ use crate::extension_scheduler::{
     ExtensionWorkContext, WorkPriority,
 };
 use quirl_catalog::{
-    Catalog, CommandSpec, Confidence, Provenance, ProvenanceInfo, Trust,
-    MAX_COMPLETION_QUERY_BYTES, MAX_COMPLETION_RESULTS,
+    ArgumentKind, Catalog, CommandSpec, Effect, MAX_COMPLETION_QUERY_BYTES, MAX_COMPLETION_RESULTS,
 };
+#[cfg(test)]
+use quirl_catalog::{Confidence, Provenance, ProvenanceInfo, Trust};
 use quirl_core::{
-    validate_contribution_set, ContributionKind, ErrorCode, ExtensionAction, ExtensionEvent,
-    ExtensionEventData, ShellError,
+    validate_contribution_set, ContributionKind, ErrorCode, ExecutionEffect, ExecutionEffects,
+    ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget, ExecutionPlan,
+    ExecutionRequest, ExecutionSource, ExtensionAction, ExtensionEvent, ExtensionEventData,
+    ShellError,
 };
 use quirl_lua::{
-    ConfigStore, EventHandlerReport, LuaCancellation, LuaPolicy, LuaRuntime, PluginRegistrations,
-    QuirlConfig,
+    CommandRegistration, ConfigStore, EventHandlerReport, LuaCancellation, LuaPolicy,
+    LuaRunnerContext, LuaRuntime, PluginRegistrations, QuirlConfig,
 };
 use quirl_plugin::{
     doctor_plugin, normalize_plugin_commands, parse_plugin_manifest, validate_plugin_manifest,
     LockedPlugin, PluginLockfile, PluginRuntime, PLUGIN_LOCK_FILE,
 };
-use quirl_syntax::Mode;
+use quirl_syntax::{parse_command_list, Mode};
 use quirl_ui::{ExtensionCompleter, ExtensionSuggestion, PanelModel};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs,
@@ -57,6 +60,7 @@ const EXTENSION_COMPLETION_WALL_TIME: Duration = Duration::from_millis(250);
 const EXTENSION_EVENT_WALL_TIME: Duration = Duration::from_millis(250);
 const EXTENSION_PROMPT_REFRESH_WALL_TIME: Duration = Duration::from_millis(100);
 const EXTENSION_SAFE_POINT_WAIT: Duration = Duration::from_millis(125);
+const PLUGIN_COMMAND_WALL_TIME: Duration = Duration::from_millis(50);
 
 static NEXT_RUNTIME_KEY: AtomicU64 = AtomicU64::new(1);
 
@@ -114,6 +118,7 @@ impl ExtensionRuntimeSlot {
     fn run_scheduled<T>(
         &self,
         control: &mut ExtensionWorkContext,
+        preserve_prior_cancellation: bool,
         operation: impl FnOnce(&LuaRuntime) -> Result<T, ShellError>,
     ) -> ScheduledInvocation<T> {
         if control.is_cancelled() || Instant::now() >= control.deadline() {
@@ -142,7 +147,9 @@ impl ExtensionRuntimeSlot {
         }
 
         let mut enabled = lock_recover(&cancellation_enabled);
-        runtime.clear_cancellation();
+        if !preserve_prior_cancellation {
+            runtime.clear_cancellation();
+        }
         *enabled = true;
         drop(enabled);
 
@@ -169,6 +176,14 @@ impl ExtensionRuntimeSlot {
             .with_help("Disable the failing plugin and restart Quirl")
         })
     }
+
+    fn prepare_execution_cancellation(
+        &self,
+    ) -> Result<quirl_core::ExecutionCancellation, ShellError> {
+        let runtime = self.lock_runtime()?;
+        runtime.clear_cancellation();
+        Ok(runtime.execution_cancellation())
+    }
 }
 
 enum ScheduledInvocation<T> {
@@ -194,6 +209,38 @@ struct PromptRefresh {
 struct EventPluginResult {
     plugin_index: usize,
     invocation: ScheduledInvocation<Vec<EventHandlerReport>>,
+}
+
+struct PluginCommandResult {
+    invocation: ScheduledInvocation<ExecutionOutcome>,
+}
+
+#[derive(Clone)]
+struct PluginCommandBinding {
+    command: CommandSpec,
+    runtime: Arc<ExtensionRuntimeSlot>,
+    allowed_effects: ExecutionEffects,
+}
+
+/// A command invocation resolved only from validated installed metadata.
+///
+/// Construction reads manifests and locked bytes but never evaluates Lua or
+/// invokes an extension callback. Execution later reconciles this snapshot
+/// with the active runtime generation before scheduling the callback.
+#[derive(Debug, Clone)]
+pub(crate) struct InstalledPluginCommand {
+    command: CommandSpec,
+    arguments: Vec<String>,
+}
+
+impl InstalledPluginCommand {
+    pub(crate) fn effect_names(&self) -> Vec<String> {
+        self.command
+            .effects
+            .iter()
+            .map(|effect| catalog_effect_name(*effect).to_owned())
+            .collect()
+    }
 }
 
 /// A cancellation boundary detached from the extension-host mutex.
@@ -226,6 +273,7 @@ impl ExtensionCallbackQuiescence {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CatalogContributionOutput {
@@ -306,6 +354,7 @@ type BuiltExtensionGeneration = (
     Vec<PathBuf>,
     Vec<Arc<ExtensionRuntimeSlot>>,
     Vec<CommandSpec>,
+    Vec<PluginCommandBinding>,
 );
 
 pub struct LuaExtensionHost {
@@ -316,6 +365,7 @@ pub struct LuaExtensionHost {
     config: ConfigStore,
     plugin_runtimes: Vec<Arc<ExtensionRuntimeSlot>>,
     managed_commands: Vec<CommandSpec>,
+    command_bindings: Vec<PluginCommandBinding>,
     errors: Vec<ShellError>,
     error_overflow_count: usize,
     observed_fingerprint: Option<ExtensionFingerprint>,
@@ -365,6 +415,7 @@ impl LuaExtensionHost {
             config: ConfigStore::default(),
             plugin_runtimes: Vec::new(),
             managed_commands: Vec::new(),
+            command_bindings: Vec::new(),
             errors: Vec::new(),
             error_overflow_count: 0,
             observed_fingerprint: None,
@@ -412,7 +463,7 @@ impl LuaExtensionHost {
             }
         };
         match self.build_candidate(snapshot) {
-            Ok((config, plugin_paths, plugin_runtimes, managed_commands)) => {
+            Ok((config, plugin_paths, plugin_runtimes, managed_commands, command_bindings)) => {
                 if !plugin_runtimes.is_empty() && self.scheduler.is_none() {
                     self.scheduler = Some(ExtensionScheduler::new());
                 }
@@ -438,6 +489,7 @@ impl LuaExtensionHost {
                 self.plugin_paths = plugin_paths;
                 self.plugin_runtimes = plugin_runtimes;
                 self.managed_commands = managed_commands;
+                self.command_bindings = command_bindings;
                 self.prompt_refresh.take();
                 self.prompt_cache = vec![Vec::new(); self.plugin_runtimes.len()];
                 self.revision = next_revision;
@@ -467,6 +519,178 @@ impl LuaExtensionHost {
 
     pub fn has_runtime_extensions(&self) -> bool {
         !self.plugin_runtimes.is_empty()
+    }
+
+    /// Reconcile a nonexecuting installed-command snapshot with the active Lua
+    /// generation and construct the shared request using the VM's cancellation
+    /// identity. A removed, replaced, non-Lua, or failed runtime never falls
+    /// through to native process lookup.
+    pub(crate) fn plugin_execution_request(
+        &mut self,
+        installed: &InstalledPluginCommand,
+        source: &str,
+    ) -> Result<ExecutionRequest, ShellError> {
+        self.reload_if_changed();
+        let binding = self
+            .command_bindings
+            .iter()
+            .find(|binding| binding.command.id == installed.command.id)
+            .ok_or_else(|| {
+                let mut error = ShellError::new(
+                    ErrorCode::InvalidCommand,
+                    format!(
+                        "installed plugin command `{}` has no active trusted-Lua runtime",
+                        installed.command.path
+                    ),
+                )
+                .with_command(source)
+                .with_help("Run `quirl plugin doctor`, then enable a healthy trusted-Lua plugin");
+                if let Some(cause) = self.errors.last() {
+                    error = error.with_context(format!("activation failure: {}", cause.message));
+                }
+                error
+            })?;
+        if binding.command != installed.command {
+            return Err(stale_plugin_snapshot_error(&installed.command, source));
+        }
+        if binding.command.io.input != "Nothing" {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!(
+                    "plugin command `{}` requires typed pipeline input",
+                    binding.command.path
+                ),
+            )
+            .with_command(source)
+            .with_context(format!("declared input: {}", binding.command.io.input))
+            .with_help(
+                "Invoke this command from a typed pipeline after that adapter is installed",
+            ));
+        }
+        let declared_effects = catalog_execution_effects(&binding.command.effects);
+        let cancellation = binding.runtime.prepare_execution_cancellation()?;
+        Ok(ExecutionRequest::new(
+            ExecutionSource::new(binding.command.id.clone(), source)?,
+            quirl_core::ExecutionMode::Plugin,
+        )
+        .with_cancellation(cancellation)
+        .with_input(ExecutionInput::None)
+        .with_arguments(installed.arguments.clone())
+        .with_deadline(PLUGIN_COMMAND_WALL_TIME)
+        .with_output(ExecutionOutputTarget::Value)
+        .with_effects(declared_effects, binding.allowed_effects))
+    }
+
+    /// Run one validated plugin plan through the bounded shared scheduler.
+    pub(crate) fn dispatch_plugin_plan(
+        &mut self,
+        plan: &ExecutionPlan,
+    ) -> Result<ExecutionOutcome, ShellError> {
+        if self.reload_if_changed() == ExtensionReloadState::Rejected {
+            let mut error = ShellError::new(
+                ErrorCode::Validation,
+                "plugin execution state could not be reconciled with its installed snapshot",
+            )
+            .with_command(plan.source().text())
+            .with_help("Run `quirl plugin doctor`, restore the locked source, and retry");
+            if let Some(cause) = self.errors.last() {
+                error = error.with_context(format!("reload failure: {}", cause.message));
+            }
+            return Err(error);
+        }
+        let binding = self
+            .command_bindings
+            .iter()
+            .find(|binding| binding.command.id == plan.source().name())
+            .cloned()
+            .ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::InvalidCommand,
+                    "plugin command disappeared before execution",
+                )
+                .with_command(plan.source().text())
+                .with_context(format!("command id: {}", plan.source().name()))
+                .with_help("Retry against the current installed plugin catalog")
+            })?;
+        let current = bind_plugin_invocation(
+            std::slice::from_ref(&binding.command),
+            plan.source().text(),
+        )?
+        .ok_or_else(|| stale_plugin_snapshot_error(&binding.command, plan.source().text()))?;
+        if current.arguments != plan.arguments()
+            || catalog_execution_effects(&binding.command.effects) != plan.declared_effects()
+        {
+            return Err(stale_plugin_snapshot_error(
+                &binding.command,
+                plan.source().text(),
+            ));
+        }
+        let context = LuaRunnerContext::from_current_process(
+            plan.arguments(),
+            plan.input().clone(),
+            plan.output(),
+            plan.declared_effects(),
+            plan.cancellation().atomic(),
+        )?;
+        let deadline = Instant::now().checked_add(plan.deadline()).ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::ResourceLimit,
+                "plugin command deadline exceeded the host monotonic clock",
+            )
+            .with_help("Retry with the configured bounded plugin command deadline")
+        })?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let runtime = Arc::clone(&binding.runtime);
+        let command_name = binding.command.path.clone();
+        let callback_deadline = plan.deadline();
+        let work = vec![ExtensionWork::new(runtime.key, move |mut control| {
+            let invocation = runtime.run_scheduled(&mut control, true, |runtime| {
+                runtime.run_plugin_command_with_context(&command_name, &context, callback_deadline)
+            });
+            let _ = sender.try_send(PluginCommandResult { invocation });
+        })];
+        let Some(scheduler) = &self.scheduler else {
+            return Err(unavailable_plugin_scheduler_error());
+        };
+        let batch = scheduler.submit_batch(self.revision, deadline, WorkPriority::Command, work)?;
+        let result = match receiver.recv_timeout(plan.deadline()) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                scheduler.cancel_batch(&batch);
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    format!(
+                        "plugin command `{}` did not finish before its deadline",
+                        binding.command.path
+                    ),
+                )
+                .with_context(format!("deadline: {} ms", plan.deadline().as_millis()))
+                .with_help("Reduce callback work or disable the blocked plugin"));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                scheduler.cancel_batch(&batch);
+                return Err(ShellError::new(
+                    ErrorCode::Lua,
+                    format!(
+                        "plugin command `{}` terminated without an outcome",
+                        binding.command.path
+                    ),
+                )
+                .with_help("Disable the failing plugin and restart Quirl before retrying"));
+            }
+        };
+        match result.invocation {
+            ScheduledInvocation::Finished(Ok(outcome)) => {
+                validate_plugin_outcome(&binding.command, &outcome)?;
+                Ok(outcome)
+            }
+            ScheduledInvocation::Finished(Err(error)) => Err(error),
+            ScheduledInvocation::Cancelled => Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                format!("plugin command `{}` was cancelled", binding.command.path),
+            )
+            .with_help("Retry only after the owning cancellation handle is clear")),
+        }
     }
 
     /// Render segments while retaining their registration names for config-driven
@@ -539,7 +763,7 @@ impl LuaExtensionHost {
             let sender = sender.clone();
             work.push(ExtensionWork::new(slot.key, move |mut control| {
                 let mut errors = Vec::new();
-                let invocation = slot.run_scheduled(&mut control, |runtime| {
+                let invocation = slot.run_scheduled(&mut control, false, |runtime| {
                     let mut rendered = Vec::new();
                     for segment in registrations {
                         match runtime.render_prompt_segment(&segment.name, &context) {
@@ -849,8 +1073,10 @@ impl LuaExtensionHost {
         suggestions
     }
 
-    /// Merge validated plugin command facts into the semantic catalog without
-    /// allowing a provider to shadow an installed command or forge provenance.
+    /// Retain the P07 dynamic-catalog contract as a focused compatibility
+    /// harness. Production command discovery uses the nonexecuting installed
+    /// snapshot below.
+    #[cfg(test)]
     pub fn merge_catalog_contributions(&mut self, catalog: &mut Catalog) {
         self.ensure_loaded();
         if let Err(error) = validate_catalog_contribution(catalog, &self.managed_commands) {
@@ -1051,7 +1277,7 @@ impl LuaExtensionHost {
             let event = Arc::clone(&event);
             let sender = sender.clone();
             work.push(ExtensionWork::new(runtime.key, move |mut control| {
-                let invocation = runtime.run_scheduled(&mut control, |runtime| {
+                let invocation = runtime.run_scheduled(&mut control, false, |runtime| {
                     runtime.dispatch_extension_event(&event)
                 });
                 let _ = sender.try_send(EventPluginResult {
@@ -1274,7 +1500,7 @@ impl LuaExtensionHost {
                 }
             },
             PluginSource::Managed(root) => {
-                snapshot_managed_plugins(root, &mut errors, cancellation)
+                snapshot_managed_plugins(root, &mut errors, cancellation, true)
             }
         };
 
@@ -1339,6 +1565,7 @@ impl LuaExtensionHost {
         }
 
         let mut plugin_runtimes = Vec::with_capacity(snapshot.plugins.len());
+        let mut command_bindings = Vec::new();
         let mut contributions = Vec::new();
         let mut managed_commands = Vec::new();
         let mut prompt_segments = 0_usize;
@@ -1384,10 +1611,21 @@ impl LuaExtensionHost {
                         MAX_HOST_CONTRIBUTIONS,
                     ));
                 }
-                plugin_runtimes.push(Arc::new(ExtensionRuntimeSlot::new(runtime, registrations)?));
+                validate_registered_commands(&plugin.catalog_commands, &registrations.commands)?;
+                let allowed_effects = granted_execution_effects(&plugin.grants);
+                let runtime = Arc::new(ExtensionRuntimeSlot::new(runtime, registrations)?);
+                for command in &plugin.catalog_commands {
+                    command_bindings.push(PluginCommandBinding {
+                        command: command.clone(),
+                        runtime: Arc::clone(&runtime),
+                        allowed_effects,
+                    });
+                }
+                plugin_runtimes.push(runtime);
             }
         }
         validate_contribution_set(&contributions)?;
+        command_bindings.sort_by(|left, right| left.command.path.cmp(&right.command.path));
         Ok((
             config,
             snapshot
@@ -1397,6 +1635,7 @@ impl LuaExtensionHost {
                 .collect(),
             plugin_runtimes,
             managed_commands,
+            command_bindings,
         ))
     }
 }
@@ -1418,6 +1657,507 @@ impl ExtensionCompleter for LuaCompletionAdapter {
             .map(|mut host| host.complete(line, pos))
             .unwrap_or_default()
     }
+}
+
+/// Merge enabled installed command manifests without evaluating plugin source
+/// or invoking a contribution callback.
+pub(crate) fn merge_installed_catalog_snapshot(catalog: &mut Catalog) -> Result<(), ShellError> {
+    let commands = installed_plugin_commands()?;
+    validate_catalog_contribution(catalog, &commands)?;
+    catalog.merge(commands);
+    Ok(())
+}
+
+/// Resolve one simple installed plugin invocation from the nonexecuting catalog
+/// snapshot. Native commands and explicit dialect islands return `None`.
+pub(crate) fn resolve_installed_plugin_command(
+    source: &str,
+) -> Result<Option<InstalledPluginCommand>, ShellError> {
+    let commands = installed_plugin_commands()?;
+    if commands
+        .iter()
+        .any(|command| literal_invocation_starts_with(source, &command.path))
+    {
+        return bind_plugin_invocation(&commands, source);
+    }
+    let first_word = source.split_whitespace().next();
+    if first_word
+        .is_some_and(|name| disabled_plugin_names().is_ok_and(|names| names.contains(name)))
+    {
+        let name = first_word.unwrap_or_default();
+        return Err(ShellError::new(
+            ErrorCode::InvalidCommand,
+            format!("plugin `{name}` is disabled"),
+        )
+        .with_command(source)
+        .with_help(format!(
+            "Run `quirl plugin enable {name}` after reviewing its permissions"
+        )));
+    }
+    Ok(None)
+}
+
+fn literal_invocation_starts_with(source: &str, command_path: &str) -> bool {
+    let mut source_words = source.split_whitespace();
+    command_path
+        .split_whitespace()
+        .all(|part| source_words.next() == Some(part))
+}
+
+fn installed_plugin_commands() -> Result<Vec<CommandSpec>, ShellError> {
+    let Some(root) = plugin_state_directory() else {
+        return Ok(Vec::new());
+    };
+    installed_plugin_commands_from_root(&root)
+}
+
+fn installed_plugin_commands_from_root(root: &Path) -> Result<Vec<CommandSpec>, ShellError> {
+    let mut errors = Vec::new();
+    let (plugins, _) = snapshot_managed_plugins(root, &mut errors, &AtomicBool::new(false), false);
+    if let Some(error) = errors.into_iter().next() {
+        return Err(error.with_context("installed plugin catalog snapshot"));
+    }
+    let mut commands = plugins
+        .into_iter()
+        .flat_map(|plugin| plugin.catalog_commands)
+        .collect::<Vec<_>>();
+    commands.sort_by(|left, right| left.path.cmp(&right.path));
+    if commands.len() > MAX_HOST_MANAGED_COMMANDS {
+        return Err(host_count_limit_error(
+            "installed plugin catalog commands",
+            commands.len(),
+            MAX_HOST_MANAGED_COMMANDS,
+        ));
+    }
+    validate_catalog_contribution(&Catalog::builtin(), &commands)?;
+    Ok(commands)
+}
+
+fn disabled_plugin_names() -> Result<BTreeSet<String>, ShellError> {
+    let Some(root) = plugin_state_directory() else {
+        return Ok(BTreeSet::new());
+    };
+    let path = root.join(PLUGIN_LOCK_FILE);
+    if !path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let bytes = read_bounded_plugin_file(&path, MAX_PLUGIN_LOCK_BYTES, "plugin lockfile")
+        .map_err(|error| io_error(&path, error))?;
+    let lock = PluginLockfile::from_json(&bytes).map_err(|error| {
+        ShellError::new(ErrorCode::Validation, "managed plugin lockfile is corrupt")
+            .with_context(error.to_string())
+            .with_help("Restore plugins.lock.json.bak or re-add plugins after review")
+    })?;
+    lock.validate()?;
+    Ok(lock
+        .plugins
+        .into_iter()
+        .filter(|plugin| !plugin.enabled)
+        .map(|plugin| plugin.name)
+        .collect())
+}
+
+fn bind_plugin_invocation(
+    commands: &[CommandSpec],
+    source: &str,
+) -> Result<Option<InstalledPluginCommand>, ShellError> {
+    ExecutionSource::new("<plugin-resolution>", source)?;
+    let parsed = parse_command_list(source).map_err(|diagnostic| {
+        ShellError::new(ErrorCode::InvalidCommand, diagnostic.message)
+            .with_label(
+                Some(source.to_owned()),
+                diagnostic.start,
+                diagnostic.end,
+                "invalid plugin command invocation",
+            )
+            .with_help(diagnostic.help)
+    })?;
+    let first_words = parsed
+        .pipelines
+        .first()
+        .and_then(|pipeline| pipeline.commands.first())
+        .map(|command| command.words.as_slice())
+        .unwrap_or_default();
+    let matched = commands
+        .iter()
+        .filter_map(|command| {
+            let path = command.path.split_whitespace().collect::<Vec<_>>();
+            first_words
+                .starts_with(
+                    &path
+                        .iter()
+                        .map(|part| (*part).to_owned())
+                        .collect::<Vec<_>>(),
+                )
+                .then_some((path.len(), command))
+        })
+        .max_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| right.1.id.cmp(&left.1.id))
+        });
+    let Some((path_words, command)) = matched else {
+        return Ok(None);
+    };
+    let simple = parsed.pipelines.len() == 1
+        && parsed.connectors.is_empty()
+        && parsed.pipelines[0].commands.len() == 1
+        && !parsed.pipelines[0].background
+        && parsed.pipelines[0].commands[0].redirects.is_empty();
+    if !simple {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "plugin command `{}` requires a single typed invocation",
+                command.path
+            ),
+        )
+        .with_command(source)
+        .with_help("Remove byte pipes, redirects, backgrounding, and command-list operators"));
+    }
+    let arguments = first_words[path_words..].to_vec();
+    validate_plugin_arguments(command, &arguments)?;
+    Ok(Some(InstalledPluginCommand {
+        command: command.clone(),
+        arguments,
+    }))
+}
+
+fn validate_plugin_arguments(
+    command: &CommandSpec,
+    arguments: &[String],
+) -> Result<(), ShellError> {
+    let positionals = command
+        .options
+        .iter()
+        .filter(|argument| argument.kind == ArgumentKind::Positional)
+        .collect::<Vec<_>>();
+    let mut positional_index = 0_usize;
+    let mut observed = BTreeMap::<String, usize>::new();
+    let mut index = 0_usize;
+    while index < arguments.len() {
+        let token = &arguments[index];
+        let (specification, consumed_value) = if token.starts_with('-') && token != "-" {
+            let (name, inline_value) = token
+                .split_once('=')
+                .map_or((token.as_str(), None), |(name, value)| (name, Some(value)));
+            let specification = command
+                .options
+                .iter()
+                .find(|argument| {
+                    argument.kind != ArgumentKind::Positional
+                        && argument.names.iter().any(|candidate| candidate == name)
+                })
+                .ok_or_else(|| {
+                    plugin_argument_error(command, format!("unknown option `{name}`"))
+                })?;
+            match specification.kind {
+                ArgumentKind::Flag if inline_value.is_some() => {
+                    return Err(plugin_argument_error(
+                        command,
+                        format!("flag `{name}` does not accept a value"),
+                    ));
+                }
+                ArgumentKind::Flag => (specification, None),
+                ArgumentKind::Option => {
+                    let value = match inline_value {
+                        Some(value) => value,
+                        None => {
+                            index = index.saturating_add(1);
+                            arguments.get(index).map(String::as_str).ok_or_else(|| {
+                                plugin_argument_error(
+                                    command,
+                                    format!("option `{name}` requires a value"),
+                                )
+                            })?
+                        }
+                    };
+                    (specification, Some(value))
+                }
+                ArgumentKind::Positional => unreachable!("named lookup excluded positionals"),
+            }
+        } else {
+            let specification = positionals.get(positional_index).copied().ok_or_else(|| {
+                plugin_argument_error(command, format!("unexpected positional argument `{token}`"))
+            })?;
+            if !specification.repeatable {
+                positional_index = positional_index.saturating_add(1);
+            }
+            (specification, Some(token.as_str()))
+        };
+        if let Some(value) = consumed_value {
+            validate_plugin_argument_value(command, specification, value)?;
+        }
+        let canonical = specification.names.first().cloned().unwrap_or_default();
+        let count = observed.entry(canonical.clone()).or_default();
+        *count = count.saturating_add(1);
+        if *count > 1 && !specification.repeatable {
+            return Err(plugin_argument_error(
+                command,
+                format!("argument `{canonical}` is not repeatable"),
+            ));
+        }
+        index = index.saturating_add(1);
+    }
+    for specification in &command.options {
+        let canonical = specification.names.first().cloned().unwrap_or_default();
+        if specification.required && !observed.contains_key(&canonical) {
+            return Err(plugin_argument_error(
+                command,
+                format!("required argument `{canonical}` is missing"),
+            ));
+        }
+        if observed.contains_key(&canonical) {
+            for conflict in &specification.conflicts {
+                if observed.contains_key(conflict) {
+                    return Err(plugin_argument_error(
+                        command,
+                        format!("arguments `{canonical}` and `{conflict}` conflict"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_plugin_argument_value(
+    command: &CommandSpec,
+    specification: &quirl_catalog::ArgumentSpec,
+    value: &str,
+) -> Result<(), ShellError> {
+    if let Some(quirl_catalog::CompletionSource::Static { values }) = &specification.values {
+        if !values.iter().any(|candidate| candidate == value) {
+            return Err(plugin_argument_error(
+                command,
+                format!(
+                    "argument `{}` must be one of: {}",
+                    specification.names.first().cloned().unwrap_or_default(),
+                    values.join(", ")
+                ),
+            ));
+        }
+    }
+    let normalized = specification.value_type.to_ascii_lowercase();
+    let valid = match normalized.as_str() {
+        "int" | "integer" => value.parse::<i64>().is_ok(),
+        "uint" | "unsigned-integer" => value.parse::<u64>().is_ok(),
+        "positive-integer" => value.parse::<u64>().is_ok_and(|number| number > 0),
+        "bool" | "boolean" => matches!(value, "true" | "false"),
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(plugin_argument_error(
+            command,
+            format!(
+                "argument `{}` is not a valid {}",
+                specification.names.first().cloned().unwrap_or_default(),
+                specification.value_type
+            ),
+        ))
+    }
+}
+
+fn plugin_argument_error(command: &CommandSpec, message: String) -> ShellError {
+    ShellError::new(
+        ErrorCode::InvalidArgument,
+        format!("invalid arguments for plugin command `{}`", command.path),
+    )
+    .with_context(message)
+    .with_help(format!("Expected: {}", command.signature))
+}
+
+fn validate_registered_commands(
+    commands: &[CommandSpec],
+    registrations: &[CommandRegistration],
+) -> Result<(), ShellError> {
+    let declared = commands
+        .iter()
+        .map(|command| command.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let registered = registrations
+        .iter()
+        .map(|registration| registration.name.as_str())
+        .collect::<BTreeSet<_>>();
+    if declared != registered {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "trusted-Lua command registrations differ from the locked manifest",
+        )
+        .with_context(format!(
+            "declared: {declared:?}; registered: {registered:?}"
+        ))
+        .with_help("Register every manifest command exactly once and no undeclared commands"));
+    }
+    for command in commands {
+        let registration = registrations
+            .iter()
+            .find(|registration| registration.name == command.path)
+            .ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::Validation,
+                    "plugin command registration disappeared",
+                )
+                .with_context(format!("command: {}", command.path))
+                .with_help("Reload the plugin from its locked source")
+            })?;
+        let registered_effects = registration
+            .effects
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let catalog_effects = command
+            .effects
+            .iter()
+            .map(|effect| catalog_effect_name(*effect).to_owned())
+            .collect::<BTreeSet<_>>();
+        let registered_exits = registration
+            .error_codes
+            .iter()
+            .map(|(code, description)| {
+                code.parse::<i32>()
+                    .map(|code| (code, description.clone()))
+                    .map_err(|_| {
+                        ShellError::new(
+                            ErrorCode::Validation,
+                            format!(
+                                "plugin command `{}` registered non-numeric status `{code}`",
+                                command.path
+                            ),
+                        )
+                        .with_help("Use the same signed integer status keys as plugin.toml")
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let matches = registration.signature == command.signature
+            && registration.summary == command.summary
+            && registration.details == command.details
+            && registration.input_type == command.io.input
+            && registration.output_type == command.io.output
+            && registration.examples == command.examples
+            && registered_effects == catalog_effects
+            && registered_exits == command.exit_codes;
+        if !matches {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!(
+                    "plugin command `{}` registration does not match its locked manifest",
+                    command.path
+                ),
+            )
+            .with_help("Keep Lua registration metadata byte-for-byte aligned with plugin.toml"));
+        }
+    }
+    Ok(())
+}
+
+fn granted_execution_effects(grants: &[String]) -> ExecutionEffects {
+    let effects = [
+        grants
+            .iter()
+            .any(|grant| grant.starts_with("filesystem.read:"))
+            .then_some(ExecutionEffect::ReadFilesystem),
+        grants
+            .iter()
+            .any(|grant| grant.starts_with("filesystem.write:"))
+            .then_some(ExecutionEffect::WriteFilesystem),
+        grants
+            .iter()
+            .any(|grant| grant == "process.spawn" || grant.starts_with("process.spawn:"))
+            .then_some(ExecutionEffect::SpawnProcess),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    ExecutionEffects::from_effects(&effects)
+}
+
+fn catalog_execution_effects(effects: &[Effect]) -> ExecutionEffects {
+    let effects = effects
+        .iter()
+        .map(|effect| match effect {
+            Effect::ReadFilesystem => ExecutionEffect::ReadFilesystem,
+            Effect::WriteFilesystem => ExecutionEffect::WriteFilesystem,
+            Effect::SpawnProcess => ExecutionEffect::SpawnProcess,
+            Effect::ChangeDirectory => ExecutionEffect::ChangeDirectory,
+        })
+        .collect::<Vec<_>>();
+    ExecutionEffects::from_effects(&effects)
+}
+
+fn catalog_effect_name(effect: Effect) -> &'static str {
+    match effect {
+        Effect::ReadFilesystem => "read_filesystem",
+        Effect::WriteFilesystem => "write_filesystem",
+        Effect::SpawnProcess => "spawn_process",
+        Effect::ChangeDirectory => "change_directory",
+    }
+}
+
+fn validate_plugin_outcome(
+    command: &CommandSpec,
+    outcome: &ExecutionOutcome,
+) -> Result<(), ShellError> {
+    if !command.exit_codes.contains_key(&outcome.status_code()) {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "plugin command `{}` returned undocumented status {}",
+                command.path,
+                outcome.status_code()
+            ),
+        )
+        .with_help(
+            "Declare every possible signed status in plugin.toml and the Lua registration",
+        ));
+    }
+    match (&outcome.output, command.io.streaming) {
+        (ExecutionOutput::Value { .. }, false) | (ExecutionOutput::Values { .. }, true) => Ok(()),
+        (ExecutionOutput::Value { .. }, true) => Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "plugin command `{}` declared streaming output",
+                command.path
+            ),
+        )
+        .with_help("Return a bounded `values` batch or declare a non-streaming output type")),
+        (ExecutionOutput::Values { .. }, false) => Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "plugin command `{}` returned an undeclared value batch",
+                command.path
+            ),
+        )
+        .with_help("Declare `Stream<T>` output or return one typed value")),
+        (ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. }, _) => Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "plugin command `{}` returned byte-oriented output",
+                command.path
+            ),
+        )
+        .with_help("Return one typed value or bounded finite value batch")),
+    }
+}
+
+fn stale_plugin_snapshot_error(command: &CommandSpec, source: &str) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        format!("plugin command `{}` changed after discovery", command.path),
+    )
+    .with_command(source)
+    .with_context(format!("command id: {}", command.id))
+    .with_help("Retry against a fresh installed catalog snapshot")
+}
+
+fn unavailable_plugin_scheduler_error() -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        "plugin command scheduler is unavailable",
+    )
+    .with_help("Restart Quirl; disable the plugin if scheduler startup fails again")
 }
 
 fn config_directory() -> Option<PathBuf> {
@@ -1509,6 +2249,7 @@ fn snapshot_managed_plugins(
     root: &Path,
     errors: &mut Vec<ShellError>,
     cancellation: &AtomicBool,
+    activate_adapters: bool,
 ) -> (Vec<PluginCandidate>, PluginFingerprint) {
     let lock_path = root.join(PLUGIN_LOCK_FILE);
     let mut fingerprints = vec![(
@@ -1567,7 +2308,12 @@ fn snapshot_managed_plugins(
             );
             break;
         }
-        match managed_plugin_candidate_with_cancellation(locked, &mut fingerprints, cancellation) {
+        match managed_plugin_candidate_with_cancellation(
+            locked,
+            &mut fingerprints,
+            cancellation,
+            activate_adapters,
+        ) {
             Ok(candidate) => candidates.push(candidate),
             Err(error) => errors.push(error),
         }
@@ -1581,13 +2327,14 @@ fn managed_plugin_candidate(
     locked: &LockedPlugin,
     fingerprints: &mut Vec<(PathBuf, FileFingerprint)>,
 ) -> Result<PluginCandidate, ShellError> {
-    managed_plugin_candidate_with_cancellation(locked, fingerprints, &AtomicBool::new(false))
+    managed_plugin_candidate_with_cancellation(locked, fingerprints, &AtomicBool::new(false), true)
 }
 
 fn managed_plugin_candidate_with_cancellation(
     locked: &LockedPlugin,
     fingerprints: &mut Vec<(PathBuf, FileFingerprint)>,
     cancellation: &AtomicBool,
+    activate_adapter: bool,
 ) -> Result<PluginCandidate, ShellError> {
     if locked.runtime == PluginRuntime::WasmComponent {
         return Err(ShellError::new(
@@ -1691,7 +2438,7 @@ fn managed_plugin_candidate_with_cancellation(
     } else {
         None
     };
-    if locked.runtime == PluginRuntime::OutOfProcess {
+    if locked.runtime == PluginRuntime::OutOfProcess && activate_adapter {
         crate::plugin::execute_out_of_process_adapter(
             &manifest,
             &entry_path,
@@ -2068,7 +2815,10 @@ quirl.completion.add_provider {{
           details = "Return one managed test value.", input_type = "Nothing",
           output_type = "String", examples = { "managed run" },
           effects = { "read_filesystem" }, error_codes = { ["0"] = "success" },
-          run = function(_) return "managed" end,
+          run = function(_)
+            return { abi_version = 1, ok = true, status = 0,
+              output = { kind = "value", value = { type = "string", value = "managed" } } }
+          end,
         }"#;
         fs::write(&entry, entry_source).unwrap();
         let manifest_path = package.join("plugin.toml");
@@ -2084,7 +2834,7 @@ runtime = "trusted_lua"
 summary = "Managed prompt test"
 
 [capabilities]
-request = ["commands.register", "prompt.register"]
+request = ["commands.register", "filesystem.read:.", "prompt.register"]
 
 [contributes]
 commands = ["managed run"]
@@ -2108,7 +2858,11 @@ error_codes = { "0" = "success" }
             manifest_source.as_bytes(),
             entry_source.as_bytes(),
             &source,
-            &["commands.register".to_owned(), "prompt.register".to_owned()],
+            &[
+                "commands.register".to_owned(),
+                "filesystem.read:.".to_owned(),
+                "prompt.register".to_owned(),
+            ],
             env!("CARGO_PKG_VERSION"),
         )
         .unwrap();
@@ -2187,6 +2941,112 @@ error_codes = { "0" = "success" }
             .any(|context| context.contains("capability denied: prompt.register"))));
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn installed_command_snapshot_is_nonexecuting_and_typed_dispatch_uses_the_scheduler() {
+        let directory = temporary_extension_directory();
+        let root = directory.join("managed-state");
+        let (_manifest, lock) = write_managed_prompt_plugin(&directory);
+        write_managed_lock(&root, &lock);
+
+        let commands = installed_plugin_commands_from_root(&root).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].path, "managed run");
+        let mut catalog = Catalog::builtin();
+        catalog.merge(commands.clone());
+        assert!(catalog.find("managed run").is_some());
+        assert!(catalog
+            .complete("managed r", "managed r".len())
+            .iter()
+            .any(|completion| completion.value == "managed run"));
+        let agent_catalog = crate::agent::installed_agent_catalog(&catalog).unwrap();
+        assert!(agent_catalog
+            .commands
+            .iter()
+            .any(|command| command.path == "managed run"));
+        let installed = bind_plugin_invocation(&commands, "managed run")
+            .unwrap()
+            .unwrap();
+
+        let host = Arc::new(Mutex::new(LuaExtensionHost::from_managed_root(
+            None,
+            root.clone(),
+        )));
+        let request = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(&installed, "managed run")
+            .unwrap();
+        let outcome = crate::execute_execution_request(
+            &mut quirl_process::NativeExecutor::default(),
+            request,
+            Some(&host),
+        )
+        .unwrap();
+        assert_eq!(outcome.status_code(), 0);
+        assert_eq!(
+            outcome.output,
+            ExecutionOutput::Value {
+                value: quirl_core::StructuredValue::String("managed".to_owned())
+            }
+        );
+        let stale_request = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(&installed, "managed run")
+            .unwrap();
+        write_managed_lock(&root, &PluginLockfile::empty());
+        let removed = crate::execute_execution_request(
+            &mut quirl_process::NativeExecutor::default(),
+            stale_request,
+            Some(&host),
+        )
+        .unwrap_err();
+        assert_eq!(removed.code, ErrorCode::InvalidCommand);
+        assert!(removed.message.contains("disappeared before execution"));
+        let host_guard = host.lock().unwrap();
+        assert!(host_guard
+            .scheduler
+            .as_ref()
+            .unwrap()
+            .handle()
+            .wait_generation_idle(host_guard.revision, Duration::from_secs(1)));
+        drop(host_guard);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn plugin_arguments_and_effects_fail_before_callback_invocation() {
+        let command = CommandSpec {
+            options: vec![quirl_catalog::ArgumentSpec {
+                names: vec!["count".to_owned()],
+                kind: ArgumentKind::Positional,
+                value_type: "positive-integer".to_owned(),
+                required: true,
+                repeatable: false,
+                values: None,
+                conflicts: Vec::new(),
+                documentation: "Count to return".to_owned(),
+                examples: vec!["managed run 2".to_owned()],
+                provenance: ProvenanceInfo::builtin(Provenance::Plugin),
+            }],
+            ..Catalog::builtin().commands[0].clone()
+        };
+        let error = bind_plugin_invocation(&[command.clone()], &format!("{} nope", command.path))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(error.details.context[0].contains("positive-integer"));
+
+        let declared = catalog_execution_effects(&[Effect::ReadFilesystem]);
+        let request = ExecutionRequest::new(
+            ExecutionSource::new("plugin:test", "test").unwrap(),
+            quirl_core::ExecutionMode::Plugin,
+        )
+        .with_effects(declared, ExecutionEffects::none());
+        let denied = request.plan().unwrap_err();
+        assert_eq!(denied.code, ErrorCode::Validation);
+        assert!(denied.details.context[0].contains("ReadFilesystem"));
     }
 
     #[test]

@@ -20,7 +20,10 @@ use agent::AgentCommand;
 use author::{DescribeCommand, DocCommand, NewCommand};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::ConfigCommand;
-use extensions::{LuaCompletionAdapter, LuaExtensionHost};
+use extensions::{
+    merge_installed_catalog_snapshot, resolve_installed_plugin_command, LuaCompletionAdapter,
+    LuaExtensionHost,
+};
 use index::IndexCommand;
 use mcp::ServeCommand;
 use package::PackageCommand;
@@ -321,7 +324,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
                 ExecutionOutputTarget::Value,
                 ExecutionEffects::from_effects(&[ExecutionEffect::SpawnProcess]),
             )?;
-            let outcome = execute_execution_request(&mut NativeExecutor::default(), request)?;
+            let outcome = execute_execution_request(&mut NativeExecutor::default(), request, None)?;
             print_execution_value(&outcome)?;
             Ok(outcome.status_code())
         }
@@ -341,7 +344,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
                     ExecutionEffect::SpawnProcess,
                 ]),
             )?;
-            let outcome = execute_execution_request(&mut NativeExecutor::default(), request)?;
+            let outcome = execute_execution_request(&mut NativeExecutor::default(), request, None)?;
             render_execution_value(&outcome, format)?;
             Ok(outcome.status_code())
         }
@@ -366,7 +369,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             Ok(0)
         }
         Some(Command::Catalog { format }) => {
-            let catalog = load_composed_catalog();
+            let catalog = load_composed_catalog()?;
             match format {
                 CatalogFormat::Json => {
                     let json = serde_json::to_string_pretty(&catalog).map_err(json_error)?;
@@ -379,17 +382,17 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             }
             Ok(0)
         }
-        Some(Command::Agent { command }) => agent::execute(command, &load_composed_catalog()),
-        Some(Command::Package { command }) => package::execute(command, &load_composed_catalog()),
-        Some(Command::Describe { command }) => author::describe(command, &load_composed_catalog()),
-        Some(Command::Doc { command }) => author::doc(command, &load_composed_catalog()),
-        Some(Command::Lsp) => lsp::execute(load_composed_catalog()),
+        Some(Command::Agent { command }) => agent::execute(command, &load_composed_catalog()?),
+        Some(Command::Package { command }) => package::execute(command, &load_composed_catalog()?),
+        Some(Command::Describe { command }) => author::describe(command, &load_composed_catalog()?),
+        Some(Command::Doc { command }) => author::doc(command, &load_composed_catalog()?),
+        Some(Command::Lsp) => lsp::execute(load_composed_catalog()?),
         Some(Command::Serve { command }) => mcp::execute(command),
         Some(Command::Index { command }) => index::execute(command),
         Some(Command::Complete { input, format }) => {
             let mut catalog = index::load_default_catalog();
+            merge_installed_catalog_snapshot(&mut catalog)?;
             let mut extensions = LuaExtensionHost::discover();
-            extensions.merge_catalog_contributions(&mut catalog);
             let mut completions = catalog.complete(&input, input.len());
             completions.extend(
                 extensions
@@ -414,7 +417,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             }
             Ok(0)
         }
-        Some(Command::Pick { command }) => pick::execute(command, &load_composed_catalog()),
+        Some(Command::Pick { command }) => pick::execute(command, &load_composed_catalog()?),
         Some(Command::Events { command }) => platform::execute_events(command),
         Some(Command::View { command }) => platform::execute_view(command),
         Some(Command::Watch { command }) => platform::execute_watch(command),
@@ -422,21 +425,17 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
         Some(Command::Exec { source, .. }) => run_exec_with_recovery(&source),
         None if !io::stdin().is_terminal() => run_stdin(),
         None => {
-            let mut host = LuaExtensionHost::discover();
-            let catalog = compose_catalog(&mut host);
+            let host = LuaExtensionHost::discover();
+            let catalog = load_composed_catalog()?;
             repl(catalog, Arc::new(Mutex::new(host)))
         }
     }
 }
 
-fn load_composed_catalog() -> Catalog {
-    compose_catalog(&mut LuaExtensionHost::discover())
-}
-
-fn compose_catalog(extensions: &mut LuaExtensionHost) -> Catalog {
+fn load_composed_catalog() -> Result<Catalog, ShellError> {
     let mut catalog = index::load_default_catalog();
-    extensions.merge_catalog_contributions(&mut catalog);
-    catalog
+    merge_installed_catalog_snapshot(&mut catalog)?;
+    Ok(catalog)
 }
 
 fn extension_completion(suggestion: quirl_ui::ExtensionSuggestion) -> Completion {
@@ -558,6 +557,7 @@ fn execution_request(
 fn execute_execution_request(
     executor: &mut NativeExecutor,
     request: ExecutionRequest,
+    extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
 ) -> Result<ExecutionOutcome, ShellError> {
     let plan = request.plan()?;
     plan.cancellation()
@@ -575,7 +575,25 @@ fn execute_execution_request(
         ExecutionMode::Data => execute_data_plan(&plan),
         ExecutionMode::Lua => execute_lua_plan(&plan),
         ExecutionMode::Bash | ExecutionMode::Zsh => execute_reference_plan(&plan),
-        ExecutionMode::Plugin | ExecutionMode::Protocol => Err(ShellError::new(
+        ExecutionMode::Plugin => {
+            let extensions = extensions.ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::InvalidCommand,
+                    "plugin execution requires the installed extension host",
+                )
+                .with_command(plan.source().text())
+                .with_help("Run the command through `quirl exec` or the interactive shell")
+            })?;
+            let mut extensions = extensions.lock().map_err(|_| {
+                ShellError::new(ErrorCode::Lua, "the extension host lock was poisoned")
+                    .with_help("Restart Quirl before executing another plugin command")
+            })?;
+            extensions.dispatch_plugin_plan(&plan).map_err(|mut error| {
+                error.details.command = Some(plan.source().text().to_owned());
+                error.with_context(format!("plugin command id: {}", plan.source().name()))
+            })
+        }
+        ExecutionMode::Protocol => Err(ShellError::new(
             ErrorCode::InvalidCommand,
             "the selected execution adapter is not installed",
         )
@@ -745,7 +763,21 @@ fn execute_with_recovery(
 ) -> Result<i32, ShellError> {
     let planned = match extensions {
         Some(extensions) => {
-            match prepare_extension_plan(extensions, source, vec!["spawn_process".to_owned()]) {
+            let plan: Result<PlannedExecution, ShellError> = (|| {
+                let plugin_command = resolve_installed_plugin_command(source)?;
+                let effects = plugin_command
+                    .as_ref()
+                    .map(extensions::InstalledPluginCommand::effect_names)
+                    .unwrap_or_else(|| vec!["spawn_process".to_owned()]);
+                let mut planned = prepare_extension_plan(extensions, source, effects)?;
+                planned.plugin_command = if planned.source == source {
+                    plugin_command
+                } else {
+                    resolve_installed_plugin_command(&planned.source)?
+                };
+                Ok(planned)
+            })();
+            match plan {
                 Ok(planned) => planned,
                 Err(error) => {
                     let mut annotations = BTreeMap::new();
@@ -768,8 +800,12 @@ fn execute_with_recovery(
     let recovery_context = journal.capture_context(&planned.source)?;
     let PlannedExecution {
         source,
+        plugin_command,
         mut annotations,
     } = planned;
+    if let Some(extensions) = extensions {
+        quiesce_extension_callbacks(extensions)?;
+    }
     if let Some(extensions) = extensions {
         apply_observation_actions(
             notify_extensions(
@@ -786,18 +822,28 @@ fn execute_with_recovery(
     let started = Instant::now();
     let renders_captured_output = output_mode == ExecutionOutputMode::Capture
         || interactive_dialect_island(&source).is_some();
-    match execute_command_or_dialect_island(executor, &source, output_mode) {
+    match execute_command_or_dialect_island_with_extensions(
+        executor,
+        &source,
+        output_mode,
+        extensions,
+        plugin_command.as_ref(),
+    ) {
         Ok(outcome) => {
             let duration = started.elapsed();
-            if outcome.status != 0 {
-                if let Err(error) =
-                    journal.record_failure(&recovery_context, duration, Some(&outcome), None)
-                {
+            let recovery_outcome = command_outcome_projection(&outcome);
+            if outcome.status_code() != 0 {
+                if let Err(error) = journal.record_failure(
+                    &recovery_context,
+                    duration,
+                    Some(&recovery_outcome),
+                    None,
+                ) {
                     eprintln!("warning: {}", render_stderr_error(&error));
                 }
             }
             if let Some(extensions) = extensions {
-                emit_outcome_events(extensions, &outcome, &mut annotations);
+                emit_execution_outcome_events(extensions, &outcome, &mut annotations);
                 apply_observation_actions(
                     notify_extensions(
                         extensions,
@@ -813,18 +859,23 @@ fn execute_with_recovery(
                     notify_extensions(
                         extensions,
                         ExtensionEventData::Result {
-                            status: outcome.status,
+                            status: outcome.status_code(),
                             duration_ms: duration_millis(duration),
                         },
                     ),
                     &mut annotations,
                 );
             }
-            if renders_captured_output {
-                print_outcome(&outcome);
+            if renders_captured_output
+                || matches!(
+                    &outcome.output,
+                    ExecutionOutput::Value { .. } | ExecutionOutput::Values { .. }
+                )
+            {
+                print_execution_outcome(&outcome)?;
             }
             print_extension_annotations(&annotations);
-            Ok(outcome.status)
+            Ok(outcome.status_code())
         }
         Err(error) => {
             let duration = started.elapsed();
@@ -850,67 +901,79 @@ fn execute_with_recovery(
     }
 }
 
+#[cfg(test)]
 fn execute_command_or_dialect_island(
     executor: &mut NativeExecutor,
     source: &str,
     output_mode: ExecutionOutputMode,
 ) -> Result<CommandOutcome, ShellError> {
-    let (mode, engine_source, source_name, target) =
-        if let Some((language, body)) = interactive_dialect_island(source) {
-            let mode = match language {
-                ScriptLanguage::Bash => ExecutionMode::Bash,
-                ScriptLanguage::Zsh => ExecutionMode::Zsh,
-                ScriptLanguage::Lua | ScriptLanguage::Quirl => {
-                    unreachable!("interactive islands admit only Bash or Zsh")
-                }
-            };
-            (
-                mode,
-                body,
-                "<dialect-island>",
-                ExecutionOutputTarget::Capture {
-                    max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
-                },
-            )
-        } else {
-            let target = match output_mode {
-                ExecutionOutputMode::Capture => ExecutionOutputTarget::Capture {
-                    max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
-                },
-                ExecutionOutputMode::Interactive => ExecutionOutputTarget::Inherit,
-            };
-            (ExecutionMode::NativeCommand, source, "<command>", target)
+    execute_command_or_dialect_island_with_extensions(executor, source, output_mode, None, None)
+        .map(|outcome| command_outcome_projection(&outcome))
+}
+
+fn execute_command_or_dialect_island_with_extensions(
+    executor: &mut NativeExecutor,
+    source: &str,
+    output_mode: ExecutionOutputMode,
+    extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
+    installed: Option<&extensions::InstalledPluginCommand>,
+) -> Result<ExecutionOutcome, ShellError> {
+    let request = if let Some((language, body)) = interactive_dialect_island(source) {
+        let mode = match language {
+            ScriptLanguage::Bash => ExecutionMode::Bash,
+            ScriptLanguage::Zsh => ExecutionMode::Zsh,
+            ScriptLanguage::Lua | ScriptLanguage::Quirl => {
+                unreachable!("interactive islands admit only Bash or Zsh")
+            }
         };
-    let request = execution_request(
-        source_name,
-        engine_source,
-        mode,
-        target,
-        ExecutionEffects::all(),
-    )?;
-    let outcome = execute_execution_request(executor, request).map_err(|mut error| {
+        let (mode, engine_source, source_name, target) = (
+            mode,
+            body,
+            "<dialect-island>",
+            ExecutionOutputTarget::Capture {
+                max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
+            },
+        );
+        execution_request(
+            source_name,
+            engine_source,
+            mode,
+            target,
+            ExecutionEffects::all(),
+        )?
+    } else if let Some(installed) = installed {
+        let extensions = extensions.ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::InvalidCommand,
+                "installed plugin command requires an extension host",
+            )
+            .with_command(source)
+            .with_help("Run the command through `quirl exec` or the interactive shell")
+        })?;
+        let mut extensions = extensions.lock().map_err(|_| {
+            ShellError::new(ErrorCode::Lua, "the extension host lock was poisoned")
+                .with_help("Restart Quirl before executing another plugin command")
+        })?;
+        extensions.plugin_execution_request(installed, source)?
+    } else {
+        let target = match output_mode {
+            ExecutionOutputMode::Capture => ExecutionOutputTarget::Capture {
+                max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
+            },
+            ExecutionOutputMode::Interactive => ExecutionOutputTarget::Inherit,
+        };
+        execution_request(
+            "<command>",
+            source,
+            ExecutionMode::NativeCommand,
+            target,
+            ExecutionEffects::all(),
+        )?
+    };
+    execute_execution_request(executor, request, extensions).map_err(|mut error| {
         error.details.command = Some(source.to_owned());
         error
-    })?;
-    let status = outcome.status_code();
-    match outcome.output {
-        ExecutionOutput::Inherited => Ok(CommandOutcome {
-            status,
-            stdout: None,
-            stderr: None,
-        }),
-        ExecutionOutput::Bytes { stdout, stderr } => Ok(CommandOutcome {
-            status,
-            stdout: Some(String::from_utf8_lossy(&stdout).into_owned()),
-            stderr: Some(String::from_utf8_lossy(&stderr).into_owned()),
-        }),
-        ExecutionOutput::Value { .. } | ExecutionOutput::Values { .. } => Err(ShellError::new(
-            ErrorCode::Validation,
-            "command execution returned a value outcome",
-        )
-        .with_command(source)
-        .with_help("Report this as an execution adapter representation defect")),
-    }
+    })
 }
 
 fn recovery_journal(
@@ -1268,6 +1331,7 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
 #[derive(Debug)]
 struct PlannedExecution {
     source: String,
+    plugin_command: Option<extensions::InstalledPluginCommand>,
     annotations: BTreeMap<String, serde_json::Value>,
 }
 
@@ -1275,6 +1339,7 @@ impl PlannedExecution {
     fn new(source: &str) -> Self {
         Self {
             source: source.to_owned(),
+            plugin_command: None,
             annotations: BTreeMap::new(),
         }
     }
@@ -1442,6 +1507,60 @@ fn emit_outcome_events(
                 ),
                 annotations,
             );
+        }
+    }
+}
+
+fn emit_execution_outcome_events(
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+    outcome: &ExecutionOutcome,
+    annotations: &mut BTreeMap<String, serde_json::Value>,
+) {
+    match &outcome.output {
+        ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => {
+            emit_outcome_events(
+                extensions,
+                &command_outcome_projection(outcome),
+                annotations,
+            );
+        }
+        ExecutionOutput::Value { value } => {
+            emit_value_output(extensions, &value.json_value(), annotations);
+        }
+        ExecutionOutput::Values { values } => {
+            let values =
+                serde_json::Value::Array(values.iter().map(StructuredValue::json_value).collect());
+            emit_value_output(extensions, &values, annotations);
+        }
+    }
+}
+
+fn command_outcome_projection(outcome: &ExecutionOutcome) -> CommandOutcome {
+    let (stdout, stderr) = match &outcome.output {
+        ExecutionOutput::Bytes { stdout, stderr } => (
+            Some(String::from_utf8_lossy(stdout).into_owned()),
+            Some(String::from_utf8_lossy(stderr).into_owned()),
+        ),
+        ExecutionOutput::Inherited
+        | ExecutionOutput::Value { .. }
+        | ExecutionOutput::Values { .. } => (None, None),
+    };
+    CommandOutcome {
+        status: outcome.status_code(),
+        stdout,
+        stderr,
+    }
+}
+
+fn print_execution_outcome(outcome: &ExecutionOutcome) -> Result<(), ShellError> {
+    match &outcome.output {
+        ExecutionOutput::Inherited => Ok(()),
+        ExecutionOutput::Bytes { .. } => {
+            print_outcome(&command_outcome_projection(outcome));
+            Ok(())
+        }
+        ExecutionOutput::Value { .. } | ExecutionOutput::Values { .. } => {
+            print_execution_value(outcome)
         }
     }
 }
@@ -2425,7 +2544,7 @@ mod tests {
             )
             .unwrap();
             let outcome =
-                execute_execution_request(&mut NativeExecutor::default(), request).unwrap();
+                execute_execution_request(&mut NativeExecutor::default(), request, None).unwrap();
             assert_eq!(outcome.status_code(), status, "mode {mode:?}");
             assert_eq!(outcome.cleanup, ExecutionCleanupState::Complete);
             assert!(matches!(
@@ -2458,7 +2577,7 @@ mod tests {
             )
             .unwrap();
             let outcome =
-                execute_execution_request(&mut NativeExecutor::default(), request).unwrap();
+                execute_execution_request(&mut NativeExecutor::default(), request, None).unwrap();
             assert_eq!(outcome.status_code(), 7);
             assert!(matches!(
                 outcome.output,
@@ -2485,8 +2604,8 @@ mod tests {
                 ExecutionEffects::from_effects(&[ExecutionEffect::SpawnProcess]),
                 ExecutionEffects::none(),
             );
-            let error =
-                execute_execution_request(&mut NativeExecutor::default(), denied).unwrap_err();
+            let error = execute_execution_request(&mut NativeExecutor::default(), denied, None)
+                .unwrap_err();
             assert_eq!(error.code, ErrorCode::Validation);
             assert_eq!(error.details.command.as_deref(), Some(source.as_str()));
 
@@ -2498,8 +2617,8 @@ mod tests {
             )
             .with_cancellation(cancellation)
             .with_effects(ExecutionEffects::none(), ExecutionEffects::all());
-            let error =
-                execute_execution_request(&mut NativeExecutor::default(), cancelled).unwrap_err();
+            let error = execute_execution_request(&mut NativeExecutor::default(), cancelled, None)
+                .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
         }
     }
@@ -2527,8 +2646,8 @@ mod tests {
                 ExecutionEffects::all(),
             )
             .unwrap();
-            let error =
-                execute_execution_request(&mut NativeExecutor::default(), request).unwrap_err();
+            let error = execute_execution_request(&mut NativeExecutor::default(), request, None)
+                .unwrap_err();
             assert_eq!(
                 error.details.command.as_deref(),
                 Some(source),
@@ -2556,8 +2675,8 @@ mod tests {
                 ExecutionEffects::all(),
             )
             .unwrap();
-            let error =
-                execute_execution_request(&mut NativeExecutor::default(), request).unwrap_err();
+            let error = execute_execution_request(&mut NativeExecutor::default(), request, None)
+                .unwrap_err();
             assert_eq!(error.details.command.as_deref(), Some(source));
         }
     }

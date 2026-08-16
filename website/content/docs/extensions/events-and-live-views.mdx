@@ -34,6 +34,15 @@ result annotations render separately from command output. A timeout, malformed
 return, or denied action becomes that handler's diagnostic and does not prevent
 later handlers from running.
 
+The interactive host runs callbacks on four persistent workers plus one
+deadline monitor; plugin count never creates threads. One event turn admits at
+most 16 loaded trusted-Lua runtimes and 64 handlers through a 64-job queue. The
+250 ms aggregate deadline starts when the batch is submitted, expired or stale
+work is cancelled, and completed actions are composed in stable plugin order.
+Queue saturation and aggregate timeout are resource-limit diagnostics. Before
+process, terminal, job, recovery, or persistence transitions, Quirl cancels
+background callback work and requires it to quiesce at a bounded safe point.
+
 ```lua
 quirl.events.subscribe {
   name = "deployment_guard",
@@ -63,6 +72,12 @@ installed paths or IDs; completion items and panels use deny-unknown shapes.
 Plugins return typed values or plain text, never terminal paint. The core and UI
 models reject ESC, CSI, NUL, and other raw control bytes. Quirl retains ownership
 of layout, color, focus, accessibility, and terminal cleanup.
+
+Prompt callbacks use the same bounded worker pool. First paint reads only the
+last completed snapshot and starts a newest-generation refresh; it never waits
+for Lua. A refresh retains at most 64 segments and 256 KiB, keeps the prior
+snapshot when a provider fails or misses the 100 ms aggregate deadline, and
+discards results from replaced plugin or prompt generations.
 
 ## Line-oriented panels
 

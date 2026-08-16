@@ -70,6 +70,38 @@ constructed with exactly the granted capability strings. Host registration
 values are deny-unknown Rust schemas; command metadata is typed and complete;
 callbacks retain instruction, memory, cancellation, and deadline enforcement.
 Manifest command contributions must exactly match Lua registrations.
+Installed command metadata is projected from the validated permission lock and
+manifest without evaluating Lua or invoking contribution callbacks. Execution
+reconciles that snapshot with the active generation, validates the catalog
+argument schema and locked effect grants, then runs the registered callback on
+the shared bounded extension scheduler. The callback receives the typed Lua
+runner context and returns the ABI-v1 result envelope; status, structured
+values, `ShellError`, cancellation, and deadlines therefore use the same
+contract as typed scripts and builtins.
+
+Command dispatch treats discovery and execution as separate states. Discovery
+reads bounded locked manifests and verified entry bytes, validates conflicts,
+and constructs catalog, completion, describe/doc, LSP, and agent projections
+without evaluating Lua. Execution polls the installed state again and requires
+the active generation to match the discovered command exactly. Removal,
+replacement, a rejected reload, or projection staleness fails closed instead of
+falling through to native process lookup. Disabled commands report that state;
+conflicts and invalid checksums prevent the snapshot from being composed.
+
+Argument schemas and declared effects are checked before scheduler admission or
+callback effects. The fixed worker pool provides bounded queue admission,
+per-runtime FIFO ownership, deadlines, cancellation, saturation errors, and
+bounded shutdown; command dispatch never creates a thread per plugin. Lua runs
+only at scheduler safe points. Malformed or oversized typed input/output,
+undocumented status codes, byte output, partial ABI results, callback failures,
+timeouts, and cancellation remain structured `ShellError` values. A callback
+cannot publish partial typed output: only a completely validated outcome is
+emitted, rendered, and included in the normal result/error and recovery
+ordering. Cleanup errors do not replace the originating diagnostic.
+
+MCP deliberately remains builtin-only. Its catalog metadata neither reads nor
+executes installed plugins, so it never advertises a plugin command as remotely
+executable.
 The interactive extension host reads the same managed lock, integrity-checks
 every enabled trusted-Lua source, ignores disabled entries, and constructs each
 VM with exactly that entry's granted capabilities. It does not implicitly load

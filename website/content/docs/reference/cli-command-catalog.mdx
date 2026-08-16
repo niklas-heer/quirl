@@ -312,7 +312,7 @@ Options:
 
 Evaluate a native structured-data pipeline
 
-Sources are `pwd`, `files [path]` (or `ls`), `open <path>`, JSON, or explicit `^external <command>`. `open` adapts JSON, YAML, TOML, CSV, and uncompressed POSIX tar headers; unknown extensions remain text. `lines`, `from json`, and `to json` make byte/value conversions visible. The CLI injects a deadline-, cancellation-, and output-bounded external host; library runtimes fail closed without one. CSV/tar rows are pulled lazily and all adapters enforce file, row, field, and depth limits. `sort` and table output intentionally collect within those limits. Transforms include typed `where` comparisons with `and`/`or`, dotted `get`, `select`, `sort`, `take`, `first`, and `length`. HTTP is not an implicit source.
+Sources are `pwd`, `files [path]` (or `ls`), `open <path>`, JSON, or explicit `^external <command>`. Values stay typed through streams and transforms: filesystem rows retain Path, Size, and DateTime; tar retains Path and Size; TOML retains DateTime. JSON/YAML/TOML and bytes are explicit conversion boundaries, and `to json` documents its lossy domain encoding. The CLI injects a deadline-, cancellation-, and output-bounded external host; library runtimes fail closed without one. CSV/tar rows are pulled lazily and all adapters enforce byte, row, field, depth, node, retained-text, and materialization limits. `sort`, table output, envelopes, and collected convenience APIs intentionally materialize within those limits. Transforms include typed `where` comparisons with `and`/`or`, dotted `get`, `select`, `sort`, `take`, Option-producing `first`, and `length`. Task remains declarative state; HTTP is not an implicit source.
 
 Options:
 
@@ -373,15 +373,16 @@ Options:
 - `file` — Positional `file` declared by the builtin command signature.
 - `--format` — Choose accessible text or stable validation JSON
 
-## `quirl exec <command...>`
+## `quirl exec <source> [--format text|json]`
 
 Execute Quirl's native command graph
 
-Runs quoted commands, byte pipes, redirects, boolean lists, and background jobs without a compatibility-shell round trip.
+Accepts complete Quirl source as exactly one outer-shell argument and passes it unchanged to extension planning. Without an explicit extension rewrite, the same source is parsed, diagnosed, and captured for bounded, redacted recovery. Quoting, empty arguments, byte pipes, redirects, boolean lists, and background jobs must be written inside that source operand; additional argv elements are rejected rather than joined into executable syntax.
 
 Options:
 
-- `command` — Positional `command` declared by the builtin command signature.
+- `source` — Positional `source` declared by the builtin command signature.
+- `--format` — Choose human-readable or stable ShellError output for failures
 
 ## `quirl fmt <file|directory> [--check]`
 

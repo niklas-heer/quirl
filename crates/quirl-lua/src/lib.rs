@@ -7,10 +7,10 @@ use mlua::{
 use quirl_core::{
     escape_terminal_controls, reject_json_terminal_controls, reject_terminal_controls,
     validate_contribution_set, ContributionKind, ContributionRegistration, ErrorCode, ErrorLabel,
-    EventKind, EventSubscription, ExecutionCleanupState, ExecutionEffect, ExecutionEffects,
-    ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget, ExecutionStatus,
-    ExtensionAction, ExtensionCapability, ExtensionEvent, ExtensionEventData, ProcessHost,
-    ProcessRequest, ShellError, StructuredValue, EXECUTION_ARGUMENTS_MAX,
+    EventKind, EventSubscription, ExecutionCancellation, ExecutionCleanupState, ExecutionEffect,
+    ExecutionEffects, ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget,
+    ExecutionStatus, ExtensionAction, ExtensionCapability, ExtensionEvent, ExtensionEventData,
+    ProcessHost, ProcessRequest, ShellError, StructuredValue, EXECUTION_ARGUMENTS_MAX,
     EXECUTION_ARGUMENT_BYTES_MAX, EXECUTION_BYTES_MAX,
 };
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
@@ -2220,6 +2220,52 @@ impl LuaRuntime {
         clippy::expect_used,
         reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
     )]
+    /// Dispatch a registered plugin command through the typed runner ABI.
+    ///
+    /// The callback receives the same immutable [`LuaRunnerContext`] as a
+    /// versioned script `main` function and must return an ABI-v1
+    /// [`ExecutionOutcome`] envelope. Unknown fields, legacy JSON results,
+    /// byte output, unbounded values, cancellation, and malformed structured
+    /// errors fail closed before crossing back to the composition root.
+    pub fn run_plugin_command_with_context(
+        &self,
+        name: &str,
+        context: &LuaRunnerContext,
+        deadline: Duration,
+    ) -> Result<ExecutionOutcome, ShellError> {
+        context.validate()?;
+        if !Arc::ptr_eq(&context.cancelled, &self.cancelled) {
+            return Err(runner_validation_error(
+                "plugin command context cancellation does not match the runtime",
+            )
+            .with_help("Build the execution request from the selected plugin runtime"));
+        }
+        ensure_runner_active(&self.cancelled, "before plugin command callback")?;
+        let function = {
+            let callbacks = self
+                .callbacks
+                .lock()
+                .expect("plugin callback mutex poisoned");
+            let key = callbacks.commands.get(name).ok_or_else(|| {
+                validation_error(name, format!("unknown plugin command `{name}`"))
+            })?;
+            self.lua
+                .registry_value::<Function>(key)
+                .map_err(|error| lua_error(error, None, 0))?
+        };
+        let context = self.create_runner_context(context, Path::new(name), 0)?;
+        self.reset_budget_with_deadline(deadline);
+        let value = function
+            .call::<Value>(context)
+            .map_err(|error| lua_error(error, Some(Path::new(name)), 0))?;
+        ensure_runner_active(&self.cancelled, "after plugin command callback")?;
+        self.decode_runner_result(value, Path::new(name))
+    }
+
+    #[allow(
+        clippy::expect_used,
+        reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
+    )]
     /// Dispatch one immutable, strictly sequenced event to subscribed handlers.
     ///
     /// Handlers run in name order under individual declared deadlines. Output text
@@ -2441,6 +2487,15 @@ impl LuaRuntime {
         LuaCancellation {
             cancelled: Arc::clone(&self.cancelled),
         }
+    }
+
+    /// Return the shared execution cancellation identity observed by this VM.
+    ///
+    /// Composition adapters use this when a persistent trusted-plugin runtime
+    /// supplies the engine for an [`ExecutionRequest`](quirl_core::ExecutionRequest).
+    /// The caller must quiesce other callbacks before clearing or reusing it.
+    pub fn execution_cancellation(&self) -> ExecutionCancellation {
+        ExecutionCancellation::from_atomic(Arc::clone(&self.cancelled))
     }
 
     /// Clear a prior cancellation request before deliberately reusing the runtime.
@@ -3306,6 +3361,10 @@ pub fn format_file(path: &Path, check: bool) -> Result<bool, ShellError> {
 pub fn sdk_lua() -> String {
     let mut output = String::from(
         "---@meta quirl\n\n---@class quirl.ErrorLabel\n---@field source? string\n---@field start integer Inclusive UTF-8 byte offset.\n---@field end integer Exclusive UTF-8 byte offset.\n---@field message string\n\n---@alias quirl.ErrorCode 'invalid_command'|'invalid_argument'|'data'|'io'|'process_spawn'|'script_read'|'lua'|'validation'|'resource_limit'\n\n---@class quirl.ShellError\n---@field code quirl.ErrorCode\n---@field message string\n---@field labels? quirl.ErrorLabel[]\n---@field context? string[]\n---@field help? string[]\n---@field command? string\n---@field exit_status? integer\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? quirl.ShellError\n\n---@class quirl.ProcessResult: quirl.Result\n---@field status integer\n---@field value string Captured stdout.\n---@field stderr string Captured stderr.\n\n---@alias quirl.ExecutionEffect 'read_filesystem'|'write_filesystem'|'spawn_process'|'change_directory'\n\n---@class quirl.CancellationContext\n---@field is_cancelled fun(): boolean Returns the shared cancellation flag without clearing it.\n\n---@class quirl.Context\n---@field abi_version 1\n---@field args string[] Bounded arguments in source order.\n---@field env table<string, string> Immutable bounded environment snapshot.\n---@field cwd string UTF-8 working directory captured before evaluation.\n---@field input table Shared deny-unknown ExecutionInput representation.\n---@field output table Shared value-only ExecutionOutputTarget representation.\n---@field cancellation quirl.CancellationContext\n---@field effects quirl.ExecutionEffect[] Effects declared before dispatch.\n\n---@class quirl.RunnerResult\n---@field abi_version 1\n---@field ok boolean\n---@field status? integer Required exactly when ok is true.\n---@field output? table Typed value or bounded finite values output; live streams are not transferable.\n---@field error? quirl.ShellError Required exactly when ok is false.\n\n---@class quirl.RunnerModule\n---@field abi_version 1\n---@field main fun(context: quirl.Context): quirl.RunnerResult\n\n---@alias quirl.PromptSymbols 'auto'|'plain'|'unicode'|'nerd_font'\n---@alias quirl.WelcomeBanner 'full'|'compact'|'none'\n---@alias quirl.Surface 'auto'|'rich'|'simple'\n\n---@class quirl.EditorConfig\n---@field keymap? 'emacs'|'vim'|'helix' Emacs is the complete default.\n---@field semantic_hints? boolean\n---@field banner? quirl.WelcomeBanner\n\n---@class quirl.PickerConfig\n---@field layout? 'adaptive'|'bottom'|'full'\n---@field preview? boolean\n\n---@class quirl.PromptConfig\n---@field symbols? quirl.PromptSymbols Auto never assumes a patched font; nerd_font enables Powerline glyphs explicitly.\n---@field left? string[] Ordered prompt segments before the input.\n---@field right? string[] Ordered prompt segments aligned on the right.\n---@field transient? boolean Collapse accepted input to one scrollback line before execution.\n\n---@class quirl.ThemeColors\n---@field accent_command string #RRGGBB color for command-mode accents.\n---@field accent_data string #RRGGBB color for data-mode accents.\n---@field context_primary string #RRGGBB color for primary context.\n---@field context_secondary string #RRGGBB color for secondary context.\n---@field muted string #RRGGBB color for subdued text.\n---@field border string #RRGGBB color for borders.\n---@field status_background string #RRGGBB status background color.\n---@field error string #RRGGBB error color.\n---@field warning string #RRGGBB color for warnings.\n---@field hint string #RRGGBB color for hints.\n---@field string string #RRGGBB string syntax color.\n---@field operator string #RRGGBB operator syntax color.\n---@field expansion string #RRGGBB expansion syntax color.\n---@field number string #RRGGBB number syntax color.\n\n---@class quirl.StatuslineConfig\n---@field hints? boolean\n\n---@class quirl.UiConfig\n---@field surface? quirl.Surface\n---@field theme? string Built-in or custom theme name; defaults to tokyo-night.\n---@field themes? table<string, quirl.ThemeColors> At most 32 custom themes.\n---@field statusline? quirl.StatuslineConfig\n\n---@class quirl.CompletionConfig\n---@field auto? boolean\n---@field min_chars? integer\n\n---@class quirl.Config\n---@field schema_version? integer\n---@field editor? quirl.EditorConfig\n---@field picker? quirl.PickerConfig\n---@field prompt? quirl.PromptConfig\n---@field ui? quirl.UiConfig\n---@field completion? quirl.CompletionConfig\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
+    );
+    output = output.replace(
+        "---@field run fun(arguments: table): any",
+        "---@field run fun(context: quirl.Context): quirl.RunnerResult",
     );
     for spec in HOST_API {
         output.push_str(&format!("---{}\n", spec.summary));
@@ -6307,7 +6366,16 @@ return { main = exported }
           details = "Return one typed record.", input_type = "Nothing",
           output_type = "Record", examples = { "demo run" },
           effects = { "read_filesystem" }, error_codes = { ["0"] = "success" },
-          run = function(args) return { ok = true, value = args.value } end,
+          run = function(args)
+            if args.abi_version == 1 then
+              if args.args[1] == "malformed" then
+                return { abi_version = 1, ok = true, status = 0 }
+              end
+              return { abi_version = 1, ok = true, status = 0,
+                output = { kind = "value", value = { type = "string", value = args.args[1] } } }
+            end
+            return { ok = true, value = args.value }
+          end,
         }"#;
         let denied = LuaRuntime::new_with_capabilities(LuaPolicy::config(), &[]).unwrap();
         let error = denied.eval(source).unwrap_err();
@@ -6323,6 +6391,52 @@ return { main = exported }
             .run_plugin_command("demo run", &serde_json::json!({"value": 42}))
             .unwrap();
         assert_eq!(output, serde_json::json!({"ok": true, "value": 42}));
+        let cancellation = runtime.execution_cancellation();
+        let context = LuaRunnerContext::from_current_process(
+            &["typed".to_owned()],
+            ExecutionInput::None,
+            ExecutionOutputTarget::Value,
+            ExecutionEffects::from_effects(&[ExecutionEffect::ReadFilesystem]),
+            cancellation.atomic(),
+        )
+        .unwrap();
+        let typed = runtime
+            .run_plugin_command_with_context("demo run", &context, Duration::from_millis(50))
+            .unwrap();
+        assert_eq!(typed.status_code(), 0);
+        assert_eq!(
+            typed.output,
+            ExecutionOutput::Value {
+                value: StructuredValue::String("typed".to_owned())
+            }
+        );
+        let malformed_context = LuaRunnerContext::from_current_process(
+            &["malformed".to_owned()],
+            ExecutionInput::None,
+            ExecutionOutputTarget::Value,
+            ExecutionEffects::from_effects(&[ExecutionEffect::ReadFilesystem]),
+            cancellation.atomic(),
+        )
+        .unwrap();
+        let malformed = runtime
+            .run_plugin_command_with_context(
+                "demo run",
+                &malformed_context,
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert_eq!(malformed.code, ErrorCode::Validation);
+        assert!(malformed.details.context[0].contains("requires typed `output`"));
+        cancellation.cancel();
+        let cancelled = runtime
+            .run_plugin_command_with_context(
+                "demo run",
+                &malformed_context,
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+        assert_eq!(cancelled.code, ErrorCode::ResourceLimit);
+        runtime.clear_cancellation();
         let invalid = runtime
             .run_plugin_command("demo run", &serde_json::json!([42]))
             .unwrap_err();

@@ -128,7 +128,7 @@
 ---@field examples string[]
 ---@field effects string[]
 ---@field error_codes table<string, string>
----@field run fun(arguments: table): any
+---@field run fun(context: quirl.Context): quirl.RunnerResult
 
 ---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'
 ---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'

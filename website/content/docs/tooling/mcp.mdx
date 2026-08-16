@@ -32,3 +32,9 @@ cannot be mixed.
 
 Messages, nested JSON, tool input, and tool output are bounded. Oversized tool
 results return a JSON-RPC error while the stdio connection remains usable.
+
+MCP intentionally exposes the compiled builtin catalog only. It does not read
+the plugin lock, evaluate installed Lua, invoke extension callbacks, or claim
+that plugin commands are MCP-executable. Installed plugin metadata remains
+available through the validated CLI catalog, LSP, documentation, completion,
+and agent projections.

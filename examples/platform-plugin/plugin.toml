@@ -10,7 +10,7 @@ runtime = "trusted_lua"
 summary = "Demonstrate permission-locked typed command registration"
 
 [capabilities]
-request = ["commands.register"]
+request = ["commands.register", "filesystem.read:."]
 
 [contributes]
 commands = ["platform-demo run"]
