@@ -9,8 +9,8 @@ pub mod syntax;
 mod value_boundary;
 
 use quirl_core::{
-    directory_entries_with_options, escape_terminal_controls, DirectoryOptions, Entry, EntryKind,
-    ErrorCode, ProcessHost, ProcessRequest, ShellError, StructuredValue,
+    directory_entries_with_options, DirectoryOptions, Entry, EntryKind, ErrorCode, ProcessHost,
+    ProcessRequest, ShellError, StructuredValue,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -52,7 +52,7 @@ pub struct DataLimits {
     pub max_nodes: usize,
     /// Maximum aggregate UTF-8 bytes retained by strings and record keys.
     pub max_retained_text_bytes: usize,
-    /// Maximum approximate in-memory bytes retained at an explicit collection boundary.
+    /// Maximum approximate value bytes or exact rendered bytes retained at a collection boundary.
     pub max_materialized_bytes: usize,
     /// Wall-clock deadline applied to an explicitly injected external process.
     pub external_deadline: Duration,
@@ -220,10 +220,22 @@ impl DataEnvelope {
             error: Some(error),
         }
     }
-    /// Render this envelope in the selected stable human or machine format.
+    /// Render this envelope within the default 16 MiB emitted-byte ceiling.
     pub fn render(&self, format: DataRenderFormat) -> Result<String, ShellError> {
-        self.validate(DataLimits::DEFAULT)?;
-        render_envelope(self, format)
+        self.render_with_limits(format, DataLimits::DEFAULT)
+    }
+
+    /// Render this envelope while enforcing `limits.max_materialized_bytes`
+    /// against every emitted byte before retaining it in the returned string.
+    pub fn render_with_limits(
+        &self,
+        format: DataRenderFormat,
+        limits: DataLimits,
+    ) -> Result<String, ShellError> {
+        self.validate(limits)?;
+        collect_rendered(limits.max_materialized_bytes, |writer| {
+            render_envelope_to(self, format, limits, writer)
+        })
     }
 
     /// Validate control-state coherence and retained typed values iteratively.
@@ -533,37 +545,67 @@ impl DataOutput {
 
     /// Render this output into an owned UTF-8 string.
     ///
-    /// This convenience boundary buffers the rendered bytes. Stream rows are
-    /// still pulled individually, while table rendering materializes rows
-    /// within the stream's configured limit.
+    /// This convenience boundary checks every emitted byte before buffering it
+    /// and rejects output above `max_materialized_bytes`. Stream rows are still
+    /// pulled individually, while table rendering materializes rows within the
+    /// stream's configured limit.
     pub fn render(
         self,
         format: DataRenderFormat,
         cancelled: &AtomicBool,
     ) -> Result<String, ShellError> {
-        let mut output = Vec::new();
-        self.render_to(format, cancelled, &mut output)?;
-        String::from_utf8(output).map_err(|error| {
-            ShellError::new(ErrorCode::Data, "data renderer produced invalid UTF-8")
-                .with_context(error.to_string())
-                .with_help(
-                    "Use a UTF-8 terminal renderer or report this internal data renderer error",
-                )
-        })
+        let limits = self.render_limits();
+        self.render_with_limits(format, cancelled, limits)
     }
 
-    /// Render to an output sink. Plain and JSON streams write each row as it is
-    /// pulled; callers that need a single `String` can use `render`, which is
-    /// the intentionally collecting convenience boundary.
+    /// Render to an output sink without applying a hidden aggregate output
+    /// ceiling. Plain and JSON streams write each row as it is pulled; callers
+    /// that need one bounded `String` can use [`Self::render`].
     pub fn render_to(
         self,
         format: DataRenderFormat,
         cancelled: &AtomicBool,
         writer: &mut impl Write,
     ) -> Result<(), ShellError> {
+        let limits = self.render_limits();
+        self.render_to_with_limits(format, cancelled, writer, limits)
+    }
+
+    fn render_limits(&self) -> DataLimits {
+        let mut current = self;
+        loop {
+            match current {
+                Self::Stream(stream) => return stream.limits(),
+                Self::Option(Some(value)) => current = value,
+                Self::Value(_) | Self::Option(None) => return DataLimits::DEFAULT,
+            }
+        }
+    }
+
+    fn render_with_limits(
+        self,
+        format: DataRenderFormat,
+        cancelled: &AtomicBool,
+        limits: DataLimits,
+    ) -> Result<String, ShellError> {
+        collect_rendered(limits.max_materialized_bytes, |writer| {
+            self.render_to_with_limits(format, cancelled, writer, limits)
+        })
+    }
+
+    fn render_to_with_limits(
+        self,
+        format: DataRenderFormat,
+        cancelled: &AtomicBool,
+        writer: &mut impl Write,
+        limits: DataLimits,
+    ) -> Result<(), ShellError> {
+        check_cancelled(cancelled)?;
         match self {
             Self::Value(value) => {
-                write_rendered(writer, &DataEnvelope::value(value).render(format)?)
+                let envelope = DataEnvelope::value(value);
+                envelope.validate(limits)?;
+                render_envelope_to(&envelope, format, limits, writer)
             }
             Self::Stream(stream) => render_stream_to(stream, format, cancelled, writer),
             Self::Option(value) => {
@@ -571,7 +613,8 @@ impl DataOutput {
                     Some(value) => DataEnvelope::some(value.into_envelope(cancelled)?),
                     None => DataEnvelope::none(),
                 };
-                write_rendered(writer, &envelope.render(format)?)
+                envelope.validate(limits)?;
+                render_envelope_to(&envelope, format, limits, writer)
             }
         }
     }
@@ -692,7 +735,7 @@ impl DataRuntime {
         cancelled: &AtomicBool,
     ) -> Result<String, ShellError> {
         self.eval_output_with_cancellation(source, cancelled)?
-            .render(format, cancelled)
+            .render_with_limits(format, cancelled, self.limits)
     }
 
     /// Evaluate and write a result without buffering plain/JSON streams in the
@@ -705,7 +748,7 @@ impl DataRuntime {
         writer: &mut impl Write,
     ) -> Result<(), ShellError> {
         self.eval_output_with_cancellation(source, cancelled)?
-            .render_to(format, cancelled, writer)
+            .render_to_with_limits(format, cancelled, writer, self.limits)
     }
 
     /// Stream a pipeline with a cancellation token that can also stop a
@@ -718,7 +761,7 @@ impl DataRuntime {
         writer: &mut impl Write,
     ) -> Result<(), ShellError> {
         self.eval_output_with_cancellation_handle(source, Arc::clone(&cancelled))?
-            .render_to(format, &cancelled, writer)
+            .render_to_with_limits(format, &cancelled, writer, self.limits)
     }
 
     /// Open a stream without collecting it. CSV rows are parsed only as the
@@ -1717,23 +1760,22 @@ fn tar_error_display(path: &str, message: impl Into<String>) -> ShellError {
         .with_help("Use a readable uncompressed POSIX .tar archive with bounded entry names")
 }
 
-fn render_envelope(
+fn render_envelope_to(
     envelope: &DataEnvelope,
     format: DataRenderFormat,
-) -> Result<String, ShellError> {
+    limits: DataLimits,
+    writer: &mut impl Write,
+) -> Result<(), ShellError> {
     match format {
-        DataRenderFormat::Json => serde_json::to_string_pretty(envelope)
-            .map(|value| format!("{value}\n"))
-            .map_err(|error| {
-                ShellError::new(ErrorCode::Data, "cannot render typed data as JSON")
-                    .with_context(error.to_string())
-                    .with_help("Use `--format plain` for terminal-only output")
-            }),
-        DataRenderFormat::Plain => Ok(format!(
-            "{}\n",
-            escape_terminal_controls(&plain_value(envelope, DataLimits::DEFAULT)?)
-        )),
-        DataRenderFormat::Table => render_table(envelope, DataLimits::DEFAULT),
+        DataRenderFormat::Json => {
+            write_json_pretty(writer, envelope, "cannot render typed data as JSON")?;
+            write_output(writer, b"\n")
+        }
+        DataRenderFormat::Plain => {
+            write_plain_envelope(writer, envelope, limits)?;
+            write_output(writer, b"\n")
+        }
+        DataRenderFormat::Table => render_table_to(writer, envelope, limits),
     }
 }
 
@@ -1747,55 +1789,45 @@ fn render_stream_to(
     cancelled: &AtomicBool,
     writer: &mut impl Write,
 ) -> Result<(), ShellError> {
+    check_cancelled(cancelled)?;
     match format {
         DataRenderFormat::Table => {
             let limits = stream.limits();
-            write_rendered(
-                writer,
-                &render_table_rows(&stream.collect(cancelled)?, limits)?,
-            )
+            let rows = stream.collect(cancelled)?;
+            check_cancelled(cancelled)?;
+            render_table_rows_to(writer, &rows, limits, Some(cancelled))
         }
         DataRenderFormat::Plain => {
             let limits = stream.limits();
             while let Some(value) = stream.next(cancelled)? {
-                write_rendered(
-                    writer,
-                    &format!(
-                        "{}\n",
-                        escape_terminal_controls(&plain_data_value(&value, limits)?)
-                    ),
-                )?;
+                write_plain_data_value(writer, &value, limits)?;
+                write_output(writer, b"\n")?;
             }
             Ok(())
         }
         DataRenderFormat::Json => {
-            write_rendered(writer, "{\n  \"kind\": \"stream\",\n  \"items\": [")?;
+            write_output(writer, b"{\n  \"kind\": \"stream\",\n  \"items\": [")?;
             let mut first = true;
             while let Some(value) = stream.next(cancelled)? {
-                let rendered = serde_json::to_string(&value).map_err(|error| {
-                    ShellError::new(ErrorCode::Data, "cannot serialize stream value as JSON")
-                        .with_context(error.to_string())
-                        .with_help("Use `--format plain` for terminal-only output")
-                })?;
                 if first {
-                    write_rendered(writer, "\n")?;
+                    write_output(writer, b"\n")?;
                     first = false;
                 } else {
-                    write_rendered(writer, ",\n")?;
+                    write_output(writer, b",\n")?;
                 }
-                write_rendered(writer, "    ")?;
-                write_rendered(writer, &rendered)?;
+                write_output(writer, b"    ")?;
+                write_json(writer, &value, "cannot serialize stream value as JSON")?;
             }
             if !first {
-                write_rendered(writer, "\n")?;
+                write_output(writer, b"\n")?;
             }
-            write_rendered(writer, "  ]\n}\n")
+            write_output(writer, b"  ]\n}\n")
         }
     }
 }
 
-fn write_rendered(writer: &mut impl Write, text: &str) -> Result<(), ShellError> {
-    writer.write_all(text.as_bytes()).map_err(|error| {
+fn write_output(writer: &mut impl Write, bytes: &[u8]) -> Result<(), ShellError> {
+    writer.write_all(bytes).map_err(|error| {
         ShellError::new(ErrorCode::Io, "cannot write data output")
             .with_context(error.to_string())
             .with_help(
@@ -1804,136 +1836,458 @@ fn write_rendered(writer: &mut impl Write, text: &str) -> Result<(), ShellError>
     })
 }
 
-fn plain_data_value(value: &DataValue, limits: DataLimits) -> Result<String, ShellError> {
+fn write_json(
+    writer: &mut impl Write,
+    value: &impl Serialize,
+    message: &str,
+) -> Result<(), ShellError> {
+    serde_json::to_writer(writer, value).map_err(|error| json_render_error(error, message))
+}
+
+fn write_json_pretty(
+    writer: &mut impl Write,
+    value: &impl Serialize,
+    message: &str,
+) -> Result<(), ShellError> {
+    serde_json::to_writer_pretty(writer, value).map_err(|error| json_render_error(error, message))
+}
+
+fn json_render_error(error: serde_json::Error, message: &str) -> ShellError {
+    let code = if error.is_io() {
+        ErrorCode::Io
+    } else {
+        ErrorCode::Data
+    };
+    ShellError::new(code, message)
+        .with_context(error.to_string())
+        .with_help("Use `--format plain` or check that the output destination is writable")
+}
+
+fn write_terminal_safe(writer: &mut impl Write, value: &str) -> Result<(), ShellError> {
+    let mut safe_start = 0_usize;
+    for (index, character) in value.char_indices() {
+        let escaped = (character.is_control() && !matches!(character, '\n' | '\t'))
+            || character == '\u{009b}';
+        if !escaped {
+            continue;
+        }
+        write_output(writer, &value.as_bytes()[safe_start..index])?;
+        for escaped_character in character.escape_default() {
+            let mut encoded = [0_u8; 4];
+            write_output(
+                writer,
+                escaped_character.encode_utf8(&mut encoded).as_bytes(),
+            )?;
+        }
+        safe_start = index + character.len_utf8();
+    }
+    write_output(writer, &value.as_bytes()[safe_start..])
+}
+
+fn write_plain_data_value(
+    writer: &mut impl Write,
+    value: &DataValue,
+    limits: DataLimits,
+) -> Result<(), ShellError> {
+    validate_data_value(value, limits)?;
     match value {
         DataValue::String(value)
         | DataValue::Path(value)
         | DataValue::DateTime(value)
-        | DataValue::Pattern(value) => Ok(value.clone()),
-        DataValue::Nothing
-        | DataValue::Bool(_)
-        | DataValue::Int(_)
-        | DataValue::UInt(_)
-        | DataValue::Decimal(_)
-        | DataValue::Duration { .. }
-        | DataValue::Size { .. } => Ok(value.display_value()),
-        DataValue::List(_) | DataValue::Record(_) => {
-            let json = json_from_data_value(value, limits)?;
-            serde_json::to_string(&json).map_err(|error| {
-                ShellError::new(ErrorCode::Data, "cannot render typed data as plain text")
-                    .with_context(error.to_string())
-                    .with_help("Use values supported by the explicit JSON display boundary")
-            })
+        | DataValue::Pattern(value) => write_terminal_safe(writer, value),
+        DataValue::Nothing => write_output(writer, b"null"),
+        DataValue::Bool(value) => write_output(writer, value.to_string().as_bytes()),
+        DataValue::Int(value) => write_output(writer, value.to_string().as_bytes()),
+        DataValue::UInt(value) => write_output(writer, value.to_string().as_bytes()),
+        DataValue::Decimal(value) => write_output(writer, value.as_bytes()),
+        DataValue::Duration { nanoseconds } => {
+            write_output(writer, format!("{nanoseconds}ns").as_bytes())
+        }
+        DataValue::Size { bytes } => write_output(writer, format!("{bytes}B").as_bytes()),
+        DataValue::List(_) | DataValue::Record(_) => write_json_compatible_value(writer, value),
+    }
+}
+
+enum JsonCompatibleFrame<'a> {
+    Value(&'a DataValue),
+    List {
+        values: &'a [DataValue],
+        index: usize,
+    },
+    Record {
+        entries: std::collections::btree_map::Iter<'a, String, DataValue>,
+        first: bool,
+    },
+}
+
+fn write_json_compatible_value(
+    writer: &mut impl Write,
+    value: &DataValue,
+) -> Result<(), ShellError> {
+    let mut stack = vec![JsonCompatibleFrame::Value(value)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            JsonCompatibleFrame::Value(value) => match value {
+                DataValue::Nothing => write_output(writer, b"null")?,
+                DataValue::Bool(value) => write_json(writer, value, "cannot render Boolean")?,
+                DataValue::Int(value) => write_json(writer, value, "cannot render integer")?,
+                DataValue::UInt(value) => write_json(writer, value, "cannot render integer")?,
+                DataValue::Decimal(value) => {
+                    let number = value.parse::<serde_json::Number>().map_err(|_| {
+                        ShellError::new(
+                            ErrorCode::Data,
+                            "decimal cannot be represented as a JSON number",
+                        )
+                        .with_context(format!("decimal source: {value}"))
+                        .with_help("Select or convert non-finite decimals before rendering")
+                    })?;
+                    write_json(writer, &number, "cannot render decimal")?;
+                }
+                DataValue::String(value)
+                | DataValue::Path(value)
+                | DataValue::DateTime(value)
+                | DataValue::Pattern(value) => write_json_string(writer, value)?,
+                DataValue::Duration { nanoseconds } => {
+                    write_json_string(writer, &format!("{nanoseconds}ns"))?
+                }
+                DataValue::Size { bytes } => write_json_string(writer, &format!("{bytes}B"))?,
+                DataValue::List(values) => {
+                    write_output(writer, b"[")?;
+                    stack.push(JsonCompatibleFrame::List { values, index: 0 });
+                }
+                DataValue::Record(values) => {
+                    write_output(writer, b"{")?;
+                    stack.push(JsonCompatibleFrame::Record {
+                        entries: values.iter(),
+                        first: true,
+                    });
+                }
+            },
+            JsonCompatibleFrame::List { values, index } => {
+                let Some(value) = values.get(index) else {
+                    write_output(writer, b"]")?;
+                    continue;
+                };
+                if index > 0 {
+                    write_output(writer, b",")?;
+                }
+                stack.push(JsonCompatibleFrame::List {
+                    values,
+                    index: index + 1,
+                });
+                stack.push(JsonCompatibleFrame::Value(value));
+            }
+            JsonCompatibleFrame::Record { mut entries, first } => {
+                let Some((key, value)) = entries.next() else {
+                    write_output(writer, b"}")?;
+                    continue;
+                };
+                if !first {
+                    write_output(writer, b",")?;
+                }
+                write_json_string(writer, key)?;
+                write_output(writer, b":")?;
+                stack.push(JsonCompatibleFrame::Record {
+                    entries,
+                    first: false,
+                });
+                stack.push(JsonCompatibleFrame::Value(value));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_json_string(writer: &mut impl Write, value: &str) -> Result<(), ShellError> {
+    write_output(writer, b"\"")?;
+    let mut safe_start = 0_usize;
+    for (index, character) in value.char_indices() {
+        let escape = match character {
+            '\"' => Some("\\\""),
+            '\\' => Some("\\\\"),
+            '\u{0008}' => Some("\\b"),
+            '\u{000c}' => Some("\\f"),
+            '\n' => Some("\\n"),
+            '\r' => Some("\\r"),
+            '\t' => Some("\\t"),
+            character if character.is_control() => None,
+            _ => continue,
+        };
+        write_output(writer, &value.as_bytes()[safe_start..index])?;
+        if let Some(escape) = escape {
+            write_output(writer, escape.as_bytes())?;
+        } else {
+            let code = u32::from(character);
+            write_output(writer, format!("\\u{code:04x}").as_bytes())?;
+        }
+        safe_start = index + character.len_utf8();
+    }
+    write_output(writer, &value.as_bytes()[safe_start..])?;
+    write_output(writer, b"\"")
+}
+
+fn write_plain_envelope(
+    writer: &mut impl Write,
+    envelope: &DataEnvelope,
+    limits: DataLimits,
+) -> Result<(), ShellError> {
+    let mut current = envelope;
+    loop {
+        match current {
+            DataEnvelope::Value { value } => return write_plain_data_value(writer, value, limits),
+            DataEnvelope::Stream { items } => {
+                for (index, value) in items.iter().enumerate() {
+                    if index > 0 {
+                        write_output(writer, b"\n")?;
+                    }
+                    write_plain_data_value(writer, value, limits)?;
+                }
+                return Ok(());
+            }
+            DataEnvelope::Option { value: Some(value) }
+            | DataEnvelope::Result {
+                value: Some(value), ..
+            } => current = value,
+            DataEnvelope::Option { value: None } => return write_output(writer, b"none"),
+            DataEnvelope::Result {
+                state,
+                value: None,
+                error,
+            } => {
+                if let Some(error) = error {
+                    write_output(writer, b"error: ")?;
+                    return write_terminal_safe(writer, &error.message);
+                }
+                return write_output(writer, format!("result {state:?}").as_bytes());
+            }
+            DataEnvelope::Task {
+                state,
+                value: Some(value),
+                ..
+            } => {
+                write_output(writer, format!("task {state:?}: ").as_bytes())?;
+                current = value;
+            }
+            DataEnvelope::Task {
+                state,
+                value: None,
+                error,
+            } => {
+                write_output(writer, format!("task {state:?}").as_bytes())?;
+                if let Some(error) = error {
+                    write_output(writer, b": ")?;
+                    write_terminal_safe(writer, &error.message)?;
+                }
+                return Ok(());
+            }
         }
     }
 }
 
-fn plain_value(envelope: &DataEnvelope, limits: DataLimits) -> Result<String, ShellError> {
-    match envelope {
-        DataEnvelope::Value { value } => plain_data_value(value, limits),
-        DataEnvelope::Stream { items } => items
-            .iter()
-            .map(|value| plain_data_value(value, limits))
-            .collect::<Result<Vec<_>, _>>()
-            .map(|items| items.join("\n")),
-        DataEnvelope::Option { value } => value
-            .as_deref()
-            .map_or_else(|| Ok("none".to_owned()), |value| plain_value(value, limits)),
-        DataEnvelope::Result {
-            state,
-            value,
-            error,
-        } => value.as_deref().map_or_else(
-            || {
-                Ok(error.as_ref().map_or_else(
-                    || format!("result {state:?}"),
-                    |error| format!("error: {}", error.message),
-                ))
+fn render_table_to(
+    writer: &mut impl Write,
+    envelope: &DataEnvelope,
+    limits: DataLimits,
+) -> Result<(), ShellError> {
+    let original = envelope;
+    let mut current = envelope;
+    let value = loop {
+        match current {
+            DataEnvelope::Value { value } => break value,
+            DataEnvelope::Stream { items } => {
+                return render_table_rows_to(writer, items, limits, None);
+            }
+            DataEnvelope::Option { value }
+            | DataEnvelope::Result { value, .. }
+            | DataEnvelope::Task { value, .. } => match value {
+                Some(value) => current = value,
+                None => {
+                    write_plain_envelope(writer, original, limits)?;
+                    return write_output(writer, b"\n");
+                }
             },
-            |value| plain_value(value, limits),
-        ),
-        DataEnvelope::Task {
-            state,
-            value,
-            error,
-        } => value.as_deref().map_or_else(
-            || {
-                Ok(error.as_ref().map_or_else(
-                    || format!("task {state:?}"),
-                    |error| format!("task {state:?}: {}", error.message),
-                ))
-            },
-            |value| plain_value(value, limits).map(|value| format!("task {state:?}: {value}")),
-        ),
-    }
-}
-
-fn render_table(envelope: &DataEnvelope, limits: DataLimits) -> Result<String, ShellError> {
-    let value = match envelope {
-        DataEnvelope::Value { value } => value,
-        DataEnvelope::Stream { items } => {
-            return render_table_rows(items, limits);
-        }
-        DataEnvelope::Option { value }
-        | DataEnvelope::Result { value, .. }
-        | DataEnvelope::Task { value, .. } => {
-            return value.as_deref().map_or_else(
-                || plain_value(envelope, limits).map(|value| format!("{value}\n")),
-                |value| render_table(value, limits),
-            )
         }
     };
     match value {
-        DataValue::List(rows) => render_table_rows(rows, limits),
-        DataValue::Record(_) => render_table_rows(std::slice::from_ref(value), limits),
-        _ => Ok(format!(
-            "{}\n",
-            escape_terminal_controls(&plain_data_value(value, limits)?)
-        )),
+        DataValue::List(rows) => render_table_rows_to(writer, rows, limits, None),
+        DataValue::Record(_) => {
+            render_table_rows_to(writer, std::slice::from_ref(value), limits, None)
+        }
+        _ => {
+            write_plain_data_value(writer, value, limits)?;
+            write_output(writer, b"\n")
+        }
     }
 }
 
-fn render_table_rows(rows: &[DataValue], limits: DataLimits) -> Result<String, ShellError> {
+fn render_table_rows_to(
+    writer: &mut impl Write,
+    rows: &[DataValue],
+    limits: DataLimits,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), ShellError> {
     let mut columns = BTreeSet::new();
     for row in rows {
         if let DataValue::Record(row) = row {
-            columns.extend(row.keys().cloned());
+            columns.extend(row.keys().map(String::as_str));
         }
     }
     if columns.is_empty() {
-        return rows
-            .iter()
-            .map(|value| {
-                plain_data_value(value, limits)
-                    .map(|value| format!("{}\n", escape_terminal_controls(&value)))
-            })
-            .collect();
+        for value in rows {
+            if let Some(cancelled) = cancelled {
+                check_cancelled(cancelled)?;
+            }
+            write_plain_data_value(writer, value, limits)?;
+            write_output(writer, b"\n")?;
+        }
+        return Ok(());
     }
     let columns: Vec<_> = columns.into_iter().collect();
-    let mut output = format!("{}\n", columns.join("\t"));
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            write_output(writer, b"\t")?;
+        }
+        write_terminal_safe(writer, column)?;
+    }
+    write_output(writer, b"\n")?;
     for row in rows {
+        if let Some(cancelled) = cancelled {
+            check_cancelled(cancelled)?;
+        }
         let DataValue::Record(row) = row else {
-            output.push_str(&format!(
-                "{}\n",
-                escape_terminal_controls(&plain_data_value(row, limits)?)
-            ));
+            write_plain_data_value(writer, row, limits)?;
+            write_output(writer, b"\n")?;
             continue;
         };
-        let cells = columns
-            .iter()
-            .map(|column| {
-                row.get(column).map_or_else(
-                    || Ok(String::new()),
-                    |value| {
-                        plain_data_value(value, limits)
-                            .map(|value| escape_terminal_controls(&value))
-                    },
-                )
-            })
-            .collect::<Result<Vec<_>, ShellError>>()?;
-        output.push_str(&format!("{}\n", cells.join("\t")));
+        for (index, column) in columns.iter().enumerate() {
+            if index > 0 {
+                write_output(writer, b"\t")?;
+            }
+            if let Some(value) = row.get(*column) {
+                write_plain_data_value(writer, value, limits)?;
+            }
+        }
+        write_output(writer, b"\n")?;
     }
-    Ok(output)
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionFailure {
+    Limit { observed: usize },
+    Allocation { observed: usize },
+}
+
+/// The collected-render failure model is deliberately localized here:
+/// many individually valid rows, one oversized rendered row, escaping
+/// expansion, headers, separators, and JSON syntax all pass through `write`.
+/// Checked addition maps an exact-size overflow to a limit failure; a limit or
+/// allocation failure retains none of the rejected chunk. Renderer, reader,
+/// and cancellation errors after partial output remain the originating
+/// `ShellError`, and dropping this collector releases every partial byte.
+struct BoundedRenderCollector {
+    bytes: Vec<u8>,
+    bytes_max: usize,
+    failure: Option<CollectionFailure>,
+}
+
+impl BoundedRenderCollector {
+    const fn new(bytes_max: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            bytes_max,
+            failure: None,
+        }
+    }
+
+    fn reserve_for(&mut self, attempted: usize) -> Result<(), std::io::Error> {
+        if attempted <= self.bytes.capacity() {
+            return Ok(());
+        }
+        let doubled = self
+            .bytes
+            .capacity()
+            .checked_mul(2)
+            .unwrap_or(self.bytes_max);
+        let capacity = attempted.max(doubled).min(self.bytes_max);
+        let additional = capacity.saturating_sub(self.bytes.len());
+        self.bytes.try_reserve_exact(additional).map_err(|_| {
+            self.failure = Some(CollectionFailure::Allocation {
+                observed: attempted,
+            });
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "cannot allocate bounded data render output",
+            )
+        })
+    }
+}
+
+impl Write for BoundedRenderCollector {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let attempted =
+            checked_rendered_usage(self.bytes.len(), buffer.len()).map_err(|observed| {
+                self.failure = Some(CollectionFailure::Limit { observed });
+                std::io::Error::new(
+                    std::io::ErrorKind::FileTooLarge,
+                    "collected data render size overflow",
+                )
+            })?;
+        if attempted > self.bytes_max {
+            self.failure = Some(CollectionFailure::Limit {
+                observed: attempted,
+            });
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "collected data render limit exceeded",
+            ));
+        }
+        self.reserve_for(attempted)?;
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn checked_rendered_usage(retained: usize, incoming: usize) -> Result<usize, usize> {
+    retained.checked_add(incoming).ok_or(usize::MAX)
+}
+
+fn collect_rendered(
+    bytes_max: usize,
+    render: impl FnOnce(&mut BoundedRenderCollector) -> Result<(), ShellError>,
+) -> Result<String, ShellError> {
+    let mut collector = BoundedRenderCollector::new(bytes_max);
+    let result = render(&mut collector);
+    if let Some(failure) = collector.failure {
+        return Err(collected_render_error(bytes_max, failure));
+    }
+    result?;
+    String::from_utf8(collector.bytes).map_err(|error| {
+        ShellError::new(ErrorCode::Data, "data renderer produced invalid UTF-8")
+            .with_context(error.to_string())
+            .with_help("Report this internal data renderer invariant failure")
+    })
+}
+
+fn collected_render_error(bytes_max: usize, failure: CollectionFailure) -> ShellError {
+    let (message, observed) = match failure {
+        CollectionFailure::Limit { observed } => (
+            "collected data render bytes exceed the configured materialization limit",
+            observed,
+        ),
+        CollectionFailure::Allocation { observed } => {
+            ("cannot allocate the collected data render buffer", observed)
+        }
+    };
+    ShellError::new(ErrorCode::ResourceLimit, message)
+        .with_context(format!("limit: {bytes_max}; observed: {observed}"))
+        .with_help(
+            "Use `render_to` for streaming output, reduce the rendered data, or raise `max_materialized_bytes`",
+        )
 }
 
 fn apply_transform(value: DataValue, transform: &DataTransform) -> Result<DataValue, ShellError> {
@@ -2567,6 +2921,28 @@ mod tests {
         }
     }
 
+    fn render_stream_with_limit(
+        rows: Vec<DataValue>,
+        format: DataRenderFormat,
+        max_materialized_bytes: usize,
+    ) -> Result<String, ShellError> {
+        DataOutput::Stream(DataStream::from_values(
+            rows,
+            DataLimits {
+                max_materialized_bytes,
+                ..DataLimits::DEFAULT
+            },
+        ))
+        .render(format, &AtomicBool::new(false))
+    }
+
+    fn expansion_row() -> DataValue {
+        DataValue::Record(BTreeMap::from([(
+            "header".to_owned(),
+            DataValue::String("\u{001b}".repeat(128)),
+        )]))
+    }
+
     #[test]
     fn transforms_structured_rows_without_stringification() {
         let runtime = DataRuntime::new();
@@ -2895,8 +3271,204 @@ mod tests {
             .render_to(DataRenderFormat::Plain, &cancelled, &mut writer)
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert_eq!(writer.writes, 1);
+        assert_eq!(writer.writes, 2);
         assert_eq!(writer.output, b"one\n");
+    }
+
+    #[test]
+    fn every_collected_format_accepts_exact_limit_and_rejects_limit_plus_one() {
+        for format in [
+            DataRenderFormat::Json,
+            DataRenderFormat::Plain,
+            DataRenderFormat::Table,
+        ] {
+            let expected = render_stream_with_limit(
+                vec![expansion_row()],
+                format,
+                DataLimits::DEFAULT.max_materialized_bytes,
+            )
+            .unwrap();
+            let exact =
+                render_stream_with_limit(vec![expansion_row()], format, expected.len()).unwrap();
+            assert_eq!(exact, expected, "exact limit failed for {format:?}");
+
+            let limit = expected.len() - 1;
+            let error = render_stream_with_limit(vec![expansion_row()], format, limit).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit, "{format:?}");
+            assert!(error.message.contains("collected data render bytes"));
+            assert!(error.details.context[0].contains(&format!("limit: {limit}")));
+            assert!(
+                error.details.context[0].contains(&format!("observed: {}", expected.len())),
+                "{}",
+                error.details.context[0]
+            );
+        }
+    }
+
+    #[test]
+    fn many_small_rows_cannot_exceed_the_aggregate_render_limit() {
+        let rows = (0..8)
+            .map(|_| DataValue::String("abcdefghij".to_owned()))
+            .collect();
+        let error = render_stream_with_limit(rows, DataRenderFormat::Plain, 64).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("limit: 64"));
+        assert!(error.details.context[0].contains("observed: 65"));
+    }
+
+    #[test]
+    fn render_to_keeps_many_small_rows_streaming_past_the_aggregate_limit() {
+        let rows = (0..8)
+            .map(|_| DataValue::String("abcdefghij".to_owned()))
+            .collect();
+        let output = DataOutput::Stream(DataStream::from_values(
+            rows,
+            DataLimits {
+                max_materialized_bytes: 64,
+                ..DataLimits::DEFAULT
+            },
+        ));
+        let mut writer = Vec::new();
+        output
+            .render_to(
+                DataRenderFormat::Plain,
+                &AtomicBool::new(false),
+                &mut writer,
+            )
+            .unwrap();
+        assert_eq!(writer.len(), 88);
+    }
+
+    #[test]
+    fn one_expanding_row_and_nested_value_are_bounded_before_retention() {
+        let row_error = render_stream_with_limit(
+            vec![DataValue::String("\u{001b}".repeat(64))],
+            DataRenderFormat::Plain,
+            128,
+        )
+        .unwrap_err();
+        assert_eq!(row_error.code, ErrorCode::ResourceLimit);
+
+        let nested = DataValue::List(vec![DataValue::String("\u{001b}".repeat(128))]);
+        let nested_error =
+            render_stream_with_limit(vec![nested], DataRenderFormat::Plain, 256).unwrap_err();
+        assert_eq!(nested_error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn table_headers_separators_and_escaping_are_part_of_the_bound() {
+        let row = DataValue::Record(BTreeMap::from([(
+            "na\u{001b}me".to_owned(),
+            DataValue::String("value".to_owned()),
+        )]));
+        let rendered = render_stream_with_limit(
+            vec![row.clone(), row],
+            DataRenderFormat::Table,
+            DataLimits::DEFAULT.max_materialized_bytes,
+        )
+        .unwrap();
+        assert_eq!(rendered, "na\\u{1b}me\nvalue\nvalue\n");
+        let error = render_stream_with_limit(
+            vec![DataValue::Record(BTreeMap::from([(
+                "na\u{001b}me".to_owned(),
+                DataValue::String("value".to_owned()),
+            )]))],
+            DataRenderFormat::Table,
+            "na\\u{1b}me\nvalue\n".len() - 1,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn collected_render_preserves_renderer_failure_after_partial_output() {
+        let output = DataOutput::Stream(DataStream::from_values(
+            vec![
+                DataValue::String("valid".to_owned()),
+                DataValue::List(vec![DataValue::Decimal("not-a-number".to_owned())]),
+            ],
+            DataLimits::DEFAULT,
+        ));
+        let error = output
+            .render(DataRenderFormat::Plain, &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Data);
+        assert!(error.message.contains("decimal cannot be represented"));
+    }
+
+    #[test]
+    fn collected_render_preserves_cancellation_after_partial_output() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::clone(&cancelled);
+        let mut first = true;
+        let stream = DataStream::from_pull(
+            move |_| {
+                if first {
+                    first = false;
+                    cancellation.store(true, AtomicOrdering::Relaxed);
+                    Ok(Some(DataValue::String("first".to_owned())))
+                } else {
+                    Ok(Some(DataValue::String("second".to_owned())))
+                }
+            },
+            DataLimits::DEFAULT,
+        );
+        let error = DataOutput::Stream(stream)
+            .render(DataRenderFormat::Plain, &cancelled)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.message.contains("cancelled"));
+    }
+
+    #[test]
+    fn envelope_and_runtime_collected_rendering_use_the_explicit_limit() {
+        let envelope = DataEnvelope::value(expansion_row());
+        let error = envelope
+            .render_with_limits(
+                DataRenderFormat::Json,
+                DataLimits {
+                    max_materialized_bytes: 512,
+                    ..DataLimits::DEFAULT
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+
+        let escaped = "\\u001b".repeat(64);
+        let runtime = DataRuntime::with_limits(DataLimits {
+            max_materialized_bytes: 256,
+            ..DataLimits::DEFAULT
+        });
+        let error = runtime
+            .render(
+                &format!("\"{escaped}\""),
+                DataRenderFormat::Plain,
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn rendered_byte_arithmetic_overflow_is_a_limit_failure() {
+        assert_eq!(checked_rendered_usage(usize::MAX, 1), Err(usize::MAX));
+        assert_eq!(checked_rendered_usage(usize::MAX - 1, 1), Ok(usize::MAX));
+    }
+
+    #[test]
+    fn collected_render_allocation_failure_is_a_resource_error() {
+        let mut collector = BoundedRenderCollector::new(usize::MAX);
+        collector.reserve_for(usize::MAX).unwrap_err();
+        let failure = collector.failure.unwrap();
+        assert_eq!(
+            failure,
+            CollectionFailure::Allocation {
+                observed: usize::MAX
+            }
+        );
+        let error = collected_render_error(usize::MAX, failure);
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("observed:"));
     }
 
     #[test]
