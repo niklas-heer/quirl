@@ -5,7 +5,9 @@ and native Quirl scripts. `.qrl` is the canonical native extension; `.quirl`
 and `.🌀` are accepted input aliases. It communicates over standard LSP `Content-Length`
 framing on stdin/stdout, so editors can launch the Quirl binary directly.
 
-The server accepts messages up to 4 MiB and implements:
+The server accepts messages up to 4 MiB. Framing headers are limited to 8 KiB
+and 64 fields, duplicate `Content-Length` fields are rejected, and truncated
+bodies fail without dispatch. It implements:
 
 - `initialize`, `initialized`, `shutdown`, and `exit`
 - `textDocument/didOpen`, `didChange`, and `didClose` with full-document sync
@@ -37,6 +39,16 @@ Use `lua` as the language id for Lua files and `quirl` for native Quirl files,
 regardless of whether they use `.qrl`, `.quirl`, or `.🌀`.
 The server uses UTF-16 LSP positions and publishes a complete replacement
 diagnostic set after every open or full-text change.
+
+The service retains at most 128 open documents and 16 MiB of aggregate
+document state. Each URI is limited to 8 KiB, each language identifier to 64
+bytes, and each document body to 1 MiB. `didChange` accepts exactly one
+full-document replacement, matching the advertised full-sync mode. Duplicate
+`didOpen` notifications atomically replace the existing document; a rejected
+open or change preserves the prior text, version, and accounting. Close,
+shutdown, and exit release retained state. These are UTF-8 byte limits, and
+limit failures include configured and observed usage where it is safe to do
+so.
 
 ## Custom module documentation request
 

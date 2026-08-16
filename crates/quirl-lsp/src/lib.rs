@@ -12,10 +12,18 @@ use quirl_syntax::check_script;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    io::{BufRead, Write},
+    io::{BufRead, ErrorKind, Read, Write},
 };
 
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_HEADER_BYTES: usize = 8 * 1024;
+const MAX_HEADER_COUNT: usize = 64;
+const MAX_OPEN_DOCUMENTS: usize = 128;
+const MAX_URI_BYTES: usize = 8 * 1024;
+const MAX_LANGUAGE_ID_BYTES: usize = 64;
+const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
+const MAX_RETAINED_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONTENT_CHANGES: usize = 1;
 
 #[derive(Debug, Clone)]
 struct Document {
@@ -29,6 +37,7 @@ struct Document {
 pub struct LanguageService {
     catalog: Catalog,
     documents: HashMap<String, Document>,
+    retained_document_bytes: usize,
     shutdown: bool,
     exit: bool,
 }
@@ -45,6 +54,7 @@ impl LanguageService {
         Self {
             catalog,
             documents: HashMap::new(),
+            retained_document_bytes: 0,
             shutdown: false,
             exit: false,
         }
@@ -100,10 +110,14 @@ impl LanguageService {
             "initialize" => Ok(Dispatch::Result(initialize_result())),
             "initialized" => Ok(Dispatch::None),
             "shutdown" => {
+                self.documents.clear();
+                self.retained_document_bytes = 0;
                 self.shutdown = true;
                 Ok(Dispatch::Result(Value::Null))
             }
             "exit" => {
+                self.documents.clear();
+                self.retained_document_bytes = 0;
                 self.exit = true;
                 Ok(Dispatch::None)
             }
@@ -128,17 +142,43 @@ impl LanguageService {
 
     fn did_open(&mut self, params: &Value) -> Result<Dispatch, ShellError> {
         let item = field(params, "textDocument")?;
-        let uri = string_field(item, "uri")?.to_owned();
+        let uri = string_field(item, "uri")?;
+        validate_byte_limit("document URI", uri.len(), MAX_URI_BYTES)?;
+        let language_id = string_field(item, "languageId")?;
+        validate_byte_limit(
+            "document language identifier",
+            language_id.len(),
+            MAX_LANGUAGE_ID_BYTES,
+        )?;
+        let text = string_field(item, "text")?;
+        validate_byte_limit("document text", text.len(), MAX_DOCUMENT_BYTES)?;
+        let old_bytes = self
+            .documents
+            .get(uri)
+            .map(|document| retained_bytes(uri, &document.language_id, &document.text))
+            .transpose()?
+            .unwrap_or(0);
+        if !self.documents.contains_key(uri) {
+            let observed =
+                self.documents.len().checked_add(1).ok_or_else(|| {
+                    count_overflow_error("open document count", MAX_OPEN_DOCUMENTS)
+                })?;
+            validate_count_limit("open document count", observed, MAX_OPEN_DOCUMENTS)?;
+        }
+        let candidate_bytes = retained_bytes(uri, language_id, text)?;
+        let next_retained_bytes =
+            retained_bytes_after_replace(self.retained_document_bytes, old_bytes, candidate_bytes)?;
         let document = Document {
-            language_id: string_field(item, "languageId")?.to_owned(),
+            language_id: language_id.to_owned(),
             version: item.get("version").and_then(Value::as_i64).unwrap_or(0),
-            text: string_field(item, "text")?.to_owned(),
+            text: text.to_owned(),
         };
-        let diagnostics = diagnostics(&uri, &document);
+        let diagnostics = diagnostics(uri, &document);
         let version = document.version;
-        self.documents.insert(uri.clone(), document);
+        self.documents.insert(uri.to_owned(), document);
+        self.retained_document_bytes = next_retained_bytes;
         Ok(Dispatch::Messages(vec![publish_diagnostics(
-            &uri,
+            uri,
             version,
             diagnostics,
         )]))
@@ -146,25 +186,43 @@ impl LanguageService {
 
     fn did_change(&mut self, params: &Value) -> Result<Dispatch, ShellError> {
         let item = field(params, "textDocument")?;
-        let uri = string_field(item, "uri")?.to_owned();
+        let uri = string_field(item, "uri")?;
+        validate_byte_limit("document URI", uri.len(), MAX_URI_BYTES)?;
         let version = item.get("version").and_then(Value::as_i64).unwrap_or(0);
-        let text = params
+        let changes = params
             .get("contentChanges")
             .and_then(Value::as_array)
-            .and_then(|changes| changes.last())
+            .ok_or_else(|| invalid_params("didChange requires a contentChanges array"))?;
+        if changes.is_empty() {
+            return Err(invalid_params(
+                "didChange requires one full contentChanges text value",
+            ));
+        }
+        validate_count_limit("content change count", changes.len(), MAX_CONTENT_CHANGES)?;
+        let text = changes
+            .last()
             .and_then(|change| change.get("text"))
             .and_then(Value::as_str)
-            .ok_or_else(|| invalid_params("didChange requires a full contentChanges text value"))?
-            .to_owned();
-        let document = self
+            .ok_or_else(|| invalid_params("didChange requires a full contentChanges text value"))?;
+        validate_byte_limit("document text", text.len(), MAX_DOCUMENT_BYTES)?;
+        let previous = self
             .documents
-            .get_mut(&uri)
+            .get(uri)
             .ok_or_else(|| invalid_params("didChange refers to a document that is not open"))?;
-        document.text = text;
-        document.version = version;
-        let diagnostics = diagnostics(&uri, document);
+        let old_bytes = retained_bytes(uri, &previous.language_id, &previous.text)?;
+        let candidate_bytes = retained_bytes(uri, &previous.language_id, text)?;
+        let next_retained_bytes =
+            retained_bytes_after_replace(self.retained_document_bytes, old_bytes, candidate_bytes)?;
+        let document = Document {
+            language_id: previous.language_id.clone(),
+            version,
+            text: text.to_owned(),
+        };
+        let diagnostics = diagnostics(uri, &document);
+        self.documents.insert(uri.to_owned(), document);
+        self.retained_document_bytes = next_retained_bytes;
         Ok(Dispatch::Messages(vec![publish_diagnostics(
-            &uri,
+            uri,
             version,
             diagnostics,
         )]))
@@ -172,7 +230,15 @@ impl LanguageService {
 
     fn did_close(&mut self, params: &Value) -> Result<Dispatch, ShellError> {
         let uri = document_uri(params)?;
-        self.documents.remove(uri);
+        if let Some(document) = self.documents.get(uri) {
+            let removed_bytes = retained_bytes(uri, &document.language_id, &document.text)?;
+            let next_retained_bytes = self
+                .retained_document_bytes
+                .checked_sub(removed_bytes)
+                .ok_or_else(retained_accounting_error)?;
+            self.documents.remove(uri);
+            self.retained_document_bytes = next_retained_bytes;
+        }
         Ok(Dispatch::Messages(vec![publish_diagnostics(
             uri,
             0,
@@ -244,6 +310,7 @@ impl LanguageService {
     }
 }
 
+#[derive(Debug)]
 enum Dispatch {
     Result(Value),
     Messages(Vec<Value>),
@@ -380,7 +447,7 @@ fn quirl_completions(catalog: &Catalog, text: &str, offset: usize, prefix: &str)
                 "insertText": command.path,
             }));
         }
-        if line.starts_with(&command.path) {
+        if command_starts_line(command, line) {
             for option in &command.options {
                 if let Some(name) = option.names.first() {
                     if prefix.is_empty() || name.to_ascii_lowercase().starts_with(&prefix) {
@@ -464,8 +531,13 @@ fn command_at<'a>(catalog: &'a Catalog, line: &str) -> Option<&'a CommandSpec> {
     catalog
         .commands
         .iter()
-        .filter(|command| line.trim_start().starts_with(&command.path))
+        .filter(|command| command_starts_line(command, line.trim_start()))
         .max_by_key(|command| command.path.len())
+}
+
+fn command_starts_line(command: &CommandSpec, line: &str) -> bool {
+    line.strip_prefix(&command.path)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 fn module_docs(catalog: &Catalog) -> String {
@@ -629,12 +701,85 @@ fn usize_field(value: &Value, name: &str) -> Result<usize, ShellError> {
 }
 
 fn document_uri(params: &Value) -> Result<&str, ShellError> {
-    string_field(field(params, "textDocument")?, "uri")
+    let uri = string_field(field(params, "textDocument")?, "uri")?;
+    validate_byte_limit("document URI", uri.len(), MAX_URI_BYTES)?;
+    Ok(uri)
 }
 
 fn invalid_params(message: &str) -> ShellError {
     ShellError::new(ErrorCode::InvalidArgument, message)
         .with_help("Send the standard LSP textDocument and position fields")
+}
+
+fn retained_bytes(uri: &str, language_id: &str, text: &str) -> Result<usize, ShellError> {
+    uri.len()
+        .checked_add(language_id.len())
+        .and_then(|bytes| bytes.checked_add(text.len()))
+        .ok_or_else(retained_accounting_error)
+}
+
+fn retained_bytes_after_replace(
+    retained_bytes: usize,
+    replaced_bytes: usize,
+    candidate_bytes: usize,
+) -> Result<usize, ShellError> {
+    let without_replaced = retained_bytes
+        .checked_sub(replaced_bytes)
+        .ok_or_else(retained_accounting_error)?;
+    let observed = without_replaced
+        .checked_add(candidate_bytes)
+        .ok_or_else(retained_accounting_error)?;
+    validate_byte_limit(
+        "aggregate retained document state",
+        observed,
+        MAX_RETAINED_DOCUMENT_BYTES,
+    )?;
+    Ok(observed)
+}
+
+fn validate_byte_limit(context: &str, observed: usize, limit: usize) -> Result<(), ShellError> {
+    if observed > limit {
+        return Err(resource_limit_error(context, "bytes", observed, limit));
+    }
+    Ok(())
+}
+
+fn validate_count_limit(context: &str, observed: usize, limit: usize) -> Result<(), ShellError> {
+    if observed > limit {
+        return Err(resource_limit_error(context, "count", observed, limit));
+    }
+    Ok(())
+}
+
+fn resource_limit_error(context: &str, unit: &str, observed: usize, limit: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{context} exceeds its configured limit"),
+    )
+    .with_context(format!(
+        "observed_{unit}: {observed}; limit_{unit}: {limit}"
+    ))
+    .with_help("Reduce the request size or close documents before retrying")
+}
+
+fn count_overflow_error(context: &str, limit: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{context} overflowed while enforcing its configured limit"),
+    )
+    .with_context(format!("observed_count: overflow; limit_count: {limit}"))
+    .with_help("Close documents before retrying")
+}
+
+fn retained_accounting_error() -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        "aggregate retained document accounting overflowed",
+    )
+    .with_context(format!(
+        "observed_bytes: overflow; limit_bytes: {MAX_RETAINED_DOCUMENT_BYTES}"
+    ))
+    .with_help("Restart the language-service connection")
 }
 
 fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
@@ -647,38 +792,115 @@ fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value 
 
 fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>, ShellError> {
     let mut content_length = None;
+    let mut header_bytes: usize = 0;
+    let mut header_count: usize = 0;
     loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line).map_err(io_error)?;
-        if read == 0 {
-            return if content_length.is_none() {
+        let Some(line) = read_header_line(reader, header_bytes)? else {
+            return if header_bytes == 0 {
                 Ok(None)
             } else {
                 Err(protocol_error(
                     "unexpected end of input while reading headers",
                 ))
             };
-        }
-        if line == "\r\n" || line == "\n" {
+        };
+        header_bytes = header_bytes.checked_add(line.len()).ok_or_else(|| {
+            resource_limit_error(
+                "language-service headers",
+                "bytes",
+                usize::MAX,
+                MAX_HEADER_BYTES,
+            )
+        })?;
+        validate_byte_limit("language-service headers", header_bytes, MAX_HEADER_BYTES)?;
+        if line == b"\r\n" || line == b"\n" {
             break;
         }
-        if let Some(value) = line
-            .strip_prefix("Content-Length:")
-            .or_else(|| line.strip_prefix("content-length:"))
-        {
-            content_length = Some(value.trim().parse::<usize>().map_err(|_| {
-                protocol_error("Content-Length must be a non-negative decimal integer")
-            })?);
+        header_count = header_count.checked_add(1).ok_or_else(|| {
+            count_overflow_error("language-service header count", MAX_HEADER_COUNT)
+        })?;
+        validate_count_limit(
+            "language-service header count",
+            header_count,
+            MAX_HEADER_COUNT,
+        )?;
+        let line = std::str::from_utf8(&line)
+            .map_err(|_| protocol_error("language-service headers must be valid UTF-8"))?;
+        let Some((name, value)) = line.trim_end_matches(['\r', '\n']).split_once(':') else {
+            return Err(protocol_error("language-service header is missing `:`"));
+        };
+        if name.eq_ignore_ascii_case("Content-Length") {
+            if content_length.is_some() {
+                return Err(protocol_error("duplicate Content-Length header"));
+            }
+            content_length = Some(parse_content_length(value.trim())?);
         }
     }
     let length = content_length.ok_or_else(|| protocol_error("missing Content-Length header"))?;
-    if length > MAX_MESSAGE_BYTES {
-        return Err(protocol_error("language-service message exceeds 4 MiB"));
-    }
+    validate_byte_limit("language-service message", length, MAX_MESSAGE_BYTES)?;
     let mut body = vec![0; length];
-    reader.read_exact(&mut body).map_err(io_error)?;
+    let mut received = 0;
+    while received < length {
+        match reader.read(&mut body[received..]) {
+            Ok(0) => {
+                return Err(protocol_error(
+                    "unexpected end of input while reading the language-service message body",
+                )
+                .with_context(format!(
+                    "expected_bytes: {length}; received_bytes: {received}"
+                )));
+            }
+            Ok(bytes) => received = received.saturating_add(bytes),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(io_error(error)),
+        }
+    }
     serde_json::from_slice(&body).map(Some).map_err(|error| {
         protocol_error("language-service message is not valid JSON").with_context(error.to_string())
+    })
+}
+
+fn read_header_line<R: BufRead>(
+    reader: &mut R,
+    bytes_already_read: usize,
+) -> Result<Option<Vec<u8>>, ShellError> {
+    let remaining = MAX_HEADER_BYTES.saturating_sub(bytes_already_read);
+    let mut line = Vec::new();
+    let read_limit = remaining.saturating_add(1);
+    let read = reader
+        .take(read_limit as u64)
+        .read_until(b'\n', &mut line)
+        .map_err(io_error)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if line.len() > remaining {
+        return Err(resource_limit_error(
+            "language-service headers",
+            "bytes",
+            bytes_already_read.saturating_add(line.len()),
+            MAX_HEADER_BYTES,
+        ));
+    }
+    Ok(Some(line))
+}
+
+fn parse_content_length(value: &str) -> Result<usize, ShellError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(protocol_error(
+            "Content-Length must be a non-negative decimal integer",
+        ));
+    }
+    value.parse::<usize>().map_err(|_| {
+        ShellError::new(
+            ErrorCode::ResourceLimit,
+            "language-service message length exceeds the platform limit",
+        )
+        .with_context(format!(
+            "observed_bytes: greater than {}; limit_bytes: {MAX_MESSAGE_BYTES}",
+            usize::MAX
+        ))
+        .with_help("Keep each language-service message at or below 4 MiB")
     })
 }
 
@@ -722,6 +944,28 @@ mod tests {
         service
             .handle(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .remove(0)
+    }
+
+    fn open_params(uri: &str, language_id: &str, version: i64, text: &str) -> Value {
+        json!({"textDocument": {
+            "uri": uri, "languageId": language_id, "version": version, "text": text
+        }})
+    }
+
+    fn change_params(uri: &str, version: i64, changes: Vec<Value>) -> Value {
+        json!({
+            "textDocument": {"uri": uri, "version": version},
+            "contentChanges": changes,
+        })
+    }
+
+    fn assert_accounting(service: &LanguageService) {
+        let expected = service
+            .documents
+            .iter()
+            .map(|(uri, document)| uri.len() + document.language_id.len() + document.text.len())
+            .sum::<usize>();
+        assert_eq!(service.retained_document_bytes, expected);
     }
 
     #[test]
@@ -889,5 +1133,242 @@ mod tests {
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.starts_with("Content-Length:"));
         assert!(rendered.contains("completionProvider"));
+    }
+
+    #[test]
+    fn duplicate_open_replaces_atomically_and_failed_replacement_preserves_state() {
+        let mut service = LanguageService::default();
+        let uri = "file:///replace.qrl";
+        service
+            .did_open(&open_params(uri, "quirl", 1, "echo old"))
+            .unwrap();
+        let before_bytes = service.retained_document_bytes;
+
+        service
+            .did_open(&open_params(uri, "quirl", 2, "echo replacement"))
+            .unwrap();
+        assert_eq!(service.documents.len(), 1);
+        assert_eq!(service.documents[uri].version, 2);
+        assert!(service.retained_document_bytes > before_bytes);
+        assert_accounting(&service);
+
+        let replacement_bytes = service.retained_document_bytes;
+        let oversized = "x".repeat(MAX_DOCUMENT_BYTES + 1);
+        let error = service
+            .did_open(&open_params(uri, "quirl", 3, &oversized))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_eq!(service.documents[uri].version, 2);
+        assert_eq!(service.documents[uri].text, "echo replacement");
+        assert_eq!(service.retained_document_bytes, replacement_bytes);
+        assert_accounting(&service);
+    }
+
+    #[test]
+    fn change_limits_are_atomic_and_duplicate_changes_are_rejected() {
+        let mut service = LanguageService::default();
+        let uri = "file:///change.qrl";
+        service
+            .did_open(&open_params(uri, "quirl", 1, "echo old"))
+            .unwrap();
+        let before_bytes = service.retained_document_bytes;
+
+        let count_error = service
+            .did_change(&change_params(
+                uri,
+                2,
+                vec![json!({"text": "echo one"}), json!({"text": "echo two"})],
+            ))
+            .unwrap_err();
+        assert_eq!(count_error.code, ErrorCode::ResourceLimit);
+        assert_eq!(service.documents[uri].version, 1);
+        assert_eq!(service.retained_document_bytes, before_bytes);
+
+        let oversized = "x".repeat(MAX_DOCUMENT_BYTES + 1);
+        let size_error = service
+            .did_change(&change_params(uri, 3, vec![json!({"text": oversized})]))
+            .unwrap_err();
+        assert_eq!(size_error.code, ErrorCode::ResourceLimit);
+        assert_eq!(service.documents[uri].version, 1);
+        assert_eq!(service.documents[uri].text, "echo old");
+
+        service
+            .did_change(&change_params(uri, 4, vec![json!({"text": "echo new"})]))
+            .unwrap();
+        assert_eq!(service.documents[uri].version, 4);
+        assert_eq!(service.documents[uri].text, "echo new");
+        assert_accounting(&service);
+    }
+
+    #[test]
+    fn open_document_count_close_and_reopen_account_exactly() {
+        let mut service = LanguageService::default();
+        for index in 0..MAX_OPEN_DOCUMENTS {
+            let uri = format!("file:///count-{index}.qrl");
+            service
+                .did_open(&open_params(&uri, "quirl", 1, ""))
+                .unwrap();
+        }
+        assert_eq!(service.documents.len(), MAX_OPEN_DOCUMENTS);
+        assert_accounting(&service);
+
+        let error = service
+            .did_open(&open_params("file:///overflow.qrl", "quirl", 1, ""))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_eq!(service.documents.len(), MAX_OPEN_DOCUMENTS);
+
+        let closed_uri = "file:///count-0.qrl";
+        service
+            .did_close(&json!({"textDocument": {"uri": closed_uri}}))
+            .unwrap();
+        service
+            .did_close(&json!({"textDocument": {"uri": closed_uri}}))
+            .unwrap();
+        service
+            .did_open(&open_params("file:///reopened.qrl", "quirl", 1, ""))
+            .unwrap();
+        assert_eq!(service.documents.len(), MAX_OPEN_DOCUMENTS);
+        assert_accounting(&service);
+    }
+
+    #[test]
+    fn repeated_near_limit_documents_hit_the_aggregate_bound() {
+        let mut service = LanguageService::default();
+        let text = " ".repeat(MAX_DOCUMENT_BYTES);
+        let mut rejected = false;
+        for index in 0..=MAX_RETAINED_DOCUMENT_BYTES / MAX_DOCUMENT_BYTES {
+            let uri = format!("file:///aggregate-{index}.qrl");
+            match service.did_open(&open_params(&uri, "quirl", 1, &text)) {
+                Ok(_) => assert!(!rejected),
+                Err(error) => {
+                    assert_eq!(error.code, ErrorCode::ResourceLimit);
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(rejected);
+        assert!(service.retained_document_bytes <= MAX_RETAINED_DOCUMENT_BYTES);
+        assert_accounting(&service);
+    }
+
+    #[test]
+    fn uri_limits_use_utf8_bytes_and_apply_to_close() {
+        let mut service = LanguageService::default();
+        let exact_uri = "u".repeat(MAX_URI_BYTES);
+        service
+            .did_open(&open_params(&exact_uri, "quirl", 1, ""))
+            .unwrap();
+        let before_bytes = service.retained_document_bytes;
+        let hostile_uri = "é".repeat(MAX_URI_BYTES / 2 + 1);
+        let error = service
+            .did_close(&json!({"textDocument": {"uri": hostile_uri}}))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_eq!(service.retained_document_bytes, before_bytes);
+        assert!(service.documents.contains_key(&exact_uri));
+    }
+
+    #[test]
+    fn accounting_overflow_and_shutdown_fail_closed_and_release_state() {
+        let mut service = LanguageService {
+            retained_document_bytes: usize::MAX,
+            ..LanguageService::default()
+        };
+        let error = service
+            .did_open(&open_params("file:///overflow.qrl", "quirl", 1, "x"))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(service.documents.is_empty());
+
+        service.retained_document_bytes = 0;
+        service
+            .did_open(&open_params("file:///shutdown.qrl", "quirl", 1, "echo ok"))
+            .unwrap();
+        service.dispatch("shutdown", json!({})).unwrap();
+        assert!(service.documents.is_empty());
+        assert_eq!(service.retained_document_bytes, 0);
+        assert_accounting(&service);
+    }
+
+    #[test]
+    fn dispatch_rejects_updates_after_shutdown_without_retaining_state() {
+        let mut service = LanguageService::default();
+        service.dispatch("shutdown", json!({})).unwrap();
+        let error = service
+            .dispatch(
+                "textDocument/didOpen",
+                open_params("file:///late.qrl", "quirl", 1, ""),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(service.documents.is_empty());
+        assert_eq!(service.retained_document_bytes, 0);
+    }
+
+    #[test]
+    fn framing_bounds_headers_lengths_and_partial_bodies() {
+        let oversized_header = vec![b'x'; MAX_HEADER_BYTES + 1];
+        let error = read_message(&mut BufReader::new(Cursor::new(oversized_header))).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+
+        let mut many_headers = Vec::new();
+        for _ in 0..=MAX_HEADER_COUNT {
+            many_headers.extend_from_slice(b"X: y\r\n");
+        }
+        many_headers.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+        let count_error = read_message(&mut BufReader::new(Cursor::new(many_headers))).unwrap_err();
+        assert_eq!(count_error.code, ErrorCode::ResourceLimit);
+
+        let oversized_body = format!("Content-Length: {}\r\n\r\n", MAX_MESSAGE_BYTES + 1);
+        let body_error =
+            read_message(&mut BufReader::new(Cursor::new(oversized_body))).unwrap_err();
+        assert_eq!(body_error.code, ErrorCode::ResourceLimit);
+
+        let partial = b"Content-Length: 5\r\n\r\n{}";
+        let partial_error = read_message(&mut BufReader::new(Cursor::new(partial))).unwrap_err();
+        assert_eq!(partial_error.code, ErrorCode::Validation);
+        assert!(partial_error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("received_bytes")));
+
+        let partial_headers = b"X-Test: incomplete\r\n";
+        let header_error =
+            read_message(&mut BufReader::new(Cursor::new(partial_headers))).unwrap_err();
+        assert_eq!(header_error.code, ErrorCode::Validation);
+    }
+
+    #[test]
+    fn duplicate_and_overflowing_content_lengths_fail_closed() {
+        let duplicate = b"Content-Length: 0\r\nContent-Length: 0\r\n\r\n";
+        let duplicate_error =
+            read_message(&mut BufReader::new(Cursor::new(duplicate))).unwrap_err();
+        assert_eq!(duplicate_error.code, ErrorCode::Validation);
+
+        let overflow = format!("Content-Length: {}0\r\n\r\n", usize::MAX);
+        let overflow_error = read_message(&mut BufReader::new(Cursor::new(overflow))).unwrap_err();
+        assert_eq!(overflow_error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn command_recognition_requires_an_exact_token_boundary() {
+        let catalog = Catalog::builtin();
+        assert_eq!(
+            command_at(&catalog, "ls").map(|command| command.path.as_str()),
+            Some("ls")
+        );
+        assert_eq!(
+            command_at(&catalog, "  ls --format json").map(|command| command.path.as_str()),
+            Some("ls")
+        );
+        for line in ["lsfoo", "ls-foo", "ls.foo", "quirl checker"] {
+            assert_ne!(
+                command_at(&catalog, line).map(|command| command.path.as_str()),
+                Some("ls")
+            );
+        }
     }
 }
