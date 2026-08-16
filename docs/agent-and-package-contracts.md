@@ -91,8 +91,9 @@ paths without parent traversal. Capability requests must be sorted, unique, and
 present in `quirl agent manifest`. Contributed command names must match exactly
 one `public_commands` record. Public command metadata must include a summary,
 detailed contract, typed input/output and arguments, examples, explicit
-non-empty effects, and documented numeric error codes. Phase 2 rejects panel
-and indexer contributions because their execution contracts arrive in Phase 3.
+non-empty effects, and documented numeric error codes. Panel and indexer
+contributions use the separately versioned Phase 3 extension contracts and
+their explicit capability gates; they are not inferred from command metadata.
 
 ```sh
 quirl package manifest --format json
@@ -110,5 +111,5 @@ Package file lists contain normalized package-relative paths, so invoking the
 build with an absolute or relative manifest path produces the same build
 record. The record includes the resolved Quirl version and installed host-API
 hash.
-`package publish` is deliberately limited to `--dry-run` in Phase 2: it emits a
+`package publish` is deliberately limited to `--dry-run` in v0.1: it emits a
 deterministic plan and performs no network operation.

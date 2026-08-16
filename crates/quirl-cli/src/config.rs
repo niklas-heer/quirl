@@ -31,11 +31,17 @@ pub enum ConfigCommand {
         port: u16,
     },
     /// Print one evaluated, schema-backed configuration value.
-    Get { file: PathBuf, key: String },
+    Get {
+        file: PathBuf,
+        /// Recognized field such as editor.keymap or prompt.symbols.
+        key: String,
+    },
     /// Patch one recognized literal, validate the candidate, and retain a .bak.
     Set {
         file: PathBuf,
+        /// Recognized literal field; use prompt.symbols for prompt glyphs.
         key: String,
+        /// Typed value; prompt symbols accept auto, plain, unicode, or nerd_font.
         value: String,
     },
     /// Show the current schema and values as an accessible line-oriented view.
@@ -167,12 +173,16 @@ fn tui(file: &Path) -> Result<i32, ShellError> {
     println!("read-only line view; use `quirl config set` to change a literal value\n");
     println!("[editor]");
     println!(
-        "editor.keymap = {}  (helix | emacs | vim)",
+        "editor.keymap = {}  (emacs | vim | helix [experimental])",
         escape_terminal_controls(&config.editor.keymap)
     );
     println!(
         "editor.semantic_hints = {}  (true | false)",
         config.editor.semantic_hints
+    );
+    println!(
+        "editor.banner = {}  (full | compact | none)",
+        escape_terminal_controls(&config.editor.banner)
     );
     println!("\n[picker]");
     println!(
@@ -182,12 +192,38 @@ fn tui(file: &Path) -> Result<i32, ShellError> {
     println!("picker.preview = {}  (true | false)", config.picker.preview);
     println!("\n[prompt]");
     println!(
+        "prompt.symbols = {}  (auto | plain | unicode | nerd_font)",
+        escape_terminal_controls(&config.prompt.symbols)
+    );
+    println!(
         "prompt.left = {}",
         escape_terminal_controls(&ConfigField::PromptLeft.value(&config))
     );
     println!(
         "prompt.right = {}",
         escape_terminal_controls(&ConfigField::PromptRight.value(&config))
+    );
+    println!(
+        "prompt.transient = {}  (true | false)",
+        config.prompt.transient
+    );
+    println!("\n[ui]");
+    println!(
+        "ui.surface = {}  (auto | rich | simple)",
+        escape_terminal_controls(&config.ui.surface)
+    );
+    println!(
+        "ui.statusline.hints = {}  (true | false)",
+        config.ui.statusline.hints
+    );
+    println!("\n[completion]");
+    println!(
+        "completion.auto = {}  (true | false)",
+        config.completion.auto
+    );
+    println!(
+        "completion.min_chars = {}  (0..4096)",
+        config.completion.min_chars
     );
     println!("\nOpen the synchronized form with `quirl config web <file>`.");
     Ok(0)
@@ -438,7 +474,7 @@ fn migration_candidate(source: &str) -> Result<(Option<u32>, String), ShellError
         let insert_at = tokens[config_open].end;
         let mut candidate = String::with_capacity(source.len() + 24);
         candidate.push_str(&source[..insert_at]);
-        candidate.push_str("\n  schema_version = 1,");
+        candidate.push_str(&format!("\n  schema_version = {CONFIG_SCHEMA_VERSION},"));
         candidate.push_str(&source[insert_at..]);
         return Ok((None, candidate));
     };
@@ -479,7 +515,14 @@ fn migration_candidate(source: &str) -> Result<(Option<u32>, String), ShellError
             "Use a Quirl version that supports this configuration before requesting a migration preview",
         ));
     }
-    Ok((Some(version), source.to_owned()))
+    if version == CONFIG_SCHEMA_VERSION {
+        return Ok((Some(version), source.to_owned()));
+    }
+    let mut candidate = String::with_capacity(source.len());
+    candidate.push_str(&source[..token.start]);
+    candidate.push_str(&CONFIG_SCHEMA_VERSION.to_string());
+    candidate.push_str(&source[token.start + digits..]);
+    Ok((Some(version), candidate))
 }
 
 fn patchable_fields(source: &str, config: &QuirlConfig) -> (Vec<&'static str>, Vec<&'static str>) {
@@ -780,6 +823,12 @@ fn apply_web_form(
     )?;
     collect_web_change(
         &mut replacements,
+        ConfigField::EditorBanner,
+        required_form_value(form, "editor_banner")?,
+        &session.config.editor.banner,
+    )?;
+    collect_web_change(
+        &mut replacements,
         ConfigField::PickerLayout,
         required_form_value(form, "picker_layout")?,
         &session.config.picker.layout,
@@ -790,6 +839,12 @@ fn apply_web_form(
         required_form_value(form, "picker_preview")?,
         &session.config.picker.preview.to_string(),
     )?;
+    collect_web_change(
+        &mut replacements,
+        ConfigField::PromptSymbols,
+        required_form_value(form, "prompt_symbols")?,
+        &session.config.prompt.symbols,
+    )?;
     let prompt_left = parse_prompt_lines(required_form_value(form, "prompt_left")?)?;
     let prompt_right = parse_prompt_lines(required_form_value(form, "prompt_right")?)?;
     if prompt_left != session.config.prompt.left {
@@ -798,14 +853,43 @@ fn apply_web_form(
     if prompt_right != session.config.prompt.right {
         replacements.push((ConfigField::PromptRight, lua_string_array(&prompt_right)));
     }
+    collect_web_change(
+        &mut replacements,
+        ConfigField::PromptTransient,
+        required_form_value(form, "prompt_transient")?,
+        &session.config.prompt.transient.to_string(),
+    )?;
+    collect_web_change(
+        &mut replacements,
+        ConfigField::UiSurface,
+        required_form_value(form, "ui_surface")?,
+        &session.config.ui.surface,
+    )?;
+    collect_web_change(
+        &mut replacements,
+        ConfigField::UiStatuslineHints,
+        required_form_value(form, "ui_statusline_hints")?,
+        &session.config.ui.statusline.hints.to_string(),
+    )?;
+    collect_web_change(
+        &mut replacements,
+        ConfigField::CompletionAuto,
+        required_form_value(form, "completion_auto")?,
+        &session.config.completion.auto.to_string(),
+    )?;
+    collect_web_change(
+        &mut replacements,
+        ConfigField::CompletionMinChars,
+        required_form_value(form, "completion_min_chars")?,
+        &session.config.completion.min_chars.to_string(),
+    )?;
     if replacements.is_empty() {
         return Ok("No changes to save.".to_owned());
     }
     // Three-way merge: compare the form's base value with the current evaluated
     // configuration for every field the user changed. Non-overlapping source
     // edits are preserved; edits to the same field become a visible conflict.
-    let current_source =
-        fs::read_to_string(file).map_err(|error| file_error("re-read", file, error))?;
+    let current_source = read_config_source(file)?;
     let current_config = if current_source == session.source {
         session.config.clone()
     } else {
@@ -932,9 +1016,11 @@ fn render_form(session: &WebSession, notice: Option<&str>) -> String {
 <body><main><h1>Quirl configuration</h1><p><code>config.lua</code> is the source of truth. Saves validate Lua, retain a <code>.bak</code>, and refuse concurrent edits.</p>{notice}
 <form method=\"post\" action=\"/\"><input type=\"hidden\" name=\"csrf\" value=\"{token}\"><input type=\"hidden\" name=\"revision\" value=\"{revision}\">
 <fieldset><legend>Schema</legend><p>Version <output>{schema}</output> (managed by Quirl; not edited by this form).</p></fieldset>
-<fieldset><legend>Editor</legend><label for=\"editor-keymap\">Keymap <select id=\"editor-keymap\" name=\"editor_keymap\"><option value=\"helix\"{key_helix}>helix</option><option value=\"emacs\"{key_emacs}>emacs</option><option value=\"vim\"{key_vim}>vim</option></select></label><label for=\"editor-semantic-hints\">Semantic hints <select id=\"editor-semantic-hints\" name=\"editor_semantic_hints\"><option value=\"true\"{semantic_true}>true</option><option value=\"false\"{semantic_false}>false</option></select></label></fieldset>
+<fieldset><legend>Editor</legend><label for=\"editor-keymap\">Keymap <select id=\"editor-keymap\" name=\"editor_keymap\"><option value=\"emacs\"{key_emacs}>emacs — complete default</option><option value=\"vim\"{key_vim}>vim</option><option value=\"helix\"{key_helix}>helix — experimental</option></select></label><label for=\"editor-semantic-hints\">Semantic hints <select id=\"editor-semantic-hints\" name=\"editor_semantic_hints\"><option value=\"true\"{semantic_true}>true</option><option value=\"false\"{semantic_false}>false</option></select></label><label for=\"editor-banner\">Welcome <select id=\"editor-banner\" name=\"editor_banner\"><option value=\"full\"{banner_full}>full</option><option value=\"compact\"{banner_compact}>compact</option><option value=\"none\"{banner_none}>none</option></select></label></fieldset>
 <fieldset><legend>Picker</legend><label for=\"picker-layout\">Layout <select id=\"picker-layout\" name=\"picker_layout\"><option value=\"adaptive\"{layout_adaptive}>adaptive</option><option value=\"bottom\"{layout_bottom}>bottom</option><option value=\"full\"{layout_full}>full</option></select></label><label for=\"picker-preview\">Preview <select id=\"picker-preview\" name=\"picker_preview\"><option value=\"true\"{preview_true}>true</option><option value=\"false\"{preview_false}>false</option></select></label></fieldset>
-<fieldset><legend>Prompt</legend><p>One segment name per line.</p><label for=\"prompt-left\">Left <textarea id=\"prompt-left\" name=\"prompt_left\">{prompt_left}</textarea></label><label for=\"prompt-right\">Right <textarea id=\"prompt-right\" name=\"prompt_right\">{prompt_right}</textarea></label></fieldset>
+<fieldset><legend>Prompt</legend><label for=\"prompt-symbols\">Symbols <select id=\"prompt-symbols\" name=\"prompt_symbols\"><option value=\"auto\"{symbols_auto}>auto — safe Unicode</option><option value=\"plain\"{symbols_plain}>plain — ASCII only</option><option value=\"unicode\"{symbols_unicode}>unicode</option><option value=\"nerd_font\"{symbols_nerd_font}>Nerd Font / Powerline</option></select></label><p><strong>Nerd Font</strong> is an explicit opt-in and requires a patched terminal font. Auto never assumes one. Segment lists use one name per line.</p><label for=\"prompt-left\">Left <textarea id=\"prompt-left\" name=\"prompt_left\">{prompt_left}</textarea></label><label for=\"prompt-right\">Right <textarea id=\"prompt-right\" name=\"prompt_right\">{prompt_right}</textarea></label><label for=\"prompt-transient\">Transient prompt <select id=\"prompt-transient\" name=\"prompt_transient\"><option value=\"true\"{transient_true}>true</option><option value=\"false\"{transient_false}>false</option></select></label></fieldset>
+<fieldset><legend>Interactive surface</legend><label for=\"ui-surface\">Surface <select id=\"ui-surface\" name=\"ui_surface\"><option value=\"auto\"{surface_auto}>auto</option><option value=\"rich\"{surface_rich}>rich</option><option value=\"simple\"{surface_simple}>simple</option></select></label><label for=\"ui-statusline-hints\">Status-line hints <select id=\"ui-statusline-hints\" name=\"ui_statusline_hints\"><option value=\"true\"{statusline_true}>true</option><option value=\"false\"{statusline_false}>false</option></select></label></fieldset>
+<fieldset><legend>Completion</legend><label for=\"completion-auto\">Open automatically <select id=\"completion-auto\" name=\"completion_auto\"><option value=\"true\"{completion_auto_true}>true</option><option value=\"false\"{completion_auto_false}>false</option></select></label><label for=\"completion-min-chars\">Minimum characters <input id=\"completion-min-chars\" name=\"completion_min_chars\" type=\"number\" min=\"0\" max=\"4096\" value=\"{completion_min_chars}\"></label></fieldset>
 <button type=\"submit\">Save configuration</button></form></main></body></html>",
         token = html_escape(&session.token),
         revision = html_escape(&source_revision(&session.source)),
@@ -944,13 +1030,30 @@ fn render_form(session: &WebSession, notice: Option<&str>) -> String {
         key_vim = selected(&config.editor.keymap, "vim"),
         semantic_true = selected(&config.editor.semantic_hints.to_string(), "true"),
         semantic_false = selected(&config.editor.semantic_hints.to_string(), "false"),
+        banner_full = selected(&config.editor.banner, "full"),
+        banner_compact = selected(&config.editor.banner, "compact"),
+        banner_none = selected(&config.editor.banner, "none"),
         layout_adaptive = selected(&config.picker.layout, "adaptive"),
         layout_bottom = selected(&config.picker.layout, "bottom"),
         layout_full = selected(&config.picker.layout, "full"),
         preview_true = selected(&config.picker.preview.to_string(), "true"),
         preview_false = selected(&config.picker.preview.to_string(), "false"),
+        symbols_auto = selected(&config.prompt.symbols, "auto"),
+        symbols_plain = selected(&config.prompt.symbols, "plain"),
+        symbols_unicode = selected(&config.prompt.symbols, "unicode"),
+        symbols_nerd_font = selected(&config.prompt.symbols, "nerd_font"),
         prompt_left = html_escape(&config.prompt.left.join("\n")),
         prompt_right = html_escape(&config.prompt.right.join("\n")),
+        transient_true = selected(&config.prompt.transient.to_string(), "true"),
+        transient_false = selected(&config.prompt.transient.to_string(), "false"),
+        surface_auto = selected(&config.ui.surface, "auto"),
+        surface_rich = selected(&config.ui.surface, "rich"),
+        surface_simple = selected(&config.ui.surface, "simple"),
+        statusline_true = selected(&config.ui.statusline.hints.to_string(), "true"),
+        statusline_false = selected(&config.ui.statusline.hints.to_string(), "false"),
+        completion_auto_true = selected(&config.completion.auto.to_string(), "true"),
+        completion_auto_false = selected(&config.completion.auto.to_string(), "false"),
+        completion_min_chars = config.completion.min_chars,
     )
 }
 
@@ -1281,7 +1384,7 @@ fn read_config_source(file: &Path) -> Result<String, ShellError> {
 fn set(file: &Path, key: &str, value: &str) -> Result<i32, ShellError> {
     let field = ConfigField::parse(key)?;
     let replacement = field.lua_literal(value)?;
-    let source = fs::read_to_string(file).map_err(|error| file_error("read", file, error))?;
+    let source = read_config_source(file)?;
     let candidate = patch_literals(&source, &[(field, replacement)])?;
     let temporary = temporary_path(file)?;
     let result = install_candidate(file, &temporary, &candidate, &source);
@@ -1326,8 +1429,7 @@ fn install_candidate(
         .load_config_file(temporary)
         .map_err(CandidateInstallFailure::from)?;
 
-    let current = fs::read_to_string(file)
-        .map_err(|error| CandidateInstallFailure::from(file_error("re-read", file, error)))?;
+    let current = read_config_source(file).map_err(CandidateInstallFailure::from)?;
     if current != expected_source {
         return Err(CandidateInstallFailure::Conflict(conflict_error()));
     }
@@ -1338,12 +1440,10 @@ fn install_candidate(
         })?;
     }
     let backup = backup_path(file);
-    fs::copy(file, &backup)
-        .map_err(|error| CandidateInstallFailure::from(file_error("back up", file, error)))?;
+    install_backup(file, &backup, expected_source)?;
     // Copying the backup can be slow on networked filesystems. Re-check after
     // it so an edit that raced the transaction is reported instead of replaced.
-    let current = fs::read_to_string(file)
-        .map_err(|error| CandidateInstallFailure::from(file_error("re-read", file, error)))?;
+    let current = read_config_source(file).map_err(CandidateInstallFailure::from)?;
     if current != expected_source {
         return Err(CandidateInstallFailure::Conflict(conflict_error()));
     }
@@ -1354,6 +1454,72 @@ fn install_candidate(
     })?;
     sync_parent(file).map_err(CandidateInstallFailure::from)?;
     Ok(())
+}
+
+/// Install the backup through a fresh sibling and an atomic rename. Replacing
+/// the directory entry avoids following a pre-existing `.bak` symlink into an
+/// unrelated user file.
+fn install_backup(
+    source_file: &Path,
+    backup: &Path,
+    source: &str,
+) -> Result<(), CandidateInstallFailure> {
+    let temporary = temporary_path(backup).map_err(CandidateInstallFailure::from)?;
+    let install = (|| -> Result<(), CandidateInstallFailure> {
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| {
+                CandidateInstallFailure::from(file_error(
+                    "create backup candidate for",
+                    backup,
+                    error,
+                ))
+            })?;
+        output
+            .write_all(source.as_bytes())
+            .and_then(|()| output.sync_all())
+            .map_err(|error| {
+                CandidateInstallFailure::from(file_error("write backup for", backup, error))
+            })?;
+        if let Ok(metadata) = fs::metadata(source_file) {
+            fs::set_permissions(&temporary, metadata.permissions()).map_err(|error| {
+                CandidateInstallFailure::from(file_error(
+                    "preserve backup permissions for",
+                    backup,
+                    error,
+                ))
+            })?;
+        }
+        replace_backup_candidate(&temporary, backup).map_err(CandidateInstallFailure::from)?;
+        sync_parent(backup).map_err(CandidateInstallFailure::from)
+    })();
+    if install.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    install
+}
+
+#[cfg(unix)]
+fn replace_backup_candidate(temporary: &Path, backup: &Path) -> Result<(), ShellError> {
+    // POSIX rename replaces the directory entry itself, including a symlink,
+    // without following its target.
+    fs::rename(temporary, backup).map_err(|error| file_error("replace backup", backup, error))
+}
+
+#[cfg(not(unix))]
+fn replace_backup_candidate(temporary: &Path, backup: &Path) -> Result<(), ShellError> {
+    // Windows rename does not replace an existing file. Removing a symlink
+    // removes the link itself; a concurrent recreation makes rename fail
+    // closed instead of following the new entry.
+    match fs::symlink_metadata(backup) {
+        Ok(_) => fs::remove_file(backup)
+            .map_err(|error| file_error("remove prior backup", backup, error))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(file_error("inspect prior backup", backup, error)),
+    }
+    fs::rename(temporary, backup).map_err(|error| file_error("replace backup", backup, error))
 }
 
 fn conflict_error() -> ShellError {
@@ -1417,30 +1583,51 @@ fn temporary_path(file: &Path) -> Result<PathBuf, ShellError> {
 enum ConfigField {
     EditorKeymap,
     EditorSemanticHints,
+    EditorBanner,
     PickerLayout,
     PickerPreview,
+    PromptSymbols,
     PromptLeft,
     PromptRight,
+    PromptTransient,
+    UiSurface,
+    UiStatuslineHints,
+    CompletionAuto,
+    CompletionMinChars,
 }
 
 impl ConfigField {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 13] = [
         Self::EditorKeymap,
         Self::EditorSemanticHints,
+        Self::EditorBanner,
         Self::PickerLayout,
         Self::PickerPreview,
+        Self::PromptSymbols,
         Self::PromptLeft,
         Self::PromptRight,
+        Self::PromptTransient,
+        Self::UiSurface,
+        Self::UiStatuslineHints,
+        Self::CompletionAuto,
+        Self::CompletionMinChars,
     ];
 
     const fn key(self) -> &'static str {
         match self {
             Self::EditorKeymap => "editor.keymap",
             Self::EditorSemanticHints => "editor.semantic_hints",
+            Self::EditorBanner => "editor.banner",
             Self::PickerLayout => "picker.layout",
             Self::PickerPreview => "picker.preview",
+            Self::PromptSymbols => "prompt.symbols",
             Self::PromptLeft => "prompt.left",
             Self::PromptRight => "prompt.right",
+            Self::PromptTransient => "prompt.transient",
+            Self::UiSurface => "ui.surface",
+            Self::UiStatuslineHints => "ui.statusline.hints",
+            Self::CompletionAuto => "completion.auto",
+            Self::CompletionMinChars => "completion.min_chars",
         }
     }
 
@@ -1448,10 +1635,17 @@ impl ConfigField {
         match key {
             "editor.keymap" => Ok(Self::EditorKeymap),
             "editor.semantic_hints" => Ok(Self::EditorSemanticHints),
+            "editor.banner" => Ok(Self::EditorBanner),
             "picker.layout" => Ok(Self::PickerLayout),
             "picker.preview" => Ok(Self::PickerPreview),
+            "prompt.symbols" => Ok(Self::PromptSymbols),
             "prompt.left" => Ok(Self::PromptLeft),
             "prompt.right" => Ok(Self::PromptRight),
+            "prompt.transient" => Ok(Self::PromptTransient),
+            "ui.surface" => Ok(Self::UiSurface),
+            "ui.statusline.hints" => Ok(Self::UiStatuslineHints),
+            "completion.auto" => Ok(Self::CompletionAuto),
+            "completion.min_chars" => Ok(Self::CompletionMinChars),
             _ => Err(ShellError::new(
                 ErrorCode::InvalidArgument,
                 format!("`{key}` is not an editable literal configuration field"),
@@ -1460,31 +1654,55 @@ impl ConfigField {
         }
     }
 
-    const KEYS: [&'static str; 6] = [
+    const KEYS: [&'static str; 13] = [
         "editor.keymap",
         "editor.semantic_hints",
+        "editor.banner",
         "picker.layout",
         "picker.preview",
+        "prompt.symbols",
         "prompt.left",
         "prompt.right",
+        "prompt.transient",
+        "ui.surface",
+        "ui.statusline.hints",
+        "completion.auto",
+        "completion.min_chars",
     ];
 
     const fn parts(self) -> (&'static str, &'static str) {
         match self {
             Self::EditorKeymap => ("editor", "keymap"),
             Self::EditorSemanticHints => ("editor", "semantic_hints"),
+            Self::EditorBanner => ("editor", "banner"),
             Self::PickerLayout => ("picker", "layout"),
             Self::PickerPreview => ("picker", "preview"),
+            Self::PromptSymbols => ("prompt", "symbols"),
             Self::PromptLeft => ("prompt", "left"),
             Self::PromptRight => ("prompt", "right"),
+            Self::PromptTransient => ("prompt", "transient"),
+            Self::UiSurface => ("ui", "surface"),
+            Self::UiStatuslineHints => ("ui.statusline", "hints"),
+            Self::CompletionAuto => ("completion", "auto"),
+            Self::CompletionMinChars => ("completion", "min_chars"),
         }
     }
 
     fn lua_literal(self, value: &str) -> Result<String, ShellError> {
         let valid = match self {
             Self::EditorKeymap => matches!(value, "helix" | "emacs" | "vim"),
+            Self::EditorBanner => matches!(value, "full" | "compact" | "none"),
             Self::PickerLayout => matches!(value, "adaptive" | "bottom" | "full"),
-            Self::EditorSemanticHints | Self::PickerPreview => matches!(value, "true" | "false"),
+            Self::PromptSymbols => {
+                matches!(value, "auto" | "plain" | "unicode" | "nerd_font")
+            }
+            Self::UiSurface => matches!(value, "auto" | "rich" | "simple"),
+            Self::CompletionMinChars => value.parse::<u16>().is_ok_and(|value| value <= 4096),
+            Self::EditorSemanticHints
+            | Self::PickerPreview
+            | Self::PromptTransient
+            | Self::UiStatuslineHints
+            | Self::CompletionAuto => matches!(value, "true" | "false"),
             Self::PromptLeft | Self::PromptRight => serde_json::from_str::<Vec<String>>(value)
                 .map(|values| values.iter().all(|item| valid_prompt_item(item)))
                 .unwrap_or(false),
@@ -1492,8 +1710,16 @@ impl ConfigField {
         if !valid {
             let expected = match self {
                 Self::EditorKeymap => "helix, emacs, or vim",
+                Self::EditorBanner => "full, compact, or none",
                 Self::PickerLayout => "adaptive, bottom, or full",
-                Self::EditorSemanticHints | Self::PickerPreview => "true or false",
+                Self::PromptSymbols => "auto, plain, unicode, or nerd_font",
+                Self::UiSurface => "auto, rich, or simple",
+                Self::CompletionMinChars => "an integer from 0 through 4096",
+                Self::EditorSemanticHints
+                | Self::PickerPreview
+                | Self::PromptTransient
+                | Self::UiStatuslineHints
+                | Self::CompletionAuto => "true or false",
                 Self::PromptLeft | Self::PromptRight => {
                     "a JSON array of non-empty prompt segment names"
                 }
@@ -1505,8 +1731,19 @@ impl ConfigField {
             .with_help(format!("Expected {expected}")));
         }
         Ok(match self {
-            Self::EditorKeymap | Self::PickerLayout => format!("\"{value}\""),
-            Self::EditorSemanticHints | Self::PickerPreview => value.to_owned(),
+            Self::EditorKeymap
+            | Self::EditorBanner
+            | Self::PickerLayout
+            | Self::PromptSymbols
+            | Self::UiSurface => {
+                format!("\"{value}\"")
+            }
+            Self::EditorSemanticHints
+            | Self::PickerPreview
+            | Self::PromptTransient
+            | Self::UiStatuslineHints
+            | Self::CompletionAuto
+            | Self::CompletionMinChars => value.to_owned(),
             Self::PromptLeft | Self::PromptRight => {
                 let values = serde_json::from_str::<Vec<String>>(value).map_err(|_| {
                     ShellError::new(ErrorCode::InvalidArgument, "invalid prompt segment list")
@@ -1521,10 +1758,17 @@ impl ConfigField {
         match self {
             Self::EditorKeymap => config.editor.keymap.clone(),
             Self::EditorSemanticHints => config.editor.semantic_hints.to_string(),
+            Self::EditorBanner => config.editor.banner.clone(),
             Self::PickerLayout => config.picker.layout.clone(),
             Self::PickerPreview => config.picker.preview.to_string(),
+            Self::PromptSymbols => config.prompt.symbols.clone(),
             Self::PromptLeft => serde_json::to_string(&config.prompt.left).unwrap_or_default(),
             Self::PromptRight => serde_json::to_string(&config.prompt.right).unwrap_or_default(),
+            Self::PromptTransient => config.prompt.transient.to_string(),
+            Self::UiSurface => config.ui.surface.clone(),
+            Self::UiStatuslineHints => config.ui.statusline.hints.to_string(),
+            Self::CompletionAuto => config.completion.auto.to_string(),
+            Self::CompletionMinChars => config.completion.min_chars.to_string(),
         }
     }
 }
@@ -1576,18 +1820,22 @@ fn patch_literal(
     let config_open = find_config_table(&tokens)
         .ok_or_else(|| patch_error("could not find a literal `quirl.config { ... }` table"))?;
     let (section, name) = field.parts();
-    let section_values = field_values(&tokens, config_open, section);
-    let [section_value] = section_values.as_slice() else {
-        return Err(patch_error(&format!(
-            "expected exactly one literal `{section} = {{ ... }}` section"
-        )));
-    };
-    if !matches!(&tokens[*section_value].kind, TokenKind::Symbol(b'{')) {
-        return Err(patch_error(&format!(
-            "`{section}` is code-controlled instead of a literal table"
-        )));
+    let mut section_open = config_open;
+    for section_part in section.split('.') {
+        let section_values = field_values(&tokens, section_open, section_part);
+        let [section_value] = section_values.as_slice() else {
+            return Err(patch_error(&format!(
+                "expected exactly one literal `{section} = {{ ... }}` section"
+            )));
+        };
+        if !matches!(&tokens[*section_value].kind, TokenKind::Symbol(b'{')) {
+            return Err(patch_error(&format!(
+                "`{section}` is code-controlled instead of a literal table"
+            )));
+        }
+        section_open = *section_value;
     }
-    let values = field_values(&tokens, *section_value, name);
+    let values = field_values(&tokens, section_open, name);
     let [value] = values.as_slice() else {
         return Err(patch_error(&format!(
             "expected exactly one literal `{section}.{name}` field"
@@ -1600,13 +1848,22 @@ fn patch_literal(
         _ => Some(*value),
     };
     let expected_literal = match field {
-        ConfigField::EditorKeymap | ConfigField::PickerLayout => {
+        ConfigField::EditorKeymap
+        | ConfigField::EditorBanner
+        | ConfigField::PickerLayout
+        | ConfigField::PromptSymbols
+        | ConfigField::UiSurface => {
             matches!(&tokens[*value].kind, TokenKind::String)
         }
-        ConfigField::EditorSemanticHints | ConfigField::PickerPreview => matches!(
+        ConfigField::EditorSemanticHints
+        | ConfigField::PickerPreview
+        | ConfigField::PromptTransient
+        | ConfigField::UiStatuslineHints
+        | ConfigField::CompletionAuto => matches!(
             &tokens[*value].kind,
             TokenKind::Identifier(value) if value == "true" || value == "false"
         ),
+        ConfigField::CompletionMinChars => matches!(&tokens[*value].kind, TokenKind::Other),
         ConfigField::PromptLeft | ConfigField::PromptRight => literal_end_index.is_some(),
     } && literal_end_index
         .is_some_and(|index| literal_value_ends(&tokens, index));
@@ -1834,9 +2091,9 @@ mod tests {
         r#"-- Keep this comment and the unrelated plugin setup.
 local plugin_value = { preview = false, render = function() return "ok" end }
 local config = quirl.config {
-  editor = { keymap = "helix", semantic_hints = true }, -- editor note
+  editor = { keymap = "helix", semantic_hints = true, banner = "full" }, -- editor note
   picker = { layout = "adaptive", preview = true },
-  prompt = { left = { "directory" }, right = {} },
+  prompt = { symbols = "auto", left = { "directory" }, right = {} },
 }
 return config
 "#
@@ -1886,14 +2143,76 @@ return config
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn backup_install_replaces_symlink_without_overwriting_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("config.lua");
+        let target = directory.join("unrelated.txt");
+        fs::write(&file, example_source()).unwrap();
+        fs::write(&target, "do not overwrite").unwrap();
+        symlink(&target, backup_path(&file)).unwrap();
+
+        set(&file, "picker.preview", "false").unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "do not overwrite");
+        assert_eq!(
+            fs::read_to_string(backup_path(&file)).unwrap(),
+            example_source()
+        );
+        assert!(!fs::symlink_metadata(backup_path(&file))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prompt_symbol_profile_is_discoverable_and_patchable() {
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("config.lua");
+        fs::write(&file, example_source()).unwrap();
+
+        assert_eq!(set(&file, "prompt.symbols", "nerd_font").unwrap(), 0);
+        let config = load(&file).unwrap();
+        assert_eq!(config.prompt.symbols, "nerd_font");
+        assert!(fs::read_to_string(&file)
+            .unwrap()
+            .contains("symbols = \"nerd_font\""));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rich_surface_fields_are_nested_patchable_and_validated() {
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("config.lua");
+        fs::write(&file, include_str!("../../../examples/config.lua")).unwrap();
+
+        assert_eq!(set(&file, "ui.surface", "rich").unwrap(), 0);
+        assert_eq!(set(&file, "ui.statusline.hints", "false").unwrap(), 0);
+        assert_eq!(set(&file, "completion.min_chars", "4").unwrap(), 0);
+
+        let config = load(&file).unwrap();
+        assert_eq!(config.schema_version, 2);
+        assert_eq!(config.ui.surface, "rich");
+        assert!(!config.ui.statusline.hints);
+        assert_eq!(config.completion.min_chars, 4);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn invalid_complete_candidate_never_replaces_source() {
         let directory = test_directory();
         fs::create_dir_all(&directory).unwrap();
         let file = directory.join("config.lua");
         let invalid = example_source().replace(
-            "prompt = { left = { \"directory\" }, right = {} }",
-            "prompt = { left = { 42 }, right = {} }",
+            "prompt = { symbols = \"auto\", left = { \"directory\" }, right = {} }",
+            "prompt = { symbols = \"auto\", left = { 42 }, right = {} }",
         );
         fs::write(&file, &invalid).unwrap();
 
@@ -1906,7 +2225,7 @@ return config
     }
 
     #[test]
-    fn migration_preview_inserts_v1_without_mutating_the_source() {
+    fn migration_preview_inserts_v2_without_mutating_the_source() {
         let directory = test_directory();
         fs::create_dir_all(&directory).unwrap();
         let file = directory.join("config.lua");
@@ -1916,7 +2235,7 @@ return config
         let (version, candidate) = migration_candidate(&source).unwrap();
 
         assert_eq!(version, None);
-        assert!(candidate.contains("schema_version = 1"));
+        assert!(candidate.contains("schema_version = 2"));
         assert_eq!(read_config_source(&file).unwrap(), source);
         assert!(!backup_path(&file).exists());
         fs::remove_dir_all(directory).unwrap();
@@ -1925,8 +2244,8 @@ return config
     #[test]
     fn migration_preview_rejects_a_future_schema_instead_of_calling_it_current() {
         let source = example_source().replace(
-            "editor = { keymap = \"helix\", semantic_hints = true },",
-            "schema_version = 2,\n  editor = { keymap = \"helix\", semantic_hints = true },",
+            "editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
+            "schema_version = 3,\n  editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
         );
 
         let error = migration_candidate(&source).unwrap_err();
@@ -1934,6 +2253,21 @@ return config
         assert_eq!(error.code, ErrorCode::Validation);
         assert!(error.message.contains("newer"));
         assert!(error.details.help[0].contains("Quirl version"));
+    }
+
+    #[test]
+    fn migration_preview_projects_v1_to_v2_without_rewriting_other_source() {
+        let source = example_source().replace(
+            "editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
+            "schema_version = 1,\n  editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
+        );
+
+        let (version, candidate) = migration_candidate(&source).unwrap();
+
+        assert_eq!(version, Some(1));
+        assert!(candidate.contains("schema_version = 2"));
+        assert!(candidate.contains("-- Keep this comment"));
+        assert!(candidate.contains("render = function() return \"ok\" end"));
     }
 
     #[test]
@@ -2027,10 +2361,17 @@ return config
             ("revision".to_owned(), source_revision(source)),
             ("editor_keymap".to_owned(), keymap.to_owned()),
             ("editor_semantic_hints".to_owned(), "true".to_owned()),
+            ("editor_banner".to_owned(), "full".to_owned()),
             ("picker_layout".to_owned(), "adaptive".to_owned()),
             ("picker_preview".to_owned(), "true".to_owned()),
+            ("prompt_symbols".to_owned(), "auto".to_owned()),
             ("prompt_left".to_owned(), "directory".to_owned()),
             ("prompt_right".to_owned(), String::new()),
+            ("prompt_transient".to_owned(), "true".to_owned()),
+            ("ui_surface".to_owned(), "auto".to_owned()),
+            ("ui_statusline_hints".to_owned(), "true".to_owned()),
+            ("completion_auto".to_owned(), "false".to_owned()),
+            ("completion_min_chars".to_owned(), "2".to_owned()),
         ])
     }
 
@@ -2045,8 +2386,11 @@ return config
         let page = render_form(&session, None);
         assert!(page.contains("Schema"));
         assert!(page.contains("editor_keymap"));
+        assert!(page.contains("editor_banner"));
         assert!(page.contains("picker_layout"));
         assert!(page.contains("prompt_left"));
+        assert!(page.contains("ui_surface"));
+        assert!(page.contains("completion_min_chars"));
         assert!(!page.contains("Cache-Control"));
         assert!(!page.contains("<script"));
     }

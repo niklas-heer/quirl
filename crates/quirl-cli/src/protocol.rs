@@ -109,7 +109,7 @@ fn current_manifest() -> Result<ProtocolFreezeManifest, quirl_core::ShellError> 
             quirl_lua::CONFIG_OLDEST_READABLE_VERSION,
             CompatibilityPolicy::MigratedRange,
             quirl_lua::config_schema_hash(),
-            "legacy_unversioned_migrates",
+            "v0_v1_migrate_to_v2",
         ),
         contract(
             "extension",
@@ -181,7 +181,7 @@ fn current_manifest() -> Result<ProtocolFreezeManifest, quirl_core::ShellError> 
             quirl_process::RUNNER_PROTOCOL_VERSION,
             CompatibilityPolicy::FrozenMajor,
             quirl_process::runner_schema_hash(),
-            "text_outcome_only",
+            "bounded_capture_streaming_interactive",
         ),
         // WIT cannot express the recursive Value / full ShellError cases in
         // COMMON_ABI_SCHEMA_DESCRIPTOR; see WASM_WIT for the projected shape.

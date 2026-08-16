@@ -1,4 +1,7 @@
-use quirl_catalog::{Catalog, CommandSpec, Confidence, Provenance, ProvenanceInfo, Trust};
+use quirl_catalog::{
+    Catalog, CommandSpec, Confidence, Provenance, ProvenanceInfo, Trust,
+    MAX_COMPLETION_QUERY_BYTES, MAX_COMPLETION_RESULTS,
+};
 use quirl_core::{
     validate_contribution_set, ContributionKind, ErrorCode, ExtensionAction, ExtensionEvent,
     ExtensionEventData, ShellError,
@@ -25,11 +28,14 @@ use std::{
         Arc, Mutex,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 const MAX_PLUGIN_LOCK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PLUGIN_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_PLUGIN_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EXTENSION_COMPLETION_CALLBACKS: usize = 64;
+const EXTENSION_COMPLETION_WALL_TIME: Duration = Duration::from_millis(250);
 
 pub type SharedLuaExtensions = Arc<Mutex<LuaExtensionHost>>;
 
@@ -106,6 +112,10 @@ enum PluginSource {
 #[derive(Debug, Clone)]
 struct PluginCandidate {
     path: PathBuf,
+    /// Present for managed plugins whose locked bytes were verified during the
+    /// snapshot. Loading these bytes instead of reopening `path` closes the
+    /// integrity-check-to-execution race.
+    verified_source: Option<String>,
     runtime: PluginRuntime,
     grants: Vec<String>,
     catalog_commands: Vec<CommandSpec>,
@@ -260,6 +270,20 @@ impl LuaExtensionHost {
     pub fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
         self.ensure_loaded();
         let position = floor_char_boundary(line, pos.min(line.len()));
+        if line.len() > MAX_COMPLETION_QUERY_BYTES {
+            self.errors.push(
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "extension completion query exceeds its byte limit",
+                )
+                .with_context(format!(
+                    "bytes: {}; limit: {MAX_COMPLETION_QUERY_BYTES}",
+                    line.len()
+                ))
+                .with_help("Shorten the input before requesting extension completion"),
+            );
+            return Vec::new();
+        }
         let before = &line[..position];
         let token_start = before
             .char_indices()
@@ -269,15 +293,38 @@ impl LuaExtensionHost {
         let query = &before[token_start..];
         let context = json!({ "line": line, "cursor": position, "query": query });
         let mut suggestions = Vec::new();
+        let started = Instant::now();
+        let mut callback_count = 0_usize;
+        let mut limit_reason = None;
 
-        for runtime in &self.plugin_runtimes {
+        'plugins: for runtime in &self.plugin_runtimes {
             for provider in runtime.registrations().completion_providers {
                 if !provider_applies(before, &provider.command) {
                     continue;
                 }
+                if callback_count == MAX_EXTENSION_COMPLETION_CALLBACKS {
+                    limit_reason = Some(format!(
+                        "extension completion callback limit reached: {MAX_EXTENSION_COMPLETION_CALLBACKS}"
+                    ));
+                    break 'plugins;
+                }
+                if started.elapsed() >= EXTENSION_COMPLETION_WALL_TIME {
+                    limit_reason = Some(format!(
+                        "extension completion deadline reached: {} ms",
+                        EXTENSION_COMPLETION_WALL_TIME.as_millis()
+                    ));
+                    break 'plugins;
+                }
+                callback_count = callback_count.saturating_add(1);
                 match runtime.complete_with_provider(&provider.command, &context) {
                     Ok(Value::Array(values)) => {
                         for value in values {
+                            if suggestions.len() == MAX_COMPLETION_RESULTS {
+                                limit_reason = Some(format!(
+                                    "extension completion result limit reached: {MAX_COMPLETION_RESULTS}"
+                                ));
+                                break 'plugins;
+                            }
                             if let Some(suggestion) = extension_suggestion(
                                 value,
                                 query,
@@ -307,6 +354,20 @@ impl LuaExtensionHost {
                 .into_iter()
                 .filter(|item| item.kind == ContributionKind::Completion)
             {
+                if callback_count == MAX_EXTENSION_COMPLETION_CALLBACKS {
+                    limit_reason = Some(format!(
+                        "extension completion callback limit reached: {MAX_EXTENSION_COMPLETION_CALLBACKS}"
+                    ));
+                    break 'plugins;
+                }
+                if started.elapsed() >= EXTENSION_COMPLETION_WALL_TIME {
+                    limit_reason = Some(format!(
+                        "extension completion deadline reached: {} ms",
+                        EXTENSION_COMPLETION_WALL_TIME.as_millis()
+                    ));
+                    break 'plugins;
+                }
+                callback_count = callback_count.saturating_add(1);
                 match runtime.invoke_contribution(
                     ContributionKind::Completion,
                     &registration.name,
@@ -317,6 +378,12 @@ impl LuaExtensionHost {
                     ) {
                         Ok(items) => {
                             for item in items {
+                                if suggestions.len() == MAX_COMPLETION_RESULTS {
+                                    limit_reason = Some(format!(
+                                        "extension completion result limit reached: {MAX_COMPLETION_RESULTS}"
+                                    ));
+                                    break 'plugins;
+                                }
                                 if let Some(suggestion) = contribution_suggestion(
                                     item,
                                     query,
@@ -342,6 +409,13 @@ impl LuaExtensionHost {
                     }
                 }
             }
+        }
+        if let Some(reason) = limit_reason {
+            self.errors.push(
+                ShellError::new(ErrorCode::ResourceLimit, reason).with_help(
+                    "Reduce enabled completion providers or narrow their returned items",
+                ),
+            );
         }
         suggestions
     }
@@ -612,7 +686,11 @@ impl LuaExtensionHost {
             managed_commands.extend(plugin.catalog_commands.clone());
             if plugin.runtime == PluginRuntime::TrustedLua {
                 let runtime = crate::plugin::trusted_lua_runtime(&plugin.grants)?;
-                let registrations = runtime.load_plugin_file(&plugin.path)?;
+                let registrations = if let Some(source) = &plugin.verified_source {
+                    runtime.load_plugin_source(source, &plugin.path.display().to_string())?
+                } else {
+                    runtime.load_plugin_file(&plugin.path)?
+                };
                 contributions.extend(registrations.contributions);
                 plugin_runtimes.push(runtime);
             }
@@ -714,6 +792,7 @@ fn snapshot_legacy_plugin_paths(
             .cloned()
             .map(|path| PluginCandidate {
                 path,
+                verified_source: None,
                 runtime: PluginRuntime::TrustedLua,
                 grants: grants.clone(),
                 catalog_commands: Vec::new(),
@@ -883,10 +962,27 @@ fn managed_plugin_candidate_with_cancellation(
         .with_help("Run `quirl plugin doctor` and restore the locked source before activation"));
     }
     validate_plugin_manifest(&manifest, &entry_bytes, env!("CARGO_PKG_VERSION"))?;
+    let verified_source = if locked.runtime == PluginRuntime::TrustedLua {
+        Some(
+            std::str::from_utf8(&entry_bytes)
+                .map(str::to_owned)
+                .map_err(|error| {
+                    ShellError::new(
+                        ErrorCode::Validation,
+                        format!("managed plugin `{}` entry is not valid UTF-8", locked.name),
+                    )
+                    .with_context(error.to_string())
+                    .with_help("Encode the locked trusted-Lua entry as UTF-8")
+                })?,
+        )
+    } else {
+        None
+    };
     if locked.runtime == PluginRuntime::OutOfProcess {
         crate::plugin::execute_out_of_process_adapter(
             &manifest,
             &entry_path,
+            &entry_bytes,
             &locked.granted_capabilities,
             Some(cancellation),
         )?;
@@ -895,6 +991,7 @@ fn managed_plugin_candidate_with_cancellation(
         normalize_plugin_commands(&manifest, &locked.source, &locked.source_checksum)?;
     Ok(PluginCandidate {
         path: entry_path,
+        verified_source,
         runtime: locked.runtime,
         grants: locked.granted_capabilities.clone(),
         catalog_commands,
@@ -1346,6 +1443,31 @@ error_codes = { "0" = "success" }
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn managed_activation_executes_the_exact_bytes_that_passed_integrity_verification() {
+        let directory = temporary_extension_directory();
+        let root = directory.join("managed-state");
+        let (manifest, enabled) = write_managed_prompt_plugin(&directory);
+        write_managed_lock(&root, &enabled);
+        let host = LuaExtensionHost::from_managed_root(None, root);
+
+        let snapshot = host.snapshot_sources(&AtomicBool::new(false));
+        assert!(snapshot.errors.is_empty(), "{:?}", snapshot.errors);
+        assert!(snapshot.plugins[0].verified_source.is_some());
+
+        // Model a local attacker replacing the entry after checksum
+        // verification but before the generation is built.
+        fs::write(
+            manifest.parent().unwrap().join("plugin.lua"),
+            "error('replacement must not execute')",
+        )
+        .unwrap();
+
+        let built = host.build_candidate(snapshot);
+        assert!(built.is_ok(), "{:?}", built.as_ref().err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn managed_activation_rejects_checksum_matching_entry_symlink_escape() {
@@ -1401,7 +1523,7 @@ error_codes = { "0" = "success" }
             host.reload_if_changed(),
             ExtensionReloadState::Reloaded { revision: 1 }
         );
-        assert_eq!(host.active_config().editor.keymap, "helix");
+        assert_eq!(host.active_config().editor.keymap, "emacs");
         assert!(host.complete("fruit ", 6).is_empty());
 
         write_config(&config, "emacs");
@@ -1430,7 +1552,7 @@ error_codes = { "0" = "success" }
             host.reload_if_changed(),
             ExtensionReloadState::Reloaded { revision: 4 }
         );
-        assert_eq!(host.active_config().editor.keymap, "helix");
+        assert_eq!(host.active_config().editor.keymap, "emacs");
         assert!(host.complete("fruit ", 6).is_empty());
 
         fs::remove_dir_all(directory).unwrap();

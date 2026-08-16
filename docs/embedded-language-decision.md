@@ -143,7 +143,7 @@ Choose Lua 5.4 for configuration, scripts, and trusted plugins. Its familiarity,
 2. **Implemented:** one Rust host definition generates LuaLS stubs, completion data, Markdown, and AI-readable JSON.
 3. **Implemented:** configuration, scripts, prompt segments, and completion providers run through the same Rust-validated API; live prompt and IDE completion consume plugin callbacks.
 4. **Implemented:** the rejected prototype runtime, CLI bridge, workspace crate, dependencies, examples, and executable benchmark paths are removed.
-5. **Current Phase 0 status:** configuration and plugins reload atomically at safe prompt boundaries; keymap, picker, prompt, and editor settings apply live; the native data surface supports typed predicates, dotted fields, sorting, and limiting. Subsequent work belongs to the preview roadmap rather than this decision’s initial implementation slice.
+5. **Phase 0 result:** configuration and plugins reload atomically at safe prompt boundaries; keymap, picker, prompt, and editor settings apply live; the native data surface supports typed predicates, dotted fields, sorting, and limiting. The later Preview, Scriptable, Platform, and review-evidence phases are recorded in the product design and release checklist rather than this runtime decision.
 
 | Concern | Contract |
 | --- | --- |

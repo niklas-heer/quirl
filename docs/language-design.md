@@ -49,6 +49,8 @@ Compatibility, structured data, rich UI, and a real extension language pull in d
 - Owning terminal scrollback or becoming a terminal emulator.
 - Making native in-process plugins a stable ABI.
 - Guessing schemas from arbitrary text.
+- Promising a native Windows interactive experience without a maintained
+  Windows test environment.
 
 > **Product anchor: Helix’s coherence, Bun’s completeness.** Quirl ships one deliberately integrated workflow: install one binary and immediately get editing, completion, fuzzy discovery, prompt context, structured tools, scripting, testing, formatting, documentation, and configuration. “Batteries included” means designed together and supported together—not a bundle of unrelated replacements for every Unix tool.
 
@@ -58,11 +60,11 @@ Compatibility, structured data, rich UI, and a real extension language pull in d
 
 ### A modal shell, not a modal trap
 
-Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unlike Vim, every action has a textual form so sessions are reproducible and accessible. Switch modes with `Ctrl-Space`.
+Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unlike Vim, every action has a textual form so sessions are reproducible and accessible. Switch modes with `Alt-M`.
 
 | Mode | Contract | Examples | Explicit entry |
 | --- | --- | --- | --- |
-| Command `❯` | Bytes and processes; compatibility grammar; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `for f in *.log; do gzip "$f"; done`, `cargo test --workspace` | `mode command`; force external with `^ls` |
+| Command `❯` | Bytes and processes; compatibility grammar; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `cargo test --workspace`, `false \|\| echo recovered` | `mode command`; force external with `^ls` |
 | Data `◆` | Unambiguous Quirl grammar; typed, lazy values; external programs require an adapter or `^command`; failures are `Result` values | `ps \| where cpu > 20 \| sort cpu desc`, `open users.json \| get users \| select name email` | `mode data`; one-shot `data { ... }` |
 
 ```quirl
@@ -221,19 +223,20 @@ Quirl targets the copy-and-paste surface first. Full Bash and Zsh are separate e
 | Level | Promise | Examples | Implementation |
 | --- | --- | --- | --- |
 | C0 · Commands | Required for preview | `git status`, quoting, redirects, byte pipes, jobs | Native process engine and POSIX-like lexer |
-| C1 · Common interactive | Required for 1.0 | `&&`, `||`, globs, substitutions, loops, functions, exports | Native compatibility AST; corpus against Bash and Zsh |
+| C1 · Common interactive | Required for 1.0 | `&&`, `||`, globs, bounded substitutions, here-strings, `export NAME=value` | Native compatibility AST on Linux/macOS; corpus against Bash and Zsh |
 | C2 · Dialect islands | Required for 1.0 | `bash { ... }`, `zsh { ... }`, shebangs | Reference-interpreter subprocess with structured capture |
 | C3 · Source state | Deliberately partial | Import cwd, exported env, aliases when representable | State-diff protocol; reject traps and opaque functions |
 | C4 · Exact emulation | No promise | Every option, trap, framework, obscure expansion | Run the requested `bash` or `zsh` |
 
 ```sh
 # Ordinary input: native, fast, familiar
-for crate in crates/*; do cargo test -p "${crate##*/}" || break; done
+cargo test --workspace && echo 'tests passed'
 
 # Dialect island: explicit and exact
 bash {
-  shopt -s globstar
-  printf '%s\n' **/*.rs
+  for crate in crates/*; do
+    cargo test -p "${crate##*/}" || break
+  done
 }
 
 # A script keeps its own authority
@@ -243,6 +246,9 @@ bash ./legacy-deploy.sh   # explicit always wins
 
 - Valid C1 input executes natively.
 - Bash- or Zsh-only constructs produce a mismatch diagnostic and the exact dialect form; Quirl never silently reinterprets them.
+- Here-documents, process substitution, loops, functions, conditionals, and
+  dialect control syntax are intentionally C2 islands for 1.0, not an unfinished
+  native-syntax promise. See [ADR 0010](decisions/0010-unix-first-release-scope.md).
 - `source` accepts Quirl modules and a portable subset. `source --bash` and `source --zsh` import only representable state.
 - Behavior is versioned in a machine-readable matrix and backed by differential tests.
 
@@ -452,7 +458,7 @@ The runtime spike evaluates cold start, warm invocation, host-boundary record/`R
 
 ### The shell is a semantic development environment
 
-The input buffer is parsed continuously, understands command schemas and annotated Lua exports, and can explain what will happen before execution. Ratatui composes the active prompt region and opt-in panels without stealing normal terminal scrollback.
+The input buffer is parsed continuously, understands command schemas and annotated Lua exports, and can explain what will happen before execution. Ratatui composes the active prompt region and opt-in panels without stealing normal terminal scrollback. The implementation contract for this surface — frame layout, editor core, completion popup, status bar, highlighting spans, degradation tiers, and milestones — is [tui-design.md](tui-design.md).
 
 > **Release criterion:** a feature is incomplete until it has completion metadata, inline help, diagnostics, keyboard navigation, accessible text output, and timing instrumentation. Lua-defined commands participate through the same Rust-validated schemas as native commands.
 
@@ -489,9 +495,10 @@ fzf proves fuzzy selection is a terminal primitive. Quirl includes a native, typ
 ```lua
 ---@type quirl.Config
 local config = quirl.config {
-  editor = { keymap = "helix", semantic_hints = true },
+  editor = { keymap = "emacs", semantic_hints = true, banner = "full" },
   picker = { layout = "adaptive", preview = true },
   prompt = {
+    symbols = "auto",
     left = { "directory", "git_branch", "git_state" },
     right = { "jobs", "duration", "status" },
   },
@@ -510,6 +517,7 @@ return config
 | Round trip | A concrete-syntax-tree patcher changes only recognized literal arguments, preserving comments, layout, unknown plugin forms, and surrounding code. Writes are atomic and retain a recoverable prior version. |
 | Live synchronization | Browser reads refresh from the authoritative file and saves re-check it before writing. Unsaved browser changes use a three-way merge; conflicts show a diff instead of silently winning. No background watcher is claimed. |
 | Validation | Versioned schema supplies types, ranges, deprecations, platform support, examples, plugin settings. `quirl config check` parses/lints Lua, validates known annotations and returned config through Rust schema, and never activates invalid state. |
+| Prompt symbols | `auto` chooses Unicode only for a UTF-8 locale and otherwise uses ASCII; `plain` and `unicode` are explicit; `nerd_font` opts into Powerline/private-use glyphs. Patched fonts are never required, and `TERM=dumb` always wins with the plain profile. |
 | Preview | Theme, prompt, keymap, completion, picker, accessibility changes render against sample and live contexts before Apply. |
 | Dynamic values | UI shows evaluated value, source span, documentation, and marks code-controlled expressions; “Open in code” never silently replaces one. |
 | Safe reload | Restricted evaluation with declared capabilities; parse/contract/runtime failures retain last-known-good config and show span diagnostic with rollback. |
@@ -671,7 +679,14 @@ The parser boundary preserves compatibility without leaking it into the value ru
 
 These are targets, not current benchmark claims. Each release records cold/warm startup, completion/render latency, pipeline throughput, peak memory, and binary size on named hardware.
 
-**Terminal contract:** Tier 1 is Linux, macOS, Windows with native job control behind one interface; negotiate color, Unicode, keyboard protocol, mouse, hyperlinks, clipboard, synchronized updates; give remote/dumb terminals a line-oriented experience using the same parser/completion data; honor `NO_COLOR`, reduced motion, accessible output, and never require a mouse; keep non-interactive stdout stable, undecorated, and control-sequence-free unless asked.
+**Terminal contract:** Tier 1 is Linux and macOS with native job control behind
+one interface. Windows is a best-effort portable-process target, not a supported
+interactive terminal. On Tier 1, negotiate color, Unicode, keyboard protocol,
+mouse, hyperlinks, clipboard, and synchronized updates; give remote/dumb
+terminals a line-oriented experience using the same parser/completion data;
+honor `NO_COLOR`, reduced motion, accessible output, and never require a mouse;
+keep non-interactive stdout stable, undecorated, and control-sequence-free unless
+asked.
 
 ## 13. Delivery sequence
 
@@ -682,14 +697,13 @@ These are targets, not current benchmark claims. Each release records cold/warm 
 | 0 | **Complete** | Lua runtime and generated SDK views; config validation; atomic live config/plugin reload; applied editor/prompt/picker settings; live prompt/completion callbacks; resource budgets; command graph; mode switch; focused native data grammar; C0 execution; byte pipes; built-in `ls`; error spans. |
 | 1 | **Accepted · Preview** | Job control, redirects, indexed completions, Zsh/Bash/Fish and help/man ingestion, history/file/action picker, adaptive prompt, typed config forms with web/TUI views, C1 subset, structured core commands, plain fallbacks, Linux/macOS. |
 | 2 | **Complete · Scriptable** | Lua scripts and computed config, `quirl run`, formatter, annotation-aware checker, linter, tests, docs, language service, agent catalog/validation formats, package manifests, generated host API, deterministic tests. |
-| 3 | **Accepted · Platform** | Trusted-language and isolated-plugin contracts, permissions/lockfile, catalog/completion/UI/event extension points, Bash/Zsh runners, directory/process panels, bounded live sampling, Windows process lifecycle, recovery. |
-| 4 | **Implemented · Review candidate** | Reviewed protocol identities and migrations, command/catalog parity, compatibility dispositions and differential evidence, performance gates, security/accessibility audits. Explicitly deferred contracts remain outside the 1.0 promise. |
+| 3 | **Accepted · Platform** | Trusted-language and isolated-plugin contracts, permissions/lockfile, catalog/completion/UI/event extension points, Bash/Zsh runners, directory/process panels, bounded live sampling, portable process contracts, recovery. |
+| 4 | **Implemented · Unix release candidate** | Reviewed protocol identities and migrations, command/catalog parity, compatibility dispositions and differential evidence, performance gates, security/accessibility audits, and a Linux/macOS interactive support promise. Explicit reference-shell and best-effort platform boundaries remain outside the native 1.0 promise. |
 
 ### Phase 1 acceptance gates
 
-Phase 1 ("Preview") is the next implementation step. Like the Lua gates in
-§9, these are the conditions under which the phase is accepted — not a task
-list:
+Phase 1 ("Preview") is accepted. Like the Lua gates in §9, these preserve the
+evidence required for that decision; they are not a current task list:
 
 - **Job control.** Background/foreground/suspend (`&`, `Ctrl-Z`, `jobs`,
   `fg`, `bg`) work through one native lifecycle interface on Linux and
@@ -708,10 +722,10 @@ list:
   lists, standard-descriptor redirects, here-strings, bounded command
   substitution, parameter/arithmetic expansion, and pathname expansion. The
   matrix records exact Bash/Zsh evidence; here-documents, process substitution,
-  and dialect control forms remain explicit bounded `bash { ... }` / `zsh {
-  ... }` islands rather than an implied native promise. Windows retains the
-  portable C0 process graph plus those reference islands until its C1 executor
-  is implemented.
+  loops, functions, conditionals, and dialect control forms remain explicit
+  bounded `bash { ... }` / `zsh { ... }` islands for 1.0 rather than an implied
+  native promise. Windows retains a best-effort portable process graph and does
+  not share the supported interactive Unix contract.
 - **Budgets measured.** Cold start, keystroke-to-frame, and first prompt
   paint are measured against the §12 budgets on named hardware and
   recorded — including where they currently miss.
@@ -725,7 +739,7 @@ and accessible text output, per the release criterion in §10.
   native Quirl grammar by explicit `--lang`, shebang, or extension. `.qrl` is
   canonical; `.quirl` and `.🌀` are accepted aliases. It accepts stdin,
   preserves Lua resource policy, and reports labeled native command/data
-  failures. Unsupported Bash/Zsh runners remain an explicit Phase 3 surface.
+  failures. Bash/Zsh runners subsequently landed as the explicit C2 surface.
 - **Deterministic authoring tools.** `fmt`, `check`, `lint`, and `test` accept
   files or deterministic project discovery. They skip build/VCS directories
   and symlink directories, aggregate every diagnostic, never execute checks,
@@ -745,7 +759,7 @@ and accessible text output, per the release criterion in §10.
   `publish --dry-run` proves that no registry or network action occurs.
 - **Evidence stays executable.** In-crate protocol, policy, schema,
   determinism, traversal, quality-gate, and tamper tests run under the canonical
-  `mask check`, alongside the generated-SDK exactness and guest Lua suite.
+  `cargo xtask check`, alongside the generated-SDK exactness and guest Lua suite.
 
 ### Phase 3 acceptance evidence
 
@@ -766,11 +780,11 @@ and accessible text output, per the release criterion in §10.
   arguments, environment, status, cancellation, and fixed-size output windows.
   Recovery is versioned, atomic, quota-limited, terminal-safe in text mode, and
   retains exact stored values in JSON.
-- **Windows has a native lifecycle backend.** Cross-target checks exercise byte
-  pipelines, redirects, boolean graphs, jobs, foregrounding, cancellation, and
-  Job Object tree containment. Windows suspend and native terminal handoff stay
-  explicit 1.0 work pending tests on a Windows host.
-- **Evidence stays executable.** The canonical `mask check` covers metadata
+- **Windows has a best-effort lifecycle backend.** Cross-target checks exercise
+  byte pipelines, redirects, boolean graphs, jobs, foregrounding, cancellation,
+  and Job Object tree containment. Native terminal handoff, suspension, and
+  Windows hardware validation are outside the supported 1.0 release contract.
+- **Evidence stays executable.** The canonical `cargo xtask check` covers metadata
   quality, capability smuggling, event ordering and action grants, contribution
   composition, output and recovery bounds, terminal controls, plugin tampering,
   runners, panels, watch cancellation, and generated-SDK exactness.
@@ -798,12 +812,13 @@ and accessible text output, per the release criterion in §10.
   path containment, capability smuggling, cancellation, hostile C0/C1 terminal
   text, JSON semantic preservation, `NO_COLOR`, `TERM=dumb`, plain fallbacks,
   and private recovery storage have executable tests and a checked-in audit.
-- **The remaining line is explicit.** Process adapters execute a deliberately
+- **The release line is explicit.** Process adapters execute a deliberately
   narrow bounded v1 handshake, and picker/completion envelopes are frozen with
-  cancellation, deadlines, and stale-result evidence. Native Windows
-  terminal/suspend validation and the explicitly deferred native compatibility
-  forms remain review blockers before Quirl may claim the 1.0 contract; this
-  checkpoint does not hide them behind a successful test suite.
+  cancellation, deadlines, and stale-result evidence. Linux and macOS are the
+  supported interactive platforms. Windows terminal behavior is best effort,
+  and non-native dialect forms remain explicit reference-shell islands; neither
+  is a hidden release blocker. The exact candidate still requires fresh
+  performance evidence and the human release checklist.
 
 ## 14. Review decisions
 
@@ -820,20 +835,43 @@ On 15 August 2026, the following decisions were reviewed and agreed:
 - **Native typed fuzzy picker:** history, files, completion, commands, data values, plugins share one previewable, scriptable selection engine.
 - **Lua configuration with synchronized views:** `config.lua` remains source of truth; generated annotations, Rust schema validation, local web/TUI views remain synchronized without another config store.
 
-### Open questions for Draft 0.9
+### Decisions closed since Draft 0.9
 
-1. Which LuaLS-compatible annotation subset can Quirl generate and validate without a fragile second source of truth?
-2. Should Lua 5.4 be statically linked and vendored everywhere, and what compatibility policy governs a Lua 5.5 upgrade?
-3. Which standard-library modules and `require` behavior are safe in config, trusted-plugin, and script contexts?
-4. How should instruction hooks, memory accounting, async cancellation, and per-callback deadlines interact across `mlua` callbacks?
-5. Should Wasm be limited to isolated plugins, or be a first-class script runner?
-6. Is a persistent mode switch better than one mode with a separate structured-pipe operator?
-7. How much dynamic Zsh/Bash completion should run in workers instead of being translated and cached?
-8. Should the agent interface start as CLI/JSON only or ship optional MCP in preview?
-9. Which plugin hooks may mutate command plans, and what confirmation should that need?
-10. How much Bash/Zsh syntax belongs in native C1 before complexity harms diagnostics?
-11. Which fuzzy query language and scoring guarantees belong in the stable picker protocol?
-12. Which IDE surfaces and bundled capabilities are essential for the first preview?
+The Draft 0.9 questions now have implemented dispositions:
+
+1. Rust `HOST_API` definitions generate the LuaLS annotations, runtime bindings,
+   Markdown, and JSON views; Rust boundary validation remains authoritative.
+2. Quirl pins vendored Lua 5.4. A Lua 5.5 move requires a deliberate runtime,
+   SDK, compatibility, and benchmark review rather than an automatic upgrade.
+3. Lua receives only the restricted table, string, math, and UTF-8 libraries;
+   ambient `io`, `os`, `debug`, `require`, and `package` stay unavailable.
+4. `LuaPolicy` combines memory, instruction, wall-clock, callback, and
+   cancellation budgets; violations become structured errors rather than host
+   panics or hangs.
+5. Wasm is a validated, disabled plugin boundary until an execution engine can
+   preserve the existing value, catalog, capability, and isolation contracts.
+   It is not a first-class script runner.
+6. Command and data remain two explicit, visible interactive modes; scripts mark
+   grammar boundaries in source.
+7. Fish/Bash/Zsh completion ingestion translates bounded declarative forms and
+   records dynamic providers without executing them.
+8. Agent discovery ships deterministic CLI/JSON/Markdown contracts plus a
+   bounded, source-only optional MCP surface.
+9. Plugin actions are typed, capability-gated, validated, and composed at the
+   Rust boundary; arbitrary command-plan mutation is not ambient authority.
+10. Native C1 stops at the frozen bounded core. Here-documents, process
+    substitution, loops, functions, conditionals, and dialect control forms are
+    explicit C2 reference-shell islands under ADR 0010.
+11. The picker exposes deterministic exact, fuzzy, and inverse matching through
+    typed values and versioned asynchronous cancellation/deadline envelopes.
+12. The first preview includes the editor, prompt, semantic completion, history,
+    picker, catalog, configuration views, authoring tools, generated SDK, and
+    plain terminal fallbacks described above.
+
+Future work is tracked as new scoped proposals rather than reopening the draft:
+a production Wasm engine, authenticated plugin distribution, promotion of
+Windows to a supported interactive platform, or expansion of the frozen native
+compatibility matrix each requires its own implementation and evidence.
 
 ## References and prior art
 

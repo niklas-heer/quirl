@@ -4,6 +4,137 @@ Quirl is a Rust workspace implementing a shell with typed data pipelines and
 an embedded, sandboxed Lua 5.4 extension runtime. This file captures the
 project-specific rules that generic Rust knowledge won't give you.
 
+## Engineering priorities: safety, performance, developer experience
+
+In that order. This is Quirl's adaptation of
+[TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md),
+not a verbatim copy: rules written for a fixed-memory database must be
+translated to a general-purpose Rust shell.
+
+- **Safety** means preserving user data, terminal state, child-process
+  lifecycle, capability boundaries, and deterministic resource limits.
+- **Performance** means predictable latency and memory use, especially for
+  interactive paths, streams, untrusted input, and extension callbacks.
+- **Developer experience** means precise names, small APIs, actionable errors,
+  reproducible tests, and one obvious source of truth.
+
+Prefer the design that advances all three. Feature gaps are acceptable;
+known correctness, security, resource-leak, or terminal-corruption defects in
+the changed path are not "future cleanup." Fix them or keep the feature out.
+
+For changes involving concurrency, process lifecycle, persistence, protocols,
+or untrusted execution, write down the failure model and invariants before
+implementation. Ask what can go wrong at every boundary, including partial
+success and cleanup failure.
+
+## Bound everything that can grow or wait
+
+Every operation driven by user, filesystem, process, or extension input needs
+an explicit limit or a demonstrated streaming bound:
+
+- bytes retained and bytes scanned;
+- collection, queue, recursion, and nesting depth;
+- records, fields, files, processes, and pipeline stages;
+- instructions, wall time, retries, and callback duration.
+
+Enforce bounds where work enters the owning crate, fail early with a
+`ShellError` carrying `ErrorCode::ResourceLimit`, and include the configured
+limit plus observed usage in error context when safe. A long-running event loop
+is allowed only when each turn has bounded work and cancellation is observable.
+
+Avoid recursion on untrusted or attacker-controlled structure. Use an
+explicit stack with a depth limit. Recursion over a small compile-time-bounded
+domain is acceptable when the bound is obvious and tested.
+
+## Assertions, validation, and invariants
+
+Distinguish programmer errors from expected operating errors:
+
+- Invalid source, configuration, protocol data, I/O, resource exhaustion, and
+  extension behavior are operating errors. Validate them and return
+  `ShellError`; never panic on user-controlled input.
+- Impossible internal states are programmer errors. Encode them with types
+  first, then use `assert!` or `debug_assert!` where an executable invariant
+  materially improves review and testing. Do not use assertions as a substitute
+  for handling a reachable error.
+- Assert or validate both the positive space and the negative boundary. If a
+  writer guarantees a property, validate it again at the reader when crossing
+  persistence, process, plugin, or protocol boundaries.
+- Split unrelated compound assertions so failures identify the violated
+  invariant precisely.
+- Check compile-time relationships among protocol sizes, limits, and constants
+  when Rust can express the check clearly.
+
+Tests must exercise valid inputs, invalid inputs, and transitions from valid to
+invalid. Fault paths must prove cleanup as well as the returned error.
+
+## Explicit control flow and resource ownership
+
+- Prefer direct, structured control flow and a small number of domain-shaped
+  abstractions. Every abstraction must make ownership, bounds, or invariants
+  easier to see.
+- Keep variables in the smallest useful scope. Validate and transform values
+  close to where they are consumed to reduce time-of-check/time-of-use gaps.
+- Centralize branching and state transitions in the owning function; push
+  bounded iteration and pure calculation into focused helpers. Leaf helpers
+  should not mutate distant state.
+- Aim for functions that fit on one screen, roughly 70 lines or fewer. Refactor
+  longer functions unless keeping a state machine or transaction together is
+  clearer and safer; document that reason when it is not obvious.
+- Prefer positive conditions and exhaustive `match` expressions. Break dense
+  boolean expressions into named predicates or branches when a reviewer cannot
+  readily enumerate the cases.
+- Acquire resources into RAII guards immediately. Partial initialization must
+  unwind safely: close descriptors, reap children, restore terminal modes,
+  remove temporary files, and preserve the original error.
+- Signal handlers and asynchronous observers record state only. Run Lua,
+  adapters, hooks, and user callbacks at explicit safe points, never while a
+  process graph, job entry, terminal handoff, or persisted record is only
+  partially committed.
+
+Use fixed-width integers for persisted, serialized, protocol, process, and
+resource-limit fields. Use `usize` for in-memory indexing and Rust collection
+APIs; convert at a checked boundary rather than with unchecked `as` casts.
+
+## Names, comments, and API shape
+
+- Choose precise nouns and verbs; avoid abbreviations unless they are standard
+  domain terms. Do not overload one name with context-dependent meanings.
+- Put units and qualifiers in names when the type alone is ambiguous, for
+  example `timeout_ms`, `output_bytes_max`, or `process_count`.
+- Use parameter structs when multiple same-typed arguments can be swapped or
+  when boolean/optional arguments would make call sites unclear.
+- Pass correctness- and security-relevant options explicitly. Do not rely on a
+  dependency's default timeout, capacity, permissions, standard library, or
+  follow-symlink behavior.
+- Comments explain **why** an invariant, ordering, or unusual mechanism exists.
+  Tests with non-obvious setup also explain their goal and method. Comments are
+  complete, maintained sentences rather than restatements of the code.
+- Order files for a top-down first read: public contract and principal control
+  flow before implementation details, with tests last.
+
+Use `rustfmt`; do not hand-align code against the formatter. Workspace warnings
+and Clippy lints are part of the design contract, not optional polish.
+
+## Performance and dependencies
+
+For hot paths or potentially large inputs, make a rough resource sketch before
+implementation: expected and maximum bytes, allocations, syscalls, processes,
+and latency. Optimize architecture and asymptotic behavior first; use benchmarks
+to justify micro-optimizations and retain regression evidence for important
+claims.
+
+Keep control-plane work such as configuration, catalog construction, and
+extension discovery out of per-keystroke and per-row data paths. Batch I/O and
+cross-thread communication when it improves bounds and latency without delaying
+cancellation or interactive feedback.
+
+Dependencies are a supply-chain, compile-time, binary-size, and maintenance
+cost. Prefer the standard library and existing workspace dependencies. A new
+dependency must have a concrete owner, justify why a small local implementation
+is less safe or maintainable, disable unnecessary features, and preserve the
+crate layering. Do not add a dependency for trivial convenience.
+
 ## Architecture: respect the layering
 
 Dependency direction is strict and one-way, codified in
@@ -55,7 +186,7 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
 
 - The Lua SDK (LuaLS stubs, JSON schema, Markdown docs) is generated from the
   single `HOST_API` table in `quirl-lua`. To change the host API, edit
-  `HOST_API`, then run `mask sdk` to regenerate `docs/quirl.lua` (a test
+  `HOST_API`, then run `cargo xtask sdk` to regenerate `docs/quirl.lua` (a test
   asserts the checked-in file matches `sdk_lua()` exactly). Never hand-edit
   `docs/quirl.lua`.
 - Command metadata (help, completions, docs, AI export) comes from
@@ -82,16 +213,19 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
   separate `tests/` directories. Follow that pattern.
 - Name tests as behavior sentences in snake_case, e.g.
   `instruction_budget_stops_runaway_code`.
-- `mask test` runs the workspace tests plus the guest-side Lua tests
-  (`cargo run -p quirl-cli -- test examples/lua_tests.lua`); run it for any
-  change touching the Lua runtime or SDK.
+- `cargo xtask test` runs workspace tests, bounded seeded C1 differential cases
+  against available Bash/Zsh references, and guest-side Lua tests. Replay a
+  generated failure with its reported `--seed` and `--cases`; never introduce a
+  wall-clock seed inside a test.
 - Sandbox changes need adversarial tests: prove the budget, limit, or
   restriction actually trips.
+- Follow [`docs/testing-strategy.md`](docs/testing-strategy.md) for contract,
+  fault, PTY, guest-runtime, and release evidence.
 
 ## Process
 
-- `mask check` is the canonical local quality gate and must pass before every
-  commit. Do not add CI workflows; local mask tasks deliberately replace CI
+- `cargo xtask check` is the canonical local quality gate and must pass before every
+  commit. Do not add CI workflows; local Cargo tasks deliberately replace CI
   while project traffic is low.
 - Conventional commits (`feat`, `fix`, `docs`, `refactor`, `chore`, `bench`),
   present tense, optionally scoped, e.g. `feat(lua): add completion budgets`.

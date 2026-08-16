@@ -61,6 +61,6 @@ resource enforcement, and crash/cancellation behavior.
   deliberately narrow executing handshake without a stable host callback ABI.
 - SHA-256 is an intentional new dependency for supply-chain integrity;
   FNV-based schema fingerprints remain identity checks, not authenticity.
-- Phase 3 panels, live pipelines, reference-shell runners, and Windows job
-  control remain independent deliverables; this layer does not imply their
-  completion.
+- Panels, live pipelines, reference-shell runners, and platform process behavior
+  remain independently owned contracts. Their subsequent implementation does
+  not add reverse dependencies to this layer.

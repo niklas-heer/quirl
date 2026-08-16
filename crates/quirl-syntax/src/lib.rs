@@ -1,7 +1,7 @@
 //! Quirl's deliberately small interaction grammar.
 
 use serde::{Deserialize, Serialize};
-use std::{fmt, str::FromStr};
+use std::{fmt, ops::Range, str::FromStr};
 
 /// Versioned, machine-readable evidence for Quirl's current native compatibility subset and
 /// the frozen 1.0 C1/C2 disposition.
@@ -122,6 +122,164 @@ struct Token {
     kind: TokenKind,
     start: usize,
     end: usize,
+}
+
+/// A lexer-derived presentation span into the original input.
+///
+/// Spans returned by [`highlight`] are sorted, non-overlapping, and exhaustive.
+/// Keeping this type free of UI concepts lets every interactive surface use the
+/// same syntax truth without inverting the workspace dependency graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HighlightSpan {
+    pub range: Range<usize>,
+    pub kind: HighlightKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HighlightKind {
+    Command,
+    Flag,
+    Argument,
+    PathLike,
+    StringSingle,
+    StringDouble,
+    Escaped,
+    Operator,
+    Redirect,
+    Expansion,
+    Number,
+    Error,
+}
+
+/// Return total, lossless highlighting information for an arbitrary edit buffer.
+///
+/// Command-mode classification is built on the parser's lexer tokens. Invalid or
+/// incomplete input remains renderable: the valid prefix keeps its neutral style
+/// and the lexer diagnostic range becomes an error span. Data mode intentionally
+/// stays neutral until its expression grammar exposes tokens.
+pub fn highlight(line: &str, mode: Mode) -> Vec<HighlightSpan> {
+    if line.is_empty() {
+        return Vec::new();
+    }
+    if mode == Mode::Data {
+        return vec![HighlightSpan {
+            range: 0..line.len(),
+            kind: HighlightKind::Argument,
+        }];
+    }
+
+    match lex_command(line) {
+        Ok(tokens) => highlight_tokens(line, &tokens),
+        Err(error) => {
+            let start = error.start.min(line.len());
+            let end = error.end.max(start.saturating_add(1)).min(line.len());
+            let mut spans = Vec::new();
+            if start > 0 {
+                spans.push(HighlightSpan {
+                    range: 0..start,
+                    kind: HighlightKind::Argument,
+                });
+            }
+            if end > start {
+                spans.push(HighlightSpan {
+                    range: start..end,
+                    kind: HighlightKind::Error,
+                });
+            }
+            if end < line.len() {
+                spans.push(HighlightSpan {
+                    range: end..line.len(),
+                    kind: HighlightKind::Argument,
+                });
+            }
+            spans
+        }
+    }
+}
+
+fn highlight_tokens(line: &str, tokens: &[Token]) -> Vec<HighlightSpan> {
+    let mut classified = Vec::with_capacity(tokens.len());
+    let mut command_position = true;
+    let mut redirect_target = false;
+    for token in tokens {
+        let raw = line.get(token.start..token.end).unwrap_or_default();
+        let kind = match &token.kind {
+            TokenKind::Pipe
+            | TokenKind::And
+            | TokenKind::Or
+            | TokenKind::Semicolon
+            | TokenKind::Background => {
+                command_position = true;
+                HighlightKind::Operator
+            }
+            TokenKind::Redirect { .. } => {
+                redirect_target = true;
+                HighlightKind::Redirect
+            }
+            TokenKind::Word(word) => {
+                if command_position {
+                    command_position = false;
+                    HighlightKind::Command
+                } else if redirect_target {
+                    redirect_target = false;
+                    HighlightKind::PathLike
+                } else {
+                    classify_word(raw, word)
+                }
+            }
+        };
+        classified.push((token.start..token.end, kind));
+    }
+
+    let mut spans = Vec::with_capacity(classified.len().saturating_mul(2).saturating_add(1));
+    let mut cursor = 0;
+    for (range, kind) in classified {
+        if cursor < range.start {
+            spans.push(HighlightSpan {
+                range: cursor..range.start,
+                kind: HighlightKind::Argument,
+            });
+        }
+        spans.push(HighlightSpan {
+            range: range.clone(),
+            kind,
+        });
+        cursor = range.end;
+    }
+    if cursor < line.len() {
+        spans.push(HighlightSpan {
+            range: cursor..line.len(),
+            kind: HighlightKind::Argument,
+        });
+    }
+    spans
+}
+
+fn classify_word(raw: &str, word: &Word) -> HighlightKind {
+    if word.parts.len() == 1 {
+        match word.parts[0].quoting {
+            Quoting::Single => return HighlightKind::StringSingle,
+            Quoting::Double => return HighlightKind::StringDouble,
+            Quoting::Escaped => return HighlightKind::Escaped,
+            Quoting::Unquoted => {}
+        }
+    }
+    if raw.starts_with('-') {
+        HighlightKind::Flag
+    } else if raw.contains("$(") || raw.contains("${") || raw.contains('$') {
+        HighlightKind::Expansion
+    } else if raw.parse::<f64>().is_ok() {
+        HighlightKind::Number
+    } else if raw.contains('/')
+        || raw.contains('~')
+        || raw.contains('*')
+        || raw.contains('?')
+        || raw.contains('[')
+    {
+        HighlightKind::PathLike
+    } else {
+        HighlightKind::Argument
+    }
 }
 
 /// Parse Quirl's quote-aware C1 command graph.
@@ -889,6 +1047,48 @@ pub fn classify(mode: Mode, input: &str) -> InteractiveLine<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn highlighting_is_sorted_non_overlapping_and_exhaustive_for_arbitrary_edits() {
+        let long = "x".repeat(4096);
+        let samples = [
+            "",
+            "git status",
+            "printf '%s' \"$HOME\" | tr a-z A-Z",
+            "unterminated 'quote",
+            "echo 👨‍👩‍👧‍👦 > ./out",
+            "a && b || c; d &",
+            "\0\u{1b}\u{85}",
+            long.as_str(),
+        ];
+        for sample in samples {
+            let spans = highlight(sample, Mode::Command);
+            let mut cursor = 0;
+            for span in spans {
+                assert_eq!(span.range.start, cursor, "gap or overlap for {sample:?}");
+                assert!(span.range.end >= span.range.start);
+                assert!(sample.is_char_boundary(span.range.start));
+                assert!(sample.is_char_boundary(span.range.end));
+                cursor = span.range.end;
+            }
+            assert_eq!(cursor, sample.len(), "incomplete coverage for {sample:?}");
+        }
+    }
+
+    #[test]
+    fn highlighting_reuses_lexer_operator_and_command_boundaries() {
+        let source = "printf '%s' value | tr a-z A-Z";
+        let spans = highlight(source, Mode::Command);
+        assert!(spans.iter().any(|span| {
+            span.kind == HighlightKind::Command && &source[span.range.clone()] == "printf"
+        }));
+        assert!(spans.iter().any(|span| {
+            span.kind == HighlightKind::Operator && &source[span.range.clone()] == "|"
+        }));
+        assert!(spans.iter().any(|span| {
+            span.kind == HighlightKind::Command && &source[span.range.clone()] == "tr"
+        }));
+    }
     use serde::Deserialize;
     use std::{collections::HashSet, process::Command};
 

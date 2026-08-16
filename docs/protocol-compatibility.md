@@ -24,21 +24,24 @@ security. Plugin file integrity continues to use SHA-256 and explicit grants.
 | Catalog cache | 4 | 2 | v2/v3 facts are assigned explicit lower-confidence defaults, then current builtins merge |
 | Plugin lock | 2 | 1 | Identity, sources, checksums, permissions, grants, and enable state are preserved; runtime schema identity is derived deterministically |
 | Recovery snapshot | 2 | 1 | Existing redacted output/errors are preserved; unavailable command/cwd/environment facts stay unavailable and replay is never inferred |
-| Lua config | 1 | legacy unversioned | Missing `schema_version` becomes 1 before Rust validation; explicit unknown/future versions fail |
+| Lua config | 2 | legacy unversioned (v0) | Missing `schema_version` and explicit v1 documents migrate deterministically to v2 defaults before Rust validation; explicit unknown/future versions fail |
 
-## Deliberate pre-1.0 surfaces
+## Deliberate 1.0 boundaries
 
 The freeze manifest names limitations rather than hiding them. Native command
-grammar v2 records the quote-aware Unix C1-core executor and explicit
-cross-platform C2 dialect islands. Here-documents, process substitution, and
-dialect control forms remain explicit reference islands, rather than an
-implied native compatibility promise. Picker and completion now use separately
-frozen asynchronous request/cancellation/response envelopes with bounded
-workers, deadlines, and stale-result suppression. The runner result remains
+grammar v2 records the quote-aware Linux/macOS C1-core executor and explicit C2
+dialect islands. Here-documents, process substitution, loops, functions,
+conditionals, and dialect control forms remain reference islands for 1.0,
+rather than an implied future native compatibility promise. Picker and
+completion use separately frozen asynchronous request/cancellation/response
+envelopes with bounded workers, deadlines, and stale-result suppression. The
+runner result remains
 text-only, Wasm remains validation-only, and the process-adapter v1 handshake
 is executable under its scoped launch grant. The MCP stdio surface freezes its
 bounded source-only tool set and keeps the modern 2026-07-28 discovery era
-strictly separate from explicitly negotiated legacy sessions. These contracts
-may be versioned again before the Phase 4 release gate is accepted.
-Windows suspend, differential conformance, performance, accessibility, and
-security evidence are tracked independently from schema identity.
+strictly separate from explicitly negotiated legacy sessions. Linux and macOS
+are the supported interactive platforms. Windows remains a best-effort portable
+process target, so native Windows terminal and suspend validation is not a 1.0
+release gate. Differential conformance, performance, accessibility, and
+security evidence remain independently tracked from schema identity. See
+[ADR 0010](decisions/0010-unix-first-release-scope.md).

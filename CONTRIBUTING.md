@@ -1,0 +1,102 @@
+# Contributing to Quirl
+
+Thanks for helping make Quirl a better shell. Quirl is a fast-moving Rust
+prototype with a deliberately narrow Unix-first support contract. Small,
+well-tested changes that extend an existing pattern are especially welcome.
+
+## Before you start
+
+- Read [`AGENTS.md`](AGENTS.md) for the crate layering, error, Lua sandbox,
+  generated-artifact, and test rules. These rules apply to human and automated
+  contributions alike.
+- Check the relevant architecture decisions in
+  [`docs/decisions`](docs/decisions) before changing a settled boundary.
+- Use a public issue or discussion for product proposals. Report suspected
+  vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md).
+
+Quirl targets Linux and macOS for interactive use. Windows portability is kept
+contract-tested on a best-effort basis, but native Windows terminal behavior is
+not a release gate. The exact boundary is recorded in
+[ADR 0010](docs/decisions/0010-unix-first-release-scope.md).
+
+## Set up the workspace
+
+Install [Rustup](https://rustup.rs). The repository's `rust-toolchain.toml`
+selects Rust 1.88; Cargo builds the repository-local `xtask`, and no separate
+task runner or system Lua installation is needed. The Unix quality gate also
+uses Python 3's standard library for its real-PTY torture harness; it installs
+no Python packages.
+
+```sh
+git clone git@github.com:niklas-heer/quirl.git
+cd quirl
+cargo xtask check
+cargo run -p quirl-cli
+```
+
+`cargo xtask check` is the canonical local gate and must pass before every
+commit. It checks formatting, Quirl source formatting, Clippy, all workspace
+tests, the real-PTY interaction matrix on Unix, and the guest-side Lua tests.
+Generated shell cases use a stable seed; replay or expand them with
+`cargo xtask test --seed <seed> --cases <count>`. The complete layered strategy
+is in [`docs/testing-strategy.md`](docs/testing-strategy.md). The project
+intentionally does not use CI while its traffic is low, so include the local
+result in your pull request.
+
+Useful focused tasks are typed Rust subcommands in [`xtask`](xtask/src/main.rs):
+
+```sh
+cargo xtask fmt
+cargo xtask lint
+cargo xtask test
+cargo xtask demo
+```
+
+The release recording is intentionally separate: `cargo xtask demo-record <sha256>`
+consumes the already-built candidate only after verifying its digest and local
+VHS/font prerequisites. It never rebuilds the artifact during capture.
+
+## Make a change
+
+- Put functionality in the lowest crate that can own it; never invert the
+  dependency graph to make a change compile.
+- Reuse `quirl_core::ShellError`, `LuaPolicy`, `HOST_API`, and
+  `Catalog::builtin()` rather than introducing parallel mechanisms.
+- Keep tests beside the implementation in `#[cfg(test)] mod tests`, and name
+  them as behavior sentences in snake case.
+- Add adversarial tests for sandbox, resource-limit, terminal-safety, or parser
+  boundary changes.
+- Add a frozen regression before fixing a generated or differential failure,
+  and include its seed and case index in the change description.
+- Do not hand-edit `docs/quirl.lua`. Change `HOST_API`, run `cargo xtask sdk`, and
+  check in the regenerated file with its source change.
+- Do not add a feature flag, dependency edge, `unsafe` block, or significant
+  architecture choice without documenting why it belongs.
+
+For user-visible behavior, check both a normal terminal and the text fallback
+where practical:
+
+```sh
+NO_COLOR=1 cargo xtask demo
+TERM=dumb NO_COLOR=1 cargo xtask demo
+```
+
+Prompt glyphs and color must remain decorative; state and diagnostics need a
+legible plain-text representation.
+
+## Send the change
+
+Use a present-tense [Conventional Commit](https://www.conventionalcommits.org/)
+subject, optionally scoped, such as `fix(lua): bound completion output`.
+Keep commits focused and avoid unrelated generated or formatting churn.
+
+A pull request should say:
+
+- what user or developer problem it solves;
+- which public contract, security boundary, or generated artifact it changes;
+- what was tested, including the `cargo xtask check` result;
+- what remains intentionally out of scope.
+
+Release work follows [`docs/release-checklist.md`](docs/release-checklist.md).
+Passing an older commit or a rebuilt artifact is not evidence for the current
+release candidate.

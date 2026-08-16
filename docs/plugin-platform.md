@@ -1,8 +1,10 @@
 # Plugin platform v0.1
 
 Quirl's first platform contract installs local plugin packages under an
-explicit permission lock. It is a Phase 3 vertical slice, not a claim that all
-Phase 3 deliverables are complete.
+explicit permission lock. The Phase 3 platform slice is complete: managed
+trusted Lua runs under exact grants, out-of-process adapters execute a narrow
+bounded initialization handshake, and Wasm packages are validated but remain
+disabled until a production component runtime is selected.
 
 ## Lifecycle
 

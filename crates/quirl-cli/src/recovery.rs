@@ -595,6 +595,34 @@ fn is_secret_key(key: &str) -> bool {
     .any(|marker| key.contains(marker))
 }
 
+fn is_secret_parameter(key: &str) -> bool {
+    let key = key.to_ascii_lowercase().replace(['-', '.'], "_");
+    matches!(
+        key.as_str(),
+        "token"
+            | "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "api_key"
+            | "apikey"
+            | "client_secret"
+            | "secret"
+            | "password"
+            | "passwd"
+            | "authorization"
+            | "auth"
+            | "signature"
+            | "sig"
+            | "x_amz_signature"
+    ) || key.ends_with("_token")
+        || key.ends_with("_secret")
+        || key.ends_with("_password")
+        || key.ends_with("_passwd")
+        || key.ends_with("_api_key")
+        || key.ends_with("_auth")
+        || key.ends_with("_signature")
+}
+
 fn redact_text(value: &str, secrets: &BTreeSet<String>) -> String {
     let mut redacted = value.to_owned();
     for secret in secrets {
@@ -604,14 +632,47 @@ fn redact_text(value: &str, secrets: &BTreeSet<String>) -> String {
     let mut rendered = String::with_capacity(redacted.len());
     let mut cursor = 0;
     let mut redact_next = false;
+    let mut authorization_scheme_next = false;
+    let mut authorization_credential_next = false;
+    let mut redact_authorization_line = false;
     for (start, end) in spans {
-        rendered.push_str(&redacted[cursor..start]);
+        let separator = &redacted[cursor..start];
+        rendered.push_str(separator);
+        if separator.contains(['\n', '\r']) {
+            redact_next = false;
+            authorization_scheme_next = false;
+            authorization_credential_next = false;
+            redact_authorization_line = false;
+        }
         let token = &redacted[start..end];
-        if redact_next {
+        if redact_authorization_line {
+            rendered.push_str(&redacted_token(token));
+        } else if authorization_credential_next {
+            rendered.push_str(&redacted_token(token));
+            authorization_credential_next = false;
+        } else if authorization_scheme_next {
+            authorization_scheme_next = false;
+            match authorization_scheme(token) {
+                Some("digest") => {
+                    rendered.push_str(token);
+                    redact_authorization_line = true;
+                }
+                Some(_) => {
+                    rendered.push_str(token);
+                    authorization_credential_next = true;
+                }
+                None => rendered.push_str(&redacted_token(token)),
+            }
+        } else if is_authorization_header_marker(token) {
+            rendered.push_str(token);
+            authorization_scheme_next = true;
+        } else if redact_next {
             rendered.push_str(&redacted_token(token));
             redact_next = false;
+        } else if let Some(structured) = redact_structured_token(token) {
+            rendered.push_str(&structured);
         } else if let Some((key, value)) = token.split_once('=') {
-            if is_secret_key(key.trim_start_matches('-')) {
+            if !key.contains("://") && is_secret_parameter(key.trim_start_matches('-')) {
                 rendered.push_str(key);
                 rendered.push('=');
                 rendered.push_str(&redacted_token(value));
@@ -620,12 +681,142 @@ fn redact_text(value: &str, secrets: &BTreeSet<String>) -> String {
             }
         } else {
             rendered.push_str(token);
-            redact_next = is_secret_key(token.trim_start_matches('-'));
+            redact_next = is_secret_parameter(token.trim_start_matches('-'));
         }
         cursor = end;
     }
     rendered.push_str(&redacted[cursor..]);
     rendered
+}
+
+fn authorization_scheme(token: &str) -> Option<&str> {
+    let token = token.trim_matches(['\'', '"']).to_ascii_lowercase();
+    match token.as_str() {
+        "basic" => Some("basic"),
+        "bearer" => Some("bearer"),
+        "digest" => Some("digest"),
+        "negotiate" => Some("negotiate"),
+        "aws4-hmac-sha256" => Some("aws4-hmac-sha256"),
+        _ => None,
+    }
+}
+
+fn is_authorization_header_marker(token: &str) -> bool {
+    matches!(
+        token
+            .trim_matches(['\'', '"'])
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "authorization:" | "proxy-authorization:"
+    )
+}
+
+fn redact_structured_token(token: &str) -> Option<String> {
+    let redacted_url = redact_url_credentials(token);
+    if redacted_url != token {
+        return Some(redacted_url);
+    }
+    if contains_embedded_authorization_header(token) || looks_like_common_secret(token) {
+        return Some(redacted_token(token));
+    }
+    None
+}
+
+fn contains_embedded_authorization_header(token: &str) -> bool {
+    let lowercase = token.to_ascii_lowercase();
+    lowercase.contains("authorization:") || lowercase.contains("proxy-authorization:")
+}
+
+fn looks_like_common_secret(token: &str) -> bool {
+    let token = token.trim_matches(|character: char| {
+        character.is_ascii_whitespace()
+            || matches!(character, '\'' | '"' | ',' | ';' | '(' | ')' | '[' | ']')
+    });
+    let strong_prefix = [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "github_pat_",
+        "glpat-",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxr-",
+        "sk_live_",
+        "sk_test_",
+        "rk_live_",
+        "rk_test_",
+    ]
+    .iter()
+    .any(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 8);
+    let aws_access_key = token.len() == 20
+        && token.starts_with("AKIA")
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit());
+    let jwt = token.len() >= 32
+        && token.starts_with("eyJ")
+        && token.split('.').count() == 3
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    strong_prefix || aws_access_key || jwt
+}
+
+fn redact_url_credentials(token: &str) -> String {
+    let Some(scheme) = token.find("://") else {
+        return token.to_owned();
+    };
+    let authority_start = scheme + 3;
+    let authority_end = token[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(token.len(), |offset| authority_start + offset);
+    let mut ranges = Vec::new();
+    if let Some(at_offset) = token[authority_start..authority_end].rfind('@') {
+        let at = authority_start + at_offset;
+        if let Some(colon_offset) = token[authority_start..at].find(':') {
+            ranges.push((authority_start + colon_offset + 1, at));
+        }
+    }
+    if let Some(query_offset) = token[authority_end..].find('?') {
+        let mut parameter_start = authority_end + query_offset + 1;
+        while parameter_start < token.len() {
+            let parameter_end = token[parameter_start..]
+                .find(['&', ';', '#', '\'', '"'])
+                .map_or(token.len(), |offset| parameter_start + offset);
+            if let Some(equal_offset) = token[parameter_start..parameter_end].find('=') {
+                let equal = parameter_start + equal_offset;
+                if is_secret_parameter(&token[parameter_start..equal]) && equal + 1 < parameter_end
+                {
+                    ranges.push((equal + 1, parameter_end));
+                }
+            }
+            if parameter_end >= token.len()
+                || matches!(token.as_bytes()[parameter_end], b'#' | b'\'' | b'"')
+            {
+                break;
+            }
+            parameter_start = parameter_end + 1;
+        }
+    }
+    if ranges.is_empty() {
+        return token.to_owned();
+    }
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut output = String::with_capacity(token.len());
+    let mut cursor = 0;
+    for (start, end) in ranges {
+        if start < cursor {
+            continue;
+        }
+        output.push_str(&token[cursor..start]);
+        output.push_str("[redacted]");
+        cursor = end;
+    }
+    output.push_str(&token[cursor..]);
+    output
 }
 
 fn shell_token_spans(value: &str) -> Vec<(usize, usize)> {
@@ -1005,5 +1196,46 @@ mod tests {
             ErrorCode::ResourceLimit
         );
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn structured_redaction_covers_headers_urls_and_common_token_shapes() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature_part";
+        let source = format!(
+            "Authorization: Bearer {jwt}\n\
+             Proxy-Authorization: Basic dXNlcjpwYXNzd29yZA==\n\
+             Authorization: opaque-without-scheme\n\
+             Authorization: Digest username=mufasa realm=test response=digest-secret\n\
+             curl -H 'Authorization: Bearer ghp_abcdefghijklmnop' \
+             'https://alice:hunter2@example.com/path?access_token=query-secret&safe=visible' \
+             xoxb-12345678-secret sk_live_123456789 tokenize=true"
+        );
+        let redacted = redact_text(&source, &BTreeSet::new());
+
+        for secret in [
+            jwt,
+            "dXNlcjpwYXNzd29yZA==",
+            "opaque-without-scheme",
+            "mufasa",
+            "digest-secret",
+            "ghp_abcdefghijklmnop",
+            "hunter2",
+            "query-secret",
+            "xoxb-12345678-secret",
+            "sk_live_123456789",
+        ] {
+            assert!(!redacted.contains(secret), "secret remained: {secret}");
+        }
+        assert!(redacted.contains("Authorization: Bearer [redacted]"));
+        assert!(redacted.contains("https://alice:[redacted]@example.com"));
+        assert!(redacted.contains("safe=visible"));
+        assert!(redacted.contains("tokenize=true"));
+    }
+
+    #[test]
+    fn structured_redaction_leaves_uncredentialed_urls_and_ordinary_ids_intact() {
+        let source =
+            "https://example.com/search?tokenize=true&signature_style=compact issue.AKIA.short";
+        assert_eq!(redact_text(source, &BTreeSet::new()), source);
     }
 }

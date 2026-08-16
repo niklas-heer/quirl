@@ -29,10 +29,12 @@ const DEFAULT_PROMPT_DEADLINE_MS: u64 = 8;
 const MAX_CALLBACK_DEADLINE_MS: u64 = 100;
 const COMPLETION_CALLBACK_DEADLINE: Duration = Duration::from_millis(50);
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+const MAX_LUA_COMPLETION_RESULTS: usize = 1_000;
+const MAX_LUA_COMPLETION_ITEM_BYTES: usize = 16 * 1024;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 pub const CONFIG_OLDEST_READABLE_VERSION: u32 = 0;
 pub const MAX_LUA_SOURCE_BYTES: usize = 4 * 1024 * 1024;
-pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@1{QuirlConfig{deny_unknown;schema_version:u32(default=1,legacy-absent=0-migrates-to-1);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default)};EditorConfig{deny_unknown;keymap:helix|emacs|vim(default=helix);semantic_hints:bool(default=true)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;left:array<string>(default=directory,git_branch);right:array<string>(default=jobs,duration,status)};migration:unversioned-table-to-v1}";
+pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@2{QuirlConfig{deny_unknown;schema_version:u32(default=2,legacy=0|1-migrates-to-2);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=full)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);statusline:StatuslineConfig(default)};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=false);min_chars:u16(0..=4096,default=2)};migration:unversioned-or-v1-to-v2}";
 
 pub fn config_schema_hash() -> String {
     quirl_core::schema_fingerprint(CONFIG_SCHEMA_DESCRIPTOR)
@@ -83,6 +85,10 @@ pub struct QuirlConfig {
     pub picker: PickerConfig,
     #[serde(default)]
     pub prompt: PromptConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
+    #[serde(default)]
+    pub completion: CompletionConfig,
 }
 
 impl Default for QuirlConfig {
@@ -92,6 +98,8 @@ impl Default for QuirlConfig {
             editor: EditorConfig::default(),
             picker: PickerConfig::default(),
             prompt: PromptConfig::default(),
+            ui: UiConfig::default(),
+            completion: CompletionConfig::default(),
         }
     }
 }
@@ -105,13 +113,15 @@ const fn default_config_schema_version() -> u32 {
 pub struct EditorConfig {
     pub keymap: String,
     pub semantic_hints: bool,
+    pub banner: String,
 }
 
 impl Default for EditorConfig {
     fn default() -> Self {
         Self {
-            keymap: "helix".to_owned(),
+            keymap: "emacs".to_owned(),
             semantic_hints: true,
+            banner: "full".to_owned(),
         }
     }
 }
@@ -135,19 +145,73 @@ impl Default for PickerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PromptConfig {
+    /// Visual symbol profile. `auto` uses broadly supported Unicode and never
+    /// assumes a patched font; `nerd_font` is an explicit opt-in.
+    pub symbols: String,
     pub left: Vec<String>,
     pub right: Vec<String>,
+    pub transient: bool,
 }
 
 impl Default for PromptConfig {
     fn default() -> Self {
         Self {
-            left: vec!["directory".to_owned(), "git_branch".to_owned()],
+            symbols: "auto".to_owned(),
+            left: vec![
+                "directory".to_owned(),
+                "git_branch".to_owned(),
+                "git_state".to_owned(),
+            ],
             right: vec![
                 "jobs".to_owned(),
                 "duration".to_owned(),
                 "status".to_owned(),
             ],
+            transient: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiConfig {
+    pub surface: String,
+    pub statusline: StatuslineConfig,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            surface: "auto".to_owned(),
+            statusline: StatuslineConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatuslineConfig {
+    pub hints: bool,
+}
+
+impl Default for StatuslineConfig {
+    fn default() -> Self {
+        Self { hints: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CompletionConfig {
+    pub auto: bool,
+    pub min_chars: u16,
+}
+
+impl Default for CompletionConfig {
+    fn default() -> Self {
+        Self {
+            auto: false,
+            min_chars: 2,
         }
     }
 }
@@ -169,10 +233,38 @@ impl QuirlConfig {
                 "editor.keymap must be `helix`, `emacs`, or `vim`",
             ));
         }
+        if !matches!(self.editor.banner.as_str(), "full" | "compact" | "none") {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "editor.banner must be `full`, `compact`, or `none`",
+            )
+            .with_help("Use `full` for the welcome and shortcuts, `compact` for one line, or `none` to hide it"));
+        }
         if !matches!(self.picker.layout.as_str(), "adaptive" | "bottom" | "full") {
             return Err(validation_error(
                 source,
                 "picker.layout must be `adaptive`, `bottom`, or `full`",
+            ));
+        }
+        if !matches!(
+            self.prompt.symbols.as_str(),
+            "auto" | "plain" | "unicode" | "nerd_font"
+        ) {
+            return Err(validation_error(
+                source,
+                "prompt.symbols must be `auto`, `plain`, `unicode`, or `nerd_font`",
+            ));
+        }
+        if !matches!(self.ui.surface.as_str(), "auto" | "rich" | "simple") {
+            return Err(validation_error(
+                source,
+                "ui.surface must be `auto`, `rich`, or `simple`",
+            ));
+        }
+        if self.completion.min_chars > 4096 {
+            return Err(validation_error(
+                source,
+                "completion.min_chars must be at most 4096",
             ));
         }
         Ok(())
@@ -557,12 +649,15 @@ impl LuaRuntime {
             .set_name(path.to_string_lossy())
             .eval::<Value>()
             .map_err(|error| lua_error(error, Some(path), source.len()))?;
-        let config = self.lua.from_value::<QuirlConfig>(value).map_err(|error| {
+        let mut config = self.lua.from_value::<QuirlConfig>(value).map_err(|error| {
             validation_error(
                 &path.display().to_string(),
                 format!("configuration does not match the Rust schema: {error}"),
             )
         })?;
+        if config.schema_version < CONFIG_SCHEMA_VERSION {
+            config.schema_version = CONFIG_SCHEMA_VERSION;
+        }
         config.validate(&path.display().to_string())?;
         Ok(config)
     }
@@ -573,7 +668,26 @@ impl LuaRuntime {
     )]
     pub fn load_plugin_file(&self, path: &Path) -> Result<PluginRegistrations, ShellError> {
         let source = read_source(path)?;
-        lint_source(&source, path)?;
+        self.load_plugin_source(&source, &path.display().to_string())
+    }
+
+    /// Load a plugin from an immutable source snapshot.
+    ///
+    /// Managed plugin hosts use this after verifying locked bytes so an
+    /// attacker cannot replace the file between integrity verification and
+    /// execution.
+    #[allow(
+        clippy::expect_used,
+        reason = "a poisoned plugin registry mutex may contain inconsistent registrations after a host callback panic"
+    )]
+    pub fn load_plugin_source(
+        &self,
+        source: &str,
+        source_name: &str,
+    ) -> Result<PluginRegistrations, ShellError> {
+        let path = Path::new(source_name);
+        validate_source_length(source, path)?;
+        lint_source(source, path)?;
         self.registrations
             .lock()
             .expect("plugin registration mutex poisoned")
@@ -595,8 +709,8 @@ impl LuaRuntime {
             .take();
         self.reset_budget();
         self.lua
-            .load(&source)
-            .set_name(path.to_string_lossy())
+            .load(source)
+            .set_name(source_name)
             .exec()
             .map_err(|error| lua_error(error, Some(path), source.len()))?;
         let registrations = self
@@ -1320,7 +1434,7 @@ pub fn format_file(path: &Path, check: bool) -> Result<bool, ShellError> {
 
 pub fn sdk_lua() -> String {
     let mut output = String::from(
-        "---@meta quirl\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? string\n\n---@class quirl.Config\n---@field schema_version integer\n---@field editor table\n---@field picker table\n---@field prompt table\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
+        "---@meta quirl\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? string\n\n---@alias quirl.PromptSymbols 'auto'|'plain'|'unicode'|'nerd_font'\n---@alias quirl.WelcomeBanner 'full'|'compact'|'none'\n---@alias quirl.Surface 'auto'|'rich'|'simple'\n\n---@class quirl.EditorConfig\n---@field keymap? 'emacs'|'vim'|'helix' Emacs is the complete default.\n---@field semantic_hints? boolean\n---@field banner? quirl.WelcomeBanner\n\n---@class quirl.PickerConfig\n---@field layout? 'adaptive'|'bottom'|'full'\n---@field preview? boolean\n\n---@class quirl.PromptConfig\n---@field symbols? quirl.PromptSymbols Auto never assumes a patched font; nerd_font enables Powerline glyphs explicitly.\n---@field left? string[] Ordered prompt segments before the input.\n---@field right? string[] Ordered prompt segments aligned on the right.\n---@field transient? boolean Collapse accepted input to one scrollback line before execution.\n\n---@class quirl.StatuslineConfig\n---@field hints? boolean\n\n---@class quirl.UiConfig\n---@field surface? quirl.Surface\n---@field statusline? quirl.StatuslineConfig\n\n---@class quirl.CompletionConfig\n---@field auto? boolean\n---@field min_chars? integer\n\n---@class quirl.Config\n---@field schema_version? integer\n---@field editor? quirl.EditorConfig\n---@field picker? quirl.PickerConfig\n---@field prompt? quirl.PromptConfig\n---@field ui? quirl.UiConfig\n---@field completion? quirl.CompletionConfig\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
     );
     for spec in HOST_API {
         output.push_str(&format!("---{}\n", spec.summary));
@@ -1877,9 +1991,20 @@ fn validate_completion_result(value: &serde_json::Value, command: &str) -> Resul
             "completion provider must return an array",
         ));
     };
+    if items.len() > MAX_LUA_COMPLETION_RESULTS {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!("completion provider `{command}` returned too many items"),
+        )
+        .with_context(format!(
+            "items: {}; limit: {MAX_LUA_COMPLETION_RESULTS}",
+            items.len()
+        ))
+        .with_help("Return the most relevant completion items and keep the result bounded"));
+    }
     for (index, item) in items.iter().enumerate() {
-        match item {
-            serde_json::Value::String(_) => {}
+        let retained_bytes = match item {
+            serde_json::Value::String(value) => value.len(),
             serde_json::Value::Object(object)
                 if object
                     .get("value")
@@ -1887,7 +2012,14 @@ fn validate_completion_result(value: &serde_json::Value, command: &str) -> Resul
                     && object.iter().all(|(key, value)| match key.as_str() {
                         "value" | "display" | "summary" | "detail" => value.is_string(),
                         _ => false,
-                    }) => {}
+                    }) =>
+            {
+                object
+                    .values()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::len)
+                    .sum()
+            }
             _ => {
                 return Err(validation_error(
                     command,
@@ -1896,6 +2028,16 @@ fn validate_completion_result(value: &serde_json::Value, command: &str) -> Resul
                     ),
                 ));
             }
+        };
+        if retained_bytes > MAX_LUA_COMPLETION_ITEM_BYTES {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                format!("completion item {index} from `{command}` is too large"),
+            )
+            .with_context(format!(
+                "bytes: {retained_bytes}; limit: {MAX_LUA_COMPLETION_ITEM_BYTES}"
+            ))
+            .with_help("Shorten completion display, summary, and detail text"));
         }
     }
     Ok(())
@@ -2303,10 +2445,26 @@ mod tests {
         config.validate("test").unwrap();
         assert_eq!(config.editor.keymap, "helix");
         assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.prompt.symbols, "auto");
     }
 
     #[test]
-    fn legacy_unversioned_config_migrates_to_v1_and_future_versions_fail() {
+    fn prompt_symbol_profile_requires_an_explicit_known_value() {
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let value = runtime
+            .lua
+            .load("return quirl.config { prompt = { symbols = 'patched_magic' } }")
+            .eval::<Value>()
+            .unwrap();
+        let config = runtime.lua.from_value::<QuirlConfig>(value).unwrap();
+        let error = config.validate("symbols.lua").unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.details.context[0].contains("prompt.symbols"));
+    }
+
+    #[test]
+    fn legacy_unversioned_config_migrates_to_v2_and_future_versions_fail() {
         let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
         let legacy = runtime
             .lua
@@ -2319,7 +2477,7 @@ mod tests {
 
         let future = runtime
             .lua
-            .load("return quirl.config { schema_version = 2 }")
+            .load("return quirl.config { schema_version = 3 }")
             .eval::<Value>()
             .unwrap();
         let future = runtime.lua.from_value::<QuirlConfig>(future).unwrap();
@@ -2329,8 +2487,20 @@ mod tests {
     #[test]
     fn config_schema_descriptor_has_a_stable_identity() {
         assert_eq!(CONFIG_OLDEST_READABLE_VERSION, 0);
-        assert!(CONFIG_SCHEMA_DESCRIPTOR.contains("migration:unversioned-table-to-v1"));
+        assert!(CONFIG_SCHEMA_DESCRIPTOR.contains("migration:unversioned-or-v1-to-v2"));
         assert!(config_schema_hash().starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn welcome_banner_rejects_unknown_profiles() {
+        let mut config = QuirlConfig::default();
+        config.editor.banner = "sometimes".to_owned();
+
+        let error = config.validate("config.lua").unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("editor.banner"));
+        assert!(error.details.help[0].contains("compact"));
     }
 
     #[test]
@@ -2724,6 +2894,23 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
         assert!(error.details.context[0].contains("completion item 0"));
+    }
+
+    #[test]
+    fn completion_results_reject_excess_items_and_retained_text() {
+        let too_many = serde_json::Value::Array(
+            (0..=MAX_LUA_COMPLETION_RESULTS)
+                .map(|_| serde_json::Value::String("value".to_owned()))
+                .collect(),
+        );
+        let error = validate_completion_result(&too_many, "bounded").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.message.contains("too many items"));
+
+        let too_large = serde_json::json!(["x".repeat(MAX_LUA_COMPLETION_ITEM_BYTES + 1)]);
+        let error = validate_completion_result(&too_large, "bounded").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.message.contains("too large"));
     }
 
     #[test]

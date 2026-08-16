@@ -528,20 +528,32 @@ fn measure_pty_sample(
     let started = Instant::now();
     let mut session = PtySession::spawn(path, fixture)?;
     let result = (|| {
-        session.wait_for_screen("❯", timeout, "first command prompt")?;
+        // The welcome banner also teaches with a prompt glyph, so `❯` alone
+        // does not prove that the rich editor has entered raw mode. The
+        // textual status row is the accessibility contract for an editable
+        // command frame and cannot be confused with terminal echo.
+        session.wait_for_screen(
+            "command · Alt-M mode",
+            timeout,
+            "first editable command frame",
+        )?;
         let prompt_paint = started.elapsed();
 
-        // A single character establishes that the newly painted editor accepts
-        // input without turning the readiness probe into a multi-key paste
-        // benchmark (which Reedline intentionally batches).
-        // `~` appears in home paths; `^` is not legal in typical path or prompt text.
-        let marker = "^";
+        // A short marker establishes that the newly painted editor accepts
+        // input. Avoid `^`: the rich status bar legitimately renders `^K` and
+        // `^R` after the onboarding frame, which would make the readiness
+        // probe succeed before the editor buffer itself was painted.
+        let marker = "qz";
         session.assert_absent(marker, "editable prompt marker")?;
         session.send(marker.as_bytes())?;
         session.wait_for_screen(marker, timeout, "editable prompt marker")?;
         let cold_to_editable = started.elapsed();
 
-        session.send(b"\x15")?;
+        // Ctrl-C provides an observable acknowledgement that the first editor
+        // frame consumed the marker and reset its buffer. Waiting for `^C`
+        // avoids racing a multi-chunk terminal diff before the timed edit.
+        session.send(b"\x03")?;
+        session.wait_for_screen("^C", timeout, "editor reset")?;
         let baseline = "git commit --amen";
         session.send(baseline.as_bytes())?;
         session.wait_for_screen(baseline, timeout, "representative edit baseline")?;
@@ -600,6 +612,14 @@ impl PtySession {
         let mut command = CommandBuilder::new(path);
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
+        command.env(
+            "LC_ALL",
+            if cfg!(target_os = "macos") {
+                "en_US.UTF-8"
+            } else {
+                "C.UTF-8"
+            },
+        );
         command.env_remove("NO_COLOR");
         command.env("QUIRL_CONFIG_DIR", &fixture.config_dir);
         command.env("QUIRL_HISTORY", &fixture.history);

@@ -73,7 +73,7 @@ Accepted costs:
 - The local configuration editor must patch supported literal forms conservatively
   and treat computed expressions as code-controlled.
 
-## Next implementation milestone
+## Original implementation milestone (complete)
 
 Build one vertical slice and remove the existing prototype runtime:
 
@@ -130,11 +130,13 @@ The initial vertical slice landed with this decision:
   and benchmark executable paths have been removed. It remains mentioned only
   in historical evaluation evidence documenting why Lua was selected.
 
-The Phase 0 integration step is complete: live atomic reload, selected UI
-settings, and the focused data grammar are wired into the running session. The
-next product milestone is the Phase 1 shell preview: durable history and picker
-state, redirects and job control, broader completion ingestion, and portable
-plain fallbacks.
+The Phase 0 integration step and the subsequent Preview, Scriptable, Platform,
+and review-evidence phases are complete. Live atomic reload, UI settings, the
+focused data grammar, durable history and picker state, redirects and Unix job
+control, completion ingestion, authoring tools, plugin boundaries, and portable
+plain fallbacks are wired into the product. Current release scope and remaining
+gates live in the [release checklist](../release-checklist.md), not in this
+historical runtime-selection ADR.
 
 ## Revisit conditions
 

@@ -5,11 +5,43 @@
 ---@field value? any
 ---@field error? string
 
+---@alias quirl.PromptSymbols 'auto'|'plain'|'unicode'|'nerd_font'
+---@alias quirl.WelcomeBanner 'full'|'compact'|'none'
+---@alias quirl.Surface 'auto'|'rich'|'simple'
+
+---@class quirl.EditorConfig
+---@field keymap? 'emacs'|'vim'|'helix' Emacs is the complete default.
+---@field semantic_hints? boolean
+---@field banner? quirl.WelcomeBanner
+
+---@class quirl.PickerConfig
+---@field layout? 'adaptive'|'bottom'|'full'
+---@field preview? boolean
+
+---@class quirl.PromptConfig
+---@field symbols? quirl.PromptSymbols Auto never assumes a patched font; nerd_font enables Powerline glyphs explicitly.
+---@field left? string[] Ordered prompt segments before the input.
+---@field right? string[] Ordered prompt segments aligned on the right.
+---@field transient? boolean Collapse accepted input to one scrollback line before execution.
+
+---@class quirl.StatuslineConfig
+---@field hints? boolean
+
+---@class quirl.UiConfig
+---@field surface? quirl.Surface
+---@field statusline? quirl.StatuslineConfig
+
+---@class quirl.CompletionConfig
+---@field auto? boolean
+---@field min_chars? integer
+
 ---@class quirl.Config
----@field schema_version integer
----@field editor table
----@field picker table
----@field prompt table
+---@field schema_version? integer
+---@field editor? quirl.EditorConfig
+---@field picker? quirl.PickerConfig
+---@field prompt? quirl.PromptConfig
+---@field ui? quirl.UiConfig
+---@field completion? quirl.CompletionConfig
 
 ---@class quirl.PromptSegment
 ---@field name string

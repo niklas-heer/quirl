@@ -1,7 +1,7 @@
 # Quirl v0.1 security and accessibility release audit
 
-Date: 2026-08-15
-Scope: Phase 4 release candidate
+Date: 2026-08-16
+Scope: Linux/macOS v0.1 release candidate plus portable Windows contracts
 Result: pass for the v0.1 prototype, with the explicit residual risks below
 
 This audit treats Lua source, plugin packages and registrations, child-process
@@ -11,20 +11,27 @@ escape, terminal-control injection, cancellation, and text-only operation. It
 does not claim that a trusted local plugin is isolated from the Quirl process;
 that is deliberately not the `trusted_lua` contract.
 
+Linux and macOS are the supported interactive platforms. Windows evidence in
+this audit covers cross-compilation and portable contract behavior only; it is
+not a claim of native terminal validation or a Windows release gate. See
+[ADR 0010](decisions/0010-unix-first-release-scope.md).
+The rich/default and simple/fallback terminal split follows
+[ADR 0012](decisions/0012-ratatui-interactive-surface.md).
+
 ## Release evidence
 
 | Boundary | Enforced v0.1 property | Adversarial evidence |
 | --- | --- | --- |
 | Lua VM | Restricted standard library; typed deny-unknown registrations; exact grants; memory, instruction, callback, wall-time, and cancellation budgets | `quirl-lua` tests for unavailable modules, unknown fields, scoped process grants, deadlines, cancellation recovery, return shapes, and oversized source |
 | Script input | File and stdin source is UTF-8 and at most 4 MiB before parsing or Lua compilation | `oversized_source_is_rejected_before_lua_compilation`; `script_reader_rejects_source_beyond_the_runtime_limit` |
-| Plugin package | Manifest is at most 256 KiB; entry is at most 4 MiB; lexical parent traversal, absolute paths, and canonical symlink escapes are rejected | `plugin_entry_symlink_cannot_escape_package_directory`; `managed_activation_rejects_checksum_matching_entry_symlink_escape`; oversized manifest/entry tests |
+| Plugin package | Manifest is at most 256 KiB; entry is at most 4 MiB; lexical parent traversal, absolute paths, and canonical symlink escapes are rejected; trusted Lua executes the verified bytes, and Unix process adapters launch a private staged snapshot of those bytes | `plugin_entry_symlink_cannot_escape_package_directory`; `managed_activation_rejects_checksum_matching_entry_symlink_escape`; `managed_activation_executes_the_exact_bytes_that_passed_integrity_verification`; `isolated_adapter_executes_the_verified_snapshot_after_package_replacement`; oversized manifest/entry tests |
 | Plugin capability boundary | Requested/granted capabilities are sorted, validated, locked, and checked again at each Lua host callback; scoped process grants reject shell operators and control characters | plugin manifest/lock capability tests and `scoped_process_capability_cannot_smuggle_shell_syntax` |
-| Native/reference process | Unix process groups and Windows Job Objects contain normal child lifecycles; cancellation is direct; Bash/Zsh reference output retains only a 64 KiB window per stream with exact discard counts | `quirl-process` backend contract/job tests and script reference-runner bounded capture/cancellation tests |
-| Recovery | Snapshot capture is truncated before persistence; reads and files are bounded; count/byte retention is enforced; secret-like values are redacted; text display neutralizes ANSI, OSC, C1, CR, and BEL; symlink escapes are rejected | recovery atomic/bounds/redaction, ANSI/OSC, retention, oversized-read, ID traversal, and symlink tests |
+| Native/reference process | Unix process groups and Windows Job Objects contain normal child lifecycles; interactive native output streams directly to the terminal; programmatic native capture retains at most 1 MiB per stream and drains excess with exact discard accounting; Bash/Zsh reference capture retains 64 KiB per stream | `quirl-process` backend contract/job, interactive streaming, and bounded-capture tests plus script reference-runner bounded capture/cancellation tests |
+| Recovery | Snapshot capture is truncated before persistence; reads and files are bounded; count/byte retention is enforced; environment/argument secrets, authorization headers, credentialed URLs, and high-confidence token shapes are redacted; text display neutralizes ANSI, OSC, C1, CR, and BEL; symlink escapes are rejected | recovery atomic/bounds/structured-redaction, ANSI/OSC, retention, oversized-read, ID traversal, and symlink tests |
 | Events and live views | Typed deny-unknown event documents, strictly increasing sequences, action capability validation, callback deadlines, 4 MiB trace input, bounded live buffers, and cooperative cancellation | core event/action tests, event trace bound/order tests, UI live-buffer cancellation test |
 | Picker input | Standard input is UTF-8, at most 4 MiB, and at most 20,000 newline-delimited values before fuzzy selection | `picker_stdin_rejects_oversized_input_and_item_counts_before_selection` |
-| Terminal output | Untrusted diagnostic, catalog, completion, plugin, picker, agent, index, package, config, authoring documentation, recovery, and JSON text cannot emit active control bytes; JSON escaping preserves parsed values | core terminal escaping tests, picker C0/C1 test, author stdout C0/C1 test, UI hostile-error test, recovery ANSI/OSC test |
-| Accessibility | Editor styling is enabled only for a color-capable terminal when `NO_COLOR` is absent; `TERM=dumb` uses ASCII prompt separators and indicators; panels require a plain fallback; noninteractive structured output has no decoration | `color_requires_a_terminal_and_no_color_must_be_absent`; `terminal_styles_require_an_interactive_color_capable_terminal`; `dumb_terminal_prompt_join_uses_ascii_only`; panel fallback/control tests |
+| Terminal output | Untrusted diagnostic, catalog, completion, plugin, picker, rich-frame, agent, index, package, config, authoring documentation, recovery, and JSON text cannot emit active control bytes; JSON escaping preserves parsed values | core terminal escaping tests, picker C0/C1 test, author stdout C0/C1 test, Ratatui hostile editor/completion buffer test, UI hostile-error test, recovery ANSI/OSC test |
+| Accessibility | `auto` selects Ratatui only for a capable TTY; `simple`, non-TTY stderr, `TERM=dumb`, or height below five rows selects Reedline; `NO_COLOR` retains rich layout without color; dumb or non-UTF-8 terminals use ASCII automatically; patched-font glyphs require explicit opt-in; mode/editor state is textual; panels require a plain fallback; noninteractive structured output has no decoration | `explicit_simple_surface_always_degrades`; rich frame/status buffer tests; `terminal_styles_require_an_interactive_color_capable_terminal`; `auto_symbols_only_use_unicode_for_a_unicode_locale`; prompt injection/profile tests; panel fallback/control tests; manual capability checks below |
 
 Recovery state is private on Unix: Quirl forces the journal directory to mode
 `0700` and newly created snapshots to `0600`. Windows relies on the ACL inherited
@@ -54,7 +61,7 @@ cargo test -p quirl-process
 cargo test -p quirl-ui
 cargo test -p quirl-cli
 cargo clippy -p quirl-core -p quirl-lua -p quirl-plugin -p quirl-process -p quirl-ui -p quirl-cli --all-targets -- -D warnings
-mask check
+cargo xtask check
 ```
 
 Manual text-only smoke checks:
@@ -65,55 +72,57 @@ NO_COLOR=1 TERM=dumb cargo run -q -p quirl-cli -- complete 'git c'
 printf 'return "plain"\n' | NO_COLOR=1 TERM=dumb cargo run -q -p quirl-cli
 ```
 
-The first two commands must contain no ANSI control sequences; the interactive
-prompt uses ASCII separators/indicators under `TERM=dumb`, and editor hints and
-semantic highlighting are unstyled for `NO_COLOR`, dumb, or noninteractive
-output. The piped command is noninteractive and prints only `plain` plus a
-newline.
+The first two commands must contain no ANSI control sequences. `TERM=dumb`
+selects the Reedline fallback with ASCII separators/indicators. In a capable
+TTY, `NO_COLOR=1` keeps the Ratatui inline layout while removing color styling;
+mode and editor state remain textual. The piped command is noninteractive and
+prints only `plain` plus a newline.
 
 ## Explicit residual risks
 
-1. **Explicit native capture is not window-bounded.** `NativeExecutor::execute_capture`
-   drains concurrently to avoid pipe deadlock, but retains the complete stdout
-   and stderr until the child exits. Reference Bash/Zsh capture and persisted
-   recovery data are bounded. Callers must use inherited/streaming execution for
-   untrusted high-volume commands. A future API should make capture limits
-   mandatory and return discard accounting.
-
-2. **Local package verification has a time-of-check/time-of-use window.** Quirl
-   canonicalizes package files, enforces containment, bounds them, and checks
-   locked hashes before loading by path. Another process running as the same user
-   can still replace a file between verification and Lua loading. Closing this
-   fully requires loading the already verified bytes or a platform-specific
-   stable file-handle design.
-
-3. **Checksums are integrity records, not publisher authentication.** A plugin
+1. **Checksums are integrity records, not publisher authentication.** A plugin
    lock detects changes relative to the reviewed local source. v0.1 has no signed
    registry, transparency log, or publisher identity.
 
-4. **Secret redaction is heuristic.** Recovery redacts values whose environment
-   keys look secret and common secret-shaped command arguments. Derived,
-   encoded, very short, or unusually named secrets can remain. Recovery is local,
-   quota-limited, private on Unix, and should still be treated as sensitive.
+2. **Adapter snapshots are hardening, not same-user isolation.** Trusted Lua
+   closes its former load-time path race by executing the verified bytes directly.
+   Unix process adapters copy verified bytes to a random owner-only directory and
+   execute a non-writable snapshot. This prevents later package-path replacement
+   from changing the launched code, but it is not an OS sandbox against another
+   process already running as the same user. The temporary filesystem must permit
+   execution, and adapters must resolve sidecars from the package working
+   directory instead of relying on the relocated executable path. Windows remains
+   best effort and launches the verified package path directly.
 
-5. **Requested child output is intentionally raw.** Like other shells, Quirl
+3. **Secret redaction is heuristic.** Recovery redacts values whose environment
+   keys look secret, secret arguments and query parameters, authorization headers,
+   credentialed URLs, and several high-confidence token shapes. Derived, encoded,
+   very short, fragmented, or unusually shaped secrets can remain. Recovery is
+   local, quota-limited, private on Unix, and should still be treated as sensitive.
+
+4. **Requested child output is intentionally raw.** Like other shells, Quirl
    allows a foreground external command to control its terminal. Quirl-owned
    metadata and diagnostics are sanitized; output from a command the user chose
    to execute is not. Running an untrusted program therefore carries normal
    terminal-emulator risk.
 
-6. **Dumb-terminal editing is reduced, not a separate line editor.** Prompt
-   glyphs become ASCII and `NO_COLOR` disables semantic highlighting, while the
-   interactive editor remains Reedline. Terminals that cannot support its basic
-   cursor protocol should use the stable noninteractive commands or piped stdin.
+5. **The simple surface still depends on Reedline.** Ratatui is the default on
+   capable TTYs, while explicit `simple`, non-TTY stderr, `TERM=dumb`, and very
+   short terminals select Reedline. This provides a reduced, line-oriented
+   fallback but is not yet an independently implemented minimal editor. A
+   terminal that cannot support Reedline's basic cursor protocol should use the
+   stable noninteractive commands or piped stdin. Reedline removal remains
+   deferred and is not claimed by ADR 0012.
 
-7. **Windows suspension differs by design.** Normal foreground/background,
-   cancellation, recovery, and Job Object containment work, but Unix terminal
-   process groups and Ctrl-Z suspension have an explicit unsupported diagnostic.
-   There is also a small spawn-to-Job-assignment race before containment becomes
-   active.
+6. **Windows interactive behavior is best effort.** The backend models normal
+   foreground/background lifecycle, cancellation, recovery, and Job Object
+   containment, but has not completed native terminal validation. Unix terminal
+   process groups and Ctrl-Z suspension have an explicit unsupported diagnostic,
+   and there is a small spawn-to-Job-assignment race before containment becomes
+   active. These constraints keep Windows outside the supported 1.0 interactive
+   scope rather than blocking the Linux/macOS release.
 
 These residuals are visible constraints, not claims of completed isolation.
-They should be re-audited when native capture becomes a public streaming API,
-plugins gain a distribution channel, or the terminal layer gains a dedicated
-minimal line editor.
+They should be re-audited when plugins gain a distribution channel or stronger
+publisher identity, isolated adapters gain a platform-stable executable handle,
+or the simple terminal layer gains a dedicated minimal line editor.

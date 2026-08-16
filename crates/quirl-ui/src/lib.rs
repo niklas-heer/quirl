@@ -1,29 +1,36 @@
 //! Terminal interaction that treats completion and diagnostics as core behavior.
 
 mod panel;
+mod surface;
 
 pub use panel::{
     directory_panel, process_panel, LiveBuffer, LiveSample, LiveSnapshot, PanelModel,
     ProcessPanelRow,
 };
+pub use surface::{select_surface, InteractiveSignal, RichSurface, SurfaceKind};
 
-use crossterm::event::{Event, KeyEvent};
+use crossterm::{
+    cursor::SetCursorStyle,
+    event::{Event, KeyEvent},
+};
 use nu_ansi_term::{Color, Style};
 use quirl_catalog::{
-    Catalog, CompletionCancellation, CompletionOutcome, CompletionRequest, CompletionResponse,
-    COMPLETION_PROTOCOL_VERSION, MAX_COMPLETION_DEADLINE_MS, MAX_COMPLETION_QUERY_BYTES,
-    MAX_COMPLETION_RESULTS,
+    Catalog, CommandSpec, CompletionCancellation, CompletionOutcome, CompletionRequest,
+    CompletionResponse, COMPLETION_PROTOCOL_VERSION, MAX_COMPLETION_DEADLINE_MS,
+    MAX_COMPLETION_QUERY_BYTES, MAX_COMPLETION_RESULTS,
 };
-use quirl_core::{ErrorCode, ShellError, VersionPolicy};
+use quirl_core::{
+    escape_terminal_controls, escape_terminal_line, ErrorCode, ShellError, VersionPolicy,
+};
 use quirl_lua::QuirlConfig;
-use quirl_picker::{ItemKind, PickItem, Picker};
 use quirl_syntax::Mode;
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
-    Completer, DefaultHinter, DefaultValidator, DescriptionMode, EditMode, Emacs,
-    FileBackedHistory, Helix, Highlighter, IdeMenu, InputMode, KeyCode, KeyModifiers, MenuBuilder,
-    OutputMode, Prompt, PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, ReedlineMenu,
-    ReedlineRawEvent, Span, StyledText, Suggestion, Vi,
+    Completer, CursorConfig, DefaultHinter, DefaultValidator, DescriptionMenu, DescriptionMode,
+    EditCommand, EditMode, Emacs, FileBackedHistory, Helix, Highlighter, IdeMenu, InputMode,
+    KeyCode, KeyModifiers, MenuBuilder, OutputMode, Prompt, PromptEditMode, PromptHistorySearch,
+    PromptViMode, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Span, StyledText,
+    Suggestion, Vi,
 };
 use std::{
     borrow::Cow,
@@ -40,6 +47,8 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+#[cfg(test)]
+use unicode_width::UnicodeWidthStr;
 
 /// Opaque Reedline host command used to switch Quirl's interactive grammar.
 pub const MODE_TOGGLE_HOST_COMMAND: &str = "quirl:mode-toggle";
@@ -49,6 +58,71 @@ const COMPLETION_MENU: &str = "completion_menu";
 const HISTORY_PICKER_MENU: &str = "history_picker_menu";
 const FILE_PICKER_MENU: &str = "file_picker_menu";
 const ACTION_PICKER_MENU: &str = "action_picker_menu";
+const HELP_MENU: &str = "catalog_help_menu";
+const PICKER_ITEMS_MAX: usize = 4_096;
+const PICKER_RESULTS_MAX: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerItemKind {
+    History,
+    File,
+    Directory,
+    Action,
+    Completion,
+    Job,
+    Data,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerItem {
+    pub id: String,
+    pub kind: PickerItemKind,
+    pub label: String,
+    pub description: String,
+    pub preview: Option<String>,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerMatch {
+    pub index: usize,
+    pub match_indices: Vec<usize>,
+}
+
+/// Ranking stays behind this terminal-independent boundary so `quirl-cli` can
+/// inject the shared `quirl-picker` engine without inverting the crate graph.
+pub trait PickerRanker: Send + Sync {
+    fn rank(&self, items: &[PickerItem], query: &str, limit: usize) -> Vec<PickerMatch>;
+}
+
+#[derive(Debug, Default)]
+struct StablePickerRanker;
+
+impl PickerRanker for StablePickerRanker {
+    fn rank(&self, items: &[PickerItem], query: &str, limit: usize) -> Vec<PickerMatch> {
+        let query = query.to_lowercase();
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let searchable = format!("{} {}", item.label, item.description).to_lowercase();
+                let mut search = searchable.char_indices();
+                let mut matched = Vec::new();
+                for wanted in query.chars() {
+                    let (byte, _) = search.find(|(_, character)| *character == wanted)?;
+                    if byte < item.label.len() {
+                        matched.push(searchable[..byte].chars().count());
+                    }
+                }
+                Some(PickerMatch {
+                    index,
+                    match_indices: matched,
+                })
+            })
+            .take(limit)
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -57,6 +131,7 @@ enum PickerInvocation {
     History,
     File,
     Action,
+    Help,
 }
 
 impl PickerInvocation {
@@ -65,16 +140,18 @@ impl PickerInvocation {
             value if value == Self::History as u8 => Self::History,
             value if value == Self::File as u8 => Self::File,
             value if value == Self::Action as u8 => Self::Action,
+            value if value == Self::Help as u8 => Self::Help,
             _ => Self::None,
         }
     }
 
-    fn item_kind(self) -> Option<ItemKind> {
+    fn item_kind(self) -> Option<PickerItemKind> {
         match self {
             Self::None => None,
-            Self::History => Some(ItemKind::History),
-            Self::File => Some(ItemKind::File),
-            Self::Action => Some(ItemKind::Action),
+            Self::History => Some(PickerItemKind::History),
+            Self::File => Some(PickerItemKind::File),
+            Self::Action => Some(PickerItemKind::Action),
+            Self::Help => None,
         }
     }
 
@@ -88,6 +165,24 @@ impl PickerInvocation {
 /// Filesystem and Git inspection run on a persistent worker. This budget is still
 /// reported with every sample so callers can detect scheduling or lock contention.
 pub const PROMPT_FIRST_PAINT_BUDGET: Duration = Duration::from_millis(8);
+
+/// Return the active terminal width without emitting a terminal query.
+///
+/// Crossterm uses the platform terminal API for this lookup. Callers should
+/// retain a conservative fallback for redirected or unusually limited output.
+pub fn terminal_width() -> Option<u16> {
+    crossterm::terminal::size().ok().map(|(columns, _)| columns)
+}
+
+/// Whether conservative UI chrome may use broadly supported Unicode glyphs.
+/// Private-use patched-font symbols remain a separate explicit opt-in.
+pub fn terminal_supports_unicode() -> bool {
+    unicode_is_safe(dumb_terminal(), locale_supports_unicode())
+}
+
+const fn unicode_is_safe(dumb: bool, unicode_locale: bool) -> bool {
+    !dumb && unicode_locale
+}
 
 pub fn editor(catalog: Catalog) -> Reedline {
     editor_with_config(catalog, QuirlConfig::default())
@@ -114,7 +209,15 @@ pub fn editor_with_extensions_and_config(
     extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
     config: QuirlConfig,
 ) -> Reedline {
-    configured_editor(catalog, extension_completer, config, None, Vec::new(), None)
+    configured_editor(
+        catalog,
+        extension_completer,
+        config,
+        None,
+        Vec::new(),
+        None,
+        Arc::new(StablePickerRanker),
+    )
 }
 
 /// Create an editor backed by a durable, newline-delimited history file.
@@ -127,6 +230,22 @@ pub fn editor_with_extensions_config_and_history(
     extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
     config: QuirlConfig,
     history_path: PathBuf,
+) -> Result<Reedline, ShellError> {
+    editor_with_extensions_config_history_and_picker(
+        catalog,
+        extension_completer,
+        config,
+        history_path,
+        Arc::new(StablePickerRanker),
+    )
+}
+
+pub fn editor_with_extensions_config_history_and_picker(
+    catalog: Catalog,
+    extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
+    config: QuirlConfig,
+    history_path: PathBuf,
+    picker_ranker: Arc<dyn PickerRanker>,
 ) -> Result<Reedline, ShellError> {
     let history =
         FileBackedHistory::with_file(HISTORY_CAPACITY, history_path.clone()).map_err(|error| {
@@ -146,6 +265,7 @@ pub fn editor_with_extensions_config_and_history(
         Some(history),
         history_items,
         Some(history_path),
+        picker_ranker,
     ))
 }
 
@@ -154,8 +274,9 @@ fn configured_editor(
     extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
     config: QuirlConfig,
     history: Option<FileBackedHistory>,
-    history_items: Vec<PickItem>,
+    history_items: Vec<PickerItem>,
     history_path: Option<PathBuf>,
+    picker_ranker: Arc<dyn PickerRanker>,
 ) -> Reedline {
     let terminal_styles = terminal_styling_enabled(
         std::io::stdout().is_terminal(),
@@ -169,8 +290,10 @@ fn configured_editor(
         picker_sources(&catalog, history_items),
         history_path,
         Arc::clone(&picker_invocation),
+        picker_ranker,
     ));
     let completion_menu = Box::new(configured_completion_menu(&config));
+    let help_menu = Box::new(configured_help_menu());
     let history_picker_menu = Box::new(configured_picker_menu(
         &config,
         HISTORY_PICKER_MENU,
@@ -192,6 +315,7 @@ fn configured_editor(
     let mut line_editor = Reedline::create()
         .with_completer(completer)
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
+        .with_menu(ReedlineMenu::EngineCompleter(help_menu))
         .with_menu(ReedlineMenu::EngineCompleter(history_picker_menu))
         .with_menu(ReedlineMenu::EngineCompleter(file_picker_menu))
         .with_menu(ReedlineMenu::EngineCompleter(action_picker_menu))
@@ -207,14 +331,26 @@ fn configured_editor(
             &config.editor.keymap,
             picker_invocation,
         ))
+        .with_ansi_colors(terminal_styles)
         .with_quick_completions(false);
     if let Some(history) = history {
         line_editor = line_editor.with_history(Box::new(history));
+    }
+    if std::io::stdout().is_terminal() && !dumb_terminal() {
+        line_editor = line_editor.with_cursor_config(editor_cursor_config());
     }
     if config.editor.semantic_hints && terminal_styles {
         line_editor = line_editor.with_highlighter(Box::new(SemanticHighlighter::new(catalog)));
     }
     line_editor
+}
+
+fn editor_cursor_config() -> CursorConfig {
+    CursorConfig {
+        vi_insert: Some(SetCursorStyle::SteadyBar),
+        vi_normal: Some(SetCursorStyle::SteadyBlock),
+        emacs: Some(SetCursorStyle::SteadyBar),
+    }
 }
 
 /// Resolve Quirl's history path from the process environment.
@@ -284,30 +420,32 @@ fn configured_edit_mode_with_picker(
     keymap: &str,
     picker_invocation: Arc<AtomicU8>,
 ) -> Box<dyn EditMode> {
-    let (inner, complete_tab): (Box<dyn EditMode>, bool) = match keymap {
-        "vim" => {
-            let mut insert = default_vi_insert_keybindings();
-            let mut normal = default_vi_normal_keybindings();
-            insert.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
-            normal.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
-            (Box::new(Vi::new(insert, normal)), false)
-        }
-        "helix" => (Box::<Helix>::default(), true),
-        // Config validation rejects other values. Keep this fallback for direct Rust callers.
-        "emacs" => {
-            let mut keybindings = default_emacs_keybindings();
-            keybindings.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
-            (Box::new(Emacs::new(keybindings)), false)
-        }
-        _ => {
-            let mut keybindings = default_emacs_keybindings();
-            keybindings.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
-            (Box::new(Emacs::new(keybindings)), false)
-        }
-    };
+    let (inner, complete_tab, needs_basic_edit_fallback): (Box<dyn EditMode>, bool, bool) =
+        match keymap {
+            "vim" => {
+                let mut insert = default_vi_insert_keybindings();
+                let mut normal = default_vi_normal_keybindings();
+                insert.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
+                normal.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
+                (Box::new(Vi::new(insert, normal)), false, false)
+            }
+            "helix" => (Box::<Helix>::default(), true, true),
+            // Config validation rejects other values. Keep this fallback for direct Rust callers.
+            "emacs" => {
+                let mut keybindings = default_emacs_keybindings();
+                keybindings.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
+                (Box::new(Emacs::new(keybindings)), false, false)
+            }
+            _ => {
+                let mut keybindings = default_emacs_keybindings();
+                keybindings.add_binding(KeyModifiers::NONE, KeyCode::Tab, completion_menu_event());
+                (Box::new(Emacs::new(keybindings)), false, false)
+            }
+        };
     Box::new(QuirlEditMode {
         inner,
         complete_tab,
+        needs_basic_edit_fallback,
         picker_invocation,
     })
 }
@@ -316,6 +454,9 @@ fn configured_edit_mode_with_picker(
 struct QuirlEditMode {
     inner: Box<dyn EditMode>,
     complete_tab: bool,
+    /// Reedline 0.49's minimal Helix mode handles character insertion and a
+    /// small normal-mode subset, but omits the common EOF and erase keys.
+    needs_basic_edit_fallback: bool,
     picker_invocation: Arc<AtomicU8>,
 }
 
@@ -324,6 +465,23 @@ impl EditMode for QuirlEditMode {
         let event: Event = event.into();
         if is_mode_toggle(&event) {
             return ReedlineEvent::ExecuteHostCommand(MODE_TOGGLE_HOST_COMMAND.to_owned());
+        }
+        if is_context_help(&event) {
+            let replace_active =
+                PickerInvocation::from_state(&self.picker_invocation) != PickerInvocation::Help;
+            PickerInvocation::Help.activate(&self.picker_invocation);
+            return menu_event(HELP_MENU, replace_active);
+        }
+        // Ctrl-D is Reedline's context-sensitive EOF action: it exits an empty
+        // editor and deletes at the cursor otherwise. Handle it before Helix's
+        // character fallback can turn Ctrl-D into a literal `d`.
+        if is_ctrl_d(&event) {
+            return ReedlineEvent::CtrlD;
+        }
+        if self.needs_basic_edit_fallback {
+            if let Some(event) = basic_edit_fallback(&event) {
+                return event;
+            }
         }
         if is_history_search(&event) {
             let replace_active =
@@ -367,6 +525,9 @@ impl EditMode for QuirlEditMode {
                 ..
             })
         ) {
+            if PickerInvocation::from_state(&self.picker_invocation) == PickerInvocation::Help {
+                return ReedlineEvent::MenuNext;
+            }
             let replace_active =
                 PickerInvocation::from_state(&self.picker_invocation) != PickerInvocation::None;
             PickerInvocation::None.activate(&self.picker_invocation);
@@ -386,8 +547,60 @@ impl EditMode for QuirlEditMode {
     }
 }
 
+fn is_ctrl_d(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        })
+    )
+}
+
+fn is_context_help(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::F(1),
+            modifiers: KeyModifiers::NONE,
+            ..
+        })
+    )
+}
+
+fn basic_edit_fallback(event: &Event) -> Option<ReedlineEvent> {
+    let command = match event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Backspace,
+            modifiers: KeyModifiers::NONE,
+            ..
+        })
+        | Event::Key(KeyEvent {
+            code: KeyCode::Char('h'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }) => EditCommand::Backspace,
+        Event::Key(KeyEvent {
+            code: KeyCode::Delete,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }) => EditCommand::Delete,
+        _ => return None,
+    };
+    Some(ReedlineEvent::Edit(vec![command]))
+}
+
 fn is_mode_toggle(event: &Event) -> bool {
     match event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('m'),
+            modifiers: KeyModifiers::ALT,
+            ..
+        }) => true,
+        // Ctrl-Space emits NUL in legacy terminals. Keep both decoded forms as
+        // compatibility aliases, but do not advertise a chord commonly owned
+        // by terminal multiplexers.
         Event::Key(KeyEvent {
             code: KeyCode::Char(' '),
             modifiers: KeyModifiers::CONTROL,
@@ -456,6 +669,16 @@ fn configured_completion_menu(config: &QuirlConfig) -> IdeMenu {
     configured_menu(config, COMPLETION_MENU)
 }
 
+fn configured_help_menu() -> DescriptionMenu {
+    DescriptionMenu::default()
+        .with_name(HELP_MENU)
+        .with_input_mode(InputMode::FullBuffer)
+        .with_output_mode(OutputMode::SuggestedSpan)
+        .with_columns(2)
+        .with_selection_rows(5)
+        .with_description_rows(12)
+}
+
 fn configured_picker_menu(
     config: &QuirlConfig,
     name: &str,
@@ -471,7 +694,17 @@ fn configured_picker_menu(
 }
 
 fn configured_menu(config: &QuirlConfig, name: &str) -> IdeMenu {
-    let menu = IdeMenu::default().with_name(name).with_default_border();
+    let menu = IdeMenu::default()
+        .with_name(name)
+        .with_default_border()
+        .with_padding(1)
+        .with_min_completion_width(22)
+        .with_max_completion_width(48)
+        .with_min_description_width(24)
+        .with_max_description_width(72)
+        .with_max_description_height(8)
+        .with_description_offset(2)
+        .with_correct_cursor_pos(true);
     let menu = match config.picker.layout.as_str() {
         // Reedline's IDE menu is always anchored below the input. A bounded height is
         // the closest supported equivalent to a bottom picker; the default adapts to
@@ -768,6 +1001,47 @@ fn load_prompt_context(cwd: PathBuf, previous: Option<PromptCacheEntry>) -> Prom
 }
 
 fn display_directory(cwd: &Path) -> String {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    display_directory_with_home(cwd, home.as_deref())
+}
+
+fn display_directory_with_home(cwd: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return directory_leaf(cwd);
+    };
+    let Ok(relative) = cwd.strip_prefix(home) else {
+        return directory_leaf(cwd);
+    };
+    let components = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if components.is_empty() {
+        return "~".to_owned();
+    }
+    let last_index = components.len().saturating_sub(1);
+    let compact = components
+        .into_iter()
+        .enumerate()
+        .map(|(index, component)| {
+            if index == last_index {
+                component
+            } else {
+                component
+                    .chars()
+                    .next()
+                    .map_or_else(String::new, |character| character.to_string())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("~/{compact}")
+}
+
+fn directory_leaf(cwd: &Path) -> String {
     cwd.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
@@ -851,7 +1125,122 @@ pub struct QuirlPrompt {
     extension_segments: Vec<String>,
     configured_left: Option<Vec<String>>,
     configured_right: Vec<String>,
+    configured_symbols: String,
     named_extension_segments: HashMap<String, String>,
+    styled: bool,
+}
+
+/// Prompt glyphs are intentionally separate from color. Terminal-derived text
+/// is escaped before Quirl adds its own fixed styles, and `NO_COLOR` sessions
+/// remain control-sequence-free without losing useful context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptSymbols {
+    Plain,
+    Unicode,
+    NerdFont,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SurfaceSymbols {
+    Plain,
+    Unicode,
+    NerdFont,
+}
+
+impl SurfaceSymbols {
+    pub(crate) const fn uses_unicode(self) -> bool {
+        !matches!(self, Self::Plain)
+    }
+
+    pub(crate) const fn input_indicator(self, mode: Mode) -> &'static str {
+        match (self, mode) {
+            (Self::Plain, Mode::Command) => "> ",
+            (Self::Plain, Mode::Data) => "D ",
+            (Self::Unicode, Mode::Command) => "❯ ",
+            (Self::Unicode, Mode::Data) => "◆ ",
+            // These private-use glyphs are restricted to the explicit patched-font profile.
+            (Self::NerdFont, Mode::Command) => "\u{f105} ",
+            (Self::NerdFont, Mode::Data) => "\u{f1b2} ",
+        }
+    }
+
+    pub(crate) const fn multiline_indicator(self) -> &'static str {
+        match self {
+            Self::Plain => ". ",
+            Self::Unicode => "∙ ",
+            Self::NerdFont => "\u{f105} ",
+        }
+    }
+}
+
+impl PromptSymbols {
+    fn resolve(requested: &str, dumb: bool, unicode_locale: bool) -> Self {
+        if dumb {
+            return Self::Plain;
+        }
+        match requested {
+            "plain" => Self::Plain,
+            "unicode" => Self::Unicode,
+            "nerd_font" => Self::NerdFont,
+            _ if unicode_locale => Self::Unicode,
+            _ => Self::Plain,
+        }
+    }
+
+    const fn separator(self) -> &'static str {
+        match self {
+            Self::Plain => " | ",
+            Self::Unicode => " · ",
+            // U+E0B1 is the slim Powerline separator. It is restricted to the
+            // explicit Nerd Font profile so auto mode never displays tofu.
+            Self::NerdFont => " \u{e0b1} ",
+        }
+    }
+
+    fn directory(self, value: &str) -> String {
+        match self {
+            Self::NerdFont => format!("\u{f07c} {value}"),
+            Self::Plain | Self::Unicode => value.to_owned(),
+        }
+    }
+
+    fn git_branch(self, value: &str) -> String {
+        match self {
+            Self::NerdFont => format!("on \u{e0a0} {value}"),
+            Self::Plain | Self::Unicode => format!("on {value}"),
+        }
+    }
+
+    fn git_state(self, value: &str) -> String {
+        match self {
+            Self::NerdFont => format!("\u{f044} {value}"),
+            Self::Unicode => format!("\u{2261} {value}"),
+            Self::Plain => value.to_owned(),
+        }
+    }
+
+    fn status(self, value: i32) -> String {
+        match self {
+            Self::NerdFont => format!("\u{f057} {value}"),
+            Self::Unicode => format!("\u{2717} {value}"),
+            Self::Plain => format!("status:{value}"),
+        }
+    }
+
+    fn jobs(self, value: usize) -> String {
+        match self {
+            Self::NerdFont => format!("\u{f085} {value}"),
+            Self::Plain | Self::Unicode => format!("jobs:{value}"),
+        }
+    }
+
+    fn duration(self, value: Duration) -> String {
+        let value = format_duration(value);
+        match self {
+            Self::NerdFont => format!("\u{f017} {value}"),
+            Self::Plain | Self::Unicode => value,
+        }
+    }
 }
 
 impl QuirlPrompt {
@@ -860,6 +1249,7 @@ impl QuirlPrompt {
         let cwd = cwd_path
             .as_deref()
             .map(display_directory)
+            .map(|directory| safe_prompt_text(&directory))
             .unwrap_or_else(|| "/".to_owned());
         Self {
             mode,
@@ -872,7 +1262,13 @@ impl QuirlPrompt {
             extension_segments: Vec::new(),
             configured_left: None,
             configured_right: Vec::new(),
+            configured_symbols: "auto".to_owned(),
             named_extension_segments: HashMap::new(),
+            styled: terminal_styling_enabled(
+                std::io::stdout().is_terminal(),
+                env::var_os("NO_COLOR").is_some(),
+                dumb_terminal(),
+            ),
         }
     }
 
@@ -885,19 +1281,23 @@ impl QuirlPrompt {
         let mut prompt = Self::new(mode);
         prompt.configured_left = Some(config.prompt.left.clone());
         prompt.configured_right = config.prompt.right.clone();
+        prompt.configured_symbols.clone_from(&config.prompt.symbols);
         prompt
     }
 
     pub fn with_extension_segments(mut self, segments: Vec<String>) -> Self {
-        self.extension_segments = segments;
+        self.extension_segments = segments
+            .into_iter()
+            .map(|value| safe_prompt_text(&value))
+            .collect();
         self
     }
 
     /// Apply a snapshot returned by [`PromptContextScheduler`].
     pub fn with_native_context(mut self, context: NativePromptContext) -> Self {
-        self.cwd = context.directory;
-        self.git_branch = context.git_branch;
-        self.git_state = context.git_state;
+        self.cwd = safe_prompt_text(&context.directory);
+        self.git_branch = context.git_branch.map(|branch| safe_prompt_text(&branch));
+        self.git_state = context.git_state.map(|state| safe_prompt_text(&state));
         self
     }
 
@@ -928,40 +1328,144 @@ impl QuirlPrompt {
         self.named_extension_segments = segments
             .into_iter()
             .filter(|(_, value)| !value.is_empty())
+            .map(|(name, value)| (name, safe_prompt_text(&value)))
             .collect();
         self
     }
 
     fn render_segments(&self, requested: &[String]) -> String {
+        let symbols = self.symbols();
         let parts = requested
             .iter()
-            .filter_map(|name| match name.as_str() {
-                "directory" => Some(self.cwd.clone()),
-                "mode" => Some(self.mode.to_string()),
-                "git_branch" => self
-                    .git_branch
-                    .as_ref()
-                    .map(|branch| format!("git:{branch}")),
-                "status" => self
-                    .status
-                    .filter(|status| *status != 0)
-                    .map(|status| format!("status:{status}")),
-                "duration" => self.duration.map(format_duration),
-                "jobs" => (self.jobs > 0).then(|| format!("jobs:{}", self.jobs)),
-                "git_state" => self.git_state.as_ref().map(|state| format!("git:{state}")),
-                _ => self.named_extension_segments.get(name).cloned(),
+            .filter_map(|name| self.render_segment(name, symbols))
+            .collect::<Vec<_>>();
+        join_prompt_parts(&parts, symbols)
+    }
+
+    fn render_left_segments(&self, requested: &[String]) -> String {
+        let symbols = self.symbols();
+        let parts = requested
+            .iter()
+            .filter_map(|name| {
+                self.render_segment(name, symbols)
+                    .map(|value| self.style_left_segment(name, value))
             })
             .collect::<Vec<_>>();
-        join_prompt_parts(&parts, dumb_terminal())
+        join_prompt_parts(&parts, symbols)
+    }
+
+    fn render_segment(&self, name: &str, symbols: PromptSymbols) -> Option<String> {
+        match name {
+            "directory" => Some(symbols.directory(&self.cwd)),
+            "mode" => Some(self.mode.to_string()),
+            "git_branch" => self
+                .git_branch
+                .as_ref()
+                .map(|branch| symbols.git_branch(branch)),
+            "status" => self
+                .status
+                .filter(|status| *status != 0)
+                .map(|status| symbols.status(status)),
+            "duration" => self.duration.map(|duration| symbols.duration(duration)),
+            "jobs" => (self.jobs > 0).then(|| symbols.jobs(self.jobs)),
+            "git_state" => self
+                .git_state
+                .as_ref()
+                .map(|state| symbols.git_state(state)),
+            _ => self.named_extension_segments.get(name).cloned(),
+        }
+    }
+
+    fn style_left_segment(&self, name: &str, value: String) -> String {
+        if !self.styled {
+            return value;
+        }
+        let style = match name {
+            "directory" => Style::new().bold().fg(Color::Cyan),
+            "git_branch" | "git_state" => Style::new().bold().fg(Color::Purple),
+            "status" => Style::new().bold().fg(Color::Red),
+            "duration" | "jobs" => Style::new().fg(Color::Purple),
+            _ => Style::new(),
+        };
+        style.paint(value).to_string()
+    }
+
+    fn symbols(&self) -> PromptSymbols {
+        PromptSymbols::resolve(
+            &self.configured_symbols,
+            dumb_terminal(),
+            locale_supports_unicode(),
+        )
+    }
+
+    pub(crate) fn surface_symbols(&self) -> SurfaceSymbols {
+        match self.symbols() {
+            PromptSymbols::Plain => SurfaceSymbols::Plain,
+            PromptSymbols::Unicode => SurfaceSymbols::Unicode,
+            PromptSymbols::NerdFont => SurfaceSymbols::NerdFont,
+        }
+    }
+
+    fn render_right_for(&self, width: u16, interactive: bool, minimal: bool) -> String {
+        let configured = self.render_segments(&self.configured_right);
+        if !interactive || minimal {
+            return configured;
+        }
+        truncate_prompt_width(&configured, usize::from(width))
+    }
+
+    fn surface_context_left(&self) -> String {
+        self.configured_left.as_deref().map_or_else(
+            || self.cwd.clone(),
+            |segments| self.render_segments(segments),
+        )
+    }
+
+    fn surface_context_right(&self) -> String {
+        self.render_segments(&self.configured_right)
     }
 }
 
-fn join_prompt_parts(parts: &[String], dumb: bool) -> String {
-    parts.join(if dumb { " | " } else { " · " })
+fn truncate_prompt_width(value: &str, width: usize) -> String {
+    value
+        .chars()
+        .scan(0_usize, |used, character| {
+            let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+            if used.saturating_add(character_width) > width {
+                return None;
+            }
+            *used = used.saturating_add(character_width);
+            Some(character)
+        })
+        .collect()
+}
+
+fn safe_prompt_text(value: &str) -> String {
+    escape_terminal_line(value)
+}
+
+fn join_prompt_parts(parts: &[String], symbols: PromptSymbols) -> String {
+    parts.join(symbols.separator())
 }
 
 fn dumb_terminal() -> bool {
     env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb"))
+}
+
+fn locale_supports_unicode() -> bool {
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .find_map(|name| env::var_os(name).filter(|value| !value.is_empty()));
+    locale_value_supports_unicode(locale.as_deref())
+}
+
+fn locale_value_supports_unicode(locale: Option<&std::ffi::OsStr>) -> bool {
+    locale.is_some_and(locale_name_supports_unicode)
+}
+
+fn locale_name_supports_unicode(locale: &std::ffi::OsStr) -> bool {
+    let locale = locale.to_string_lossy().to_ascii_lowercase();
+    locale.contains("utf-8") || locale.contains("utf8")
 }
 
 fn terminal_styling_enabled(terminal: bool, no_color_is_set: bool, dumb: bool) -> bool {
@@ -996,42 +1500,64 @@ fn resolve_git_dir(directory: &Path) -> Option<PathBuf> {
 impl Prompt for QuirlPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
         if let Some(segments) = &self.configured_left {
-            let rendered = self.render_segments(segments);
+            let rendered = self.render_left_segments(segments);
             return Cow::Owned(if rendered.is_empty() {
                 String::new()
             } else {
-                format!("{rendered} ")
+                format!("{rendered}\n")
             });
         }
         let mut parts = vec![self.cwd.clone(), self.mode.to_string()];
         parts.extend(self.extension_segments.iter().cloned());
-        Cow::Owned(format!("{} ", join_prompt_parts(&parts, dumb_terminal())))
+        Cow::Owned(format!("{}\n", join_prompt_parts(&parts, self.symbols())))
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {
-        Cow::Owned(self.render_segments(&self.configured_right))
+        Cow::Owned(self.render_right_for(
+            terminal_width().unwrap_or(80),
+            std::io::stdout().is_terminal(),
+            dumb_terminal(),
+        ))
     }
 
-    fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
-        if dumb_terminal() {
-            Cow::Owned(match self.mode {
-                Mode::Command => "> ".to_owned(),
-                Mode::Data => "data> ".to_owned(),
-            })
+    fn render_prompt_indicator(&self, prompt_mode: PromptEditMode) -> Cow<'_, str> {
+        let edit_mode = match prompt_mode {
+            PromptEditMode::Vi(PromptViMode::Normal) => Some("normal"),
+            PromptEditMode::Vi(PromptViMode::Insert) => Some("insert"),
+            PromptEditMode::Vi(PromptViMode::Visual) => Some("visual"),
+            PromptEditMode::Custom(_) => Some("edit"),
+            PromptEditMode::Emacs | PromptEditMode::Default => None,
+        };
+        let indicator = if self.symbols() == PromptSymbols::Plain {
+            match self.mode {
+                Mode::Command => "command >",
+                Mode::Data => "data >",
+            }
         } else {
-            Cow::Owned(format!("{} ", self.mode.prompt()))
-        }
+            match self.mode {
+                Mode::Command => "command ❯",
+                Mode::Data => "data ◆",
+            }
+        };
+        Cow::Owned(match edit_mode {
+            Some(edit_mode) => format!("{edit_mode} {indicator} "),
+            None => format!("{indicator} "),
+        })
     }
 
     fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
-        Cow::Borrowed(if dumb_terminal() { "... " } else { "  · " })
+        Cow::Borrowed(if self.symbols() == PromptSymbols::Plain {
+            "... "
+        } else {
+            "  · "
+        })
     }
 
     fn render_prompt_history_search_indicator(
         &self,
         history_search: PromptHistorySearch,
     ) -> Cow<'_, str> {
-        let indicator = if dumb_terminal() {
+        let indicator = if self.symbols() == PromptSymbols::Plain {
             match self.mode {
                 Mode::Command => ">",
                 Mode::Data => "data>",
@@ -1041,21 +1567,37 @@ impl Prompt for QuirlPrompt {
         };
         Cow::Owned(format!("search `{}` {indicator} ", history_search.term))
     }
+
+    fn get_prompt_right_color(&self) -> reedline::Color {
+        reedline::Color::Magenta
+    }
+
+    fn get_indicator_color(&self) -> reedline::Color {
+        match self.mode {
+            Mode::Command => reedline::Color::Green,
+            Mode::Data => reedline::Color::Cyan,
+        }
+    }
+
+    fn right_prompt_on_last_line(&self) -> bool {
+        true
+    }
 }
 
 struct HistoryPickerCache {
     len: u64,
     modified: Option<SystemTime>,
-    items: Vec<PickItem>,
+    items: Vec<PickerItem>,
 }
 
 pub struct CatalogCompleter {
     catalog: Catalog,
     extensions: Option<Box<dyn ExtensionCompleter + Send>>,
-    picker_items: Vec<PickItem>,
+    picker_items: Vec<PickerItem>,
     history_path: Option<PathBuf>,
     history_cache: Option<HistoryPickerCache>,
     picker_invocation: Arc<AtomicU8>,
+    picker_ranker: Arc<dyn PickerRanker>,
 }
 
 impl CatalogCompleter {
@@ -1067,6 +1609,7 @@ impl CatalogCompleter {
             history_path: None,
             history_cache: None,
             picker_invocation: Arc::new(AtomicU8::new(PickerInvocation::None as u8)),
+            picker_ranker: Arc::new(StablePickerRanker),
         }
     }
 
@@ -1081,15 +1624,17 @@ impl CatalogCompleter {
             history_path: None,
             history_cache: None,
             picker_invocation: Arc::new(AtomicU8::new(PickerInvocation::None as u8)),
+            picker_ranker: Arc::new(StablePickerRanker),
         }
     }
 
     fn with_extensions_and_picker(
         catalog: Catalog,
         extensions: Option<Box<dyn ExtensionCompleter + Send>>,
-        picker_items: Vec<PickItem>,
+        picker_items: Vec<PickerItem>,
         history_path: Option<PathBuf>,
         picker_invocation: Arc<AtomicU8>,
+        picker_ranker: Arc<dyn PickerRanker>,
     ) -> Self {
         Self {
             catalog,
@@ -1098,10 +1643,11 @@ impl CatalogCompleter {
             history_path,
             history_cache: None,
             picker_invocation,
+            picker_ranker,
         }
     }
 
-    fn refreshed_history_items(&mut self) -> Option<&[PickItem]> {
+    fn refreshed_history_items(&mut self) -> Option<&[PickerItem]> {
         let path = self.history_path.as_deref()?;
         let metadata = fs::metadata(path).ok()?;
         let len = metadata.len();
@@ -1297,13 +1843,25 @@ fn unavailable_completion_worker() -> ShellError {
 
 impl Completer for CatalogCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
-        if let Some(kind) = PickerInvocation::from_state(&self.picker_invocation).item_kind() {
+        let invocation = PickerInvocation::from_state(&self.picker_invocation);
+        if invocation == PickerInvocation::Help {
+            return catalog_help_suggestions(&self.catalog, line, pos);
+        }
+        if let Some(kind) = invocation.item_kind() {
+            let picker_ranker = Arc::clone(&self.picker_ranker);
             let (query, replace_start, replace_end) = picker_query_and_span(kind, line, pos);
-            return if kind == ItemKind::History {
+            return if kind == PickerItemKind::History {
                 if let Some(items) = self.refreshed_history_items() {
-                    rank_picker_suggestions(items, query, replace_start, replace_end)
+                    rank_picker_suggestions(
+                        picker_ranker.as_ref(),
+                        items,
+                        query,
+                        replace_start,
+                        replace_end,
+                    )
                 } else {
                     rank_picker_suggestions_of_kind(
+                        picker_ranker.as_ref(),
                         &self.picker_items,
                         kind,
                         query,
@@ -1313,6 +1871,7 @@ impl Completer for CatalogCompleter {
                 }
             } else {
                 rank_picker_suggestions_of_kind(
+                    picker_ranker.as_ref(),
                     &self.picker_items,
                     kind,
                     query,
@@ -1325,31 +1884,14 @@ impl Completer for CatalogCompleter {
             .catalog
             .complete(line, pos)
             .into_iter()
-            .map(|completion| Suggestion {
-                value: completion.value,
-                display_override: Some(completion.display),
-                description: Some(completion.summary),
-                extra: Some(vec![completion.detail]),
-                span: Span::new(completion.replace_start, completion.replace_end),
-                append_whitespace: true,
-                match_indices: Some(completion.match_indices),
-                ..Suggestion::default()
-            })
+            .map(catalog_suggestion)
             .collect::<Vec<_>>();
         if let Some(extensions) = &mut self.extensions {
             suggestions.extend(
                 extensions
                     .complete(line, pos)
                     .into_iter()
-                    .map(|completion| Suggestion {
-                        value: completion.value,
-                        display_override: Some(completion.display),
-                        description: Some(completion.summary),
-                        extra: Some(vec![completion.detail]),
-                        span: Span::new(completion.replace_start, completion.replace_end),
-                        append_whitespace: true,
-                        ..Suggestion::default()
-                    }),
+                    .map(extension_suggestion),
             );
         }
         let mut seen = HashSet::new();
@@ -1358,10 +1900,167 @@ impl Completer for CatalogCompleter {
     }
 }
 
-fn picker_query_and_span(kind: ItemKind, line: &str, pos: usize) -> (&str, usize, usize) {
+fn catalog_help_suggestions(catalog: &Catalog, line: &str, pos: usize) -> Vec<Suggestion> {
+    let prefix = line.get(..pos.min(line.len())).unwrap_or(line);
+    let query = prefix.trim();
+    let mut commands = if query.is_empty() {
+        catalog.commands.iter().collect::<Vec<_>>()
+    } else {
+        let exact = catalog
+            .commands
+            .iter()
+            .filter(|command| command_matches_exactly(command, query))
+            .collect::<Vec<_>>();
+        if !exact.is_empty() {
+            exact
+        } else {
+            let path_prefix = catalog
+                .commands
+                .iter()
+                .filter(|command| command_matches_prefix(command, query))
+                .collect::<Vec<_>>();
+            if !path_prefix.is_empty() {
+                path_prefix
+            } else if let Some(context) = catalog
+                .commands
+                .iter()
+                .filter(|command| command_is_context_for(command, query))
+                .max_by_key(|command| command.path.len())
+            {
+                vec![context]
+            } else {
+                let query = query.to_ascii_lowercase();
+                catalog
+                    .commands
+                    .iter()
+                    .filter(|command| {
+                        command.path.to_ascii_lowercase().contains(&query)
+                            || command.summary.to_ascii_lowercase().contains(&query)
+                    })
+                    .collect::<Vec<_>>()
+            }
+        }
+    };
+    commands.sort_by(|left, right| left.path.cmp(&right.path));
+    commands
+        .into_iter()
+        .map(|command| command_help_suggestion(command, pos))
+        .collect()
+}
+
+fn command_matches_exactly(command: &CommandSpec, query: &str) -> bool {
+    command.path == query || command.aliases.iter().any(|alias| alias == query)
+}
+
+fn command_matches_prefix(command: &CommandSpec, query: &str) -> bool {
+    command.path.starts_with(query) || command.aliases.iter().any(|alias| alias.starts_with(query))
+}
+
+fn command_is_context_for(command: &CommandSpec, query: &str) -> bool {
+    query
+        .strip_prefix(&command.path)
+        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        || command.aliases.iter().any(|alias| {
+            query
+                .strip_prefix(alias)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+        })
+}
+
+fn command_help_suggestion(command: &CommandSpec, pos: usize) -> Suggestion {
+    let mut description = vec![
+        format!("Usage: {}", escape_terminal_controls(&command.signature)),
+        escape_terminal_controls(&command.summary),
+    ];
+    if !command.details.is_empty() && command.details != command.summary {
+        description.push(escape_terminal_controls(&command.details));
+    }
+    if !command.options.is_empty() {
+        let options = command
+            .options
+            .iter()
+            .map(|option| {
+                format!(
+                    "  {}: {}",
+                    escape_terminal_controls(&option.names.join(", ")),
+                    escape_terminal_controls(&option.documentation)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        description.push(format!("Arguments and options:\n{options}"));
+    }
+    if !command.examples.is_empty() {
+        description.push(format!(
+            "Examples:\n{}",
+            command
+                .examples
+                .iter()
+                .map(|example| format!("  {}", escape_terminal_controls(example)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    Suggestion {
+        // F1 is inspect-only: accepting or dismissing help must not rewrite input.
+        value: String::new(),
+        display_override: Some(escape_terminal_line(&command.signature)),
+        description: Some(description.join("\n\n")),
+        extra: None,
+        span: Span::new(pos, pos),
+        append_whitespace: false,
+        ..Suggestion::default()
+    }
+}
+
+fn catalog_suggestion(completion: quirl_catalog::Completion) -> Suggestion {
+    let kind = if completion.value.starts_with('-') {
+        "option"
+    } else if completion.replace_start == 0 {
+        "command"
+    } else {
+        "value"
+    };
+    Suggestion {
+        value: completion.value,
+        display_override: Some(format!("{}  [{kind}]", completion.display)),
+        description: Some(format!(
+            "{}\nkind: {kind} | source: catalog\n{}",
+            completion.summary, completion.detail
+        )),
+        extra: Some(vec![
+            format!("kind: {kind} | source: catalog"),
+            completion.detail,
+        ]),
+        span: Span::new(completion.replace_start, completion.replace_end),
+        append_whitespace: true,
+        match_indices: Some(completion.match_indices),
+        ..Suggestion::default()
+    }
+}
+
+fn extension_suggestion(completion: ExtensionSuggestion) -> Suggestion {
+    Suggestion {
+        value: completion.value,
+        display_override: Some(format!("{}  [plugin]", completion.display)),
+        description: Some(format!(
+            "{}\nkind: value | source: plugin\n{}",
+            completion.summary, completion.detail
+        )),
+        extra: Some(vec![
+            "kind: value | source: plugin".to_owned(),
+            completion.detail,
+        ]),
+        span: Span::new(completion.replace_start, completion.replace_end),
+        append_whitespace: true,
+        ..Suggestion::default()
+    }
+}
+
+fn picker_query_and_span(kind: PickerItemKind, line: &str, pos: usize) -> (&str, usize, usize) {
     let end = pos.min(line.len());
     let before_cursor = line.get(..end).unwrap_or(line);
-    if kind != ItemKind::File {
+    if kind != PickerItemKind::File {
         return (before_cursor, 0, end);
     }
     let start = before_cursor
@@ -1378,21 +2077,30 @@ fn picker_query_and_span(kind: ItemKind, line: &str, pos: usize) -> (&str, usize
 }
 
 fn rank_picker_suggestions(
-    items: &[PickItem],
+    ranker: &dyn PickerRanker,
+    items: &[PickerItem],
     query: &str,
     replace_start: usize,
     replace_end: usize,
 ) -> Vec<Suggestion> {
-    Picker
-        .rank(items, query)
+    ranker
+        .rank(items, query, PICKER_RESULTS_MAX)
         .into_iter()
         .map(|matched| {
             let item = &items[matched.index];
+            let kind = picker_kind_label(item.kind);
+            let detail = format!("{}\nkind: {kind} | source: picker", item.description);
+            let extra = item
+                .preview
+                .iter()
+                .cloned()
+                .chain([format!("kind: {kind} | source: picker")])
+                .collect::<Vec<_>>();
             Suggestion {
-                value: item.value.as_str().unwrap_or(&item.label).to_owned(),
-                display_override: Some(item.label.clone()),
-                description: Some(item.description.clone()),
-                extra: item.preview.clone().map(|preview| vec![preview]),
+                value: item.value.clone(),
+                display_override: Some(format!("{}  [{kind}]", item.label)),
+                description: Some(detail),
+                extra: Some(extra),
                 span: Span::new(replace_start, replace_end),
                 append_whitespace: false,
                 match_indices: Some(matched.match_indices),
@@ -1402,9 +2110,22 @@ fn rank_picker_suggestions(
         .collect()
 }
 
+const fn picker_kind_label(kind: PickerItemKind) -> &'static str {
+    match kind {
+        PickerItemKind::History => "history",
+        PickerItemKind::File => "file",
+        PickerItemKind::Directory => "directory",
+        PickerItemKind::Action => "action",
+        PickerItemKind::Completion => "completion",
+        PickerItemKind::Job => "job",
+        PickerItemKind::Data => "data",
+    }
+}
+
 fn rank_picker_suggestions_of_kind(
-    items: &[PickItem],
-    kind: ItemKind,
+    ranker: &dyn PickerRanker,
+    items: &[PickerItem],
+    kind: PickerItemKind,
     query: &str,
     replace_start: usize,
     replace_end: usize,
@@ -1414,57 +2135,63 @@ fn rank_picker_suggestions_of_kind(
         .iter()
         .filter(|item| {
             item.kind == kind
-                && (kind != ItemKind::History || seen_history_values.insert(item.value.as_str()))
+                && (kind != PickerItemKind::History
+                    || seen_history_values.insert(item.value.as_str()))
         })
         .cloned()
         .collect::<Vec<_>>();
-    rank_picker_suggestions(&scoped, query, replace_start, replace_end)
+    rank_picker_suggestions(ranker, &scoped, query, replace_start, replace_end)
 }
 
-fn read_history_picker_items(path: &Path) -> Option<Vec<PickItem>> {
+fn read_history_picker_items(path: &Path) -> Option<Vec<PickerItem>> {
     let source = fs::read_to_string(path).ok()?;
     Some(history_picker_items(&source))
 }
 
-fn history_picker_items(source: &str) -> Vec<PickItem> {
+fn history_picker_items(source: &str) -> Vec<PickerItem> {
     let mut seen = HashSet::new();
     source
         .lines()
         .rev()
+        .take(PICKER_ITEMS_MAX)
         .filter(|line| seen.insert((*line).to_owned()))
         .enumerate()
-        .map(|(index, line)| picker_item(index, ItemKind::History, line, "history"))
+        .map(|(index, line)| picker_item(index, PickerItemKind::History, line, "history"))
         .collect()
 }
 
-fn picker_sources(catalog: &Catalog, mut items: Vec<PickItem>) -> Vec<PickItem> {
+fn picker_sources(catalog: &Catalog, mut items: Vec<PickerItem>) -> Vec<PickerItem> {
     let next_id = items.len();
+    let catalog_remaining = PICKER_ITEMS_MAX.saturating_sub(items.len());
     items.extend(
         catalog
             .commands
             .iter()
+            .take(catalog_remaining)
             .enumerate()
-            .map(|(index, command)| PickItem {
+            .map(|(index, command)| PickerItem {
                 id: format!("action-{}", next_id + index),
-                kind: ItemKind::Action,
+                kind: PickerItemKind::Action,
                 label: command.path.clone(),
                 description: command.summary.clone(),
                 preview: Some(command.details.clone()),
-                value: serde_json::Value::String(command.path.clone()),
+                value: command.path.clone(),
             }),
     );
     let next_id = items.len();
+    let file_remaining = PICKER_ITEMS_MAX.saturating_sub(items.len());
     if let Ok(entries) = fs::read_dir(".") {
         items.extend(
             entries
                 .filter_map(Result::ok)
+                .take(file_remaining)
                 .enumerate()
                 .map(|(index, entry)| {
                     let path = entry.path();
                     let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
-                    PickItem {
+                    PickerItem {
                         id: format!("file-{}", next_id + index),
-                        kind: ItemKind::File,
+                        kind: PickerItemKind::File,
                         label: path.to_string_lossy().into_owned(),
                         description: if is_directory {
                             "directory".to_owned()
@@ -1472,7 +2199,7 @@ fn picker_sources(catalog: &Catalog, mut items: Vec<PickItem>) -> Vec<PickItem> 
                             "file".to_owned()
                         },
                         preview: None,
-                        value: serde_json::Value::String(path.to_string_lossy().into_owned()),
+                        value: path.to_string_lossy().into_owned(),
                     }
                 }),
         );
@@ -1480,14 +2207,14 @@ fn picker_sources(catalog: &Catalog, mut items: Vec<PickItem>) -> Vec<PickItem> 
     items
 }
 
-fn picker_item(index: usize, kind: ItemKind, value: &str, description: &str) -> PickItem {
-    PickItem {
+fn picker_item(index: usize, kind: PickerItemKind, value: &str, description: &str) -> PickerItem {
+    PickerItem {
         id: format!("{kind:?}-{index}"),
         kind,
         label: value.to_owned(),
         description: description.to_owned(),
         preview: None,
-        value: serde_json::Value::String(value.to_owned()),
+        value: value.to_owned(),
     }
 }
 
@@ -1626,6 +2353,74 @@ mod tests {
         let result = completer.complete("git c", 5);
         assert_eq!(result[0].value, "git commit");
         assert!(result[0].description.as_deref().unwrap().contains("Record"));
+        assert!(result[0]
+            .display_override
+            .as_deref()
+            .unwrap()
+            .contains("[command]"));
+        assert!(result[0]
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("source: catalog"));
+    }
+
+    #[test]
+    fn contextual_help_uses_catalog_metadata_without_rewriting_input() {
+        let catalog = Catalog::builtin();
+        let command = catalog
+            .commands
+            .iter()
+            .find(|command| command.path == "git commit")
+            .unwrap();
+        let line = "git commit --message";
+        let suggestions = catalog_help_suggestions(&catalog, line, line.len());
+
+        assert_eq!(suggestions.len(), 1);
+        let suggestion = &suggestions[0];
+        assert_eq!(suggestion.value, "");
+        assert_eq!(suggestion.span, Span::new(line.len(), line.len()));
+        assert!(!suggestion.append_whitespace);
+        assert!(suggestion
+            .display_override
+            .as_deref()
+            .unwrap()
+            .contains(&command.signature));
+        let description = suggestion.description.as_deref().unwrap();
+        assert!(description.contains(&command.summary));
+        assert!(description.contains(&command.details));
+        for option in &command.options {
+            assert!(description.contains(&option.documentation));
+        }
+        for example in &command.examples {
+            assert!(description.contains(example));
+        }
+        assert!(suggestion.extra.is_none());
+    }
+
+    #[test]
+    fn contextual_help_searches_prefixes_and_escapes_catalog_controls() {
+        let mut catalog = Catalog::builtin();
+        let command = catalog
+            .commands
+            .iter_mut()
+            .find(|command| command.path == "git commit")
+            .unwrap();
+        command.summary.push_str("\u{1b}[31m");
+        command.examples.push("echo safe\u{009b}2J".to_owned());
+
+        let suggestions = catalog_help_suggestions(&catalog, "git c", 5);
+        assert!(suggestions.iter().any(|suggestion| {
+            suggestion
+                .display_override
+                .as_deref()
+                .is_some_and(|display| display.starts_with("git commit"))
+        }));
+        let rendered = format!("{suggestions:?}");
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{009b}'));
+        assert!(rendered.contains("\\u{1b}"));
+        assert!(rendered.contains("\\u{9b}"));
     }
 
     #[test]
@@ -1657,20 +2452,183 @@ mod tests {
     }
 
     #[test]
-    fn dumb_terminal_prompt_join_uses_ascii_only() {
+    fn prompt_symbol_profiles_keep_font_requirements_explicit() {
         let parts = vec![
             "project".to_owned(),
             "command".to_owned(),
             "git:main".to_owned(),
         ];
         assert_eq!(
-            join_prompt_parts(&parts, true),
+            join_prompt_parts(&parts, PromptSymbols::Plain),
             "project | command | git:main"
         );
         assert_eq!(
-            join_prompt_parts(&parts, false),
+            join_prompt_parts(&parts, PromptSymbols::Unicode),
             "project · command · git:main"
         );
+        assert_eq!(
+            join_prompt_parts(&parts, PromptSymbols::NerdFont),
+            "project \u{e0b1} command \u{e0b1} git:main"
+        );
+    }
+
+    #[test]
+    fn auto_symbols_only_use_unicode_for_a_unicode_locale() {
+        assert!(unicode_is_safe(false, true));
+        assert!(!unicode_is_safe(false, false));
+        assert!(!unicode_is_safe(true, true));
+        assert_eq!(
+            PromptSymbols::resolve("auto", false, true),
+            PromptSymbols::Unicode
+        );
+        assert_eq!(
+            PromptSymbols::resolve("auto", false, false),
+            PromptSymbols::Plain
+        );
+        assert_eq!(
+            PromptSymbols::resolve("nerd_font", false, true),
+            PromptSymbols::NerdFont
+        );
+        assert_eq!(
+            PromptSymbols::resolve("nerd_font", false, false),
+            PromptSymbols::NerdFont
+        );
+        assert_eq!(
+            PromptSymbols::resolve("unicode", false, false),
+            PromptSymbols::Unicode
+        );
+        assert_eq!(
+            PromptSymbols::resolve("nerd_font", true, true),
+            PromptSymbols::Plain
+        );
+        assert!(locale_name_supports_unicode(std::ffi::OsStr::new(
+            "en_US.UTF-8"
+        )));
+        assert!(!locale_name_supports_unicode(std::ffi::OsStr::new("C")));
+        assert!(!locale_value_supports_unicode(None));
+        assert!(locale_value_supports_unicode(Some(std::ffi::OsStr::new(
+            "C.UTF-8"
+        ))));
+    }
+
+    #[test]
+    fn filesystem_and_native_prompt_context_cannot_inject_terminal_controls() {
+        let hostile = "cwd\u{1b}]0;owned\u{7}\u{009b}2J\rrewritten\nnext";
+        let displayed = display_directory(Path::new(&format!("/tmp/{hostile}")));
+        assert_eq!(displayed, hostile);
+        let safe_display = safe_prompt_text(&displayed);
+        assert!(safe_display.contains("\\u{1b}]0;owned\\u{7}"));
+        assert!(safe_display.contains("\\u{9b}2J\\rrewritten\\nnext"));
+
+        let context = NativePromptContext {
+            directory: hostile.to_owned(),
+            git_branch: Some(hostile.to_owned()),
+            git_state: Some(hostile.to_owned()),
+        };
+        let original = context.clone();
+        let config = QuirlConfig {
+            prompt: PromptConfig {
+                symbols: "plain".to_owned(),
+                left: vec![
+                    "directory".to_owned(),
+                    "git_branch".to_owned(),
+                    "git_state".to_owned(),
+                ],
+                right: Vec::new(),
+                ..PromptConfig::default()
+            },
+            ..QuirlConfig::default()
+        };
+        let rendered = QuirlPrompt::with_config(Mode::Command, &config)
+            .with_native_context(context)
+            .render_prompt_left()
+            .into_owned();
+
+        assert_eq!(original.directory, hostile);
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+        assert!(!rendered.contains('\u{009b}'));
+        assert!(!rendered.contains('\r'));
+        assert!(rendered.ends_with('\n'));
+        assert_eq!(rendered.matches('\n').count(), 1);
+        assert!(rendered.contains("\\u{1b}]0;owned\\u{7}"));
+        assert!(rendered.contains("\\u{9b}2J\\rrewritten\\nnext"));
+    }
+
+    #[test]
+    fn plugin_prompt_segments_are_escaped_without_changing_the_source_value() {
+        let hostile = "plugin\u{1b}]8;;https://example.invalid\u{7}link\u{1b}]8;;\u{7}\u{009b}2J\r";
+        let original = hostile.to_owned();
+        let config = QuirlConfig {
+            prompt: PromptConfig {
+                symbols: "plain".to_owned(),
+                left: vec!["project".to_owned()],
+                right: vec!["region".to_owned()],
+                ..PromptConfig::default()
+            },
+            ..QuirlConfig::default()
+        };
+        let prompt = QuirlPrompt::with_config(Mode::Command, &config)
+            .with_named_extension_segments([
+                ("project".to_owned(), hostile.to_owned()),
+                ("region".to_owned(), hostile.to_owned()),
+            ]);
+        let named = format!(
+            "{}{}",
+            prompt.render_prompt_left(),
+            prompt.render_prompt_right()
+        );
+        let legacy = QuirlPrompt::new(Mode::Command)
+            .with_extension_segments(vec![hostile.to_owned()])
+            .render_prompt_left()
+            .into_owned();
+
+        assert_eq!(original, hostile);
+        for rendered in [named, legacy] {
+            assert!(!rendered.contains('\u{1b}'));
+            assert!(!rendered.contains('\u{7}'));
+            assert!(!rendered.contains('\u{009b}'));
+            assert!(!rendered.contains('\r'));
+            assert!(rendered.contains("\\u{1b}]8;;https://example.invalid\\u{7}"));
+            assert!(rendered.contains("\\u{9b}2J\\r"));
+        }
+    }
+
+    #[test]
+    fn prompt_profiles_are_escape_free_and_plain_is_ascii() {
+        for profile in ["plain", "unicode", "nerd_font"] {
+            let config = QuirlConfig {
+                prompt: PromptConfig {
+                    symbols: profile.to_owned(),
+                    ..PromptConfig::default()
+                },
+                ..QuirlConfig::default()
+            };
+            let prompt = QuirlPrompt::with_config(Mode::Command, &config)
+                .with_native_context(NativePromptContext {
+                    directory: "quirl".to_owned(),
+                    git_branch: Some("main".to_owned()),
+                    git_state: Some("dirty".to_owned()),
+                })
+                .with_jobs(2)
+                .with_duration(Duration::from_millis(42))
+                .with_status(7);
+            let rendered = format!(
+                "{}{}{}",
+                prompt.render_prompt_left(),
+                prompt.render_prompt_right(),
+                prompt.render_prompt_indicator(PromptEditMode::Default)
+            );
+            assert!(!rendered.contains('\u{1b}'));
+            assert!(!rendered.contains('\u{009b}'));
+            if profile == "plain" {
+                assert!(rendered.is_ascii());
+            }
+        }
+        let nerd = PromptSymbols::NerdFont;
+        assert!(nerd.git_branch("main").contains('\u{e0a0}'));
+        assert!(nerd.separator().contains('\u{e0b1}'));
+        assert!(nerd.directory("quirl").contains('\u{f07c}'));
     }
 
     #[test]
@@ -1682,13 +2640,101 @@ mod tests {
     }
 
     #[test]
+    fn right_prompt_stays_quiet_and_respects_configured_context() {
+        let config = QuirlConfig {
+            editor: EditorConfig {
+                keymap: "vim".to_owned(),
+                ..EditorConfig::default()
+            },
+            prompt: PromptConfig {
+                symbols: "plain".to_owned(),
+                right: vec!["jobs".to_owned()],
+                ..PromptConfig::default()
+            },
+            ..QuirlConfig::default()
+        };
+        let prompt = QuirlPrompt::with_config(Mode::Command, &config)
+            .with_status(7)
+            .with_jobs(2);
+
+        let rendered = prompt.render_right_for(140, true, false);
+        assert_eq!(rendered, "jobs:2");
+        assert!(!rendered.contains("Tab"));
+        assert!(!rendered.contains("COMMAND"));
+        assert!(rendered.width() <= 140);
+    }
+
+    #[test]
+    fn editor_chrome_has_ascii_tiny_and_dumb_terminal_fallbacks() {
+        let config = QuirlConfig {
+            prompt: PromptConfig {
+                symbols: "plain".to_owned(),
+                ..PromptConfig::default()
+            },
+            ..QuirlConfig::default()
+        };
+        let prompt = QuirlPrompt::with_config(Mode::Data, &config).with_status(12);
+
+        let tiny = prompt.render_right_for(9, true, false);
+        assert_eq!(tiny, "status:12");
+        assert!(tiny.is_ascii());
+        assert!(tiny.width() <= 9);
+        let dumb = prompt.render_right_for(80, true, true);
+        assert_eq!(dumb, "status:12");
+    }
+
+    #[test]
+    fn modal_edit_indicators_and_cursor_shapes_match_editor_state() {
+        let config = QuirlConfig {
+            prompt: PromptConfig {
+                symbols: "plain".to_owned(),
+                ..PromptConfig::default()
+            },
+            ..QuirlConfig::default()
+        };
+        let prompt = QuirlPrompt::with_config(Mode::Command, &config);
+        assert_eq!(
+            prompt.render_prompt_indicator(PromptEditMode::Default),
+            "command > "
+        );
+        assert_eq!(
+            prompt.render_prompt_indicator(PromptEditMode::Emacs),
+            "command > "
+        );
+        assert_eq!(
+            prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Normal)),
+            "normal command > "
+        );
+        assert_eq!(
+            prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Insert)),
+            "insert command > "
+        );
+        assert_eq!(
+            prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Visual)),
+            "visual command > "
+        );
+        let cursors = editor_cursor_config();
+        assert_eq!(cursors.vi_insert, Some(SetCursorStyle::SteadyBar));
+        assert_eq!(cursors.vi_normal, Some(SetCursorStyle::SteadyBlock));
+        assert_eq!(cursors.emacs, Some(SetCursorStyle::SteadyBar));
+        assert!(prompt.right_prompt_on_last_line());
+    }
+
+    #[test]
     fn lua_suggestions_merge_with_catalog_completion() {
         let mut completer =
             CatalogCompleter::with_extensions(Catalog::builtin(), Some(Box::new(ExampleExtension)));
         let result = completer.complete("deploy --environment prod", 25);
         assert!(result.iter().any(|suggestion| {
             suggestion.value == "production"
-                && suggestion.description.as_deref() == Some("Deployment environment")
+                && suggestion
+                    .description
+                    .as_deref()
+                    .is_some_and(|description| description.contains("Deployment environment"))
+                && suggestion
+                    .display_override
+                    .as_deref()
+                    .is_some_and(|display| display.contains("[plugin]"))
         }));
     }
 
@@ -1771,7 +2817,7 @@ mod tests {
         let rendered = prompt.render_prompt_left();
         assert!(rendered.contains(&join_prompt_parts(
             &["project".to_owned(), "git:main".to_owned()],
-            dumb_terminal(),
+            prompt.symbols(),
         )));
     }
 
@@ -1779,6 +2825,7 @@ mod tests {
     fn configured_prompt_orders_native_and_named_segments() {
         let config = QuirlConfig {
             prompt: PromptConfig {
+                symbols: "plain".to_owned(),
                 left: vec![
                     "mode".to_owned(),
                     "project".to_owned(),
@@ -1789,6 +2836,7 @@ mod tests {
                     "status".to_owned(),
                     "region".to_owned(),
                 ],
+                ..PromptConfig::default()
             },
             ..QuirlConfig::default()
         };
@@ -1800,7 +2848,7 @@ mod tests {
             ]);
 
         let left = prompt.render_prompt_left();
-        let separator = if dumb_terminal() { " | " } else { " · " };
+        let separator = " | ";
         assert!(left.starts_with(&format!("command{separator}quirl{separator}")));
         assert_eq!(
             prompt.render_prompt_right(),
@@ -1818,6 +2866,7 @@ mod tests {
                     "git_state".to_owned(),
                 ],
                 right: vec!["status".to_owned()],
+                ..PromptConfig::default()
             },
             ..QuirlConfig::default()
         };
@@ -1833,6 +2882,7 @@ mod tests {
             prompt: PromptConfig {
                 left: Vec::new(),
                 right: vec!["duration".to_owned()],
+                ..PromptConfig::default()
             },
             ..QuirlConfig::default()
         };
@@ -1848,6 +2898,7 @@ mod tests {
             prompt: PromptConfig {
                 left: Vec::new(),
                 right: vec!["jobs".to_owned()],
+                ..PromptConfig::default()
             },
             ..QuirlConfig::default()
         };
@@ -1960,6 +3011,7 @@ mod tests {
     fn git_state_renders_in_configured_order_with_extension_segments() {
         let config = QuirlConfig {
             prompt: PromptConfig {
+                symbols: "plain".to_owned(),
                 left: vec![
                     "directory".to_owned(),
                     "git_branch".to_owned(),
@@ -1967,6 +3019,7 @@ mod tests {
                     "project".to_owned(),
                 ],
                 right: Vec::new(),
+                ..PromptConfig::default()
             },
             ..QuirlConfig::default()
         };
@@ -1976,23 +3029,62 @@ mod tests {
                 git_branch: Some("main".to_owned()),
                 git_state: Some("dirty".to_owned()),
             })
-            .with_named_extension_segments(vec![("project".to_owned(), "nsh".to_owned())]);
+            .with_named_extension_segments(vec![("project".to_owned(), "quirl".to_owned())]);
 
         assert_eq!(
             prompt.render_prompt_left(),
             format!(
-                "{} ",
+                "{}\n",
                 join_prompt_parts(
                     &[
                         "quirl".to_owned(),
-                        "git:main".to_owned(),
-                        "git:dirty".to_owned(),
-                        "nsh".to_owned(),
+                        "on main".to_owned(),
+                        "dirty".to_owned(),
+                        "quirl".to_owned(),
                     ],
-                    dumb_terminal(),
+                    PromptSymbols::Plain,
                 )
             )
         );
+    }
+
+    #[test]
+    fn home_directory_is_compacted_like_a_modern_shell_prompt() {
+        let home = Path::new("/Users/alex");
+
+        assert_eq!(display_directory_with_home(home, Some(home)), "~");
+        assert_eq!(
+            display_directory_with_home(
+                Path::new("/Users/alex/Projects/github.com/example/quirl"),
+                Some(home),
+            ),
+            "~/P/g/e/quirl"
+        );
+        assert_eq!(
+            display_directory_with_home(Path::new("/var/tmp/quirl"), Some(home)),
+            "quirl"
+        );
+    }
+
+    #[test]
+    fn styled_default_prompt_uses_only_fixed_quirl_color_sequences() {
+        let config = QuirlConfig::default();
+        let mut prompt = QuirlPrompt::with_config(Mode::Command, &config).with_native_context(
+            NativePromptContext {
+                directory: "~/P/g/n/quirl".to_owned(),
+                git_branch: Some("main".to_owned()),
+                git_state: Some("dirty".to_owned()),
+            },
+        );
+        prompt.styled = true;
+
+        let rendered = prompt.render_prompt_left();
+
+        assert!(rendered.starts_with("\u{1b}[1;36m~/P/g/n/quirl"));
+        assert!(rendered.contains("\u{1b}[1;35mon main"));
+        assert!(rendered.contains("dirty"));
+        assert!(rendered.ends_with('\n'));
+        assert!(!rendered.contains("\u{1b}]"));
     }
 
     #[test]
@@ -2002,6 +3094,7 @@ mod tests {
                 editor: EditorConfig {
                     keymap: keymap.to_owned(),
                     semantic_hints: keymap != "vim",
+                    ..EditorConfig::default()
                 },
                 picker: PickerConfig {
                     layout: if keymap == "emacs" {
@@ -2025,6 +3118,167 @@ mod tests {
         let mut helix = configured_edit_mode("helix");
 
         assert_eq!(helix.parse_event(event), completion_menu_event());
+    }
+
+    fn parsed_key(
+        edit_mode: &mut dyn EditMode,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> ReedlineEvent {
+        let event = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(code, modifiers))).unwrap();
+        edit_mode.parse_event(event)
+    }
+
+    fn apply_key(
+        edit_mode: &mut dyn EditMode,
+        editor: &mut Reedline,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> ReedlineEvent {
+        let event = parsed_key(edit_mode, code, modifiers);
+        if let ReedlineEvent::Edit(commands) = &event {
+            editor.run_edit_commands(commands);
+        }
+        event
+    }
+
+    #[test]
+    fn every_keymap_maps_ctrl_d_to_reedline_eof() {
+        for keymap in ["emacs", "vim", "helix"] {
+            let mut edit_mode = configured_edit_mode(keymap);
+
+            assert_eq!(
+                parsed_key(
+                    edit_mode.as_mut(),
+                    KeyCode::Char('d'),
+                    KeyModifiers::CONTROL,
+                ),
+                ReedlineEvent::CtrlD,
+                "{keymap}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_keymap_edits_again_after_backspace_delete_and_ctrl_h() {
+        for keymap in ["emacs", "vim", "helix"] {
+            let mut edit_mode = configured_edit_mode(keymap);
+            let mut editor = Reedline::create().with_edit_mode(configured_edit_mode(keymap));
+
+            for character in ['a', 'b', 'c'] {
+                apply_key(
+                    edit_mode.as_mut(),
+                    &mut editor,
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                );
+            }
+            apply_key(
+                edit_mode.as_mut(),
+                &mut editor,
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            );
+            apply_key(
+                edit_mode.as_mut(),
+                &mut editor,
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            );
+            assert_eq!(editor.current_buffer_contents(), "abx", "{keymap}");
+
+            editor.run_edit_commands(&[EditCommand::MoveToStart { select: false }]);
+            apply_key(
+                edit_mode.as_mut(),
+                &mut editor,
+                KeyCode::Delete,
+                KeyModifiers::NONE,
+            );
+            apply_key(
+                edit_mode.as_mut(),
+                &mut editor,
+                KeyCode::Char('z'),
+                KeyModifiers::NONE,
+            );
+            assert_eq!(editor.current_buffer_contents(), "zbx", "{keymap}");
+
+            apply_key(
+                edit_mode.as_mut(),
+                &mut editor,
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL,
+            );
+            apply_key(
+                edit_mode.as_mut(),
+                &mut editor,
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            );
+            assert_eq!(editor.current_buffer_contents(), "ybx", "{keymap}");
+        }
+    }
+
+    #[test]
+    fn picker_query_edits_remain_buffer_mutations_in_every_keymap() {
+        for keymap in ["emacs", "vim", "helix"] {
+            for (code, modifiers) in [
+                (KeyCode::Char('r'), KeyModifiers::CONTROL),
+                (KeyCode::Char('t'), KeyModifiers::CONTROL),
+                (KeyCode::Char('k'), KeyModifiers::CONTROL),
+                (KeyCode::Tab, KeyModifiers::NONE),
+            ] {
+                let mut edit_mode = configured_edit_mode(keymap);
+                let mut editor = Reedline::create().with_edit_mode(configured_edit_mode(keymap));
+                editor.run_edit_commands(&[EditCommand::InsertString("abc".to_owned())]);
+
+                let menu = parsed_key(edit_mode.as_mut(), code, modifiers);
+                assert!(
+                    matches!(
+                        menu,
+                        ReedlineEvent::Multiple(_) | ReedlineEvent::UntilFound(_)
+                    ),
+                    "menu opener in {keymap}"
+                );
+                apply_key(
+                    edit_mode.as_mut(),
+                    &mut editor,
+                    KeyCode::Backspace,
+                    KeyModifiers::NONE,
+                );
+                apply_key(
+                    edit_mode.as_mut(),
+                    &mut editor,
+                    KeyCode::Char('x'),
+                    KeyModifiers::NONE,
+                );
+                editor.run_edit_commands(&[EditCommand::MoveToStart { select: false }]);
+                apply_key(
+                    edit_mode.as_mut(),
+                    &mut editor,
+                    KeyCode::Delete,
+                    KeyModifiers::NONE,
+                );
+                apply_key(
+                    edit_mode.as_mut(),
+                    &mut editor,
+                    KeyCode::Char('y'),
+                    KeyModifiers::NONE,
+                );
+
+                assert_eq!(editor.current_buffer_contents(), "ybx", "{keymap}");
+            }
+        }
+    }
+
+    #[test]
+    fn vim_normal_backspace_keeps_its_navigation_semantics() {
+        let mut vim = configured_edit_mode("vim");
+        let _ = parsed_key(vim.as_mut(), KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(
+            parsed_key(vim.as_mut(), KeyCode::Backspace, KeyModifiers::NONE),
+            ReedlineEvent::Edit(vec![EditCommand::MoveLeft { select: false }])
+        );
     }
 
     #[test]
@@ -2059,8 +3313,8 @@ mod tests {
             let mut edit_mode =
                 configured_edit_mode_with_picker(keymap, Arc::clone(&picker_invocation));
             let toggle = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
-                KeyCode::Char(' '),
-                KeyModifiers::CONTROL,
+                KeyCode::Char('m'),
+                KeyModifiers::ALT,
             )))
             .unwrap();
             assert_eq!(
@@ -2105,6 +3359,46 @@ mod tests {
                 assert_eq!(edit_mode.parse_event(picker), picker_menu_event(menu, true));
                 assert_eq!(PickerInvocation::from_state(&picker_invocation), invocation);
             }
+
+            let help = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+                KeyCode::F(1),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert_eq!(edit_mode.parse_event(help), menu_event(HELP_MENU, true));
+            assert_eq!(
+                PickerInvocation::from_state(&picker_invocation),
+                PickerInvocation::Help
+            );
+            let help_again = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+                KeyCode::F(1),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert_eq!(
+                edit_mode.parse_event(help_again),
+                menu_event(HELP_MENU, false)
+            );
+            let tab = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+            assert_eq!(edit_mode.parse_event(tab), ReedlineEvent::MenuNext);
+            assert_eq!(
+                PickerInvocation::from_state(&picker_invocation),
+                PickerInvocation::Help
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_space_encodings_remain_compatibility_mode_toggles() {
+        for event in [
+            Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Char('\0'), KeyModifiers::NONE)),
+        ] {
+            assert!(is_mode_toggle(&event));
         }
     }
 
@@ -2153,9 +3447,19 @@ mod tests {
     #[test]
     fn typed_picker_completer_returns_original_values_with_kind_specific_spans() {
         let items = vec![
-            picker_item(0, ItemKind::History, "cargo test --workspace", "history"),
-            picker_item(1, ItemKind::File, "crates/quirl-ui/src/lib.rs", "file"),
-            picker_item(2, ItemKind::Action, "mode data", "action"),
+            picker_item(
+                0,
+                PickerItemKind::History,
+                "cargo test --workspace",
+                "history",
+            ),
+            picker_item(
+                1,
+                PickerItemKind::File,
+                "crates/quirl-ui/src/lib.rs",
+                "file",
+            ),
+            picker_item(2, PickerItemKind::Action, "mode data", "action"),
         ];
         let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
         let mut completer = CatalogCompleter::with_extensions_and_picker(
@@ -2164,10 +3468,19 @@ mod tests {
             items,
             None,
             Arc::clone(&picker_invocation),
+            Arc::new(StablePickerRanker),
         );
         let suggestions = completer.complete("cts", 3);
         assert_eq!(suggestions[0].value, "cargo test --workspace");
         assert_eq!(suggestions[0].span, Span::new(0, 3));
+        assert!(suggestions[0]
+            .display_override
+            .as_deref()
+            .is_some_and(|display| display.contains("[history]")));
+        assert!(suggestions[0]
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("source: picker")));
 
         PickerInvocation::File.activate(&picker_invocation);
         let line = "cat crates/quirlXYZ trailing";
@@ -2189,8 +3502,8 @@ mod tests {
 
         let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
         let fallback_items = vec![
-            picker_item(0, ItemKind::History, "cargo test", "history"),
-            picker_item(1, ItemKind::History, "cargo test", "history"),
+            picker_item(0, PickerItemKind::History, "cargo test", "history"),
+            picker_item(1, PickerItemKind::History, "cargo test", "history"),
         ];
         let mut completer = CatalogCompleter::with_extensions_and_picker(
             Catalog::builtin(),
@@ -2198,6 +3511,7 @@ mod tests {
             fallback_items,
             None,
             picker_invocation,
+            Arc::new(StablePickerRanker),
         );
         let suggestions = completer.complete("cargo", 5);
         assert_eq!(suggestions.len(), 1);
@@ -2224,6 +3538,7 @@ mod tests {
             Vec::new(),
             Some(history_path.clone()),
             picker_invocation,
+            Arc::new(StablePickerRanker),
         );
         let line = "cargo";
         assert_eq!(completer.complete(line, line.len())[0].value, "cargo test");

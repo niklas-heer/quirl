@@ -33,14 +33,16 @@ use quirl_data::{DataRenderFormat, DataRuntime};
 use quirl_lua::{
     sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig, MAX_LUA_SOURCE_BYTES,
 };
+use quirl_picker::{ItemKind, PickItem, Picker, MAX_PICKER_ITEMS};
 use quirl_process::{sandboxed_process_host, JobStatus, NativeExecutor};
 use quirl_syntax::{classify, InteractiveLine, Mode};
 use quirl_ui::{
-    editor_with_extensions_config_and_history, history_path, render_error, PromptContextScheduler,
-    QuirlPrompt, MODE_TOGGLE_HOST_COMMAND,
+    editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
+    terminal_supports_unicode, terminal_width, InteractiveSignal, PickerItem, PickerItemKind,
+    PickerMatch, PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind,
+    MODE_TOGGLE_HOST_COMMAND,
 };
 use recovery::RecoveryCommand;
-use reedline::Signal;
 use script::ScriptLanguage;
 use std::{
     collections::BTreeMap,
@@ -50,6 +52,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc, Mutex},
     time::{Duration, Instant},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Parser)]
 #[command(name = "quirl", version, about = "Everything you need, mixed in")]
@@ -481,7 +484,14 @@ fn run_exec_with_recovery(command: &str) -> Result<i32, ShellError> {
         &journal,
         command,
         Some(&extensions),
+        ExecutionOutputMode::Capture,
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionOutputMode {
+    Capture,
+    Interactive,
 }
 
 fn execute_with_recovery(
@@ -489,6 +499,7 @@ fn execute_with_recovery(
     journal: &recovery::RecoveryJournal,
     command: &str,
     extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
+    output_mode: ExecutionOutputMode,
 ) -> Result<i32, ShellError> {
     let planned = match extensions {
         Some(extensions) => {
@@ -531,7 +542,9 @@ fn execute_with_recovery(
         );
     }
     let started = Instant::now();
-    match execute_command_or_dialect_island(executor, &source) {
+    let renders_captured_output = output_mode == ExecutionOutputMode::Capture
+        || interactive_dialect_island(&source).is_some();
+    match execute_command_or_dialect_island(executor, &source, output_mode) {
         Ok(outcome) => {
             let duration = started.elapsed();
             if outcome.status != 0 {
@@ -565,7 +578,9 @@ fn execute_with_recovery(
                     &mut annotations,
                 );
             }
-            print_outcome(&outcome);
+            if renders_captured_output {
+                print_outcome(&outcome);
+            }
             print_extension_annotations(&annotations);
             Ok(outcome.status)
         }
@@ -596,6 +611,7 @@ fn execute_with_recovery(
 fn execute_command_or_dialect_island(
     executor: &mut NativeExecutor,
     source: &str,
+    output_mode: ExecutionOutputMode,
 ) -> Result<CommandOutcome, ShellError> {
     if let Some((language, body)) = interactive_dialect_island(source) {
         return script::run_interactive_island(
@@ -604,7 +620,10 @@ fn execute_command_or_dialect_island(
             &script::ScriptCancellation::default(),
         );
     }
-    executor.execute_capture(source)
+    match output_mode {
+        ExecutionOutputMode::Capture => executor.execute_capture(source),
+        ExecutionOutputMode::Interactive => executor.execute_interactive(source),
+    }
 }
 
 /// Recognize a deliberately tiny, explicit bridge form. The body is passed verbatim to the
@@ -639,7 +658,7 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
     let history_path = history_path()?;
     let mut line_editor =
         configured_editor(&catalog, &extensions, active_config.clone(), &history_path)?;
-    print_banner();
+    print_banner(&active_config);
     let mut mode = Mode::Command;
     let mut executor = NativeExecutor::default();
     let recovery = recovery::RecoveryJournal::discover()?;
@@ -707,18 +726,18 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
             prompt = prompt.with_duration(duration);
         }
         match line_editor.read_line(&prompt) {
-            Ok(Signal::Success(buffer)) => {
+            Ok(InteractiveSignal::Success(buffer)) => {
                 sync_history(&mut line_editor, &history_path)?;
                 match classify(mode, &buffer) {
                     InteractiveLine::Empty => {}
                     InteractiveLine::Exit => return Ok(last_status),
                     InteractiveLine::ChangeMode(next) => {
                         mode = next;
-                        println!("mode → {mode}");
+                        print_mode_feedback(mode, &active_config);
                     }
                     InteractiveLine::ToggleMode => {
                         mode = mode.toggled();
-                        println!("mode → {mode}");
+                        print_mode_feedback(mode, &active_config);
                     }
                     InteractiveLine::Help(topic) => print_help(&catalog, topic),
                     InteractiveLine::Command(command) => {
@@ -728,6 +747,7 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
                             &recovery,
                             command,
                             Some(&extensions),
+                            ExecutionOutputMode::Interactive,
                         ) {
                             Ok(status) => {
                                 last_status = status;
@@ -877,7 +897,7 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
                     }
                 }
             }
-            Ok(Signal::CtrlC) => {
+            Ok(InteractiveSignal::CtrlC) => {
                 last_status = 130;
                 let mut annotations = BTreeMap::new();
                 apply_observation_actions(
@@ -891,11 +911,12 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
                 );
                 println!("^C");
             }
-            Ok(Signal::CtrlD) => return Ok(last_status),
-            Ok(Signal::HostCommand(command)) if command == MODE_TOGGLE_HOST_COMMAND => {
+            Ok(InteractiveSignal::CtrlD) => return Ok(last_status),
+            Ok(InteractiveSignal::HostCommand(command)) if command == MODE_TOGGLE_HOST_COMMAND => {
                 mode = mode.toggled();
-                println!("mode → {mode}");
+                print_mode_feedback(mode, &active_config);
             }
+            Ok(InteractiveSignal::Suspend) => suspend_self()?,
             Ok(_) => {}
             Err(error) => {
                 return Err(
@@ -1104,25 +1125,122 @@ fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+enum SessionEditor {
+    Rich(Box<RichSurface>),
+    Simple(Box<reedline::Reedline>),
+}
+
+impl SessionEditor {
+    fn read_line(&mut self, prompt: &QuirlPrompt) -> Result<InteractiveSignal, ShellError> {
+        match self {
+            Self::Rich(editor) => editor.read_line(prompt),
+            Self::Simple(editor) => editor
+                .read_line(prompt)
+                .map(|signal| match signal {
+                    reedline::Signal::Success(buffer) => InteractiveSignal::Success(buffer),
+                    reedline::Signal::CtrlC => InteractiveSignal::CtrlC,
+                    reedline::Signal::CtrlD => InteractiveSignal::CtrlD,
+                    reedline::Signal::HostCommand(command) => {
+                        InteractiveSignal::HostCommand(command)
+                    }
+                    _ => InteractiveSignal::CtrlC,
+                })
+                .map_err(|error| {
+                    ShellError::new(ErrorCode::Io, "the interactive editor failed")
+                        .with_context(error.to_string())
+                        .with_help("Retry with ui.surface = \"simple\"")
+                }),
+        }
+    }
+
+    fn sync_history(&mut self, history_path: &Path) -> Result<(), ShellError> {
+        match self {
+            Self::Rich(editor) => editor.sync_history(),
+            Self::Simple(editor) => sync_reedline_history(editor, history_path),
+        }
+    }
+}
+
 fn configured_editor(
     catalog: &Catalog,
     extensions: &Arc<Mutex<LuaExtensionHost>>,
     mut config: QuirlConfig,
     history_path: &Path,
-) -> Result<reedline::Reedline, ShellError> {
+) -> Result<SessionEditor, ShellError> {
     if std::env::var_os("NO_COLOR").is_some() {
         config.editor.semantic_hints = false;
     }
     let completion_adapter = LuaCompletionAdapter::new(Arc::clone(extensions));
-    editor_with_extensions_config_and_history(
+    let picker_ranker: Arc<dyn PickerRanker> = Arc::new(SharedPickerRanker);
+    if select_surface(&config.ui.surface) == SurfaceKind::Rich {
+        return RichSurface::new(
+            catalog.clone(),
+            Some(Box::new(completion_adapter)),
+            Arc::clone(&picker_ranker),
+            &config,
+            history_path.to_path_buf(),
+        )
+        .map(|editor| SessionEditor::Rich(Box::new(editor)));
+    }
+    editor_with_extensions_config_history_and_picker(
         catalog.clone(),
         Some(Box::new(completion_adapter)),
         config,
         history_path.to_path_buf(),
+        picker_ranker,
     )
+    .map(|editor| SessionEditor::Simple(Box::new(editor)))
 }
 
-fn sync_history(editor: &mut reedline::Reedline, history_path: &Path) -> Result<(), ShellError> {
+#[derive(Debug)]
+struct SharedPickerRanker;
+
+impl PickerRanker for SharedPickerRanker {
+    fn rank(&self, items: &[PickerItem], query: &str, limit: usize) -> Vec<PickerMatch> {
+        let shared = items
+            .iter()
+            .take(MAX_PICKER_ITEMS)
+            .map(|item| PickItem {
+                id: item.id.clone(),
+                kind: shared_picker_kind(item.kind),
+                label: item.label.clone(),
+                description: item.description.clone(),
+                preview: item.preview.clone(),
+                value: serde_json::Value::String(item.value.clone()),
+            })
+            .collect::<Vec<_>>();
+        Picker
+            .rank(&shared, query)
+            .into_iter()
+            .take(limit.min(MAX_PICKER_ITEMS))
+            .map(|matched| PickerMatch {
+                index: matched.index,
+                match_indices: matched.match_indices,
+            })
+            .collect()
+    }
+}
+
+const fn shared_picker_kind(kind: PickerItemKind) -> ItemKind {
+    match kind {
+        PickerItemKind::History => ItemKind::History,
+        PickerItemKind::File => ItemKind::File,
+        PickerItemKind::Directory => ItemKind::Directory,
+        PickerItemKind::Action => ItemKind::Action,
+        PickerItemKind::Completion => ItemKind::Completion,
+        PickerItemKind::Job => ItemKind::Job,
+        PickerItemKind::Data => ItemKind::Data,
+    }
+}
+
+fn sync_history(editor: &mut SessionEditor, history_path: &Path) -> Result<(), ShellError> {
+    editor.sync_history(history_path)
+}
+
+fn sync_reedline_history(
+    editor: &mut reedline::Reedline,
+    history_path: &Path,
+) -> Result<(), ShellError> {
     editor.sync_history().map_err(|error| {
         ShellError::new(
             ErrorCode::Io,
@@ -1131,6 +1249,22 @@ fn sync_history(editor: &mut reedline::Reedline, history_path: &Path) -> Result<
         .with_context(error.to_string())
         .with_help("Set QUIRL_HISTORY to a writable file path")
     })
+}
+
+#[cfg(unix)]
+fn suspend_self() -> Result<(), ShellError> {
+    nix::sys::signal::raise(nix::sys::signal::Signal::SIGTSTP).map_err(|error| {
+        ShellError::new(ErrorCode::Io, "could not suspend the interactive shell")
+            .with_context(error.to_string())
+            .with_help(
+                "Use the terminal's job-control shortcut or run Quirl from a job-control shell",
+            )
+    })
+}
+
+#[cfg(not(unix))]
+fn suspend_self() -> Result<(), ShellError> {
+    Ok(())
 }
 
 fn print_extension_errors(extensions: &Arc<Mutex<LuaExtensionHost>>) {
@@ -1143,17 +1277,156 @@ fn print_extension_errors(extensions: &Arc<Mutex<LuaExtensionHost>>) {
     }
 }
 
-fn print_banner() {
-    let banner = "Quirl 0.1 · command mode · Ctrl-Space switches · Ctrl-R/T/K pick · Tab completes";
+fn print_banner(config: &QuirlConfig) {
+    let terminal = io::stdout().is_terminal();
+    if !show_welcome(&config.editor.banner, terminal) {
+        return;
+    }
+    let unicode = unicode_chrome(&config.prompt.symbols, terminal_supports_unicode());
+    let banner = if config.editor.banner == "compact" {
+        compact_welcome(terminal_width().unwrap_or(80), unicode)
+    } else {
+        onboarding_banner(terminal_width().unwrap_or(80), unicode)
+    };
     if color_enabled(
-        io::stdout().is_terminal(),
+        terminal,
         std::env::var_os("NO_COLOR").is_some(),
         terminal_is_dumb(),
     ) {
-        println!("\x1b[1;32mQuirl\x1b[0m{}", &banner["Quirl".len()..]);
+        if let Some(rest) = banner.strip_prefix("Quirl") {
+            println!("\x1b[1;32mQuirl\x1b[0m{rest}");
+        } else {
+            println!("{banner}");
+        }
     } else {
         println!("{banner}");
     }
+}
+
+fn show_welcome(banner: &str, terminal: bool) -> bool {
+    banner != "none" && terminal
+}
+
+fn onboarding_banner(width: u16, unicode: bool) -> String {
+    let width = usize::from(width.max(1));
+    if width < 32 {
+        return minimal_onboarding(width);
+    }
+    let separator = if unicode { " · " } else { " | " };
+    let heading_separator = if unicode { " · " } else { " - " };
+    let heading = if width >= 96 {
+        format!(
+            "Quirl {}{heading_separator}a modern shell for processes and typed data",
+            env!("CARGO_PKG_VERSION")
+        )
+    } else if width >= 64 {
+        format!(
+            "Quirl {}{heading_separator}processes + typed data",
+            env!("CARGO_PKG_VERSION")
+        )
+    } else {
+        format!(
+            "Quirl {}{heading_separator}command + data",
+            env!("CARGO_PKG_VERSION")
+        )
+    };
+    let mut lines = vec![heading];
+    if width >= 96 {
+        lines.push(
+            [
+                "COMMAND: processes/bytes",
+                "DATA: typed values/tables",
+                "Alt-M mode",
+            ]
+            .join(separator),
+        );
+        lines.push(
+            [
+                "Tab semantic completion",
+                "Ctrl-R history",
+                "Ctrl-T files",
+                "Ctrl-K actions",
+                "F1 help",
+            ]
+            .join(separator),
+        );
+        lines.push("Nerd Font prompt: set prompt.symbols = \"nerd_font\" in config.lua".to_owned());
+        lines.push("Type help to explore commands.".to_owned());
+    } else if width >= 64 {
+        lines.push(["COMMAND: processes/bytes", "DATA: typed values"].join(separator));
+        lines.push(["Alt-M mode", "Tab semantic completion", "Ctrl-R history"].join(separator));
+        lines.push(["Ctrl-T files", "Ctrl-K actions", "F1 help"].join(separator));
+        lines.push("Nerd Font prompt: prompt.symbols = \"nerd_font\"".to_owned());
+    } else {
+        lines.push("Processes + typed data".to_owned());
+        lines.push(["Alt-M mode", "Tab complete"].join(separator));
+        lines.push(["Ctrl-R history", "Ctrl-T files"].join(separator));
+        lines.push(["Ctrl-K actions", "F1 help"].join(separator));
+        lines.push("Nerd Font prompt:".to_owned());
+        lines.push("  prompt.symbols = \"nerd_font\"".to_owned());
+    }
+    lines.join("\n")
+}
+
+fn compact_welcome(width: u16, unicode: bool) -> String {
+    let separator = if unicode { " · " } else { " | " };
+    let line = [
+        format!("Quirl {}", env!("CARGO_PKG_VERSION")),
+        "COMMAND/DATA".to_owned(),
+        "Tab complete".to_owned(),
+        "Alt-M mode".to_owned(),
+        "help".to_owned(),
+    ]
+    .join(separator);
+    truncate_display_width(&line, usize::from(width.max(1)))
+}
+
+fn minimal_onboarding(width: usize) -> String {
+    let mut lines = vec![if width >= UnicodeWidthStr::width("Quirl") {
+        "Quirl".to_owned()
+    } else {
+        truncate_display_width("Quirl", width)
+    }];
+    for hint in ["Alt-M mode", "Tab complete", "Ctrl-R/T/K pickers", "help"] {
+        if UnicodeWidthStr::width(hint) <= width {
+            lines.push(hint.to_owned());
+        }
+    }
+    lines.join("\n")
+}
+
+fn truncate_display_width(value: &str, width: usize) -> String {
+    let mut rendered = String::new();
+    let mut used = 0_usize;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used.saturating_add(character_width) > width {
+            break;
+        }
+        rendered.push(character);
+        used = used.saturating_add(character_width);
+    }
+    rendered
+}
+
+fn print_mode_feedback(mode: Mode, config: &QuirlConfig) {
+    let unicode = unicode_chrome(&config.prompt.symbols, terminal_supports_unicode());
+    println!("{}", mode_feedback(mode, unicode));
+}
+
+fn unicode_chrome(prompt_symbols: &str, terminal_unicode: bool) -> bool {
+    prompt_symbols != "plain" && terminal_unicode
+}
+
+fn mode_feedback(mode: Mode, unicode: bool) -> String {
+    let (separator, description) = match (unicode, mode) {
+        (true, Mode::Command) => (" → ", "processes and byte pipelines"),
+        (true, Mode::Data) => (" → ", "typed values and data pipelines"),
+        (false, Mode::Command) => (": ", "processes and byte pipelines"),
+        (false, Mode::Data) => (": ", "typed values and data pipelines"),
+    };
+    let detail_separator = if unicode { " · " } else { " - " };
+    format!("mode{separator}{mode}{detail_separator}{description}")
 }
 
 fn render_stderr_error(error: &ShellError) -> String {
@@ -1327,6 +1600,149 @@ mod tests {
     };
 
     static NEXT_DIFFERENTIAL_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+    const DEFAULT_DIFFERENTIAL_CASES: usize = 128;
+    const DEFAULT_DIFFERENTIAL_SEED: u64 = 7_640_891_576_956_012_809;
+
+    struct DifferentialGenerator {
+        state: u64,
+    }
+
+    impl DifferentialGenerator {
+        fn new(seed: u64) -> Self {
+            Self { state: seed.max(1) }
+        }
+
+        fn next(&mut self) -> u64 {
+            let mut value = self.state;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            self.state = value;
+            value
+        }
+
+        fn bounded(&mut self, upper_exclusive: usize) -> usize {
+            usize::try_from(self.next() % u64::try_from(upper_exclusive).unwrap()).unwrap()
+        }
+
+        fn word(&mut self) -> String {
+            let len = 1_usize.saturating_add(self.bounded(12));
+            (0..len)
+                .map(|_| {
+                    let offset = u8::try_from(self.bounded(26)).unwrap();
+                    char::from(b'a'.saturating_add(offset))
+                })
+                .collect()
+        }
+
+        fn source(&mut self) -> String {
+            let left = self.word();
+            let right = self.word();
+            match self.bounded(8) {
+                0 => format!("printf '%s:%s' '{left}' '{right}'"),
+                1 => format!("printf '%s' '{left}' | tr a-z A-Z"),
+                2 => format!("printf '%s' '{left}'; printf '%s' '{right}'"),
+                3 => format!("true && printf '%s' '{left}' || printf '%s' '{right}'"),
+                4 => format!("false && printf '%s' '{left}' || printf '%s' '{right}'"),
+                5 => {
+                    let a = self.bounded(100);
+                    let b = self.bounded(100);
+                    format!("printf '%s' $(({a} + {b}))")
+                }
+                6 => format!("printf '[%s]' $(printf '%s' '{left}')"),
+                _ => format!("printf '%s' '{left}' | cat"),
+            }
+        }
+    }
+
+    fn differential_setting(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (1..=10_000).contains(value))
+            .unwrap_or(default)
+    }
+
+    fn differential_seed() -> u64 {
+        std::env::var("QUIRL_TEST_SEED")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_DIFFERENTIAL_SEED)
+    }
+
+    #[test]
+    fn welcome_respects_the_configured_visibility_and_terminal_boundary() {
+        assert!(show_welcome("full", true));
+        assert!(show_welcome("compact", true));
+        assert!(!show_welcome("none", true));
+        assert!(!show_welcome("full", false));
+        assert!(unicode_chrome("auto", true));
+        assert!(!unicode_chrome("auto", false));
+        assert!(!unicode_chrome("plain", true));
+    }
+
+    #[test]
+    fn onboarding_adapts_without_hiding_daily_driver_shortcuts() {
+        for (width, unicode) in [(32, false), (64, true), (96, true)] {
+            let banner = onboarding_banner(width, unicode);
+            assert!(banner.contains("Alt-M mode"));
+            assert!(banner.contains("semantic completion") || banner.contains("Tab complete"));
+            assert!(banner.contains("Ctrl-R history"));
+            assert!(banner.contains("Ctrl-T files"));
+            assert!(banner.contains("Ctrl-K actions"));
+            assert!(banner.contains("prompt.symbols = \"nerd_font\""));
+            assert!(!banner.contains('\u{1b}'));
+            assert!(banner
+                .lines()
+                .all(|line| UnicodeWidthStr::width(line) <= usize::from(width)));
+            if !unicode {
+                assert!(banner.is_ascii());
+            }
+        }
+    }
+
+    #[test]
+    fn onboarding_has_a_display_width_safe_minimal_layout() {
+        for width in [1, 2, 4, 8, 16, 31] {
+            let banner = onboarding_banner(width, true);
+            assert!(!banner.is_empty());
+            assert!(banner
+                .lines()
+                .all(|line| UnicodeWidthStr::width(line) <= usize::from(width)));
+            assert!(!banner.contains('\u{1b}'));
+        }
+    }
+
+    #[test]
+    fn compact_welcome_is_width_safe_and_font_safe() {
+        for width in [1, 16, 32, 64, 96] {
+            let plain = compact_welcome(width, false);
+            assert!(plain.is_ascii());
+            assert!(UnicodeWidthStr::width(plain.as_str()) <= usize::from(width));
+            let unicode = compact_welcome(width, true);
+            assert!(UnicodeWidthStr::width(unicode.as_str()) <= usize::from(width));
+        }
+    }
+
+    #[test]
+    fn onboarding_color_is_independent_from_plain_glyphs() {
+        assert!(!unicode_chrome("plain", true));
+        assert!(color_enabled(true, false, false));
+        assert!(!color_enabled(true, true, false));
+        assert!(!color_enabled(true, false, true));
+    }
+
+    #[test]
+    fn mode_feedback_names_the_active_execution_model() {
+        assert_eq!(
+            mode_feedback(Mode::Command, false),
+            "mode: command - processes and byte pipelines"
+        );
+        assert_eq!(
+            mode_feedback(Mode::Data, true),
+            "mode → data · typed values and data pipelines"
+        );
+    }
 
     struct DifferentialFixture {
         root: PathBuf,
@@ -1815,6 +2231,30 @@ mod tests {
     }
 
     #[test]
+    fn seeded_c1_differential_cases_match_available_reference_shells() {
+        let seed = differential_seed();
+        let cases = differential_setting("QUIRL_TEST_CASES", DEFAULT_DIFFERENTIAL_CASES);
+        let mut generator = DifferentialGenerator::new(seed);
+        let sources = (0..cases).map(|_| generator.source()).collect::<Vec<_>>();
+
+        for shell in ["bash", "zsh"] {
+            if !shell_is_available(shell) {
+                eprintln!("skipping {shell} generated differential: executable is unavailable");
+                continue;
+            }
+            for (index, source) in sources.iter().enumerate() {
+                let native = NativeExecutor::default().execute_capture(source).unwrap();
+                let reference = reference_outcome(shell, source);
+                assert_same_outcome(
+                    &format!("seed={seed} case={index} shell={shell} source={source}"),
+                    &native,
+                    &reference,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn explicit_dialect_islands_are_routed_without_reparsing_the_body() {
         let (language, body) = interactive_dialect_island("bash { if true; then printf yes; fi; }")
             .expect("bash island is recognized");
@@ -1828,6 +2268,28 @@ mod tests {
     }
 
     #[test]
+    fn interactive_native_dispatch_inherits_streams_instead_of_capturing() {
+        let outcome = execute_command_or_dialect_island(
+            &mut NativeExecutor::default(),
+            "true",
+            ExecutionOutputMode::Interactive,
+        )
+        .unwrap();
+        assert_eq!(outcome.status, 0);
+        assert_eq!(outcome.stdout, None);
+        assert_eq!(outcome.stderr, None);
+
+        let captured = execute_command_or_dialect_island(
+            &mut NativeExecutor::default(),
+            "true",
+            ExecutionOutputMode::Capture,
+        )
+        .unwrap();
+        assert_eq!(captured.stdout.as_deref(), Some(""));
+        assert_eq!(captured.stderr.as_deref(), Some(""));
+    }
+
+    #[test]
     fn bash_island_preserves_reference_observable_output_when_available() {
         if !shell_is_available("bash") {
             return;
@@ -1835,6 +2297,7 @@ mod tests {
         let native = execute_command_or_dialect_island(
             &mut NativeExecutor::default(),
             "bash { printf value; printf warning >&2; exit 7; }",
+            ExecutionOutputMode::Capture,
         )
         .unwrap();
         let reference = reference_outcome("bash", "printf value; printf warning >&2; exit 7;");

@@ -1,14 +1,122 @@
 //! Native command graph execution and background-job lifecycle.
 
 pub const RUNNER_PROTOCOL_VERSION: u32 = 1;
-pub const RUNNER_SCHEMA_DESCRIPTOR: &str = "quirl.runner@1{input:quirl.command-grammar@1;ProcessBackend{execute_capture(source)->CommandOutcome;execute_interactive(source)->CommandOutcome;jobs()->array<JobState>;foreground_job(id)->JobState;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};byte-pipeline:ordered;redirection:input|output|append;background:terminal-ampersand;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows}";
+/// Maximum bytes retained per captured output stream when a caller does not
+/// provide the tighter sandboxed-process budget.
+pub const DEFAULT_CAPTURE_BYTES: usize = 1024 * 1024;
+/// Maximum UTF-8 bytes accepted by one native command-list execution.
+pub const NATIVE_COMMAND_BYTES_MAX: usize = 1024 * 1024;
+/// Maximum pipelines in one native command list.
+pub const NATIVE_PIPELINES_MAX: usize = 256;
+/// Maximum command stages in one native pipeline.
+pub const NATIVE_PIPELINE_STAGES_MAX: usize = 64;
+/// Maximum bytes written for one here-string, including its trailing newline.
+pub const HERE_STRING_BYTES_MAX: usize = 256 * 1024;
+/// Maximum bytes parsed by one arithmetic expansion.
+pub const ARITHMETIC_SOURCE_BYTES_MAX: usize = 16 * 1024;
+/// Maximum nested unary/parenthesized arithmetic expressions.
+pub const ARITHMETIC_DEPTH_MAX: usize = 64;
+pub const RUNNER_SCHEMA_DESCRIPTOR: &str = "quirl.runner@1{input:quirl.command-grammar@1,native-source-bytes<=1048576,native-pipelines<=256,native-stages-per-pipeline<=64,here-string-bytes-including-newline<=262144,arithmetic-source-bytes<=16384,arithmetic-depth<=64;ProcessBackend{execute_capture(source)->CommandOutcome;execute_interactive(source)->CommandOutcome;jobs()->array<JobState>;foreground_job(id)->JobState;cancel_job(id)->JobState;suspend_job(id)->JobState};JobState{deny_unknown;id:u32;command:string;status:running|stopped|done;process_group:null|i32;exit_status:null|i32};CommandOutcome{status:i32;stdout:null|string;stderr:null|string};capture:default-retained-per-stream=1048576|caller-tighter,drain-excess-then-ResourceLimit-with-retained-and-discarded-byte-context;interactive:inherit-streams-without-retention-limit;byte-pipeline:ordered;redirection:input|output|append|here-string;background:terminal-ampersand;cancel-status:130;errors:ShellError;platform:suspend-unavailable-on-windows}";
 
 pub fn runner_schema_hash() -> String {
     quirl_core::schema_fingerprint(RUNNER_SCHEMA_DESCRIPTOR)
 }
 
+fn validate_native_source(input: &str) -> Result<(), quirl_core::ShellError> {
+    if input.len() <= NATIVE_COMMAND_BYTES_MAX {
+        return Ok(());
+    }
+    Err(quirl_core::ShellError::new(
+        quirl_core::ErrorCode::ResourceLimit,
+        "native command source exceeds its byte limit",
+    )
+    .with_context(format!(
+        "limit {NATIVE_COMMAND_BYTES_MAX} bytes; observed {} bytes",
+        input.len()
+    ))
+    .with_help("Split the command list into smaller commands or move large input to a file"))
+}
+
+fn validate_native_plan(graph: &quirl_syntax::CommandList) -> Result<(), quirl_core::ShellError> {
+    if graph.pipelines.len() > NATIVE_PIPELINES_MAX {
+        return Err(quirl_core::ShellError::new(
+            quirl_core::ErrorCode::ResourceLimit,
+            "native command list exceeds its pipeline limit",
+        )
+        .with_context(format!(
+            "limit {NATIVE_PIPELINES_MAX} pipelines; observed {} pipelines",
+            graph.pipelines.len()
+        ))
+        .with_help("Split the command list into smaller commands"));
+    }
+    for (index, pipeline) in graph.pipelines.iter().enumerate() {
+        if pipeline.commands.len() > NATIVE_PIPELINE_STAGES_MAX {
+            return Err(quirl_core::ShellError::new(
+                quirl_core::ErrorCode::ResourceLimit,
+                "native pipeline exceeds its stage limit",
+            )
+            .with_context(format!(
+                "limit {NATIVE_PIPELINE_STAGES_MAX} stages; pipeline {} has {} stages",
+                index + 1,
+                pipeline.commands.len()
+            ))
+            .with_help("Split the pipeline or use intermediate files"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod simulation_support {
+    pub const DEFAULT_SIMULATION_CASES: usize = 128;
+    pub const DEFAULT_SIMULATION_SEED: u64 = 7_640_891_576_956_012_809;
+    pub const SIMULATION_CASES_MAX: usize = 10_000;
+
+    pub struct DeterministicRng(u64);
+
+    impl DeterministicRng {
+        pub fn new(seed: u64) -> Self {
+            // Xorshift cannot advance from zero, so map that valid CLI seed to
+            // a fixed non-zero state while preserving deterministic replay.
+            Self(if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            })
+        }
+
+        pub fn index(&mut self, upper: usize) -> usize {
+            assert!(upper > 0);
+            let mut value = self.0;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            self.0 = value;
+            let upper = u64::try_from(upper).unwrap();
+            usize::try_from(value % upper).unwrap()
+        }
+    }
+
+    pub fn configuration() -> (u64, usize) {
+        let seed = std::env::var("QUIRL_TEST_SEED")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_SIMULATION_SEED);
+        let cases = std::env::var("QUIRL_TEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|cases| (1..=SIMULATION_CASES_MAX).contains(cases))
+            .unwrap_or(DEFAULT_SIMULATION_CASES);
+        (seed, cases)
+    }
+}
+
 #[cfg(unix)]
 mod platform {
+    use super::{
+        validate_native_plan, validate_native_source, ARITHMETIC_DEPTH_MAX,
+        ARITHMETIC_SOURCE_BYTES_MAX, DEFAULT_CAPTURE_BYTES, HERE_STRING_BYTES_MAX,
+    };
 
     use nix::{
         sys::{
@@ -30,7 +138,10 @@ mod platform {
         io::{ErrorKind, IsTerminal, Read, Write},
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
-        sync::atomic::Ordering,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         thread::{self, JoinHandle},
         time::Instant,
     };
@@ -73,12 +184,48 @@ mod platform {
 
     struct ReaderCapture {
         bytes: Vec<u8>,
-        truncated: bool,
+        discarded_bytes: u64,
+    }
+
+    struct CaptureBudget {
+        limit: usize,
+        retained: AtomicUsize,
+    }
+
+    impl CaptureBudget {
+        fn new(limit: usize) -> Self {
+            Self {
+                limit,
+                retained: AtomicUsize::new(0),
+            }
+        }
+
+        fn claim(&self, requested: usize) -> usize {
+            let mut retained = self.retained.load(Ordering::Relaxed);
+            loop {
+                let claimed = requested.min(self.limit.saturating_sub(retained));
+                match self.retained.compare_exchange_weak(
+                    retained,
+                    retained + claimed,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return claimed,
+                    Err(observed) => retained = observed,
+                }
+            }
+        }
     }
 
     type ReaderTask = JoinHandle<std::io::Result<ReaderCapture>>;
     type WriterTask = JoinHandle<std::io::Result<()>>;
+    type PendingWriter = (PipeWriter, Vec<u8>);
     type OutputStdio = (Stdio, Option<PipeReader>, Option<PipeWriter>, Option<File>);
+
+    struct PreparedInput {
+        stdio: Stdio,
+        writer: Option<PendingWriter>,
+    }
 
     pub struct NativeExecutor {
         jobs: Vec<Job>,
@@ -134,6 +281,13 @@ mod platform {
     }
 
     impl NativeExecutor {
+        /// Execute an ordinary foreground command with terminal streams
+        /// inherited. Unlike capture APIs, interactive output is not retained
+        /// or rejected at the programmatic capture ceiling.
+        pub fn execute_interactive(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
+            self.execute(input)
+        }
+
         pub fn execute(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, false)
         }
@@ -236,6 +390,7 @@ mod platform {
             capture: bool,
             request: Option<&ProcessRequest>,
         ) -> Result<CommandOutcome, ShellError> {
+            validate_native_source(input)?;
             let graph = parse_command_list(input).map_err(|error| {
                 ShellError::new(ErrorCode::InvalidCommand, error.message)
                     .with_label(
@@ -247,6 +402,7 @@ mod platform {
                     .with_help(error.help)
                     .with_command(input)
             })?;
+            validate_native_plan(&graph)?;
             if graph.pipelines.is_empty() {
                 return Ok(outcome(0, None, None));
             }
@@ -268,12 +424,12 @@ mod platform {
                     append_captured_output(
                         &mut captured_stdout,
                         last.stdout.as_deref().unwrap_or_default(),
-                        request.map_or(usize::MAX, |request| request.max_output_bytes),
+                        retained_output_limit(request),
                     )?;
                     append_captured_output(
                         &mut captured_stderr,
                         last.stderr.as_deref().unwrap_or_default(),
-                        request.map_or(usize::MAX, |request| request.max_output_bytes),
+                        retained_output_limit(request),
                     )?;
                 }
             }
@@ -583,12 +739,19 @@ mod platform {
             capture: bool,
             request: Option<&ProcessRequest>,
         ) -> Result<CommandOutcome, ShellError> {
-            let mut spawned = SpawnGuard::default();
+            // Pipeline construction is a transaction. Local descriptors and
+            // the guard own every partial resource until the complete process
+            // group is either registered as a job or handed to the waiter.
+            // Extension callbacks and other user code must stay outside this
+            // window so an early child notification cannot observe half a job.
+            let mut spawned = PipelineConstructionGuard::default();
             let mut previous_reader: Option<PipeReader> = None;
             let mut capture_reader = None;
             let mut stderr_readers = Vec::new();
-            let mut builtin_writers: Vec<(PipeWriter, Vec<u8>)> = Vec::new();
+            let mut pending_writers: Vec<PendingWriter> = Vec::new();
             let capture_streams = capture && !pipeline.background;
+            let output_limit = retained_output_limit(request);
+            let stderr_budget = Arc::new(CaptureBudget::new(output_limit));
 
             for (index, command) in pipeline.commands.iter().enumerate() {
                 let last = index + 1 == pipeline.commands.len();
@@ -610,7 +773,7 @@ mod platform {
                         "Use `> file 2>&1` to merge both streams into the file, or use an explicit Bash/Zsh island for ordered descriptor routing",
                     ));
                 }
-                let stdin = input_stdio(command, previous_reader.take(), index > 0)?;
+                let input = input_stdio(command, previous_reader.take(), index > 0)?;
                 let (stdout, next_reader, writer, redirected_stdout) =
                     output_stdio(command, last, capture_streams)?;
                 if last && capture_streams {
@@ -628,11 +791,11 @@ mod platform {
                     }) {
                         write_redirected_output(command, &bytes)?;
                     } else if let Some(writer) = writer {
-                        builtin_writers.push((writer, bytes));
+                        pending_writers.push((writer, bytes));
                     } else if !capture_streams {
                         io_write_all(std::io::stdout(), &bytes, "standard output")?;
                     }
-                    drop(stdin);
+                    drop(input);
                     continue;
                 }
 
@@ -665,7 +828,7 @@ mod platform {
                 } else {
                     stderr_stdio(command, capture_streams)?
                 };
-                process.stdin(stdin).stdout(stdout).stderr(stderr);
+                process.stdin(input.stdio).stdout(stdout).stderr(stderr);
                 #[cfg(unix)]
                 process.process_group(spawned.process_group.unwrap_or(0));
                 let mut child = process.spawn().map_err(|error| {
@@ -681,16 +844,20 @@ mod platform {
                 })?;
                 if capture_streams {
                     if let Some(stderr) = child.stderr.take() {
-                        stderr_readers.push(spawn_reader(
-                            stderr,
-                            request.map_or(usize::MAX, |request| request.max_output_bytes),
-                        ));
+                        stderr_readers
+                            .push(spawn_reader_with_budget(stderr, Arc::clone(&stderr_budget)));
                     }
                 }
                 spawned.push(child)?;
+                if let Some(writer) = input.writer {
+                    pending_writers.push(writer);
+                }
             }
 
-            let writers = builtin_writers
+            // Start writers only after every child exists. A pending writer is
+            // owned by this construction transaction until then, so any spawn
+            // failure closes the descriptor without leaving a detached task.
+            let writers = pending_writers
                 .into_iter()
                 .map(|(mut writer, bytes)| thread::spawn(move || writer.write_all(&bytes)))
                 .collect::<Vec<_>>();
@@ -723,7 +890,6 @@ mod platform {
             let process_group = spawned.process_group;
             let mut terminal = ForegroundTerminal::give_to(process_group)?;
             let mut children = spawned.release();
-            let output_limit = request.map_or(usize::MAX, |request| request.max_output_bytes);
             let stdout_reader = capture_reader.map(|reader| spawn_reader(reader, output_limit));
             let child_count = children.len();
             let mut wait_error = None;
@@ -804,23 +970,15 @@ mod platform {
                     }
                     poll_child(child);
                 }
-                if job
-                    .children
-                    .iter()
-                    .all(|child| child.status == JobStatus::Done)
-                {
-                    job.state.status = JobStatus::Done;
-                    job.state.exit_status = job.children.last().and_then(|child| child.exit_status);
+                let (status, exit_status) = super::summarize_job_lifecycle(
+                    job.children
+                        .iter()
+                        .map(|child| (child.status, child.exit_status)),
+                );
+                job.state.status = status;
+                job.state.exit_status = exit_status;
+                if status == JobStatus::Done {
                     finish_job_tasks_silently(job);
-                } else if job
-                    .children
-                    .iter()
-                    .filter(|child| child.status != JobStatus::Done)
-                    .all(|child| child.status == JobStatus::Stopped)
-                {
-                    job.state.status = JobStatus::Stopped;
-                } else {
-                    job.state.status = JobStatus::Running;
                 }
             }
         }
@@ -963,6 +1121,17 @@ mod platform {
     }
 
     fn evaluate_arithmetic(source: &str) -> Result<i64, ShellError> {
+        if source.len() > ARITHMETIC_SOURCE_BYTES_MAX {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "arithmetic expansion exceeds its source byte limit",
+            )
+            .with_context(format!(
+                "limit {ARITHMETIC_SOURCE_BYTES_MAX} bytes; observed {} bytes",
+                source.len()
+            ))
+            .with_help("Split the calculation into smaller expressions"));
+        }
         #[derive(Clone, Copy)]
         struct Parser<'a> {
             input: &'a [u8],
@@ -978,14 +1147,14 @@ mod platform {
                     self.index += 1;
                 }
             }
-            fn expression(&mut self) -> Result<i64, ShellError> {
-                let mut value = self.term()?;
+            fn expression(&mut self, depth: usize) -> Result<i64, ShellError> {
+                let mut value = self.term(depth)?;
                 loop {
                     self.skip();
                     match self.input.get(self.index).copied() {
                         Some(b'+') => {
                             self.index += 1;
-                            value = value.checked_add(self.term()?).ok_or_else(|| {
+                            value = value.checked_add(self.term(depth)?).ok_or_else(|| {
                                 expansion_error(
                                     "arithmetic expansion overflowed",
                                     "Use a smaller integer expression",
@@ -994,7 +1163,7 @@ mod platform {
                         }
                         Some(b'-') => {
                             self.index += 1;
-                            value = value.checked_sub(self.term()?).ok_or_else(|| {
+                            value = value.checked_sub(self.term(depth)?).ok_or_else(|| {
                                 expansion_error(
                                     "arithmetic expansion overflowed",
                                     "Use a smaller integer expression",
@@ -1005,14 +1174,14 @@ mod platform {
                     }
                 }
             }
-            fn term(&mut self) -> Result<i64, ShellError> {
-                let mut value = self.factor()?;
+            fn term(&mut self, depth: usize) -> Result<i64, ShellError> {
+                let mut value = self.factor(depth)?;
                 loop {
                     self.skip();
                     match self.input.get(self.index).copied() {
                         Some(b'*') => {
                             self.index += 1;
-                            value = value.checked_mul(self.factor()?).ok_or_else(|| {
+                            value = value.checked_mul(self.factor(depth)?).ok_or_else(|| {
                                 expansion_error(
                                     "arithmetic expansion overflowed",
                                     "Use a smaller integer expression",
@@ -1021,24 +1190,44 @@ mod platform {
                         }
                         Some(b'/') => {
                             self.index += 1;
-                            let divisor = self.factor()?;
+                            let divisor = self.factor(depth)?;
                             if divisor == 0 {
                                 return Err(expansion_error(
                                     "arithmetic expansion divides by zero",
                                     "Use a non-zero divisor",
                                 ));
                             }
-                            value /= divisor;
+                            value = value.checked_div(divisor).ok_or_else(|| {
+                                expansion_error(
+                                    "arithmetic expansion overflowed",
+                                    "Use a smaller integer expression",
+                                )
+                            })?;
                         }
                         _ => return Ok(value),
                     }
                 }
             }
-            fn factor(&mut self) -> Result<i64, ShellError> {
+            fn nested_depth(depth: usize) -> Result<usize, ShellError> {
+                let observed_depth = depth.saturating_add(1);
+                if observed_depth > ARITHMETIC_DEPTH_MAX {
+                    return Err(ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "arithmetic expansion exceeds its nesting depth limit",
+                    )
+                    .with_context(format!(
+                        "limit {ARITHMETIC_DEPTH_MAX} levels; observed at least {observed_depth} levels"
+                    ))
+                    .with_help("Flatten the arithmetic expression"));
+                }
+                Ok(observed_depth)
+            }
+
+            fn factor(&mut self, depth: usize) -> Result<i64, ShellError> {
                 self.skip();
                 if self.input.get(self.index) == Some(&b'(') {
                     self.index += 1;
-                    let value = self.expression()?;
+                    let value = self.expression(Self::nested_depth(depth)?)?;
                     self.skip();
                     if self.input.get(self.index) != Some(&b')') {
                         return Err(expansion_error(
@@ -1049,12 +1238,18 @@ mod platform {
                     self.index += 1;
                     return Ok(value);
                 }
-                let negative = if self.input.get(self.index) == Some(&b'-') {
+                if self.input.get(self.index) == Some(&b'-') {
                     self.index += 1;
-                    true
-                } else {
-                    false
-                };
+                    return self
+                        .factor(Self::nested_depth(depth)?)?
+                        .checked_neg()
+                        .ok_or_else(|| {
+                            expansion_error(
+                                "arithmetic expansion overflowed",
+                                "Use a smaller integer expression",
+                            )
+                        });
+                }
                 let start = self.index;
                 while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
                     self.index += 1;
@@ -1074,14 +1269,14 @@ mod platform {
                         "Use a smaller integer expression",
                     )
                 })?;
-                Ok(if negative { -value } else { value })
+                Ok(value)
             }
         }
         let mut parser = Parser {
             input: source.as_bytes(),
             index: 0,
         };
-        let value = parser.expression()?;
+        let value = parser.expression(0)?;
         parser.skip();
         if parser.index != parser.input.len() {
             return Err(expansion_error(
@@ -1247,7 +1442,7 @@ mod platform {
         command: &SimpleCommand,
         previous: Option<PipeReader>,
         has_upstream: bool,
-    ) -> Result<Stdio, ShellError> {
+    ) -> Result<PreparedInput, ShellError> {
         let mut redirected = None;
         let mut here_string = None;
         for redirect in command.redirects.iter().filter(|redirect| {
@@ -1270,35 +1465,49 @@ mod platform {
             }
         }
         if let Some(value) = here_string {
-            let (reader, mut writer) = pipe().map_err(|error| {
+            let observed_bytes = value.len().saturating_add(1);
+            if observed_bytes > HERE_STRING_BYTES_MAX {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "here-string input exceeds its byte limit",
+                )
+                .with_context(format!(
+                    "limit {HERE_STRING_BYTES_MAX} bytes; observed {observed_bytes} bytes including the trailing newline"
+                ))
+                .with_help("Use an input file or pipeline for larger input"));
+            }
+            let mut bytes = Vec::with_capacity(observed_bytes);
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(b'\n');
+            let (reader, writer) = pipe().map_err(|error| {
                 ShellError::new(ErrorCode::Io, "could not create here-string input")
                     .with_context(error.to_string())
                     .with_help("Retry the command or use an input file")
             })?;
-            writer
-                .write_all(value.as_bytes())
-                .and_then(|()| writer.write_all(b"\n"))
-                .map_err(|error| {
-                    ShellError::new(ErrorCode::Io, "could not write here-string input")
-                        .with_context(error.to_string())
-                        .with_help("Retry the command or use an input file")
-                })?;
-            drop(writer);
-            return Ok(Stdio::from(reader));
+            return Ok(PreparedInput {
+                stdio: Stdio::from(reader),
+                writer: Some((writer, bytes)),
+            });
         }
         if let Some(file) = redirected {
-            return Ok(Stdio::from(file));
+            return Ok(PreparedInput {
+                stdio: Stdio::from(file),
+                writer: None,
+            });
         }
-        Ok(previous.map_or_else(
-            || {
-                if has_upstream {
-                    Stdio::null()
-                } else {
-                    Stdio::inherit()
-                }
-            },
-            Stdio::from,
-        ))
+        Ok(PreparedInput {
+            stdio: previous.map_or_else(
+                || {
+                    if has_upstream {
+                        Stdio::null()
+                    } else {
+                        Stdio::inherit()
+                    }
+                },
+                Stdio::from,
+            ),
+            writer: None,
+        })
     }
 
     fn output_stdio(
@@ -1541,12 +1750,12 @@ mod platform {
     }
 
     #[derive(Default)]
-    struct SpawnGuard {
+    struct PipelineConstructionGuard {
         children: Vec<JobChild>,
         process_group: Option<i32>,
     }
 
-    impl SpawnGuard {
+    impl PipelineConstructionGuard {
         fn push(&mut self, mut child: Child) -> Result<(), ShellError> {
             let process_id = i32::try_from(child.id()).map_err(|error| {
                 let _ = child.kill();
@@ -1572,7 +1781,7 @@ mod platform {
         }
     }
 
-    impl Drop for SpawnGuard {
+    impl Drop for PipelineConstructionGuard {
         fn drop(&mut self) {
             if !self.children.is_empty() {
                 terminate_children(&mut self.children, self.process_group);
@@ -1609,22 +1818,31 @@ mod platform {
         }
     }
 
-    fn spawn_reader(mut reader: impl Read + Send + 'static, limit: usize) -> ReaderTask {
+    fn spawn_reader(reader: impl Read + Send + 'static, limit: usize) -> ReaderTask {
+        spawn_reader_with_budget(reader, Arc::new(CaptureBudget::new(limit)))
+    }
+
+    fn spawn_reader_with_budget(
+        mut reader: impl Read + Send + 'static,
+        budget: Arc<CaptureBudget>,
+    ) -> ReaderTask {
         thread::spawn(move || {
             let mut bytes = Vec::new();
             let mut chunk = [0_u8; 8 * 1024];
-            let mut truncated = false;
+            let mut discarded_bytes = 0_u64;
             loop {
                 let count = reader.read(&mut chunk)?;
                 if count == 0 {
                     break;
                 }
-                let remaining = limit.saturating_sub(bytes.len());
-                let retained = remaining.min(count);
+                let retained = budget.claim(count);
                 bytes.extend_from_slice(&chunk[..retained]);
-                truncated |= retained < count;
+                discarded_bytes = discarded_bytes.saturating_add((count - retained) as u64);
             }
-            Ok(ReaderCapture { bytes, truncated })
+            Ok(ReaderCapture {
+                bytes,
+                discarded_bytes,
+            })
         })
     }
 
@@ -1632,7 +1850,18 @@ mod platform {
         let Some(reader) = reader else {
             return Ok(String::new());
         };
-        let bytes = reader
+        let capture = join_reader_task(reader, description)?;
+        if capture.discarded_bytes > 0 {
+            return Err(capture_limit_error(description, &capture));
+        }
+        Ok(String::from_utf8_lossy(&capture.bytes).into_owned())
+    }
+
+    fn join_reader_task(
+        reader: ReaderTask,
+        description: &str,
+    ) -> Result<ReaderCapture, ShellError> {
+        reader
             .join()
             .map_err(|_| {
                 ShellError::new(ErrorCode::Io, format!("{description} reader panicked"))
@@ -1642,28 +1871,46 @@ mod platform {
                 ShellError::new(ErrorCode::Io, format!("could not read {description}"))
                     .with_context(error.to_string())
                     .with_help("Retry the command; report this if the pipeline is reproducible")
-            })?;
-        if bytes.truncated {
-            return Err(ShellError::new(
-                ErrorCode::ResourceLimit,
-                format!("{description} exceeded the retained output limit"),
-            )
-            .with_help("Reduce process output or write it to a file before returning it to Lua"));
-        }
-        Ok(String::from_utf8_lossy(&bytes.bytes).into_owned())
+            })
+    }
+
+    fn capture_limit_error(description: &str, capture: &ReaderCapture) -> ShellError {
+        ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!("{description} exceeded the retained output limit"),
+        )
+        .with_context(format!(
+            "retained {} bytes; discarded {} bytes",
+            capture.bytes.len(),
+            capture.discarded_bytes
+        ))
+        .with_help("Reduce process output, redirect it to a file, or consume it in a pipeline")
     }
 
     fn join_readers(readers: Vec<ReaderTask>, description: &str) -> Result<String, ShellError> {
-        let mut output = String::new();
+        let mut capture = ReaderCapture {
+            bytes: Vec::new(),
+            discarded_bytes: 0,
+        };
         let mut failure = None;
         for reader in readers {
-            match join_reader(Some(reader), description) {
-                Ok(text) => output.push_str(&text),
+            match join_reader_task(reader, description) {
+                Ok(next) => {
+                    capture.bytes.extend(next.bytes);
+                    capture.discarded_bytes =
+                        capture.discarded_bytes.saturating_add(next.discarded_bytes);
+                }
                 Err(error) if failure.is_none() => failure = Some(error),
                 Err(_) => {}
             }
         }
-        failure.map_or(Ok(output), Err)
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if capture.discarded_bytes > 0 {
+            return Err(capture_limit_error(description, &capture));
+        }
+        Ok(String::from_utf8_lossy(&capture.bytes).into_owned())
     }
 
     fn join_writers(writers: Vec<WriterTask>) -> Result<(), ShellError> {
@@ -1940,14 +2187,28 @@ mod platform {
         limit: usize,
     ) -> Result<(), ShellError> {
         if next.len() > limit.saturating_sub(retained.len()) {
+            let available = limit.saturating_sub(retained.len());
             return Err(ShellError::new(
                 ErrorCode::ResourceLimit,
                 "captured process output exceeded the retained output limit",
             )
-            .with_help("Reduce process output or write it to a file before returning it to Lua"));
+            .with_context(format!(
+                "retained {} bytes; discarded at least {} bytes; limit {limit} bytes",
+                retained.len(),
+                next.len().saturating_sub(available)
+            ))
+            .with_help(
+                "Reduce process output, redirect it to a file, or consume it in a pipeline",
+            ));
         }
         retained.push_str(next);
         Ok(())
+    }
+
+    fn retained_output_limit(request: Option<&ProcessRequest>) -> usize {
+        request.map_or(DEFAULT_CAPTURE_BYTES, |request| {
+            request.max_output_bytes.min(DEFAULT_CAPTURE_BYTES)
+        })
     }
 
     fn io_write_all(mut writer: impl Write, bytes: &[u8], target: &str) -> Result<(), ShellError> {
@@ -1961,6 +2222,7 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::simulation_support::{configuration, DeterministicRng};
         use std::{
             fs,
             sync::atomic::{AtomicUsize, Ordering},
@@ -2005,6 +2267,113 @@ mod platform {
             let result = executor.execute_capture("ls | grep Cargo.toml").unwrap();
             assert_eq!(result.status, 0);
             assert_eq!(result.stdout.as_deref(), Some("Cargo.toml\n"));
+        }
+
+        #[test]
+        fn here_string_larger_than_pipe_capacity_starts_the_reader_before_writing() {
+            let payload = "x".repeat(128 * 1024);
+            let result = NativeExecutor::default()
+                .execute_capture(&format!("cat <<< {payload}"))
+                .unwrap();
+            assert_eq!(result.status, 0);
+            assert_eq!(
+                result.stdout.as_deref().map(str::len),
+                Some(payload.len() + 1)
+            );
+            assert_eq!(
+                result.stdout.as_deref(),
+                Some(format!("{payload}\n").as_str())
+            );
+        }
+
+        #[test]
+        fn here_string_input_is_bounded_before_pipe_creation() {
+            let payload = "x".repeat(HERE_STRING_BYTES_MAX);
+            let error = NativeExecutor::default()
+                .execute_capture(&format!("cat <<< {payload}"))
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("here-string"));
+            assert!(error.details.context.iter().any(|context| {
+                context.contains(&format!("limit {HERE_STRING_BYTES_MAX} bytes"))
+                    && context.contains(&format!("observed {} bytes", payload.len() + 1))
+            }));
+        }
+
+        #[test]
+        fn cancelling_a_blocked_here_string_writer_reaps_the_reader() {
+            let payload = "x".repeat(128 * 1024);
+            let request = ProcessRequest {
+                command: format!("sh -c 'sleep 5' <<< {payload}"),
+                deadline: Duration::from_millis(20),
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: 1024,
+            };
+            let started = Instant::now();
+            let error = NativeExecutor::default()
+                .execute_capture_request(request)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn arithmetic_input_and_nesting_are_bounded() {
+            let source = "1".repeat(ARITHMETIC_SOURCE_BYTES_MAX + 1);
+            let error = evaluate_arithmetic(&source).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.details.context.iter().any(|context| {
+                context.contains(&format!("limit {ARITHMETIC_SOURCE_BYTES_MAX} bytes"))
+            }));
+
+            let nested = format!(
+                "{}1{}",
+                "(".repeat(ARITHMETIC_DEPTH_MAX + 1),
+                ")".repeat(ARITHMETIC_DEPTH_MAX + 1)
+            );
+            let error = evaluate_arithmetic(&nested).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("nesting depth"));
+        }
+
+        #[test]
+        fn arithmetic_minimum_division_and_negation_return_overflow_errors() {
+            for source in [
+                "(-9223372036854775807 - 1) / -1",
+                "-(-9223372036854775807 - 1)",
+            ] {
+                let error = evaluate_arithmetic(source).unwrap_err();
+                assert_eq!(error.code, ErrorCode::InvalidCommand);
+                assert!(error.message.contains("overflowed"));
+            }
+        }
+
+        #[test]
+        fn native_source_and_process_graph_counts_are_bounded_before_spawning() {
+            let oversized_source = "x".repeat(crate::NATIVE_COMMAND_BYTES_MAX + 1);
+            let error = NativeExecutor::default()
+                .execute_capture(&oversized_source)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("source"));
+
+            let command_list = std::iter::repeat_n("true", crate::NATIVE_PIPELINES_MAX + 1)
+                .collect::<Vec<_>>()
+                .join(";");
+            let error = NativeExecutor::default()
+                .execute_capture(&command_list)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("pipeline limit"));
+
+            let pipeline = std::iter::repeat_n("cat", crate::NATIVE_PIPELINE_STAGES_MAX + 1)
+                .collect::<Vec<_>>()
+                .join("|");
+            let error = NativeExecutor::default()
+                .execute_capture(&pipeline)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("stage limit"));
         }
 
         #[test]
@@ -2116,6 +2485,97 @@ mod platform {
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
             assert!(error.message.contains("output limit"));
+            assert!(error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("discarded") && context.contains("retained")));
+        }
+
+        #[test]
+        fn ordinary_capture_has_a_mandatory_retention_limit() {
+            let error = NativeExecutor::default()
+                .execute_capture(&format!(
+                    "sh -c 'yes x | head -c {}'",
+                    DEFAULT_CAPTURE_BYTES + 32 * 1024
+                ))
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("output limit"));
+            assert!(error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("discarded 32768 bytes")));
+        }
+
+        #[test]
+        fn interactive_helper_emits_above_the_capture_limit() {
+            if env::var_os("QUIRL_INTERACTIVE_LIMIT_HELPER").is_none() {
+                return;
+            }
+            let outcome = NativeExecutor::default()
+                .execute_interactive(&format!(
+                    "sh -c 'yes x | head -c {}'",
+                    DEFAULT_CAPTURE_BYTES + 32 * 1024
+                ))
+                .unwrap();
+            assert_eq!(outcome.status, 0);
+            assert_eq!(outcome.stdout, None);
+            assert_eq!(outcome.stderr, None);
+        }
+
+        #[test]
+        fn interactive_output_above_the_capture_limit_streams_without_failure() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::tests::interactive_helper_emits_above_the_capture_limit",
+                    "--nocapture",
+                ])
+                .env("QUIRL_INTERACTIVE_LIMIT_HELPER", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        #[test]
+        fn pipeline_stages_share_one_stderr_retention_budget() {
+            let request = ProcessRequest {
+                command: "sh -c 'yes a | head -c 800 >&2' | sh -c 'cat >/dev/null; yes b | head -c 800 >&2'"
+                    .to_owned(),
+                deadline: Duration::from_secs(1),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: 1024,
+            };
+            let error = NativeExecutor::default()
+                .execute_capture_request(request)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.details.context.iter().any(|context| {
+                context.contains("retained 1024 bytes") && context.contains("discarded 576 bytes")
+            }));
+        }
+
+        #[test]
+        fn sandbox_request_can_tighten_but_not_expand_the_default_capture_ceiling() {
+            let request = ProcessRequest {
+                command: format!("sh -c 'yes x | head -c {}'", DEFAULT_CAPTURE_BYTES + 1024),
+                deadline: Duration::from_secs(1),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: DEFAULT_CAPTURE_BYTES * 2,
+            };
+            let error = NativeExecutor::default()
+                .execute_capture_request(request)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("discarded 1024 bytes")));
         }
 
         #[test]
@@ -2221,23 +2681,64 @@ mod platform {
         }
 
         #[test]
-        fn spawn_guard_kills_and_reaps_children_on_early_errors() {
+        fn pipeline_construction_guard_kills_and_reaps_children_on_early_errors() {
             let mut command = Command::new("sh");
             command.arg("-c").arg("sleep 10");
             #[cfg(unix)]
             command.process_group(0);
             let child = command.spawn().unwrap();
             let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
-            let mut guard = SpawnGuard::default();
+            let mut guard = PipelineConstructionGuard::default();
             guard.push(child).unwrap();
             drop(guard);
             assert!(kill(pid, None).is_err());
+        }
+
+        #[test]
+        fn seeded_construction_fault_schedule_reaps_every_started_child() {
+            const PROCESS_CASES_MAX: usize = 32;
+            const PIPELINE_STAGES_MAX: usize = 4;
+
+            let (seed, requested_cases) = configuration();
+            let cases = requested_cases.min(PROCESS_CASES_MAX);
+            let mut rng = DeterministicRng::new(seed);
+            for case_index in 0..cases {
+                // Rotate through every spawn checkpoint. The seed varies the
+                // planned suffix, which must never be reached after the fault.
+                let fault_after = case_index % PIPELINE_STAGES_MAX + 1;
+                let planned_stages = fault_after + rng.index(PIPELINE_STAGES_MAX + 1 - fault_after);
+                let mut guard = PipelineConstructionGuard::default();
+                let mut process_ids = Vec::with_capacity(fault_after);
+
+                for stage in 0..planned_stages {
+                    let mut command = Command::new("sh");
+                    command.arg("-c").arg("sleep 10");
+                    command.process_group(guard.process_group.unwrap_or(0));
+                    let child = command.spawn().unwrap_or_else(|error| {
+                        panic!("seed={seed} case={case_index} stage={stage} spawn failed: {error}")
+                    });
+                    process_ids.push(Pid::from_raw(i32::try_from(child.id()).unwrap()));
+                    guard.push(child).unwrap();
+                    if stage + 1 == fault_after {
+                        break;
+                    }
+                }
+
+                drop(guard); // Inject the construction failure at this checkpoint.
+                for process_id in process_ids {
+                    assert!(
+                        kill(process_id, None).is_err(),
+                        "seed={seed} case={case_index} fault_after={fault_after} pid={process_id} survived cleanup"
+                    );
+                }
+            }
         }
     }
 }
 
 #[cfg(windows)]
 mod platform {
+    use super::{validate_native_plan, validate_native_source, DEFAULT_CAPTURE_BYTES};
     use quirl_core::{CommandOutcome, CommandRunner, ErrorCode, ProcessRequest, ShellError};
     use quirl_syntax::{parse_command_list, ListConnector, Pipeline, RedirectKind, SimpleCommand};
     use serde::{Deserialize, Serialize};
@@ -2247,7 +2748,10 @@ mod platform {
         io::{self, Read, Write},
         os::windows::io::AsRawHandle,
         process::{Child, ChildStdout, Command, Stdio},
-        sync::atomic::Ordering,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
         thread::{self, JoinHandle},
         time::Instant,
     };
@@ -2287,7 +2791,37 @@ mod platform {
 
     struct ReaderCapture {
         bytes: Vec<u8>,
-        truncated: bool,
+        discarded_bytes: u64,
+    }
+
+    struct CaptureBudget {
+        limit: usize,
+        retained: AtomicUsize,
+    }
+
+    impl CaptureBudget {
+        fn new(limit: usize) -> Self {
+            Self {
+                limit,
+                retained: AtomicUsize::new(0),
+            }
+        }
+
+        fn claim(&self, requested: usize) -> usize {
+            let mut retained = self.retained.load(Ordering::Relaxed);
+            loop {
+                let claimed = requested.min(self.limit.saturating_sub(retained));
+                match self.retained.compare_exchange_weak(
+                    retained,
+                    retained + claimed,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return claimed,
+                    Err(observed) => retained = observed,
+                }
+            }
+        }
     }
 
     type ReaderTask = JoinHandle<io::Result<ReaderCapture>>;
@@ -2335,6 +2869,13 @@ mod platform {
     }
 
     impl NativeExecutor {
+        /// Execute an ordinary foreground command with terminal streams
+        /// inherited. Unlike capture APIs, interactive output is not retained
+        /// or rejected at the programmatic capture ceiling.
+        pub fn execute_interactive(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
+            self.execute(input)
+        }
+
         pub fn execute(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, false)
         }
@@ -2403,6 +2944,7 @@ mod platform {
             capture: bool,
             request: Option<&ProcessRequest>,
         ) -> Result<CommandOutcome, ShellError> {
+            validate_native_source(input)?;
             let graph = parse_command_list(input).map_err(|error| {
                 ShellError::new(ErrorCode::InvalidCommand, error.message)
                     .with_label(
@@ -2414,6 +2956,7 @@ mod platform {
                     .with_help(error.help)
                     .with_command(input)
             })?;
+            validate_native_plan(&graph)?;
             let mut last = CommandOutcome {
                 status: 0,
                 stdout: None,
@@ -2435,12 +2978,12 @@ mod platform {
                     append_captured_output(
                         &mut captured_stdout,
                         last.stdout.as_deref().unwrap_or_default(),
-                        request.map_or(usize::MAX, |request| request.max_output_bytes),
+                        retained_output_limit(request),
                     )?;
                     append_captured_output(
                         &mut captured_stderr,
                         last.stderr.as_deref().unwrap_or_default(),
-                        request.map_or(usize::MAX, |request| request.max_output_bytes),
+                        retained_output_limit(request),
                     )?;
                 }
             }
@@ -2578,6 +3121,8 @@ mod platform {
             let mut previous_stdout: Option<ChildStdout> = None;
             let mut stdout_reader = None;
             let mut stderr_readers = Vec::new();
+            let output_limit = retained_output_limit(request);
+            let stderr_budget = Arc::new(CaptureBudget::new(output_limit));
 
             for (index, command) in pipeline.commands.iter().enumerate() {
                 let Some(program) = command.words.first() else {
@@ -2630,20 +3175,17 @@ mod platform {
                 })?;
                 if capture && !pipeline.background {
                     if let Some(stderr) = child.stderr.take() {
-                        stderr_readers.push(spawn_reader(
-                            stderr,
-                            request.map_or(usize::MAX, |request| request.max_output_bytes),
-                        ));
+                        stderr_readers
+                            .push(spawn_reader_with_budget(stderr, Arc::clone(&stderr_budget)));
                     }
                 }
                 if output.is_none() && !last {
                     previous_stdout = child.stdout.take();
                 } else if output.is_none() && last && capture && !pipeline.background {
-                    let limit = request.map_or(usize::MAX, |request| request.max_output_bytes);
                     stdout_reader = child
                         .stdout
                         .take()
-                        .map(|stdout| spawn_reader(stdout, limit));
+                        .map(|stdout| spawn_reader(stdout, output_limit));
                 }
                 children.push(child);
                 exit_statuses.push(None);
@@ -2854,22 +3396,31 @@ mod platform {
         .with_help("Check the redirect path and file permissions")
     }
 
-    fn spawn_reader(mut reader: impl Read + Send + 'static, limit: usize) -> ReaderTask {
+    fn spawn_reader(reader: impl Read + Send + 'static, limit: usize) -> ReaderTask {
+        spawn_reader_with_budget(reader, Arc::new(CaptureBudget::new(limit)))
+    }
+
+    fn spawn_reader_with_budget(
+        mut reader: impl Read + Send + 'static,
+        budget: Arc<CaptureBudget>,
+    ) -> ReaderTask {
         thread::spawn(move || {
             let mut bytes = Vec::new();
             let mut chunk = [0_u8; 8 * 1024];
-            let mut truncated = false;
+            let mut discarded_bytes = 0_u64;
             loop {
                 let count = reader.read(&mut chunk)?;
                 if count == 0 {
                     break;
                 }
-                let remaining = limit.saturating_sub(bytes.len());
-                let retained = remaining.min(count);
+                let retained = budget.claim(count);
                 bytes.extend_from_slice(&chunk[..retained]);
-                truncated |= retained < count;
+                discarded_bytes = discarded_bytes.saturating_add((count - retained) as u64);
             }
-            Ok(ReaderCapture { bytes, truncated })
+            Ok(ReaderCapture {
+                bytes,
+                discarded_bytes,
+            })
         })
     }
 
@@ -2878,11 +3429,18 @@ mod platform {
             return Ok(Vec::new());
         };
         match reader.join() {
-            Ok(Ok(capture)) if capture.truncated => Err(ShellError::new(
+            Ok(Ok(capture)) if capture.discarded_bytes > 0 => Err(ShellError::new(
                 ErrorCode::ResourceLimit,
                 format!("{description} exceeded the retained output limit"),
             )
-            .with_help("Reduce process output or write it to a file before returning it to Lua")),
+            .with_context(format!(
+                "retained {} bytes; discarded {} bytes",
+                capture.bytes.len(),
+                capture.discarded_bytes
+            ))
+            .with_help(
+                "Reduce process output, redirect it to a file, or consume it in a pipeline",
+            )),
             Ok(Ok(capture)) => Ok(capture.bytes),
             Ok(Err(error)) => Err(ShellError::new(
                 ErrorCode::Io,
@@ -2957,14 +3515,28 @@ mod platform {
         limit: usize,
     ) -> Result<(), ShellError> {
         if next.len() > limit.saturating_sub(retained.len()) {
+            let available = limit.saturating_sub(retained.len());
             return Err(ShellError::new(
                 ErrorCode::ResourceLimit,
                 "captured process output exceeded the retained output limit",
             )
-            .with_help("Reduce process output or write it to a file before returning it to Lua"));
+            .with_context(format!(
+                "retained {} bytes; discarded at least {} bytes; limit {limit} bytes",
+                retained.len(),
+                next.len().saturating_sub(available)
+            ))
+            .with_help(
+                "Reduce process output, redirect it to a file, or consume it in a pipeline",
+            ));
         }
         retained.push_str(next);
         Ok(())
+    }
+
+    fn retained_output_limit(request: Option<&ProcessRequest>) -> usize {
+        request.map_or(DEFAULT_CAPTURE_BYTES, |request| {
+            request.max_output_bytes.min(DEFAULT_CAPTURE_BYTES)
+        })
     }
 
     fn missing_job_error(id: u32) -> ShellError {
@@ -3005,6 +3577,31 @@ mod platform {
 }
 
 pub use platform::{ChildProcessTree, JobState, JobStatus, NativeExecutor};
+
+#[cfg(any(unix, test))]
+fn summarize_job_lifecycle(
+    children: impl IntoIterator<Item = (JobStatus, Option<i32>)>,
+) -> (JobStatus, Option<i32>) {
+    let mut live_count = 0_usize;
+    let mut stopped_count = 0_usize;
+    let mut last_exit_status = None;
+    for (status, exit_status) in children {
+        last_exit_status = exit_status;
+        if status != JobStatus::Done {
+            live_count += 1;
+            if status == JobStatus::Stopped {
+                stopped_count += 1;
+            }
+        }
+    }
+    if live_count == 0 {
+        (JobStatus::Done, last_exit_status)
+    } else if stopped_count == live_count {
+        (JobStatus::Stopped, None)
+    } else {
+        (JobStatus::Running, None)
+    }
+}
 
 /// Process host adapter for sandboxed callers.  A fresh executor keeps Lua
 /// process work isolated from the interactive job table while still using the
@@ -3088,6 +3685,7 @@ impl ProcessBackend for NativeExecutor {
 #[cfg(test)]
 mod backend_contract_tests {
     use super::*;
+    use crate::simulation_support::{configuration, DeterministicRng};
     use quirl_core::ErrorCode;
     use std::{
         fs,
@@ -3269,5 +3867,170 @@ mod backend_contract_tests {
         assert_eq!(cancelled.status, JobStatus::Done);
         assert_eq!(cancelled.exit_status, Some(130));
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[derive(Clone, Copy)]
+    struct SimulatedChild {
+        status: JobStatus,
+        exit_status: Option<i32>,
+    }
+
+    fn model_transition(
+        current: JobStatus,
+        event: JobLifecycleEvent,
+    ) -> Option<(JobStatus, Option<i32>)> {
+        match (current, event) {
+            (JobStatus::Running, JobLifecycleEvent::Stop) => Some((JobStatus::Stopped, None)),
+            (JobStatus::Stopped, JobLifecycleEvent::Continue) => Some((JobStatus::Running, None)),
+            (JobStatus::Running | JobStatus::Stopped, JobLifecycleEvent::Exit(status)) => {
+                Some((JobStatus::Done, Some(status)))
+            }
+            _ => None,
+        }
+    }
+
+    fn assert_simulated_job_invariants(
+        seed: u64,
+        case_index: usize,
+        step: usize,
+        children: &[SimulatedChild],
+    ) {
+        let actual = summarize_job_lifecycle(
+            children
+                .iter()
+                .map(|child| (child.status, child.exit_status)),
+        );
+        let live = children
+            .iter()
+            .filter(|child| child.status != JobStatus::Done)
+            .collect::<Vec<_>>();
+        let expected = if live.is_empty() {
+            (
+                JobStatus::Done,
+                children.last().and_then(|child| child.exit_status),
+            )
+        } else if live.iter().all(|child| child.status == JobStatus::Stopped) {
+            (JobStatus::Stopped, None)
+        } else {
+            (JobStatus::Running, None)
+        };
+        assert_eq!(
+            actual, expected,
+            "seed={seed} case={case_index} step={step}"
+        );
+    }
+
+    #[test]
+    fn seeded_job_simulation_converges_after_faults_freeze() {
+        const CHILDREN_MAX: usize = 8;
+        const SAFETY_STEPS_MAX: usize = 32;
+
+        let (seed, cases) = configuration();
+        let mut rng = DeterministicRng::new(seed);
+        for case_index in 0..cases {
+            let child_count = rng.index(CHILDREN_MAX) + 1;
+            let mut children = vec![
+                SimulatedChild {
+                    status: JobStatus::Running,
+                    exit_status: None,
+                };
+                child_count
+            ];
+            let safety_steps = rng.index(SAFETY_STEPS_MAX + 1);
+
+            // Safety mode explores arbitrary notification orders, including
+            // stale and duplicate events. Invalid transitions must fail
+            // without mutating committed state.
+            for step in 0..safety_steps {
+                let child_index = rng.index(child_count);
+                let event = match rng.index(3) {
+                    0 => JobLifecycleEvent::Stop,
+                    1 => JobLifecycleEvent::Continue,
+                    _ => JobLifecycleEvent::Exit(i32::try_from(rng.index(256)).unwrap()),
+                };
+                let before = children[child_index];
+                let expected = model_transition(before.status, event);
+                match (expected, transition_job_state(before.status, event)) {
+                    (Some(expected), Ok(actual)) => {
+                        assert_eq!(
+                            actual, expected,
+                            "seed={seed} case={case_index} step={step} child={child_index}"
+                        );
+                        children[child_index] = SimulatedChild {
+                            status: actual.0,
+                            exit_status: actual.1,
+                        };
+                    }
+                    (None, Err(error)) => assert_eq!(
+                        error.code,
+                        ErrorCode::InvalidArgument,
+                        "seed={seed} case={case_index} step={step} child={child_index}"
+                    ),
+                    (expected, actual) => panic!(
+                        "seed={seed} case={case_index} step={step} child={child_index} expected={expected:?} actual={actual:?}"
+                    ),
+                }
+                assert_simulated_job_invariants(seed, case_index, step, &children);
+            }
+
+            // Liveness mode freezes completed children permanently and makes
+            // the remaining process-group core healthy: stopped children are
+            // continued, then every live child receives an exit notification.
+            // No randomized fault is allowed to rescue a stuck transition.
+            let mut order = (0..child_count).collect::<Vec<_>>();
+            for index in (1..child_count).rev() {
+                let other = rng.index(index + 1);
+                order.swap(index, other);
+            }
+            let mut liveness_steps = 0_usize;
+            for &child_index in &order {
+                if children[child_index].status == JobStatus::Stopped {
+                    let (status, exit_status) = transition_job_state(
+                        children[child_index].status,
+                        JobLifecycleEvent::Continue,
+                    )
+                    .unwrap();
+                    children[child_index] = SimulatedChild {
+                        status,
+                        exit_status,
+                    };
+                    liveness_steps += 1;
+                }
+            }
+            for &child_index in &order {
+                if children[child_index].status != JobStatus::Done {
+                    let (status, exit_status) = transition_job_state(
+                        children[child_index].status,
+                        JobLifecycleEvent::Exit(0),
+                    )
+                    .unwrap();
+                    children[child_index] = SimulatedChild {
+                        status,
+                        exit_status,
+                    };
+                    liveness_steps += 1;
+                }
+            }
+            assert!(
+                liveness_steps <= child_count * 2,
+                "seed={seed} case={case_index} liveness_steps={liveness_steps}"
+            );
+            assert_simulated_job_invariants(
+                seed,
+                case_index,
+                safety_steps + liveness_steps,
+                &children,
+            );
+            assert_eq!(
+                summarize_job_lifecycle(
+                    children
+                        .iter()
+                        .map(|child| (child.status, child.exit_status))
+                )
+                .0,
+                JobStatus::Done,
+                "seed={seed} case={case_index} did not converge"
+            );
+        }
     }
 }

@@ -43,22 +43,27 @@ Catalog v2/v3 migrates to v4. Plugin lock v1 migrates to v2 without changing
 identity, checksums, requested permissions, grants, or enabled state; the new
 runtime-schema hash is derived from the locked runtime. Recovery v1 migrates to
 v2 with explicit unavailable markers for facts v1 never stored and never
-reconstructs secrets or executable commands. An absent Lua config version is
-the sole legacy v0 form and becomes config v1 through serde defaults before
-authoritative validation. Future versions always fail closed.
+reconstructs secrets or executable commands. Lua config schema v2 adds the
+Ratatui-surface, status-line, transient-prompt, and completion-policy fields
+accepted in [ADR 0012](0012-ratatui-interactive-surface.md). An absent config
+version is legacy v0; both v0 and explicit v1 deterministically receive v2
+defaults and become v2 before authoritative validation. Config versions newer
+than v2, like future versions of every frozen-major surface, fail closed.
 
 ## Consequences
 
 - A reviewed golden change is required when any public contract identity moves.
 - Persisted migrations are deterministic and tested for permission, checksum,
-  redaction, and source preservation.
+  redaction, source preservation, and config-default preservation.
 - Descriptor fingerprints do not replace SHA-256 content integrity in plugin
   locks and do not establish trust.
-- The manifest is a **1.0 freeze candidate**, not proof that Phase 4 is accepted.
-  Command grammar remains a documented preview subset; completion and picker
+- The manifest is a **1.0 freeze candidate**, not proof that a release artifact
+  passed every independent gate. Command grammar remains a documented bounded
+  subset; completion and picker
   have separately frozen asynchronous envelopes with bounded worker and
   stale-result evidence. Runner output remains text-shaped; Wasm remains
   non-executing and its full WIT structural binding is pending, while the
   separate process-adapter v1 initialization handshake is executable.
   Performance, security, accessibility, and compatibility evidence remain
-  separate release gates.
+  separate release gates. ADR 0010 freezes Linux/macOS as the supported
+  interactive platforms and keeps Windows terminal behavior best effort.

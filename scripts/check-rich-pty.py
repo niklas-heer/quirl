@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""Exercise Quirl's interactive surfaces through a real Unix pseudo-terminal."""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import os
+from pathlib import Path
+import pty
+import select
+import signal
+import shutil
+import struct
+import sys
+import tempfile
+import termios
+import time
+
+
+STARTUP_MARKER = b"Tab complete"
+TIMEOUT = 5.0
+
+
+class Session:
+    def __init__(
+        self,
+        binary: Path,
+        root: Path,
+        *,
+        term: str = "xterm-256color",
+        stderr_path: Path | None = None,
+        shell: Path | None = None,
+        symbols: str = "plain",
+        semantic_hints: bool = True,
+    ) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="quirl-pty-")
+        private = Path(self.temp.name)
+        config_dir = private / "config"
+        config_dir.mkdir()
+        temporary_dir = private / "tmp"
+        temporary_dir.mkdir()
+        (config_dir / "config.lua").write_text(
+            f"""---@type quirl.Config
+return quirl.config {{
+  schema_version = 2,
+  editor = {{ keymap = "emacs", semantic_hints = {str(semantic_hints).lower()}, banner = "none" }},
+  picker = {{ layout = "adaptive", preview = true }},
+  prompt = {{
+    symbols = "{symbols}",
+    left = {{ "directory" }},
+    right = {{ "duration", "status" }},
+    transient = false,
+  }},
+  ui = {{ surface = "rich", statusline = {{ hints = true }} }},
+  completion = {{ auto = false, min_chars = 2 }},
+}}
+""",
+            encoding="utf-8",
+        )
+
+        # The PTY child must not inherit developer credentials, plugins, history,
+        # or prompt state. Keep the environment small and deterministic while
+        # retaining PATH so reference shells can start ordinary commands.
+        environment = {
+            "HOME": str(private),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TERM": term,
+            "LC_ALL": "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8",
+            "TMPDIR": str(temporary_dir),
+            "QUIRL_CONFIG_DIR": str(config_dir),
+            "QUIRL_HISTORY": str(private / "history"),
+            "QUIRL_PLUGIN_HOME": str(private / "plugins"),
+            "QUIRL_INDEX_DIR": str(private / "index"),
+            "QUIRL_RECOVERY_DIR": str(private / "recovery"),
+            "XDG_CACHE_HOME": str(private / "cache"),
+            "XDG_CONFIG_HOME": str(private / "xdg-config"),
+            "XDG_DATA_HOME": str(private / "data"),
+            "XDG_STATE_HOME": str(private / "state"),
+        }
+
+        pid, master = pty.fork()
+        if pid == 0:
+            os.chdir(private)
+            os.environ.clear()
+            os.environ.update(environment)
+            if stderr_path is not None:
+                error_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                os.dup2(error_fd, 2)
+                os.close(error_fd)
+            if shell is not None:
+                arguments = (
+                    [shell.name, "-f"]
+                    if shell.name == "zsh"
+                    else [shell.name, "--noprofile", "--norc", "-i"]
+                )
+                os.execv(str(shell), arguments)
+            os.execv(str(binary), [str(binary)])
+            raise AssertionError("exec returned")
+
+        self.pid = pid
+        self.master = master
+        self.binary = binary
+        self.root = root
+        self.output = bytearray()
+        self.shell = shell is not None
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+        flags = fcntl.fcntl(master, fcntl.F_GETFL)
+        fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    def close(self) -> None:
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+        if self.pid > 0:
+            try:
+                os.kill(self.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(self.pid, 0)
+            except ChildProcessError:
+                pass
+        self.temp.cleanup()
+
+    def send(self, data: bytes) -> None:
+        offset = 0
+        deadline = time.monotonic() + TIMEOUT
+        while offset < len(data):
+            try:
+                written = os.write(self.master, data[offset:])
+            except OSError as error:
+                if error.errno != errno.EAGAIN:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise AssertionError("timed out writing PTY input") from error
+                select.select([], [self.master], [], 0.05)
+                continue
+            if written == 0:
+                raise AssertionError("PTY input closed during write")
+            offset += written
+
+    def type(self, text: str) -> None:
+        self.send(text.encode("utf-8"))
+
+    def read(self, duration: float = 0.15) -> bytes:
+        deadline = time.monotonic() + duration
+        chunk = bytearray()
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([self.master], [], [], min(0.05, deadline - time.monotonic()))
+            if not ready:
+                continue
+            try:
+                data = os.read(self.master, 65536)
+            except OSError as error:
+                if error.errno in (errno.EAGAIN, errno.EIO):
+                    continue
+                raise
+            if not data:
+                break
+            # Ratatui's inline viewport asks the terminal for its current cursor
+            # position during initialization. A bare PTY has no emulator to
+            # answer the CPR query, so provide the same response a terminal at
+            # the first row and column would send.
+            for _ in range(data.count(b"\x1b[6n")):
+                os.write(self.master, b"\x1b[1;1R")
+            chunk.extend(data)
+            self.output.extend(data)
+        return bytes(chunk)
+
+    def wait_for(self, marker: bytes, timeout: float = TIMEOUT) -> bytes:
+        start = len(self.output)
+        deadline = time.monotonic() + timeout
+        while marker not in self.output[start:] and time.monotonic() < deadline:
+            self.read(0.1)
+        observed = bytes(self.output[start:])
+        if marker not in observed:
+            raise AssertionError(
+                f"timed out waiting for {marker!r}; tail={observed[-1000:]!r}"
+            )
+        return observed
+
+    def wait_exit(self, timeout: float = TIMEOUT) -> int:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.read(0.05)
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if pid == self.pid:
+                self.pid = -1
+                return os.waitstatus_to_exitcode(status)
+        raise AssertionError("Quirl did not exit")
+
+
+def enter_and_wait(session: Session, command: str, marker: bytes) -> bytes:
+    session.type(command)
+    session.send(b"\r")
+    return session.wait_for(marker)
+
+
+def check_rich_editing(binary: Path, root: Path) -> None:
+    session = Session(binary, root)
+    try:
+        session.wait_for(STARTUP_MARKER)
+
+        session.type("/usr/bin/printf BACKSPACE_BAD")
+        session.send(b"\x7f\x7f\x7f")
+        enter_and_wait(session, "OK", b"BACKSPACE_OK")
+
+        session.type("/usr/bin/printf DELETE_XOK")
+        session.send(b"\x1b[D\x1b[D\x1b[D\x1b[3~\r")
+        session.wait_for(b"DELETE_OK")
+
+        session.type("/usr/bin/printf UNICODE_e\u0301")
+        session.send(b"\x7f")
+        enter_and_wait(session, "OK", b"UNICODE_OK")
+
+        session.type("/usr/bin/printf CTRLD_XOK")
+        session.send(b"\x1b[D\x1b[D\x1b[D\x04\r")
+        session.wait_for(b"CTRLD_OK")
+
+        session.type("/usr/bin/printf SHOULD_NOT_RUN")
+        session.send(b"\x03")
+        session.wait_for(b"^C")
+        enter_and_wait(session, "/usr/bin/printf AFTER_CTRLC", b"AFTER_CTRLC")
+
+        # Alt-M is encoded as Escape followed by `m` in a legacy PTY. Assert
+        # both the session feedback and the next rich status frame so this
+        # catches event-decoding bugs as well as missed repaints.
+        session.send(b"\x1bm")
+        toggled_to_data = session.wait_for(b"typed values and data pipelines")
+        if b"Alt-M mode" not in toggled_to_data or b"data" not in toggled_to_data:
+            raise AssertionError("Alt-M did not repaint the rich data-mode status")
+        session.send(b"\x1bm")
+        toggled_to_command = session.wait_for(b"processes and byte pipelines")
+        if b"Alt-M mode" not in toggled_to_command or b"command" not in toggled_to_command:
+            raise AssertionError("Alt-M did not repaint the rich command-mode status")
+
+        session.type("/usr/bin/printf 'MULTI_ONE")
+        session.send(b"\r")
+        session.read(0.2)
+        session.type("_TWO'")
+        session.send(b"\r")
+        session.wait_for(b"MULTI_ONE\r\n_TWO")
+
+        enter_and_wait(
+            session,
+            "/bin/sh -c 'printf STDOUT_OK; printf STDERR_OK >&2'",
+            b"STDERR_OK",
+        )
+        if b"STDOUT_OK" not in session.output:
+            raise AssertionError("interactive command stdout was not handed back to the PTY")
+
+        session.send(b"\x04")
+        status = session.wait_exit()
+        if status != 0:
+            raise AssertionError(f"Ctrl-D exited with status {status}")
+    finally:
+        session.close()
+
+
+def check_completion(binary: Path, root: Path) -> None:
+    session = Session(binary, root)
+    try:
+        session.wait_for(STARTUP_MARKER)
+        session.type("git st")
+        session.send(b"\t")
+        session.wait_for(b"git status [--short]")
+        session.send(b"\x1b")
+        session.read(0.2)
+        session.send(b"\x03")
+        session.wait_for(b"^C")
+
+        session.type("git st")
+        session.send(b"\t")
+        session.wait_for(b"git status [--short]")
+        session.send(b"\r")
+        session.read(0.2)
+        session.send(b"\r")
+        session.wait_for(b"not a git repository")
+
+        session.type("git")
+        session.send(b"\x1b[Z")
+        session.wait_for(b"picker")
+        # Paste the query as one event so a diff-rendering terminal writes the
+        # complete value, rather than one independently styled cell per key.
+        session.send(b"\x1b[200~zzzz-no-match\x1b[201~")
+        session.wait_for(b"zzzz-no-match")
+        session.send(b"\x1b")
+        session.read(0.1)
+        session.send(b"\x03")
+        session.wait_for(b"^C")
+        session.send(b"\x04")
+        session.wait_exit()
+    finally:
+        session.close()
+
+
+def check_rich_review_regressions(binary: Path, root: Path) -> None:
+    session = Session(binary, root)
+    try:
+        startup = session.wait_for(STARTUP_MARKER)
+        if any(
+            marker in startup
+            for marker in [
+                "❯".encode("utf-8"),
+                "◆".encode("utf-8"),
+                "·".encode("utf-8"),
+            ]
+        ):
+            raise AssertionError("plain prompt.symbols emitted Unicode input chrome")
+
+        session.send(b"\x1b[200~" + (b"x" * 5_000) + b"\x1b[201~")
+        session.read(0.5)
+        session.send(b"\t")
+        completion_notice = session.read(1.0)
+        if b"completion limited" not in completion_notice:
+            raise AssertionError(
+                f"oversized completion notice missing; tail={bytes(session.output[-1500:])!r}"
+            )
+
+        session.send(b"\x15")
+        session.read(0.1)
+        session.type("git st")
+        session.send(b"\x1bOP")
+        session.wait_for(b"documentation")
+        session.send(b"\x1bOP")
+        session.read(0.1)
+        session.send(b"\r")
+        session.type("atus")
+        session.send(b"\r")
+        session.wait_for(b"not a git repository")
+
+        long_line = b"echo " + (b"x" * 180) + b"VIEWPORT-END"
+        session.send(b"\x1b[200~" + long_line + b"\x1b[201~")
+        session.wait_for(b"VIEWPORT-END")
+        session.send(b"\x03")
+        session.wait_for(b"^C")
+
+        cleanup_start = len(session.output)
+        session.send(b"\x04")
+        session.wait_exit()
+        if b"\x1b[?25h" not in bytes(session.output[cleanup_start:]):
+            raise AssertionError("rich terminal cleanup did not explicitly show the cursor")
+    finally:
+        session.close()
+
+    no_hints = Session(binary, root, semantic_hints=False)
+    try:
+        no_hints.wait_for(STARTUP_MARKER)
+        no_hints.type("definitely-not-a-command")
+        if b"unknown command" in no_hints.read(0.3):
+            raise AssertionError("semantic_hints=false rendered a semantic diagnostic")
+        no_hints.send(b"\x03")
+        no_hints.wait_for(b"^C")
+        no_hints.send(b"\x04")
+        no_hints.wait_exit()
+    finally:
+        no_hints.close()
+
+
+def check_suspend_resume(binary: Path, root: Path) -> None:
+    shell_name = shutil.which("zsh") or shutil.which("bash")
+    if shell_name is None:
+        print("skip: check_suspend_resume (zsh/bash unavailable)")
+        return
+    session = Session(binary, root, shell=Path(shell_name))
+    try:
+        session.read(0.2)
+        session.type(f"'{binary}'")
+        session.send(b"\r")
+        session.wait_for(STARTUP_MARKER)
+        session.send(b"\x1a")
+        session.wait_for(b"suspended")
+        session.type("fg")
+        session.send(b"\r")
+        session.wait_for(STARTUP_MARKER)
+        session.send(b"\x04")
+        session.read(0.3)
+        session.type("exit")
+        session.send(b"\r")
+        session.wait_exit()
+    finally:
+        session.close()
+
+
+def check_fallbacks(binary: Path, root: Path) -> None:
+    dumb = Session(binary, root, term="dumb")
+    try:
+        dumb.read(0.5)
+        if STARTUP_MARKER in dumb.output:
+            raise AssertionError("TERM=dumb rendered the rich status line")
+        enter_and_wait(dumb, "/usr/bin/printf DUMB_OK", b"DUMB_OK")
+        dumb.send(b"\x04")
+        dumb.wait_exit()
+    finally:
+        dumb.close()
+
+    with tempfile.TemporaryDirectory(prefix="quirl-redirect-") as directory:
+        stderr_path = Path(directory) / "stderr"
+        redirected = Session(binary, root, stderr_path=stderr_path)
+        try:
+            redirected.read(0.5)
+            if STARTUP_MARKER in redirected.output:
+                raise AssertionError("redirected stderr rendered the rich status line")
+            enter_and_wait(redirected, "/usr/bin/printf REDIRECT_OK", b"REDIRECT_OK")
+            redirected.send(b"\x04")
+            redirected.wait_exit()
+        finally:
+            redirected.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("binary", nargs="?", default="target/debug/quirl")
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent.parent
+    binary = (root / args.binary).resolve() if not Path(args.binary).is_absolute() else Path(args.binary)
+    if not binary.is_file():
+        raise SystemExit(f"missing Quirl binary: {binary}; run cargo build -p quirl-cli")
+
+    checks = [
+        check_rich_editing,
+        check_completion,
+        check_rich_review_regressions,
+        check_suspend_resume,
+        check_fallbacks,
+    ]
+    for check in checks:
+        check(binary, root)
+        print(f"ok: {check.__name__}")
+
+
+if __name__ == "__main__":
+    main()

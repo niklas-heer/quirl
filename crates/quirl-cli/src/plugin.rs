@@ -26,7 +26,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{
+    fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+    process::CommandExt,
+};
 
 const MANIFEST_FILE: &str = "plugin.toml";
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
@@ -147,6 +150,7 @@ pub fn execute(command: PluginCommand) -> Result<i32, ShellError> {
             validate_runtime(
                 &package.manifest,
                 &package.entry_path,
+                &package.entry_bytes,
                 &resolved.granted_capabilities,
                 false,
             )?;
@@ -190,6 +194,7 @@ pub fn execute(command: PluginCommand) -> Result<i32, ShellError> {
             validate_runtime(
                 &package.manifest,
                 &package.entry_path,
+                &package.entry_bytes,
                 &plugin.granted_capabilities,
                 true,
             )?;
@@ -216,6 +221,7 @@ pub fn execute(command: PluginCommand) -> Result<i32, ShellError> {
             if let Err(error) = validate_runtime(
                 &package.manifest,
                 &package.entry_path,
+                &package.entry_bytes,
                 &plugin.granted_capabilities,
                 false,
             ) {
@@ -376,20 +382,15 @@ pub(crate) fn trusted_lua_runtime(grants: &[String]) -> Result<LuaRuntime, Shell
 fn validate_runtime(
     manifest: &PluginManifest,
     entry_path: &Path,
+    entry_bytes: &[u8],
     grants: &[String],
     require_runnable: bool,
 ) -> Result<(), ShellError> {
-    let entry_bytes = read_bounded(
-        entry_path,
-        MAX_ENTRY_BYTES,
-        "plugin entry",
-        "Restore a locked entry smaller than 4 MiB before activation",
-    )?;
-    validate_plugin_manifest(manifest, &entry_bytes, env!("CARGO_PKG_VERSION"))?;
+    validate_plugin_manifest(manifest, entry_bytes, env!("CARGO_PKG_VERSION"))?;
     match manifest.plugin.runtime {
         PluginRuntime::OutOfProcess => {
             if require_runnable {
-                execute_out_of_process_adapter(manifest, entry_path, grants, None)?;
+                execute_out_of_process_adapter(manifest, entry_path, entry_bytes, grants, None)?;
             }
             return Ok(());
         }
@@ -408,9 +409,18 @@ fn validate_runtime(
         }
         PluginRuntime::TrustedLua => {}
     }
-    LuaRuntime::check_file(entry_path)?;
+    let entry_source = std::str::from_utf8(entry_bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "trusted Lua plugin entry is not valid UTF-8",
+        )
+        .with_context(error.to_string())
+        .with_help("Encode the locked plugin entry as UTF-8")
+    })?;
+    let source_name = entry_path.display().to_string();
+    LuaRuntime::check_source(entry_source, &source_name)?;
     let runtime = trusted_lua_runtime(grants)?;
-    let registrations = runtime.load_plugin_file(entry_path)?;
+    let registrations = runtime.load_plugin_source(entry_source, &source_name)?;
     let registered_commands = registrations
         .commands
         .iter()
@@ -483,12 +493,132 @@ fn validate_runtime(
     Ok(())
 }
 
+/// An owner-only executable copy of the exact adapter bytes that passed lock
+/// verification. The random owner-only directory and non-writable file remain
+/// alive through adapter exit because shebang interpreters may reopen the
+/// script path after `Command::spawn` returns.
+#[cfg(unix)]
+struct VerifiedExecutableSnapshot {
+    directory: Option<PathBuf>,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl VerifiedExecutableSnapshot {
+    fn stage(entry_path: &Path, entry_bytes: &[u8]) -> Result<Self, ShellError> {
+        const CREATE_ATTEMPTS: usize = 16;
+        let temporary_root = env::temp_dir();
+        let mut directory = None;
+        for _ in 0..CREATE_ATTEMPTS {
+            let mut random = [0_u8; 16];
+            getrandom::fill(&mut random).map_err(|error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not generate a private adapter snapshot name",
+                )
+                .with_context(error.to_string())
+                .with_help("Retry adapter activation; report repeated random-source failures")
+            })?;
+            let suffix = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let candidate = temporary_root.join(format!("quirl-adapter-{suffix}"));
+            match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                Ok(()) => {
+                    directory = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(io_error(
+                        "could not create a private adapter snapshot directory",
+                        error,
+                        "Check temporary-directory permissions and retry activation",
+                    ));
+                }
+            }
+        }
+        let directory = directory.ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::Io,
+                "could not allocate a unique adapter snapshot directory",
+            )
+            .with_help("Clear stale temporary files and retry adapter activation")
+        })?;
+        let name = entry_path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| std::ffi::OsStr::new("adapter"));
+        let path = directory.join(name);
+        let staged = (|| {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o700)
+                .open(&path)
+                .map_err(|error| {
+                    io_error(
+                        "could not create the verified adapter snapshot",
+                        error,
+                        "Check temporary-directory permissions and retry activation",
+                    )
+                })?;
+            file.write_all(entry_bytes).map_err(|error| {
+                io_error(
+                    "could not write the verified adapter snapshot",
+                    error,
+                    "Check temporary storage capacity and retry activation",
+                )
+            })?;
+            file.sync_all().map_err(|error| {
+                io_error(
+                    "could not sync the verified adapter snapshot",
+                    error,
+                    "Check temporary storage health and retry activation",
+                )
+            })?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).map_err(|error| {
+                io_error(
+                    "could not make the verified adapter snapshot non-writable",
+                    error,
+                    "Check temporary filesystem permission support and retry activation",
+                )
+            })?;
+            Ok(Self {
+                directory: Some(directory.clone()),
+                path: path.clone(),
+            })
+        })();
+        if staged.is_err() {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_dir(&directory);
+        }
+        staged
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+impl Drop for VerifiedExecutableSnapshot {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        if let Some(directory) = self.directory.take() {
+            let _ = fs::remove_dir(directory);
+        }
+    }
+}
+
 /// Execute the narrow v1 initialization handshake for a locked process
 /// adapter. This lives in the CLI composition root because it owns process
 /// creation; `quirl-plugin` owns the typed protocol and boundary validation.
 pub(crate) fn execute_out_of_process_adapter(
     manifest: &PluginManifest,
     entry_path: &Path,
+    entry_bytes: &[u8],
     grants: &[String],
     cancellation: Option<&AtomicBool>,
 ) -> Result<(), ShellError> {
@@ -536,7 +666,16 @@ pub(crate) fn execute_out_of_process_adapter(
     }
 
     let package_root = entry_path.parent().unwrap_or_else(|| Path::new("."));
-    let mut command = Command::new(entry_path);
+    #[cfg(unix)]
+    let executable_snapshot = VerifiedExecutableSnapshot::stage(entry_path, entry_bytes)?;
+    #[cfg(unix)]
+    let executable_path = executable_snapshot.path();
+    #[cfg(not(unix))]
+    let executable_path = {
+        let _ = entry_bytes;
+        entry_path
+    };
+    let mut command = Command::new(executable_path);
     command
         .args(&adapter.arguments)
         .current_dir(package_root)
@@ -556,7 +695,9 @@ pub(crate) fn execute_out_of_process_adapter(
             ),
         )
         .with_context(error.to_string())
-        .with_help("Restore the executable bit and locked adapter entry, then run plugin doctor")
+        .with_help(
+            "Ensure temporary storage permits execution and the locked adapter is a self-contained relocatable executable, then run plugin doctor",
+        )
     })?;
     containment.assign(&mut child).map_err(|error| {
         let _ = child.kill();
@@ -639,11 +780,18 @@ pub(crate) fn execute_out_of_process_adapter(
     };
     let stdout = join_adapter_reader(stdout, "adapter stdout")?;
     let stderr = join_adapter_reader(stderr, "adapter stderr")?;
-    if stdout.exceeded || stderr.exceeded {
+    let discarded_bytes = stdout
+        .discarded_bytes
+        .saturating_add(stderr.discarded_bytes);
+    if discarded_bytes > 0 {
         return Err(adapter_limit_error(
             "isolated adapter exceeded its output message limit",
             adapter.max_message_bytes,
-        ));
+        )
+        .with_context(format!(
+            "retained {} bytes; discarded {discarded_bytes} bytes",
+            stdout.bytes.len().saturating_add(stderr.bytes.len())
+        )));
     }
     if !status.success() {
         return Err(ShellError::new(
@@ -652,7 +800,10 @@ pub(crate) fn execute_out_of_process_adapter(
         )
         .with_context(format!("exit status: {}", status.code().unwrap_or(1)))
         .with_context(truncate_adapter_diagnostic(&stderr.bytes))
-        .with_help("Make the adapter return a ready response and exit successfully"));
+        .with_help("Make the adapter return a ready response and exit successfully")
+        .with_help(
+            "Adapters run from a private relocated snapshot; resolve sidecars from the package working directory rather than from the executable path",
+        ));
     }
     if !stderr.bytes.is_empty() {
         return Err(ShellError::new(
@@ -683,7 +834,7 @@ pub(crate) fn execute_out_of_process_adapter(
 #[derive(Debug)]
 struct AdapterOutput {
     bytes: Vec<u8>,
-    exceeded: bool,
+    discarded_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -699,6 +850,22 @@ impl AdapterOutputBudget {
             consumed: AtomicUsize::new(0),
         }
     }
+
+    fn claim(&self, requested: usize) -> usize {
+        let mut consumed = self.consumed.load(Ordering::Relaxed);
+        loop {
+            let claimed = requested.min(self.limit.saturating_sub(consumed));
+            match self.consumed.compare_exchange_weak(
+                consumed,
+                consumed + claimed,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return claimed,
+                Err(observed) => consumed = observed,
+            }
+        }
+    }
 }
 
 fn spawn_adapter_reader(
@@ -707,20 +874,21 @@ fn spawn_adapter_reader(
 ) -> thread::JoinHandle<io::Result<AdapterOutput>> {
     thread::spawn(move || {
         let mut bytes = Vec::with_capacity(budget.limit.min(8 * 1024));
-        let mut exceeded = false;
+        let mut discarded_bytes = 0_u64;
         let mut buffer = [0_u8; 8 * 1024];
         loop {
             let read = stream.read(&mut buffer)?;
             if read == 0 {
                 break;
             }
-            let previously_consumed = budget.consumed.fetch_add(read, Ordering::Relaxed);
-            let available = budget.limit.saturating_sub(previously_consumed);
-            let retained = available.min(read);
+            let retained = budget.claim(read);
             bytes.extend_from_slice(&buffer[..retained]);
-            exceeded |= retained != read;
+            discarded_bytes = discarded_bytes.saturating_add((read - retained) as u64);
         }
-        Ok(AdapterOutput { bytes, exceeded })
+        Ok(AdapterOutput {
+            bytes,
+            discarded_bytes,
+        })
     })
 }
 
@@ -749,7 +917,7 @@ fn join_adapter_reader(
     let Some(reader) = reader else {
         return Ok(AdapterOutput {
             bytes: Vec::new(),
-            exceeded: false,
+            discarded_bytes: 0,
         });
     };
     match reader.join() {
@@ -1288,14 +1456,98 @@ max_message_bytes = {max_bytes}
             65_536,
         );
         let entry = directory.join("adapter");
-        assert!(validate_runtime(&manifest, &entry, &[], false).is_ok());
+        let entry_bytes = fs::read(&entry).unwrap();
+        assert!(validate_runtime(&manifest, &entry, &entry_bytes, &[], false).is_ok());
         let result = validate_runtime(
             &manifest,
             &entry,
+            &entry_bytes,
             &["process.spawn:adapter".to_owned()],
             true,
         );
         assert!(result.is_ok(), "{result:?}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_adapter_executes_the_verified_snapshot_after_package_replacement() {
+        let directory = test_package_directory("adapter-snapshot");
+        fs::create_dir_all(&directory).unwrap();
+        let manifest = write_isolated_adapter(
+            &directory,
+            "#!/bin/sh\nread request\nprintf '%s\\n' '{\"protocol\":\"quirl.plugin.v1\",\"schema_version\":1,\"api_version\":\"0.1.0\",\"operation\":\"initialize\",\"status\":\"ready\"}'\n",
+            1_000,
+            65_536,
+        );
+        let entry = directory.join("adapter");
+        let verified_bytes = fs::read(&entry).unwrap();
+        fs::write(&entry, "#!/bin/sh\nexit 97\n").unwrap();
+
+        let result = validate_runtime(
+            &manifest,
+            &entry,
+            &verified_bytes,
+            &["process.spawn:adapter".to_owned()],
+            true,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_adapter_snapshot_is_private_non_writable_and_removed_on_drop() {
+        let entry = Path::new("adapter");
+        let snapshot = VerifiedExecutableSnapshot::stage(entry, b"#!/bin/sh\nexit 0\n").unwrap();
+        let path = snapshot.path().to_owned();
+        let directory = snapshot.directory.as_ref().unwrap().clone();
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        drop(snapshot);
+        assert!(!path.exists());
+        assert!(!directory.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_adapter_reports_the_self_relative_sidecar_constraint() {
+        let directory = test_package_directory("adapter-sidecar");
+        fs::create_dir_all(&directory).unwrap();
+        let manifest = write_isolated_adapter(
+            &directory,
+            "#!/bin/sh\ntest -f \"$(dirname \"$0\")/sidecar\" || exit 42\n",
+            1_000,
+            65_536,
+        );
+        fs::write(
+            directory.join("sidecar"),
+            "present only beside the package entry",
+        )
+        .unwrap();
+        let entry = directory.join("adapter");
+        let entry_bytes = fs::read(&entry).unwrap();
+
+        let error = validate_runtime(
+            &manifest,
+            &entry,
+            &entry_bytes,
+            &["process.spawn:adapter".to_owned()],
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error
+            .details
+            .help
+            .iter()
+            .any(|help| help.contains("private relocated snapshot")));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1311,12 +1563,14 @@ max_message_bytes = {max_bytes}
             65_536,
         );
         let entry = directory.join("adapter");
-        let grant_error = validate_runtime(&manifest, &entry, &[], true).unwrap_err();
+        let entry_bytes = fs::read(&entry).unwrap();
+        let grant_error = validate_runtime(&manifest, &entry, &entry_bytes, &[], true).unwrap_err();
         assert_eq!(grant_error.code, ErrorCode::Validation);
         assert!(grant_error.message.contains("exact locked launch grant"));
         let response_error = validate_runtime(
             &manifest,
             &entry,
+            &entry_bytes,
             &["process.spawn:adapter".to_owned()],
             true,
         )
@@ -1340,9 +1594,11 @@ max_message_bytes = {max_bytes}
         let timeout =
             write_isolated_adapter(&directory, "#!/bin/sh\nwhile :; do :; done\n", 5, 512);
         let entry = directory.join("adapter");
+        let timeout_bytes = fs::read(&entry).unwrap();
         let deadline = validate_runtime(
             &timeout,
             &entry,
+            &timeout_bytes,
             &["process.spawn:adapter".to_owned()],
             true,
         )
@@ -1356,16 +1612,28 @@ max_message_bytes = {max_bytes}
             1_000,
             512,
         );
-        let output_error =
-            validate_runtime(&output, &entry, &["process.spawn:adapter".to_owned()], true)
-                .unwrap_err();
+        let output_bytes = fs::read(&entry).unwrap();
+        let output_error = validate_runtime(
+            &output,
+            &entry,
+            &output_bytes,
+            &["process.spawn:adapter".to_owned()],
+            true,
+        )
+        .unwrap_err();
         assert_eq!(output_error.code, ErrorCode::ResourceLimit);
         assert!(output_error.message.contains("output message limit"));
+        assert!(output_error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("discarded") && context.contains("retained")));
 
         let cancelled = AtomicBool::new(true);
         let cancellation_error = execute_out_of_process_adapter(
             &timeout,
             &entry,
+            &timeout_bytes,
             &["process.spawn:adapter".to_owned()],
             Some(&cancelled),
         )
@@ -1424,6 +1692,7 @@ error_codes = { "resource_limit" = "bounded" }
         let result = validate_runtime(
             &manifest,
             &entry,
+            &fs::read(&entry).unwrap(),
             &[
                 "commands.register".to_owned(),
                 "process.spawn:printf".to_owned(),

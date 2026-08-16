@@ -6,7 +6,7 @@
 
 ## Context
 
-Phase 3 requires native process lifecycle behavior on Unix and Windows without
+Phase 3 defines process lifecycle behavior behind one portable contract without
 making the CLI conditional on operating-system details. It also requires
 recoverable command failures. Process handles and terminal ownership belong in
 the process layer, while persistence paths and user-facing recovery commands
@@ -75,10 +75,12 @@ decision because it can repeat destructive effects.
 ## Consequences
 
 - Unix job-control behavior remains unchanged behind a portable interface.
-- Windows cross-compiles against a native lifecycle backend with external byte
-  pipelines, redirects, foreground/background jobs, listing, foregrounding,
-  cancellation, and Job Object tree cleanup. Suspend/resume and terminal
-  ownership remain explicitly unsupported.
+- Windows cross-compiles against a best-effort native lifecycle backend with
+  external byte pipelines, redirects, foreground/background jobs, listing,
+  foregrounding, cancellation, and Job Object tree cleanup. Suspend/resume and
+  terminal ownership remain explicitly unsupported. Under
+  [ADR 0010](0010-unix-first-release-scope.md), this backend is portability work,
+  not a tested Windows interactive-support or 1.0 release claim.
 - Bash and Zsh runners are exact-dialect bridges with no implicit user RC.
 - A failure to write recovery data emits a warning but never replaces the
   command's original status or `ShellError`.
