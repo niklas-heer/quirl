@@ -1,68 +1,95 @@
-# Historical 0.1.0 release performance record
+# 0.1.0 exact-candidate performance record
 
-> **Historical evidence only.** This record applies solely to commit
-> `c5a8d757a35a92a9a269686a1cd166c5a486e2b3` and the SHA-256-named artifact
-> below. It is not release evidence for the current candidate; a candidate must
-> be measured again from its exact clean source and artifact.
+**Measured:** 16 August 2026 at 18:51:07 UTC
 
-**Measured:** 16 August 2026 at 00:49:55 UTC
+**Candidate A:** `7bf188344ca61798a3cd8657787eacb8ec26ef84`
+(tree `60df4fe8309f624642273ca8981a43d95217191e`, clean)
 
-**Source:** `c5a8d757a35a92a9a269686a1cd166c5a486e2b3` (clean)
+**Artifact SHA-256:**
+`81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6`
 
-**Artifact SHA-256:** `12989bce23eccda4330cd815f5b234fb7c59e5c5cc23f5f93987592af3f0341e`
+**Automated performance gate:** **passed all release budgets**
 
-**Release gate:** **passed all release budgets**
+**Overall release readiness:** **blocked**. The automated macOS evidence below
+does not replace the named human terminal review required by the release
+checklist, and no actual Linux hardware run was available. No tag, release,
+upload, deployment, or publication was performed.
 
-This record measures the exact `quirl 0.1.0` artifact named above. Report
-schema v5 rejects tracked or untracked source changes, requires an independently
-supplied SHA-256, copies the artifact into a private read-only staging directory,
-and verifies the staged copy before any execution. It also verifies the
-artifact's embedded source revision, profile, optimization level, panic
-strategy, operating system, and architecture. The report therefore does not
-trust the artifact's self-description as its identity and uses one read-only
-staged copy for metadata, timing, and size measurements.
+This record measures the exact `quirl 0.1.0` artifact named above. Evidence
+commit B only records candidate A's results; it is not the measured binary
+source. Report schema v7 rejects tracked or untracked source changes, requires
+an independently supplied SHA-256, copies the artifact into a private read-only
+staging directory, and verifies the staged copy before execution. It also
+verifies the artifact's embedded source revision, profile, optimization level,
+panic strategy, operating system, architecture, and the independently embedded
+source identity of `quirl-bench`.
 
-The harness runs the actual Quirl binary in a fresh pseudo-terminal for each
-end-to-end sample and reconstructs terminal frames from the PTY byte stream.
-It does not claim terminal-emulator scheduling, GPU composition, or physical
-monitor-scanout latency.
+The harness runs the actual release binary in a fresh pseudo-terminal for every
+end-to-end sample and reconstructs terminal frames from the PTY byte stream. It
+does not claim terminal-emulator scheduling, GPU composition, monitor scanout,
+or human usability review.
 
-## Reference machine and artifact
+## Source, toolchain, and artifact identity
 
 | Field | Value |
 | --- | --- |
-| Hardware | Apple M2 Pro, 12 logical CPUs, 32 GiB memory |
-| Platform | macOS 15.7.9 (24G830), `aarch64` |
+| Shared base | `70ec1b70e97db823747dffa43b8e468e0ea1aa17` |
+| Release remote | Local `main`, `origin/main`, and a fresh `git ls-remote origin refs/heads/main` all resolved to the shared base |
+| Candidate commit | `7bf188344ca61798a3cd8657787eacb8ec26ef84` |
+| Candidate tree | `60df4fe8309f624642273ca8981a43d95217191e` |
+| Candidate chain | 14 fast-forwarded commits above the shared base; no cherry-pick, rebase, squash, or amend |
+| `Cargo.lock` SHA-256 | `760c563326bf205d06e9af496637e0a4065eda3660afc0c1d729917b144a2440` |
+| `Cargo.toml` SHA-256 | `e74a48ef5c39ac7537fbf095ee249a4f08d4c3f210c78b6ded22bc564a594af2` |
+| `rust-toolchain.toml` SHA-256 | `1492287aa0b458ad3277d11eae2175fb662a33e7d7958ec99a057973f2bac1a2` |
+| Generated Lua SDK SHA-256 | `80786a06f3545892d601c75a2026424ad06fcc9c2a6d6a81aca8e2fea024c154` |
+| Protocol manifest SHA-256 | `64e017c95626648eb735656bc9047937ecc6100d6441b68823c0354b9735d1da` |
+| Config protocol identity | Schema v3; oldest readable v0; `migrated_range`; `fnv1a64:ecd91686169f6b26` |
 | Rust | `rustc 1.88.0 (6b00bc388 2025-06-23)`, LLVM 20.1.5 |
 | Cargo | `cargo 1.88.0 (873a06493 2025-05-10)` |
-| Build | Cargo `release`; `opt-level=z`; fat LTO; one codegen unit; symbols stripped; `panic=unwind` |
-| Quirl | `quirl 0.1.0`, 3,861,808-byte executable |
-| PTY | 120 columns × 40 rows, `TERM=xterm-256color`, truecolor advertised |
+| Target triple | `aarch64-apple-darwin` |
+| Build profile | Cargo `release`; `opt-level=z`; fat LTO; one codegen unit; symbols stripped; `panic=unwind` |
+| Embedded build identity | schema 2; source candidate A; `source_dirty=false`; `macos`; `aarch64`; `quirl 0.1.0` |
+| Artifact | 4,593,264 bytes; SHA-256 shown above |
 
-The machine was not isolated. CPU frequency, thermal state, scheduler load,
-and filesystem cache state were not controlled.
+The digest was first computed independently with `shasum -a 256`, then passed
+back to the enforcing harness. The digest printed by the harness, the embedded
+source identity, the harness source identity, and the independently recorded
+candidate commit all matched.
+
+## Measurement environment
+
+| Field | Value |
+| --- | --- |
+| Hardware | Apple Mac14,9; Apple M2 Pro; 12 physical/logical CPUs; 32 GiB memory |
+| Platform | macOS 15.7.9 (24G830), Darwin 24.6.0, `aarch64` |
+| Reference shells | GNU Bash 5.3.15 at `/opt/homebrew/bin/bash`; Zsh 5.9 at `/bin/zsh` |
+| Automated PTY | `portable-pty` 0.9.0 with `vt100` 0.15.2; 120 columns × 40 rows; `TERM=xterm-256color`; truecolor advertised |
+| Human terminal application | None used. The command runner exposed no `TERM_PROGRAM`; no Terminal.app, iTerm2, WezTerm, Kitty, Alacritty, or other graphical terminal was reviewed. |
+| Warmup and cache method | No discarded warmup samples. Every PTY timing is a new process. Filesystem caches were not flushed. |
+| Load controls | The machine was not isolated; CPU frequency, thermal state, scheduler load, and filesystem cache state were not controlled. |
+
+These measurements ran on actual local macOS hardware. They are automated PTY
+evidence only, not a named human macOS terminal signoff. No actual Linux
+hardware, Linux terminal owner, container accepted as hardware evidence, SSH
+session, or remote PTY was used.
 
 ## End-to-end release budgets
 
-Times are wall-clock milliseconds. The enforcing gate uses nearest rank over
-101 independent fresh processes; all samples completed before the 2,000 ms
-phase timeout.
+Times are wall-clock milliseconds. Percentiles use nearest rank over 101
+independent fresh processes. All samples completed before the 2,000 ms phase
+timeout; the harness reported no failures or warnings.
 
-| Measurement | Valid samples | P50 | P95 | Target | Outcome |
-| --- | ---: | ---: | ---: | --- | --- |
-| Process start to editable prompt | 101/101 | 12.093 | 13.323 | P50 ≤25 ms | **Within** |
-| Final keystroke to corresponding frame | 101/101 | 0.187 | 0.237 | P95 ≤8 ms | **Within** |
-| Process start to first prompt frame | 101/101 | 11.936 | 13.145 | ≤16 ms | **Within (conservative P95)** |
-| Release executable size | — | 3,861,808 bytes | — | Historical v5 gate: ≤5,242,880 bytes; current policy: 5 MiB ideal, 8 MiB soft cap, 10 MiB hard ceiling | **Within historical gate and current ideal tier: 1,381,072 bytes below 5 MiB** |
+| Measurement | Valid | Minimum | P50 | P95 | Maximum | Target | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Process start to editable prompt | 101/101 | 13.215 | 22.828 | 25.095 | 27.613 | P50 ≤25 ms | **Within** |
+| Final keystroke to corresponding frame | 101/101 | 0.494 | 1.163 | 2.222 | 2.708 | P95 ≤8 ms | **Within** |
+| Process start to first prompt frame | 101/101 | 11.109 | 18.775 | 20.661 | 22.843 | P95 ≤21 ms | **Within** |
+| Release executable size | — | — | 4,593,264 bytes | — | — | ≤10,485,760 bytes hard ceiling | **Within ideal 5 MiB tier** |
 
-The gate conservatively enforces first-prompt P95. The schema-v5 gate used for
-this frozen run enforced a 5 MiB hard limit and passed; that historical result
-is unchanged. Current schema v7 defines binary-size units as MiB, where one MiB
-is exactly 1,048,576 bytes: 5 MiB (5,242,880 bytes) is ideal, more than 8 MiB
-(8,388,608 bytes) records a warning, and more than 10 MiB (10,485,760 bytes) is
-a hard release failure. Under the current policy the same measured artifact is
-in the ideal tier. `opt-level=z` keeps it compact while the measured interactive
-timings retain substantial headroom.
+The first-prompt gate uses P95. Binary units are MiB, where one MiB is exactly
+1,048,576 bytes. This artifact is 649,616 bytes below the 5 MiB ideal limit,
+3,795,344 bytes below the 8 MiB soft cap, and 5,892,496 bytes below the 10 MiB
+hard ceiling.
 
 ## Stream retention evidence
 
@@ -77,38 +104,67 @@ not an RSS, allocator, record-size, or producer-backpressure claim.
 | 16 | 16 | 99,984 | 845 |
 | 256 | 256 | 99,744 | 12,606 |
 
+The production buffer invariant was valid at every tested capacity and the
+enforcing harness accepted the stream-retention gate.
+
 ## Supplementary diagnostics
 
-These probes are diagnostic only and cannot satisfy an end-to-end release
-gate.
+These probes are exact raw aggregate values from the same enforcing run. They
+are diagnostic only and cannot satisfy an end-to-end release gate.
 
-| Probe | Samples | P50 | P95 | Scope |
-| --- | ---: | ---: | ---: | --- |
-| `quirl --version` subprocess | 31 | 3.571 ms | 5.325 ms | Process/loading/argument lower bound |
-| Completion, semantic-highlight proxy, prompt render | 2,000 | 0.0170 ms | 0.0214 ms | Headless CPU only |
-| Fresh prompt construction and render | 500 | 0.0072 ms | 0.0100 ms | Headless CPU only |
+| Probe | Valid | Minimum | P50 | P95 | Maximum | Scope |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `quirl --version` subprocess | 31/31 | 2.993 ms | 3.747 ms | 5.389 ms | 6.112 ms | Process/loading/argument lower bound |
+| Completion, semantic-highlight proxy, prompt render | 2,000/2,000 | 2.322 ms | 2.558 ms | 2.794 ms | 3.120 ms | Headless CPU only |
+| Fresh prompt construction and render | 500/500 | 2.356 ms | 2.563 ms | 2.770 ms | 2.867 ms | Headless CPU only |
 
-## Reproduce
+## Commands executed
+
+The candidate was clean for every build and measurement command. The canonical
+JSON output was retained locally as bounded raw evidence while this record was
+written; this repository's checked-in benchmark convention is the exact,
+privacy-safe aggregate record above.
 
 ```sh
-cargo build --release -p quirl-cli -p quirl-bench
+cargo xtask check
+npm ci --prefix website
+cargo xtask website-check
+cargo xtask sdk
+git diff --exit-code -- docs/quirl.lua
+cargo clean --profile release
+cargo xtask demo
+cargo xtask release-preview
 shasum -a 256 target/release/quirl
-# Copy the independently recorded digest; do not derive it from the binary's
-# self-reported metadata.
-QUIRL_EXPECTED_SHA256=<64-hex-digit-digest>
+target/release/quirl --build-info
 target/release/quirl-bench release \
   --quirl target/release/quirl \
-  --expected-sha256 "$QUIRL_EXPECTED_SHA256" \
+  --expected-sha256 81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6 \
   --json
+python3 scripts/check-rich-pty.py target/release/quirl
 ```
 
-The commands above use the current schema-v7 harness; they reproduce the method
-against a newly built artifact rather than rewriting this frozen schema-v5
-record. `release` exits non-zero when any release budget misses, while still
-emitting the complete JSON evidence. It requires the independently recorded
-SHA-256, copies the supplied binary into a private read-only staging directory,
-verifies the copy before executing it, and uses only that staged copy throughout
-the run. `preview` emits the same schema without enforcing the final exit status
-or requiring a digest. The release run defaults to 101 PTY samples; preview
-uses 31. Both use 31 version samples, 2,000 headless edit samples, 500 prompt
-samples, and 100,000 stream samples for every tested window.
+Focused process/job, typed data, Lua policy/ABI, installed plugin dispatch,
+LSP/MCP, config/recovery, rich/simple UI, security, and accessibility commands
+are recorded in the exact-candidate release checklist and audit. The full
+automated real-PTY harness passed all nine scenarios against the release
+artifact: rich editing, completion, integrated runtime, rich regressions,
+native job control, noninteractive dialect islands, suspend/resume, fallback
+selection, and `NO_COLOR` semantic hints.
+
+## Missing evidence and historical record
+
+Release readiness remains blocked on:
+
+- a named human reviewer completing the real-terminal checklist in an actual
+  macOS terminal application, including resize, narrow, custom-theme,
+  `config web`, foreground-terminal, and remote-PTY observations;
+- the same named real-terminal and process/job-control review on actual Linux
+  hardware; and
+- human review of a candidate-derived real-terminal demo before any README or
+  release asset is published.
+
+The earlier record for commit
+`c5a8d757a35a92a9a269686a1cd166c5a486e2b3` and artifact
+`12989bce23eccda4330cd815f5b234fb7c59e5c5cc23f5f93987592af3f0341e`
+is historical only. None of its timings, pass state, or artifact identity was
+copied forward into this candidate's evidence.

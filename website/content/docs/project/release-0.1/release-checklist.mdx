@@ -23,18 +23,34 @@ This checklist uses two explicit revisions:
   rebuilds, or relabels A. Any code, manifest, generated-contract, dependency,
   or release-profile change requires a new candidate A and a fresh gate.
 
+## Exact-candidate evidence status
+
+Candidate A is `7bf188344ca61798a3cd8657787eacb8ec26ef84` and the
+measured release artifact SHA-256 is
+`81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6`.
+The automated gate passed on actual local macOS hardware on 16 August 2026;
+the exact environment, commands, raw aggregate measurements, and artifact
+identity are in the [performance record](/docs/project/release-0.1/performance-record). Evidence
+commit B records those facts and is not the measured artifact commit.
+
+**Release readiness remains blocked.** No named human reviewer used an actual
+terminal application for the macOS checklist, no actual Linux hardware or
+Linux terminal application was available, and the real-terminal demo has not
+received human review. Every corresponding box below remains unchecked. The
+automated real-PTY harness is supporting evidence, not a human signoff.
+
 ## 1. Freeze the candidate
 
-- [ ] The worktree is clean and `main` is synchronized with its release remote.
-- [ ] `Cargo.lock`, `rust-toolchain.toml`, the release profile, version strings,
+- [x] The worktree is clean and `main` is synchronized with its release remote.
+- [x] `Cargo.lock`, `rust-toolchain.toml`, the release profile, version strings,
   generated SDK, protocol manifest, and user-facing status text describe the
   candidate being shipped.
-- [ ] The reviewed config descriptor is schema v3, its golden fingerprint
+- [x] The reviewed config descriptor is schema v3, its golden fingerprint
   matches the candidate, and v0/v1/v2-to-v3 migration tests pass.
-- [ ] The supported compatibility boundary is unchanged: C0/C1-core is native
+- [x] The supported compatibility boundary is unchanged: C0/C1-core is native
   on Linux/macOS; here-documents, process substitution, loops, functions,
   conditionals, and dialect control forms are explicit Bash/Zsh islands.
-- [ ] Deferred and best-effort work is visible in the README and release notes.
+- [x] Deferred and best-effort work is visible in the README and release notes.
   In particular, do not present native Windows terminal behavior or Wasm
   execution as supported.
 
@@ -50,14 +66,14 @@ git log -1 --format='%h %s'
 
 ## 2. Run the automated gate
 
-- [ ] `cargo xtask check` passes with the pinned Rust 1.88 toolchain.
-- [ ] The generated Lua SDK has no diff after `cargo xtask sdk`.
-- [ ] Website dependencies were installed with `npm ci --prefix website` and
+- [x] `cargo xtask check` passes with the pinned Rust 1.88 toolchain.
+- [x] The generated Lua SDK has no diff after `cargo xtask sdk`.
+- [x] Website dependencies were installed with `npm ci --prefix website` and
   `cargo xtask website-check` passes. This non-mutating gate checks generated
   mirror/reference freshness, lint, route type checking, and the production
   build using the committed `website/package-lock.json`.
-- [ ] The deterministic product tour passes against the candidate binary.
-- [ ] The release binary and benchmark harness are built together from the
+- [x] The deterministic product tour passes against the candidate binary.
+- [x] The release binary and benchmark harness are built together from the
   clean candidate.
 
 ```sh
@@ -117,6 +133,14 @@ font or a Nerd Font was used. A glyph difference must never change behavior.
 The exact commands and adversarial text-only checks are also recorded in the
 [security and accessibility audit](/docs/project/release-0.1/security-accessibility-audit).
 
+Candidate A's release artifact also passed every automated scenario in
+`scripts/check-rich-pty.py` on actual macOS hardware. That run covered rich
+editing, completion, integrated runtime behavior, review regressions, native
+job control, noninteractive dialect islands, suspend/resume, fallback
+selection, and `NO_COLOR`. It used a programmatic 120×40 pseudo-terminal, not
+a named graphical terminal application. Consequently none of the human,
+cross-terminal, resize, remote-PTY, or Linux boxes in this section are checked.
+
 ## 4. Refresh performance evidence
 
 Do not edit measurements by hand or reuse the previous digest. On an idle,
@@ -142,24 +166,24 @@ when the human-readable report is sufficient; it also runs the explicit website
 gate and therefore requires the locked website dependencies to be installed.
 Use the direct command above to capture canonical JSON evidence.
 
-- [ ] The harness accepts the clean revision embedded independently in both
+- [x] The harness accepts the clean revision embedded independently in both
   `quirl` and `quirl-bench`, their matching source identity, the artifact
   profile, panic strategy, operating system, architecture, and independent
   digest.
-- [ ] All enforced PTY latency, first-prompt, binary-size, and bounded-history
+- [x] All enforced PTY latency, first-prompt, binary-size, and bounded-history
   budgets pass, or the release stops with the miss preserved in the record.
-- [ ] The exact release binary is at or below the 10 MiB hard ceiling
+- [x] The exact release binary is at or below the 10 MiB hard ceiling
   (10,485,760 bytes). At or below 5 MiB (5,242,880 bytes) is ideal; a binary
   above the 8 MiB soft cap (8,388,608 bytes) records a warning without weakening
   the hard gate. `--max-binary-bytes` may tighten but never raise the ceiling.
-- [ ] Rich-surface draw and edit latency are measured on the selected
+- [x] Rich-surface draw and edit latency are measured on the selected
   candidate; `QUIRL_UI_TIMINGS=1` is diagnostic evidence, not a substitute for
   the enforcing PTY harness.
-- [ ] The release evidence names candidate A's exact revision, artifact digest,
+- [x] The release evidence names candidate A's exact revision, artifact digest,
   hardware, OS, Rust version, sample counts, results, and limitations. It may be
   captured as a release asset first and checked into
   `docs/benchmarks/release-v1.0.md` later in evidence commit B.
-- [ ] The performance record and the binary intended for publication describe
+- [x] The performance record and the binary intended for publication describe
   the same artifact. Any source or release-profile change invalidates the run.
 
 ## 5. Capture the real-terminal demo
