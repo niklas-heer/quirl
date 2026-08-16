@@ -2,10 +2,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::VecDeque;
 use unicode_segmentation::UnicodeSegmentation;
 
-pub(super) const MAX_EDITOR_BUFFER_BYTES: usize = 64 * 1024;
-pub(super) const MAX_HISTORY_ENTRY_BYTES: usize = MAX_EDITOR_BUFFER_BYTES;
-pub(super) const MAX_HISTORY_ENCODED_ENTRY_BYTES: usize = MAX_HISTORY_ENTRY_BYTES * 4;
-pub(super) const MAX_HISTORY_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+use crate::{MAX_HISTORY_ENTRY_BYTES, MAX_HISTORY_RETAINED_BYTES};
+
+pub(super) const MAX_EDITOR_BUFFER_BYTES: usize = MAX_HISTORY_ENTRY_BYTES;
 const MAX_UNDO_STATES: usize = 256;
 const MAX_UNDO_BYTES: usize = 8 * 1024 * 1024;
 

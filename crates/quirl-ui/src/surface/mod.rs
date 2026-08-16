@@ -10,16 +10,15 @@ pub use degrade::{select_surface, SurfaceKind};
 
 use self::{
     completion::CompletionState,
-    editor::{
-        EditAction, EditorState, MAX_HISTORY_ENCODED_ENTRY_BYTES, MAX_HISTORY_ENTRY_BYTES,
-        MAX_HISTORY_RETAINED_BYTES,
-    },
+    editor::{EditAction, EditorState},
     frame::FrameModel,
     highlight::InputAnalyzer,
     overlay::{contextual_help_query, PickerLayout, PickerOverlay},
 };
 use super::{
-    ExtensionCompleter, PickerRanker, QuirlPrompt, SurfaceSymbols, MODE_TOGGLE_HOST_COMMAND,
+    read_history, ExtensionCompleter, PickerRanker, QuirlPrompt, SurfaceSymbols,
+    MAX_HISTORY_ENCODED_ENTRY_BYTES, MAX_HISTORY_ENTRY_BYTES, MAX_HISTORY_RETAINED_BYTES,
+    MODE_TOGGLE_HOST_COMMAND,
 };
 use crate::theme::Theme;
 use crossterm::{
@@ -42,8 +41,8 @@ use ratatui::{
 use std::{
     collections::VecDeque,
     env, fs,
-    fs::{File, OpenOptions},
-    io::{self, IsTerminal, Read, Seek, SeekFrom, Write},
+    fs::OpenOptions,
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
@@ -119,7 +118,7 @@ impl RichSurface {
         config: &QuirlConfig,
         history_path: PathBuf,
     ) -> Result<Self, ShellError> {
-        let history = read_history(&history_path);
+        let history = read_history(&history_path).unwrap_or_default();
         let input_analysis = InputAnalyzer::new(Arc::clone(&catalog));
         let theme = Theme::from_config(config, true)?;
         Ok(Self {
@@ -803,58 +802,6 @@ fn retain_error(slot: &mut Option<ShellError>, error: ShellError) {
     }
 }
 
-fn read_history(path: &Path) -> Vec<String> {
-    let Ok(mut file) = File::open(path) else {
-        return Vec::new();
-    };
-    let file_len = file.metadata().map_or(0, |metadata| metadata.len());
-    let start = file_len.saturating_sub(MAX_HISTORY_FILE_BYTES as u64);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return Vec::new();
-    }
-    let mut bytes = Vec::with_capacity(
-        usize::try_from(file_len.saturating_sub(start))
-            .unwrap_or(MAX_HISTORY_FILE_BYTES)
-            .min(MAX_HISTORY_FILE_BYTES),
-    );
-    if file
-        .take(MAX_HISTORY_FILE_BYTES as u64)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let bytes = if start == 0 {
-        bytes.as_slice()
-    } else if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
-        &bytes[newline.saturating_add(1)..]
-    } else {
-        return Vec::new();
-    };
-    let mut retained_bytes = 0_usize;
-    let mut history = Vec::new();
-    for line in bytes.rsplit(|byte| *byte == b'\n') {
-        if line.is_empty() || line.len() > MAX_HISTORY_ENCODED_ENTRY_BYTES {
-            continue;
-        }
-        let Ok(line) = std::str::from_utf8(line) else {
-            continue;
-        };
-        let entry = decode_history_entry(line);
-        if entry.len() > MAX_HISTORY_ENTRY_BYTES {
-            continue;
-        }
-        let next_bytes = retained_bytes.saturating_add(entry.len());
-        if history.len() == 50_000 || next_bytes > MAX_HISTORY_RETAINED_BYTES {
-            break;
-        }
-        retained_bytes = next_bytes;
-        history.push(entry);
-    }
-    history.reverse();
-    history
-}
-
 fn trim_history(history: &mut Vec<String>) {
     let mut retained_bytes = 0_usize;
     let mut keep_from = history.len();
@@ -876,10 +823,6 @@ fn trim_history(history: &mut Vec<String>) {
 
 fn encode_history_entry(value: &str) -> String {
     value.replace('\n', HISTORY_NEWLINE_ESCAPE)
-}
-
-fn decode_history_entry(value: &str) -> String {
-    value.replace(HISTORY_NEWLINE_ESCAPE, "\n")
 }
 
 fn history_error(path: &Path) -> impl Fn(io::Error) -> ShellError + '_ {
@@ -952,7 +895,10 @@ mod tests {
         let encoded = encode_history_entry(entry);
         assert!(!encoded.contains('\n'));
         assert!(encoded.contains(HISTORY_NEWLINE_ESCAPE));
-        assert_eq!(decode_history_entry(&encoded), entry);
+        assert_eq!(
+            crate::parse_history_tail(encoded.as_bytes(), crate::HISTORY_READ_LIMITS),
+            vec![entry]
+        );
     }
 
     #[test]
@@ -962,12 +908,12 @@ mod tests {
             std::process::id(),
             HISTORY_COMPACTION_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut file = File::create(&path).unwrap();
+        let mut file = fs::File::create(&path).unwrap();
         file.write_all(&vec![b'x'; MAX_HISTORY_ENCODED_ENTRY_BYTES + 1])
             .unwrap();
         file.write_all(b"\nsafe tail\n").unwrap();
         drop(file);
-        assert_eq!(read_history(&path), vec!["safe tail"]);
+        assert_eq!(read_history(&path).unwrap(), vec!["safe tail"]);
         fs::remove_file(path).unwrap();
     }
 

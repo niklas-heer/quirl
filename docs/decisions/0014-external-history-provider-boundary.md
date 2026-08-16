@@ -55,6 +55,7 @@ The adapter must enforce these invariants:
 - The implementation needs deterministic fake-provider tests for arguments,
   environment, multiline records, filtering, nonzero exits, timeouts, reaping,
   queue overflow, malformed output, and missing executables.
-- Native history readers used by the simple and non-interactive picker must be
-  brought under the rich surface's existing byte and record bounds before an
-  external provider is added.
+- The prerequisite native-history work is implemented independently: rich,
+  simple, Reedline-picker, and non-interactive picker reads share explicit
+  scanned-byte, retained-byte, entry-count, and per-entry bounds. This does not
+  accept this ADR or implement an external provider.

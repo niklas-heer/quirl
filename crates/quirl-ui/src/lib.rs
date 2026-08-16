@@ -28,10 +28,10 @@ use quirl_syntax::{HighlightKind, Mode};
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
     Completer, CursorConfig, DefaultHinter, DefaultValidator, DescriptionMenu, DescriptionMode,
-    EditCommand, EditMode, Emacs, FileBackedHistory, Helix, Highlighter, IdeMenu, InputMode,
-    KeyCode, KeyModifiers, MenuBuilder, OutputMode, Prompt, PromptEditMode, PromptHistorySearch,
-    PromptViMode, Reedline, ReedlineEvent, ReedlineMenu, ReedlineRawEvent, Span, StyledText,
-    Suggestion, Vi,
+    EditCommand, EditMode, Emacs, FileBackedHistory, Helix, Highlighter, History, HistoryItem,
+    HistoryItemId, HistorySessionId, IdeMenu, InputMode, KeyCode, KeyModifiers, MenuBuilder,
+    OutputMode, Prompt, PromptEditMode, PromptHistorySearch, PromptViMode, Reedline, ReedlineEvent,
+    ReedlineMenu, ReedlineRawEvent, SearchQuery, Span, StyledText, Suggestion, Vi,
 };
 #[cfg(test)]
 use std::sync::mpsc;
@@ -40,8 +40,8 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
     ffi::OsString,
-    fs,
-    io::IsTerminal,
+    fs::{self, File, OpenOptions},
+    io::{self, IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
@@ -58,6 +58,16 @@ use unicode_width::UnicodeWidthStr;
 pub const MODE_TOGGLE_HOST_COMMAND: &str = "quirl:mode-toggle";
 
 const HISTORY_CAPACITY: usize = 50_000;
+const HISTORY_NEWLINE_ESCAPE: &str = "<\\n>";
+const MAX_HISTORY_ENTRY_BYTES: usize = 64 * 1024;
+const MAX_HISTORY_ENCODED_ENTRY_BYTES: usize = MAX_HISTORY_ENTRY_BYTES * 4;
+const MAX_HISTORY_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HISTORY_SCANNED_BYTES: usize = MAX_HISTORY_RETAINED_BYTES * 4 + HISTORY_CAPACITY;
+const _: () = assert!(
+    MAX_HISTORY_SCANNED_BYTES
+        >= MAX_HISTORY_RETAINED_BYTES * (MAX_HISTORY_ENCODED_ENTRY_BYTES / MAX_HISTORY_ENTRY_BYTES)
+            + HISTORY_CAPACITY
+);
 const COMPLETION_MENU: &str = "completion_menu";
 const HISTORY_PICKER_MENU: &str = "history_picker_menu";
 const FILE_PICKER_MENU: &str = "file_picker_menu";
@@ -65,6 +75,183 @@ const ACTION_PICKER_MENU: &str = "action_picker_menu";
 const HELP_MENU: &str = "catalog_help_menu";
 const PICKER_ITEMS_MAX: usize = 4_096;
 const PICKER_RESULTS_MAX: usize = 256;
+
+#[derive(Debug)]
+/// Reedline adapter that keeps all file ingestion behind Quirl's history limits.
+///
+/// The inner Reedline backend is memory-only because its file synchronization
+/// scans and materializes the complete file before enforcing an entry count.
+struct BoundedFileHistory {
+    inner: FileBackedHistory,
+    entries: VecDeque<String>,
+    pending: VecDeque<String>,
+    retained_bytes: usize,
+    path: PathBuf,
+}
+
+impl BoundedFileHistory {
+    fn with_file(path: PathBuf) -> Result<Self, ShellError> {
+        ensure_history_parent(&path).map_err(|error| history_access_error(&path, error))?;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&path)
+            .map_err(|error| history_access_error(&path, error))?;
+        let entries = read_history(&path)?.into_iter().collect::<VecDeque<_>>();
+        let retained_bytes = entries.iter().map(String::len).sum();
+        let inner = in_memory_history(&entries).map_err(|error| {
+            ShellError::new(ErrorCode::Io, "could not initialize bounded history")
+                .with_context(error.to_string())
+                .with_help("Set QUIRL_HISTORY to a readable and writable file path")
+        })?;
+        Ok(Self {
+            inner,
+            entries,
+            pending: VecDeque::new(),
+            retained_bytes,
+            path,
+        })
+    }
+
+    fn trim_and_rebuild(&mut self) -> reedline::Result<()> {
+        let mut trimmed = false;
+        while self.entries.len() > HISTORY_CAPACITY
+            || self.retained_bytes > MAX_HISTORY_RETAINED_BYTES
+        {
+            let Some(entry) = self.entries.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(entry.len());
+            trimmed = true;
+        }
+        while self.pending.len() > self.entries.len() {
+            self.pending.pop_front();
+        }
+        if trimmed {
+            self.inner = in_memory_history(&self.entries)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_from_disk(&mut self) -> io::Result<()> {
+        let history = read_history(&self.path).map_err(io::Error::other)?;
+        self.entries = history.into_iter().collect();
+        self.retained_bytes = self.entries.iter().map(String::len).sum();
+        self.inner = in_memory_history(&self.entries).map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    fn append_pending(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        ensure_history_parent(&self.path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        while let Some(entry) = self.pending.front() {
+            let mut encoded = entry.replace('\n', HISTORY_NEWLINE_ESCAPE);
+            debug_assert!(encoded.len() <= MAX_HISTORY_ENCODED_ENTRY_BYTES);
+            encoded.push('\n');
+            if let Err(error) = file.write_all(encoded.as_bytes()) {
+                // Terminate a possible partial record so a later retry cannot merge with it.
+                let _ = file.write_all(b"\n");
+                return Err(error);
+            }
+            self.pending.pop_front();
+        }
+        file.flush()
+    }
+}
+
+impl History for BoundedFileHistory {
+    fn save(&mut self, item: HistoryItem) -> reedline::Result<HistoryItem> {
+        if item.command_line.len() > MAX_HISTORY_ENTRY_BYTES {
+            return Ok(HistoryItem { id: None, ..item });
+        }
+        let saved = self.inner.save(item)?;
+        if saved.id.is_some() {
+            self.retained_bytes = self.retained_bytes.saturating_add(saved.command_line.len());
+            self.entries.push_back(saved.command_line.clone());
+            self.pending.push_back(saved.command_line.clone());
+            self.trim_and_rebuild()?;
+        }
+        Ok(saved)
+    }
+
+    fn load(&self, id: HistoryItemId) -> reedline::Result<HistoryItem> {
+        self.inner.load(id)
+    }
+
+    fn count(&self, query: SearchQuery) -> reedline::Result<i64> {
+        self.inner.count(query)
+    }
+
+    fn search(&self, query: SearchQuery) -> reedline::Result<Vec<HistoryItem>> {
+        self.inner.search(query)
+    }
+
+    fn update(
+        &mut self,
+        id: HistoryItemId,
+        updater: &dyn Fn(HistoryItem) -> HistoryItem,
+    ) -> reedline::Result<()> {
+        self.inner.update(id, updater)
+    }
+
+    fn clear(&mut self) -> reedline::Result<()> {
+        self.inner.clear()?;
+        self.entries.clear();
+        self.pending.clear();
+        self.retained_bytes = 0;
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(reedline::ReedlineError(
+                reedline::ReedlineErrorVariants::IOError(error),
+            )),
+        }
+    }
+
+    fn delete(&mut self, id: HistoryItemId) -> reedline::Result<()> {
+        self.inner.delete(id)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.append_pending()?;
+        self.refresh_from_disk()
+    }
+
+    fn session(&self) -> Option<HistorySessionId> {
+        self.inner.session()
+    }
+}
+
+impl Drop for BoundedFileHistory {
+    fn drop(&mut self) {
+        let _ = self.sync();
+    }
+}
+
+fn in_memory_history(entries: &VecDeque<String>) -> reedline::Result<FileBackedHistory> {
+    let mut history = FileBackedHistory::new(HISTORY_CAPACITY)?;
+    for entry in entries {
+        history.save(HistoryItem::from_command_line(entry))?;
+    }
+    Ok(history)
+}
+
+fn ensure_history_parent(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Semantic source category for an item passed to [`PickerRanker`].
@@ -256,7 +443,9 @@ pub fn editor_with_extensions_and_config(
 ///
 /// Reopening an editor with the same path reloads the prior entries. Callers that
 /// rebuild the editor while it is live should call [`Reedline::sync_history`] first
-/// so the replacement observes the newest commands.
+/// so the replacement observes the newest commands. Reads scan at most about
+/// 32 MiB and retain at most 50,000 entries or 8 MiB; malformed and entries over
+/// 64 KiB are ignored without making the terminal session unusable.
 pub fn editor_with_extensions_config_and_history(
     catalog: Catalog,
     extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
@@ -274,10 +463,12 @@ pub fn editor_with_extensions_config_and_history(
 
 /// Create a configured durable-history editor with an injected picker ranker.
 ///
-/// Reedline retains at most 50,000 history entries; picker materialization later
-/// caps candidates at 4,096 and results at 256. Returns [`ErrorCode::Io`] when
-/// the history backend cannot open `history_path`. Callers rebuilding a live
-/// editor should synchronize the old backend before replacement.
+/// Reedline retains at most 50,000 history entries or 8 MiB after scanning a
+/// roughly 32 MiB tail; each decoded entry is capped at 64 KiB. Picker
+/// materialization later caps candidates at 4,096 and results at 256. Returns
+/// [`ErrorCode::Io`] when the history backend cannot open or read `history_path`.
+/// Callers rebuilding a live editor should synchronize the old backend before
+/// replacement.
 pub fn editor_with_extensions_config_history_and_picker(
     catalog: Catalog,
     extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
@@ -286,17 +477,8 @@ pub fn editor_with_extensions_config_history_and_picker(
     picker_ranker: Arc<dyn PickerRanker>,
 ) -> Result<Reedline, ShellError> {
     Theme::from_config(&config, true)?;
-    let history =
-        FileBackedHistory::with_file(HISTORY_CAPACITY, history_path.clone()).map_err(|error| {
-            ShellError::new(
-                quirl_core::ErrorCode::Io,
-                format!("could not open history at {}", history_path.display()),
-            )
-            .with_context(error.to_string())
-            .with_help("Set QUIRL_HISTORY to a writable file path")
-        })?;
-    let history_items =
-        history_picker_items(&fs::read_to_string(&history_path).unwrap_or_default());
+    let mut history = BoundedFileHistory::with_file(history_path.clone())?;
+    let history_items = history_picker_items(history.entries.make_contiguous());
     Ok(configured_editor(
         catalog,
         extension_completer,
@@ -312,7 +494,7 @@ fn configured_editor(
     catalog: Catalog,
     extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
     config: QuirlConfig,
-    history: Option<FileBackedHistory>,
+    history: Option<BoundedFileHistory>,
     history_items: Vec<PickerItem>,
     history_path: Option<PathBuf>,
     picker_ranker: Arc<dyn PickerRanker>,
@@ -1801,7 +1983,7 @@ impl CatalogCompleter {
             .as_ref()
             .is_some_and(|cache| cache.len == len && cache.modified == modified);
         if !hit {
-            let items = read_history_picker_items(path)?;
+            let items = read_history_picker_items(path).ok()?;
             self.history_cache = Some(HistoryPickerCache {
                 len,
                 modified,
@@ -2372,21 +2554,138 @@ fn rank_picker_suggestions_of_kind(
     rank_picker_suggestions(ranker, &scoped, query, replace_start, replace_end)
 }
 
-fn read_history_picker_items(path: &Path) -> Option<Vec<PickerItem>> {
-    let source = fs::read_to_string(path).ok()?;
-    Some(history_picker_items(&source))
+fn read_history_picker_items(path: &Path) -> Result<Vec<PickerItem>, ShellError> {
+    read_history(path).map(|history| history_picker_items(&history))
 }
 
-fn history_picker_items(source: &str) -> Vec<PickerItem> {
+fn history_picker_items(history: &[String]) -> Vec<PickerItem> {
     let mut seen = HashSet::new();
-    source
-        .lines()
+    history
+        .iter()
         .rev()
         .take(PICKER_ITEMS_MAX)
-        .filter(|line| seen.insert((*line).to_owned()))
+        .filter(|entry| seen.insert((*entry).clone()))
         .enumerate()
-        .map(|(index, line)| picker_item(index, PickerItemKind::History, line, "history"))
+        .map(|(index, entry)| PickerItem {
+            id: format!("History-{index}"),
+            kind: PickerItemKind::History,
+            label: escape_terminal_line(entry),
+            description: "history".to_owned(),
+            preview: None,
+            value: entry.clone(),
+        })
         .collect()
+}
+
+#[derive(Clone, Copy)]
+struct HistoryReadLimits {
+    scanned_bytes_max: usize,
+    retained_bytes_max: usize,
+    entry_count_max: usize,
+    encoded_entry_bytes_max: usize,
+    entry_bytes_max: usize,
+}
+
+const HISTORY_READ_LIMITS: HistoryReadLimits = HistoryReadLimits {
+    scanned_bytes_max: MAX_HISTORY_SCANNED_BYTES,
+    retained_bytes_max: MAX_HISTORY_RETAINED_BYTES,
+    entry_count_max: HISTORY_CAPACITY,
+    encoded_entry_bytes_max: MAX_HISTORY_ENCODED_ENTRY_BYTES,
+    entry_bytes_max: MAX_HISTORY_ENTRY_BYTES,
+};
+
+fn read_history(path: &Path) -> Result<Vec<String>, ShellError> {
+    read_history_with_limits(path, HISTORY_READ_LIMITS)
+}
+
+fn read_history_with_limits(
+    path: &Path,
+    limits: HistoryReadLimits,
+) -> Result<Vec<String>, ShellError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(history_read_error(path, error)),
+    };
+    let file_len = file
+        .metadata()
+        .map_err(|error| history_read_error(path, error))?
+        .len();
+    read_history_file(&mut file, file_len, path, limits)
+}
+
+fn read_history_file(
+    file: &mut File,
+    file_len: u64,
+    path: &Path,
+    limits: HistoryReadLimits,
+) -> Result<Vec<String>, ShellError> {
+    let scanned_bytes_max = u64::try_from(limits.scanned_bytes_max).unwrap_or(u64::MAX);
+    let start = file_len.saturating_sub(scanned_bytes_max);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| history_read_error(path, error))?;
+
+    // Use the length observed before reading so concurrent appends cannot extend this scan.
+    let scanned_bytes = file_len.saturating_sub(start);
+    let capacity = usize::try_from(scanned_bytes)
+        .unwrap_or(limits.scanned_bytes_max)
+        .min(limits.scanned_bytes_max);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(scanned_bytes)
+        .read_to_end(&mut bytes)
+        .map_err(|error| history_read_error(path, error))?;
+
+    let bytes = if start == 0 {
+        bytes.as_slice()
+    } else if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
+        &bytes[newline.saturating_add(1)..]
+    } else {
+        return Ok(Vec::new());
+    };
+    Ok(parse_history_tail(bytes, limits))
+}
+
+fn parse_history_tail(bytes: &[u8], limits: HistoryReadLimits) -> Vec<String> {
+    let mut retained_bytes = 0_usize;
+    let mut history = Vec::new();
+    for line in bytes.rsplit(|byte| *byte == b'\n') {
+        if line.is_empty() || line.len() > limits.encoded_entry_bytes_max {
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let entry = line.replace(HISTORY_NEWLINE_ESCAPE, "\n");
+        if entry.len() > limits.entry_bytes_max {
+            continue;
+        }
+        let next_bytes = retained_bytes.saturating_add(entry.len());
+        if history.len() == limits.entry_count_max || next_bytes > limits.retained_bytes_max {
+            break;
+        }
+        retained_bytes = next_bytes;
+        history.push(entry);
+    }
+    history.reverse();
+    history
+}
+
+fn history_read_error(path: &Path, error: io::Error) -> ShellError {
+    ShellError::new(
+        ErrorCode::Io,
+        format!("could not read history at {}", path.display()),
+    )
+    .with_context(error.to_string())
+    .with_help("Set QUIRL_HISTORY to a readable file path")
+}
+
+fn history_access_error(path: &Path, error: io::Error) -> ShellError {
+    ShellError::new(
+        ErrorCode::Io,
+        format!("could not access history at {}", path.display()),
+    )
+    .with_context(error.to_string())
+    .with_help("Set QUIRL_HISTORY to a readable and writable file path")
 }
 
 fn picker_sources(catalog: &Catalog, mut items: Vec<PickerItem>) -> Vec<PickerItem> {
@@ -2436,6 +2735,7 @@ fn picker_sources(catalog: &Catalog, mut items: Vec<PickerItem>) -> Vec<PickerIt
     items
 }
 
+#[cfg(test)]
 fn picker_item(index: usize, kind: PickerItemKind, value: &str, description: &str) -> PickerItem {
     PickerItem {
         id: format!("{kind:?}-{index}"),
@@ -3911,7 +4211,12 @@ mod tests {
 
     #[test]
     fn history_picker_keeps_only_the_most_recent_copy_of_each_command() {
-        let items = history_picker_items("cargo test\ncargo clippy\ncargo test\n");
+        let history = [
+            "cargo test".to_owned(),
+            "cargo clippy".to_owned(),
+            "cargo test".to_owned(),
+        ];
+        let items = history_picker_items(&history);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].value, "cargo test");
         assert_eq!(items[1].value, "cargo clippy");
@@ -3932,6 +4237,226 @@ mod tests {
         let suggestions = completer.complete("cargo", 5);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].value, "cargo test");
+    }
+
+    fn test_history_limits() -> HistoryReadLimits {
+        HistoryReadLimits {
+            scanned_bytes_max: 16,
+            retained_bytes_max: 16,
+            entry_count_max: 4,
+            encoded_entry_bytes_max: 8,
+            entry_bytes_max: 8,
+        }
+    }
+
+    fn test_history_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("quirl-ui-{label}-{}-{unique}", std::process::id()))
+    }
+
+    #[test]
+    fn bounded_history_reader_preserves_order_and_multiline_encoding() {
+        let limits = HistoryReadLimits {
+            scanned_bytes_max: 128,
+            retained_bytes_max: 128,
+            entry_count_max: 8,
+            encoded_entry_bytes_max: 64,
+            entry_bytes_max: 64,
+        };
+        let history = parse_history_tail(b"first\nprintf one<\\n>printf two\nlast\n", limits);
+
+        assert_eq!(history, vec!["first", "printf one\nprintf two", "last"]);
+        let items = history_picker_items(&history);
+        assert_eq!(items[0].value, "last");
+        assert_eq!(items[1].value, "printf one\nprintf two");
+        assert_eq!(items[1].label, "printf one\\nprintf two");
+        assert_eq!(items[2].value, "first");
+    }
+
+    #[test]
+    fn bounded_history_reader_drops_truncated_first_entry() {
+        let path = test_history_path("truncated-history");
+        fs::write(&path, b"oldest\nmiddle\nnewest\n").unwrap();
+
+        let history = read_history_with_limits(&path, test_history_limits()).unwrap();
+
+        assert_eq!(history, vec!["middle", "newest"]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_history_reader_skips_malformed_and_oversized_entries() {
+        let limits = HistoryReadLimits {
+            scanned_bytes_max: 64,
+            retained_bytes_max: 64,
+            entry_count_max: 8,
+            encoded_entry_bytes_max: 5,
+            entry_bytes_max: 5,
+        };
+        let history = parse_history_tail(b"good\n\xff\xfe\n123456\nlast\n", limits);
+
+        assert_eq!(history, vec!["good", "last"]);
+    }
+
+    #[test]
+    fn bounded_history_reader_enforces_count_and_retained_byte_limits() {
+        let count_limits = HistoryReadLimits {
+            entry_count_max: 2,
+            ..test_history_limits()
+        };
+        assert_eq!(
+            parse_history_tail(b"aa\nbb\ncc\ndd\n", count_limits),
+            vec!["cc", "dd"]
+        );
+
+        let byte_limits = HistoryReadLimits {
+            retained_bytes_max: 3,
+            ..test_history_limits()
+        };
+        assert_eq!(
+            parse_history_tail(b"aa\nbb\ncc\ndd\n", byte_limits),
+            vec!["dd"]
+        );
+    }
+
+    #[test]
+    fn bounded_history_reader_treats_a_missing_file_as_empty() {
+        let path = test_history_path("missing-history");
+        assert_eq!(
+            read_history_with_limits(&path, test_history_limits()).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn bounded_history_reader_excludes_growth_after_metadata() {
+        let path = test_history_path("growing-history");
+        fs::write(&path, b"first\n").unwrap();
+        let mut reader = File::open(&path).unwrap();
+        let observed_len = reader.metadata().unwrap().len();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"second\n")
+            .unwrap();
+
+        let history =
+            read_history_file(&mut reader, observed_len, &path, test_history_limits()).unwrap();
+
+        assert_eq!(history, vec!["first"]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_history_reader_reports_permission_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = test_history_path("permission-history");
+        fs::write(&path, b"private\n").unwrap();
+        let original = fs::metadata(&path).unwrap().permissions();
+        let mut denied = original.clone();
+        denied.set_mode(0o0);
+        fs::set_permissions(&path, denied).unwrap();
+        let result = read_history_with_limits(&path, test_history_limits());
+        fs::set_permissions(&path, original).unwrap();
+        fs::remove_file(path).unwrap();
+
+        let error = result.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Io);
+        assert!(error.message.contains("could not read history"));
+        assert!(!error.details.context.is_empty());
+    }
+
+    #[test]
+    fn reedline_history_uses_the_bounded_reader_and_does_not_retain_oversized_saves() {
+        let path = test_history_path("reedline-bounded-history");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&vec![b'x'; MAX_HISTORY_ENCODED_ENTRY_BYTES + 1])
+            .unwrap();
+        file.write_all(b"\nsafe tail\n").unwrap();
+        drop(file);
+
+        let mut history = BoundedFileHistory::with_file(path.clone()).unwrap();
+        assert_eq!(history.count_all().unwrap(), 1);
+        let oversized = history
+            .save(HistoryItem::from_command_line(
+                "x".repeat(MAX_HISTORY_ENTRY_BYTES + 1),
+            ))
+            .unwrap();
+        assert!(oversized.id.is_none());
+        assert_eq!(history.count_all().unwrap(), 1);
+        history
+            .save(HistoryItem::from_command_line("echo durable"))
+            .unwrap();
+        history.sync().unwrap();
+        drop(history);
+
+        let reopened = BoundedFileHistory::with_file(path.clone()).unwrap();
+        assert_eq!(reopened.count_all().unwrap(), 2);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reedline_history_sync_merges_concurrent_appends_without_an_unbounded_scan() {
+        let path = test_history_path("reedline-concurrent-history");
+        fs::write(&path, b"first\n").unwrap();
+        let mut history = BoundedFileHistory::with_file(path.clone()).unwrap();
+        history
+            .save(HistoryItem::from_command_line("local"))
+            .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"external\n")
+            .unwrap();
+
+        history.sync().unwrap();
+
+        let entries = history
+            .search(SearchQuery::everything(
+                reedline::SearchDirection::Forward,
+                None,
+            ))
+            .unwrap()
+            .into_iter()
+            .map(|item| item.command_line)
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec!["first", "external", "local"]);
+        drop(history);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reedline_history_sync_failure_keeps_pending_data_for_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = test_history_path("reedline-retry-history");
+        fs::write(&path, b"first\n").unwrap();
+        let mut history = BoundedFileHistory::with_file(path.clone()).unwrap();
+        history
+            .save(HistoryItem::from_command_line("retry me"))
+            .unwrap();
+        let original = fs::metadata(&path).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(0o400);
+        fs::set_permissions(&path, read_only).unwrap();
+
+        let first_sync = history.sync();
+
+        fs::set_permissions(&path, original).unwrap();
+        assert!(first_sync.is_err());
+        assert_eq!(history.pending, VecDeque::from(["retry me".to_owned()]));
+        history.sync().unwrap();
+        assert!(history.pending.is_empty());
+        drop(history);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
