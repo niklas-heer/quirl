@@ -127,9 +127,10 @@ impl DataValue {
             Self::Bool(value) => Value::Bool(*value),
             Self::Int(value) => Value::from(*value),
             Self::UInt(value) => Value::from(*value),
-            Self::Decimal(value) => {
-                serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.clone()))
-            }
+            // Accept only numeric re-parses so a hand-built `Decimal` holding
+            // `null`, `true`, or structured JSON cannot change kind here.
+            Self::Decimal(value) => serde_json::from_str::<serde_json::Number>(value)
+                .map_or_else(|_| Value::String(value.clone()), Value::Number),
             Self::String(value)
             | Self::Path(value)
             | Self::DateTime(value)

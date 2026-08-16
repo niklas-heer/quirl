@@ -354,6 +354,25 @@ fn read_source_package(source: &str) -> Result<SourcePackage, ShellError> {
     })
 }
 
+/// Builds the restricted runtime for a trusted-Lua plugin. This is the single
+/// place that maps `process.spawn` grants onto `LuaPolicy::allow_process`, so
+/// activation and validation cannot drift apart.
+pub(crate) fn trusted_lua_runtime(grants: &[String]) -> Result<LuaRuntime, ShellError> {
+    let mut policy = LuaPolicy::config();
+    policy.allow_process = grants
+        .iter()
+        .any(|grant| grant == "process.spawn" || grant.starts_with("process.spawn:"));
+    if policy.allow_process {
+        LuaRuntime::new_with_capabilities_and_process_host(
+            policy,
+            grants,
+            Some(sandboxed_process_host()),
+        )
+    } else {
+        LuaRuntime::new_with_capabilities(policy, grants)
+    }
+}
+
 fn validate_runtime(
     manifest: &PluginManifest,
     entry_path: &Path,
@@ -390,19 +409,7 @@ fn validate_runtime(
         PluginRuntime::TrustedLua => {}
     }
     LuaRuntime::check_file(entry_path)?;
-    let mut policy = LuaPolicy::config();
-    policy.allow_process = grants
-        .iter()
-        .any(|grant| grant == "process.spawn" || grant.starts_with("process.spawn:"));
-    let runtime = if policy.allow_process {
-        LuaRuntime::new_with_capabilities_and_process_host(
-            policy,
-            grants,
-            Some(sandboxed_process_host()),
-        )?
-    } else {
-        LuaRuntime::new_with_capabilities(policy, grants)?
-    };
+    let runtime = trusted_lua_runtime(grants)?;
     let registrations = runtime.load_plugin_file(entry_path)?;
     let registered_commands = registrations
         .commands

@@ -581,7 +581,7 @@ impl CandidateInstallFailure {
 /// proxy support, or ambient network binding: the capability is the unguessable
 /// URL token printed to the invoking terminal.
 fn web(file: &Path, port: u16) -> Result<i32, ShellError> {
-    let source = fs::read_to_string(file).map_err(|error| file_error("read", file, error))?;
+    let source = read_config_source(file)?;
     let config = load(file)?;
     let listener =
         TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).map_err(|error| {
@@ -753,7 +753,7 @@ fn is_urlencoded_form_content_type(value: &str) -> bool {
 }
 
 fn refresh_session(file: &Path, session: &mut WebSession) -> Result<(), ShellError> {
-    let source = fs::read_to_string(file).map_err(|error| file_error("read", file, error))?;
+    let source = read_config_source(file)?;
     let config = load(file)?;
     session.source = source;
     session.config = config;
@@ -1607,9 +1607,7 @@ fn patch_literal(
             &tokens[*value].kind,
             TokenKind::Identifier(value) if value == "true" || value == "false"
         ),
-        ConfigField::PromptLeft | ConfigField::PromptRight => {
-            literal_string_array_end(&tokens, *value).is_some()
-        }
+        ConfigField::PromptLeft | ConfigField::PromptRight => literal_end_index.is_some(),
     } && literal_end_index
         .is_some_and(|index| literal_value_ends(&tokens, index));
     if !expected_literal {

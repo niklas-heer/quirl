@@ -194,12 +194,6 @@ impl McpServer {
         }
         let params: InitializeParams = parse_params(params)?;
         let _ = (&params.capabilities, &params.client_info);
-        if !LEGACY_PROTOCOL_VERSIONS.contains(&params.protocol_version.as_str()) {
-            return Err(RpcError::new(
-                -32602,
-                "unsupported legacy MCP protocol version",
-            ));
-        }
         let version = LEGACY_PROTOCOL_VERSIONS
             .iter()
             .copied()
@@ -443,7 +437,6 @@ impl RpcError {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
 struct Response {
     jsonrpc: &'static str,
     id: Value,
@@ -456,7 +449,6 @@ struct Response {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(deny_unknown_fields)]
 struct RpcErrorBody {
     code: i32,
     message: String,

@@ -8,7 +8,6 @@ use quirl_plugin::{
     doctor_plugin, normalize_plugin_commands, parse_plugin_manifest, validate_plugin_manifest,
     LockedPlugin, PluginLockfile, PluginRuntime, PLUGIN_LOCK_FILE,
 };
-use quirl_process::sandboxed_process_host;
 use quirl_syntax::Mode;
 use quirl_ui::{ExtensionCompleter, ExtensionSuggestion, PanelModel};
 use serde::Deserialize;
@@ -612,20 +611,7 @@ impl LuaExtensionHost {
         for plugin in &snapshot.plugins {
             managed_commands.extend(plugin.catalog_commands.clone());
             if plugin.runtime == PluginRuntime::TrustedLua {
-                let mut policy = LuaPolicy::config();
-                policy.allow_process = plugin
-                    .grants
-                    .iter()
-                    .any(|grant| grant == "process.spawn" || grant.starts_with("process.spawn:"));
-                let runtime = if policy.allow_process {
-                    LuaRuntime::new_with_capabilities_and_process_host(
-                        policy,
-                        &plugin.grants,
-                        Some(sandboxed_process_host()),
-                    )?
-                } else {
-                    LuaRuntime::new_with_capabilities(policy, &plugin.grants)?
-                };
+                let runtime = crate::plugin::trusted_lua_runtime(&plugin.grants)?;
                 let registrations = runtime.load_plugin_file(&plugin.path)?;
                 contributions.extend(registrations.contributions);
                 plugin_runtimes.push(runtime);

@@ -118,9 +118,7 @@ impl Entry {
     /// JSON callers retain the original filename (where serde_json escapes
     /// controls correctly); human renderers must use this representation.
     pub fn display_name(&self) -> String {
-        crate::escape_terminal_controls(&self.name)
-            .replace('\n', "\\n")
-            .replace('\t', "\\t")
+        crate::escape_terminal_line(&self.name)
     }
 }
 
@@ -278,7 +276,8 @@ impl CommandRunner {
                     options.sort = parse_directory_sort(value, words)?;
                 }
                 value if value.starts_with("--sort=") => {
-                    options.sort = parse_directory_sort(&value[7..], words)?;
+                    let sort = value.strip_prefix("--sort=").unwrap_or_default();
+                    options.sort = parse_directory_sort(sort, words)?;
                 }
                 "--max-entries" => {
                     index += 1;
@@ -293,7 +292,8 @@ impl CommandRunner {
                     options.max_entries = parse_max_entries(value, words)?;
                 }
                 value if value.starts_with("--max-entries=") => {
-                    options.max_entries = parse_max_entries(&value[14..], words)?;
+                    let limit = value.strip_prefix("--max-entries=").unwrap_or_default();
+                    options.max_entries = parse_max_entries(limit, words)?;
                 }
                 "--format" => {
                     index += 1;
@@ -305,7 +305,8 @@ impl CommandRunner {
                     json = parse_ls_format(value, words)?;
                 }
                 value if value.starts_with("--format=") => {
-                    json = parse_ls_format(&value[9..], words)?;
+                    let format = value.strip_prefix("--format=").unwrap_or_default();
+                    json = parse_ls_format(format, words)?;
                 }
                 short if short.starts_with('-') && !short.starts_with("--") => {
                     for flag in short[1..].chars() {

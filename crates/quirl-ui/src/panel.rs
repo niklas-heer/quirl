@@ -1,6 +1,4 @@
-use quirl_core::{
-    escape_terminal_controls, reject_terminal_controls, Entry, ErrorCode, ShellError,
-};
+use quirl_core::{escape_terminal_line, reject_terminal_controls, Entry, ErrorCode, ShellError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -115,9 +113,7 @@ pub fn directory_panel(path: &str, entries: &[Entry]) -> Result<PanelModel, Shel
 }
 
 fn panel_line(value: &str) -> String {
-    escape_terminal_controls(value)
-        .replace('\n', "\\n")
-        .replace('\t', "\\t")
+    escape_terminal_line(value)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -352,6 +352,14 @@ pub fn escape_terminal_controls(value: &str) -> String {
     rendered
 }
 
+/// Render `value` as terminal-safe single-line text. Control bytes are
+/// escaped, and newlines and tabs become visible escape sequences.
+pub fn escape_terminal_line(value: &str) -> String {
+    escape_terminal_controls(value)
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+}
+
 /// Escape terminal controls in an already serialized JSON document while
 /// preserving its parsed value. Pretty-printing whitespace remains intact.
 pub fn escape_json_terminal_controls(serialized: &str) -> String {
