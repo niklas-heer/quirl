@@ -8,7 +8,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     thread,
@@ -251,7 +251,7 @@ fn format(file: &Path, check: bool) -> Result<i32, ShellError> {
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
-        result?;
+        result.map_err(CandidateInstallFailure::into_shell_error)?;
     }
     let rendered_path = escape_terminal_controls(&file.display().to_string());
     if check && changed {
@@ -322,8 +322,10 @@ fn migrate(file: &Path, dry_run: bool, format: ConfigOutputFormat) -> Result<i32
         .with_help("Pass `--dry-run`; Quirl 0.1.0 never rewrites configuration during migration"));
     }
     let source = read_config_source(file)?;
-    load(file)?;
     let (source_schema_version, candidate) = migration_candidate(&source)?;
+    // Inspect the declared version before evaluating it so a configuration from
+    // a newer Quirl never gets described as an already-current schema.
+    load(file)?;
     let report = ConfigMigrationReport {
         document_type: "quirl.config.migration",
         schema_version: 1,
@@ -466,6 +468,17 @@ fn migration_candidate(source: &str) -> Result<(Option<u32>, String), ShellError
     let version = tail[..digits].parse::<u32>().map_err(|_| {
         patch_error("schema_version must be an integer literal for migration preview")
     })?;
+    if version > CONFIG_SCHEMA_VERSION {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "configuration schema_version {version} is newer than this Quirl supports"
+            ),
+        )
+        .with_help(
+            "Use a Quirl version that supports this configuration before requesting a migration preview",
+        ));
+    }
     Ok((Some(version), source.to_owned()))
 }
 
@@ -513,6 +526,55 @@ struct HttpRequest {
 struct HttpResponse {
     status: u16,
     body: String,
+}
+
+/// Classifies the two expected failures from an interactive save without
+/// deriving an HTTP status from user-facing diagnostic text.
+#[derive(Debug)]
+enum WebFormFailure {
+    Conflict(ShellError),
+    Invalid(ShellError),
+}
+
+impl From<ShellError> for WebFormFailure {
+    fn from(error: ShellError) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+impl WebFormFailure {
+    fn error(&self) -> &ShellError {
+        match self {
+            Self::Conflict(error) | Self::Invalid(error) => error,
+        }
+    }
+
+    fn status(&self) -> u16 {
+        match self {
+            Self::Conflict(_) => 409,
+            Self::Invalid(_) => 422,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CandidateInstallFailure {
+    Conflict(ShellError),
+    Other(ShellError),
+}
+
+impl From<ShellError> for CandidateInstallFailure {
+    fn from(error: ShellError) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl CandidateInstallFailure {
+    fn into_shell_error(self) -> ShellError {
+        match self {
+            Self::Conflict(error) | Self::Other(error) => error,
+        }
+    }
 }
 
 /// Starts a deliberately small local-only server. It has no assets, cookies,
@@ -578,8 +640,14 @@ fn serve_web(
                     Ok(request) => handle_web_request(file, session, request),
                     Err(error) => HttpResponse::error(400, &error.message),
                 };
-                write_http_response(&mut stream, &response)?;
-                deadline = Instant::now() + WEB_IDLE_TIMEOUT;
+                match write_http_response(&mut stream, &response) {
+                    Ok(()) => deadline = Instant::now() + WEB_IDLE_TIMEOUT,
+                    // Browsers are free to abandon a navigation while the form
+                    // response is being produced. That peer-local failure must
+                    // not terminate the loopback server for every other tab.
+                    Err(error) if client_disconnected(&error) => continue,
+                    Err(error) => return Err(web_response_error(error)),
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25));
@@ -626,7 +694,7 @@ fn handle_web_request(file: &Path, session: &mut WebSession, request: HttpReques
             if !request
                 .headers
                 .get("content-type")
-                .is_some_and(|value| value.starts_with("application/x-www-form-urlencoded"))
+                .is_some_and(|value| is_urlencoded_form_content_type(value))
             {
                 return HttpResponse::error(
                     415,
@@ -653,16 +721,10 @@ fn handle_web_request(file: &Path, session: &mut WebSession, request: HttpReques
             }
             match apply_web_form(file, session, &form) {
                 Ok(message) => HttpResponse::page(200, render_form(session, Some(&message))),
-                Err(error) => {
-                    let status = if error.message.contains("changed after")
-                        || error.message.contains("changed concurrently")
-                    {
-                        409
-                    } else {
-                        422
-                    };
-                    HttpResponse::page(status, render_form(session, Some(&error.message)))
-                }
+                Err(error) => HttpResponse::page(
+                    error.status(),
+                    render_form(session, Some(&error.error().message)),
+                ),
             }
         }
         _ => HttpResponse::error(405, "Only GET and POST are supported"),
@@ -673,14 +735,21 @@ fn loopback_authority(authority: &str) -> bool {
     authority == "127.0.0.1"
         || authority
             .strip_prefix("127.0.0.1:")
-            .is_some_and(|port| !port.is_empty() && port.parse::<u16>().is_ok())
+            .is_some_and(|port| port.parse::<u16>().is_ok_and(|port| port != 0))
 }
 
 fn loopback_origin(origin: &str) -> bool {
     origin
         .strip_prefix("http://")
-        .and_then(|value| value.split('/').next())
         .is_some_and(loopback_authority)
+}
+
+fn is_urlencoded_form_content_type(value: &str) -> bool {
+    value
+        .split_once(';')
+        .map_or(value, |(media_type, _)| media_type)
+        .trim()
+        .eq_ignore_ascii_case("application/x-www-form-urlencoded")
 }
 
 fn refresh_session(file: &Path, session: &mut WebSession) -> Result<(), ShellError> {
@@ -695,7 +764,7 @@ fn apply_web_form(
     file: &Path,
     session: &mut WebSession,
     form: &BTreeMap<String, String>,
-) -> Result<String, ShellError> {
+) -> Result<String, WebFormFailure> {
     let mut replacements = Vec::new();
     collect_web_change(
         &mut replacements,
@@ -744,12 +813,14 @@ fn apply_web_form(
     };
     for (field, _) in &replacements {
         if field.value(&current_config) != field.value(&session.config) {
-            return Err(ShellError::new(
-                ErrorCode::Validation,
-                format!("configuration field changed concurrently: {}", field.key()),
-            )
-            .with_help(
-                "Reload the configuration form, review the external value, and submit again",
+            return Err(WebFormFailure::Conflict(
+                ShellError::new(
+                    ErrorCode::Validation,
+                    format!("configuration field changed concurrently: {}", field.key()),
+                )
+                .with_help(
+                    "Reload the configuration form, review the external value, and submit again",
+                ),
             ));
         }
     }
@@ -759,7 +830,13 @@ fn apply_web_form(
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result?;
+    match result {
+        Ok(()) => {}
+        Err(CandidateInstallFailure::Conflict(error)) => {
+            return Err(WebFormFailure::Conflict(error));
+        }
+        Err(CandidateInstallFailure::Other(error)) => return Err(WebFormFailure::Invalid(error)),
+    }
     session.source = candidate;
     session.config = load(file)?;
     Ok(format!(
@@ -911,23 +988,20 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, ShellError> 
                 .with_help("Reload the local form; Quirl closes requests that cannot be bounded")
         })?;
     let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 2048];
     let header_end = loop {
-        if bytes.len() > WEB_MAX_REQUEST_BYTES {
+        if bytes.len() == WEB_MAX_REQUEST_BYTES {
             return Err(request_error("request is too large"));
         }
-        match stream.read(&mut buffer) {
-            Ok(0) => return Err(request_error("request ended before its headers")),
-            Ok(count) => {
-                bytes.extend_from_slice(&buffer[..count]);
-                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-                    if end > WEB_MAX_HEADER_BYTES {
-                        return Err(request_error("request headers are too large"));
-                    }
-                    break end + 4;
-                }
+        let count = read_http_bytes(stream, &mut bytes, WEB_MAX_REQUEST_BYTES)
+            .map_err(|error| request_error(&format!("could not read request: {error}")))?;
+        if count == 0 {
+            return Err(request_error("request ended before its headers"));
+        }
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            if end > WEB_MAX_HEADER_BYTES {
+                return Err(request_error("request headers are too large"));
             }
-            Err(error) => return Err(request_error(&format!("could not read request: {error}"))),
+            break end + 4;
         }
     };
     let head = std::str::from_utf8(&bytes[..header_end])
@@ -942,14 +1016,18 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, ShellError> 
     if !request_size_is_allowed(header_end, content_length) {
         return Err(request_error("request body is too large"));
     }
-    while bytes.len() < header_end + content_length {
-        let count = stream
-            .read(&mut buffer)
+    let body_end = header_end + content_length;
+    if bytes.len() > body_end {
+        return Err(request_error(
+            "request contains bytes past its declared body",
+        ));
+    }
+    while bytes.len() < body_end {
+        let count = read_http_bytes(stream, &mut bytes, body_end)
             .map_err(|error| request_error(&format!("could not read request body: {error}")))?;
         if count == 0 {
             return Err(request_error("request ended before its body"));
         }
-        bytes.extend_from_slice(&buffer[..count]);
     }
     let body = std::str::from_utf8(&bytes[header_end..header_end + content_length])
         .map_err(|_| request_error("request body must be UTF-8"))?
@@ -967,6 +1045,17 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, ShellError> 
         headers,
         body,
     })
+}
+
+/// Append at most `limit` total bytes. Passing a shortened mutable slice to
+/// `read` matters: TCP may have more bytes queued than the declared body.
+fn read_http_bytes(stream: &mut TcpStream, bytes: &mut Vec<u8>, limit: usize) -> io::Result<usize> {
+    let remaining = limit.saturating_sub(bytes.len());
+    let mut buffer = [0_u8; 2048];
+    let buffer_limit = remaining.min(buffer.len());
+    let count = stream.read(&mut buffer[..buffer_limit])?;
+    bytes.extend_from_slice(&buffer[..count]);
+    Ok(count)
 }
 
 fn request_size_is_allowed(header_end: usize, content_length: usize) -> bool {
@@ -1026,7 +1115,7 @@ fn parse_http_head(head: &str) -> Result<(String, &str, BTreeMap<String, String>
     Ok((method.to_owned(), target, headers))
 }
 
-fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> Result<(), ShellError> {
+fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> io::Result<()> {
     let reason = match response.status {
         200 => "OK",
         400 => "Bad Request",
@@ -1045,11 +1134,22 @@ fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> Resul
     stream
         .write_all(header.as_bytes())
         .and_then(|()| stream.write_all(response.body.as_bytes()))
-        .map_err(|error| {
-            ShellError::new(ErrorCode::Io, "could not respond to a local web request")
-                .with_context(error.to_string())
-                .with_help("Reload the private loopback URL and submit the form again")
-        })
+}
+
+fn client_disconnected(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+    )
+}
+
+fn web_response_error(error: io::Error) -> ShellError {
+    ShellError::new(ErrorCode::Io, "could not respond to a local web request")
+        .with_context(error.to_string())
+        .with_help("Reload the private loopback URL and submit the form again")
 }
 
 fn parse_form(input: &str) -> Result<BTreeMap<String, String>, ShellError> {
@@ -1188,7 +1288,7 @@ fn set(file: &Path, key: &str, value: &str) -> Result<i32, ShellError> {
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result?;
+    result.map_err(CandidateInstallFailure::into_shell_error)?;
     println!(
         "updated {key} in {} (backup: {})",
         escape_terminal_controls(&file.display().to_string()),
@@ -1205,44 +1305,54 @@ fn install_candidate(
     temporary: &Path,
     candidate: &str,
     expected_source: &str,
-) -> Result<(), ShellError> {
+) -> Result<(), CandidateInstallFailure> {
     let mut output = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(temporary)
-        .map_err(|error| file_error("create candidate for", file, error))?;
+        .map_err(|error| {
+            CandidateInstallFailure::from(file_error("create candidate for", file, error))
+        })?;
     output
         .write_all(candidate.as_bytes())
         .and_then(|()| output.sync_all())
-        .map_err(|error| file_error("write candidate for", file, error))?;
+        .map_err(|error| {
+            CandidateInstallFailure::from(file_error("write candidate for", file, error))
+        })?;
 
     // Candidate evaluation happens before either the source or its backup changes.
-    LuaRuntime::new(LuaPolicy::config())?.load_config_file(temporary)?;
+    LuaRuntime::new(LuaPolicy::config())
+        .map_err(CandidateInstallFailure::from)?
+        .load_config_file(temporary)
+        .map_err(CandidateInstallFailure::from)?;
 
-    let current = fs::read_to_string(file).map_err(|error| file_error("re-read", file, error))?;
+    let current = fs::read_to_string(file)
+        .map_err(|error| CandidateInstallFailure::from(file_error("re-read", file, error)))?;
     if current != expected_source {
-        return Err(conflict_error());
+        return Err(CandidateInstallFailure::Conflict(conflict_error()));
     }
 
     if let Ok(metadata) = fs::metadata(file) {
-        fs::set_permissions(temporary, metadata.permissions())
-            .map_err(|error| file_error("preserve permissions for", file, error))?;
+        fs::set_permissions(temporary, metadata.permissions()).map_err(|error| {
+            CandidateInstallFailure::from(file_error("preserve permissions for", file, error))
+        })?;
     }
     let backup = backup_path(file);
-    fs::copy(file, &backup).map_err(|error| file_error("back up", file, error))?;
+    fs::copy(file, &backup)
+        .map_err(|error| CandidateInstallFailure::from(file_error("back up", file, error)))?;
     // Copying the backup can be slow on networked filesystems. Re-check after
     // it so an edit that raced the transaction is reported instead of replaced.
-    let current = fs::read_to_string(file).map_err(|error| file_error("re-read", file, error))?;
+    let current = fs::read_to_string(file)
+        .map_err(|error| CandidateInstallFailure::from(file_error("re-read", file, error)))?;
     if current != expected_source {
-        return Err(conflict_error());
+        return Err(CandidateInstallFailure::Conflict(conflict_error()));
     }
     fs::rename(temporary, file).map_err(|error| {
-        file_error("atomically replace", file, error).with_help(format!(
-            "The original remains available at {}",
-            backup.display()
+        CandidateInstallFailure::from(file_error("atomically replace", file, error).with_help(
+            format!("The original remains available at {}", backup.display()),
         ))
     })?;
-    sync_parent(file)?;
+    sync_parent(file).map_err(CandidateInstallFailure::from)?;
     Ok(())
 }
 
@@ -1815,6 +1925,20 @@ return config
     }
 
     #[test]
+    fn migration_preview_rejects_a_future_schema_instead_of_calling_it_current() {
+        let source = example_source().replace(
+            "editor = { keymap = \"helix\", semantic_hints = true },",
+            "schema_version = 2,\n  editor = { keymap = \"helix\", semantic_hints = true },",
+        );
+
+        let error = migration_candidate(&source).unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("newer"));
+        assert!(error.details.help[0].contains("Quirl version"));
+    }
+
+    #[test]
     fn migration_preview_requires_an_explicit_dry_run_flag() {
         let error = migrate(Path::new("config.lua"), false, ConfigOutputFormat::Text).unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidArgument);
@@ -1971,7 +2095,10 @@ return config
         let error = apply_web_form(&file, &mut session, &web_form("private", &original, "vim"))
             .unwrap_err();
 
+        assert!(matches!(error, WebFormFailure::Conflict(_)));
+        assert_eq!(error.status(), 409);
         assert!(error
+            .error()
             .message
             .contains("changed concurrently: editor.keymap"));
         assert_eq!(fs::read_to_string(&file).unwrap(), external);
@@ -2026,9 +2153,79 @@ return config
         assert!(parse_prompt_lines(&"a".repeat(4097)).is_err());
         assert!(!loopback_origin("http://attacker.invalid"));
         assert!(!loopback_origin("https://127.0.0.1:1234"));
+        assert!(!loopback_authority("127.0.0.1:0"));
+        assert!(!loopback_authority("127.0.0.1:"));
+        assert!(!loopback_origin("http://127.0.0.1:1234/not-an-origin"));
+        assert!(loopback_origin("http://127.0.0.1:1234"));
+        assert!(is_urlencoded_form_content_type(
+            "application/x-www-form-urlencoded; charset=utf-8"
+        ));
+        assert!(!is_urlencoded_form_content_type(
+            "application/x-www-form-urlencoded-evil"
+        ));
         assert!(request_size_is_allowed(128, WEB_MAX_REQUEST_BYTES - 128));
         assert!(!request_size_is_allowed(128, WEB_MAX_REQUEST_BYTES));
         assert!(!request_size_is_allowed(usize::MAX, 1));
+    }
+
+    #[test]
+    fn disconnected_browser_writes_are_nonfatal_but_other_write_errors_are_reported() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::NotConnected,
+        ] {
+            assert!(client_disconnected(&io::Error::from(kind)), "{kind:?}");
+        }
+        let error = io::Error::from(io::ErrorKind::WriteZero);
+        assert!(!client_disconnected(&error));
+        let reported = web_response_error(error);
+        assert_eq!(reported.code, ErrorCode::Io);
+        assert!(!reported.details.help.is_empty());
+    }
+
+    #[test]
+    fn http_reader_rejects_an_oversized_declared_body_before_reading_it() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {WEB_MAX_REQUEST_BYTES}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let error = read_http_request(&mut stream).unwrap_err();
+
+        assert!(error.message.contains("body is too large"));
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn http_reader_rejects_eof_before_a_declared_body() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            stream
+                .write_all(b"POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 8\r\n\r\nshort")
+                .unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+
+        let error = read_http_request(&mut stream).unwrap_err();
+
+        assert!(error.message.contains("ended before its body"));
+        client.join().unwrap();
     }
 
     fn load_test_config() -> QuirlConfig {
