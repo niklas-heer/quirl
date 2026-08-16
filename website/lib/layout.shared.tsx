@@ -1,0 +1,22 @@
+import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
+import Image from 'next/image';
+import { appName, gitConfig } from './shared';
+
+export function baseOptions(): BaseLayoutProps {
+  return {
+    nav: {
+      title: (
+        <span className="brand-lockup">
+          <Image src="/logo.png" alt="" width={28} height={28} priority />
+          <span>{appName}</span>
+          <span className="brand-status">0.1 RC</span>
+        </span>
+      ),
+    },
+    links: [
+      { text: 'Documentation', url: '/docs', active: 'nested-url' },
+      { text: 'Changelog', url: '/docs/project/changelog' },
+    ],
+    githubUrl: `https://github.com/${gitConfig.user}/${gitConfig.repo}`,
+  };
+}

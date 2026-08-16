@@ -1,0 +1,16 @@
+---
+title: Generated artifacts
+description: Download checked-in protocol and Lua tooling projections without confusing them for their sources.
+---
+
+Generated artifacts are reviewable evidence. Their Rust owners remain the source
+of truth.
+
+| Artifact | Purpose | Authoritative source |
+| --- | --- | --- |
+| [LuaLS stub](/reference/quirl.lua) | Editor types for extension authors | `quirl-lua::HOST_API` |
+| [Protocol freeze v1](/reference/protocol-freeze-v1.json) | Reviewed compatibility fixture | Protocol descriptors in owning crates |
+
+Run `cargo xtask sdk` after changing the Lua host API. Command help, completion,
+documentation, and AI metadata are generated from `Catalog::builtin()` in
+`quirl-catalog`.

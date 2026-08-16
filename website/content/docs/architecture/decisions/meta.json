@@ -1,0 +1,21 @@
+{
+  "title": "Decisions",
+  "pages": [
+    "index",
+    "0001-lua-extension-language",
+    "0002-crate-layering",
+    "0003-preview-runtime-layers",
+    "0004-phase-2-contract-and-language-service-layers",
+    "0005-plugin-platform-layer",
+    "0006-platform-process-and-recovery-boundaries",
+    "0007-semantic-catalog-v4",
+    "0008-protocol-freeze-and-migrations",
+    "0009-isolated-process-adapter-v1",
+    "0010-unix-first-release-scope",
+    "0011-deterministic-testing-and-bounded-engineering",
+    "0012-ratatui-interactive-surface",
+    "0013-lua-config-themes",
+    "0014-external-history-provider-boundary",
+    "0015-bounded-theme-preview-gallery"
+  ]
+}

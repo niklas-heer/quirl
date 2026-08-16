@@ -1,0 +1,15 @@
+{
+  "title": "Quirl",
+  "pages": [
+    "index",
+    "getting-started",
+    "guides",
+    "extensions",
+    "tooling",
+    "reference",
+    "architecture",
+    "contributing",
+    "project",
+    "research"
+  ]
+}

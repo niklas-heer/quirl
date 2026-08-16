@@ -1,0 +1,37 @@
+---
+title: Lua SDK
+description: Extend Quirl through one sandboxed, resource-budgeted Lua 5.4 boundary.
+---
+
+Quirl uses one Lua 5.4 SDK for configuration, scripts, prompt segments,
+completion providers, and trusted plugins. Rust owns the host. Lua receives a
+restricted standard library, explicit capabilities, and bounded execution.
+
+<Callout type="info" title="One source of truth">
+  The authoritative host API is the `HOST_API` table in `quirl-lua`. Generated
+  LuaLS stubs, schema, and reference prose are projections of that table and
+  must not be edited by hand.
+</Callout>
+
+## Boundary guarantees
+
+- Every VM runs under a policy with memory, instruction, deadline, and
+  cancellation limits.
+- `io`, `os`, `debug`, `require`, and `package` are not exposed.
+- Lua values are deserialized into typed Rust structures and validated before
+  higher crates can use them.
+- Script failures become structured `ShellError` values instead of host panics.
+
+## Reference files
+
+- [Read the generated Lua API reference](/docs/extensions/lua-api-reference)
+- [Download the generated LuaLS stub](/reference/quirl.lua)
+- [View a minimal script](/examples/hello.lua)
+- [View configuration](/examples/config.lua)
+- [View guest-side tests](/examples/lua_tests.lua)
+
+Regenerate checked-in SDK artifacts from the repository root:
+
+```sh
+cargo xtask sdk
+```

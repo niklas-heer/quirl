@@ -1,0 +1,12 @@
+{
+  "title": "Extensions",
+  "icon": "Blocks",
+  "pages": [
+    "index",
+    "lua-sdk",
+    "lua-api-reference",
+    "plugin-platform",
+    "events-and-live-views",
+    "agent-and-package-contracts"
+  ]
+}

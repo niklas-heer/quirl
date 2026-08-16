@@ -1,0 +1,116 @@
+---
+title: "Lua SDK API reference"
+description: "Generated function signatures, capabilities, and contracts for the Quirl Lua SDK."
+---
+
+{/* Generated from the compiled Quirl catalog. Run npm run sync:reference; do not edit this page by hand. */}
+
+Module: `quirl`
+
+Version: `0.1.0`
+
+Schema version: `1`
+
+## `quirl.cwd`
+
+`quirl.cwd() -> string`
+
+Return the current working directory.
+
+Returns: `string`
+
+## `quirl.process.run`
+
+`quirl.process.run(command: string) -> quirl.Result`
+
+Run a command through Quirl's compatibility shell.
+
+| Parameter | Type |
+| --- | --- |
+| `command` | `string` |
+
+Returns: `quirl.Result`
+
+Capability: `process.spawn`
+
+## `quirl.config`
+
+`quirl.config(value: quirl.Config) -> quirl.Config`
+
+Return configuration for Rust schema validation.
+
+| Parameter | Type |
+| --- | --- |
+| `value` | `quirl.Config` |
+
+Returns: `quirl.Config`
+
+## `quirl.prompt.add_segment`
+
+`quirl.prompt.add_segment(spec: quirl.PromptSegment) -> nil`
+
+Register a deadline-bounded prompt segment.
+
+| Parameter | Type |
+| --- | --- |
+| `spec` | `quirl.PromptSegment` |
+
+Returns: `nil`
+
+Capability: `prompt.register`
+
+## `quirl.completion.add_provider`
+
+`quirl.completion.add_provider(spec: quirl.CompletionProvider) -> nil`
+
+Register a semantic completion provider.
+
+| Parameter | Type |
+| --- | --- |
+| `spec` | `quirl.CompletionProvider` |
+
+Returns: `nil`
+
+Capability: `completion.register`
+
+## `quirl.plugin.command`
+
+`quirl.plugin.command(spec: quirl.PluginCommand) -> nil`
+
+Register a typed, documented plugin command.
+
+| Parameter | Type |
+| --- | --- |
+| `spec` | `quirl.PluginCommand` |
+
+Returns: `nil`
+
+Capability: `commands.register`
+
+## `quirl.events.subscribe`
+
+`quirl.events.subscribe(spec: quirl.EventSubscription) -> nil`
+
+Observe immutable typed shell events and return declared actions.
+
+| Parameter | Type |
+| --- | --- |
+| `spec` | `quirl.EventSubscription` |
+
+Returns: `nil`
+
+Capability: `events.observe`
+
+## `quirl.extension.contribute`
+
+`quirl.extension.contribute(spec: quirl.Contribution) -> nil`
+
+Register a typed catalog, completion, analysis, view, panel, or knowledge contribution.
+
+| Parameter | Type |
+| --- | --- |
+| `spec` | `quirl.Contribution` |
+
+Returns: `nil`
+
+Capability: `extension.contribute`

@@ -1,0 +1,38 @@
+---
+title: Your first session
+description: Use familiar commands, switch into typed data, and discover the shared catalog.
+---
+
+## Begin with command mode
+
+Quirl starts where shell users expect: external commands, redirects, byte
+pipelines, boolean lists, and background jobs. The native grammar intentionally
+stays small; use an explicit Bash or Zsh island when you need behavior outside
+that frozen core.
+
+```sh
+ls -la | grep Cargo
+```
+
+## Switch to typed data
+
+Press <kbd>Alt-M</kbd> in an interactive session, or write an explicit `data`
+block in a native `.qrl` script. Data mode works with values rather than terminal
+text:
+
+```text
+open deployments.json | where status == "failed" | select service region
+```
+
+The detailed semantics live in the [typed data runtime](/docs/guides/typed-data-runtime).
+
+## Discover as you type
+
+- <kbd>Tab</kbd> opens semantic completion.
+- <kbd>F1</kbd> opens contextual documentation from the same catalog.
+- <kbd>Ctrl-R</kbd> opens reverse history search.
+- <kbd>Ctrl-T</kbd> opens the file picker.
+- <kbd>Ctrl-K</kbd> opens catalog actions.
+
+The catalog is also the source for generated help, documentation, and AI-facing
+metadata, so these surfaces do not drift into separate command lists.
