@@ -1079,7 +1079,7 @@ fn validate_out_of_process(manifest: &PluginManifest) -> Result<(), ShellError> 
     if manifest.capabilities.request != [launch_grant.clone()] {
         return Err(validation_error(
             "out-of-process adapters must request only their scoped launch capability",
-            format!("Set capabilities.request = [\"{launch_grant}\"]`; protocol v1 exposes no other host capabilities"),
+            format!("Set capabilities.request = [\"{launch_grant}\"]; protocol v1 exposes no other host capabilities"),
         ));
     }
     Ok(())

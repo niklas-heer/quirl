@@ -334,6 +334,12 @@ struct Budget {
     deadline: Instant,
 }
 
+#[derive(Clone)]
+struct HostExecutionState {
+    budget: Arc<Mutex<Budget>>,
+    cancelled: Arc<AtomicBool>,
+}
+
 #[derive(Debug, Default)]
 struct PluginCallbacks {
     prompt_segments: HashMap<String, PromptCallback>,
@@ -458,7 +464,10 @@ impl LuaRuntime {
             policy,
             granted_capabilities.iter().cloned().collect(),
             process_host,
-            Arc::clone(&cancelled),
+            HostExecutionState {
+                budget: Arc::clone(&budget),
+                cancelled: Arc::clone(&cancelled),
+            },
             Arc::clone(&registrations),
             Arc::clone(&callbacks),
         )
@@ -1432,7 +1441,7 @@ fn install_host_api(
     policy: LuaPolicy,
     granted_capabilities: HashSet<String>,
     process_host: Option<ProcessHost>,
-    cancelled: Arc<AtomicBool>,
+    execution: HostExecutionState,
     registrations: Arc<Mutex<PluginRegistrations>>,
     callbacks: Arc<Mutex<PluginCallbacks>>,
 ) -> mlua::Result<()> {
@@ -1450,7 +1459,8 @@ fn install_host_api(
 
     let process = lua.create_table()?;
     let process_grants = granted_capabilities.clone();
-    let process_cancelled = Arc::clone(&cancelled);
+    let process_budget = Arc::clone(&execution.budget);
+    let process_cancelled = Arc::clone(&execution.cancelled);
     process.set(
         "run",
         lua.create_function(move |lua, command: String| {
@@ -1465,9 +1475,29 @@ fn install_host_api(
                         .to_owned(),
                 ));
             };
+            if process_cancelled.load(Ordering::Relaxed) {
+                return Err(mlua::Error::RuntimeError(
+                    RESOURCE_LIMIT_SENTINEL.to_owned(),
+                ));
+            }
+            let deadline = process_budget
+                .lock()
+                .map_err(|_| {
+                    mlua::Error::RuntimeError("quirl budget state is unavailable".to_owned())
+                })?
+                .deadline
+                .saturating_duration_since(Instant::now());
+            if deadline.is_zero() {
+                return Err(mlua::Error::RuntimeError(
+                    RESOURCE_LIMIT_SENTINEL.to_owned(),
+                ));
+            }
             let outcome = process_host(ProcessRequest {
                 command,
-                deadline: policy.wall_time,
+                // The budget is reset to each callback's declared deadline before invoking Lua.
+                // A host call must consume the same remaining budget, rather than giving a short
+                // callback another full policy-sized process window.
+                deadline,
                 cancelled: Arc::clone(&process_cancelled),
                 max_output_bytes: MAX_PROCESS_OUTPUT_BYTES,
             })
@@ -2380,7 +2410,8 @@ mod tests {
     #[test]
     fn scoped_process_grant_cannot_smuggle_shell_operators() {
         let process_host: ProcessHost = Arc::new(|request| {
-            assert_eq!(request.deadline, Duration::from_millis(100));
+            assert!(request.deadline <= Duration::from_millis(100));
+            assert!(!request.deadline.is_zero());
             assert_eq!(request.max_output_bytes, MAX_PROCESS_OUTPUT_BYTES);
             Ok(quirl_core::CommandOutcome {
                 status: 0,
@@ -2416,6 +2447,48 @@ mod tests {
     }
 
     #[test]
+    fn process_host_uses_the_remaining_callback_deadline() {
+        let received_deadline = Arc::new(Mutex::new(None));
+        let received_by_host = Arc::clone(&received_deadline);
+        let process_host: ProcessHost = Arc::new(move |request| {
+            *received_by_host.lock().unwrap() = Some(request.deadline);
+            Ok(quirl_core::CommandOutcome {
+                status: 0,
+                stdout: Some("ok".to_owned()),
+                stderr: Some(String::new()),
+            })
+        });
+        let runtime = LuaRuntime::new_with_capabilities_and_process_host(
+            LuaPolicy {
+                allow_process: true,
+                wall_time: Duration::from_secs(1),
+                ..LuaPolicy::config()
+            },
+            &["prompt.register".to_owned(), "process.spawn".to_owned()],
+            Some(process_host),
+        )
+        .unwrap();
+        runtime
+            .eval(
+                r#"quirl.prompt.add_segment {
+                    name = "bounded-process", deadline_ms = 1,
+                    render = function() return quirl.process.run("printf bounded").value end,
+                }"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .render_prompt_segment("bounded-process", &serde_json::json!({}))
+                .unwrap(),
+            Some("ok".to_owned())
+        );
+        let deadline = received_deadline.lock().unwrap().unwrap();
+        assert!(deadline <= Duration::from_millis(1));
+        assert!(!deadline.is_zero());
+    }
+
+    #[test]
     fn process_host_receives_lua_cancellation() {
         let process_host: ProcessHost = Arc::new(|request| {
             while !request.cancelled.load(Ordering::Relaxed) {
@@ -2434,6 +2507,47 @@ mod tests {
         });
         let error = runtime
             .eval("return quirl.process.run('long-running-command')")
+            .unwrap_err();
+        canceller.join().unwrap();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("process execution was cancelled"));
+    }
+
+    #[test]
+    fn cancellation_reaches_a_process_started_by_a_prompt_callback() {
+        let process_host: ProcessHost = Arc::new(|request| {
+            while !request.cancelled.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(
+                ShellError::new(ErrorCode::ResourceLimit, "process execution was cancelled")
+                    .with_help("Use a shorter-running command"),
+            )
+        });
+        let runtime = LuaRuntime::new_with_capabilities_and_process_host(
+            LuaPolicy {
+                allow_process: true,
+                ..LuaPolicy::config()
+            },
+            &["prompt.register".to_owned(), "process.spawn".to_owned()],
+            Some(process_host),
+        )
+        .unwrap();
+        runtime
+            .eval(
+                r#"quirl.prompt.add_segment {
+                    name = "cancelled-process", deadline_ms = 100,
+                    render = function() return quirl.process.run("long-running-command").value end,
+                }"#,
+            )
+            .unwrap();
+        let cancellation = runtime.cancellation_token();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            cancellation.cancel();
+        });
+        let error = runtime
+            .render_prompt_segment("cancelled-process", &serde_json::json!({}))
             .unwrap_err();
         canceller.join().unwrap();
         assert_eq!(error.code, ErrorCode::ResourceLimit);

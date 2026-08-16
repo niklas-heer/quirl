@@ -507,16 +507,31 @@ pub fn run_source_with_cancellation(
 pub fn run_interactive_island(
     language: ScriptLanguage,
     source: &str,
+    cancellation: &ScriptCancellation,
 ) -> Result<quirl_core::CommandOutcome, ShellError> {
+    let signal_id = signal_hook::flag::register(
+        signal_hook::consts::SIGINT,
+        Arc::clone(&cancellation.cancelled),
+    )
+    .map_err(|error| {
+        ShellError::new(
+            ErrorCode::Io,
+            "could not install interactive island cancellation handler",
+        )
+        .with_context(error.to_string())
+        .with_help("Retry the island; report repeated signal-handler failures")
+    })?;
     let executable = language.executable();
-    let output = run_reference_script(
+    let result = run_reference_script(
         source,
         "<interactive island>",
         language,
         &[],
-        &ScriptCancellation::default(),
+        cancellation,
         executable,
-    )?;
+    );
+    signal_hook::low_level::unregister(signal_id);
+    let output = result?;
     let stdout = output
         .value
         .get("stdout")
@@ -739,9 +754,10 @@ fn run_reference_script(
     let stderr = child.stderr.take().map(spawn_stream_reader);
     let status = loop {
         if cancellation.cancelled.load(Ordering::Relaxed) {
-            terminate_reference_process(&mut child, &containment);
+            let termination = terminate_reference_process(&mut child, &containment);
             let _ = join_stream_reader(stdout, "reference runner stdout");
             let _ = join_stream_reader(stderr, "reference runner stderr");
+            termination?;
             return Err(ShellError::new(
                 ErrorCode::ResourceLimit,
                 format!("{executable} script execution was cancelled"),
@@ -758,7 +774,8 @@ fn run_reference_script(
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(Duration::from_millis(2)),
             Err(error) => {
-                terminate_reference_process(&mut child, &containment);
+                let termination = terminate_reference_process(&mut child, &containment);
+                termination?;
                 return Err(ShellError::new(
                     ErrorCode::Io,
                     format!("could not observe `{executable}` script status"),
@@ -803,7 +820,10 @@ fn run_reference_script(
     })
 }
 
-fn terminate_reference_process(child: &mut std::process::Child, containment: &ChildProcessTree) {
+fn terminate_reference_process(
+    child: &mut std::process::Child,
+    containment: &ChildProcessTree,
+) -> Result<(), ShellError> {
     #[cfg(unix)]
     if let Ok(process_group) = i32::try_from(child.id()) {
         let _ = nix::sys::signal::killpg(
@@ -811,9 +831,12 @@ fn terminate_reference_process(child: &mut std::process::Child, containment: &Ch
             nix::sys::signal::Signal::SIGKILL,
         );
     }
-    containment.terminate(child);
-    let _ = child.kill();
+    let result = containment.terminate(child);
+    if result.is_err() {
+        let _ = child.kill();
+    }
     let _ = child.wait();
+    result
 }
 
 #[derive(Debug)]
@@ -1223,12 +1246,25 @@ fn execute_command_block(
         let leading = line.len().saturating_sub(line.trim_start().len());
         let trimmed = line.trim();
         if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            outcome = execute_native_command(
+            let line_outcome = execute_native_command(
                 executor,
                 trimmed,
                 source_name,
                 (offset + leading)..(offset + leading + trimmed.len()),
             )?;
+            outcome.status = line_outcome.status;
+            if let Some(stdout) = line_outcome.stdout {
+                outcome
+                    .stdout
+                    .get_or_insert_with(String::new)
+                    .push_str(&stdout);
+            }
+            if let Some(stderr) = line_outcome.stderr {
+                outcome
+                    .stderr
+                    .get_or_insert_with(String::new)
+                    .push_str(&stderr);
+            }
             if outcome.status != 0 {
                 return Ok(outcome);
             }
@@ -1475,6 +1511,24 @@ mod tests {
     }
 
     #[test]
+    fn interactive_dialect_island_observes_cancellation() {
+        if !reference_interpreter_available("bash") {
+            eprintln!("skipping bash: interpreter is unavailable");
+            return;
+        }
+        let cancellation = ScriptCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn(move || {
+            run_interactive_island(ScriptLanguage::Bash, "sleep 10", &worker_cancellation)
+        });
+        thread::sleep(Duration::from_millis(20));
+        cancellation.cancelled.store(true, Ordering::Relaxed);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.message.contains("cancelled"));
+    }
+
+    #[test]
     fn lua_stdin_source_runs_with_arguments_under_script_policy() {
         let output = run_source(
             "return { main = function(ctx) return { value = ctx.args[1] } end }",
@@ -1553,7 +1607,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.status, 0);
-        assert_eq!(output.value["stdout"], "second");
+        assert_eq!(output.value["stdout"], "firstsecond");
     }
 
     #[test]

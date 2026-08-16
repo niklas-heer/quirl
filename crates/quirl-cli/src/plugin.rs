@@ -576,9 +576,10 @@ pub(crate) fn execute_out_of_process_adapter(
         ))
     };
     if let Err(error) = write_result {
-        terminate_adapter(&mut child, &containment);
+        let termination = terminate_adapter(&mut child, &containment);
         let _ = join_adapter_reader(stdout, "adapter stdout");
         let _ = join_adapter_reader(stderr, "adapter stderr");
+        termination?;
         return Err(ShellError::new(
             ErrorCode::Io,
             "could not send initialization request to isolated adapter",
@@ -590,9 +591,10 @@ pub(crate) fn execute_out_of_process_adapter(
     let deadline = Instant::now() + Duration::from_millis(adapter.callback_timeout_ms);
     let status = loop {
         if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            terminate_adapter(&mut child, &containment);
+            let termination = terminate_adapter(&mut child, &containment);
             let _ = join_adapter_reader(stdout, "adapter stdout");
             let _ = join_adapter_reader(stderr, "adapter stderr");
+            termination?;
             return Err(ShellError::new(
                 ErrorCode::ResourceLimit,
                 "isolated adapter initialization was cancelled",
@@ -600,9 +602,10 @@ pub(crate) fn execute_out_of_process_adapter(
             .with_help("Retry when cancellation is no longer requested"));
         }
         if Instant::now() >= deadline {
-            terminate_adapter(&mut child, &containment);
+            let termination = terminate_adapter(&mut child, &containment);
             let _ = join_adapter_reader(stdout, "adapter stdout");
             let _ = join_adapter_reader(stderr, "adapter stderr");
+            termination?;
             return Err(ShellError::new(
                 ErrorCode::ResourceLimit,
                 "isolated adapter initialization exceeded its callback deadline",
@@ -614,9 +617,10 @@ pub(crate) fn execute_out_of_process_adapter(
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(Duration::from_millis(1)),
             Err(error) => {
-                terminate_adapter(&mut child, &containment);
+                let termination = terminate_adapter(&mut child, &containment);
                 let _ = join_adapter_reader(stdout, "adapter stdout");
                 let _ = join_adapter_reader(stderr, "adapter stderr");
+                termination?;
                 return Err(ShellError::new(
                     ErrorCode::Io,
                     "could not observe isolated adapter status",
@@ -756,7 +760,10 @@ fn join_adapter_reader(
     }
 }
 
-fn terminate_adapter(child: &mut std::process::Child, containment: &ChildProcessTree) {
+fn terminate_adapter(
+    child: &mut std::process::Child,
+    containment: &ChildProcessTree,
+) -> Result<(), ShellError> {
     #[cfg(unix)]
     if let Ok(group) = i32::try_from(child.id()) {
         let _ = nix::sys::signal::killpg(
@@ -764,9 +771,12 @@ fn terminate_adapter(child: &mut std::process::Child, containment: &ChildProcess
             nix::sys::signal::Signal::SIGKILL,
         );
     }
-    containment.terminate(child);
-    let _ = child.kill();
+    let result = containment.terminate(child);
+    if result.is_err() {
+        let _ = child.kill();
+    }
     let _ = child.wait();
+    result
 }
 
 fn adapter_limit_error(message: &str, limit: u64) -> ShellError {

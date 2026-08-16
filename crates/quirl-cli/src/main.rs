@@ -598,7 +598,11 @@ fn execute_command_or_dialect_island(
     source: &str,
 ) -> Result<CommandOutcome, ShellError> {
     if let Some((language, body)) = interactive_dialect_island(source) {
-        return script::run_interactive_island(language, body);
+        return script::run_interactive_island(
+            language,
+            body,
+            &script::ScriptCancellation::default(),
+        );
     }
     executor.execute_capture(source)
 }

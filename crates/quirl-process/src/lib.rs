@@ -27,7 +27,7 @@ mod platform {
     use std::{
         env,
         fs::{File, OpenOptions},
-        io::{IsTerminal, Read, Write},
+        io::{ErrorKind, IsTerminal, Read, Write},
         path::{Path, PathBuf},
         process::{Child, Command, Stdio},
         sync::atomic::Ordering,
@@ -78,10 +78,12 @@ mod platform {
 
     type ReaderTask = JoinHandle<std::io::Result<ReaderCapture>>;
     type WriterTask = JoinHandle<std::io::Result<()>>;
+    type OutputStdio = (Stdio, Option<PipeReader>, Option<PipeWriter>, Option<File>);
 
     pub struct NativeExecutor {
         jobs: Vec<Job>,
         next_job_id: u32,
+        substitution_depth: u8,
     }
 
     /// Cross-platform containment hook for a directly spawned child process.
@@ -96,8 +98,17 @@ mod platform {
             Ok(())
         }
 
-        pub fn terminate(&self, child: &mut Child) {
-            let _ = child.kill();
+        pub fn terminate(&self, child: &mut Child) -> Result<(), ShellError> {
+            match child.kill() {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::InvalidInput => Ok(()),
+                Err(error) => Err(ShellError::new(
+                    ErrorCode::ProcessSpawn,
+                    "could not terminate contained child process",
+                )
+                .with_context(error.to_string())
+                .with_help("Retry the command; report repeated process termination failures")),
+            }
         }
     }
 
@@ -106,6 +117,7 @@ mod platform {
             Self {
                 jobs: Vec::new(),
                 next_job_id: 1,
+                substitution_depth: 0,
             }
         }
     }
@@ -418,7 +430,17 @@ mod platform {
                             "Keep `$(...)` below 16 KiB or use an explicit pipeline",
                         ));
                     }
-                    let nested = self.execute_inner_with_request(source, true, request)?;
+                    const MAX_COMMAND_SUBSTITUTION_DEPTH: u8 = 8;
+                    if self.substitution_depth >= MAX_COMMAND_SUBSTITUTION_DEPTH {
+                        return Err(expansion_error(
+                            "command substitution nesting exceeds the depth limit",
+                            "Flatten nested substitutions or use an explicit pipeline",
+                        ));
+                    }
+                    self.substitution_depth += 1;
+                    let nested = self.execute_inner_with_request(source, true, request);
+                    self.substitution_depth = self.substitution_depth.saturating_sub(1);
+                    let nested = nested?;
                     let stdout = nested.stdout.unwrap_or_default();
                     if stdout.len() > limit {
                         return Err(expansion_error(
@@ -578,8 +600,19 @@ mod platform {
                     .with_command(source)
                     .with_help("Move `ls` to the start of the pipeline or use `^ls`"));
                 }
+                if stderr_duplication_precedes_stdout_redirect(command) {
+                    return Err(ShellError::new(
+                        ErrorCode::InvalidCommand,
+                        "native C1 cannot preserve `2>&1` before a later stdout file redirect",
+                    )
+                    .with_command(source)
+                    .with_help(
+                        "Use `> file 2>&1` to merge both streams into the file, or use an explicit Bash/Zsh island for ordered descriptor routing",
+                    ));
+                }
                 let stdin = input_stdio(command, previous_reader.take(), index > 0)?;
-                let (stdout, next_reader, writer) = output_stdio(command, last, capture_streams)?;
+                let (stdout, next_reader, writer, redirected_stdout) =
+                    output_stdio(command, last, capture_streams)?;
                 if last && capture_streams {
                     capture_reader = next_reader;
                 } else {
@@ -622,17 +655,12 @@ mod platform {
                             .with_context(error.to_string())
                             .with_help("Retry the command or use an explicit dialect island")
                         })?)
+                    } else if let Some(file) = redirected_stdout {
+                        Stdio::from(file)
                     } else if !capture_streams {
                         Stdio::inherit()
                     } else {
-                        return Err(ShellError::new(
-                            ErrorCode::InvalidCommand,
-                            "native C1 cannot capture `2>&1` after a stdout file redirect",
-                        )
-                        .with_command(source)
-                        .with_help(
-                            "Use `bash { ... }` or `zsh { ... }` for ordered descriptor redirects",
-                        ));
+                        Stdio::piped()
                     }
                 } else {
                     stderr_stdio(command, capture_streams)?
@@ -921,7 +949,17 @@ mod platform {
     }
 
     fn matching_double_paren(source: &str) -> Option<usize> {
-        source.find("))")
+        let mut depth = 0_usize;
+        for (index, character) in source.char_indices() {
+            match character {
+                '(' => depth = depth.saturating_add(1),
+                ')' if depth > 0 => depth = depth.saturating_sub(1),
+                ')' if source[index..].starts_with("))") => return Some(index),
+                ')' => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     fn evaluate_arithmetic(source: &str) -> Result<i64, ShellError> {
@@ -1267,7 +1305,7 @@ mod platform {
         command: &SimpleCommand,
         last: bool,
         capture: bool,
-    ) -> Result<(Stdio, Option<PipeReader>, Option<PipeWriter>), ShellError> {
+    ) -> Result<OutputStdio, ShellError> {
         let mut redirected = None;
         for redirect in command.redirects.iter().filter(|redirect| {
             redirect.fd == 1 && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
@@ -1275,7 +1313,15 @@ mod platform {
             redirected = Some(open_redirected_output(redirect)?);
         }
         if let Some(file) = redirected {
-            return Ok((Stdio::from(file), None, None));
+            let duplicate = file.try_clone().map_err(|error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not duplicate the redirected output descriptor",
+                )
+                .with_context(error.to_string())
+                .with_help("Retry the command or use an explicit dialect island")
+            })?;
+            return Ok((Stdio::from(file), None, None, Some(duplicate)));
         }
         if !last || capture {
             let (reader, writer) = pipe().map_err(|error| {
@@ -1288,9 +1334,9 @@ mod platform {
                     .with_context(error.to_string())
                     .with_help("Retry after closing unused processes or file descriptors")
             })?);
-            return Ok((stdout, Some(reader), Some(writer)));
+            return Ok((stdout, Some(reader), Some(writer), None));
         }
-        Ok((Stdio::inherit(), None, None))
+        Ok((Stdio::inherit(), None, None, None))
     }
 
     fn stderr_stdio(command: &SimpleCommand, capture: bool) -> Result<Stdio, ShellError> {
@@ -1308,6 +1354,21 @@ mod platform {
 
     fn duplicates_stderr_to_stdout(redirect: &quirl_syntax::Redirect) -> bool {
         redirect.fd == 2 && redirect.kind == RedirectKind::DuplicateOutput && redirect.path == "1"
+    }
+
+    fn stderr_duplication_precedes_stdout_redirect(command: &SimpleCommand) -> bool {
+        let mut duplicated = false;
+        for redirect in &command.redirects {
+            if duplicates_stderr_to_stdout(redirect) {
+                duplicated = true;
+            } else if duplicated
+                && redirect.fd == 1
+                && matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn finish_control_builtin(
@@ -2248,8 +2309,8 @@ mod platform {
             self.0.assign(child)
         }
 
-        pub fn terminate(&self, _child: &mut Child) {
-            let _ = self.0.terminate(130);
+        pub fn terminate(&self, _child: &mut Child) -> Result<(), ShellError> {
+            self.0.terminate(130)
         }
     }
 
@@ -3081,11 +3142,14 @@ mod backend_contract_tests {
         let mut backend = NativeExecutor::default();
         let output = backend
             .execute_capture(
-                "printf '%s|%s|%s\\n' $QUIRL_C1_WORD $((1 + 2)) $(printf nested); cat <<< value",
+                "printf '%s|%s|%s|%s\\n' $QUIRL_C1_WORD $((1 + 2)) $((1 + ((2)))) $(printf nested); cat <<< value",
             )
             .unwrap();
         assert_eq!(output.status, 0);
-        assert_eq!(output.stdout.as_deref(), Some("expanded|3|nested\nvalue\n"));
+        assert_eq!(
+            output.stdout.as_deref(),
+            Some("expanded|3|3|nested\nvalue\n")
+        );
         std::env::remove_var("QUIRL_C1_WORD");
     }
 
@@ -3102,6 +3166,38 @@ mod backend_contract_tests {
         assert_eq!(result.stdout.as_deref(), Some("$HOME"));
         assert_eq!(fs::read_to_string(&output).unwrap(), "err");
         fs::remove_file(output).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_file_redirect_and_stderr_duplication_share_one_output_handle() {
+        let output = temporary_path("c1-merged-output");
+        let command = format!(
+            "sh -c 'printf stdout; printf stderr >&2' > {} 2>&1",
+            output.display()
+        );
+        let result = NativeExecutor::default().execute_capture(&command).unwrap();
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout.as_deref(), Some(""));
+        assert_eq!(fs::read_to_string(&output).unwrap(), "stdoutstderr");
+        fs::remove_file(output).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_duplication_before_stdout_redirect_fails_closed() {
+        let output = temporary_path("c1-ordered-redirect");
+        let command = format!(
+            "sh -c 'printf stdout; printf stderr >&2' 2>&1 > {}",
+            output.display()
+        );
+        let error = NativeExecutor::default()
+            .execute_capture(&command)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert!(error.message.contains("before a later stdout"));
+        assert!(error.details.help[0].contains("> file 2>&1"));
+        assert!(!output.exists());
     }
 
     #[cfg(unix)]
@@ -3128,6 +3224,21 @@ mod backend_contract_tests {
         let error = backend.execute_capture_request(request).unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_substitution_depth_is_bounded_before_stack_exhaustion() {
+        let mut source = "printf leaf".to_owned();
+        for _ in 0..9 {
+            source = format!("printf $({source})");
+        }
+        let error = NativeExecutor::default()
+            .execute_capture(&source)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert!(error.message.contains("depth limit"));
+        assert!(error.details.help[0].contains("Flatten nested"));
     }
 
     #[test]

@@ -306,6 +306,19 @@ fn reject_reserved_dialect_forms(tokens: &[Token]) -> Result<(), CommandSyntaxEr
     let mut command_position = true;
     let mut redirect_target = false;
     for token in tokens {
+        if let TokenKind::Word(word) = &token.kind {
+            if contains_unquoted_brace_expansion(word) {
+                return Err(CommandSyntaxError {
+                    message: format!(
+                        "unsupported C1 dialect control form `{}`",
+                        word.text()
+                    ),
+                    start: token.start,
+                    end: token.end,
+                    help: "Run it as `bash { ... }` or `zsh { ... }`; the bounded reference island preserves the selected dialect's control semantics".to_owned(),
+                });
+            }
+        }
         if redirect_target {
             redirect_target = false;
             continue;
@@ -316,14 +329,23 @@ fn reject_reserved_dialect_forms(tokens: &[Token]) -> Result<(), CommandSyntaxEr
                 command_position = true;
             }
             TokenKind::Background => command_position = true,
-            TokenKind::Word(word) if command_position => {
+            TokenKind::Word(word) => {
                 let value = word.text();
-                let reserved = matches!(
-                    value.as_str(),
-                    "for" | "while" | "until" | "if" | "case" | "select" | "function"
-                ) || value == "[["
-                    || value == "(("
-                    || value.ends_with("()");
+                let reserved = command_position
+                    && (matches!(
+                        value.as_str(),
+                        "for"
+                            | "while"
+                            | "until"
+                            | "if"
+                            | "case"
+                            | "select"
+                            | "function"
+                            | "{"
+                            | "}"
+                    ) || value == "[["
+                        || value == "(("
+                        || value.ends_with("()"));
                 if reserved {
                     return Err(CommandSyntaxError {
                         message: format!("unsupported C1 dialect control form `{value}`"),
@@ -334,10 +356,39 @@ fn reject_reserved_dialect_forms(tokens: &[Token]) -> Result<(), CommandSyntaxEr
                 }
                 command_position = false;
             }
-            TokenKind::Word(_) => command_position = false,
         }
     }
     Ok(())
+}
+
+/// Brace expansion is intentionally not part of native C1.  Treat only the
+/// unquoted shell form as reserved; quoted braces and `${parameter}` remain
+/// ordinary literals/parameter expansion inputs for the process layer.
+fn contains_unquoted_brace_expansion(word: &Word) -> bool {
+    let text = word
+        .parts
+        .iter()
+        .filter(|part| part.quoting == Quoting::Unquoted)
+        .map(|part| part.text.as_str())
+        .collect::<String>();
+    let mut offset = 0;
+    while let Some(open) = text[offset..].find('{') {
+        let open = offset + open;
+        if text[..open].ends_with('$') {
+            offset = open + 1;
+            continue;
+        }
+        let content_start = open + 1;
+        let Some(close_relative) = text[content_start..].find('}') else {
+            return false;
+        };
+        let content = &text[content_start..content_start + close_relative];
+        if !content.is_empty() && (content.contains(',') || content.contains("..")) {
+            return true;
+        }
+        offset = content_start + close_relative + 1;
+    }
+    false
 }
 
 /// Return the expression from a `data` statement.
@@ -430,9 +481,44 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
     let mut fragment = String::new();
     let mut fragment_quoting = Quoting::Unquoted;
     let mut substitution_depth = 0_u32;
+    let mut substitution_quote = None;
+    let mut substitution_escaped = false;
     let mut characters = input.char_indices().peekable();
 
     while let Some((index, character)) = characters.next() {
+        if substitution_depth > 0 {
+            let quoting = match quote {
+                Some('\'') => Quoting::Single,
+                Some('"') => Quoting::Double,
+                None => Quoting::Unquoted,
+                _ => unreachable!(),
+            };
+            if substitution_escaped {
+                substitution_escaped = false;
+            } else if character == '\\' && substitution_quote != Some('\'') {
+                substitution_escaped = true;
+            } else if let Some(active) = substitution_quote {
+                if character == active {
+                    substitution_quote = None;
+                }
+            } else if matches!(character, '\'' | '"') {
+                substitution_quote = Some(character);
+            } else {
+                match character {
+                    '(' => substitution_depth = substitution_depth.saturating_add(1),
+                    ')' => substitution_depth = substitution_depth.saturating_sub(1),
+                    _ => {}
+                }
+            }
+            append_fragment(
+                &mut parts,
+                &mut fragment,
+                &mut fragment_quoting,
+                character,
+                quoting,
+            );
+            continue;
+        }
         if character == '\\' && quote != Some('\'') {
             word_start.get_or_insert(index);
             let Some((_, escaped)) = characters.next() else {
@@ -469,21 +555,6 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                 );
                 continue;
             }
-            if substitution_depth > 0 {
-                match character {
-                    '(' => substitution_depth = substitution_depth.saturating_add(1),
-                    ')' => substitution_depth = substitution_depth.saturating_sub(1),
-                    _ => {}
-                }
-                append_fragment(
-                    &mut parts,
-                    &mut fragment,
-                    &mut fragment_quoting,
-                    character,
-                    quoting,
-                );
-                continue;
-            }
             if character == active {
                 push_fragment(&mut parts, &mut fragment, fragment_quoting);
                 quote = None;
@@ -498,12 +569,6 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             }
             continue;
         }
-        if matches!(character, '\'' | '"') {
-            word_start.get_or_insert(index);
-            push_fragment(&mut parts, &mut fragment, fragment_quoting);
-            quote = Some(character);
-            continue;
-        }
         if character == '(' && fragment.ends_with('$') {
             substitution_depth = substitution_depth.saturating_add(1);
             append_fragment(
@@ -515,19 +580,10 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             );
             continue;
         }
-        if substitution_depth > 0 {
-            match character {
-                '(' => substitution_depth = substitution_depth.saturating_add(1),
-                ')' => substitution_depth = substitution_depth.saturating_sub(1),
-                _ => {}
-            }
-            append_fragment(
-                &mut parts,
-                &mut fragment,
-                &mut fragment_quoting,
-                character,
-                Quoting::Unquoted,
-            );
+        if matches!(character, '\'' | '"') {
+            word_start.get_or_insert(index);
+            push_fragment(&mut parts, &mut fragment, fragment_quoting);
+            quote = Some(character);
             continue;
         }
         if character.is_whitespace() {
@@ -1099,6 +1155,9 @@ mod tests {
             "greeting() { echo hello; }",
             "[[ -n value ]]",
             "(( 1 + 1 ))",
+            "printf {left,right}",
+            "printf {1..3}",
+            "2>&1 if true; then echo yes; fi",
         ] {
             let error = parse_command_list(source).unwrap_err();
             assert!(error
@@ -1119,6 +1178,30 @@ mod tests {
         for source in ["echo nope 3> output", "echo nope 1>&2", "cat 0<&1"] {
             let error = parse_command_list(source).unwrap_err();
             assert!(error.help.contains("bash { ... }"));
+        }
+    }
+
+    #[test]
+    fn quotes_inside_unquoted_substitution_do_not_quote_the_outer_word() {
+        let graph = parse_command_list(r#"printf $(printf "%s" "two words")"#).unwrap();
+        let word = &graph.pipelines[0].commands[0].word_ir[1];
+        assert_eq!(word.parts.len(), 1);
+        assert_eq!(word.parts[0].quoting, Quoting::Unquoted);
+        assert_eq!(word.parts[0].text, r#"$(printf "%s" "two words")"#);
+    }
+
+    #[test]
+    fn quoted_and_escaped_parentheses_inside_substitution_do_not_close_the_outer_word() {
+        for source in [
+            r#"printf $(printf ')')"#,
+            r#"printf $(printf \\))"#,
+            r#"printf $(printf ")")"#,
+        ] {
+            let graph = parse_command_list(source).unwrap();
+            let word = &graph.pipelines[0].commands[0].word_ir[1];
+            assert_eq!(word.parts[0].quoting, Quoting::Unquoted);
+            assert!(word.parts[0].text.starts_with("$("));
+            assert!(word.parts[0].text.ends_with(')'));
         }
     }
 
