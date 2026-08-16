@@ -48,12 +48,16 @@ phase timeout.
 | Process start to editable prompt | 101/101 | 12.093 | 13.323 | P50 ≤25 ms | **Within** |
 | Final keystroke to corresponding frame | 101/101 | 0.187 | 0.237 | P95 ≤8 ms | **Within** |
 | Process start to first prompt frame | 101/101 | 11.936 | 13.145 | ≤16 ms | **Within (conservative P95)** |
-| Release executable size | — | 3,861,808 bytes | — | ≤5,242,880 bytes | **Within: 1,381,072 bytes headroom** |
+| Release executable size | — | 3,861,808 bytes | — | Historical v5 gate: ≤5,242,880 bytes; current policy: 5 MiB ideal, 8 MiB soft cap, 10 MiB hard ceiling | **Within historical gate and current ideal tier: 1,381,072 bytes below 5 MiB** |
 
-The language specification leaves the first-prompt percentile unspecified, so
-the gate conservatively enforces P95. The 5 MiB binary limit is the frozen
-release-tool default. `opt-level=z` reduces the complete artifact below that
-limit while the measured interactive timings retain substantial headroom.
+The gate conservatively enforces first-prompt P95. The schema-v5 gate used for
+this frozen run enforced a 5 MiB hard limit and passed; that historical result
+is unchanged. Current schema v7 defines binary-size units as MiB, where one MiB
+is exactly 1,048,576 bytes: 5 MiB (5,242,880 bytes) is ideal, more than 8 MiB
+(8,388,608 bytes) records a warning, and more than 10 MiB (10,485,760 bytes) is
+a hard release failure. Under the current policy the same measured artifact is
+in the ideal tier. `opt-level=z` keeps it compact while the measured interactive
+timings retain substantial headroom.
 
 ## Stream retention evidence
 
@@ -93,11 +97,13 @@ target/release/quirl-bench release \
   --json
 ```
 
-`release` exits non-zero when any release budget misses, while still emitting
-the complete JSON evidence. It requires the independently recorded SHA-256,
-copies the supplied binary into a private read-only staging directory, verifies
-the copy before executing it, and uses only that staged copy throughout the
-run. `preview` emits the same schema without enforcing the final exit status or
-requiring a digest. The release run defaults to 101 PTY samples; preview uses
-31. Both use 31 version samples, 2,000 headless edit samples, 500 prompt samples,
-and 100,000 stream samples for every tested window.
+The commands above use the current schema-v7 harness; they reproduce the method
+against a newly built artifact rather than rewriting this frozen schema-v5
+record. `release` exits non-zero when any release budget misses, while still
+emitting the complete JSON evidence. It requires the independently recorded
+SHA-256, copies the supplied binary into a private read-only staging directory,
+verifies the copy before executing it, and uses only that staged copy throughout
+the run. `preview` emits the same schema without enforcing the final exit status
+or requiring a digest. The release run defaults to 101 PTY samples; preview
+uses 31. Both use 31 version samples, 2,000 headless edit samples, 500 prompt
+samples, and 100,000 stream samples for every tested window.

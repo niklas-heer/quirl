@@ -129,6 +129,10 @@ capture canonical JSON evidence.
   digest.
 - [ ] All enforced PTY latency, first-prompt, binary-size, and bounded-history
   budgets pass, or the release stops with the miss preserved in the record.
+- [ ] The exact release binary is at or below the 10 MiB hard ceiling
+  (10,485,760 bytes). At or below 5 MiB (5,242,880 bytes) is ideal; a binary
+  above the 8 MiB soft cap (8,388,608 bytes) records a warning without weakening
+  the hard gate. `--max-binary-bytes` may tighten but never raise the ceiling.
 - [ ] Rich-surface draw and edit latency are measured on the selected
   candidate; `QUIRL_UI_TIMINGS=1` is diagnostic evidence, not a substitute for
   the enforcing PTY harness.
