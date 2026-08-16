@@ -495,6 +495,7 @@ fzf proves fuzzy selection is a terminal primitive. Quirl includes a native, typ
 ```lua
 ---@type quirl.Config
 local config = quirl.config {
+  schema_version = 3,
   editor = { keymap = "emacs", semantic_hints = true, banner = "full" },
   picker = { layout = "adaptive", preview = true },
   prompt = {
@@ -502,6 +503,7 @@ local config = quirl.config {
     left = { "directory", "git_branch", "git_state" },
     right = { "jobs", "duration", "status" },
   },
+  ui = { theme = "tokyo-night" },
 }
 
 if quirl.project.is_rust() then

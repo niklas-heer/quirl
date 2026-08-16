@@ -75,6 +75,9 @@ font or a Nerd Font was used. A glyph difference must never change behavior.
 - [ ] The default `tokyo-night` theme and one Lua-configured custom theme apply
   the same semantic roles on rich and simple surfaces; `NO_COLOR` suppresses
   foreground and background colors for both.
+- [ ] `config web` renders bounded no-JavaScript preview cards for built-in and
+  configured custom themes, and selecting a card updates only the validated
+  `ui.theme` literal through the existing backup transaction.
 - [ ] The mode indicator is always visible; `Alt-M` switches command/data
   mode and the text labels remain understandable without relying on color.
 - [ ] Tab completion, `Ctrl-R` history, `Ctrl-T` files, `Alt-C` directories,

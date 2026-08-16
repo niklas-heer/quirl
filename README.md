@@ -183,6 +183,12 @@ The architecture and decisions behind it are documented in depth:
 - [ADR 0013: Lua-configured themes](docs/decisions/0013-lua-config-themes.md) —
   bounded semantic palettes shared by both terminal surfaces, with Tokyo Night
   as the default.
+- [ADR 0014: external history provider boundary](docs/decisions/0014-external-history-provider-boundary.md) —
+  the bounded, failure-isolated contract required before tools such as Atuin
+  can augment native history.
+- [ADR 0015: bounded theme preview gallery](docs/decisions/0015-bounded-theme-preview-gallery.md) —
+  no-JavaScript previews derived from the same validated palettes the terminal
+  surfaces consume.
 - [Security and accessibility audit](docs/security-accessibility-audit-v0.1.md)
   and [1.0 performance record](docs/benchmarks/release-v1.0.md) — adversarial
   boundaries, text fallbacks, named hardware, reproducible budgets, and outcomes.
@@ -470,15 +476,16 @@ cargo run -p quirl-cli -- config migrate examples/config.lua --dry-run
 cargo run -p quirl-cli -- config doctor examples/config.lua
 ```
 
-`config set` and `config web` patch only recognized literal fields under
-`editor`, `picker`, and `prompt`, preserve surrounding Lua source, validate
-the complete candidate before activation, replace the file atomically, and
-retain the prior source as `config.lua.bak`. Values controlled by Lua
-expressions must be edited in code. `config web` binds only to `127.0.0.1`,
-prints a private tokenized URL, sends no-cache headers, bounds requests and
-read time, merges non-overlapping external edits, and rejects stale or
-conflicting source changes instead of silently overwriting them. Use `--port 8787` to choose a loopback port; the
-default selects one automatically.
+`config set` and `config web` patch only recognized literal fields, preserve
+surrounding Lua source, validate the complete candidate before activation,
+replace the file atomically, and retain the prior source as `config.lua.bak`.
+Values controlled by Lua expressions must be edited in code. `config web`
+renders bounded no-JavaScript cards for every built-in and configured custom
+theme, binds only to `127.0.0.1`, prints a private tokenized URL, sends no-cache
+headers, bounds requests and read time, merges non-overlapping external edits,
+and rejects stale or conflicting source changes instead of silently
+overwriting them. Use `--port 8787` to choose a loopback port; the default
+selects one automatically.
 
 `config export`, `diff`, and `doctor` read only the authoritative Lua source
 and offer deterministic terminal-safe text or JSON where applicable. `config

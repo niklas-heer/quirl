@@ -625,6 +625,9 @@ local config = quirl.config {
 }
 ```
 
+ADR 0013 later adds bounded built-in and custom semantic themes as config
+schema v3; v0/v1/v2 documents migrate to the Tokyo Night default.
+
 `ui.surface = "auto"` applies the §9 probe. Everything else in the frame
 derives from existing config (keymap, picker layout, prompt segments,
 symbols).

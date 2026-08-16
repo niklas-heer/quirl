@@ -1,0 +1,44 @@
+# ADR 0015: The local configuration form previews validated theme data
+
+- Status: Accepted
+- Date: 2026-08-16
+- Extends: [ADR 0013](0013-lua-config-themes.md)
+
+## Context
+
+ADR 0013 makes built-in and custom semantic palettes authoritative in Lua
+configuration. The loopback-only configuration form could select a theme by
+name, but a plain text field made comparison difficult and could not show how
+the same roles appear across prompt, syntax, hints, and status output.
+
+A separate web-only palette table would drift from the data applied by the
+terminal surfaces. Running Lua, JavaScript, plugins, or remote assets while
+rendering previews would also expand a deliberately narrow local boundary.
+
+## Decision
+
+`quirl config web` renders a no-JavaScript preview card for every built-in
+palette and every already-validated custom palette in the active configuration.
+Cards are derived from the same bounded `ThemeColors` records consumed by the
+Ratatui and Reedline surfaces. They use deterministic sample text and never
+execute Lua, shell commands, plugin callbacks, or remote content.
+
+Selecting a card uses the existing private token, request bounds, three-way
+merge, full-config validation, atomic replacement, and backup transaction.
+`NO_COLOR`, `TERM=dumb`, textual status, and non-interactive output remain
+authoritative; the preview does not imply that color is the only carrier of
+state.
+
+The gallery is bounded by the schema limits: 31 built-in palettes and at most
+32 custom palettes. Custom names and every color value have already crossed the
+deny-unknown, length-limited Lua boundary before HTML generation. All names are
+HTML-escaped even though validation restricts their alphabet.
+
+## Consequences
+
+- The local form previews the exact semantic data that the shell applies.
+- A custom palette must first exist in `config.lua`; the form selects and
+  previews it but does not create an unvalidated second representation.
+- Adding or renaming built-ins remains a reviewed config-protocol change.
+- The gallery remains useful without granting script execution or network
+  access.

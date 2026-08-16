@@ -1,8 +1,8 @@
 use clap::{Subcommand, ValueEnum};
 use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
 use quirl_lua::{
-    builtin_theme_names, format_source, LuaPolicy, LuaRuntime, QuirlConfig, CONFIG_SCHEMA_VERSION,
-    MAX_LUA_SOURCE_BYTES, MAX_THEME_NAME_BYTES,
+    builtin_theme, builtin_theme_names, format_source, LuaPolicy, LuaRuntime, QuirlConfig,
+    ThemeColors, CONFIG_SCHEMA_VERSION, MAX_LUA_SOURCE_BYTES, MAX_THEME_NAME_BYTES,
 };
 use serde::Serialize;
 use std::{
@@ -1033,14 +1033,49 @@ impl HttpResponse {
     }
 }
 
+fn render_theme_card(name: &str, colors: &ThemeColors, selected_theme: &str) -> String {
+    let checked = if name == selected_theme {
+        " checked"
+    } else {
+        ""
+    };
+    format!(
+        "<label class=\"theme-card\" style=\"--bg:{background};--command:{command};--data:{data};--context:{context};--secondary:{secondary};--string:{string};--dim:{dim};--error:{error};--warning:{warning}\"><input type=\"radio\" name=\"ui_theme\" value=\"{id}\"{checked}><span class=\"theme-name\">{display_name}</span><span class=\"terminal\"><span class=\"term-context\">~/src/quirl</span> <span class=\"term-secondary\">on main dirty</span><br><span class=\"term-command\">$ git</span> <span class=\"term-context\">status</span> <span class=\"term-string\">--short</span><br><span class=\"term-dim\">Alt-M mode | Ctrl-R history</span> <span class=\"term-error\">status:1</span></span></label>",
+        background = html_escape(&colors.status_background),
+        command = html_escape(&colors.accent_command),
+        data = html_escape(&colors.accent_data),
+        context = html_escape(&colors.context_primary),
+        secondary = html_escape(&colors.context_secondary),
+        string = html_escape(&colors.string),
+        dim = html_escape(&colors.muted),
+        error = html_escape(&colors.error),
+        warning = html_escape(&colors.warning),
+        id = html_escape(name),
+        display_name = html_escape(name),
+    )
+}
+
+fn render_theme_cards(config: &QuirlConfig) -> String {
+    let builtins = builtin_theme_names()
+        .filter_map(|name| builtin_theme(name).map(|colors| (name.to_owned(), colors)));
+    let custom = config
+        .ui
+        .themes
+        .iter()
+        .map(|(name, colors)| (name.clone(), colors.clone()));
+    let cards = builtins
+        .chain(custom)
+        .map(|(name, colors)| render_theme_card(&name, &colors, &config.ui.theme))
+        .collect::<String>();
+    format!(
+        "<fieldset><legend>Theme</legend><p>Preview the 31 bounded built-in palettes and any custom palettes already defined in <code>config.lua</code>. <code>NO_COLOR</code> remains authoritative.</p><div class=\"theme-grid\">{cards}</div></fieldset>"
+    )
+}
+
 fn render_form(session: &WebSession, notice: Option<&str>) -> String {
     let config = &session.config;
     let selected = |value: &str, option: &str| if value == option { " selected" } else { "" };
-    let theme_options = builtin_theme_names()
-        .map(str::to_owned)
-        .chain(config.ui.themes.keys().cloned())
-        .map(|name| format!("<option value=\"{}\"></option>", html_escape(&name)))
-        .collect::<String>();
+    let theme_cards = render_theme_cards(config);
     let notice = notice.map_or_else(String::new, |message| {
         format!(
             "<p role=\"status\" aria-live=\"polite\">{}</p>",
@@ -1051,18 +1086,19 @@ fn render_form(session: &WebSession, notice: Option<&str>) -> String {
         "<!doctype html>
 <html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <meta name=\"referrer\" content=\"no-referrer\"><title>Quirl configuration</title>
-<style>body{{font:1rem system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem}}fieldset{{margin:1rem 0;padding:1rem}}label{{display:block;margin:.75rem 0}}input,select,textarea{{font:inherit;max-width:100%;width:24rem}}textarea{{height:7rem}}button{{font:inherit;padding:.5rem 1rem}}[role=status]{{padding:.75rem;background:#eef}}</style></head>
-<body><main><h1>Quirl configuration</h1><p><code>config.lua</code> is the source of truth. Saves validate Lua, retain a <code>.bak</code>, and refuse concurrent edits.</p>{notice}
-<form method=\"post\" action=\"/\"><input type=\"hidden\" name=\"csrf\" value=\"{token}\"><input type=\"hidden\" name=\"revision\" value=\"{revision}\">
+<style>:root{{color-scheme:dark}}*{{box-sizing:border-box}}body{{font:1rem system-ui,sans-serif;max-width:72rem;margin:0 auto;padding:2rem 1rem 5rem;background:#101014;color:#ededf2}}main>p{{color:#a9a9b3}}code{{color:#b9a8ff}}fieldset{{margin:1.25rem 0;padding:1.25rem;border:1px solid #383842;border-radius:.8rem;background:#18181e}}legend{{font-weight:700;padding:0 .4rem}}label{{display:block;margin:.75rem 0}}select,input,textarea,button{{font:inherit}}select,input,textarea{{max-width:100%;width:26rem;padding:.45rem;border:1px solid #555563;border-radius:.4rem;background:#101014;color:#ededf2}}textarea{{height:7rem}}button{{padding:.7rem 1.2rem;border:0;border-radius:.45rem;background:#8f7cf7;color:#fff;font-weight:700;cursor:pointer}}[role=status]{{padding:.75rem;border-radius:.5rem;background:#29304a}}.theme-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(17rem,1fr));gap:.9rem}}.theme-card{{position:relative;margin:0;padding:.85rem;border:2px solid #3c3c45;border-radius:.7rem;cursor:pointer}}.theme-card:has(input:checked){{border-color:#b9a8ff;box-shadow:0 0 0 2px #6d58db}}.theme-card input{{position:absolute;width:1rem;right:.7rem;top:.3rem}}.theme-name{{display:block;margin:0 1.5rem .65rem 0;font-weight:700}}.terminal{{display:block;padding:.8rem;border-radius:.45rem;background:var(--bg);color:#ededf2;font:500 .82rem/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;overflow:hidden}}.terminal span{{white-space:nowrap}}.term-context{{color:var(--context)}}.term-secondary{{color:var(--secondary)}}.term-command{{color:var(--command);font-weight:700}}.term-data{{color:var(--data)}}.term-string{{color:var(--string)}}.term-dim{{color:var(--dim)}}.term-error{{color:var(--error)}}.term-warning{{color:var(--warning)}}@media(max-width:36rem){{body{{padding-top:1rem}}fieldset{{padding:.9rem}}}}</style></head>
+<body><main><h1>Make Quirl yours</h1><p><code>config.lua</code> is the source of truth. Preview a palette, then save through the bounded transaction that validates Lua, retains a <code>.bak</code>, and refuses concurrent edits.</p>{notice}
+<form method=\"post\" action=\"/\"><input type=\"hidden\" name=\"csrf\" value=\"{token}\"><input type=\"hidden\" name=\"revision\" value=\"{revision}\">{theme_cards}
 <fieldset><legend>Schema</legend><p>Version <output>{schema}</output> (managed by Quirl; not edited by this form).</p></fieldset>
 <fieldset><legend>Editor</legend><label for=\"editor-keymap\">Keymap <select id=\"editor-keymap\" name=\"editor_keymap\"><option value=\"emacs\"{key_emacs}>emacs — complete default</option><option value=\"vim\"{key_vim}>vim</option><option value=\"helix\"{key_helix}>helix — experimental</option></select></label><label for=\"editor-semantic-hints\">Semantic hints <select id=\"editor-semantic-hints\" name=\"editor_semantic_hints\"><option value=\"true\"{semantic_true}>true</option><option value=\"false\"{semantic_false}>false</option></select></label><label for=\"editor-banner\">Welcome <select id=\"editor-banner\" name=\"editor_banner\"><option value=\"full\"{banner_full}>full</option><option value=\"compact\"{banner_compact}>compact</option><option value=\"none\"{banner_none}>none</option></select></label></fieldset>
 <fieldset><legend>Picker</legend><label for=\"picker-layout\">Layout <select id=\"picker-layout\" name=\"picker_layout\"><option value=\"adaptive\"{layout_adaptive}>adaptive</option><option value=\"bottom\"{layout_bottom}>bottom</option><option value=\"full\"{layout_full}>full</option></select></label><label for=\"picker-preview\">Preview <select id=\"picker-preview\" name=\"picker_preview\"><option value=\"true\"{preview_true}>true</option><option value=\"false\"{preview_false}>false</option></select></label></fieldset>
 <fieldset><legend>Prompt</legend><label for=\"prompt-symbols\">Symbols <select id=\"prompt-symbols\" name=\"prompt_symbols\"><option value=\"auto\"{symbols_auto}>auto — safe Unicode</option><option value=\"plain\"{symbols_plain}>plain — ASCII only</option><option value=\"unicode\"{symbols_unicode}>unicode</option><option value=\"nerd_font\"{symbols_nerd_font}>Nerd Font / Powerline</option></select></label><p><strong>Nerd Font</strong> is an explicit opt-in and requires a patched terminal font. Auto never assumes one. Segment lists use one name per line.</p><label for=\"prompt-left\">Left <textarea id=\"prompt-left\" name=\"prompt_left\">{prompt_left}</textarea></label><label for=\"prompt-right\">Right <textarea id=\"prompt-right\" name=\"prompt_right\">{prompt_right}</textarea></label><label for=\"prompt-transient\">Transient prompt <select id=\"prompt-transient\" name=\"prompt_transient\"><option value=\"true\"{transient_true}>true</option><option value=\"false\"{transient_false}>false</option></select></label></fieldset>
-<fieldset><legend>Interactive surface</legend><label for=\"ui-theme\">Theme <input id=\"ui-theme\" name=\"ui_theme\" type=\"text\" list=\"ui-theme-options\" maxlength=\"{theme_name_bytes_max}\" value=\"{theme}\"><datalist id=\"ui-theme-options\">{theme_options}</datalist></label><label for=\"ui-surface\">Surface <select id=\"ui-surface\" name=\"ui_surface\"><option value=\"auto\"{surface_auto}>auto</option><option value=\"rich\"{surface_rich}>rich</option><option value=\"simple\"{surface_simple}>simple</option></select></label><label for=\"ui-statusline-hints\">Status-line hints <select id=\"ui-statusline-hints\" name=\"ui_statusline_hints\"><option value=\"true\"{statusline_true}>true</option><option value=\"false\"{statusline_false}>false</option></select></label></fieldset>
+<fieldset><legend>Interactive surface</legend><label for=\"ui-surface\">Surface <select id=\"ui-surface\" name=\"ui_surface\"><option value=\"auto\"{surface_auto}>auto</option><option value=\"rich\"{surface_rich}>rich</option><option value=\"simple\"{surface_simple}>simple</option></select></label><label for=\"ui-statusline-hints\">Status-line hints <select id=\"ui-statusline-hints\" name=\"ui_statusline_hints\"><option value=\"true\"{statusline_true}>true</option><option value=\"false\"{statusline_false}>false</option></select></label></fieldset>
 <fieldset><legend>Completion</legend><label for=\"completion-auto\">Open automatically <select id=\"completion-auto\" name=\"completion_auto\"><option value=\"true\"{completion_auto_true}>true</option><option value=\"false\"{completion_auto_false}>false</option></select></label><label for=\"completion-min-chars\">Minimum characters <input id=\"completion-min-chars\" name=\"completion_min_chars\" type=\"number\" min=\"0\" max=\"4096\" value=\"{completion_min_chars}\"></label></fieldset>
 <button type=\"submit\">Save configuration</button></form></main></body></html>",
         token = html_escape(&session.token),
         revision = html_escape(&source_revision(&session.source)),
+        theme_cards = theme_cards,
         schema = config.schema_version,
         key_helix = selected(&config.editor.keymap, "helix"),
         key_emacs = selected(&config.editor.keymap, "emacs"),
@@ -1085,9 +1121,6 @@ fn render_form(session: &WebSession, notice: Option<&str>) -> String {
         prompt_right = html_escape(&config.prompt.right.join("\n")),
         transient_true = selected(&config.prompt.transient.to_string(), "true"),
         transient_false = selected(&config.prompt.transient.to_string(), "false"),
-        theme = html_escape(&config.ui.theme),
-        theme_options = theme_options,
-        theme_name_bytes_max = MAX_THEME_NAME_BYTES,
         surface_auto = selected(&config.ui.surface, "auto"),
         surface_rich = selected(&config.ui.surface, "rich"),
         surface_simple = selected(&config.ui.surface, "simple"),
@@ -2779,7 +2812,12 @@ return config
 
     #[test]
     fn web_form_renders_the_complete_schema_without_a_second_store() {
-        let config = load_test_config();
+        let mut config = load_test_config();
+        let custom_colors = config.active_theme().unwrap();
+        config
+            .ui
+            .themes
+            .insert("custom-preview".to_owned(), custom_colors);
         let session = WebSession {
             token: "private".to_owned(),
             source: example_source().to_owned(),
@@ -2792,10 +2830,12 @@ return config
         assert!(page.contains("picker_layout"));
         assert!(page.contains("prompt_left"));
         assert!(page.contains("ui_theme"));
-        assert!(page.contains("value=\"tokyo-night\""));
-        assert!(page.contains("ui-theme-options"));
+        assert!(page.contains("value=\"tokyo-night\" checked"));
+        assert!(page.contains("class=\"theme-grid\""));
+        assert!(page.contains("class=\"terminal\""));
         assert!(page.contains("value=\"dracula\""));
         assert!(page.contains("value=\"solarized-dark\""));
+        assert!(page.contains("value=\"custom-preview\""));
         assert!(page.contains("ui_surface"));
         assert!(page.contains("completion_min_chars"));
         assert!(!page.contains("Cache-Control"));

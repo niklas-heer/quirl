@@ -901,7 +901,11 @@ pub fn builtin_theme_names() -> impl ExactSizeIterator<Item = &'static str> {
     BUILTIN_THEMES.iter().map(|theme| theme.name)
 }
 
-fn builtin_theme(name: &str) -> Option<ThemeColors> {
+/// Resolve one built-in palette by its stable lowercase name.
+///
+/// Custom palettes are configuration-owned and are therefore not returned by
+/// this catalog lookup.
+pub fn builtin_theme(name: &str) -> Option<ThemeColors> {
     BUILTIN_THEMES
         .iter()
         .find(|theme| theme.name == name)
