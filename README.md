@@ -59,7 +59,7 @@ The repository pins Rust 1.88.0 through `rust-toolchain.toml`. No system Lua
 installation is required.
 
 ```console
-git clone https://github.com/niklasheer/quirl.git
+git clone https://github.com/niklas-heer/quirl.git
 cd quirl
 cargo run -p quirl-cli
 ```
@@ -80,10 +80,14 @@ For requirements and a guided first session, see the website's
 
 ## Status
 
-Quirl 0.1 runs end to end as a Unix release candidate. The native C1-core
-command subset, typed data runtime, Lua authoring stack, permission-locked
-plugins, language service, semantic catalog, terminal surfaces, process
-lifecycle, recovery, and compatibility contracts are implemented and tested.
+The integrated 0.1 candidate implementation has native C1-core command
+execution on Linux and macOS; a bounded, focused typed-data runtime; a
+restricted Lua 5.4 runner and SDK; permission-locked trusted-Lua plugin command
+dispatch; a semantic catalog and language service; and rich/simple terminal
+surfaces with explicit process and recovery boundaries. These behaviors have
+repository tests, but this commit is not a measured or tagged release artifact.
+The runtime contracts live in `Catalog::builtin()` and `HOST_API`; the generated
+references and website are projections, not competing specifications.
 
 Config schema v3 includes 30 curated dark themes plus `ansi`, and accepts
 bounded custom semantic palettes shared by both terminal surfaces. Tokyo Night
@@ -100,8 +104,9 @@ Important current limits:
   control forms remain explicit reference-shell islands.
 - Windows interactive terminal behavior is outside the 0.1 release gate.
 
-The remaining candidate work is to refresh the named performance record against
-the exact release artifact and complete the human
+The checked-in performance record is historical evidence for its named commit
+and digest, not evidence for this candidate. Remaining release work includes
+refreshing that record against the exact artifact and completing the human
 [release checklist](docs/release-checklist.md).
 
 | Platform | Support level | Promise |
@@ -127,7 +132,7 @@ It includes:
 From `website/`, run:
 
 ```console
-npm install
+npm ci
 npm run dev
 ```
 
@@ -135,6 +140,8 @@ npm run dev
 LuaLS stubs, examples, or the protocol-freeze fixture changes. See
 [`website/README.md`](website/README.md) for the website maintenance workflow,
 including `npm run sync:reference` for the compiled CLI and Lua API pages.
+Use `npm run check` for the non-mutating website release gate; it checks mirror
+freshness, lint, types, and the production build using `package-lock.json`.
 
 ## Contributing
 

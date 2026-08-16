@@ -3,6 +3,31 @@
 Quirl has two deliberately connected documentation layers. They serve different
 consumers, and each has one authoritative source.
 
+## Truth and evidence hierarchy
+
+When sources disagree, use this order rather than copying the most attractive
+claim into another document:
+
+1. The engineering contract and accepted ADRs define enduring ownership,
+   support, safety, and release-policy decisions. Proposed ADRs remain proposals
+   and do not describe delivered behavior.
+2. Runtime canonical sources define executable interfaces: `Catalog::builtin()`
+   for commands and `HOST_API` for Lua. Their generated SDK/catalog outputs are
+   projections, never independent contracts.
+3. Integrated implementation and behavioral tests establish what the current
+   source tree actually does. User-facing prose must not outrun them.
+4. README, changelog, guides, and website entry pages are user-facing
+   projections of the first three levels. Website mirrors are generated from
+   repository sources and must not be edited by hand.
+5. Benchmarks, recordings, and release reports are exact-artifact evidence.
+   Their result applies only to the recorded revision, digest, environment, and
+   method; it never transfers automatically to a later candidate.
+
+`docs/language-design.md` deliberately contains two kinds of material: its
+current-implementation contract is explicitly labeled, while its remaining
+sections preserve labeled long-term direction and illustrative designs. Neither
+historical research nor future direction can be used as a current release claim.
+
 ## Rust API documentation
 
 Public Rust APIs use ordinary Rust doc comments: `//!` for crates and modules,
@@ -54,6 +79,23 @@ Clap doc comments remain short parser-facing navigation text. Full command
 contracts belong only in the catalog. Changing a catalog record automatically
 updates every catalog consumer; changing `HOST_API` requires
 `cargo xtask sdk` to refresh the checked-in Lua stub.
+
+## Website mirrors and release validation
+
+The website's canonical Markdown mirrors are produced only by
+`website/scripts/sync-docs.mjs`; compiled catalog and Lua reference pages are
+produced only by `website/scripts/sync-generated-reference.mjs`. Never repair a
+generated MDX page directly. Run the appropriate sync command, review the
+canonical source and generated diff, then run both syncs a second time to prove
+byte idempotence.
+
+With dependencies installed by the lock-preserving `npm ci --prefix website`,
+`npm --prefix website run check:generated` is the deterministic, non-mutating
+freshness check. `npm --prefix website run check` adds lint, Next route type
+checking, and the production build. `cargo xtask website-check` exposes that
+website gate explicitly, and `cargo xtask release-gate` runs it as part of the
+release workflow; `cargo xtask check` intentionally remains Rust-focused and
+does not require Node.
 
 ## Adding or changing an interface
 

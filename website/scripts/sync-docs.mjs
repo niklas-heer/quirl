@@ -1,11 +1,4 @@
-import {
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -97,7 +90,7 @@ function rewriteLinks(markdown, sourcePath) {
 
 function historicalNotice(sourcePath) {
   if (sourcePath === 'docs/benchmarks/release-v1.0.md') {
-    return '> **Release evidence:** This is the current named performance record for the 0.1 release candidate.\n\n';
+    return '> **Historical artifact evidence:** This record applies only to its named commit and artifact. It is not evidence for the current candidate.\n\n';
   }
 
   if (sourcePath.startsWith('docs/benchmarks/')) {
@@ -126,38 +119,74 @@ function renderDocument(sourcePath) {
 const previousFiles = existsSync(manifestPath)
   ? JSON.parse(readFileSync(manifestPath, 'utf8'))
   : [];
+const arguments_ = process.argv.slice(2);
+const checkMode = arguments_.includes('--check');
+
+if (arguments_.some((argument) => argument !== '--check')) {
+  throw new Error('usage: node scripts/sync-docs.mjs [--check]');
+}
+
+const driftedFiles = [];
+const staleFiles = [];
+
+function writeOrCheck(target, contents) {
+  if (checkMode) {
+    if (!existsSync(target) || readFileSync(target, 'utf8') !== contents) {
+      driftedFiles.push(relative(repositoryRoot, target));
+    }
+    return;
+  }
+
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, contents);
+}
+
+const expectedGeneratedFiles = new Set(documents.map(([, targetPath]) => targetPath));
 
 for (const previousFile of previousFiles) {
   const absoluteTarget = join(contentRoot, previousFile);
-  if (!existsSync(absoluteTarget)) continue;
+  if (!existsSync(absoluteTarget) || expectedGeneratedFiles.has(previousFile)) continue;
   const contents = readFileSync(absoluteTarget, 'utf8');
-  if (contents.slice(0, 500).includes(generatedBanner)) rmSync(absoluteTarget);
+  if (!contents.slice(0, 500).includes(generatedBanner)) continue;
+
+  if (checkMode) {
+    staleFiles.push(relative(repositoryRoot, absoluteTarget));
+  } else {
+    rmSync(absoluteTarget);
+  }
 }
 
 for (const [sourcePath, targetPath] of documents) {
   const absoluteTarget = join(contentRoot, targetPath);
-  mkdirSync(dirname(absoluteTarget), { recursive: true });
-  writeFileSync(absoluteTarget, renderDocument(sourcePath));
+  writeOrCheck(absoluteTarget, renderDocument(sourcePath));
 }
 
 const publicReference = join(websiteRoot, 'public', 'reference');
-mkdirSync(publicReference, { recursive: true });
-copyFileSync(
-  join(repositoryRoot, 'docs', 'protocol-freeze-v1.json'),
+writeOrCheck(
   join(publicReference, 'protocol-freeze-v1.json'),
+  readFileSync(join(repositoryRoot, 'docs', 'protocol-freeze-v1.json'), 'utf8'),
 );
-copyFileSync(join(repositoryRoot, 'docs', 'quirl.lua'), join(publicReference, 'quirl.lua'));
+writeOrCheck(
+  join(publicReference, 'quirl.lua'),
+  readFileSync(join(repositoryRoot, 'docs', 'quirl.lua'), 'utf8'),
+);
 
 const publicExamples = join(websiteRoot, 'public', 'examples');
-mkdirSync(publicExamples, { recursive: true });
 for (const example of ['config.lua', 'hello.lua', 'lua_tests.lua', 'plugin.lua']) {
-  copyFileSync(join(repositoryRoot, 'examples', example), join(publicExamples, example));
+  writeOrCheck(
+    join(publicExamples, example),
+    readFileSync(join(repositoryRoot, 'examples', example), 'utf8'),
+  );
 }
 
-mkdirSync(dirname(manifestPath), { recursive: true });
-writeFileSync(
+writeOrCheck(
   manifestPath,
   `${JSON.stringify(documents.map(([, targetPath]) => targetPath), null, 2)}\n`,
 );
 
-console.log(`Synced ${documents.length} documentation sources.`);
+if (driftedFiles.length > 0 || staleFiles.length > 0) {
+  const files = [...driftedFiles, ...staleFiles].join(', ');
+  throw new Error(`generated website files are stale: ${files}; run npm run sync:docs`);
+}
+
+console.log(`${checkMode ? 'Checked' : 'Synced'} ${documents.length} documentation sources.`);

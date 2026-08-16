@@ -17,7 +17,8 @@ Notable user-visible changes to Quirl are recorded here. The format follows
 - One sandboxed Lua 5.4 SDK for configuration, scripts, prompt segments,
   completions, tests, and trusted in-process plugins.
 - Permission-locked plugin packages, typed extension events, live views,
-  recovery records, and bounded out-of-process adapter initialization.
+  recovery records, bounded out-of-process adapter initialization, and typed
+  trusted-Lua plugin command dispatch.
 - Plain, Unicode, and opt-in Nerd Font prompt profiles with `NO_COLOR` and
   `TERM=dumb` fallbacks.
 - A Ratatui inline surface selected by default on capable TTYs, with a
@@ -45,10 +46,14 @@ Notable user-visible changes to Quirl are recorded here. The format follows
 - The capable-TTY default is now the rich Ratatui inline frame. Reedline remains
   the explicit and automatic simple-terminal fallback; its removal is not part
   of this change.
-- Advanced the pre-release config contract to v2 for `prompt.transient`,
-  `ui.surface`, `ui.statusline.hints`, `completion.auto`, and
-  `completion.min_chars`. Legacy unversioned v0 and explicit v1 config migrate
-  to v2 defaults before validation; future versions fail closed.
+- Advanced the pre-release config contract to v3. It retains the v2 rich-surface
+  settings and adds validated shared semantic themes; unversioned v0 and
+  explicit v1/v2 configurations migrate to v3 defaults before validation, while
+  future versions fail closed.
+- Added a release-only website gate with non-mutating generated-mirror
+  freshness, lint, route type checking, and a production build. It uses the
+  exact `website/package-lock.json` dependency graph and is not part of narrow
+  Rust-only checks.
 
 ### Known limitations
 
@@ -61,6 +66,8 @@ Notable user-visible changes to Quirl are recorded here. The format follows
 - The rich and Reedline editor cores intentionally coexist. Rich-keymap parity,
   named real-terminal evidence, and a replacement minimal fallback are required
   before Reedline can be removed.
+- The checked-in performance record applies only to commit `c5a8d757` and its
+  named artifact. A current candidate needs fresh measured release evidence.
 
 The first version entry will be cut only after the exact candidate passes the
 [release checklist](docs/release-checklist.md). Until then, everything above is

@@ -3,9 +3,10 @@ title: Architecture
 description: The product specification, crate layering, runtime boundaries, and accepted design decisions.
 ---
 
-Quirl keeps dependency direction one-way: foundation crates define contracts,
-data and Lua sit on core, UI composes those lower layers, and the CLI is the only
-crate that sees the entire system.
+Quirl keeps dependency direction one-way. `quirl-catalog`, `quirl-core`, and
+`quirl-syntax` are foundation peers; the complete allowed crate graph and
+process ownership live in accepted ADR 0016. The CLI is the only product
+composition root that sees every layer.
 
 <Cards>
   <Card title="Product and language design" href="/docs/architecture/product-and-language-design" />

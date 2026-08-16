@@ -8,7 +8,7 @@ the documentation mirror is designed for frequent updates.
 ## Develop locally
 
 ```sh
-npm install
+npm ci
 npm run dev
 ```
 
@@ -39,13 +39,22 @@ code until a Shiki grammar is available. `sync:reference` is intentionally
 manual because it compiles Quirl, then regenerates the CLI catalog and Lua API
 pages from the installed Rust definitions.
 
+`npm run check:generated` is non-mutating: it renders both mirror classes in
+memory and fails if any tracked output would change. Use it in reviews and
+release gates; use the two sync commands only when intentionally updating
+canonical-source projections.
+
 ## Validate
 
 ```sh
-npm run lint
-npm run types:check
-npm run build
+npm ci
+npm run check
 ```
+
+`npm run check` verifies generated-mirror freshness, lint, route type checking,
+and a production build without rewriting tracked files. It uses the exact
+dependency graph in `package-lock.json`; do not substitute `npm install` for
+release validation.
 
 Set `NEXT_PUBLIC_SITE_URL` to the canonical production origin when deployment is
 configured. Until then, metadata uses the local development origin and makes no

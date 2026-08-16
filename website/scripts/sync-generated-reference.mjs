@@ -1,12 +1,18 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const websiteRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryRoot = resolve(websiteRoot, '..');
 const outputBytesMax = 8 * 1024 * 1024;
 const timeoutMs = 120_000;
+const arguments_ = process.argv.slice(2);
+const checkMode = arguments_.includes('--check');
+
+if (arguments_.some((argument) => argument !== '--check')) {
+  throw new Error('usage: node scripts/sync-generated-reference.mjs [--check]');
+}
 
 const references = [
   {
@@ -25,10 +31,10 @@ const references = [
   },
 ];
 
-function generate(arguments_) {
+function generate(commandArguments) {
   const result = spawnSync(
     'cargo',
-    ['run', '--quiet', '-p', 'quirl-cli', '--', ...arguments_],
+    ['run', '--quiet', '-p', 'quirl-cli', '--', ...commandArguments],
     {
       cwd: repositoryRoot,
       encoding: 'utf8',
@@ -47,13 +53,27 @@ function generate(arguments_) {
   return result.stdout.replaceAll('\r\n', '\n').replace(/^#\s+.+\n+/, '').trim();
 }
 
+const driftedFiles = [];
+
 for (const reference of references) {
   const body = generate(reference.arguments);
   const target = join(websiteRoot, reference.target);
   const rendered = `---\ntitle: ${JSON.stringify(reference.title)}\ndescription: ${JSON.stringify(reference.description)}\n---\n\n{/* Generated from the compiled Quirl catalog. Run npm run sync:reference; do not edit this page by hand. */}\n\n${body}\n`;
 
-  mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, rendered);
+  if (checkMode) {
+    if (!existsSync(target) || readFileSync(target, 'utf8') !== rendered) {
+      driftedFiles.push(relative(repositoryRoot, target));
+    }
+  } else {
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, rendered);
+  }
 }
 
-console.log(`Generated ${references.length} compiled reference pages.`);
+if (driftedFiles.length > 0) {
+  throw new Error(
+    `generated website references are stale: ${driftedFiles.join(', ')}; run npm run sync:reference`,
+  );
+}
+
+console.log(`${checkMode ? 'Checked' : 'Generated'} ${references.length} compiled reference pages.`);

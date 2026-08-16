@@ -18,6 +18,7 @@ const DEFAULT_TEST_CASES: usize = 128;
 const DEFAULT_TEST_SEED: u64 = 7_640_891_576_956_012_809;
 const DEFAULT_SIMULATION_SESSIONS: usize = 256;
 const DEFAULT_SIMULATION_STEPS: usize = 8;
+const WEBSITE_CHECK_PROGRAM: &str = "npm";
 
 #[derive(Debug, Parser)]
 #[command(name = "cargo xtask", about = "Cargo-native Quirl development tasks")]
@@ -52,6 +53,8 @@ enum Task {
     },
     /// Build all public Rust API documentation with warnings denied.
     Docs,
+    /// Check website mirrors, lint, types, and a production build without rewriting sources.
+    WebsiteCheck,
     /// Explore replayable shell sessions against clean Bash and Zsh references.
     Simulate {
         /// Reproducible seed for the generated session swarm.
@@ -108,6 +111,7 @@ fn execute(cli: Cli) -> Result<(), Box<dyn Error>> {
         Task::Test { seed, cases } => task_test(&root, seed, cases),
         Task::Check { seed, cases } => task_check(&root, seed, cases),
         Task::Docs => task_docs(&root),
+        Task::WebsiteCheck => task_website_check(&root),
         Task::Simulate {
             seed,
             sessions,
@@ -184,6 +188,12 @@ fn task_docs(root: &Path) -> Result<(), Box<dyn Error>> {
     cmd!(sh, "cargo doc --workspace --no-deps")
         .env("RUSTDOCFLAGS", "-D warnings")
         .run()?;
+    Ok(())
+}
+
+fn task_website_check(root: &Path) -> Result<(), Box<dyn Error>> {
+    let sh = workspace_shell(root)?;
+    cmd!(sh, "{WEBSITE_CHECK_PROGRAM} --prefix website run check").run()?;
     Ok(())
 }
 
@@ -341,6 +351,7 @@ fn task_release_gate(root: &Path, expected_sha256: &str) -> Result<(), Box<dyn E
         "target/release/quirl-bench release --quirl target/release/quirl --expected-sha256 {expected_sha256}"
     )
     .run()?;
+    task_website_check(root)?;
     Ok(())
 }
 
@@ -427,5 +438,11 @@ mod tests {
             "7",
         ]);
         assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn website_check_is_an_explicit_task() {
+        assert!(Cli::try_parse_from(["cargo xtask", "website-check"]).is_ok());
+        assert_eq!(WEBSITE_CHECK_PROGRAM, "npm");
     }
 }

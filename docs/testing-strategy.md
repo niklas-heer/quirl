@@ -23,6 +23,7 @@ cases against each available reference shell, and runs guest-side Lua tests.
 | Adversarial and fault | Limits, cancellation, symlink checks, recovery, plugin integrity, and terminal escaping fail closed | Tests that cross every declared boundary |
 | Real PTY | Editing, deletion, mode changes, completion, wrapping, cursor queries, and Ctrl-D work through a terminal | PTY smoke and release matrix |
 | Guest runtime | Lua code sees the documented sandbox and API rather than Rust-only test shortcuts | `examples/lua_tests.lua` |
+| Website release gate | Mirrors match canonical sources, and the documentation site lints, type-checks, and builds | `npm --prefix website run check` / `cargo xtask website-check` |
 | Release evidence | Startup, repaint latency, retention, binary size, digest, and source identity meet budgets | `cargo xtask release-preview` and `release-gate` |
 
 ## Reproducing generated failures

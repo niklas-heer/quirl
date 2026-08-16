@@ -47,6 +47,10 @@ git log -1 --format='%h %s'
 
 - [ ] `cargo xtask check` passes with the pinned Rust 1.88 toolchain.
 - [ ] The generated Lua SDK has no diff after `cargo xtask sdk`.
+- [ ] Website dependencies were installed with `npm ci --prefix website` and
+  `cargo xtask website-check` passes. This non-mutating gate checks generated
+  mirror/reference freshness, lint, route type checking, and the production
+  build using the committed `website/package-lock.json`.
 - [ ] The deterministic product tour passes against the candidate binary.
 - [ ] The release binary and benchmark harness are built together from the
   clean candidate.
@@ -55,6 +59,8 @@ git log -1 --format='%h %s'
 cargo xtask check
 cargo xtask sdk
 git diff --exit-code -- docs/quirl.lua
+npm ci --prefix website
+cargo xtask website-check
 cargo xtask demo
 cargo xtask release-preview
 ```
@@ -127,8 +133,9 @@ target/release/quirl-bench release \
 ```
 
 `cargo xtask release-gate "$QUIRL_EXPECTED_SHA256"` is the concise enforcing form
-when the human-readable report is sufficient; use the direct command above to
-capture canonical JSON evidence.
+when the human-readable report is sufficient; it also runs the explicit website
+gate and therefore requires the locked website dependencies to be installed.
+Use the direct command above to capture canonical JSON evidence.
 
 - [ ] The harness accepts the clean revision embedded independently in both
   `quirl` and `quirl-bench`, their matching source identity, the artifact

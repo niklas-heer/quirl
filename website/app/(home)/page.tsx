@@ -18,7 +18,7 @@ export default function HomePage() {
         <div className="hero-copy">
           <div className="release-pill">
             <span className="release-dot" />
-            Unix release candidate · 0.1
+            Unreleased Unix candidate · 0.1
           </div>
           <p className="hero-kicker">A well-stirred shell.</p>
           <h1>Your shell, with a richer vocabulary.</h1>
@@ -187,10 +187,9 @@ export default function HomePage() {
           <p className="section-label">The foundation is here</p>
           <h2>Documentation for the project as it exists today.</h2>
           <p>
-            Quirl is an unreleased 0.1 Unix release candidate and a fast-moving
-            prototype. The docs include current usage, architecture, protocol
-            contracts, decisions, research, and release evidence so future
-            updates have one complete place to land.
+            Quirl is an unreleased 0.1 Unix candidate implementation and a
+            fast-moving prototype. The docs separate current usage and runtime
+            contracts from long-term direction and exact-artifact evidence.
           </p>
         </div>
         <Link href="/docs" className="button button-secondary">

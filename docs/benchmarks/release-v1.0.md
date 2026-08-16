@@ -1,4 +1,9 @@
-# 0.1.0 release performance record
+# Historical 0.1.0 release performance record
+
+> **Historical evidence only.** This record applies solely to commit
+> `c5a8d757a35a92a9a269686a1cd166c5a486e2b3` and the SHA-256-named artifact
+> below. It is not release evidence for the current candidate; a candidate must
+> be measured again from its exact clean source and artifact.
 
 **Measured:** 16 August 2026 at 00:49:55 UTC
 
