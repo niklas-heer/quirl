@@ -407,16 +407,37 @@ Target-adjacent familiarity matters: TypeScript and Python dominate broad popula
 ```lua
 #!/usr/bin/env -S quirl run
 ---@param ctx quirl.Context
----@return quirl.Result<quirl.Output, quirl.ShellError>
+---@return quirl.RunnerResult
 local function main(ctx)
-  local env = ctx.args:required("env")
-  local services = quirl.data.open("services.toml", quirl.schema.services)
-  if not services.ok then return services end
-  return quirl.process.run("deployctl", { "apply", "--env", env }, services.value)
+  if ctx.cancellation.is_cancelled() then
+    return {
+      abi_version = 1, ok = false,
+      error = {
+        code = "resource_limit", message = "deployment was cancelled",
+        help = { "Retry with a fresh execution request" },
+      },
+    }
+  end
+  return {
+    abi_version = 1, ok = true, status = 0,
+    output = {
+      kind = "value",
+      value = { type = "string", value = ctx.env.QUIRL_DEPLOY_ENV or ctx.args[1] },
+    },
+  }
 end
 
-return { main = main }
+return { abi_version = 1, main = main }
 ```
+
+Runner ABI v1 captures bounded arguments, a UTF-8 environment view, cwd, typed
+input/output intent, declared effects, and one shared cancellation identity.
+Results use the shared tagged value and structured `ShellError` representations.
+Only finite value batches of at most 512 items cross this ABI; live streams stay
+engine-owned and are never collected merely to fit a Lua or JSON table.
+Unversioned modules remain readable through the bounded v0 migration adapter,
+while unknown and future versions fail before `main` runs. ADR 0018 is the
+normative ABI and migration record.
 
 ```sh
 quirl check deploy.lua --format json
@@ -440,7 +461,7 @@ quirl run --lang zsh release.zsh
 | Contract | Decision |
 | --- | --- |
 | Annotated host capabilities | Rust schema emits runtime bindings, LuaLS stubs, completion metadata, docs, and AI schemas for prompt, commands, filesystem, process, network, data, and TUI. Schema hashes must match before code runs. |
-| One value ABI | `Value`, `Stream`, `Result`, and `ShellError` cross native commands, scripts, embedded code, and plugins. |
+| One value ABI | Shared tagged `Value`, bounded finite value batches, `Result`, and structured `ShellError` cross native commands, scripts, embedded code, and plugins; live streams remain engine-owned. |
 | Capability manifest | Packages declare effects; first use prompts once; CI can enforce lockfile policy. Untrusted packages run out of process or as WebAssembly. |
 | One Lua SDK | Configuration, scripts, and trusted plugins share one generated `quirl` module; the earlier prototype runtime is fully removed. |
 

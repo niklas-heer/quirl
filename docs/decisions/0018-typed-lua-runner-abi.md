@@ -1,0 +1,161 @@
+# ADR 0018: Version the typed Lua runner ABI
+
+- Status: Accepted
+- Date: 2026-08-16
+- Decision owners: Quirl maintainers
+- Extends: [ADR 0001](0001-lua-extension-language.md) and
+  [ADR 0017](0017-shared-execution-contract.md)
+
+## Context
+
+The Lua script runner historically treated a module's optional `main` callback
+as `main({ args = strings }) -> JSON`. The CLI created that VM on a cancellation
+flag unrelated to `ScriptCancellation`, the current directory and environment
+were ambient rather than captured, process errors used a string field, and an
+arbitrary returned table was converted to JSON before the shared execution
+contract saw it. That boundary could not preserve Quirl value kinds, distinguish
+a bounded finite batch from an unbounded stream, or round-trip `ShellError`.
+
+ADR 0017 introduced the passive execution request, cancellation, value, output,
+status, and outcome vocabulary but explicitly deferred the typed Lua ABI. This
+decision adopts that vocabulary at the Lua boundary without making Lua own
+processes or live streams and without exposing `mlua::Value` outside
+`quirl-lua`.
+
+## Failure model and invariants
+
+- Cancellation may already be set, may arrive while loading Lua, may arrive in
+  `main`, or may be observed by an injected process host. The runner context,
+  instruction hook, process host, and CLI script adapter use the same
+  `Arc<AtomicBool>`. Cancellation is a `ResourceLimit` `ShellError`, never a
+  successful status.
+- Environment size, working-directory bytes, argument count and bytes, input
+  bytes/value shape, returned value nodes/depth/text, finite stream values, and
+  every structured error field are bounded before crossing the owning boundary.
+- ABI v1 tables deny unknown fields. Lua-to-Rust results deserialize to private
+  typed wires, validate, and only then become `ExecutionOutcome` or
+  `ShellError`.
+- A successful result has one `i32` status and one typed value representation.
+  A failed result has one structured error and no status or output. Mixed or
+  incomplete envelopes fail validation.
+- Lua never transfers a raw VM value, callback, descriptor, child, or live
+  stream. A finite `ExecutionOutput::Values` batch is capped at 512 values and
+  remains subject to the stricter aggregate Lua-return and shared-value bounds.
+- `ShellError` text rejects terminal controls, field and collection counts are
+  capped, aggregate retained bytes are capped, and labels validate ordered UTF-8
+  byte spans. Unknown fields fail closed.
+- Every VM retains the P05 restricted standard library, allocator ceiling,
+  instruction budget, deadline, registration bounds, callback return bounds,
+  and capability checks. This ABI grants no authority.
+
+## Decision
+
+### ABI identity
+
+`quirl-lua` owns `LUA_RUNNER_ABI_VERSION`,
+`LUA_RUNNER_OLDEST_READABLE_ABI_VERSION`, and the canonical
+`LUA_RUNNER_ABI_DESCRIPTOR`. Version 1 is current. The descriptor includes the
+module, context, result, error, stream, migration, and fail-closed rules and has
+a deterministic fingerprint exported in the generated SDK document.
+
+An ABI v1 module returns exactly this header:
+
+```lua
+return {
+  abi_version = 1,
+  main = function(ctx)
+    -- Return one typed result envelope.
+  end,
+}
+```
+
+Only `abi_version` and `main` are accepted module fields. A missing or explicit
+version zero enters the legacy migration path. Any other version fails before
+`main` runs.
+
+### Runner context
+
+`main` receives an immutable context with:
+
+- `abi_version = 1`;
+- bounded `args` in source order;
+- a bounded UTF-8 `env` snapshot;
+- the UTF-8 `cwd` captured before module evaluation;
+- the shared deny-unknown `ExecutionInput` representation;
+- the requested shared `ExecutionOutputTarget` representation;
+- `cancellation.is_cancelled()`, backed by the shared atomic flag; and
+- the fixed list of declared `ExecutionEffect` names.
+
+The CLI captures this context before invoking Lua. `quirl.cwd()` remains a host
+convenience for existing callbacks, but runner code should use `ctx.cwd` when it
+needs the request-stable working directory.
+
+### Typed result and error
+
+ABI v1 `main` returns a deny-unknown envelope:
+
+```lua
+return {
+  abi_version = 1,
+  ok = true,
+  status = 0,
+  output = {
+    kind = "value",
+    value = { type = "string", value = "complete" },
+  },
+}
+```
+
+The output is the serialized shared `ExecutionOutput`; ABI v1 accepts only
+`value` and bounded finite `values`. Byte capture and inherited sinks are owned
+by other adapters and are rejected here.
+
+A failure returns `ok = false` and one structured `ShellError` containing the
+stable `ErrorCode`, message, optional validated labels, context, help, command,
+and exit status. It must not also contain status or output. Rust validates and
+returns that error directly. `quirl.process.run` likewise exposes a structured
+error on non-zero status and keeps captured stderr in a separate bounded
+`stderr` field.
+
+### Migration and compatibility
+
+An unversioned module, or one declaring version zero, may keep its historical
+optional `main` callback and arbitrary JSON-compatible return value. It receives
+the richer context, so `ctx.args` remains compatible. Rust applies the existing
+Lua return-shape limits, validates the optional legacy `status`, converts the
+JSON-compatible value to `StructuredValue`, validates the shared bounds, and
+returns a current `ExecutionOutcome`.
+
+This migration cannot create effects, capabilities, live streams, or missing
+type distinctions. Domain-specific JSON strings remain strings. ABI v1 is
+required when a script needs typed paths, sizes, durations, dates, patterns,
+structured errors, or finite value batches.
+
+Removal of version-zero readability requires a later accepted decision and a
+tested fail-closed transition. Future versions always fail closed until their
+reader, fixtures, migration policy, generated SDK, and descriptor land
+together.
+
+### Generated bindings
+
+`HOST_API` remains the function source of truth. Runtime tests enumerate every
+installed `quirl` function and require an exact match with `HOST_API`, including
+the declared primary capability checks. `sdk_lua`, `sdk_json`, and
+`sdk_markdown` generate the runner types, ABI version/fingerprint, structured
+process result, and function signatures from the same Rust source. The checked-
+in `docs/quirl.lua` is regenerated only by `cargo xtask sdk` and compared byte
+for byte in tests.
+
+## Consequences
+
+- Lua scripts can preserve the shared typed values, status, cancellation, and
+  error model without collecting a live stream or stringifying a diagnostic.
+- Existing scripts remain usable through one explicit bounded migration path.
+- Environment-heavy or non-UTF-8 process states may now fail before Lua starts;
+  this is preferable to silently truncating or lossy conversion.
+- The v1 tagged value syntax is more verbose than arbitrary Lua tables. The
+  generated SDK makes it discoverable, and future ergonomic constructors may be
+  added only if they preserve this descriptor and the same validation boundary.
+- Live pull streams remain engine-owned. A later streaming ABI requires a new
+  versioned handle protocol with backpressure, cancellation, cleanup ownership,
+  and its own accepted decision.

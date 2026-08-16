@@ -1,12 +1,15 @@
 use clap::ValueEnum;
-use quirl_core::{escape_json_terminal_controls, ErrorCode, ShellError};
+use quirl_core::{
+    escape_json_terminal_controls, ErrorCode, ExecutionEffect, ExecutionEffects, ExecutionInput,
+    ExecutionOutput, ExecutionOutputTarget, ShellError,
+};
 use quirl_data::{
     syntax::{
         format_data_expression, parse_data_expression, DataSyntaxDiagnosticKind, DataSyntaxLimits,
     },
     DataRuntime,
 };
-use quirl_lua::{format_file, LuaPolicy, LuaRuntime, MAX_LUA_SOURCE_BYTES};
+use quirl_lua::{format_file, LuaPolicy, LuaRunnerContext, LuaRuntime, MAX_LUA_SOURCE_BYTES};
 use quirl_process::{sandboxed_process_host, ChildProcessTree, NativeExecutor};
 use quirl_syntax::{check_script, parse_command_list};
 use quirl_ui::render_error;
@@ -546,22 +549,25 @@ pub fn run(
     let path = (file != Path::new("-")).then_some(file);
     let language = detect_language(&source, path, requested_language)?;
     let cancellation = ScriptCancellation::default();
-    let signal_id = matches!(language, ScriptLanguage::Bash | ScriptLanguage::Zsh)
-        .then(|| {
-            signal_hook::flag::register(
-                signal_hook::consts::SIGINT,
-                Arc::clone(&cancellation.cancelled),
+    let signal_id = matches!(
+        language,
+        ScriptLanguage::Lua | ScriptLanguage::Bash | ScriptLanguage::Zsh
+    )
+    .then(|| {
+        signal_hook::flag::register(
+            signal_hook::consts::SIGINT,
+            Arc::clone(&cancellation.cancelled),
+        )
+        .map_err(|error| {
+            ShellError::new(
+                ErrorCode::Io,
+                "could not install script cancellation handler",
             )
-            .map_err(|error| {
-                ShellError::new(
-                    ErrorCode::Io,
-                    "could not install script cancellation handler",
-                )
-                .with_context(error.to_string())
-                .with_help("Retry the script; report repeated signal-handler failures")
-            })
+            .with_context(error.to_string())
+            .with_help("Retry the script; report repeated signal-handler failures")
         })
-        .transpose()?;
+    })
+    .transpose()?;
     let result = run_source_with_cancellation(
         &source,
         &source_name,
@@ -656,10 +662,33 @@ pub fn run_source_with_cancellation(
     let language = detect_language(source, path, requested_language)?;
     match language {
         ScriptLanguage::Lua => {
-            let runtime =
-                LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
-            let value = runtime.run_source(source, source_name, arguments)?;
-            let status = structured_status(&value)?;
+            let runtime = LuaRuntime::new_with_process_host_and_cancellation(
+                LuaPolicy::script(),
+                sandboxed_process_host(),
+                Arc::clone(&cancellation.cancelled),
+            )?;
+            let context = LuaRunnerContext::from_current_process(
+                arguments,
+                ExecutionInput::None,
+                ExecutionOutputTarget::Value,
+                ExecutionEffects::from_effects(&[ExecutionEffect::SpawnProcess]),
+                Arc::clone(&cancellation.cancelled),
+            )?;
+            let outcome = runtime.run_source_with_context(source, source_name, &context)?;
+            let status = outcome.status_code();
+            let value = match outcome.output {
+                ExecutionOutput::Value { value } => value.json_value(),
+                ExecutionOutput::Values { values } => {
+                    Value::Array(values.into_iter().map(|value| value.json_value()).collect())
+                }
+                ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => {
+                    return Err(ShellError::new(
+                        ErrorCode::Validation,
+                        "Lua runner returned non-value output to the script front door",
+                    )
+                    .with_help("Return a typed value or bounded finite value batch"));
+                }
+            };
             Ok(ScriptRunOutput { status, value })
         }
         ScriptLanguage::Quirl => run_quirl_source(source, source_name, arguments),
@@ -860,26 +889,6 @@ fn unsupported_shebang_language(language: &str) -> ShellError {
         format!("script shebang requests unsupported language `{language}`"),
     )
     .with_help("Use `--lang bash` or `--lang zsh`; generic `sh` remains intentionally ambiguous")
-}
-
-fn structured_status(value: &Value) -> Result<i32, ShellError> {
-    let Some(status) = value.get("status") else {
-        return Ok(0);
-    };
-    let Some(status) = status.as_i64() else {
-        return Err(ShellError::new(
-            ErrorCode::Validation,
-            "script result status must be an integer",
-        )
-        .with_help("Return `{ status = 0, ... }` or omit status from the Lua result"));
-    };
-    i32::try_from(status).map_err(|_| {
-        ShellError::new(
-            ErrorCode::Validation,
-            "script result status is outside the supported integer range",
-        )
-        .with_help("Return a status between -2147483648 and 2147483647")
-    })
 }
 
 fn run_reference_script(
@@ -1750,6 +1759,40 @@ mod tests {
         .unwrap();
         assert_eq!(output.value, json!({ "value": "argument" }));
         assert_eq!(output.status, 0);
+    }
+
+    #[test]
+    fn lua_typed_runner_preserves_status_and_value_output() {
+        let output = run_source(
+            r#"return { abi_version = 1, main = function(ctx)
+              return { abi_version = 1, ok = true, status = 23,
+                output = { kind = "value", value = { type = "string", value = ctx.args[1] } } }
+            end }"#,
+            "typed.lua",
+            None,
+            Some(ScriptLanguage::Lua),
+            &["typed-value".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(output.status, 23);
+        assert_eq!(output.value, json!("typed-value"));
+    }
+
+    #[test]
+    fn script_cancellation_is_the_lua_runtime_cancellation() {
+        let cancellation = ScriptCancellation::default();
+        cancellation.cancelled.store(true, Ordering::Relaxed);
+        let error = run_source_with_cancellation(
+            "return { abi_version = 1, main = function() error('must not run') end }",
+            "cancelled.lua",
+            None,
+            Some(ScriptLanguage::Lua),
+            &[],
+            &cancellation,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("before Lua module evaluation"));
     }
 
     #[test]

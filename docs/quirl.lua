@@ -1,9 +1,57 @@
 ---@meta quirl
 
+---@class quirl.ErrorLabel
+---@field source? string
+---@field start integer Inclusive UTF-8 byte offset.
+---@field end integer Exclusive UTF-8 byte offset.
+---@field message string
+
+---@alias quirl.ErrorCode 'invalid_command'|'invalid_argument'|'data'|'io'|'process_spawn'|'script_read'|'lua'|'validation'|'resource_limit'
+
+---@class quirl.ShellError
+---@field code quirl.ErrorCode
+---@field message string
+---@field labels? quirl.ErrorLabel[]
+---@field context? string[]
+---@field help? string[]
+---@field command? string
+---@field exit_status? integer
+
 ---@class quirl.Result
 ---@field ok boolean
 ---@field value? any
----@field error? string
+---@field error? quirl.ShellError
+
+---@class quirl.ProcessResult: quirl.Result
+---@field status integer
+---@field value string Captured stdout.
+---@field stderr string Captured stderr.
+
+---@alias quirl.ExecutionEffect 'read_filesystem'|'write_filesystem'|'spawn_process'|'change_directory'
+
+---@class quirl.CancellationContext
+---@field is_cancelled fun(): boolean Returns the shared cancellation flag without clearing it.
+
+---@class quirl.Context
+---@field abi_version 1
+---@field args string[] Bounded arguments in source order.
+---@field env table<string, string> Immutable bounded environment snapshot.
+---@field cwd string UTF-8 working directory captured before evaluation.
+---@field input table Shared deny-unknown ExecutionInput representation.
+---@field output table Shared value-only ExecutionOutputTarget representation.
+---@field cancellation quirl.CancellationContext
+---@field effects quirl.ExecutionEffect[] Effects declared before dispatch.
+
+---@class quirl.RunnerResult
+---@field abi_version 1
+---@field ok boolean
+---@field status? integer Required exactly when ok is true.
+---@field output? table Typed value or bounded finite values output; live streams are not transferable.
+---@field error? quirl.ShellError Required exactly when ok is false.
+
+---@class quirl.RunnerModule
+---@field abi_version 1
+---@field main fun(context: quirl.Context): quirl.RunnerResult
 
 ---@alias quirl.PromptSymbols 'auto'|'plain'|'unicode'|'nerd_font'
 ---@alias quirl.WelcomeBanner 'full'|'compact'|'none'
@@ -33,8 +81,8 @@
 ---@field border string #RRGGBB color for borders.
 ---@field status_background string #RRGGBB status background color.
 ---@field error string #RRGGBB error color.
----@field warning string #RRGGBB warning color.
----@field hint string #RRGGBB hint color.
+---@field warning string #RRGGBB color for warnings.
+---@field hint string #RRGGBB color for hints.
 ---@field string string #RRGGBB string syntax color.
 ---@field operator string #RRGGBB operator syntax color.
 ---@field expansion string #RRGGBB expansion syntax color.
@@ -107,7 +155,7 @@ function quirl.cwd() end
 
 ---Run a command through the composed bounded native process host.
 ---@param command string
----@return quirl.Result
+---@return quirl.ProcessResult
 function quirl.process.run(command) end
 
 ---Return configuration for Rust schema validation.

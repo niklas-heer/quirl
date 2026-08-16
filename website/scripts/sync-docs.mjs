@@ -60,6 +60,7 @@ const documents = [
   ['docs/decisions/0015-bounded-theme-preview-gallery.md', 'architecture/decisions/0015-bounded-theme-preview-gallery.mdx'],
   ['docs/decisions/0016-runtime-layering-contract.md', 'architecture/decisions/0016-runtime-layering-contract.mdx'],
   ['docs/decisions/0017-shared-execution-contract.md', 'architecture/decisions/0017-shared-execution-contract.mdx'],
+  ['docs/decisions/0018-typed-lua-runner-abi.md', 'architecture/decisions/0018-typed-lua-runner-abi.mdx'],
 ];
 
 const pageBySource = new Map(documents);

@@ -5,10 +5,13 @@ use mlua::{
     VmState,
 };
 use quirl_core::{
-    reject_json_terminal_controls, reject_terminal_controls, validate_contribution_set,
-    ContributionKind, ContributionRegistration, ErrorCode, EventKind, EventSubscription,
+    escape_terminal_controls, reject_json_terminal_controls, reject_terminal_controls,
+    validate_contribution_set, ContributionKind, ContributionRegistration, ErrorCode, ErrorLabel,
+    EventKind, EventSubscription, ExecutionCleanupState, ExecutionEffect, ExecutionEffects,
+    ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget, ExecutionStatus,
     ExtensionAction, ExtensionCapability, ExtensionEvent, ExtensionEventData, ProcessHost,
-    ProcessRequest, ShellError,
+    ProcessRequest, ShellError, StructuredValue, EXECUTION_ARGUMENTS_MAX,
+    EXECUTION_ARGUMENT_BYTES_MAX, EXECUTION_BYTES_MAX,
 };
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
@@ -48,6 +51,28 @@ const MAX_PANEL_FALLBACK_BYTES: usize = 16 * 1024;
 const MAX_REGISTRATION_INPUT_NODES: usize = 512;
 const MAX_REGISTRATION_INPUT_DEPTH: usize = 4;
 const MAX_REGISTRATION_INPUT_BYTES: usize = 64 * 1024;
+/// Current version of the typed Lua runner ABI supplied to `main`.
+pub const LUA_RUNNER_ABI_VERSION: u32 = 1;
+/// Oldest runner ABI accepted by the deterministic compatibility path.
+///
+/// Version zero is the historical unversioned `{ args = ... }` contract. It is
+/// accepted only as a bounded migration input and always produces the current
+/// shared execution outcome on the Rust side.
+pub const LUA_RUNNER_OLDEST_READABLE_ABI_VERSION: u32 = 0;
+/// Canonical structural descriptor for the Lua runner ABI and migration policy.
+pub const LUA_RUNNER_ABI_DESCRIPTOR: &str = "quirl.lua-runner@1{module{deny_unknown;abi_version:1;main:function;field_name_bytes=128};context{abi_version:1;args:array<string>(max=1024,bytes=1048576);env:map<string,string>(max=256,bytes=65536,utf8);cwd:string(bytes=4096,utf8);input:ExecutionInput(shared-bounds);output:ExecutionOutputTarget(value-only,shared-bounds);cancellation{is_cancelled:function,shared-atomic};effects:array<ExecutionEffect>(fixed)};result{deny_unknown;abi_version:1;ok:bool;status:i32?;output:ExecutionOutput?;error:ShellError?};error{deny_unknown;items_per_collection=32;field_bytes=16384;label_source_bytes=65536;total_bytes=262144;terminal_controls=rejected;utf8_spans=validated};streams:finite-ExecutionOutput.values(max=512,shared-value-bounds);live-stream-handles:rejected;migration:unversioned-or-v0-to-v1;future:fail-closed}";
+/// Maximum environment entries exposed to one Lua `main` invocation.
+pub const MAX_LUA_RUNNER_ENVIRONMENT_ENTRIES: usize = 256;
+/// Maximum aggregate UTF-8 bytes retained across Lua runner environment keys and values.
+pub const MAX_LUA_RUNNER_ENVIRONMENT_BYTES: usize = 64 * 1024;
+/// Maximum UTF-8 bytes retained for the Lua runner working directory.
+pub const MAX_LUA_RUNNER_CWD_BYTES: usize = 4 * 1024;
+/// Maximum values accepted in one finite Lua runner value batch.
+pub const MAX_LUA_RUNNER_STREAM_VALUES: usize = 512;
+const MAX_LUA_RUNNER_ERROR_ITEMS: usize = 32;
+const MAX_LUA_RUNNER_ERROR_FIELD_BYTES: usize = 16 * 1024;
+const MAX_LUA_RUNNER_ERROR_SOURCE_BYTES: usize = 64 * 1024;
+const MAX_LUA_RUNNER_ERROR_TOTAL_BYTES: usize = 256 * 1024;
 /// Maximum number of prompt callback declarations retained from one Lua plugin.
 pub const MAX_PLUGIN_PROMPT_SEGMENTS: usize = 64;
 /// Maximum retained UTF-8 metadata bytes across one plugin's prompt declarations.
@@ -105,6 +130,217 @@ pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@3{QuirlConfig{deny_unkn
 /// Return the deterministic fingerprint of [`CONFIG_SCHEMA_DESCRIPTOR`].
 pub fn config_schema_hash() -> String {
     quirl_core::schema_fingerprint(CONFIG_SCHEMA_DESCRIPTOR)
+}
+
+/// Return the deterministic fingerprint of [`LUA_RUNNER_ABI_DESCRIPTOR`].
+pub fn lua_runner_abi_hash() -> String {
+    quirl_core::schema_fingerprint(LUA_RUNNER_ABI_DESCRIPTOR)
+}
+
+/// Validated, bounded context supplied to a versioned Lua module's `main` function.
+///
+/// The environment is an immutable UTF-8 snapshot. Input and output retain the
+/// shared execution contract's byte/value distinction, and cancellation shares
+/// the exact atomic identity observed by the VM hook and injected process host.
+#[derive(Debug, Clone)]
+pub struct LuaRunnerContext {
+    arguments: Vec<String>,
+    environment: BTreeMap<String, String>,
+    working_directory: String,
+    input: ExecutionInput,
+    output: ExecutionOutputTarget,
+    declared_effects: ExecutionEffects,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl LuaRunnerContext {
+    /// Validate and retain an explicit runner context.
+    ///
+    /// This constructor is intended for composition adapters and deterministic
+    /// tests. Ordinary CLI callers should use [`Self::from_current_process`].
+    pub fn new(
+        arguments: Vec<String>,
+        environment: BTreeMap<String, String>,
+        working_directory: String,
+        input: ExecutionInput,
+        output: ExecutionOutputTarget,
+        declared_effects: ExecutionEffects,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self, ShellError> {
+        let context = Self {
+            arguments,
+            environment,
+            working_directory,
+            input,
+            output,
+            declared_effects,
+            cancelled,
+        };
+        context.validate()?;
+        Ok(context)
+    }
+
+    /// Snapshot the current UTF-8 process environment and working directory under ABI bounds.
+    pub fn from_current_process(
+        arguments: &[String],
+        input: ExecutionInput,
+        output: ExecutionOutputTarget,
+        declared_effects: ExecutionEffects,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self, ShellError> {
+        let working_directory = std::env::current_dir()
+            .map_err(|error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not read the Lua runner working directory",
+                )
+                .with_context(error.to_string())
+                .with_help("Run the script from an accessible working directory")
+            })?
+            .into_os_string()
+            .into_string()
+            .map_err(|_| {
+                ShellError::new(
+                    ErrorCode::Validation,
+                    "the Lua runner working directory is not valid UTF-8",
+                )
+                .with_help("Run the script from a UTF-8 working directory")
+            })?;
+        let mut environment = BTreeMap::new();
+        let mut environment_bytes = 0_usize;
+        for (key, value) in std::env::vars_os() {
+            let key = key.into_string().map_err(|_| {
+                ShellError::new(
+                    ErrorCode::Validation,
+                    "a Lua runner environment name is not valid UTF-8",
+                )
+                .with_help("Remove or re-encode non-UTF-8 environment entries before running Lua")
+            })?;
+            let value = value.into_string().map_err(|_| {
+                ShellError::new(
+                    ErrorCode::Validation,
+                    "a Lua runner environment value is not valid UTF-8",
+                )
+                .with_context(format!("environment name: {key}"))
+                .with_help("Remove or re-encode non-UTF-8 environment entries before running Lua")
+            })?;
+            environment_bytes = environment_bytes
+                .saturating_add(key.len())
+                .saturating_add(value.len());
+            let observed_entries = environment.len().saturating_add(1);
+            if observed_entries > MAX_LUA_RUNNER_ENVIRONMENT_ENTRIES {
+                return Err(runner_limit_error(
+                    "Lua runner environment entries",
+                    MAX_LUA_RUNNER_ENVIRONMENT_ENTRIES,
+                    observed_entries,
+                ));
+            }
+            if environment_bytes > MAX_LUA_RUNNER_ENVIRONMENT_BYTES {
+                return Err(runner_limit_error(
+                    "Lua runner environment bytes",
+                    MAX_LUA_RUNNER_ENVIRONMENT_BYTES,
+                    environment_bytes,
+                ));
+            }
+            environment.insert(key, value);
+        }
+        Self::new(
+            arguments.to_vec(),
+            environment,
+            working_directory,
+            input,
+            output,
+            declared_effects,
+            cancelled,
+        )
+    }
+
+    /// Exact bounded arguments in source order.
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    /// Immutable bounded environment snapshot.
+    pub fn environment(&self) -> &BTreeMap<String, String> {
+        &self.environment
+    }
+
+    /// UTF-8 working directory captured before module evaluation.
+    pub fn working_directory(&self) -> &str {
+        &self.working_directory
+    }
+
+    /// Shared byte or structured-value input representation.
+    pub fn input(&self) -> &ExecutionInput {
+        &self.input
+    }
+
+    /// Output representation requested by the composition adapter.
+    pub const fn output(&self) -> ExecutionOutputTarget {
+        self.output
+    }
+
+    /// Effects declared and validated before the Lua engine was selected.
+    pub const fn declared_effects(&self) -> ExecutionEffects {
+        self.declared_effects
+    }
+
+    fn validate(&self) -> Result<(), ShellError> {
+        validate_runner_arguments(&self.arguments)?;
+        validate_runner_environment(&self.environment)?;
+        validate_runner_text(
+            "Lua runner working directory",
+            &self.working_directory,
+            MAX_LUA_RUNNER_CWD_BYTES,
+        )?;
+        if self.working_directory.is_empty() {
+            return Err(runner_validation_error(
+                "Lua runner working directory must not be empty",
+            ));
+        }
+        validate_runner_input(&self.input)?;
+        validate_runner_output_target(self.output)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LuaRunnerResultWire {
+    abi_version: u32,
+    ok: bool,
+    #[serde(default)]
+    status: Option<i32>,
+    #[serde(default)]
+    output: Option<ExecutionOutput>,
+    #[serde(default)]
+    error: Option<LuaShellErrorWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LuaShellErrorWire {
+    code: ErrorCode,
+    message: String,
+    #[serde(default)]
+    labels: Vec<LuaErrorLabelWire>,
+    #[serde(default)]
+    context: Vec<String>,
+    #[serde(default)]
+    help: Vec<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    exit_status: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LuaErrorLabelWire {
+    #[serde(default)]
+    source: Option<String>,
+    start: usize,
+    end: usize,
+    message: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1288,7 +1524,7 @@ pub const HOST_API: &[HostApiSpec] = &[
         path: "quirl.process.run",
         summary: "Run a command through the composed bounded native process host.",
         parameters: COMMAND_PARAMETER,
-        returns: "quirl.Result",
+        returns: "quirl.ProcessResult",
         capability: Some("process.spawn"),
     },
     HostApiSpec {
@@ -1598,8 +1834,8 @@ impl LuaRuntime {
 
     /// Read and execute a Lua module under this runtime's policy.
     ///
-    /// Shebangs are normalized, restricted APIs are linted, and a returned module
-    /// table's optional `main` function receives `{ args = arguments }`.
+    /// Versioned modules receive the complete typed runner context. Historical
+    /// unversioned modules are migrated through the bounded v0 adapter.
     pub fn run_file(
         &self,
         path: &Path,
@@ -1616,8 +1852,40 @@ impl LuaRuntime {
         source_name: &str,
         arguments: &[String],
     ) -> Result<serde_json::Value, ShellError> {
+        let context = LuaRunnerContext::from_current_process(
+            arguments,
+            ExecutionInput::None,
+            ExecutionOutputTarget::Value,
+            ExecutionEffects::from_effects(&[ExecutionEffect::SpawnProcess]),
+            Arc::clone(&self.cancelled),
+        )?;
+        let outcome = self.run_source_with_context(source, source_name, &context)?;
+        runner_output_to_legacy_json(outcome.output)
+    }
+
+    /// Execute a Lua module through the versioned ABI and return the shared execution outcome.
+    ///
+    /// ABI v1 modules declare `abi_version = 1` beside `main` and must return a
+    /// deny-unknown typed result envelope. Unversioned or explicit v0 modules
+    /// retain the historical arbitrary-JSON return shape, but Rust immediately
+    /// validates and migrates it into a bounded [`ExecutionOutcome`]. Future
+    /// versions fail closed before `main` is called.
+    pub fn run_source_with_context(
+        &self,
+        source: &str,
+        source_name: &str,
+        context: &LuaRunnerContext,
+    ) -> Result<ExecutionOutcome, ShellError> {
         let path = Path::new(source_name);
         validate_source_length(source, path)?;
+        context.validate()?;
+        if !Arc::ptr_eq(&context.cancelled, &self.cancelled) {
+            return Err(runner_validation_error(
+                "Lua runner context cancellation does not match the runtime",
+            )
+            .with_help("Create the context with the same cancellation flag passed to LuaRuntime"));
+        }
+        ensure_runner_active(&context.cancelled, "before Lua module evaluation")?;
         let source = normalize_shebang(source);
         lint_source(&source, path)?;
         self.reset_budget();
@@ -1627,8 +1895,8 @@ impl LuaRuntime {
             .set_name(source_name)
             .eval::<Value>()
             .map_err(|error| lua_error(error, Some(path), source.len()))?;
-        let value = self.call_main_if_present(value, arguments, path, source.len())?;
-        self.value_to_json(value, Some(path), source.len())
+        ensure_runner_active(&context.cancelled, "after Lua module evaluation")?;
+        self.dispatch_runner_module(value, context, path, source.len())
     }
 
     /// Evaluate a configuration file and validate it against the Rust schema.
@@ -1915,6 +2183,14 @@ impl LuaRuntime {
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, ShellError> {
+        if !arguments.is_object() {
+            return Err(validation_error(
+                name,
+                "plugin command arguments must be a named object",
+            ));
+        }
+        let typed_arguments = StructuredValue::from_json(arguments.clone());
+        typed_arguments.validate()?;
         let function = {
             let callbacks = self
                 .callbacks
@@ -1935,7 +2211,9 @@ impl LuaRuntime {
         let value = function
             .call::<Value>(arguments)
             .map_err(|error| lua_error(error, None, 0))?;
-        self.value_to_json(value, None, 0)
+        let value = self.value_to_json(value, None, 0)?;
+        StructuredValue::from_json(value.clone()).validate()?;
+        Ok(value)
     }
 
     #[allow(
@@ -2173,35 +2451,143 @@ impl LuaRuntime {
         self.cancelled.store(false, Ordering::Relaxed);
     }
 
-    fn call_main_if_present(
+    fn dispatch_runner_module(
         &self,
         value: Value,
-        arguments: &[String],
+        context: &LuaRunnerContext,
         path: &Path,
         source_len: usize,
-    ) -> Result<Value, ShellError> {
+    ) -> Result<ExecutionOutcome, ShellError> {
         let Value::Table(module) = value else {
-            return Ok(value);
+            return self.migrate_legacy_runner_result(value, path, source_len);
         };
-        let Some(main) = module
+        let abi_version = module.get::<Option<u32>>("abi_version").map_err(|error| {
+            runner_boundary_error(path, format!("invalid module ABI version: {error}"))
+        })?;
+        match abi_version {
+            None | Some(LUA_RUNNER_OLDEST_READABLE_ABI_VERSION) => {
+                let value =
+                    self.call_runner_main_if_present(module, context, path, source_len, false)?;
+                self.migrate_legacy_runner_result(value, path, source_len)
+            }
+            Some(LUA_RUNNER_ABI_VERSION) => {
+                validate_runner_module_fields(&module, path)?;
+                let value =
+                    self.call_runner_main_if_present(module, context, path, source_len, true)?;
+                self.decode_runner_result(value, path)
+            }
+            Some(version) => Err(unsupported_runner_abi_error(version)),
+        }
+    }
+
+    fn call_runner_main_if_present(
+        &self,
+        module: Table,
+        context: &LuaRunnerContext,
+        path: &Path,
+        source_len: usize,
+        main_required: bool,
+    ) -> Result<Value, ShellError> {
+        let main = module
             .get::<Option<Function>>("main")
-            .map_err(|error| lua_error(error, Some(path), source_len))?
-        else {
+            .map_err(|error| lua_error(error, Some(path), source_len))?;
+        let Some(main) = main else {
+            if main_required {
+                return Err(runner_boundary_error(
+                    path,
+                    "Lua runner ABI v1 module must contain a `main` function",
+                ));
+            }
             return Ok(Value::Table(module));
         };
-        let context = self
+        let context = self.create_runner_context(context, path, source_len)?;
+        let value = main
+            .call::<Value>(context)
+            .map_err(|error| lua_error(error, Some(path), source_len))?;
+        ensure_runner_active(&self.cancelled, "after Lua runner main")?;
+        Ok(value)
+    }
+
+    fn create_runner_context(
+        &self,
+        context: &LuaRunnerContext,
+        path: &Path,
+        source_len: usize,
+    ) -> Result<Table, ShellError> {
+        let table = self
             .lua
             .create_table()
             .map_err(|error| lua_error(error, Some(path), source_len))?;
-        let lua_arguments = self
+        table
+            .set("abi_version", LUA_RUNNER_ABI_VERSION)
+            .and_then(|()| {
+                let arguments = self
+                    .lua
+                    .create_sequence_from(context.arguments.iter().cloned())?;
+                table.set("args", arguments)
+            })
+            .and_then(|()| table.set("env", self.lua.to_value(&context.environment)?))
+            .and_then(|()| table.set("cwd", context.working_directory.as_str()))
+            .and_then(|()| table.set("input", self.lua.to_value(&context.input)?))
+            .and_then(|()| table.set("output", self.lua.to_value(&context.output)?))
+            .and_then(|()| {
+                table.set(
+                    "effects",
+                    self.lua
+                        .create_sequence_from(runner_effect_names(context.declared_effects))?,
+                )
+            })
+            .map_err(|error| lua_error(error, Some(path), source_len))?;
+        let cancellation = self
             .lua
-            .create_sequence_from(arguments.iter().cloned())
+            .create_table()
             .map_err(|error| lua_error(error, Some(path), source_len))?;
-        context
-            .set("args", lua_arguments)
+        let cancelled = Arc::clone(&context.cancelled);
+        cancellation
+            .set(
+                "is_cancelled",
+                self.lua
+                    .create_function(move |_, ()| Ok(cancelled.load(Ordering::Relaxed)))
+                    .map_err(|error| lua_error(error, Some(path), source_len))?,
+            )
             .map_err(|error| lua_error(error, Some(path), source_len))?;
-        main.call::<Value>(context)
-            .map_err(|error| lua_error(error, Some(path), source_len))
+        table
+            .set("cancellation", cancellation)
+            .map_err(|error| lua_error(error, Some(path), source_len))?;
+        Ok(table)
+    }
+
+    fn decode_runner_result(
+        &self,
+        value: Value,
+        path: &Path,
+    ) -> Result<ExecutionOutcome, ShellError> {
+        validate_lua_return_shape(&value)?;
+        let wire = self
+            .lua
+            .from_value::<LuaRunnerResultWire>(value)
+            .map_err(|error| {
+                runner_boundary_error(path, format!("invalid ABI v1 result: {error}"))
+            })?;
+        validate_runner_result(wire)
+    }
+
+    fn migrate_legacy_runner_result(
+        &self,
+        value: Value,
+        path: &Path,
+        source_len: usize,
+    ) -> Result<ExecutionOutcome, ShellError> {
+        let value = self.value_to_json(value, Some(path), source_len)?;
+        let status = legacy_runner_status(&value)?;
+        let value = StructuredValue::from_json(value);
+        value.validate()?;
+        ExecutionOutcome::new(
+            ExecutionStatus::Exited(status),
+            ExecutionOutput::Value { value },
+            Vec::new(),
+            ExecutionCleanupState::Complete,
+        )
     }
 
     fn value_to_json(
@@ -2242,6 +2628,386 @@ impl LuaRuntime {
         budget.deadline = expires;
         budget.wall_time = wall_time;
     }
+}
+
+fn validate_runner_arguments(arguments: &[String]) -> Result<(), ShellError> {
+    if arguments.len() > EXECUTION_ARGUMENTS_MAX {
+        return Err(runner_limit_error(
+            "Lua runner arguments",
+            EXECUTION_ARGUMENTS_MAX,
+            arguments.len(),
+        ));
+    }
+    let bytes = arguments.iter().fold(0_usize, |total, argument| {
+        total.saturating_add(argument.len())
+    });
+    if bytes > EXECUTION_ARGUMENT_BYTES_MAX {
+        return Err(runner_limit_error(
+            "Lua runner argument bytes",
+            EXECUTION_ARGUMENT_BYTES_MAX,
+            bytes,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runner_environment(environment: &BTreeMap<String, String>) -> Result<(), ShellError> {
+    if environment.len() > MAX_LUA_RUNNER_ENVIRONMENT_ENTRIES {
+        return Err(runner_limit_error(
+            "Lua runner environment entries",
+            MAX_LUA_RUNNER_ENVIRONMENT_ENTRIES,
+            environment.len(),
+        ));
+    }
+    let bytes = environment.iter().fold(0_usize, |total, (key, value)| {
+        total.saturating_add(key.len()).saturating_add(value.len())
+    });
+    if bytes > MAX_LUA_RUNNER_ENVIRONMENT_BYTES {
+        return Err(runner_limit_error(
+            "Lua runner environment bytes",
+            MAX_LUA_RUNNER_ENVIRONMENT_BYTES,
+            bytes,
+        ));
+    }
+    for (key, value) in environment {
+        if key.is_empty() || key.contains('=') || key.contains('\0') {
+            return Err(runner_validation_error(
+                "Lua runner environment names must be non-empty and contain neither `=` nor NUL",
+            ));
+        }
+        if value.contains('\0') {
+            return Err(runner_validation_error(
+                "Lua runner environment values must not contain NUL",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_runner_text(description: &str, value: &str, limit: usize) -> Result<(), ShellError> {
+    if value.len() > limit {
+        return Err(runner_limit_error(description, limit, value.len()));
+    }
+    Ok(())
+}
+
+fn validate_runner_input(input: &ExecutionInput) -> Result<(), ShellError> {
+    match input {
+        ExecutionInput::None => Ok(()),
+        ExecutionInput::Bytes(bytes) if bytes.len() <= EXECUTION_BYTES_MAX => Ok(()),
+        ExecutionInput::Bytes(bytes) => Err(runner_limit_error(
+            "Lua runner input bytes",
+            EXECUTION_BYTES_MAX,
+            bytes.len(),
+        )),
+        ExecutionInput::Value(value) => value.validate(),
+    }
+}
+
+fn validate_runner_output_target(output: ExecutionOutputTarget) -> Result<(), ShellError> {
+    match output {
+        ExecutionOutputTarget::Value => Ok(()),
+        ExecutionOutputTarget::Inherit | ExecutionOutputTarget::Capture { .. } => Err(
+            runner_validation_error("Lua runner ABI v1 supports typed value output only")
+                .with_help("Select value output or use a byte-oriented execution adapter"),
+        ),
+    }
+}
+
+fn validate_runner_module_fields(module: &Table, path: &Path) -> Result<(), ShellError> {
+    for pair in module.clone().pairs::<Value, Value>() {
+        let (key, _) = pair.map_err(|error| lua_error(error, Some(path), 0))?;
+        let Value::String(key) = key else {
+            return Err(runner_boundary_error(
+                path,
+                "Lua runner ABI v1 module keys must be strings",
+            ));
+        };
+        let key = key.to_str().map_err(|error| {
+            runner_boundary_error(path, format!("Lua runner module key is not UTF-8: {error}"))
+        })?;
+        if key.len() > MAX_REGISTRATION_NAME_BYTES {
+            return Err(runner_limit_error(
+                "Lua runner module field name bytes",
+                MAX_REGISTRATION_NAME_BYTES,
+                key.len(),
+            ));
+        }
+        if !matches!(key.as_ref(), "abi_version" | "main") {
+            return Err(runner_boundary_error(
+                path,
+                format!("unknown Lua runner module field `{key}`"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_runner_result(wire: LuaRunnerResultWire) -> Result<ExecutionOutcome, ShellError> {
+    if wire.abi_version != LUA_RUNNER_ABI_VERSION {
+        return Err(unsupported_runner_abi_error(wire.abi_version));
+    }
+    if wire.ok {
+        if wire.error.is_some() {
+            return Err(runner_validation_error(
+                "successful Lua runner result must not contain `error`",
+            ));
+        }
+        let status = wire.status.ok_or_else(|| {
+            runner_validation_error("successful Lua runner result requires integer `status`")
+        })?;
+        let output = wire.output.ok_or_else(|| {
+            runner_validation_error("successful Lua runner result requires typed `output`")
+        })?;
+        match &output {
+            ExecutionOutput::Value { value } => value.validate()?,
+            ExecutionOutput::Values { values } => {
+                if values.len() > MAX_LUA_RUNNER_STREAM_VALUES {
+                    return Err(runner_limit_error(
+                        "Lua runner finite stream values",
+                        MAX_LUA_RUNNER_STREAM_VALUES,
+                        values.len(),
+                    ));
+                }
+                for value in values {
+                    value.validate()?;
+                }
+            }
+            ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => {
+                return Err(runner_validation_error(
+                    "Lua runner ABI v1 returns typed values, not inherited or byte output",
+                )
+                .with_help(
+                    "Return `output = { kind = 'value', value = ... }` or a bounded `values` batch",
+                ));
+            }
+        }
+        ExecutionOutcome::new(
+            ExecutionStatus::Exited(status),
+            output,
+            Vec::new(),
+            ExecutionCleanupState::Complete,
+        )
+    } else {
+        if wire.status.is_some() || wire.output.is_some() {
+            return Err(runner_validation_error(
+                "failed Lua runner result must contain only structured `error` data",
+            ));
+        }
+        let error = wire.error.ok_or_else(|| {
+            runner_validation_error("failed Lua runner result requires structured `error`")
+        })?;
+        Err(error.into_shell_error()?)
+    }
+}
+
+impl LuaShellErrorWire {
+    fn from_shell_error(error: &ShellError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message.clone(),
+            labels: error
+                .details
+                .labels
+                .iter()
+                .map(|label| LuaErrorLabelWire {
+                    source: label.source.clone(),
+                    start: label.start,
+                    end: label.end,
+                    message: label.message.clone(),
+                })
+                .collect(),
+            context: error.details.context.clone(),
+            help: error.details.help.clone(),
+            command: error.details.command.clone(),
+            exit_status: error.details.exit_status,
+        }
+    }
+
+    fn into_shell_error(self) -> Result<ShellError, ShellError> {
+        self.validate()?;
+        let mut error = ShellError::new(self.code, self.message);
+        error.details.labels = self
+            .labels
+            .into_iter()
+            .map(|label| ErrorLabel {
+                source: label.source,
+                start: label.start,
+                end: label.end,
+                message: label.message,
+            })
+            .collect();
+        error.details.context = self.context;
+        error.details.help = self.help;
+        error.details.command = self.command;
+        error.details.exit_status = self.exit_status;
+        Ok(error)
+    }
+
+    fn validate(&self) -> Result<(), ShellError> {
+        validate_runner_error_text("Lua ShellError message", &self.message)?;
+        validate_runner_error_items("labels", self.labels.len())?;
+        validate_runner_error_items("context", self.context.len())?;
+        validate_runner_error_items("help", self.help.len())?;
+        let mut total_bytes = self.message.len();
+        for item in self.context.iter().chain(&self.help) {
+            validate_runner_error_text("Lua ShellError detail", item)?;
+            total_bytes = total_bytes.saturating_add(item.len());
+        }
+        if let Some(command) = &self.command {
+            validate_runner_error_text("Lua ShellError command", command)?;
+            total_bytes = total_bytes.saturating_add(command.len());
+        }
+        for label in &self.labels {
+            validate_runner_error_text("Lua ShellError label message", &label.message)?;
+            total_bytes = total_bytes.saturating_add(label.message.len());
+            if let Some(source) = &label.source {
+                if source.len() > MAX_LUA_RUNNER_ERROR_SOURCE_BYTES {
+                    return Err(runner_limit_error(
+                        "Lua ShellError label source bytes",
+                        MAX_LUA_RUNNER_ERROR_SOURCE_BYTES,
+                        source.len(),
+                    ));
+                }
+                reject_terminal_controls("Lua ShellError label source", source)?;
+                let valid_span = label.start <= label.end
+                    && label.end <= source.len()
+                    && source.is_char_boundary(label.start)
+                    && source.is_char_boundary(label.end);
+                if !valid_span {
+                    return Err(runner_validation_error(
+                        "Lua ShellError label is not a valid UTF-8 byte range",
+                    ));
+                }
+                total_bytes = total_bytes.saturating_add(source.len());
+            } else if label.start != 0 || label.end != 0 {
+                return Err(runner_validation_error(
+                    "Lua ShellError label without source must use the empty 0..0 span",
+                ));
+            }
+        }
+        if total_bytes > MAX_LUA_RUNNER_ERROR_TOTAL_BYTES {
+            return Err(runner_limit_error(
+                "Lua ShellError retained bytes",
+                MAX_LUA_RUNNER_ERROR_TOTAL_BYTES,
+                total_bytes,
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_runner_error_items(description: &str, observed: usize) -> Result<(), ShellError> {
+    if observed > MAX_LUA_RUNNER_ERROR_ITEMS {
+        return Err(runner_limit_error(
+            &format!("Lua ShellError {description}"),
+            MAX_LUA_RUNNER_ERROR_ITEMS,
+            observed,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runner_error_text(description: &str, value: &str) -> Result<(), ShellError> {
+    validate_runner_text(description, value, MAX_LUA_RUNNER_ERROR_FIELD_BYTES)?;
+    reject_terminal_controls(description, value)
+}
+
+fn legacy_runner_status(value: &serde_json::Value) -> Result<i32, ShellError> {
+    let Some(status) = value.get("status") else {
+        return Ok(0);
+    };
+    let Some(status) = status.as_i64() else {
+        return Err(
+            runner_validation_error("legacy Lua runner result status must be an integer")
+                .with_help("Return an ABI v1 typed result or omit the legacy `status` field"),
+        );
+    };
+    i32::try_from(status).map_err(|_| {
+        runner_validation_error("legacy Lua runner result status is outside the i32 range")
+    })
+}
+
+fn runner_output_to_legacy_json(output: ExecutionOutput) -> Result<serde_json::Value, ShellError> {
+    match output {
+        ExecutionOutput::Value { value } => Ok(value.json_value()),
+        ExecutionOutput::Values { values } => Ok(serde_json::Value::Array(
+            values.into_iter().map(|value| value.json_value()).collect(),
+        )),
+        ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => Err(runner_validation_error(
+            "Lua script adapter cannot convert byte or inherited output to a typed value",
+        )),
+    }
+}
+
+fn runner_effect_names(effects: ExecutionEffects) -> Vec<&'static str> {
+    [
+        (ExecutionEffect::ReadFilesystem, "read_filesystem"),
+        (ExecutionEffect::WriteFilesystem, "write_filesystem"),
+        (ExecutionEffect::SpawnProcess, "spawn_process"),
+        (ExecutionEffect::ChangeDirectory, "change_directory"),
+    ]
+    .into_iter()
+    .filter_map(|(effect, name)| effects.contains(effect).then_some(name))
+    .collect()
+}
+
+fn ensure_runner_active(cancelled: &Arc<AtomicBool>, stage: &str) -> Result<(), ShellError> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "Lua runner execution was cancelled",
+        )
+        .with_context(format!("cancellation observed {stage}"))
+        .with_help("Retry with a fresh shared execution cancellation handle"));
+    }
+    Ok(())
+}
+
+fn unsupported_runner_abi_error(version: u32) -> ShellError {
+    ShellError::new(ErrorCode::Validation, "unsupported Lua runner ABI version")
+        .with_context(format!(
+            "requested: {version}; supported: {LUA_RUNNER_ABI_VERSION}; oldest readable: {LUA_RUNNER_OLDEST_READABLE_ABI_VERSION}"
+        ))
+        .with_help("Regenerate the Lua SDK and migrate the module to the supported runner ABI")
+}
+
+fn runner_boundary_error(path: &Path, message: impl Into<String>) -> ShellError {
+    let message = bounded_runner_diagnostic(&message.into());
+    let path = bounded_runner_diagnostic(&path.display().to_string());
+    ShellError::new(ErrorCode::Validation, "Lua runner ABI validation failed")
+        .with_context(message)
+        .with_label(Some(path), 0, 0, "runner ABI mismatch")
+        .with_help("Follow the generated `quirl.Context` and `quirl.RunnerResult` contracts")
+}
+
+fn bounded_runner_diagnostic(value: &str) -> String {
+    let value = escape_terminal_controls(value);
+    if value.len() <= MAX_LUA_RUNNER_ERROR_FIELD_BYTES {
+        return value;
+    }
+    let mut end = MAX_LUA_RUNNER_ERROR_FIELD_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = value[..end].to_owned();
+    bounded.push('…');
+    bounded
+}
+
+fn runner_validation_error(message: impl Into<String>) -> ShellError {
+    ShellError::new(ErrorCode::Validation, "Lua runner ABI validation failed")
+        .with_context(message)
+        .with_help("Follow the generated typed Lua runner ABI")
+}
+
+fn runner_limit_error(description: &str, limit: usize, observed: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{description} exceeds its configured limit"),
+    )
+    .with_context(format!("limit: {limit}; observed: {observed}"))
+    .with_help("Reduce the retained runner data or use a bounded engine-owned stream")
 }
 
 /// Format Lua source with Quirl's deterministic, literal-aware indentation rules.
@@ -2539,7 +3305,7 @@ pub fn format_file(path: &Path, check: bool) -> Result<bool, ShellError> {
 /// callers should regenerate it rather than hand-editing that artifact.
 pub fn sdk_lua() -> String {
     let mut output = String::from(
-        "---@meta quirl\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? string\n\n---@alias quirl.PromptSymbols 'auto'|'plain'|'unicode'|'nerd_font'\n---@alias quirl.WelcomeBanner 'full'|'compact'|'none'\n---@alias quirl.Surface 'auto'|'rich'|'simple'\n\n---@class quirl.EditorConfig\n---@field keymap? 'emacs'|'vim'|'helix' Emacs is the complete default.\n---@field semantic_hints? boolean\n---@field banner? quirl.WelcomeBanner\n\n---@class quirl.PickerConfig\n---@field layout? 'adaptive'|'bottom'|'full'\n---@field preview? boolean\n\n---@class quirl.PromptConfig\n---@field symbols? quirl.PromptSymbols Auto never assumes a patched font; nerd_font enables Powerline glyphs explicitly.\n---@field left? string[] Ordered prompt segments before the input.\n---@field right? string[] Ordered prompt segments aligned on the right.\n---@field transient? boolean Collapse accepted input to one scrollback line before execution.\n\n---@class quirl.ThemeColors\n---@field accent_command string #RRGGBB color for command-mode accents.\n---@field accent_data string #RRGGBB color for data-mode accents.\n---@field context_primary string #RRGGBB color for primary context.\n---@field context_secondary string #RRGGBB color for secondary context.\n---@field muted string #RRGGBB color for subdued text.\n---@field border string #RRGGBB color for borders.\n---@field status_background string #RRGGBB status background color.\n---@field error string #RRGGBB error color.\n---@field warning string #RRGGBB warning color.\n---@field hint string #RRGGBB hint color.\n---@field string string #RRGGBB string syntax color.\n---@field operator string #RRGGBB operator syntax color.\n---@field expansion string #RRGGBB expansion syntax color.\n---@field number string #RRGGBB number syntax color.\n\n---@class quirl.StatuslineConfig\n---@field hints? boolean\n\n---@class quirl.UiConfig\n---@field surface? quirl.Surface\n---@field theme? string Built-in or custom theme name; defaults to tokyo-night.\n---@field themes? table<string, quirl.ThemeColors> At most 32 custom themes.\n---@field statusline? quirl.StatuslineConfig\n\n---@class quirl.CompletionConfig\n---@field auto? boolean\n---@field min_chars? integer\n\n---@class quirl.Config\n---@field schema_version? integer\n---@field editor? quirl.EditorConfig\n---@field picker? quirl.PickerConfig\n---@field prompt? quirl.PromptConfig\n---@field ui? quirl.UiConfig\n---@field completion? quirl.CompletionConfig\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
+        "---@meta quirl\n\n---@class quirl.ErrorLabel\n---@field source? string\n---@field start integer Inclusive UTF-8 byte offset.\n---@field end integer Exclusive UTF-8 byte offset.\n---@field message string\n\n---@alias quirl.ErrorCode 'invalid_command'|'invalid_argument'|'data'|'io'|'process_spawn'|'script_read'|'lua'|'validation'|'resource_limit'\n\n---@class quirl.ShellError\n---@field code quirl.ErrorCode\n---@field message string\n---@field labels? quirl.ErrorLabel[]\n---@field context? string[]\n---@field help? string[]\n---@field command? string\n---@field exit_status? integer\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? quirl.ShellError\n\n---@class quirl.ProcessResult: quirl.Result\n---@field status integer\n---@field value string Captured stdout.\n---@field stderr string Captured stderr.\n\n---@alias quirl.ExecutionEffect 'read_filesystem'|'write_filesystem'|'spawn_process'|'change_directory'\n\n---@class quirl.CancellationContext\n---@field is_cancelled fun(): boolean Returns the shared cancellation flag without clearing it.\n\n---@class quirl.Context\n---@field abi_version 1\n---@field args string[] Bounded arguments in source order.\n---@field env table<string, string> Immutable bounded environment snapshot.\n---@field cwd string UTF-8 working directory captured before evaluation.\n---@field input table Shared deny-unknown ExecutionInput representation.\n---@field output table Shared value-only ExecutionOutputTarget representation.\n---@field cancellation quirl.CancellationContext\n---@field effects quirl.ExecutionEffect[] Effects declared before dispatch.\n\n---@class quirl.RunnerResult\n---@field abi_version 1\n---@field ok boolean\n---@field status? integer Required exactly when ok is true.\n---@field output? table Typed value or bounded finite values output; live streams are not transferable.\n---@field error? quirl.ShellError Required exactly when ok is false.\n\n---@class quirl.RunnerModule\n---@field abi_version 1\n---@field main fun(context: quirl.Context): quirl.RunnerResult\n\n---@alias quirl.PromptSymbols 'auto'|'plain'|'unicode'|'nerd_font'\n---@alias quirl.WelcomeBanner 'full'|'compact'|'none'\n---@alias quirl.Surface 'auto'|'rich'|'simple'\n\n---@class quirl.EditorConfig\n---@field keymap? 'emacs'|'vim'|'helix' Emacs is the complete default.\n---@field semantic_hints? boolean\n---@field banner? quirl.WelcomeBanner\n\n---@class quirl.PickerConfig\n---@field layout? 'adaptive'|'bottom'|'full'\n---@field preview? boolean\n\n---@class quirl.PromptConfig\n---@field symbols? quirl.PromptSymbols Auto never assumes a patched font; nerd_font enables Powerline glyphs explicitly.\n---@field left? string[] Ordered prompt segments before the input.\n---@field right? string[] Ordered prompt segments aligned on the right.\n---@field transient? boolean Collapse accepted input to one scrollback line before execution.\n\n---@class quirl.ThemeColors\n---@field accent_command string #RRGGBB color for command-mode accents.\n---@field accent_data string #RRGGBB color for data-mode accents.\n---@field context_primary string #RRGGBB color for primary context.\n---@field context_secondary string #RRGGBB color for secondary context.\n---@field muted string #RRGGBB color for subdued text.\n---@field border string #RRGGBB color for borders.\n---@field status_background string #RRGGBB status background color.\n---@field error string #RRGGBB error color.\n---@field warning string #RRGGBB color for warnings.\n---@field hint string #RRGGBB color for hints.\n---@field string string #RRGGBB string syntax color.\n---@field operator string #RRGGBB operator syntax color.\n---@field expansion string #RRGGBB expansion syntax color.\n---@field number string #RRGGBB number syntax color.\n\n---@class quirl.StatuslineConfig\n---@field hints? boolean\n\n---@class quirl.UiConfig\n---@field surface? quirl.Surface\n---@field theme? string Built-in or custom theme name; defaults to tokyo-night.\n---@field themes? table<string, quirl.ThemeColors> At most 32 custom themes.\n---@field statusline? quirl.StatuslineConfig\n\n---@class quirl.CompletionConfig\n---@field auto? boolean\n---@field min_chars? integer\n\n---@class quirl.Config\n---@field schema_version? integer\n---@field editor? quirl.EditorConfig\n---@field picker? quirl.PickerConfig\n---@field prompt? quirl.PromptConfig\n---@field ui? quirl.UiConfig\n---@field completion? quirl.CompletionConfig\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
     );
     for spec in HOST_API {
         output.push_str(&format!("---{}\n", spec.summary));
@@ -2572,13 +3338,19 @@ pub fn sdk_json() -> Result<String, ShellError> {
         schema_version: u32,
         module: &'static str,
         module_version: &'static str,
+        runner_abi_version: u32,
+        runner_abi_hash: String,
+        runner_abi_descriptor: &'static str,
         functions: &'a [HostApiSpec],
     }
     let document = HostApiDocument {
         document_type: "quirl.host_api",
-        schema_version: 1,
+        schema_version: 2,
         module: "quirl",
         module_version: env!("CARGO_PKG_VERSION"),
+        runner_abi_version: LUA_RUNNER_ABI_VERSION,
+        runner_abi_hash: lua_runner_abi_hash(),
+        runner_abi_descriptor: LUA_RUNNER_ABI_DESCRIPTOR,
         functions: HOST_API,
     };
     serde_json::to_string_pretty(&document).map_err(|error| {
@@ -2592,8 +3364,10 @@ pub fn sdk_json() -> Result<String, ShellError> {
 /// All function facts are projected directly from [`HOST_API`] in table order.
 pub fn sdk_markdown() -> String {
     let mut output = format!(
-        "# Quirl Lua SDK\n\nModule: `quirl`\n\nVersion: `{}`\n\nSchema version: `1`\n\n",
-        env!("CARGO_PKG_VERSION")
+        "# Quirl Lua SDK\n\nModule: `quirl`\n\nVersion: `{}`\n\nSchema version: `2`\n\nRunner ABI: `{}`\n\nRunner ABI hash: `{}`\n\n",
+        env!("CARGO_PKG_VERSION"),
+        LUA_RUNNER_ABI_VERSION,
+        lua_runner_abi_hash(),
     );
     for spec in HOST_API {
         let parameters = spec
@@ -2756,10 +3530,23 @@ fn install_host_api(
             })
             .map_err(mlua::Error::external)?;
             let result = lua.create_table()?;
-            result.set("ok", outcome.status == 0)?;
+            let ok = outcome.status == 0;
+            result.set("ok", ok)?;
             result.set("status", outcome.status)?;
             result.set("value", outcome.stdout.unwrap_or_default())?;
-            result.set("error", outcome.stderr.unwrap_or_default())?;
+            result.set("stderr", outcome.stderr.unwrap_or_default())?;
+            if !ok {
+                let mut error = ShellError::new(
+                    ErrorCode::InvalidCommand,
+                    "process invoked from Lua exited with a non-zero status",
+                )
+                .with_context(format!("exit status: {}", outcome.status))
+                .with_help("Inspect `stderr` and handle the status explicitly");
+                error.details.exit_status = Some(outcome.status);
+                let error = LuaShellErrorWire::from_shell_error(&error);
+                error.validate().map_err(mlua::Error::external)?;
+                result.set("error", lua.to_value(&error)?)?;
+            }
             Ok(result)
         })?,
     )?;
@@ -4252,6 +5039,26 @@ fn validation_error(source: &str, message: impl Into<String>) -> ShellError {
 mod tests {
     use super::*;
 
+    fn runner_context(
+        runtime: &LuaRuntime,
+        arguments: &[&str],
+        input: ExecutionInput,
+    ) -> LuaRunnerContext {
+        LuaRunnerContext::new(
+            arguments.iter().map(|value| (*value).to_owned()).collect(),
+            BTreeMap::from([("QUIRL_TEST_ENV".to_owned(), "visible".to_owned())]),
+            "/tmp/quirl-runner".to_owned(),
+            input,
+            ExecutionOutputTarget::Value,
+            ExecutionEffects::from_effects(&[
+                ExecutionEffect::ReadFilesystem,
+                ExecutionEffect::SpawnProcess,
+            ]),
+            Arc::clone(&runtime.cancelled),
+        )
+        .unwrap()
+    }
+
     fn test_theme(color: &str) -> ThemeColors {
         ThemeColors {
             accent_command: color.to_owned(),
@@ -5362,23 +6169,30 @@ return { main = exported }
             schema_version: u32,
             module: String,
             module_version: String,
+            runner_abi_version: u32,
+            runner_abi_hash: String,
+            runner_abi_descriptor: String,
             functions: Vec<serde_json::Value>,
         }
         let json = sdk_json().unwrap();
         let envelope: SdkEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(envelope.document_type, "quirl.host_api");
-        assert_eq!(envelope.schema_version, 1);
+        assert_eq!(envelope.schema_version, 2);
         assert_eq!(envelope.module, "quirl");
         assert_eq!(envelope.module_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(envelope.runner_abi_version, LUA_RUNNER_ABI_VERSION);
+        assert_eq!(envelope.runner_abi_hash, lua_runner_abi_hash());
+        assert_eq!(envelope.runner_abi_descriptor, LUA_RUNNER_ABI_DESCRIPTOR);
         assert_eq!(envelope.functions.len(), HOST_API.len());
         let mut unknown: serde_json::Value = serde_json::from_str(&json).unwrap();
         unknown["unexpected"] = serde_json::Value::Bool(true);
         assert!(serde_json::from_value::<SdkEnvelope>(unknown).is_err());
 
         let markdown = sdk_markdown();
-        assert!(markdown.contains("`quirl.process.run(command: string) -> quirl.Result`"));
+        assert!(markdown.contains("Runner ABI: `1`"));
+        assert!(markdown.contains("`quirl.process.run(command: string) -> quirl.ProcessResult`"));
         assert!(markdown.contains("| `command` | `string` |"));
-        assert!(markdown.contains("Returns: `quirl.Result`"));
+        assert!(markdown.contains("Returns: `quirl.ProcessResult`"));
     }
 
     #[test]
@@ -5509,6 +6323,11 @@ return { main = exported }
             .run_plugin_command("demo run", &serde_json::json!({"value": 42}))
             .unwrap();
         assert_eq!(output, serde_json::json!({"ok": true, "value": 42}));
+        let invalid = runtime
+            .run_plugin_command("demo run", &serde_json::json!([42]))
+            .unwrap_err();
+        assert_eq!(invalid.code, ErrorCode::Validation);
+        assert!(invalid.details.context[0].contains("named object"));
     }
 
     #[test]
@@ -5620,5 +6439,211 @@ return { main = exported }
             )
             .unwrap_err();
         assert!(error.details.context[0].contains("terminal control"));
+    }
+
+    #[test]
+    fn runner_v0_migrates_and_future_versions_fail_before_main() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        let context = runner_context(&runtime, &["alpha", "beta"], ExecutionInput::None);
+        let legacy = runtime
+            .run_source_with_context(
+                "return { main = function(ctx) return { status = 7, first = ctx.args[1], cwd = ctx.cwd } end }",
+                "legacy.lua",
+                &context,
+            )
+            .unwrap();
+        assert_eq!(legacy.status_code(), 7);
+        let ExecutionOutput::Value { value } = legacy.output else {
+            panic!("legacy migration must produce one typed value");
+        };
+        assert_eq!(value.json_value()["first"], "alpha");
+        assert_eq!(value.json_value()["cwd"], "/tmp/quirl-runner");
+
+        let error = runtime
+            .run_source_with_context(
+                "return { abi_version = 2, main = function() error('must not run') end }",
+                "future.lua",
+                &context,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.details.context[0].contains("requested: 2"));
+    }
+
+    #[test]
+    fn runner_v1_context_preserves_typed_input_environment_effects_and_cancellation() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        let context = runner_context(
+            &runtime,
+            &["deploy"],
+            ExecutionInput::Value(StructuredValue::Path("services.toml".to_owned())),
+        );
+        let outcome = runtime
+            .run_source_with_context(
+                r#"return {
+                  abi_version = 1,
+                  main = function(ctx)
+                    return {
+                      abi_version = 1, ok = true, status = 3,
+                      output = { kind = "value", value = {
+                        type = "record", value = {
+                          argument = { type = "string", value = ctx.args[1] },
+                          environment = { type = "string", value = ctx.env.QUIRL_TEST_ENV },
+                          cwd = { type = "path", value = ctx.cwd },
+                          input_kind = { type = "string", value = ctx.input.kind },
+                          input_type = { type = "string", value = ctx.input.content.type },
+                          effect = { type = "string", value = ctx.effects[2] },
+                          cancelled = { type = "bool", value = ctx.cancellation.is_cancelled() },
+                          output_kind = { type = "string", value = ctx.output.kind },
+                        }
+                      }}
+                    }
+                  end
+                }"#,
+                "context.lua",
+                &context,
+            )
+            .unwrap();
+        assert_eq!(outcome.status_code(), 3);
+        let ExecutionOutput::Value { value } = outcome.output else {
+            panic!("typed runner must preserve value output");
+        };
+        let json = value.json_value();
+        assert_eq!(json["argument"], "deploy");
+        assert_eq!(json["environment"], "visible");
+        assert_eq!(json["cwd"], "/tmp/quirl-runner");
+        assert_eq!(json["input_kind"], "value");
+        assert_eq!(json["input_type"], "path");
+        assert_eq!(json["effect"], "spawn_process");
+        assert_eq!(json["cancelled"], false);
+        assert_eq!(json["output_kind"], "value");
+    }
+
+    #[test]
+    fn runner_structured_shell_error_round_trips_and_rejects_unknown_fields() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        let context = runner_context(&runtime, &[], ExecutionInput::None);
+        let error = runtime
+            .run_source_with_context(
+                r#"return { abi_version = 1, main = function()
+                  return { abi_version = 1, ok = false, error = {
+                    code = "invalid_argument", message = "bad deployment target",
+                    labels = {{ source = "deploy prod", start = 7, ["end"] = 11, message = "unknown target" }},
+                    context = {"target: prod"}, help = {"Use staging"},
+                    command = "deploy prod", exit_status = 64,
+                  }}
+                end }"#,
+                "structured-error.lua",
+                &context,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(error.message, "bad deployment target");
+        assert_eq!(error.details.labels[0].start, 7);
+        assert_eq!(error.details.labels[0].end, 11);
+        assert_eq!(error.details.context, ["target: prod"]);
+        assert_eq!(error.details.help, ["Use staging"]);
+        assert_eq!(error.details.command.as_deref(), Some("deploy prod"));
+        assert_eq!(error.details.exit_status, Some(64));
+
+        let unknown = runtime
+            .run_source_with_context(
+                r#"return { abi_version = 1, main = function()
+                  return { abi_version = 1, ok = true, status = 0,
+                    output = { kind = "value", value = { type = "nothing" } }, surprise = true }
+                end }"#,
+                "unknown-result.lua",
+                &context,
+            )
+            .unwrap_err();
+        assert_eq!(unknown.code, ErrorCode::Validation);
+        assert!(unknown.details.context[0].contains("unknown field"));
+    }
+
+    #[test]
+    fn runner_rejects_hostile_returns_and_unbounded_stream_materialization() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        let context = runner_context(&runtime, &[], ExecutionInput::None);
+        let hostile = runtime
+            .run_source_with_context(
+                r#"return { abi_version = 1, main = function()
+                  local cycle = {}; cycle.self = cycle
+                  return { abi_version = 1, ok = true, status = 0,
+                    output = { kind = "value", value = cycle } }
+                end }"#,
+                "hostile.lua",
+                &context,
+            )
+            .unwrap_err();
+        assert_eq!(hostile.code, ErrorCode::Validation);
+        assert!(hostile.details.context[0].contains("cyclic"));
+
+        let source = format!(
+            r#"return {{ abi_version = 1, main = function()
+              local values = {{}}
+              for i = 1, {} do values[i] = {{ type = "nothing" }} end
+              return {{ abi_version = 1, ok = true, status = 0,
+                output = {{ kind = "values", values = values }} }}
+            end }}"#,
+            MAX_LUA_RUNNER_STREAM_VALUES + 1
+        );
+        let stream = runtime
+            .run_source_with_context(&source, "stream-limit.lua", &context)
+            .unwrap_err();
+        assert_eq!(stream.code, ErrorCode::ResourceLimit);
+        assert!(stream.message.contains("finite stream values"));
+        assert!(stream.details.context[0].contains("observed: 513"));
+    }
+
+    #[test]
+    fn runner_environment_error_and_context_cancellation_are_bounded() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        let environment = (0..=MAX_LUA_RUNNER_ENVIRONMENT_ENTRIES)
+            .map(|index| (format!("KEY_{index}"), "value".to_owned()))
+            .collect();
+        let error = LuaRunnerContext::new(
+            Vec::new(),
+            environment,
+            "/tmp".to_owned(),
+            ExecutionInput::None,
+            ExecutionOutputTarget::Value,
+            ExecutionEffects::none(),
+            Arc::clone(&runtime.cancelled),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("observed: 257"));
+
+        let context = runner_context(&runtime, &[], ExecutionInput::None);
+        context.cancelled.store(true, Ordering::Relaxed);
+        let cancelled = runtime
+            .run_source_with_context(
+                "return { abi_version = 1, main = function() error('must not run') end }",
+                "cancelled.lua",
+                &context,
+            )
+            .unwrap_err();
+        assert_eq!(cancelled.code, ErrorCode::ResourceLimit);
+        assert!(cancelled.details.context[0].contains("before Lua module evaluation"));
+    }
+
+    #[test]
+    fn process_results_expose_structured_errors_and_bounded_stderr() {
+        let process_host: ProcessHost = Arc::new(|_| {
+            Ok(quirl_core::CommandOutcome {
+                status: 9,
+                stdout: Some("partial".to_owned()),
+                stderr: Some("failed safely".to_owned()),
+            })
+        });
+        let runtime = LuaRuntime::new_with_process_host(LuaPolicy::script(), process_host).unwrap();
+        let value = runtime
+            .eval(
+                "local result = quirl.process.run('false'); return { code = result.error.code, status = result.error.exit_status, stderr = result.stderr }",
+            )
+            .unwrap();
+        assert_eq!(value["code"], "invalid_command");
+        assert_eq!(value["status"], 9);
+        assert_eq!(value["stderr"], "failed safely");
     }
 }
