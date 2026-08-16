@@ -1,0 +1,32 @@
+---
+title: Quirl documentation
+description: Learn the shell, typed data runtime, Lua SDK, plugin platform, and the engineering decisions behind Quirl.
+---
+
+Quirl is a Rust shell that keeps your Bash and Zsh muscle memory working
+natively, adds an explicit typed data mode for structured pipelines, and
+standardizes configuration, scripts, prompts, completions, and trusted plugins
+on one sandboxed Lua 5.4 SDK.
+
+<Callout type="warn" title="Pre-release documentation">
+  Quirl 0.1 is an unreleased Unix release candidate and a fast-moving prototype.
+  Some interfaces will change before the first tagged release. Linux and macOS
+  are the supported interactive targets; Windows is best-effort portability work.
+</Callout>
+
+## Start here
+
+<Cards>
+  <Card title="Install from source" href="/docs/getting-started/installation" description="Build the current release candidate with the pinned Rust toolchain." />
+  <Card title="Your first session" href="/docs/getting-started/first-session" description="Move from familiar commands to typed data and back again." />
+  <Card title="Understand the language" href="/docs/architecture/product-and-language-design" description="Read the complete product and language specification." />
+  <Card title="Extend with Lua" href="/docs/extensions/lua-sdk" description="Use one bounded SDK for scripts, configuration, and plugins." />
+</Cards>
+
+## What is documented
+
+These docs include current user workflows, the full language and runtime
+specification, extension contracts, architectural decisions, protocol evidence,
+testing strategy, historical research, and the release checklist. Authored guides
+sit beside complete source documents so nothing important is hidden behind a
+summary.

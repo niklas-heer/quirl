@@ -1,0 +1,5 @@
+{
+  "title": "Using Quirl",
+  "icon": "SquareTerminal",
+  "pages": ["index", "typed-data-runtime"]
+}

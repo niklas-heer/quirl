@@ -1,0 +1,711 @@
+---
+title: "CLI command catalog"
+description: "Generated documentation for every installed command in Quirl’s semantic catalog."
+---
+
+{/* Generated from the compiled Quirl catalog. Run npm run sync:reference; do not edit this page by hand. */}
+
+## `bg [%job]`
+
+Resume a stopped job in the background
+
+Sends SIGCONT to the selected process group without transferring terminal ownership.
+
+Options:
+
+- `%job` — Positional `%job` declared by the builtin command signature.
+
+## `cd [path]`
+
+Change the shell working directory
+
+Changes Quirl's process directory so later commands and prompt context follow it.
+
+Options:
+
+- `path` — Positional `path` declared by the builtin command signature.
+
+## `export NAME=value...`
+
+Set environment variables for later commands
+
+The Preview grammar accepts explicit NAME=value assignments without shell expansion.
+
+## `fg [%job]`
+
+Resume a job in the foreground
+
+Transfers terminal ownership to the selected process group and waits until it exits or stops again.
+
+Options:
+
+- `%job` — Positional `%job` declared by the builtin command signature.
+
+## `git commit [options]`
+
+Record changes to the repository
+
+External command metadata demonstrates imported completion knowledge.
+
+Options:
+
+- `-m`, `--message` — Use the given commit message
+- `--amend` — Replace the tip of the current branch
+- `--no-verify` — Bypass pre-commit and commit-msg hooks
+- `-a`, `--all` — Stage modified and deleted tracked files
+
+## `git status [--short]`
+
+Show repository and working-tree status
+
+External command metadata can eventually be imported from generated specs and help output.
+
+Options:
+
+- `-s`, `--short` — Use the compact status format
+
+## `help [command]`
+
+Explore commands and their contracts
+
+Reads this same catalog used by completion and AI discovery.
+
+Options:
+
+- `command` — Positional `command` declared by the builtin command signature.
+
+## `jobs`
+
+List structured background job state
+
+Shows Quirl job ids, running/stopped/done state, and the original command.
+
+## `ls [path] [options]`
+
+List a directory as structured entries
+
+Quirl's bounded native ls renders terminal-safe plain rows for humans and preserves exact entry values in stable JSON. Sorting is deterministic; symlink targets are lazy and opt-in. `--max-entries` is a positive, explicit resource bound.
+
+Options:
+
+- `path` — Positional `path` declared by the builtin command signature.
+- `--format` — Choose terminal-safe plain output or stable JSON
+- `--max-entries` — Limit the listing to a positive number of entries
+- `--sort` — Choose the deterministic entry ordering
+- `--directories-first`, `--dirs-first` — Keep directories before other entry kinds
+- `--json` — Emit stable structured JSON
+- `--resolve-links` — Read symlink targets as an explicit metadata enrichment
+- `-a`, `--all` — Include hidden entries
+- `-l`, `--long` — Show size, kind, and modified time
+- `-r`, `--reverse` — Reverse the selected sort within directory/file groups
+
+## `lua <expression>`
+
+Evaluate Lua without leaving command mode
+
+Runs an expression in the persistent restricted Lua 5.4 VM.
+
+Options:
+
+- `expression` — Positional `expression` declared by the builtin command signature.
+
+## `mode <command|data|toggle>`
+
+Switch the visible interactive grammar
+
+Command mode carries bytes and process status. Data mode evaluates Quirl's native structured values and pipelines.
+
+Options:
+
+- `command|data|toggle` — Positional `command|data|toggle` declared by the builtin command signature.
+
+## `quirl agent catalog [--format text|json]`
+
+Export installed commands and Lua host capabilities
+
+Emits a versioned deny-unknown schema with deterministic catalog and HOST_API content hashes, provenance, installed capabilities, and their versions.
+
+Options:
+
+- `--format` — Choose accessible text or stable machine JSON
+
+## `quirl agent context <query...> [--token-budget count] [--format markdown|json]`
+
+Build deterministic token-budgeted agent context
+
+Ranks only installed command and HOST_API facts, selects the smallest relevant subtree within a documented deterministic token estimate, and records truncation and source hashes.
+
+Options:
+
+- `query` — Positional `query` declared by the builtin command signature.
+- `--format` — Choose agent Markdown or stable machine JSON
+- `--token-budget` — Bound the canonical context payload
+
+## `quirl agent manifest [--format text|json]`
+
+Export installed tools, versions, schemas, and validators
+
+Lists only tools and capabilities installed in this Quirl composition, with schema/content hashes and validation commands grounded in the semantic catalog and generated Lua HOST_API.
+
+Options:
+
+- `--format` — Choose accessible text or stable machine JSON
+
+## `quirl agent validate <file> --kind catalog|context|manifest [--format text|json]`
+
+Validate a versioned agent contract without execution
+
+Rejects unknown fields, unsupported schema versions, tampered content hashes, nondeterministic ordering, and context payloads that exceed their declared token budget.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `--format` — Choose accessible diagnostics or stable JSON
+- `--kind` — Select the deny-unknown document schema
+
+## `quirl catalog [--format text|json|markdown]`
+
+Export installed command knowledge for humans or AI
+
+Emits the versioned semantic catalog bundled with this binary.
+
+Options:
+
+- `--format` — Choose a stable output format
+
+## `quirl check <file|directory> [--format text|json]`
+
+Validate scripts without executing them
+
+Deterministically discovers Lua and Quirl scripts, checks Lua syntax, annotations, modules, and restricted APIs plus Quirl statement structure, and aggregates structured diagnostics without executing source.
+
+Options:
+
+- `file|directory` — Positional `file|directory` declared by the builtin command signature.
+- `--format` — Choose diagnostic output
+
+## `quirl complete <input> [--format text|json]`
+
+Query the semantic completion engine
+
+Returns the same attributed completion items used by the interactive editor.
+
+Options:
+
+- `input` — Positional `input` declared by the builtin command signature.
+- `--format` — Choose stable text or JSON output
+
+## `quirl config check <file> [--format text|json]`
+
+Validate Lua configuration through Rust schemas
+
+Evaluates under config restrictions and preserves the active last-known-good value on failure.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `--format` — Choose output format
+
+## `quirl config diff <file> <other> [--format text|json]`
+
+Compare two evaluated configurations
+
+Loads both authoritative Lua files under the restricted schema policy and reports deterministic field-level differences without changing either file.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `other` — Positional `other` declared by the builtin command signature.
+- `--format` — Choose output format
+
+## `quirl config doctor <file> [--format text|json]`
+
+Diagnose configuration schema and editability
+
+Validates the authoritative configuration and reports which recognized settings are safe literal patches versus code-controlled expressions; it never writes source.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `--format` — Choose output format
+
+## `quirl config export <file> [--format text|json]`
+
+Export evaluated schema-backed configuration
+
+Reads and validates config.lua, then emits a deterministic terminal-safe text view or versioned JSON document without modifying source.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `--format` — Choose output format
+
+## `quirl config fmt <file> [--check]`
+
+Format a Lua configuration deterministically
+
+Validates the authoritative configuration, then applies Quirl's deterministic Lua formatter. `--check` reports drift and never writes.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `--check` — Report formatting drift without writing
+
+## `quirl config get <file> <key>`
+
+Read one evaluated configuration value
+
+Evaluates the complete restricted Lua configuration, validates it through Rust schemas, and prints one recognized typed field.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `key` — Positional `key` declared by the builtin command signature.
+
+## `quirl config migrate <file> --dry-run [--format text|json]`
+
+Preview a schema migration without rewriting configuration
+
+0.1.0 only previews the unversioned-to-v1 schema insertion. `--dry-run` is required and no source or backup file is written.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `--format` — Choose output format
+- `--dry-run` — Require a non-mutating migration preview
+
+## `quirl config set <file> <key> <value>`
+
+Safely patch one literal configuration value
+
+Changes only a recognized literal field in `quirl.config`, including `prompt.symbols` (`auto`, `plain`, `unicode`, or explicit `nerd_font`), validates the complete candidate before an atomic replacement, and retains the previous source as `.bak`.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `key` — Positional `key` declared by the builtin command signature.
+- `value` — Positional `value` declared by the builtin command signature.
+
+## `quirl config tui <file>`
+
+Inspect schema-backed configuration in the terminal
+
+Shows current editor, picker, and prompt symbol values, allowed values, and textual editing guidance in an accessible line-oriented view.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+
+## `quirl config web <file> [--port <port>]`
+
+Open the local schema-backed configuration form
+
+Serves an accessible configuration form only on IPv4 loopback. The private session URL carries a CSRF token; saves validate the complete Lua configuration, retain a `.bak`, preserve non-overlapping concurrent source edits, and reject conflicting or code-controlled fields.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `port` — Positional `port` declared by the builtin command signature.
+- `--port` — Loopback port; 0 selects an available port
+
+## `quirl data <source> [| transform ...] [--format table|plain|json]`
+
+Evaluate a native structured-data pipeline
+
+Sources are `pwd`, `files [path]` (or `ls`), `open <path>`, JSON, or explicit `^external <command>`. `open` adapts JSON, YAML, TOML, CSV, and uncompressed POSIX tar headers; unknown extensions remain text. `lines`, `from json`, and `to json` make byte/value conversions visible. The CLI injects a deadline-, cancellation-, and output-bounded external host; library runtimes fail closed without one. CSV/tar rows are pulled lazily and all adapters enforce file, row, field, and depth limits. `sort` and table output intentionally collect within those limits. Transforms include typed `where` comparisons with `and`/`or`, dotted `get`, `select`, `sort`, `take`, `first`, and `length`. HTTP is not an implicit source.
+
+Options:
+
+- `source` — Positional `source` declared by the builtin command signature.
+- `--format` — Choose a human table/plain renderer or the stable typed JSON envelope
+
+## `quirl describe <command> [--format text|json|markdown|html]`
+
+Describe one installed command
+
+Renders one exact entry from the same semantic catalog used by completion, documentation, language services, and agents.
+
+Options:
+
+- `command` — Positional `command` declared by the builtin command signature.
+- `--format` — Choose a deterministic documentation view
+
+## `quirl doc [--format text|json|markdown|html] [--output path] [--open]`
+
+Generate installed command documentation
+
+Generates deterministic human or machine documentation from the installed catalog, writes requested files atomically, and can open an explicit output in the platform viewer.
+
+Options:
+
+- `--format` — Choose a deterministic documentation view
+- `--output` — Atomically write the generated view
+- `--open` — Open the explicit output in the default viewer
+
+## `quirl eval <lua-expression>`
+
+Evaluate Lua and print the returned value
+
+Runs one expression in the same restricted, budgeted Lua runtime used by scripts.
+
+Options:
+
+- `lua-expression` — Positional `lua-expression` declared by the builtin command signature.
+
+## `quirl events schema [--format text|json]`
+
+Describe the installed typed extension protocol
+
+Lists immutable lifecycle, directory, plan, progress, output, cancellation, result, and error events together with declared mutation capabilities and the composed catalog, completion, and panel contribution kinds.
+
+Options:
+
+- `--format` — Choose accessible text or versioned machine JSON
+
+## `quirl events validate <file> [--format text|json]`
+
+Validate an immutable extension event trace
+
+Checks the deny-unknown versioned envelope, protocol version, safe output text, and strictly increasing event sequence without invoking a plugin.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `--format` — Choose accessible text or stable validation JSON
+
+## `quirl exec <command...>`
+
+Execute Quirl's native command graph
+
+Runs quoted commands, byte pipes, redirects, boolean lists, and background jobs without a compatibility-shell round trip.
+
+Options:
+
+- `command` — Positional `command` declared by the builtin command signature.
+
+## `quirl fmt <file|directory> [--check]`
+
+Format Lua scripts deterministically
+
+Deterministically discovers scripts, applies Quirl's idempotent literal-safe Lua formatting contract, reports all CI drift, and leaves native `.qrl` source (including `.quirl` and `.🌀` aliases) unchanged.
+
+Options:
+
+- `file|directory` — Positional `file|directory` declared by the builtin command signature.
+- `--check` — Report drift without writing
+
+## `quirl index build [--fish path]... [--bash path]... [--zsh path]... [--help path]... [--man path]... [--output path] [--format text|json]`
+
+Build the attributed completion index
+
+Imports declarative Fish, Bash, and Zsh completions plus bounded supplied help/man text without sourcing or executing providers, commands, or man, then atomically writes a versioned catalog.
+
+Options:
+
+- `--bash` — Import a Bash completion file or directory
+- `--fish` — Import a Fish completion file or directory
+- `--format` — Choose the build report format
+- `--help` — Parse supplied command-help text without executing its command
+- `--man` — Parse supplied rendered/raw man text without invoking man
+- `--output` — Write a specific index instead of the default cache
+- `--zsh` — Import a Zsh completion file or directory
+
+## `quirl index explain <command...> [--index path] [--format text|json]`
+
+Explain where indexed command facts came from
+
+Shows source kind, confidence, origin, and fingerprint for command metadata and each retained option.
+
+Options:
+
+- `command` — Positional `command` declared by the builtin command signature.
+- `--format` — Choose the explanation format
+- `--index` — Read a specific catalog index
+
+## `quirl lint <file|directory> [--format text|json]`
+
+Lint scripts without executing them
+
+Aggregates annotation and capability diagnostics for deterministically discovered scripts and rejects ambient APIs that bypass Quirl capabilities.
+
+Options:
+
+- `file|directory` — Positional `file|directory` declared by the builtin command signature.
+- `--format` — Choose diagnostic output
+
+## `quirl lsp`
+
+Serve generated Lua and native Quirl (`.qrl`) editor intelligence
+
+Speaks a deterministic LSP subset over stdio, using the generated Lua HOST_API and semantic command catalog for diagnostics, completion, hover, signatures, and module docs without evaluating documents.
+
+## `quirl new <name> [--lang lua|quirl] [--directory path]`
+
+Create a checked script
+
+Writes a deterministic Lua or native Quirl script with create-new semantics, so an existing script is never overwritten. Lua is the default; `--lang quirl` generates the canonical `.qrl` extension. `.quirl` and `.🌀` remain accepted input aliases.
+
+Options:
+
+- `name` — Positional `name` declared by the builtin command signature.
+- `--directory` — Choose the destination directory
+- `--lang` — Choose Lua (the default) or native Quirl (`.qrl`)
+
+## `quirl package build [--manifest path] [--format text|json]`
+
+Validate and build a deterministic package contract
+
+Checks the entry path, Quirl version range, installed capabilities, and the public-command quality gate for summaries, argument docs and types, examples, effects, and error codes; it returns content hashes without executing Lua.
+
+Options:
+
+- `--format` — Choose accessible diagnostics or stable JSON
+- `--manifest` — Build a manifest other than ./plugin.toml
+
+## `quirl package manifest [--manifest path] [--format text|json]`
+
+Parse a versioned project package manifest
+
+Reads a deny-unknown plugin.toml schema and shows normalized package identity, Quirl compatibility, requested capabilities, and contributions without loading its Lua entry.
+
+Options:
+
+- `--format` — Choose accessible text or stable machine JSON
+- `--manifest` — Read a manifest other than ./plugin.toml
+
+## `quirl package publish --dry-run [--manifest path] [--format text|json]`
+
+Preview a deterministic network-free package publication
+
+Runs the complete package build quality gate and emits the files, build hash, and requested permissions that would be published. Phase 2 performs no network publication.
+
+Options:
+
+- `--format` — Choose accessible text or stable JSON
+- `--manifest` — Read a manifest other than ./plugin.toml
+- `--dry-run` — Require a network-free publication plan
+
+## `quirl pick [--source stdin|history|files|actions] [--query text] [--multi] [--limit count] [--root path] [--format text|json]`
+
+Select typed values with Quirl's shared fuzzy engine
+
+The same deterministic exact/fuzzy/inverse query model ranks history, files, actions, jobs, completions, and data while returning the original value.
+
+Options:
+
+- `--format` — Choose stable output
+- `--limit` — Bound multi-selection output
+- `--query` — Set the initial fuzzy query
+- `--root` — Set the file provider root
+- `--source` — Choose the typed provider
+- `--multi` — Return multiple selected values
+
+## `quirl plugin add <source> [--allow capability]... [--format text|json]`
+
+Install a local plugin with explicit permission approval
+
+Validates the versioned manifest and runtime boundary, shows the permission diff, records SHA-256 source checksums, and atomically installs a disabled permission lock without implicit network access.
+
+Options:
+
+- `source` — Positional `source` declared by the builtin command signature.
+- `--allow` — Approve one requested capability after review; repeat as needed
+- `--format` — Choose accessible text or stable machine JSON
+
+## `quirl plugin check <file> [--format text|json]`
+
+Validate Lua plugin registrations
+
+Loads a trusted plugin with process access denied and validates prompt and completion callbacks.
+
+Options:
+
+- `file` — Positional `file` declared by the builtin command signature.
+- `--format` — Choose output format
+
+## `quirl plugin disable <name> [--format text|json]`
+
+Disable a plugin while retaining its permission lock
+
+Atomically changes only enabled state; source, checksums, versions, and granted capabilities remain locked for inspection and recovery.
+
+Options:
+
+- `name` — Positional `name` declared by the builtin command signature.
+- `--format` — Choose accessible text or stable machine JSON
+
+## `quirl plugin doctor <name> [--format text|json]`
+
+Diagnose plugin schema, source integrity, permissions, and runtime boundaries
+
+Verifies lock schema/API versions and SHA-256 checksums, then validates trusted Lua registrations or isolated Wasm/out-of-process boundaries with accessible diagnostics.
+
+Options:
+
+- `name` — Positional `name` declared by the builtin command signature.
+- `--format` — Choose accessible text or stable machine JSON
+
+## `quirl plugin enable <name> [--format text|json]`
+
+Enable a checksum-verified installed plugin
+
+Runs doctor and the declared non-executing or budgeted trusted boundary before atomically enabling the existing locked plugin.
+
+Options:
+
+- `name` — Positional `name` declared by the builtin command signature.
+- `--format` — Choose accessible text or stable machine JSON
+
+## `quirl plugin permissions <name> [--format text|json]`
+
+Inspect requested and granted plugin authority
+
+Reads the permission lock and emits requested, granted, added, removed, and unchanged capabilities without loading plugin code.
+
+Options:
+
+- `name` — Positional `name` declared by the builtin command signature.
+- `--format` — Choose accessible text or stable machine JSON
+
+## `quirl plugin remove <name> [--format text|json]`
+
+Remove an installed plugin lock without deleting source
+
+Atomically removes the named permission record; external source directories are never deleted by the plugin manager.
+
+Options:
+
+- `name` — Positional `name` declared by the builtin command signature.
+- `--format` — Choose accessible text or stable machine JSON
+
+## `quirl plugin update --locked [--format text|json]`
+
+Verify installed plugins without changing locked authority
+
+Re-resolves every local source and rejects any version, checksum, API, or permission change; platform v0.1 does not perform network updates.
+
+Options:
+
+- `--format` — Choose accessible text or stable machine JSON
+- `--locked` — Forbid changes to versions, checksums, API versions, and capabilities
+
+## `quirl recover <list|show> [--format text|json]`
+
+Inspect recoverable command-failure snapshots
+
+Lists or displays versioned atomic snapshots containing a redacted command, working directory, environment diff, bounded captured output, timing, status, and error chain.
+
+Options:
+
+- `list|show` — Positional `list|show` declared by the builtin command signature.
+- `--format` — Choose stable text or JSON output
+
+## `quirl recover list [--format text|json]`
+
+List recoverable command-failure snapshots
+
+Lists versioned snapshot identifiers newest first without reading or replaying command contents.
+
+Options:
+
+- `--format` — Choose stable text or JSON output
+
+## `quirl recover show [id] [--format text|json]`
+
+Inspect one recoverable command-failure snapshot
+
+Displays an explicit snapshot or the newest available snapshot, including redacted context and bounded captured output; it never replays the command.
+
+Options:
+
+- `id` — Positional `id` declared by the builtin command signature.
+- `--format` — Choose stable text or JSON output
+
+## `quirl run <file|-> [--lang lua|quirl|bash|zsh] [arguments...]`
+
+Run a script through its explicit language engine
+
+Selects a language by explicit flag, shebang, or extension; Lua uses the restricted VM, `.qrl` uses native executors, and `.quirl` plus `.🌀` are accepted native aliases. Bash/Zsh use reference interpreters with startup files disabled and structured capture.
+
+Options:
+
+- `arguments` — Positional `arguments` declared by the builtin command signature.
+- `file|-` — Positional `file|-` declared by the builtin command signature.
+- `--lang` — Select the language explicitly, including for stdin
+
+## `quirl sdk [--format text|json|markdown]`
+
+Export the generated Lua extension SDK
+
+LuaLS stubs, AI JSON, and human documentation are generated from the same Rust host API definitions.
+
+Options:
+
+- `--format` — Choose the generated SDK view
+
+## `quirl serve mcp --capabilities catalog|complete|check|format`
+
+Serve explicitly granted source intelligence over MCP stdio
+
+Supports modern 2026-07-28 discovery and explicitly negotiated legacy clients. Each process exposes only the requested bounded catalog, completion, source-check, and source-format tools; it grants no filesystem, network, plugin, or command-execution authority.
+
+Options:
+
+- `--capabilities` — Grant one or more comma-separated MCP tools
+
+## `quirl test [file|directory]`
+
+Run a Lua test module under resource limits
+
+Discovers conventional Lua test modules deterministically and runs every returned `test_*` function in an isolated restricted runtime.
+
+Options:
+
+- `file|directory` — Positional `file|directory` declared by the builtin command signature.
+
+## `quirl view directory [path] [--all] [--format text|json]`
+
+Render a directory as an escape-safe typed panel
+
+Produces a line-oriented name, kind, byte-size, and modification view with a plain fallback; raw terminal control bytes are rejected.
+
+Options:
+
+- `path` — Positional `path` declared by the builtin command signature.
+- `--format` — Choose the plain view or typed panel model
+- `--all` — Include hidden entries
+
+## `quirl view panel <name> [--format text|json]`
+
+Render an enabled plugin's typed panel contribution
+
+Invokes one permission-locked, deadline-bounded panel provider, validates its escape-free PanelModel and declared plain fallback, then renders accessible text or JSON.
+
+Options:
+
+- `name` — Positional `name` declared by the builtin command signature.
+- `--format` — Choose the plain view or typed panel model
+
+## `quirl view processes [--format text|json]`
+
+Render the process table as an escape-safe typed panel
+
+Reads the platform process table into typed pid, parent, state, and command cells and renders an accessible plain fallback without accepting terminal escapes.
+
+Options:
+
+- `--format` — Choose the plain view or typed panel model
+
+## `quirl watch <expression> [--samples count] [--interval-ms ms] [--capacity count] [--format text|json]`
+
+Watch a typed data pipeline with bounded live samples
+
+Re-evaluates the native data expression until the declared sample bound or Ctrl-C, checks cancellation between stages and during refresh waits, retains a bounded completed-sample history, and reports older samples dropped from retention.
+
+Options:
+
+- `expression` — Positional `expression` declared by the builtin command signature.
+- `--capacity` — Bound retained samples to at most 256
+- `--format` — Choose live lines or a bounded JSON snapshot
+- `--interval-ms` — Set the cancellable refresh interval
+- `--samples` — Set a bounded sample count

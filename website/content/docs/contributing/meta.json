@@ -1,0 +1,11 @@
+{
+  "title": "Contributing",
+  "icon": "GitPullRequest",
+  "pages": [
+    "index",
+    "project-guide",
+    "engineering-contract",
+    "testing-strategy",
+    "manual-job-control"
+  ]
+}

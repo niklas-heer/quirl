@@ -1,0 +1,44 @@
+---
+title: Install from source
+description: Build and run Quirl's unreleased 0.1 candidate with the pinned toolchain.
+---
+
+<Callout type="warn" title="No stable release yet">
+  Quirl is currently built from source. There are no supported package-manager
+  binaries or stable release artifacts to install yet.
+</Callout>
+
+## Requirements
+
+- Linux or macOS for the supported interactive experience.
+- Git.
+- Rustup. The repository pins Rust 1.88.0 with `clippy` and `rustfmt`.
+- Python 3 only for the Unix PTY quality gate.
+
+You do not need a system Lua installation; Quirl embeds vendored Lua 5.4.
+
+## Build and run
+
+```sh
+git clone https://github.com/niklas-heer/quirl.git
+cd quirl
+cargo run -p quirl-cli
+```
+
+For a guided recording of the major surfaces:
+
+```sh
+cargo xtask demo
+```
+
+## Verify a checkout
+
+The canonical local quality gate formats, lints, tests, and validates the
+workspace's generated artifacts:
+
+```sh
+cargo xtask check
+```
+
+See [Contributing](/docs/contributing) for focused checks and the complete test
+strategy.

@@ -1,0 +1,29 @@
+---
+title: Contributing
+description: Work on Quirl with the same safety, performance, and quality boundaries as the project.
+---
+
+Quirl prioritizes safety, performance, and developer experience—in that order.
+Changes should preserve user data, terminal state, process lifecycle, capability
+boundaries, and deterministic resource limits before adding surface area.
+
+## Before opening a change
+
+```sh
+cargo xtask check
+```
+
+Use the focused tasks while iterating:
+
+```sh
+cargo xtask fmt
+cargo xtask lint
+cargo xtask test
+```
+
+<Cards>
+  <Card title="Project contribution guide" href="/docs/contributing/project-guide" />
+  <Card title="Engineering contract" href="/docs/contributing/engineering-contract" />
+  <Card title="Testing strategy" href="/docs/contributing/testing-strategy" />
+  <Card title="Manual job-control checks" href="/docs/contributing/manual-job-control" />
+</Cards>

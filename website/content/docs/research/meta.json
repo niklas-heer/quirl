@@ -1,0 +1,5 @@
+{
+  "title": "Research",
+  "icon": "FlaskConical",
+  "pages": ["index", "bash-zsh-source-study", "benchmarks"]
+}

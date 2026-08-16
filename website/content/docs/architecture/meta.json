@@ -1,0 +1,12 @@
+{
+  "title": "Architecture",
+  "icon": "Layers",
+  "pages": [
+    "index",
+    "product-and-language-design",
+    "interactive-surface",
+    "why-lua",
+    "crates",
+    "decisions"
+  ]
+}

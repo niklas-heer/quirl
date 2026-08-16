@@ -1,0 +1,12 @@
+{
+  "title": "Reference",
+  "icon": "BookOpenText",
+  "pages": [
+    "index",
+    "cli-command-catalog",
+    "artifacts",
+    "catalog-schema",
+    "async-interaction-protocol",
+    "protocol-compatibility"
+  ]
+}

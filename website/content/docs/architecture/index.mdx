@@ -1,0 +1,15 @@
+---
+title: Architecture
+description: The product specification, crate layering, runtime boundaries, and accepted design decisions.
+---
+
+Quirl keeps dependency direction one-way: foundation crates define contracts,
+data and Lua sit on core, UI composes those lower layers, and the CLI is the only
+crate that sees the entire system.
+
+<Cards>
+  <Card title="Product and language design" href="/docs/architecture/product-and-language-design" />
+  <Card title="Interactive surface" href="/docs/architecture/interactive-surface" />
+  <Card title="Why Lua" href="/docs/architecture/why-lua" />
+  <Card title="Architecture decisions" href="/docs/architecture/decisions" />
+</Cards>
