@@ -263,26 +263,60 @@ pub struct SyntaxRecordField {
 }
 
 impl SyntaxLiteral {
-    /// Convert this bounded syntax literal into the evaluator's JSON-compatible value.
+    /// Convert this bounded syntax literal into JSON-compatible analysis data.
+    ///
+    /// The evaluator does not use this compatibility view. Conversion is
+    /// iterative so deeply nested caller input cannot consume the Rust stack.
     pub fn to_json(&self) -> Value {
-        match &self.kind {
-            SyntaxLiteralKind::Nothing => Value::Null,
-            SyntaxLiteralKind::Bool(value) => Value::Bool(*value),
-            SyntaxLiteralKind::Int(value) => Value::from(*value),
-            SyntaxLiteralKind::UInt(value) => Value::from(*value),
-            SyntaxLiteralKind::Decimal(value) => serde_json::from_str::<Number>(value)
-                .map_or_else(|_| Value::String(value.clone()), Value::Number),
-            SyntaxLiteralKind::String(value) => Value::String(value.clone()),
-            SyntaxLiteralKind::List(values) => {
-                Value::Array(values.iter().map(Self::to_json).collect())
-            }
-            SyntaxLiteralKind::Record(fields) => Value::Object(
-                fields
-                    .iter()
-                    .map(|field| (field.name.value.clone(), field.value.to_json()))
-                    .collect::<Map<_, _>>(),
-            ),
+        enum Work<'a> {
+            Visit(&'a SyntaxLiteral),
+            FinishList(usize),
+            FinishRecord(Vec<String>),
         }
+
+        let mut work = vec![Work::Visit(self)];
+        let mut output = Vec::new();
+        while let Some(task) = work.pop() {
+            match task {
+                Work::Visit(literal) => match &literal.kind {
+                    SyntaxLiteralKind::Nothing => output.push(Value::Null),
+                    SyntaxLiteralKind::Bool(value) => output.push(Value::Bool(*value)),
+                    SyntaxLiteralKind::Int(value) => output.push(Value::from(*value)),
+                    SyntaxLiteralKind::UInt(value) => output.push(Value::from(*value)),
+                    SyntaxLiteralKind::Decimal(value) => output.push(
+                        serde_json::from_str::<Number>(value)
+                            .map_or_else(|_| Value::String(value.clone()), Value::Number),
+                    ),
+                    SyntaxLiteralKind::String(value) => output.push(Value::String(value.clone())),
+                    SyntaxLiteralKind::List(values) => {
+                        work.push(Work::FinishList(values.len()));
+                        work.extend(values.iter().rev().map(Work::Visit));
+                    }
+                    SyntaxLiteralKind::Record(fields) => {
+                        work.push(Work::FinishRecord(
+                            fields
+                                .iter()
+                                .map(|field| field.name.value.clone())
+                                .collect(),
+                        ));
+                        work.extend(fields.iter().rev().map(|field| Work::Visit(&field.value)));
+                    }
+                },
+                Work::FinishList(length) => {
+                    let start = output.len().saturating_sub(length);
+                    let values = output.split_off(start);
+                    output.push(Value::Array(values));
+                }
+                Work::FinishRecord(keys) => {
+                    let start = output.len().saturating_sub(keys.len());
+                    let values = output.split_off(start);
+                    output.push(Value::Object(
+                        keys.into_iter().zip(values).collect::<Map<_, _>>(),
+                    ));
+                }
+            }
+        }
+        output.pop().unwrap_or(Value::Null)
     }
 
     /// Infer the explicit literal type without resolving names or evaluator behavior.

@@ -207,6 +207,7 @@ pub fn directory_entries_with_options(
             continue;
         }
         if entries.len() == options.max_entries {
+            let observed = options.max_entries.saturating_add(1);
             return Err(ShellError::new(
                 ErrorCode::ResourceLimit,
                 format!(
@@ -215,6 +216,10 @@ pub fn directory_entries_with_options(
                     options.max_entries
                 ),
             )
+            .with_context(format!(
+                "limit: {}; observed: {observed}",
+                options.max_entries
+            ))
             .with_help("Choose a narrower directory or increase the explicit listing limit"));
         }
         let entry_path = item.path();

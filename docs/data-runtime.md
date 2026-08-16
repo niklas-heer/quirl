@@ -1,5 +1,37 @@
 # Data runtime in 0.1.0
 
+## Streaming failure model and invariants
+
+- Cancellation is checked before source initialization, before and during every
+  pull, and before each transform or renderer write. Cancellation after a
+  partial write remains an error; already-written bytes are not reported as a
+  successful value.
+- A lazy source owns its reader until the stream is dropped. Adapter failure
+  after earlier rows does not manufacture a successful partial result, and
+  dropping the stream after success, cancellation, or error closes the reader.
+- Values remain `DataValue` from source ingress through transforms and shared
+  execution outcomes. JSON, YAML, TOML, and byte strings are named conversion
+  boundaries; none is the evaluator's internal representation.
+- Every conversion validates bytes, rows, record width, nesting depth, value
+  nodes, retained text, and materialized bytes. A bridge fails with
+  `ResourceLimit` before retaining the first value beyond its configured bound,
+  and reports the configured limit and observed use when safe.
+- `sort`, table rendering, `DataOutput::into_envelope`, and the collected
+  convenience APIs are the only materializing stream operations. Lazy `lines`,
+  CSV, tar, `where`, `get`, `select`, and `take` retain an O(one-row) window.
+- Type mismatches and lossy conversions are operating errors. No adapter,
+  transform, or renderer panics on user input, recurses over untrusted value
+  structure, or performs a hidden JSON round trip.
+- `first` is the focused grammar's optional operation: an empty stream becomes
+  `Option::None` and a present row becomes `Option::Some`. Operating failures
+  remain `ShellError` unless a caller explicitly requests a result envelope.
+  `Task` remains bounded declarative state; this runtime does not claim a
+  scheduler or asynchronous execution.
+- A successful shared execution outcome has one zero status and one typed value
+  representation. Cancellation, adapter failure, bridge overflow, and
+  transform errors remain `Err(ShellError)` after owned readers are released;
+  they never become a successful status with a partial value.
+
 `quirl data` evaluates native structured values and renders them explicitly:
 
 ```text
@@ -32,8 +64,9 @@ literal, and `^external` sources; `lines`, `from json`, and `to json` bridges;
 and `get`, `where`, `select`, `sort`, `take`, `first`, and `length` transforms.
 Its `DataType` surface names existing scalar/domain `DataValue` forms plus
 `List`, `Record`, `Table`, `Option`, `Result`, `Task`, `Stream`, and `Command`.
-Those type nodes are semantic vocabulary only; they do not claim P09 evaluator
-inference, scheduling, or stream behavior.
+Those type nodes remain focused semantic vocabulary rather than general type
+inference. The evaluator now preserves `DataValue` through live streams and
+implements `first` as `Option`; `Task` still does not claim scheduling.
 
 An empty expression is now a syntax diagnostic instead of the earlier
 implementation accident that produced `null`; write `null` explicitly. Bare
@@ -44,11 +77,14 @@ author to quote the complete path.
 does not need to infer whether an array is an ordinary value or a pipeline
 stream. Values themselves retain an ABI tag (`int`, `decimal`, `path`, `size`,
 and so on) rather than making domain values look like strings. The current
-native parser emits JSON-compatible scalar/list/record values; domain tags are
-available to adapters and host boundaries. `Option`, `Result` (`ok` or
-`error`), and `Task` (`pending`, `complete`, `cancelled`, or `failed`) remain
-explicit in the same ABI. Failures remain `ShellError` until a caller
-intentionally puts one in a result or task envelope.
+native parser emits generic scalar/list/record values. Filesystem rows preserve
+`Path`, `Size`, and optional `DateTime` fields; tar rows preserve `Path` and
+`Size`; TOML datetimes remain `DateTime`. `Option`, `Result` (`ok` or `error`),
+and `Task` (`pending`, `complete`, `cancelled`, or `failed`) remain explicit in
+the same ABI. `first` produces `Option::Some` or `Option::None`.
+`DataRuntime::eval_result_envelope` is the intentional boundary that captures
+an operating error; other evaluator entry points return `ShellError`. Task
+states are validated declarative data and never start asynchronous work.
 
 Supported adapters are JSON, YAML, TOML, CSV, uncompressed POSIX tar archive
 inspection, and filesystem rows (`files [path]`, with `ls` retained as an
@@ -56,16 +92,22 @@ alias). CSV and tar entries are pull-based: a row is parsed when the consumer
 asks for it, and cancellation is checked before each pull. The public CLI
 writes plain and JSON rows directly to stdout as it pulls them, keeping those
 paths `O(window)` rather than constructing a complete output string. It keeps
-that laziness through `where`, `get`, `select`, and `take`; `sort` and table
-rendering are deliberate bounded collection boundaries. `DataRuntime::render`
-is a collected convenience API, while `render_to` is the streaming boundary.
+that laziness through `where`, `get`, `select`, and `take`; `sort`, table
+rendering, `DataOutput::into_envelope`, and the collected `eval`/`render`
+convenience APIs are deliberate bounded collection boundaries. `render_to` is
+the streaming output boundary. `eval_typed` is the collected typed API;
+the older `eval` method is retained as a named JSON-compatibility bridge for
+script and watch consumers and therefore applies the same documented loss as
+`to json`.
 JSON, YAML, TOML, and directory entries are validated then materialized because
 their current underlying parsers expose whole-document APIs.
 
-Every adapter enforces the default 8 MiB file size, 100,000 row, 256 field,
-64 nesting-depth, and 256 KiB expression limits. Library callers can set
-`DataLimits` explicitly; evaluator entry points derive matching syntax byte,
-depth, and field limits before parsing. CSV requires a single unique header row
+Every adapter enforces the default 8 MiB file size, 100,000 row/node, 256
+field, 64 nesting-depth, 8 MiB retained-text, 16 MiB materialization, and
+256 KiB expression limits. Library callers can set `DataLimits` explicitly;
+evaluator entry points derive matching syntax byte, depth, and field limits
+before parsing. Resource-limit diagnostics report the configured limit and
+observed use when safe. CSV requires a single unique header row
 and does not support multiline quoted fields. Tar inspection lists headers
 only: it never extracts entries and intentionally supports only uncompressed POSIX `.tar`
 archives (not zip, gzip, bzip2, xz, or PAX/GNU extended-name semantics); each
@@ -74,7 +116,12 @@ header checksum is verified before the entry is reported.
 Byte/value crossings are explicit. `lines` turns one string byte value into a
 lazy stream of newline-delimited strings; `from json` parses a string byte
 value (or each string stream item); and `to json` serializes a value or each
-stream item. `^external <command>` is the only external byte producer. A
+stream item. JSON never creates domain tags. At `to json`, paths, datetimes,
+and patterns become strings; sizes and durations become strings suffixed with
+`B` and `ns`; non-finite decimal text is rejected rather than silently changed.
+YAML requires string mapping keys and rejects application-specific tags. TOML
+converts directly without passing through JSON. `^external <command>` is the
+only external byte producer. A
 standalone `DataRuntime` has no ambient process capability and rejects it. The
 CLI injects the sandboxed process host with a 2-second deadline and a 1 MiB
 combined retained-output limit; cancellation is passed through the shareable

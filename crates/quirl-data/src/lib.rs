@@ -1,21 +1,21 @@
 //! Quirl's bounded native structured-data runtime.
 //!
-//! This crate deliberately owns values, streams, result envelopes, and rendering
-//! without depending on the UI or CLI layers. Adapters are explicit: JSON,
-//! YAML, TOML, CSV, POSIX tar headers, and filesystem rows become structured
-//! values at `open`/`files`.
+//! This crate owns streams, data envelopes, adapters, evaluation, and rendering
+//! over the shared [`DataValue`] contract without depending on UI or CLI layers.
+//! JSON, YAML, TOML, and bytes are explicit conversion boundaries; CSV, POSIX
+//! tar headers, and filesystem rows enter the evaluator as typed values.
 
 pub mod syntax;
+mod value_boundary;
 
 use quirl_core::{
-    directory_entries, escape_terminal_controls, ErrorCode, ProcessHost, ProcessRequest,
-    ShellError, StructuredValue,
+    directory_entries_with_options, escape_terminal_controls, DirectoryOptions, Entry, EntryKind,
+    ErrorCode, ProcessHost, ProcessRequest, ShellError, StructuredValue,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 use std::{
     cmp::Ordering,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -29,6 +29,10 @@ use syntax::{
     BooleanOperator as SyntaxBooleanOperator, ComparisonOperator as SyntaxComparisonOperator,
     DataPredicate as SyntaxPredicate, DataSource, DataSyntaxDiagnostic, DataSyntaxDiagnosticKind,
     DataSyntaxLimits, DataTransform, SortDirection, Spanned,
+};
+use value_boundary::{
+    data_value_from_json, data_value_from_syntax, data_value_from_toml, data_value_from_yaml,
+    json_from_data_value, validate_data_value, ValueUsage,
 };
 
 /// Resource limits applied before data enters the evaluator.
@@ -44,6 +48,12 @@ pub struct DataLimits {
     pub max_fields: usize,
     /// Maximum nesting depth accepted in structured input.
     pub max_depth: usize,
+    /// Maximum scalar and container nodes accepted in one value or materialization.
+    pub max_nodes: usize,
+    /// Maximum aggregate UTF-8 bytes retained by strings and record keys.
+    pub max_retained_text_bytes: usize,
+    /// Maximum approximate in-memory bytes retained at an explicit collection boundary.
+    pub max_materialized_bytes: usize,
     /// Wall-clock deadline applied to an explicitly injected external process.
     pub external_deadline: Duration,
     /// Maximum bytes retained for each captured output stream of an external process.
@@ -58,6 +68,9 @@ impl DataLimits {
         max_rows: 100_000,
         max_fields: 256,
         max_depth: 64,
+        max_nodes: 100_000,
+        max_retained_text_bytes: 8 * 1024 * 1024,
+        max_materialized_bytes: 16 * 1024 * 1024,
         external_deadline: Duration::from_secs(2),
         max_external_output_bytes: 1024 * 1024,
     };
@@ -141,17 +154,13 @@ pub enum TaskState {
 }
 
 impl DataEnvelope {
-    /// Wrap a JSON-compatible value in a typed value envelope.
-    pub fn value(value: Value) -> Self {
-        Self::Value {
-            value: DataValue::from_json(value),
-        }
+    /// Wrap one already-typed value without a serialization round trip.
+    pub const fn value(value: DataValue) -> Self {
+        Self::Value { value }
     }
-    /// Wrap materialized JSON-compatible rows in a stream envelope.
-    pub fn stream(items: Vec<Value>) -> Self {
-        Self::Stream {
-            items: items.into_iter().map(DataValue::from_json).collect(),
-        }
+    /// Wrap already-typed materialized rows in a stream envelope.
+    pub const fn stream(items: Vec<DataValue>) -> Self {
+        Self::Stream { items }
     }
     /// Construct a present optional envelope.
     pub fn some(value: Self) -> Self {
@@ -213,7 +222,86 @@ impl DataEnvelope {
     }
     /// Render this envelope in the selected stable human or machine format.
     pub fn render(&self, format: DataRenderFormat) -> Result<String, ShellError> {
+        self.validate(DataLimits::DEFAULT)?;
         render_envelope(self, format)
+    }
+
+    /// Validate control-state coherence and retained typed values iteratively.
+    ///
+    /// Task values are declarative states only; validation never polls, waits,
+    /// schedules work, or executes callbacks.
+    pub fn validate(&self, limits: DataLimits) -> Result<(), ShellError> {
+        let mut stack = vec![self];
+        let mut usage = ValueUsage::default();
+        let mut envelopes = 0_usize;
+        while let Some(envelope) = stack.pop() {
+            envelopes = envelopes.saturating_add(1);
+            if envelopes > limits.max_nodes {
+                return Err(resource_limit_error(
+                    "data envelope nodes",
+                    limits.max_nodes,
+                    envelopes,
+                    "Reduce nested control envelopes or raise the configured node limit",
+                ));
+            }
+            match envelope {
+                Self::Value { value } => {
+                    merge_usage(&mut usage, validate_data_value(value, limits)?)
+                }
+                Self::Stream { items } => {
+                    if items.len() > limits.max_rows {
+                        return Err(resource_limit_error(
+                            "data envelope rows",
+                            limits.max_rows,
+                            items.len(),
+                            "Retain fewer stream rows or raise the configured row limit",
+                        ));
+                    }
+                    for item in items {
+                        merge_usage(&mut usage, validate_data_value(item, limits)?);
+                    }
+                }
+                Self::Option { value } => stack.extend(value.as_deref()),
+                Self::Result {
+                    state,
+                    value,
+                    error,
+                } => {
+                    let coherent = matches!(
+                        (state, value.is_some(), error.is_some()),
+                        (ResultState::Ok, true, false) | (ResultState::Error, false, true)
+                    );
+                    if !coherent {
+                        return Err(control_state_error("result"));
+                    }
+                    if let Some(error) = error {
+                        merge_usage(&mut usage, control_error_usage(error, limits)?);
+                    }
+                    stack.extend(value.as_deref());
+                }
+                Self::Task {
+                    state,
+                    value,
+                    error,
+                } => {
+                    let coherent = matches!(
+                        (state, value.is_some(), error.is_some()),
+                        (TaskState::Pending | TaskState::Cancelled, false, false)
+                            | (TaskState::Complete, true, false)
+                            | (TaskState::Failed, false, true)
+                    );
+                    if !coherent {
+                        return Err(control_state_error("task"));
+                    }
+                    if let Some(error) = error {
+                        merge_usage(&mut usage, control_error_usage(error, limits)?);
+                    }
+                    stack.extend(value.as_deref());
+                }
+            }
+            validate_materialization_usage(usage, limits)?;
+        }
+        Ok(())
     }
 }
 
@@ -230,10 +318,10 @@ pub enum DataRenderFormat {
 
 /// A pull-based stream. Calling `next` performs at most one row of work and
 /// checks cancellation before consuming it. Sources and consumers share the
-/// configured row budget.
-type StreamPull = dyn FnMut(&AtomicBool) -> Result<Option<Value>, ShellError> + Send;
+/// configured row, node, text, and materialization budgets.
+type StreamPull = dyn FnMut(&AtomicBool) -> Result<Option<DataValue>, ShellError> + Send;
 
-/// A bounded, pull-based sequence of JSON-compatible rows.
+/// A bounded, pull-based sequence of typed rows.
 pub struct DataStream {
     pull: Box<StreamPull>,
     emitted: usize,
@@ -241,7 +329,7 @@ pub struct DataStream {
 }
 
 impl DataStream {
-    fn from_values(values: Vec<Value>, limits: DataLimits) -> Self {
+    fn from_values(values: Vec<DataValue>, limits: DataLimits) -> Self {
         Self {
             pull: Box::new({
                 let mut values = values.into_iter();
@@ -253,7 +341,7 @@ impl DataStream {
     }
 
     fn from_iterator(
-        iterator: impl Iterator<Item = Result<Value, ShellError>> + Send + 'static,
+        iterator: impl Iterator<Item = Result<DataValue, ShellError>> + Send + 'static,
         limits: DataLimits,
     ) -> Self {
         Self {
@@ -279,7 +367,7 @@ impl DataStream {
                     None => (remaining, remaining.len()),
                 };
                 offset += consumed;
-                Ok(Some(Value::String(
+                Ok(Some(DataValue::String(
                     line.strip_suffix('\r').unwrap_or(line).to_owned(),
                 )))
             },
@@ -288,7 +376,7 @@ impl DataStream {
     }
 
     fn from_pull(
-        pull: impl FnMut(&AtomicBool) -> Result<Option<Value>, ShellError> + Send + 'static,
+        pull: impl FnMut(&AtomicBool) -> Result<Option<DataValue>, ShellError> + Send + 'static,
         limits: DataLimits,
     ) -> Self {
         Self {
@@ -298,7 +386,10 @@ impl DataStream {
         }
     }
 
-    fn map(self, transform: impl Fn(Value) -> Result<Value, ShellError> + Send + 'static) -> Self {
+    fn map(
+        self,
+        transform: impl Fn(DataValue) -> Result<DataValue, ShellError> + Send + 'static,
+    ) -> Self {
         let limits = self.limits();
         let mut source = self;
         Self::from_pull(
@@ -309,7 +400,7 @@ impl DataStream {
 
     fn filter(
         self,
-        predicate: impl Fn(&Value) -> Result<bool, ShellError> + Send + 'static,
+        predicate: impl Fn(&DataValue) -> Result<bool, ShellError> + Send + 'static,
     ) -> Self {
         let limits = self.limits();
         let mut source = self;
@@ -351,28 +442,42 @@ impl DataStream {
     }
 
     /// Pull at most one row, observing cancellation and the configured row limit.
-    pub fn next(&mut self, cancelled: &AtomicBool) -> Result<Option<Value>, ShellError> {
+    pub fn next(&mut self, cancelled: &AtomicBool) -> Result<Option<DataValue>, ShellError> {
         check_cancelled(cancelled)?;
         if self.emitted == self.limits.max_rows {
             return match (self.pull)(cancelled)? {
                 None => Ok(None),
-                Some(_) => Err(limit_error(
-                    "stream row limit exceeded",
+                Some(_) => Err(resource_limit_error(
+                    "stream rows",
+                    self.limits.max_rows,
+                    self.limits.max_rows.saturating_add(1),
                     "Use `take <count>` or raise the configured data row limit",
                 )),
             };
         }
         let value = (self.pull)(cancelled)?;
-        if value.is_some() {
+        if let Some(value) = &value {
+            validate_data_value(value, self.limits)?;
             self.emitted += 1;
         }
         Ok(value)
     }
 
-    /// Consume the stream into memory within its configured row bound.
-    pub fn collect(mut self, cancelled: &AtomicBool) -> Result<Vec<Value>, ShellError> {
+    /// Consume the stream at an explicit materialization boundary.
+    ///
+    /// Rows, aggregate nodes, retained text, and approximate retained bytes are
+    /// checked before each row is appended.
+    pub fn collect(mut self, cancelled: &AtomicBool) -> Result<Vec<DataValue>, ShellError> {
         let mut values = Vec::new();
+        let mut usage = ValueUsage::default();
         while let Some(value) = self.next(cancelled)? {
+            let row_usage = validate_data_value(&value, self.limits)?;
+            usage.nodes = usage.nodes.saturating_add(row_usage.nodes);
+            usage.text_bytes = usage.text_bytes.saturating_add(row_usage.text_bytes);
+            usage.retained_bytes = usage
+                .retained_bytes
+                .saturating_add(row_usage.retained_bytes);
+            validate_materialization_usage(usage, self.limits)?;
             values.push(value);
         }
         Ok(values)
@@ -391,16 +496,23 @@ pub struct DataRuntime {
 /// reader would hide an I/O or memory boundary from callers.
 pub enum DataOutput {
     /// An already-materialized scalar or structured value.
-    Value(Value),
+    Value(DataValue),
     /// A pull-based stream whose rows have not necessarily been read yet.
     Stream(DataStream),
+    /// Optional output produced by focused operations such as `first`.
+    Option(Option<Box<DataOutput>>),
 }
 
 impl DataOutput {
-    fn into_value(self, cancelled: &AtomicBool) -> Result<Value, ShellError> {
+    fn into_value(self, cancelled: &AtomicBool) -> Result<DataValue, ShellError> {
         match self {
             Self::Value(value) => Ok(value),
-            Self::Stream(stream) => stream.collect(cancelled).map(Value::Array),
+            Self::Stream(stream) => stream.collect(cancelled).map(DataValue::List),
+            Self::Option(_) => Err(ShellError::new(
+                ErrorCode::Data,
+                "collected value API cannot erase an optional result",
+            )
+            .with_help("Use `eval_envelope` to preserve the explicit Option state")),
         }
     }
 
@@ -411,9 +523,11 @@ impl DataOutput {
     pub fn into_envelope(self, cancelled: &AtomicBool) -> Result<DataEnvelope, ShellError> {
         match self {
             Self::Value(value) => Ok(DataEnvelope::value(value)),
-            // The JSON envelope is an explicit machine boundary, so it owns the
-            // materialization rather than making a producer silently collect.
             Self::Stream(stream) => Ok(DataEnvelope::stream(stream.collect(cancelled)?)),
+            Self::Option(value) => match value {
+                Some(value) => Ok(DataEnvelope::some(value.into_envelope(cancelled)?)),
+                None => Ok(DataEnvelope::none()),
+            },
         }
     }
 
@@ -452,6 +566,13 @@ impl DataOutput {
                 write_rendered(writer, &DataEnvelope::value(value).render(format)?)
             }
             Self::Stream(stream) => render_stream_to(stream, format, cancelled, writer),
+            Self::Option(value) => {
+                let envelope = match value {
+                    Some(value) => DataEnvelope::some(value.into_envelope(cancelled)?),
+                    None => DataEnvelope::none(),
+                };
+                write_rendered(writer, &envelope.render(format)?)
+            }
         }
     }
 }
@@ -543,6 +664,7 @@ impl DataRuntime {
         cancelled: &AtomicBool,
         cancellation_handle: Option<Arc<AtomicBool>>,
     ) -> Result<DataOutput, ShellError> {
+        validate_limits(self.limits)?;
         let syntax_limits = syntax_limits(self.limits);
         let expression = syntax::parse_data_expression(source, syntax_limits)
             .map_err(|diagnostic| syntax_shell_error(source, diagnostic))?;
@@ -553,9 +675,11 @@ impl DataRuntime {
             self.process_host.as_ref(),
             cancellation_handle,
         )?;
+        validate_data_output(&output, self.limits)?;
         for transform in &expression.transforms {
             check_cancelled(cancelled)?;
             output = apply_output_transform(output, transform, self.limits, cancelled)?;
+            validate_data_output(&output, self.limits)?;
         }
         Ok(output)
     }
@@ -600,50 +724,88 @@ impl DataRuntime {
     /// Open a stream without collecting it. CSV rows are parsed only as the
     /// caller pulls them. Other bounded adapters validate before exposing rows.
     pub fn open_stream(&self, path: impl AsRef<Path>) -> Result<DataStream, ShellError> {
+        validate_limits(self.limits)?;
         let path = path.as_ref();
         match extension(path).as_deref() {
             Some("csv") => open_csv_stream(path, self.limits),
             Some("tar") => open_tar_stream(path, self.limits),
             _ => match self.open_value(path)? {
-                Value::Array(values) => Ok(DataStream::from_values(values, self.limits)),
+                DataValue::List(values) => Ok(DataStream::from_values(values, self.limits)),
                 value => Ok(DataStream::from_values(vec![value], self.limits)),
             },
         }
     }
 
-    /// Evaluate `source` and collect its result into a JSON-compatible value.
-    pub fn eval(&self, source: &str) -> Result<Value, ShellError> {
+    /// Evaluate `source` and collect its result into one typed value.
+    ///
+    /// Live streams materialize only at this named convenience boundary.
+    pub fn eval_typed(&self, source: &str) -> Result<DataValue, ShellError> {
         let cancelled = Arc::new(AtomicBool::new(false));
         self.eval_output_with_token(source, &cancelled, Some(Arc::clone(&cancelled)))?
             .into_value(&cancelled)
     }
 
-    /// Evaluate and collect a result while observing cancellation.
-    pub fn eval_with_cancellation(
+    /// Evaluate and collect a typed result while observing cancellation.
+    pub fn eval_typed_with_cancellation(
         &self,
         source: &str,
         cancelled: &AtomicBool,
-    ) -> Result<Value, ShellError> {
+    ) -> Result<DataValue, ShellError> {
         self.eval_output_with_cancellation(source, cancelled)?
             .into_value(cancelled)
     }
 
-    fn open_value(&self, path: &Path) -> Result<Value, ShellError> {
+    /// Evaluate and explicitly convert the collected typed result to ordinary JSON.
+    ///
+    /// This compatibility API is a named lossy boundary for existing script and
+    /// watch consumers. Prefer [`Self::eval_typed`] or [`Self::eval_output`]
+    /// when domain tags must survive.
+    pub fn eval(&self, source: &str) -> Result<serde_json::Value, ShellError> {
+        self.eval_typed(source)
+            .and_then(|value| json_from_data_value(&value, self.limits))
+    }
+
+    /// Evaluate with cancellation and explicitly convert the result to ordinary JSON.
+    pub fn eval_with_cancellation(
+        &self,
+        source: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<serde_json::Value, ShellError> {
+        self.eval_typed_with_cancellation(source, cancelled)
+            .and_then(|value| json_from_data_value(&value, self.limits))
+    }
+
+    /// Evaluate and deliberately capture success or failure in an explicit result envelope.
+    ///
+    /// Normal evaluator entry points continue to return operating failures as
+    /// `ShellError`; this method is the focused runtime's intentional Result boundary.
+    pub fn eval_result_envelope(&self, source: &str) -> DataEnvelope {
+        match self.eval_envelope(source) {
+            Ok(value) => DataEnvelope::result(value),
+            Err(error) => DataEnvelope::result_error(error),
+        }
+    }
+
+    fn open_value(&self, path: &Path) -> Result<DataValue, ShellError> {
+        validate_limits(self.limits)?;
         match extension(path).as_deref() {
-            Some("csv") => return Ok(Value::Array(read_csv(path, self.limits)?)),
-            Some("tar") => return Ok(Value::Array(read_tar(path, self.limits)?)),
+            Some("csv") => return Ok(DataValue::List(read_csv(path, self.limits)?)),
+            Some("tar") => return Ok(DataValue::List(read_tar(path, self.limits)?)),
             _ => {}
         }
         let contents = read_bounded_utf8(path, self.limits.max_file_bytes)?;
         let value = match extension(path).as_deref() {
-            Some("json") => serde_json::from_str(&contents).map_err(|error| {
-                ShellError::new(
-                    ErrorCode::Data,
-                    format!("cannot parse JSON in {}", path.display()),
-                )
-                .with_context(error.to_string())
-                .with_help("Correct the JSON syntax or use a .toml/.csv adapter")
-            })?,
+            Some("json") => {
+                let parsed = serde_json::from_str(&contents).map_err(|error| {
+                    ShellError::new(
+                        ErrorCode::Data,
+                        format!("cannot parse JSON in {}", path.display()),
+                    )
+                    .with_context(error.to_string())
+                    .with_help("Correct the JSON syntax or use a .toml/.csv adapter")
+                })?;
+                data_value_from_json(parsed, self.limits)?
+            }
             Some("toml") => {
                 let parsed: toml::Value = toml::from_str(&contents).map_err(|error| {
                     ShellError::new(
@@ -653,25 +815,22 @@ impl DataRuntime {
                     .with_context(error.to_string())
                     .with_help("Correct the TOML syntax before opening the file")
                 })?;
-                serde_json::to_value(parsed).map_err(|error| {
-                    ShellError::new(ErrorCode::Data, "cannot convert TOML into a typed value")
-                        .with_context(error.to_string())
-                        .with_help("Use TOML values supported by the Quirl data adapter")
-                })?
+                data_value_from_toml(parsed, self.limits)?
             }
             Some("yaml") | Some("yml") => {
-                serde_yaml_ng::from_str::<Value>(&contents).map_err(|error| {
+                let parsed = serde_yaml_ng::from_str(&contents).map_err(|error| {
                     ShellError::new(
                         ErrorCode::Data,
                         format!("cannot parse YAML in {}", path.display()),
                     )
                     .with_context(error.to_string())
                     .with_help("Correct the YAML syntax before opening the file")
-                })?
+                })?;
+                data_value_from_yaml(parsed, self.limits)?
             }
-            _ => Value::String(contents),
+            _ => DataValue::String(contents),
         };
-        validate_value(&value, self.limits)?;
+        validate_data_value(&value, self.limits)?;
         Ok(value)
     }
 }
@@ -688,10 +847,60 @@ fn check_cancelled(cancelled: &AtomicBool) -> Result<(), ShellError> {
     }
 }
 
-fn evaluate_source(source: &Spanned<DataSource>, limits: DataLimits) -> Result<Value, ShellError> {
+fn validate_limits(limits: DataLimits) -> Result<(), ShellError> {
+    let zero_limit = [
+        ("source bytes", limits.max_source_bytes == 0),
+        ("file bytes", limits.max_file_bytes == 0),
+        ("rows", limits.max_rows == 0),
+        ("fields", limits.max_fields == 0),
+        ("nodes", limits.max_nodes == 0),
+        ("retained text bytes", limits.max_retained_text_bytes == 0),
+        ("materialized bytes", limits.max_materialized_bytes == 0),
+        (
+            "external output bytes",
+            limits.max_external_output_bytes == 0,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(name, zero)| zero.then_some(name));
+    if let Some(name) = zero_limit {
+        return Err(ShellError::new(
+            ErrorCode::InvalidArgument,
+            format!("data {name} limit must be greater than zero"),
+        )
+        .with_help("Configure a positive bound for every retained data resource"));
+    }
+    if limits.external_deadline.is_zero() {
+        return Err(ShellError::new(
+            ErrorCode::InvalidArgument,
+            "data external process deadline must be greater than zero",
+        )
+        .with_help("Configure a positive external process deadline"));
+    }
+    Ok(())
+}
+
+fn validate_data_output(output: &DataOutput, limits: DataLimits) -> Result<(), ShellError> {
+    let mut current = Some(output);
+    while let Some(output) = current.take() {
+        match output {
+            DataOutput::Value(value) => {
+                validate_data_value(value, limits)?;
+            }
+            DataOutput::Stream(_) | DataOutput::Option(None) => {}
+            DataOutput::Option(Some(value)) => current = Some(value),
+        }
+    }
+    Ok(())
+}
+
+fn evaluate_source(
+    source: &Spanned<DataSource>,
+    limits: DataLimits,
+) -> Result<DataValue, ShellError> {
     match &source.value {
         DataSource::Pwd => std::env::current_dir()
-            .map(|path| Value::String(path.display().to_string()))
+            .map(|path| DataValue::Path(path.display().to_string()))
             .map_err(|error| {
                 ShellError::new(ErrorCode::Io, "cannot read the current directory")
                     .with_context(error.to_string())
@@ -701,33 +910,59 @@ fn evaluate_source(source: &Spanned<DataSource>, limits: DataLimits) -> Result<V
             let path = path
                 .as_ref()
                 .map_or_else(|| PathBuf::from("."), |path| PathBuf::from(&path.value));
-            let entries = directory_entries(&path, false)?;
-            if entries.len() > limits.max_rows {
-                return Err(limit_error(
-                    "filesystem row limit exceeded",
-                    "Select a narrower directory or raise the configured data row limit",
-                ));
-            }
-            serde_json::to_value(entries).map_err(|error| {
-                ShellError::new(ErrorCode::Data, "cannot represent directory entries")
-                    .with_context(error.to_string())
-                    .with_help("Try a directory whose entries can be represented as typed values")
-            })
+            let entries = directory_entries_with_options(
+                &path,
+                &DirectoryOptions {
+                    max_entries: limits.max_rows,
+                    ..DirectoryOptions::default()
+                },
+            )?;
+            let value = DataValue::List(entries.into_iter().map(directory_entry_value).collect());
+            validate_data_value(&value, limits)?;
+            Ok(value)
         }
         DataSource::Open { path } => {
             let path = PathBuf::from(&path.value);
             DataRuntime::with_limits(limits).open_value(&path)
         }
-        DataSource::Literal(literal) => {
-            let value = literal.to_json();
-            validate_value(&value, limits)?;
-            Ok(value)
-        }
+        DataSource::Literal(literal) => data_value_from_syntax(literal, limits),
         DataSource::External { .. } => Err(data_error(
             "^external",
             "external sources require the explicit process-host output boundary",
         )),
     }
+}
+
+fn directory_entry_value(entry: Entry) -> DataValue {
+    let kind = match entry.kind {
+        EntryKind::Directory => "directory",
+        EntryKind::File => "file",
+        EntryKind::Symlink => "symlink",
+        EntryKind::Other => "other",
+    };
+    let modified = entry
+        .modified_unix_seconds
+        .map_or(DataValue::Nothing, |seconds| {
+            // Fixed-width Unix seconds preserve chronological lexical ordering
+            // without adding a datetime dependency to the data runtime.
+            DataValue::DateTime(format!("unix:{seconds:020}"))
+        });
+    let target = entry.symlink_target.map_or(DataValue::Nothing, |path| {
+        DataValue::Path(path.display().to_string())
+    });
+    DataValue::Record(BTreeMap::from([
+        ("hidden".to_owned(), DataValue::Bool(entry.hidden)),
+        ("kind".to_owned(), DataValue::String(kind.to_owned())),
+        ("modified".to_owned(), modified),
+        ("name".to_owned(), DataValue::String(entry.name)),
+        (
+            "path".to_owned(),
+            DataValue::Path(entry.path.display().to_string()),
+        ),
+        ("readonly".to_owned(), DataValue::Bool(entry.readonly)),
+        ("size".to_owned(), DataValue::Size { bytes: entry.size }),
+        ("target".to_owned(), target),
+    ]))
 }
 
 fn evaluate_source_output(
@@ -772,7 +1007,7 @@ fn evaluate_source_output(
             error.details.exit_status = Some(outcome.status);
             return Err(error);
         }
-        return Ok(DataOutput::Value(Value::String(
+        return Ok(DataOutput::Value(DataValue::String(
             outcome.stdout.unwrap_or_default(),
         )));
     }
@@ -783,7 +1018,7 @@ fn evaluate_source_output(
             match extension(&path).as_deref() {
                 Some("csv") | Some("tar") => Ok(DataOutput::Stream(runtime.open_stream(path)?)),
                 _ => match runtime.open_value(&path)? {
-                    Value::Array(rows) => {
+                    DataValue::List(rows) => {
                         Ok(DataOutput::Stream(DataStream::from_values(rows, limits)))
                     }
                     value => Ok(DataOutput::Value(value)),
@@ -791,7 +1026,7 @@ fn evaluate_source_output(
             }
         }
         DataSource::Files { .. } => {
-            let Value::Array(rows) = evaluate_source(source, limits)? else {
+            let DataValue::List(rows) = evaluate_source(source, limits)? else {
                 return Err(ShellError::new(
                     ErrorCode::Data,
                     "filesystem source did not produce directory rows",
@@ -801,7 +1036,7 @@ fn evaluate_source_output(
             Ok(DataOutput::Stream(DataStream::from_values(rows, limits)))
         }
         DataSource::Pwd | DataSource::Literal(_) => match evaluate_source(source, limits)? {
-            Value::Array(rows) => Ok(DataOutput::Stream(DataStream::from_values(rows, limits))),
+            DataValue::List(rows) => Ok(DataOutput::Stream(DataStream::from_values(rows, limits))),
             value => Ok(DataOutput::Value(value)),
         },
         DataSource::External { .. } => Err(ShellError::new(
@@ -818,42 +1053,65 @@ fn apply_output_transform(
     limits: DataLimits,
     cancelled: &AtomicBool,
 ) -> Result<DataOutput, ShellError> {
+    if let DataOutput::Option(value) = output {
+        return match value {
+            Some(value) => apply_output_transform(*value, transform, limits, cancelled)
+                .map(|value| DataOutput::Option(Some(Box::new(value)))),
+            None => Ok(DataOutput::Option(None)),
+        };
+    }
     if let DataOutput::Value(value) = output {
         match &transform.value {
             DataTransform::Lines => {
-                let Value::String(bytes) = value else {
+                let DataValue::String(bytes) = value else {
                     return Err(data_error("lines", "lines expects a string byte value"));
                 };
                 return Ok(DataOutput::Stream(DataStream::from_lines(bytes, limits)));
             }
             DataTransform::FromJson => {
-                let Value::String(bytes) = value else {
+                let DataValue::String(bytes) = value else {
                     return Err(data_error(
                         "from json",
                         "from json expects a string byte value",
                     ));
                 };
                 return match parse_json_boundary(&bytes, "from json", limits)? {
-                    Value::Array(rows) => {
+                    DataValue::List(rows) => {
                         Ok(DataOutput::Stream(DataStream::from_values(rows, limits)))
                     }
                     value => Ok(DataOutput::Value(value)),
                 };
             }
             DataTransform::ToJson => {
-                return Ok(DataOutput::Value(Value::String(to_json_boundary(
-                    &value, "to json",
+                return Ok(DataOutput::Value(DataValue::String(to_json_boundary(
+                    &value, "to json", limits,
                 )?)));
+            }
+            DataTransform::First => {
+                let DataValue::List(values) = value else {
+                    return Err(data_error("first", "first expects a list or stream"));
+                };
+                return Ok(DataOutput::Option(
+                    values
+                        .into_iter()
+                        .next()
+                        .map(DataOutput::Value)
+                        .map(Box::new),
+                ));
             }
             _ => {
                 let value = apply_transform(value, &transform.value)?;
-                validate_value(&value, limits)?;
+                validate_data_value(&value, limits)?;
                 return Ok(DataOutput::Value(value));
             }
         }
     }
     let DataOutput::Stream(mut stream) = output else {
-        unreachable!();
+        return Err(ShellError::new(
+            ErrorCode::Data,
+            "typed data output escaped exhaustive transform dispatch",
+        )
+        .with_help("Report this internal typed-data state invariant failure"));
     };
     match &transform.value {
         DataTransform::Lines => Err(data_error(
@@ -861,7 +1119,7 @@ fn apply_output_transform(
             "lines expects one string value; apply it immediately after ^external or from json",
         )),
         DataTransform::FromJson => Ok(DataOutput::Stream(stream.map(move |value| {
-            let Value::String(bytes) = value else {
+            let DataValue::String(bytes) = value else {
                 return Err(data_error(
                     "from json",
                     "from json expects string stream items",
@@ -869,15 +1127,13 @@ fn apply_output_transform(
             };
             parse_json_boundary(&bytes, "from json", limits)
         }))),
-        DataTransform::ToJson => {
-            Ok(DataOutput::Stream(stream.map(move |value| {
-                to_json_boundary(&value, "to json").map(Value::String)
-            })))
-        }
+        DataTransform::ToJson => Ok(DataOutput::Stream(stream.map(move |value| {
+            to_json_boundary(&value, "to json", limits).map(DataValue::String)
+        }))),
         DataTransform::Where(predicate) => {
             let predicate = predicate.clone();
             Ok(DataOutput::Stream(stream.filter(move |row| {
-                if !row.is_object() {
+                if !matches!(row, DataValue::Record(_)) {
                     return Err(data_error("where", "where expects object rows"));
                 }
                 predicate_matches(&predicate, row, "where")
@@ -907,8 +1163,8 @@ fn apply_output_transform(
             })?;
             Ok(DataOutput::Stream(stream.take(count)))
         }
-        DataTransform::First => Ok(DataOutput::Value(
-            stream.next(cancelled)?.unwrap_or(Value::Null),
+        DataTransform::First => Ok(DataOutput::Option(
+            stream.next(cancelled)?.map(DataOutput::Value).map(Box::new),
         )),
         DataTransform::Length => {
             let mut length = 0_u64;
@@ -920,15 +1176,15 @@ fn apply_output_transform(
                     )
                 })?;
             }
-            Ok(DataOutput::Value(Value::from(length)))
+            Ok(DataOutput::Value(DataValue::UInt(length)))
         }
         DataTransform::Sort { field, direction } => {
             // Sorting is intentionally a collection boundary. The row limit is
             // still enforced by `collect`, and callers can make it explicit
             // with `take` before sorting.
             let rows = stream.collect(cancelled)?;
-            let sorted = sort_rows(Value::Array(rows), &field.value, *direction, "sort")?;
-            let Value::Array(rows) = sorted else {
+            let sorted = sort_rows(DataValue::List(rows), &field.value, *direction, "sort")?;
+            let DataValue::List(rows) = sorted else {
                 return Err(ShellError::new(
                     ErrorCode::Data,
                     "sort did not produce structured rows",
@@ -1008,10 +1264,12 @@ fn is_file_size_limit(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::InvalidData && error.to_string() == FILE_SIZE_LIMIT_ERROR
 }
 
-fn bounded_io_error(action: &str, path: &Path, error: std::io::Error) -> ShellError {
+fn bounded_io_error(action: &str, path: &Path, limit: u64, error: std::io::Error) -> ShellError {
     if is_file_size_limit(&error) {
-        limit_error(
-            format!("{} exceeds the file-size limit", path.display()),
+        resource_limit_error_u64(
+            &format!("{} file bytes", path.display()),
+            limit,
+            limit.saturating_add(1),
             "Increase the data file limit or select a smaller input file",
         )
     } else {
@@ -1024,7 +1282,7 @@ fn read_bounded_utf8(path: &Path, limit: u64) -> Result<String, ShellError> {
     let mut contents = String::new();
     reader
         .read_to_string(&mut contents)
-        .map_err(|error| bounded_io_error("read", path, error))?;
+        .map_err(|error| bounded_io_error("read", path, limit, error))?;
     Ok(contents)
 }
 
@@ -1045,8 +1303,10 @@ fn open_bounded_file(path: &Path, limit: u64) -> Result<BoundedReader<File>, She
         .with_help("Copy the input into a bounded regular file before opening it as data"));
     }
     if metadata.len() > limit {
-        return Err(limit_error(
-            format!("{} exceeds the file-size limit", path.display()),
+        return Err(resource_limit_error_u64(
+            &format!("{} file bytes", path.display()),
+            limit,
+            metadata.len(),
             "Increase the data file limit or select a smaller input file",
         ));
     }
@@ -1073,45 +1333,102 @@ fn limit_error(message: impl Into<String>, help: impl Into<String>) -> ShellErro
     ShellError::new(ErrorCode::ResourceLimit, message).with_help(help)
 }
 
-fn validate_value(value: &Value, limits: DataLimits) -> Result<(), ShellError> {
-    fn visit(value: &Value, depth: usize, limits: DataLimits) -> Result<(), ShellError> {
-        if depth > limits.max_depth {
-            return Err(limit_error(
-                "structured value exceeds the nesting-depth limit",
-                "Flatten the input or raise the configured data depth limit",
-            ));
-        }
-        match value {
-            Value::Array(values) => {
-                if values.len() > limits.max_rows {
-                    return Err(limit_error(
-                        "structured value exceeds the row limit",
-                        "Use `take <count>` or raise the configured data row limit",
-                    ));
-                }
-                for value in values {
-                    visit(value, depth + 1, limits)?;
-                }
-            }
-            Value::Object(values) => {
-                if values.len() > limits.max_fields {
-                    return Err(limit_error(
-                        "record exceeds the field limit",
-                        "Select fewer fields or raise the configured data field limit",
-                    ));
-                }
-                for value in values.values() {
-                    visit(value, depth + 1, limits)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-    visit(value, 0, limits)
+fn resource_limit_error(name: &str, limit: usize, observed: usize, help: &str) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{name} exceeds its configured limit"),
+    )
+    .with_context(format!("limit: {limit}; observed: {observed}"))
+    .with_help(help)
 }
 
-fn read_csv(path: &Path, limits: DataLimits) -> Result<Vec<Value>, ShellError> {
+fn resource_limit_error_u64(name: &str, limit: u64, observed: u64, help: &str) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{name} exceeds its configured limit"),
+    )
+    .with_context(format!("limit: {limit}; observed: {observed}"))
+    .with_help(help)
+}
+
+fn validate_materialization_usage(usage: ValueUsage, limits: DataLimits) -> Result<(), ShellError> {
+    if usage.nodes > limits.max_nodes {
+        return Err(resource_limit_error(
+            "materialized value nodes",
+            limits.max_nodes,
+            usage.nodes,
+            "Use a streaming transform or raise the configured data node limit",
+        ));
+    }
+    if usage.text_bytes > limits.max_retained_text_bytes {
+        return Err(resource_limit_error(
+            "materialized retained text bytes",
+            limits.max_retained_text_bytes,
+            usage.text_bytes,
+            "Use a streaming transform or raise the configured retained-text limit",
+        ));
+    }
+    if usage.retained_bytes > limits.max_materialized_bytes {
+        return Err(resource_limit_error(
+            "materialized retained bytes",
+            limits.max_materialized_bytes,
+            usage.retained_bytes,
+            "Use a streaming transform or raise the configured materialization limit",
+        ));
+    }
+    Ok(())
+}
+
+fn merge_usage(total: &mut ValueUsage, value: ValueUsage) {
+    total.nodes = total.nodes.saturating_add(value.nodes);
+    total.text_bytes = total.text_bytes.saturating_add(value.text_bytes);
+    total.retained_bytes = total.retained_bytes.saturating_add(value.retained_bytes);
+}
+
+fn control_state_error(kind: &str) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        format!("data {kind} envelope has an incoherent state"),
+    )
+    .with_help("Construct control envelopes with the typed DataEnvelope constructors")
+}
+
+fn control_error_usage(error: &ShellError, limits: DataLimits) -> Result<ValueUsage, ShellError> {
+    let mut usage = ValueUsage {
+        nodes: 1,
+        text_bytes: error.message.len(),
+        retained_bytes: std::mem::size_of::<ShellError>().saturating_add(error.message.len()),
+    };
+    for label in &error.details.labels {
+        usage.nodes = usage.nodes.saturating_add(1);
+        if let Some(source) = &label.source {
+            observe_control_text(&mut usage, source);
+        }
+        observe_control_text(&mut usage, &label.message);
+    }
+    for context in &error.details.context {
+        observe_control_text(&mut usage, context);
+    }
+    for help in &error.details.help {
+        observe_control_text(&mut usage, help);
+    }
+    if let Some(command) = &error.details.command {
+        observe_control_text(&mut usage, command);
+    }
+    validate_materialization_usage(usage, limits)?;
+    Ok(usage)
+}
+
+fn observe_control_text(usage: &mut ValueUsage, text: &str) {
+    usage.nodes = usage.nodes.saturating_add(1);
+    usage.text_bytes = usage.text_bytes.saturating_add(text.len());
+    usage.retained_bytes = usage
+        .retained_bytes
+        .saturating_add(std::mem::size_of::<String>())
+        .saturating_add(text.len());
+}
+
+fn read_csv(path: &Path, limits: DataLimits) -> Result<Vec<DataValue>, ShellError> {
     let stream = open_csv_stream(path, limits)?;
     stream.collect(&AtomicBool::new(false))
 }
@@ -1121,7 +1438,7 @@ fn open_csv_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
     let header = lines
         .next()
         .transpose()
-        .map_err(|error| bounded_io_error("read", path, error))?
+        .map_err(|error| bounded_io_error("read", path, limits.max_file_bytes, error))?
         .ok_or_else(|| {
             ShellError::new(
                 ErrorCode::Data,
@@ -1135,7 +1452,9 @@ fn open_csv_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
     let source_path = path.to_path_buf();
     let iterator = lines.enumerate().map(move |(index, line)| {
         let line_number = index + 2;
-        let line = line.map_err(|error| bounded_io_error("read", &source_path, error))?;
+        let line = line.map_err(|error| {
+            bounded_io_error("read", &source_path, limits.max_file_bytes, error)
+        })?;
         let fields = parse_csv_record(&line)
             .map_err(|message| csv_error_display(&display, line_number, message))?;
         if fields.len() != headers.len() {
@@ -1153,9 +1472,9 @@ fn open_csv_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
             .iter()
             .cloned()
             .zip(fields)
-            .map(|(key, value)| (key, Value::String(value)))
+            .map(|(key, value)| (key, DataValue::String(value)))
             .collect();
-        Ok(Value::Object(row))
+        Ok(DataValue::Record(row))
     });
     Ok(DataStream::from_iterator(iterator, limits))
 }
@@ -1237,7 +1556,7 @@ fn csv_error_display(path: &str, line: usize, message: impl Into<String>) -> She
         .with_help("Use a header row, balanced quotes, and the same field count on every row")
 }
 
-fn read_tar(path: &Path, limits: DataLimits) -> Result<Vec<Value>, ShellError> {
+fn read_tar(path: &Path, limits: DataLimits) -> Result<Vec<DataValue>, ShellError> {
     open_tar_stream(path, limits)?.collect(&AtomicBool::new(false))
 }
 
@@ -1258,9 +1577,9 @@ fn open_tar_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
             let mut header = [0_u8; 512];
             let mut read = 0;
             while read < header.len() {
-                let count = reader
-                    .read(&mut header[read..])
-                    .map_err(|error| bounded_io_error("read", &source_path, error))?;
+                let count = reader.read(&mut header[read..]).map_err(|error| {
+                    bounded_io_error("read", &source_path, limits.max_file_bytes, error)
+                })?;
                 if count == 0 {
                     if read == 0 {
                         finished = true;
@@ -1323,9 +1642,9 @@ fn open_tar_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
                     usize::try_from(remaining.min(discard.len() as u64)).map_err(|_| {
                         tar_error_display(&display, "entry size cannot be represented on this host")
                     })?;
-                let count = reader
-                    .read(&mut discard[..wanted])
-                    .map_err(|error| bounded_io_error("read", &source_path, error))?;
+                let count = reader.read(&mut discard[..wanted]).map_err(|error| {
+                    bounded_io_error("read", &source_path, limits.max_file_bytes, error)
+                })?;
                 if count == 0 {
                     return Err(tar_error_display(&display, "entry payload is truncated"));
                 }
@@ -1333,11 +1652,11 @@ fn open_tar_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
                     tar_error_display(&display, "read size cannot be represented on this host")
                 })?;
             }
-            Ok(Some(serde_json::json!({
-                "path": path,
-                "kind": kind,
-                "size": size,
-            })))
+            Ok(Some(DataValue::Record(BTreeMap::from([
+                ("kind".to_owned(), DataValue::String(kind.to_owned())),
+                ("path".to_owned(), DataValue::Path(path)),
+                ("size".to_owned(), DataValue::Size { bytes: size }),
+            ]))))
         },
         limits,
     ))
@@ -1412,9 +1731,9 @@ fn render_envelope(
             }),
         DataRenderFormat::Plain => Ok(format!(
             "{}\n",
-            escape_terminal_controls(&plain_value(envelope))
+            escape_terminal_controls(&plain_value(envelope, DataLimits::DEFAULT)?)
         )),
-        DataRenderFormat::Table => Ok(render_table(envelope)),
+        DataRenderFormat::Table => render_table(envelope, DataLimits::DEFAULT),
     }
 }
 
@@ -1430,13 +1749,21 @@ fn render_stream_to(
 ) -> Result<(), ShellError> {
     match format {
         DataRenderFormat::Table => {
-            write_rendered(writer, &render_table_rows(&stream.collect(cancelled)?))
+            let limits = stream.limits();
+            write_rendered(
+                writer,
+                &render_table_rows(&stream.collect(cancelled)?, limits)?,
+            )
         }
         DataRenderFormat::Plain => {
+            let limits = stream.limits();
             while let Some(value) = stream.next(cancelled)? {
                 write_rendered(
                     writer,
-                    &format!("{}\n", escape_terminal_controls(&plain_json_value(&value))),
+                    &format!(
+                        "{}\n",
+                        escape_terminal_controls(&plain_data_value(&value, limits)?)
+                    ),
                 )?;
             }
             Ok(())
@@ -1445,12 +1772,11 @@ fn render_stream_to(
             write_rendered(writer, "{\n  \"kind\": \"stream\",\n  \"items\": [")?;
             let mut first = true;
             while let Some(value) = stream.next(cancelled)? {
-                let rendered =
-                    serde_json::to_string(&DataValue::from_json(value)).map_err(|error| {
-                        ShellError::new(ErrorCode::Data, "cannot serialize stream value as JSON")
-                            .with_context(error.to_string())
-                            .with_help("Use `--format plain` for terminal-only output")
-                    })?;
+                let rendered = serde_json::to_string(&value).map_err(|error| {
+                    ShellError::new(ErrorCode::Data, "cannot serialize stream value as JSON")
+                        .with_context(error.to_string())
+                        .with_help("Use `--format plain` for terminal-only output")
+                })?;
                 if first {
                     write_rendered(writer, "\n")?;
                     first = false;
@@ -1478,36 +1804,53 @@ fn write_rendered(writer: &mut impl Write, text: &str) -> Result<(), ShellError>
     })
 }
 
-fn plain_json_value(value: &Value) -> String {
+fn plain_data_value(value: &DataValue, limits: DataLimits) -> Result<String, ShellError> {
     match value {
-        Value::String(value) => value.clone(),
-        value => value.to_string(),
+        DataValue::String(value)
+        | DataValue::Path(value)
+        | DataValue::DateTime(value)
+        | DataValue::Pattern(value) => Ok(value.clone()),
+        DataValue::Nothing
+        | DataValue::Bool(_)
+        | DataValue::Int(_)
+        | DataValue::UInt(_)
+        | DataValue::Decimal(_)
+        | DataValue::Duration { .. }
+        | DataValue::Size { .. } => Ok(value.display_value()),
+        DataValue::List(_) | DataValue::Record(_) => {
+            let json = json_from_data_value(value, limits)?;
+            serde_json::to_string(&json).map_err(|error| {
+                ShellError::new(ErrorCode::Data, "cannot render typed data as plain text")
+                    .with_context(error.to_string())
+                    .with_help("Use values supported by the explicit JSON display boundary")
+            })
+        }
     }
 }
 
-fn plain_value(envelope: &DataEnvelope) -> String {
+fn plain_value(envelope: &DataEnvelope, limits: DataLimits) -> Result<String, ShellError> {
     match envelope {
-        DataEnvelope::Value { value } => value.display_value(),
+        DataEnvelope::Value { value } => plain_data_value(value, limits),
         DataEnvelope::Stream { items } => items
             .iter()
-            .map(DataValue::display_value)
-            .collect::<Vec<_>>()
-            .join("\n"),
+            .map(|value| plain_data_value(value, limits))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|items| items.join("\n")),
         DataEnvelope::Option { value } => value
             .as_deref()
-            .map_or_else(|| "none".to_owned(), plain_value),
+            .map_or_else(|| Ok("none".to_owned()), |value| plain_value(value, limits)),
         DataEnvelope::Result {
             state,
             value,
             error,
         } => value.as_deref().map_or_else(
             || {
-                error.as_ref().map_or_else(
+                Ok(error.as_ref().map_or_else(
                     || format!("result {state:?}"),
                     |error| format!("error: {}", error.message),
-                )
+                ))
             },
-            plain_value,
+            |value| plain_value(value, limits),
         ),
         DataEnvelope::Task {
             state,
@@ -1515,86 +1858,100 @@ fn plain_value(envelope: &DataEnvelope) -> String {
             error,
         } => value.as_deref().map_or_else(
             || {
-                error.as_ref().map_or_else(
+                Ok(error.as_ref().map_or_else(
                     || format!("task {state:?}"),
                     |error| format!("task {state:?}: {}", error.message),
-                )
+                ))
             },
-            |value| format!("task {state:?}: {}", plain_value(value)),
+            |value| plain_value(value, limits).map(|value| format!("task {state:?}: {value}")),
         ),
     }
 }
 
-fn render_table(envelope: &DataEnvelope) -> String {
+fn render_table(envelope: &DataEnvelope, limits: DataLimits) -> Result<String, ShellError> {
     let value = match envelope {
         DataEnvelope::Value { value } => value,
         DataEnvelope::Stream { items } => {
-            let rows = items.iter().map(DataValue::json_value).collect::<Vec<_>>();
-            return render_table_rows(&rows);
+            return render_table_rows(items, limits);
         }
         DataEnvelope::Option { value }
         | DataEnvelope::Result { value, .. }
         | DataEnvelope::Task { value, .. } => {
-            return value
-                .as_deref()
-                .map_or_else(|| format!("{}\n", plain_value(envelope)), render_table)
+            return value.as_deref().map_or_else(
+                || plain_value(envelope, limits).map(|value| format!("{value}\n")),
+                |value| render_table(value, limits),
+            )
         }
     };
-    match value.json_value() {
-        Value::Array(rows) => render_table_rows(&rows),
-        Value::Object(row) => render_table_rows(&[Value::Object(row)]),
-        _ => format!("{}\n", escape_terminal_controls(&value.display_value())),
+    match value {
+        DataValue::List(rows) => render_table_rows(rows, limits),
+        DataValue::Record(_) => render_table_rows(std::slice::from_ref(value), limits),
+        _ => Ok(format!(
+            "{}\n",
+            escape_terminal_controls(&plain_data_value(value, limits)?)
+        )),
     }
 }
 
-fn render_table_rows(rows: &[Value]) -> String {
+fn render_table_rows(rows: &[DataValue], limits: DataLimits) -> Result<String, ShellError> {
     let mut columns = BTreeSet::new();
     for row in rows {
-        if let Value::Object(row) = row {
+        if let DataValue::Record(row) = row {
             columns.extend(row.keys().cloned());
         }
     }
     if columns.is_empty() {
         return rows
             .iter()
-            .map(|value| format!("{}\n", escape_terminal_controls(&value.to_string())))
+            .map(|value| {
+                plain_data_value(value, limits)
+                    .map(|value| format!("{}\n", escape_terminal_controls(&value)))
+            })
             .collect();
     }
     let columns: Vec<_> = columns.into_iter().collect();
     let mut output = format!("{}\n", columns.join("\t"));
     for row in rows {
-        let Value::Object(row) = row else {
-            output.push_str(&format!("{}\n", escape_terminal_controls(&row.to_string())));
+        let DataValue::Record(row) = row else {
+            output.push_str(&format!(
+                "{}\n",
+                escape_terminal_controls(&plain_data_value(row, limits)?)
+            ));
             continue;
         };
         let cells = columns
             .iter()
             .map(|column| {
-                row.get(column).map_or_else(String::new, |value| {
-                    escape_terminal_controls(&value.to_string())
-                })
+                row.get(column).map_or_else(
+                    || Ok(String::new()),
+                    |value| {
+                        plain_data_value(value, limits)
+                            .map(|value| escape_terminal_controls(&value))
+                    },
+                )
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, ShellError>>()?;
         output.push_str(&format!("{}\n", cells.join("\t")));
     }
-    output
+    Ok(output)
 }
 
-fn apply_transform(value: Value, transform: &DataTransform) -> Result<Value, ShellError> {
+fn apply_transform(value: DataValue, transform: &DataTransform) -> Result<DataValue, ShellError> {
     match transform {
         DataTransform::Length => match value {
-            Value::Array(values) => Ok(Value::from(values.len())),
-            Value::Object(values) => Ok(Value::from(values.len())),
-            Value::String(value) => Ok(Value::from(value.chars().count())),
+            DataValue::List(values) => usize_value(values.len()),
+            DataValue::Record(values) => usize_value(values.len()),
+            DataValue::String(value) => usize_value(value.chars().count()),
             _ => Err(data_error(
                 "length",
-                "length expects an array, object, or string",
+                "length expects a list, record, or string",
             )),
         },
-        DataTransform::First => match value {
-            Value::Array(values) => Ok(values.into_iter().next().unwrap_or(Value::Null)),
-            _ => Err(data_error("first", "first expects an array")),
-        },
+        DataTransform::First => Err(ShellError::new(
+            ErrorCode::Data,
+            "first escaped its explicit Option output boundary",
+        )
+        .with_help("Report this internal focused-evaluator invariant failure")),
         DataTransform::Get { path } => get_field(value, &path.value, "get"),
         DataTransform::Where(predicate) => filter_where(value, predicate, "where"),
         DataTransform::Select { fields } => {
@@ -1618,54 +1975,51 @@ fn apply_transform(value: Value, transform: &DataTransform) -> Result<Value, She
     }
 }
 
-fn get_field(value: Value, field: &str, stage: &str) -> Result<Value, ShellError> {
+fn get_field(value: DataValue, field: &str, stage: &str) -> Result<DataValue, ShellError> {
     match value {
-        Value::Object(object) => get_path(&Value::Object(object), field)
+        DataValue::Record(object) => get_path(&DataValue::Record(object), field)
             .cloned()
-            .ok_or_else(|| data_error(stage, format!("object has no field `{field}`"))),
-        Value::Array(values) => values
+            .ok_or_else(|| data_error(stage, format!("record has no field `{field}`"))),
+        DataValue::List(values) => values
             .into_iter()
             .map(|value| {
-                if !value.is_object() {
-                    return Err(data_error(stage, "get over an array expects object rows"));
+                if !matches!(value, DataValue::Record(_)) {
+                    return Err(data_error(stage, "get over a list expects record rows"));
                 }
                 get_path(&value, field)
                     .cloned()
                     .ok_or_else(|| data_error(stage, format!("row has no field `{field}`")))
             })
             .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
-        _ => Err(data_error(
-            stage,
-            "get expects an object or array of objects",
-        )),
+            .map(DataValue::List),
+        _ => Err(data_error(stage, "get expects a record or list of records")),
     }
 }
 
 fn filter_where(
-    value: Value,
+    value: DataValue,
     predicate: &SyntaxPredicate,
     stage: &str,
-) -> Result<Value, ShellError> {
-    let Value::Array(values) = value else {
-        return Err(data_error(stage, "where expects an array of objects"));
+) -> Result<DataValue, ShellError> {
+    let DataValue::List(values) = value else {
+        return Err(data_error(stage, "where expects a list of records"));
     };
 
     let mut filtered = Vec::new();
     for value in values {
-        if !value.is_object() {
-            return Err(data_error(stage, "where expects object rows"));
+        if !matches!(value, DataValue::Record(_)) {
+            return Err(data_error(stage, "where expects record rows"));
         }
         if predicate_matches(predicate, &value, stage)? {
             filtered.push(value);
         }
     }
-    Ok(Value::Array(filtered))
+    Ok(DataValue::List(filtered))
 }
 
 fn predicate_matches(
     predicate: &SyntaxPredicate,
-    row: &Value,
+    row: &DataValue,
     stage: &str,
 ) -> Result<bool, ShellError> {
     let Some(first) = predicate.conditions.first() else {
@@ -1697,16 +2051,16 @@ fn predicate_matches(
 
 fn evaluate_condition(
     condition: &syntax::DataCondition,
-    row: &Value,
+    row: &DataValue,
     stage: &str,
 ) -> Result<bool, ShellError> {
     let Some(actual) = get_path(row, &condition.field.value) else {
         return Ok(false);
     };
-    let expected = condition.expected.to_json();
+    let expected = data_value_from_syntax(&condition.expected, DataLimits::DEFAULT)?;
     match condition.comparison.value {
-        SyntaxComparisonOperator::Equal => Ok(actual == &expected),
-        SyntaxComparisonOperator::NotEqual => Ok(actual != &expected),
+        SyntaxComparisonOperator::Equal => values_equal(actual, &expected, stage),
+        SyntaxComparisonOperator::NotEqual => values_equal(actual, &expected, stage).map(|v| !v),
         SyntaxComparisonOperator::Less => {
             Ok(compare_values(actual, &expected, stage)? == Ordering::Less)
         }
@@ -1724,35 +2078,48 @@ fn evaluate_condition(
     }
 }
 
-fn compare_values(left: &Value, right: &Value, stage: &str) -> Result<Ordering, ShellError> {
+fn compare_values(
+    left: &DataValue,
+    right: &DataValue,
+    stage: &str,
+) -> Result<Ordering, ShellError> {
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => {
-            if let (Some(left), Some(right)) = (left.as_i64(), right.as_i64()) {
-                return Ok(left.cmp(&right));
-            }
-            if let (Some(left), Some(right)) = (left.as_u64(), right.as_u64()) {
-                return Ok(left.cmp(&right));
-            }
-            if let (Some(left), Some(right)) = (left.as_i64(), right.as_u64()) {
-                return Ok(if left < 0 {
-                    Ordering::Less
-                } else {
-                    (left as u64).cmp(&right)
-                });
-            }
-            if let (Some(left), Some(right)) = (left.as_u64(), right.as_i64()) {
-                return Ok(if right < 0 {
-                    Ordering::Greater
-                } else {
-                    left.cmp(&(right as u64))
-                });
-            }
-            left.as_f64()
-                .and_then(|left| right.as_f64().and_then(|right| left.partial_cmp(&right)))
-                .ok_or_else(|| data_error(stage, "numbers cannot be ordered"))
+        (DataValue::Int(left), DataValue::Int(right)) => Ok(left.cmp(right)),
+        (DataValue::UInt(left), DataValue::UInt(right)) => Ok(left.cmp(right)),
+        (DataValue::Int(left), DataValue::UInt(right)) => Ok(i64_u64_order(*left, *right)),
+        (DataValue::UInt(left), DataValue::Int(right)) => {
+            Ok(i64_u64_order(*right, *left).reverse())
         }
-        (Value::String(left), Value::String(right)) => Ok(left.cmp(right)),
-        (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
+        (DataValue::Decimal(left), DataValue::Decimal(right)) => decimal_order(left, right, stage),
+        (DataValue::Decimal(left), DataValue::Int(right)) => {
+            decimal_integer_order(left, *right, stage)
+        }
+        (DataValue::Int(left), DataValue::Decimal(right)) => {
+            decimal_integer_order(right, *left, stage).map(Ordering::reverse)
+        }
+        (DataValue::Decimal(left), DataValue::UInt(right)) => {
+            decimal_unsigned_order(left, *right, stage)
+        }
+        (DataValue::UInt(left), DataValue::Decimal(right)) => {
+            decimal_unsigned_order(right, *left, stage).map(Ordering::reverse)
+        }
+        (DataValue::String(left), DataValue::String(right))
+        | (DataValue::Path(left), DataValue::Path(right))
+        | (DataValue::DateTime(left), DataValue::DateTime(right))
+        | (DataValue::Pattern(left), DataValue::Pattern(right)) => Ok(left.cmp(right)),
+        (DataValue::Bool(left), DataValue::Bool(right)) => Ok(left.cmp(right)),
+        (DataValue::Duration { nanoseconds: left }, DataValue::Duration { nanoseconds: right })
+        | (DataValue::Size { bytes: left }, DataValue::Size { bytes: right }) => {
+            Ok(left.cmp(right))
+        }
+        (DataValue::Size { bytes: left }, right)
+        | (DataValue::Duration { nanoseconds: left }, right) => {
+            compare_unsigned_to_numeric(*left, right, stage)
+        }
+        (left, DataValue::Size { bytes: right })
+        | (left, DataValue::Duration { nanoseconds: right }) => {
+            compare_unsigned_to_numeric(*right, left, stage).map(Ordering::reverse)
+        }
         _ => Err(data_error(
             stage,
             format!(
@@ -1764,35 +2131,117 @@ fn compare_values(left: &Value, right: &Value, stage: &str) -> Result<Ordering, 
     }
 }
 
-fn value_kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
+fn values_equal(left: &DataValue, right: &DataValue, stage: &str) -> Result<bool, ShellError> {
+    if is_numeric_value(left) && is_numeric_value(right) {
+        return compare_values(left, right, stage).map(|ordering| ordering == Ordering::Equal);
+    }
+    Ok(left == right)
+}
+
+fn is_numeric_value(value: &DataValue) -> bool {
+    matches!(
+        value,
+        DataValue::Int(_)
+            | DataValue::UInt(_)
+            | DataValue::Decimal(_)
+            | DataValue::Duration { .. }
+            | DataValue::Size { .. }
+    )
+}
+
+fn compare_unsigned_to_numeric(
+    left: u64,
+    right: &DataValue,
+    stage: &str,
+) -> Result<Ordering, ShellError> {
+    match right {
+        DataValue::UInt(right) => Ok(left.cmp(right)),
+        DataValue::Int(right) => Ok(i64_u64_order(*right, left).reverse()),
+        DataValue::Decimal(right) => {
+            decimal_unsigned_order(right, left, stage).map(Ordering::reverse)
+        }
+        _ => Err(data_error(
+            stage,
+            format!(
+                "cannot order unsigned domain magnitude and {} values",
+                value_kind(right)
+            ),
+        )),
     }
 }
 
-fn get_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.')
-        .try_fold(value, |value, field| value.as_object()?.get(field))
+fn i64_u64_order(left: i64, right: u64) -> Ordering {
+    u64::try_from(left).map_or(Ordering::Less, |left| left.cmp(&right))
+}
+
+fn decimal_order(left: &str, right: &str, stage: &str) -> Result<Ordering, ShellError> {
+    let left = left
+        .parse::<f64>()
+        .map_err(|_| data_error(stage, "left decimal cannot be ordered"))?;
+    let right = right
+        .parse::<f64>()
+        .map_err(|_| data_error(stage, "right decimal cannot be ordered"))?;
+    left.partial_cmp(&right)
+        .ok_or_else(|| data_error(stage, "non-finite decimals cannot be ordered"))
+}
+
+fn decimal_integer_order(left: &str, right: i64, stage: &str) -> Result<Ordering, ShellError> {
+    decimal_order(left, &right.to_string(), stage)
+}
+
+fn decimal_unsigned_order(left: &str, right: u64, stage: &str) -> Result<Ordering, ShellError> {
+    decimal_order(left, &right.to_string(), stage)
+}
+
+fn usize_value(value: usize) -> Result<DataValue, ShellError> {
+    u64::try_from(value).map(DataValue::UInt).map_err(|_| {
+        ShellError::new(
+            ErrorCode::ResourceLimit,
+            "data length exceeds the supported unsigned integer range",
+        )
+        .with_context(format!("observed platform length: {value}"))
+        .with_help("Use `take <count>` before requesting the length")
+    })
+}
+
+fn value_kind(value: &DataValue) -> &'static str {
+    match value {
+        DataValue::Nothing => "nothing",
+        DataValue::Bool(_) => "boolean",
+        DataValue::Int(_) => "integer",
+        DataValue::UInt(_) => "unsigned integer",
+        DataValue::Decimal(_) => "decimal",
+        DataValue::String(_) => "string",
+        DataValue::List(_) => "list",
+        DataValue::Record(_) => "record",
+        DataValue::Path(_) => "path",
+        DataValue::Duration { .. } => "duration",
+        DataValue::Size { .. } => "size",
+        DataValue::DateTime(_) => "datetime",
+        DataValue::Pattern(_) => "pattern",
+    }
+}
+
+fn get_path<'a>(value: &'a DataValue, path: &str) -> Option<&'a DataValue> {
+    path.split('.').try_fold(value, |value, field| match value {
+        DataValue::Record(values) => values.get(field),
+        _ => None,
+    })
 }
 
 fn sort_rows(
-    value: Value,
+    value: DataValue,
     field: &str,
     direction: SortDirection,
     stage: &str,
-) -> Result<Value, ShellError> {
+) -> Result<DataValue, ShellError> {
     let descending = direction == SortDirection::Descending;
-    let Value::Array(mut values) = value else {
-        return Err(data_error(stage, "sort expects an array of objects"));
+    let DataValue::List(mut values) = value else {
+        return Err(data_error(stage, "sort expects a list of records"));
     };
     for value in &values {
-        if !value.is_object() {
-            return Err(data_error(stage, "sort expects object rows"));
+        if !matches!(value, DataValue::Record(_)) {
+            return Err(data_error(stage, "sort expects record rows"));
         }
         if get_path(value, field).is_none() {
             return Err(data_error(stage, format!("row has no field `{field}`")));
@@ -1820,25 +2269,32 @@ fn sort_rows(
     if let Some(error) = comparison_error {
         return Err(error);
     }
-    Ok(Value::Array(values))
+    Ok(DataValue::List(values))
 }
 
-fn take_values(value: Value, count: u64, stage: &str) -> Result<Value, ShellError> {
+fn take_values(value: DataValue, count: u64, stage: &str) -> Result<DataValue, ShellError> {
     let count = usize::try_from(count).map_err(|_| {
         limit_error(
             "take count exceeds the platform index range",
             "Use a smaller non-negative count",
         )
     })?;
-    let Value::Array(mut values) = value else {
-        return Err(data_error(stage, "take expects an array"));
+    let DataValue::List(mut values) = value else {
+        return Err(data_error(stage, "take expects a list"));
     };
     values.truncate(count);
-    Ok(Value::Array(values))
+    Ok(DataValue::List(values))
 }
 
-fn select_fields(value: Value, fields: &[String], stage: &str) -> Result<Value, ShellError> {
-    fn select(object: Map<String, Value>, fields: &[String]) -> Map<String, Value> {
+fn select_fields(
+    value: DataValue,
+    fields: &[String],
+    stage: &str,
+) -> Result<DataValue, ShellError> {
+    fn select(
+        object: BTreeMap<String, DataValue>,
+        fields: &[String],
+    ) -> BTreeMap<String, DataValue> {
         fields
             .iter()
             .filter_map(|field| {
@@ -1851,26 +2307,32 @@ fn select_fields(value: Value, fields: &[String], stage: &str) -> Result<Value, 
     }
 
     match value {
-        Value::Object(object) => Ok(Value::Object(select(object, fields))),
-        Value::Array(values) => values
+        DataValue::Record(object) => Ok(DataValue::Record(select(object, fields))),
+        DataValue::List(values) => values
             .into_iter()
             .map(|value| match value {
-                Value::Object(object) => Ok(Value::Object(select(object, fields))),
-                _ => Err(data_error(stage, "select expects object rows")),
+                DataValue::Record(object) => Ok(DataValue::Record(select(object, fields))),
+                _ => Err(data_error(stage, "select expects record rows")),
             })
             .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
+            .map(DataValue::List),
         _ => Err(data_error(
             stage,
-            "select expects an object or array of objects",
+            "select expects a record or list of records",
         )),
     }
 }
 
-fn parse_json_boundary(bytes: &str, stage: &str, limits: DataLimits) -> Result<Value, ShellError> {
+fn parse_json_boundary(
+    bytes: &str,
+    stage: &str,
+    limits: DataLimits,
+) -> Result<DataValue, ShellError> {
     if bytes.len() > limits.max_source_bytes {
-        return Err(limit_error(
-            "JSON byte value exceeds the data source-size limit",
+        return Err(resource_limit_error(
+            "JSON bridge input bytes",
+            limits.max_source_bytes,
+            bytes.len(),
             "Use a bounded external command or raise the configured data source limit",
         ));
     }
@@ -1878,16 +2340,30 @@ fn parse_json_boundary(bytes: &str, stage: &str, limits: DataLimits) -> Result<V
         data_error(stage, format!("from json received invalid JSON: {error}"))
             .with_help("Ensure the byte producer emits one valid JSON document")
     })?;
-    validate_value(&value, limits)?;
-    Ok(value)
+    data_value_from_json(value, limits)
 }
 
-fn to_json_boundary(value: &Value, stage: &str) -> Result<String, ShellError> {
-    serde_json::to_string(value).map_err(|error| {
+fn to_json_boundary(
+    value: &DataValue,
+    stage: &str,
+    limits: DataLimits,
+) -> Result<String, ShellError> {
+    let json = json_from_data_value(value, limits)?;
+    let rendered = serde_json::to_string(&json).map_err(|error| {
         data_error(stage, "to json cannot encode this value")
             .with_context(error.to_string())
             .with_help("Select JSON-compatible fields before crossing the byte boundary")
-    })
+    })?;
+    let observed = u64::try_from(rendered.len()).unwrap_or(u64::MAX);
+    if observed > limits.max_file_bytes {
+        return Err(resource_limit_error_u64(
+            "JSON bridge output bytes",
+            limits.max_file_bytes,
+            observed,
+            "Select fewer fields or raise the configured conversion byte limit",
+        ));
+    }
+    Ok(rendered)
 }
 
 fn syntax_limits(limits: DataLimits) -> DataSyntaxLimits {
@@ -1940,6 +2416,10 @@ mod tests {
         path: PathBuf,
     }
 
+    struct TemporaryDirectory {
+        path: PathBuf,
+    }
+
     impl TemporaryFile {
         fn path(&self) -> &Path {
             &self.path
@@ -1955,6 +2435,12 @@ mod tests {
     impl Drop for TemporaryFile {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 
@@ -1983,6 +2469,26 @@ mod tests {
 
     fn temporary_file(extension: &str, contents: &str) -> TemporaryFile {
         temporary_bytes(extension, contents.as_bytes())
+    }
+
+    fn temporary_directory() -> TemporaryDirectory {
+        for _ in 0..128 {
+            let nonce = TEMPORARY_FILE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "quirl-data-directory-{}-{nonce}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return TemporaryDirectory { path },
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("could not create temporary test directory: {error}"),
+            }
+        }
+        panic!("could not allocate a unique temporary test directory after 128 attempts");
+    }
+
+    fn typed(value: serde_json::Value) -> DataValue {
+        data_value_from_json(value, DataLimits::DEFAULT).unwrap()
     }
 
     #[cfg(unix)]
@@ -2053,38 +2559,51 @@ mod tests {
         }
     }
 
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, AtomicOrdering::Relaxed);
+        }
+    }
+
     #[test]
     fn transforms_structured_rows_without_stringification() {
         let runtime = DataRuntime::new();
         let value = runtime
-            .eval(
+            .eval_typed(
                 r#"[{"name":"api","status":"up"},{"name":"db","status":"down"}]
                    | where status == "down" | select name"#,
             )
             .unwrap();
-        assert_eq!(value, serde_json::json!([{"name": "db"}]));
+        assert_eq!(value, typed(serde_json::json!([{"name": "db"}])));
     }
 
     #[test]
     fn pipes_inside_json_strings_do_not_split_the_pipeline() {
         let runtime = DataRuntime::new();
         assert_eq!(
-            runtime.eval(r#"{"value":"a|b"} | get value"#).unwrap(),
-            "a|b"
+            runtime
+                .eval_typed(r#"{"value":"a|b"} | get value"#)
+                .unwrap(),
+            DataValue::String("a|b".to_owned())
         );
     }
 
     #[test]
     fn length_preserves_a_numeric_value() {
         let runtime = DataRuntime::new();
-        assert_eq!(runtime.eval("[1,2,3] | length").unwrap(), 3);
+        assert_eq!(
+            runtime.eval_typed("[1,2,3] | length").unwrap(),
+            DataValue::UInt(3)
+        );
     }
 
     #[test]
     fn filters_sorts_and_limits_rows_with_the_documented_grammar() {
         let runtime = DataRuntime::new();
         let value = runtime
-            .eval(
+            .eval_typed(
                 r#"[
                     {"name":"old-small","kind":"file","size":100,"meta":{"age":40}},
                     {"name":"new-large","kind":"file","size":900,"meta":{"age":2}},
@@ -2100,10 +2619,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             value,
-            serde_json::json!([
+            typed(serde_json::json!([
                 {"name": "old-largest", "size": 1100},
                 {"name": "old-large", "size": 700}
-            ])
+            ]))
         );
     }
 
@@ -2111,7 +2630,7 @@ mod tests {
     fn where_supports_all_comparisons_and_and_before_or_precedence() {
         let runtime = DataRuntime::new();
         let value = runtime
-            .eval(
+            .eval_typed(
                 r#"[
                     {"name":"a","score":1,"enabled":true},
                     {"name":"b","score":2,"enabled":false},
@@ -2121,13 +2640,13 @@ mod tests {
                   | get name"#,
             )
             .unwrap();
-        assert_eq!(value, serde_json::json!(["a", "b", "c"]));
+        assert_eq!(value, typed(serde_json::json!(["a", "b", "c"])));
 
         assert_eq!(
             runtime
-                .eval(r#"[{"n":1},{"n":2},{"n":3}] | where n <= 2 and n > 1"#)
+                .eval_typed(r#"[{"n":1},{"n":2},{"n":3}] | where n <= 2 and n > 1"#)
                 .unwrap(),
-            serde_json::json!([{"n": 2}])
+            typed(serde_json::json!([{"n": 2}]))
         );
     }
 
@@ -2136,15 +2655,15 @@ mod tests {
         let runtime = DataRuntime::new();
         assert_eq!(
             runtime
-                .eval(r#"[{"value":"42"},{"value":42}] | where value == "42""#)
+                .eval_typed(r#"[{"value":"42"},{"value":42}] | where value == "42""#)
                 .unwrap(),
-            serde_json::json!([{"value": "42"}])
+            typed(serde_json::json!([{"value": "42"}]))
         );
         assert_eq!(
             runtime
-                .eval(r#"[{"value":"a and b"},{"value":"a"}] | where value == 'a and b'"#)
+                .eval_typed(r#"[{"value":"a and b"},{"value":"a"}] | where value == 'a and b'"#)
                 .unwrap(),
-            serde_json::json!([{"value": "a and b"}])
+            typed(serde_json::json!([{"value": "a and b"}]))
         );
     }
 
@@ -2153,30 +2672,32 @@ mod tests {
         let runtime = DataRuntime::new();
         assert_eq!(
             runtime
-                .eval(
+                .eval_typed(
                     r#"[{"user":{"name":"Ada","rank":2}},{"user":{"name":"Lin","rank":1}}]
                        | where user.rank != 3 | sort user.rank | get user.name"#,
                 )
                 .unwrap(),
-            serde_json::json!(["Lin", "Ada"])
+            typed(serde_json::json!(["Lin", "Ada"]))
         );
     }
 
     #[test]
     fn malformed_predicates_and_incomparable_sorts_are_errors() {
         let runtime = DataRuntime::new();
-        assert!(runtime.eval(r#"[{"value":1}] | where value = 1"#).is_err());
         assert!(runtime
-            .eval(r#"[{"value":1},{"value":"one"}] | sort value"#)
+            .eval_typed(r#"[{"value":1}] | where value = 1"#)
             .is_err());
-        assert!(runtime.eval("[1,2 | length").is_err());
+        assert!(runtime
+            .eval_typed(r#"[{"value":1},{"value":"one"}] | sort value"#)
+            .is_err());
+        assert!(runtime.eval_typed("[1,2 | length").is_err());
     }
 
     #[test]
     fn cancellation_stops_between_typed_pipeline_stages() {
         let cancelled = AtomicBool::new(true);
         let error = DataRuntime::new()
-            .eval_with_cancellation("[1,2,3] | length", &cancelled)
+            .eval_typed_with_cancellation("[1,2,3] | length", &cancelled)
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
     }
@@ -2189,23 +2710,75 @@ mod tests {
 
         assert_eq!(
             runtime
-                .eval(&format!(
+                .eval_typed(&format!(
                     "open {} | get service.name",
                     toml.path().display()
                 ))
                 .unwrap(),
-            "api"
+            DataValue::String("api".to_owned())
         );
         let mut stream = runtime.open_stream(&csv).unwrap();
         assert_eq!(
             stream.next(&AtomicBool::new(false)).unwrap(),
-            Some(serde_json::json!({"name": "api", "enabled": "true"}))
+            Some(typed(serde_json::json!({"name": "api", "enabled": "true"})))
         );
         assert_eq!(
             stream.next(&AtomicBool::new(false)).unwrap(),
-            Some(serde_json::json!({"name": "worker", "enabled": "false"}))
+            Some(typed(
+                serde_json::json!({"name": "worker", "enabled": "false"})
+            ))
         );
         assert_eq!(stream.next(&AtomicBool::new(false)).unwrap(), None);
+    }
+
+    #[test]
+    fn typed_sources_survive_transforms_bridges_and_rendering() {
+        let directory = temporary_directory();
+        std::fs::write(directory.path.join("entry.txt"), b"five!").unwrap();
+        let expression = format!(
+            "files {} | where size == 5 | select path size modified | first",
+            directory.path.display()
+        );
+        let envelope = DataRuntime::new().eval_envelope(&expression).unwrap();
+        let DataEnvelope::Option { value: Some(value) } = envelope else {
+            panic!("first over one typed filesystem row must return some");
+        };
+        let DataEnvelope::Value {
+            value: DataValue::Record(row),
+        } = *value
+        else {
+            panic!("selected filesystem row must remain a typed record");
+        };
+        assert!(matches!(row.get("path"), Some(DataValue::Path(_))));
+        assert_eq!(row.get("size"), Some(&DataValue::Size { bytes: 5 }));
+        assert!(matches!(row.get("modified"), Some(DataValue::DateTime(_))));
+
+        let rendered = DataRuntime::new()
+            .render(
+                &format!("{expression} | to json"),
+                DataRenderFormat::Json,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert!(rendered.contains("\"kind\": \"option\""));
+        assert!(rendered.contains("\\\"size\\\":\\\"5B\\\""));
+    }
+
+    #[test]
+    fn toml_datetime_survives_without_a_json_round_trip() {
+        let toml = temporary_file("toml", "when = 1979-05-27T07:32:00Z\n");
+        assert_eq!(
+            DataRuntime::new()
+                .eval_typed(&format!("open {} | get when", toml.path().display()))
+                .unwrap(),
+            DataValue::DateTime("1979-05-27T07:32:00Z".to_owned())
+        );
+        assert_eq!(
+            DataRuntime::new()
+                .eval(&format!("open {} | get when", toml.path().display()))
+                .unwrap(),
+            serde_json::Value::String("1979-05-27T07:32:00Z".to_owned())
+        );
     }
 
     #[test]
@@ -2219,21 +2792,32 @@ mod tests {
 
         assert_eq!(
             runtime
-                .eval(&format!(
+                .eval_typed(&format!(
                     "open {} | get service.name",
                     yaml.path().display()
                 ))
                 .unwrap(),
-            "api"
+            DataValue::String("api".to_owned())
         );
         let mut stream = runtime.open_stream(&tar).unwrap();
         assert_eq!(
             stream.next(&AtomicBool::new(false)).unwrap(),
-            Some(serde_json::json!({"path":"alpha.txt", "kind":"file", "size":5}))
+            Some(DataValue::Record(BTreeMap::from([
+                ("kind".to_owned(), DataValue::String("file".to_owned())),
+                ("path".to_owned(), DataValue::Path("alpha.txt".to_owned())),
+                ("size".to_owned(), DataValue::Size { bytes: 5 }),
+            ])))
         );
         assert_eq!(
             stream.next(&AtomicBool::new(false)).unwrap(),
-            Some(serde_json::json!({"path":"nested/bravo.txt", "kind":"file", "size":5}))
+            Some(DataValue::Record(BTreeMap::from([
+                ("kind".to_owned(), DataValue::String("file".to_owned())),
+                (
+                    "path".to_owned(),
+                    DataValue::Path("nested/bravo.txt".to_owned()),
+                ),
+                ("size".to_owned(), DataValue::Size { bytes: 5 }),
+            ])))
         );
         assert_eq!(stream.next(&AtomicBool::new(false)).unwrap(), None);
     }
@@ -2296,7 +2880,10 @@ mod tests {
     fn render_to_writes_rows_incrementally_and_honors_cancellation() {
         let cancelled = AtomicBool::new(false);
         let output = DataOutput::Stream(DataStream::from_values(
-            vec![serde_json::json!("one"), serde_json::json!("two")],
+            vec![
+                DataValue::String("one".to_owned()),
+                DataValue::String("two".to_owned()),
+            ],
             DataLimits::DEFAULT,
         ));
         let mut writer = CancelAfterFirstWrite {
@@ -2315,7 +2902,7 @@ mod tests {
     #[test]
     fn render_to_reports_output_failures_as_shell_errors() {
         let mut writer = FailingWriter;
-        let error = DataOutput::Value(serde_json::json!("value"))
+        let error = DataOutput::Value(DataValue::String("value".to_owned()))
             .render_to(
                 DataRenderFormat::Plain,
                 &AtomicBool::new(false),
@@ -2324,6 +2911,57 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Io);
         assert!(!error.details.help.is_empty());
+    }
+
+    #[test]
+    fn stream_reader_state_is_released_after_a_pull_error() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(Arc::clone(&dropped));
+        let stream = DataStream::from_pull(
+            move |_| {
+                let _keep_reader_alive = &probe;
+                Err(ShellError::new(ErrorCode::Data, "injected reader failure")
+                    .with_help("This is a deterministic cleanup-path test"))
+            },
+            DataLimits::DEFAULT,
+        );
+        let error = DataOutput::Stream(stream)
+            .render(DataRenderFormat::Plain, &AtomicBool::new(false))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Data);
+        assert!(dropped.load(AtomicOrdering::Relaxed));
+    }
+
+    #[test]
+    fn conversion_and_materialization_overflow_report_limit_and_observed_usage() {
+        let bridge_runtime = DataRuntime::with_limits(DataLimits {
+            max_source_bytes: 128,
+            max_file_bytes: 5,
+            ..DataLimits::DEFAULT
+        });
+        let bridge_error = bridge_runtime
+            .eval_typed(r#""abcdefgh" | to json"#)
+            .unwrap_err();
+        assert_eq!(bridge_error.code, ErrorCode::ResourceLimit);
+        assert!(bridge_error.details.context[0].contains("limit: 5"));
+        assert!(bridge_error.details.context[0].contains("observed:"));
+
+        let limits = DataLimits {
+            max_materialized_bytes: std::mem::size_of::<DataValue>() + 8,
+            ..DataLimits::DEFAULT
+        };
+        let error = DataStream::from_values(
+            vec![
+                DataValue::String("one".to_owned()),
+                DataValue::String("two".to_owned()),
+            ],
+            limits,
+        )
+        .collect(&AtomicBool::new(false))
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.message.contains("materialized retained bytes"));
+        assert!(error.details.context[0].contains("observed:"));
     }
 
     #[test]
@@ -2345,38 +2983,47 @@ mod tests {
         let limits = DataLimits {
             max_depth: 1,
             max_rows: 1,
+            max_fields: 1,
             ..DataLimits::DEFAULT
         };
         let runtime = DataRuntime::with_limits(limits);
         assert_eq!(
-            runtime.eval("[[1]]").unwrap_err().code,
+            runtime.eval_typed("[[1]]").unwrap_err().code,
             ErrorCode::ResourceLimit
         );
         assert_eq!(
-            runtime.eval("[1,2]").unwrap_err().code,
+            runtime.eval_typed("[1,2]").unwrap_err().code,
             ErrorCode::ResourceLimit
         );
+
+        let json = temporary_file("json", r#"{"one":1,"two":2}"#);
+        let error = runtime
+            .eval_typed(&format!("open {}", json.path().display()))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("limit: 1"));
+        assert!(error.details.context[0].contains("observed: 2"));
     }
 
     #[test]
     fn envelope_and_renderers_keep_machine_and_terminal_contracts_distinct() {
-        let envelope = DataEnvelope::task(DataEnvelope::result(DataEnvelope::stream(vec![
+        let envelope = DataEnvelope::task(DataEnvelope::result(DataEnvelope::stream(vec![typed(
             serde_json::json!({"name": "api", "port": 8080}),
-        ])));
+        )])));
         let json = envelope.render(DataRenderFormat::Json).unwrap();
         assert!(json.contains("\"kind\": \"task\""));
         assert!(json.contains("\"state\": \"complete\""));
         assert!(json.contains("\"type\": \"string\""));
         let table = envelope.render(DataRenderFormat::Table).unwrap();
-        assert_eq!(table, "name\tport\n\"api\"\t8080\n");
+        assert_eq!(table, "name\tport\napi\t8080\n");
     }
 
     #[test]
     fn plain_rendering_of_nested_values_does_not_leak_abi_tags() {
-        let output = DataEnvelope::value(serde_json::json!({
+        let output = DataEnvelope::value(typed(serde_json::json!({
             "service": {"name": "api"},
             "ports": [8080, 8443],
-        }))
+        })))
         .render(DataRenderFormat::Plain)
         .unwrap();
         assert_eq!(
@@ -2403,7 +3050,7 @@ mod tests {
             ..DataLimits::DEFAULT
         });
         let error = runtime
-            .eval(&format!("open {}", json.path().display()))
+            .eval_typed(&format!("open {}", json.path().display()))
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert!(!error.details.help.is_empty());
@@ -2448,6 +3095,28 @@ mod tests {
             .render(DataRenderFormat::Plain)
             .unwrap()
             .contains("Pending"));
+
+        let first = DataRuntime::new().eval_envelope("[] | first").unwrap();
+        assert_eq!(first, DataEnvelope::none());
+        let captured = DataRuntime::new().eval_result_envelope("[1,2");
+        assert!(matches!(
+            captured,
+            DataEnvelope::Result {
+                state: ResultState::Error,
+                error: Some(_),
+                ..
+            }
+        ));
+
+        let incoherent = DataEnvelope::Task {
+            state: TaskState::Pending,
+            value: Some(Box::new(DataEnvelope::value(DataValue::Int(1)))),
+            error: None,
+        };
+        assert_eq!(
+            incoherent.validate(DataLimits::DEFAULT).unwrap_err().code,
+            ErrorCode::Validation
+        );
     }
 
     #[test]
@@ -2463,25 +3132,29 @@ mod tests {
         });
         let runtime = DataRuntime::with_process_host(host);
         assert_eq!(
-            runtime.eval("^external fixture | lines | take 1").unwrap(),
-            serde_json::json!(["one"])
+            runtime
+                .eval_typed("^external fixture | lines | take 1")
+                .unwrap(),
+            typed(serde_json::json!(["one"]))
         );
         assert_eq!(
             DataRuntime::new()
-                .eval(r#""{\"name\":\"api\"}" | from json | get name | to json"#)
+                .eval_typed(r#""{\"name\":\"api\"}" | from json | get name | to json"#)
                 .unwrap(),
-            serde_json::json!("\"api\"")
+            DataValue::String("\"api\"".to_owned())
         );
     }
 
     #[test]
     fn external_sources_fail_closed_and_invalid_json_is_diagnostic() {
-        let error = DataRuntime::new().eval("^external fixture").unwrap_err();
+        let error = DataRuntime::new()
+            .eval_typed("^external fixture")
+            .unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
         assert!(!error.details.help.is_empty());
 
         let error = DataRuntime::new()
-            .eval(r#""not json" | from json"#)
+            .eval_typed(r#""not json" | from json"#)
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Data);
         assert!(error.details.context[0].contains("invalid JSON"));

@@ -314,55 +314,121 @@ pub enum StructuredValue {
 
 impl StructuredValue {
     /// Convert a JSON-compatible value without losing integer sign or width.
+    ///
+    /// This compatibility bridge is iterative. Callers must validate the
+    /// returned value before retaining it; execution request and outcome
+    /// constructors perform that bounded validation automatically.
     pub fn from_json(value: serde_json::Value) -> Self {
-        match value {
-            serde_json::Value::Null => Self::Nothing,
-            serde_json::Value::Bool(value) => Self::Bool(value),
-            serde_json::Value::Number(value) => match (value.as_i64(), value.as_u64()) {
-                (Some(value), _) => Self::Int(value),
-                (_, Some(value)) => Self::UInt(value),
-                _ => Self::Decimal(value.to_string()),
-            },
-            serde_json::Value::String(value) => Self::String(value),
-            serde_json::Value::Array(values) => {
-                Self::List(values.into_iter().map(Self::from_json).collect())
-            }
-            serde_json::Value::Object(values) => Self::Record(
-                values
-                    .into_iter()
-                    .map(|(key, value)| (key, Self::from_json(value)))
-                    .collect(),
-            ),
+        enum Work {
+            Visit(serde_json::Value),
+            FinishList(usize),
+            FinishRecord(Vec<String>),
         }
+
+        let mut work = vec![Work::Visit(value)];
+        let mut output = Vec::new();
+        while let Some(task) = work.pop() {
+            match task {
+                Work::Visit(value) => match value {
+                    serde_json::Value::Null => output.push(Self::Nothing),
+                    serde_json::Value::Bool(value) => output.push(Self::Bool(value)),
+                    serde_json::Value::Number(value) => {
+                        output.push(match (value.as_i64(), value.as_u64()) {
+                            (Some(value), _) => Self::Int(value),
+                            (_, Some(value)) => Self::UInt(value),
+                            _ => Self::Decimal(value.to_string()),
+                        })
+                    }
+                    serde_json::Value::String(value) => output.push(Self::String(value)),
+                    serde_json::Value::Array(values) => {
+                        let length = values.len();
+                        work.push(Work::FinishList(length));
+                        work.extend(values.into_iter().rev().map(Work::Visit));
+                    }
+                    serde_json::Value::Object(values) => {
+                        let (keys, values): (Vec<_>, Vec<_>) = values.into_iter().unzip();
+                        work.push(Work::FinishRecord(keys));
+                        work.extend(values.into_iter().rev().map(Work::Visit));
+                    }
+                },
+                Work::FinishList(length) => {
+                    let start = output.len().saturating_sub(length);
+                    let values = output.split_off(start);
+                    output.push(Self::List(values));
+                }
+                Work::FinishRecord(keys) => {
+                    let start = output.len().saturating_sub(keys.len());
+                    let values = output.split_off(start);
+                    output.push(Self::Record(keys.into_iter().zip(values).collect()));
+                }
+            }
+        }
+        debug_assert_eq!(output.len(), 1);
+        output.pop().unwrap_or(Self::Nothing)
     }
 
     /// Convert to JSON-compatible data for existing renderers and Lua adapters.
+    ///
+    /// Domain strings lose their tag; durations and sizes become suffixed
+    /// strings. Conversion is iterative, but callers should validate first so
+    /// retained JSON remains within the common value bounds.
     pub fn json_value(&self) -> serde_json::Value {
-        match self {
-            Self::Nothing => serde_json::Value::Null,
-            Self::Bool(value) => serde_json::Value::Bool(*value),
-            Self::Int(value) => serde_json::Value::from(*value),
-            Self::UInt(value) => serde_json::Value::from(*value),
-            Self::Decimal(value) => serde_json::from_str::<serde_json::Number>(value).map_or_else(
-                |_| serde_json::Value::String(value.clone()),
-                serde_json::Value::Number,
-            ),
-            Self::String(value)
-            | Self::Path(value)
-            | Self::DateTime(value)
-            | Self::Pattern(value) => serde_json::Value::String(value.clone()),
-            Self::Duration { nanoseconds } => serde_json::Value::String(format!("{nanoseconds}ns")),
-            Self::Size { bytes } => serde_json::Value::String(format!("{bytes}B")),
-            Self::List(values) => {
-                serde_json::Value::Array(values.iter().map(Self::json_value).collect())
-            }
-            Self::Record(values) => serde_json::Value::Object(
-                values
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.json_value()))
-                    .collect(),
-            ),
+        enum Work<'a> {
+            Visit(&'a StructuredValue),
+            FinishList(usize),
+            FinishRecord(Vec<String>),
         }
+
+        let mut work = vec![Work::Visit(self)];
+        let mut output = Vec::new();
+        while let Some(task) = work.pop() {
+            match task {
+                Work::Visit(value) => match value {
+                    Self::Nothing => output.push(serde_json::Value::Null),
+                    Self::Bool(value) => output.push(serde_json::Value::Bool(*value)),
+                    Self::Int(value) => output.push(serde_json::Value::from(*value)),
+                    Self::UInt(value) => output.push(serde_json::Value::from(*value)),
+                    Self::Decimal(value) => output.push(
+                        serde_json::from_str::<serde_json::Number>(value).map_or_else(
+                            |_| serde_json::Value::String(value.clone()),
+                            serde_json::Value::Number,
+                        ),
+                    ),
+                    Self::String(value)
+                    | Self::Path(value)
+                    | Self::DateTime(value)
+                    | Self::Pattern(value) => output.push(serde_json::Value::String(value.clone())),
+                    Self::Duration { nanoseconds } => {
+                        output.push(serde_json::Value::String(format!("{nanoseconds}ns")))
+                    }
+                    Self::Size { bytes } => {
+                        output.push(serde_json::Value::String(format!("{bytes}B")))
+                    }
+                    Self::List(values) => {
+                        work.push(Work::FinishList(values.len()));
+                        work.extend(values.iter().rev().map(Work::Visit));
+                    }
+                    Self::Record(values) => {
+                        work.push(Work::FinishRecord(values.keys().cloned().collect()));
+                        work.extend(values.values().rev().map(Work::Visit));
+                    }
+                },
+                Work::FinishList(length) => {
+                    let start = output.len().saturating_sub(length);
+                    let values = output.split_off(start);
+                    output.push(serde_json::Value::Array(values));
+                }
+                Work::FinishRecord(keys) => {
+                    let start = output.len().saturating_sub(keys.len());
+                    let values = output.split_off(start);
+                    output.push(serde_json::Value::Object(
+                        keys.into_iter().zip(values).collect(),
+                    ));
+                }
+            }
+        }
+        debug_assert_eq!(output.len(), 1);
+        output.pop().unwrap_or(serde_json::Value::Null)
     }
 
     /// Render one value for a terminal-safe caller to escape before display.
