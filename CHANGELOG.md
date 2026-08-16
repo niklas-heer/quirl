@@ -68,7 +68,8 @@ Notable user-visible changes to Quirl are recorded here. The format follows
   removed.
 
 <!-- BEGIN QUIRL RELEASE EVIDENCE STATUS -->
-> **Release evidence status — current.** The record for measured candidate `631d7849a22d04a028cbe90315dd63b8a526b03a` and artifact `6ab5d8c5069956b5b5fe2d0b37b50e7d3c2a287df33a36ae75b88c87f900d8a0` is current exact-candidate evidence.
+> **Release evidence status — historical.** Artifact evidence for measured candidate `631d7849a22d04a028cbe90315dd63b8a526b03a` and artifact `6ab5d8c5069956b5b5fe2d0b37b50e7d3c2a287df33a36ae75b88c87f900d8a0` is historical.
+> Evidence commit `31e9b9b9c6ee8b0b7fdcc8f4ebc7aabbdb006bf8` documents that measurement. It is not evidence for the corrected implementation, which has no fresh exact-candidate measurement.
 > Human review on named Linux and macOS terminals, remote-PTY review, and real-terminal demo review remain incomplete.
 <!-- END QUIRL RELEASE EVIDENCE STATUS -->
 

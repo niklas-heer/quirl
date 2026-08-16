@@ -673,7 +673,7 @@ impl Catalog {
                     "quirl run",
                     "quirl run <file|-> [--lang lua|quirl|bash|zsh] [arguments...]",
                     "Run a script through its explicit language engine",
-                    "Selects a language by explicit flag, shebang, or extension; Lua uses the restricted VM, `.qrl` uses native executors, and `.quirl` plus `.🌀` are accepted native aliases. Bash/Zsh use reference interpreters with startup files disabled and structured capture.",
+                    "Reads at most 4 MiB from an admitted regular file, or bounded standard input. Selects a language by explicit flag, shebang, or extension; Lua uses the restricted VM, `.qrl` uses native executors, and `.quirl` plus `.🌀` are accepted native aliases. Bash/Zsh use reference interpreters with startup files disabled and structured capture.",
                     vec![option(
                         &["--lang"],
                         Some("lua|quirl|bash|zsh"),
@@ -838,7 +838,7 @@ impl Catalog {
                     "quirl plugin check",
                     "quirl plugin check <file> [--format text|json]",
                     "Validate Lua plugin registrations",
-                    "Loads a trusted plugin with process access denied and validates prompt and completion callbacks.",
+                    "Reads at most 4 MiB from an admitted regular file, then loads a trusted plugin with process access denied and validates prompt and completion callbacks.",
                     vec![option(&["--format"], Some("text|json"), "Choose output format")],
                     &["quirl plugin check examples/plugin.lua --format json"],
                     &[Effect::ReadFilesystem],
@@ -848,7 +848,7 @@ impl Catalog {
                     "quirl plugin add",
                     "quirl plugin add <source> [--allow capability]... [--format text|json]",
                     "Install a local plugin with explicit permission approval",
-                    "Validates the versioned manifest and runtime boundary, shows the permission diff, records SHA-256 source checksums, and atomically installs a disabled permission lock without implicit network access.",
+                    "Reads the manifest and entry only from admitted regular files under their 256 KiB and 4 MiB limits. It validates the versioned runtime boundary, shows the permission diff, records SHA-256 source checksums, and atomically installs a disabled permission lock without implicit network access.",
                     vec![
                         repeatable_option(
                             &["--allow"],
@@ -1005,7 +1005,7 @@ impl Catalog {
                     "quirl agent validate",
                     "quirl agent validate <file> --kind catalog|context|manifest [--format text|json]",
                     "Validate a versioned agent contract without execution",
-                    "Rejects unknown fields, unsupported schema versions, tampered content hashes, nondeterministic ordering, and context payloads that exceed their declared token budget.",
+                    "Reads at most 4 MiB from an admitted regular file, then rejects unknown fields, unsupported schema versions, tampered content hashes, nondeterministic ordering, and context payloads that exceed their declared token budget.",
                     vec![
                         required_option(
                             &["--kind"],
@@ -1243,7 +1243,7 @@ impl Catalog {
                     "quirl events validate",
                     "quirl events validate <file> [--format text|json]",
                     "Validate an immutable extension event trace",
-                    "Checks the deny-unknown versioned envelope, protocol version, safe output text, and strictly increasing event sequence without invoking a plugin.",
+                    "Reads at most 4 MiB from an admitted regular file, then checks the deny-unknown versioned envelope, protocol version, safe output text, and strictly increasing event sequence without invoking a plugin.",
                     vec![option(
                         &["--format"],
                         Some("text|json"),
@@ -1357,7 +1357,7 @@ impl Catalog {
                     "quirl index build",
                     "quirl index build [--fish path]... [--bash path]... [--zsh path]... [--help path]... [--man path]... [--output path] [--format text|json]",
                     "Build the attributed completion index",
-                    "Imports declarative Fish, Bash, and Zsh completions plus bounded supplied help/man text without sourcing or executing providers, commands, or man, then atomically writes a versioned catalog.",
+                    "Imports declarative Fish, Bash, and Zsh completions from admitted regular files up to 4 MiB each, plus admitted help/man text up to 1 MiB each. It never sources or executes providers, commands, or man, then atomically writes a versioned catalog.",
                     vec![
                         repeatable_option(&["--fish"], "path", "Import a Fish completion file or directory"),
                         repeatable_option(&["--bash"], "path", "Import a Bash completion file or directory"),
@@ -1379,7 +1379,7 @@ impl Catalog {
                     "quirl index explain",
                     "quirl index explain <command...> [--index path] [--format text|json]",
                     "Explain where indexed command facts came from",
-                    "Shows source kind, confidence, origin, and fingerprint for command metadata and each retained option.",
+                    "Reads an admitted regular catalog file up to 4 MiB, then shows source kind, confidence, origin, and fingerprint for command metadata and each retained option.",
                     vec![
                         option(&["--index"], Some("path"), "Read a specific catalog index"),
                         option(&["--format"], Some("text|json"), "Choose the explanation format"),

@@ -155,7 +155,7 @@ export function renderProjection(metadata, format = 'markdown') {
   const statusLines =
     metadata.status === 'historical'
       ? [
-          `> **Release evidence status — historical.** P14 evidence for measured ${identity} is historical.`,
+          `> **Release evidence status — historical.** Artifact evidence for measured ${identity} is historical.`,
           `>${evidenceCommitClause(metadata)} It is not evidence for the corrected implementation, which has no fresh exact-candidate measurement.`,
         ]
       : [
@@ -248,11 +248,11 @@ function extractSingleField(markdown, pattern, field) {
 
 export function validateRecordIdentity(markdown, metadata) {
   const expectedStatus = metadata.status === 'historical'
-    ? 'Historical P14 evidence'
+    ? 'Historical artifact evidence'
     : 'Current exact-candidate evidence';
   const visibleStatus = extractSingleField(
     markdown,
-    /^> \*\*(Historical P14 evidence|Current exact-candidate evidence)\.\*\*/gm,
+    /^> \*\*(Historical artifact evidence|Current exact-candidate evidence)\.\*\*/gm,
     'visible status',
   );
   if (visibleStatus !== expectedStatus) {

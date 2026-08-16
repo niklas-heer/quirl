@@ -211,7 +211,7 @@ Options:
 
 Validate a versioned agent contract without execution
 
-Rejects unknown fields, unsupported schema versions, tampered content hashes, nondeterministic ordering, and context payloads that exceed their declared token budget.
+Reads at most 4 MiB from an admitted regular file, then rejects unknown fields, unsupported schema versions, tampered content hashes, nondeterministic ordering, and context payloads that exceed their declared token budget.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -498,7 +498,7 @@ Options:
 
 Validate an immutable extension event trace
 
-Checks the deny-unknown versioned envelope, protocol version, safe output text, and strictly increasing event sequence without invoking a plugin.
+Reads at most 4 MiB from an admitted regular file, then checks the deny-unknown versioned envelope, protocol version, safe output text, and strictly increasing event sequence without invoking a plugin.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -543,7 +543,7 @@ Options:
 
 Build the attributed completion index
 
-Imports declarative Fish, Bash, and Zsh completions plus bounded supplied help/man text without sourcing or executing providers, commands, or man, then atomically writes a versioned catalog.
+Imports declarative Fish, Bash, and Zsh completions from admitted regular files up to 4 MiB each, plus admitted help/man text up to 1 MiB each. It never sources or executes providers, commands, or man, then atomically writes a versioned catalog.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -563,7 +563,7 @@ Options:
 
 Explain where indexed command facts came from
 
-Shows source kind, confidence, origin, and fingerprint for command metadata and each retained option.
+Reads an admitted regular catalog file up to 4 MiB, then shows source kind, confidence, origin, and fingerprint for command metadata and each retained option.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -685,7 +685,7 @@ Options:
 
 Install a local plugin with explicit permission approval
 
-Validates the versioned manifest and runtime boundary, shows the permission diff, records SHA-256 source checksums, and atomically installs a disabled permission lock without implicit network access.
+Reads the manifest and entry only from admitted regular files under their 256 KiB and 4 MiB limits. It validates the versioned runtime boundary, shows the permission diff, records SHA-256 source checksums, and atomically installs a disabled permission lock without implicit network access.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -701,7 +701,7 @@ Options:
 
 Validate Lua plugin registrations
 
-Loads a trusted plugin with process access denied and validates prompt and completion callbacks.
+Reads at most 4 MiB from an admitted regular file, then loads a trusted plugin with process access denied and validates prompt and completion callbacks.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -850,7 +850,7 @@ Options:
 
 Run a script through its explicit language engine
 
-Selects a language by explicit flag, shebang, or extension; Lua uses the restricted VM, `.qrl` uses native executors, and `.quirl` plus `.🌀` are accepted native aliases. Bash/Zsh use reference interpreters with startup files disabled and structured capture.
+Reads at most 4 MiB from an admitted regular file, or bounded standard input. Selects a language by explicit flag, shebang, or extension; Lua uses the restricted VM, `.qrl` uses native executors, and `.quirl` plus `.🌀` are accepted native aliases. Bash/Zsh use reference interpreters with startup files disabled and structured capture.
 
 - Input: `Nothing`
 - Output: `Bytes`

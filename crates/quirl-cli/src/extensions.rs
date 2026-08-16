@@ -1,6 +1,9 @@
-use crate::extension_scheduler::{
-    ExtensionScheduler, ExtensionSchedulerHandle, ExtensionWork, ExtensionWorkBatch,
-    ExtensionWorkContext, WorkPriority,
+use crate::{
+    bounded_file::{read_optional_regular_file, read_regular_file, ReadFileOptions},
+    extension_scheduler::{
+        ExtensionScheduler, ExtensionSchedulerHandle, ExtensionWork, ExtensionWorkBatch,
+        ExtensionWorkContext, WorkPriority,
+    },
 };
 use quirl_catalog::{
     ArgumentKind, Catalog, CommandSpec, Effect, MAX_COMPLETION_QUERY_BYTES, MAX_COMPLETION_RESULTS,
@@ -36,7 +39,6 @@ use std::{
     ffi::OsString,
     fs,
     hash::{Hash, Hasher},
-    io::Read,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -2083,8 +2085,7 @@ fn disabled_plugin_names() -> Result<BTreeSet<String>, ShellError> {
     if !path.exists() {
         return Ok(BTreeSet::new());
     }
-    let bytes = read_bounded_plugin_file(&path, MAX_PLUGIN_LOCK_BYTES, "plugin lockfile")
-        .map_err(|error| io_error(&path, error))?;
+    let bytes = read_bounded_plugin_file(&path, MAX_PLUGIN_LOCK_BYTES, "plugin lockfile")?;
     let lock = PluginLockfile::from_json(&bytes).map_err(|error| {
         ShellError::new(ErrorCode::Validation, "managed plugin lockfile is corrupt")
             .with_context(error.to_string())
@@ -2779,7 +2780,7 @@ fn snapshot_managed_plugins(
     {
         Ok(bytes) => bytes,
         Err(error) => {
-            errors.push(io_error(&lock_path, error));
+            errors.push(error);
             return (Vec::new(), PluginFingerprint::Files(fingerprints));
         }
     };
@@ -2862,8 +2863,7 @@ fn managed_plugin_candidate_with_cancellation(
     let manifest_path = managed_manifest_path(&locked.source)?;
     fingerprints.push((manifest_path.clone(), fingerprint_file(&manifest_path)?));
     let manifest_bytes =
-        read_bounded_plugin_file(&manifest_path, MAX_PLUGIN_MANIFEST_BYTES, "plugin manifest")
-            .map_err(|error| io_error(&manifest_path, error))?;
+        read_bounded_plugin_file(&manifest_path, MAX_PLUGIN_MANIFEST_BYTES, "plugin manifest")?;
     let manifest_source = String::from_utf8(manifest_bytes).map_err(|error| {
         ShellError::new(
             ErrorCode::Validation,
@@ -2913,8 +2913,8 @@ fn managed_plugin_candidate_with_cancellation(
         .with_help("Keep the entry inside the package; external symlink targets are rejected"));
     }
     fingerprints.push((entry_path.clone(), fingerprint_file(&entry_path)?));
-    let entry_bytes = read_bounded_plugin_file(&entry_path, MAX_PLUGIN_ENTRY_BYTES, "plugin entry")
-        .map_err(|error| io_error(&entry_path, error))?;
+    let entry_bytes =
+        read_bounded_plugin_file(&entry_path, MAX_PLUGIN_ENTRY_BYTES, "plugin entry")?;
     let report = doctor_plugin(locked, manifest_source.as_bytes(), &entry_bytes);
     if !report.healthy {
         return Err(ShellError::new(
@@ -3014,8 +3014,12 @@ fn legacy_registration_grants() -> Vec<String> {
 }
 
 fn fingerprint_file(path: &Path) -> Result<FileFingerprint, ShellError> {
-    match read_bounded_plugin_file(path, MAX_PLUGIN_LOCK_BYTES, "plugin source") {
-        Ok(contents) => {
+    match read_optional_regular_file(plugin_read_options(
+        path,
+        MAX_PLUGIN_LOCK_BYTES,
+        "plugin source",
+    ))? {
+        Some(contents) => {
             let mut hasher = DefaultHasher::new();
             contents.hash(&mut hasher);
             Ok(FileFingerprint::Contents {
@@ -3023,8 +3027,7 @@ fn fingerprint_file(path: &Path) -> Result<FileFingerprint, ShellError> {
                 hash: hasher.finish(),
             })
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileFingerprint::Missing),
-        Err(error) => Err(io_error(path, error)),
+        None => Ok(FileFingerprint::Missing),
     }
 }
 
@@ -3032,23 +3035,18 @@ fn read_bounded_plugin_file(
     path: &Path,
     limit: usize,
     context: &str,
-) -> Result<Vec<u8>, std::io::Error> {
-    let file = fs::File::open(path)?;
-    let size = file.metadata()?.len();
-    if size > limit as u64 {
-        return Err(std::io::Error::other(format!(
-            "{context} is {size} bytes; limit is {limit} bytes"
-        )));
+) -> Result<Vec<u8>, ShellError> {
+    read_regular_file(plugin_read_options(path, limit, context))
+}
+
+fn plugin_read_options<'a>(path: &'a Path, limit: usize, context: &'a str) -> ReadFileOptions<'a> {
+    ReadFileOptions {
+        path,
+        bytes_max: limit,
+        context,
+        help: "Restore the plugin input as a readable regular file within its byte limit",
+        io_error_code: ErrorCode::Io,
     }
-    let mut bytes = Vec::with_capacity(size as usize);
-    file.take(limit.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(std::io::Error::other(format!(
-            "{context} exceeded its {limit}-byte limit while reading"
-        )));
-    }
-    Ok(bytes)
 }
 
 fn io_error(path: &Path, error: std::io::Error) -> ShellError {

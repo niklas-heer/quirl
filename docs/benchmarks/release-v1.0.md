@@ -1,20 +1,22 @@
 # 0.1.0 exact-candidate performance record
 
 <!-- quirl-release-evidence:v1
-status: current
+status: historical
 measured-candidate-commit: 631d7849a22d04a028cbe90315dd63b8a526b03a
-evidence-documentation-commit: none
+evidence-documentation-commit: 31e9b9b9c6ee8b0b7fdcc8f4ebc7aabbdb006bf8
 artifact-sha256: 6ab5d8c5069956b5b5fe2d0b37b50e7d3c2a287df33a36ae75b88c87f900d8a0
 measured-at: 2026-08-16T21:54:29Z
 measurement-platform-scope: macos-15.7.9-24g830-apple-m2-pro-aarch64-apple-darwin-automated-pty
 -->
 
-> **Current exact-candidate evidence.** This automated measurement record
-> applies to corrected candidate
+> **Historical artifact evidence.** This automated measurement record applies
+> only to corrected candidate
 > `631d7849a22d04a028cbe90315dd63b8a526b03a` and its named artifact. The
-> evidence commit is resolved from `HEAD` by the post-commit semantic
-> attribution validator. The performance gate did not pass, so this record is
-> evidence of the observed candidate rather than a release-readiness claim.
+> evidence documentation commit is
+> `31e9b9b9c6ee8b0b7fdcc8f4ebc7aabbdb006bf8`. Runtime code now postdates that
+> candidate, so none of these measurements is evidence for the current tree.
+> The performance gate also did not pass, so this remains observation rather
+> than a release-readiness claim.
 
 **Measured:** 16 August 2026 at 21:54:29 UTC
 

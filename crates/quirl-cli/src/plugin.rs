@@ -1,3 +1,4 @@
+use crate::bounded_file::{read_optional_regular_file, read_regular_file, ReadFileOptions};
 use clap::{Subcommand, ValueEnum};
 use quirl_core::{
     escape_json_terminal_controls, escape_terminal_controls, ContributionKind, ErrorCode,
@@ -35,6 +36,7 @@ use std::os::unix::{
 const MANIFEST_FILE: &str = "plugin.toml";
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LOCK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum PluginCommand {
@@ -1068,16 +1070,15 @@ fn check_legacy(path: &Path, format: PluginOutputFormat) -> Result<i32, ShellErr
 
 fn load_lock(root: &Path) -> Result<PluginLockfile, ShellError> {
     let path = root.join(PLUGIN_LOCK_FILE);
-    if !path.exists() {
+    let options = plugin_read_options(
+        &path,
+        MAX_LOCK_BYTES,
+        "plugin lockfile",
+        "Repair the lockfile as a readable regular file at or below 4 MiB, or restore its backup",
+    );
+    let Some(bytes) = read_optional_regular_file(options)? else {
         return Ok(PluginLockfile::empty());
-    }
-    let bytes = fs::read(&path).map_err(|error| {
-        io_error(
-            format!("cannot read plugin lockfile {}", path.display()),
-            error,
-            "Repair permissions or restore the lockfile backup",
-        )
-    })?;
+    };
     PluginLockfile::from_json(&bytes)
         .map_err(|error| error.with_context(format!("lockfile: {}", path.display())))
 }
@@ -1232,54 +1233,22 @@ fn read_bounded(
     context: &str,
     help: &str,
 ) -> Result<Vec<u8>, ShellError> {
-    let file = fs::File::open(path).map_err(|error| {
-        io_error(
-            format!("cannot read {context} {}", path.display()),
-            error,
-            help,
-        )
-    })?;
-    let size = file
-        .metadata()
-        .map_err(|error| {
-            io_error(
-                format!("cannot inspect {context} {}", path.display()),
-                error,
-                help,
-            )
-        })?
-        .len();
-    if size > limit as u64 {
-        return Err(resource_limit_error(context, size, limit, help));
-    }
-    let mut bytes = Vec::with_capacity(size as usize);
-    file.take(limit.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            io_error(
-                format!("cannot read {context} {}", path.display()),
-                error,
-                help,
-            )
-        })?;
-    if bytes.len() > limit {
-        return Err(resource_limit_error(
-            context,
-            bytes.len() as u64,
-            limit,
-            help,
-        ));
-    }
-    Ok(bytes)
+    read_regular_file(plugin_read_options(path, limit, context, help))
 }
 
-fn resource_limit_error(context: &str, size: u64, limit: usize, help: &str) -> ShellError {
-    ShellError::new(
-        ErrorCode::ResourceLimit,
-        format!("{context} exceeds its read limit"),
-    )
-    .with_context(format!("bytes: {size}; limit: {limit}"))
-    .with_help(help)
+fn plugin_read_options<'a>(
+    path: &'a Path,
+    limit: usize,
+    context: &'a str,
+    help: &'a str,
+) -> ReadFileOptions<'a> {
+    ReadFileOptions {
+        path,
+        bytes_max: limit,
+        context,
+        help,
+        io_error_code: ErrorCode::Io,
+    }
 }
 
 fn package_escape_error(context: &str) -> ShellError {

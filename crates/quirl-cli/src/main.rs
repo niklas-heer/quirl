@@ -2,6 +2,7 @@
 
 mod agent;
 mod author;
+mod bounded_file;
 mod config;
 mod extension_scheduler;
 mod extensions;

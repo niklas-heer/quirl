@@ -1400,6 +1400,7 @@ name = "quirl-lua"
 version = "0.1.0"
 dependencies = [
  "mlua",
+ "nix 0.30.1",
  "quirl-core",
  "serde",
  "serde_json",

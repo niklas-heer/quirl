@@ -1,3 +1,4 @@
+use crate::bounded_file::{read_regular_file, ReadFileOptions};
 use clap::{ArgAction, Subcommand, ValueEnum};
 use quirl_catalog::{
     import_bash, import_fish, import_help, import_man, import_zsh, Catalog, ImportDiagnostic,
@@ -7,11 +8,12 @@ use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorC
 use serde::Serialize;
 use std::{
     env, fs,
-    io::Read,
     path::{Path, PathBuf},
 };
 
-const DOCUMENTATION_READ_LIMIT: u64 = 1024 * 1024 + 1;
+const INDEX_READ_LIMIT: usize = 4 * 1024 * 1024;
+const COMPLETION_READ_LIMIT: usize = 4 * 1024 * 1024;
+const DOCUMENTATION_READ_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Subcommand)]
 pub enum IndexCommand {
@@ -117,7 +119,7 @@ pub fn load_default_catalog() -> Catalog {
 }
 
 fn load_catalog_at(path: &Path) -> Catalog {
-    match fs::read_to_string(path) {
+    match read_index(path) {
         Ok(source) => decode_catalog(&source, path)
             .map(merge_cached_catalog)
             .unwrap_or_else(|_| Catalog::builtin()),
@@ -228,10 +230,8 @@ fn explain_index(
         ShellError::new(ErrorCode::InvalidArgument, "cannot determine an index path")
             .with_help("Pass `--index <path>` or configure HOME/XDG_CACHE_HOME")
     })?;
-    let source = fs::read_to_string(&path).map_err(|error| {
-        index_io_error("read", &path, error)
-            .with_help("Build the index first with `quirl index build`")
-    })?;
+    let source = read_index(&path)
+        .map_err(|error| error.with_help("Build the index first with `quirl index build`"))?;
     let catalog = decode_catalog(&source, &path)?;
     let explanation = catalog.explain(command).ok_or_else(|| {
         ShellError::new(
@@ -380,22 +380,52 @@ fn default_index_path() -> Option<PathBuf> {
 }
 
 fn read_completion(path: &Path) -> Result<String, ShellError> {
-    fs::read_to_string(path).map_err(|error| index_io_error("read", path, error))
+    read_index_utf8(
+        path,
+        COMPLETION_READ_LIMIT,
+        "completion source",
+        "Supply completion declarations in a readable UTF-8 regular file at or below 4 MiB",
+    )
 }
 
 fn read_documentation(path: &Path) -> Result<String, ShellError> {
-    let file = fs::File::open(path).map_err(|error| index_io_error("read", path, error))?;
-    let mut bytes = Vec::new();
-    file.take(DOCUMENTATION_READ_LIMIT)
-        .read_to_end(&mut bytes)
-        .map_err(|error| index_io_error("read", path, error))?;
+    read_index_utf8(
+        path,
+        DOCUMENTATION_READ_LIMIT,
+        "documentation source",
+        "Supply help or man text in a readable UTF-8 regular file at or below 1 MiB",
+    )
+}
+
+fn read_index(path: &Path) -> Result<String, ShellError> {
+    read_index_utf8(
+        path,
+        INDEX_READ_LIMIT,
+        "completion index",
+        "Build a readable regular index file at or below 4 MiB with `quirl index build`",
+    )
+}
+
+fn read_index_utf8(
+    path: &Path,
+    bytes_max: usize,
+    context: &str,
+    help: &str,
+) -> Result<String, ShellError> {
+    let bytes = read_regular_file(ReadFileOptions {
+        path,
+        bytes_max,
+        context,
+        help,
+        io_error_code: ErrorCode::Io,
+    })?;
     String::from_utf8(bytes).map_err(|error| {
         ShellError::new(
             ErrorCode::Validation,
-            format!("{} is not UTF-8 documentation text", path.display()),
+            format!("{} is not UTF-8 {context} text", path.display()),
         )
         .with_context(error.to_string())
-        .with_help("Supply rendered help or man text encoded as UTF-8")
+        .with_help(help)
     })
 }
 

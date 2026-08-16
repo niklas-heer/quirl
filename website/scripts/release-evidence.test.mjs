@@ -192,7 +192,7 @@ test('historical_record_cannot_use_current_visible_status', () => {
 test('record_identity_rejects_visible_artifact_time_and_platform_mismatches', () => {
   const metadata = parseEvidenceMetadata(header());
   const exactRecord = `${header()}
-> **Historical P14 evidence.**
+> **Historical artifact evidence.**
 **Measured:** 16 August 2026 at 18:51:07 UTC
 **Candidate A:** \`${candidate}\`
 **Artifact SHA-256:**

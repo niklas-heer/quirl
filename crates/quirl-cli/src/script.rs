@@ -1,3 +1,4 @@
+use crate::bounded_file::{read_regular_file, ReadFileOptions};
 use clap::ValueEnum;
 use quirl_core::{
     escape_json_terminal_controls, replace_file_atomically, AtomicReplaceOptions, ErrorCode,
@@ -971,15 +972,15 @@ pub(crate) fn execution_request(
 }
 
 fn read_script_file(path: &Path) -> Result<String, ShellError> {
-    let file = fs::File::open(path).map_err(|error| path_error(path, error))?;
-    let size = file
-        .metadata()
-        .map_err(|error| path_error(path, error))?
-        .len();
-    if size > MAX_LUA_SOURCE_BYTES as u64 {
-        return Err(script_source_limit_error(&path.display().to_string(), size));
-    }
-    read_script_bytes(file, &path.display().to_string())
+    let source_name = path.display().to_string();
+    let bytes = read_regular_file(ReadFileOptions {
+        path,
+        bytes_max: MAX_LUA_SOURCE_BYTES,
+        context: "script source",
+        help: "Pass a readable UTF-8 script in a regular file at or below 4 MiB",
+        io_error_code: ErrorCode::ScriptRead,
+    })?;
+    decode_script_bytes(bytes, &source_name)
 }
 
 fn read_script_stdin() -> Result<String, ShellError> {
@@ -988,8 +989,9 @@ fn read_script_stdin() -> Result<String, ShellError> {
 
 fn read_script_bytes(reader: impl Read, source_name: &str) -> Result<String, ShellError> {
     let mut bytes = Vec::new();
+    let bytes_max_u64 = u64::try_from(MAX_LUA_SOURCE_BYTES).unwrap_or(u64::MAX);
     reader
-        .take(MAX_LUA_SOURCE_BYTES.saturating_add(1) as u64)
+        .take(bytes_max_u64.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| {
             ShellError::new(
@@ -1000,8 +1002,13 @@ fn read_script_bytes(reader: impl Read, source_name: &str) -> Result<String, She
             .with_help("Check the script source and read permissions")
         })?;
     if bytes.len() > MAX_LUA_SOURCE_BYTES {
-        return Err(script_source_limit_error(source_name, bytes.len() as u64));
+        let observed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        return Err(script_source_limit_error(source_name, observed));
     }
+    decode_script_bytes(bytes, source_name)
+}
+
+fn decode_script_bytes(bytes: Vec<u8>, source_name: &str) -> Result<String, ShellError> {
     String::from_utf8(bytes).map_err(|error| {
         ShellError::new(
             ErrorCode::ScriptRead,

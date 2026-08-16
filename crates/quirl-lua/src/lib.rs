@@ -17,7 +17,7 @@ use quirl_core::{
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs,
+    fs::{self, OpenOptions},
     io::Read,
     path::Path,
     sync::{
@@ -5019,20 +5019,33 @@ fn read_source(path: &Path) -> Result<String, ShellError> {
 }
 
 fn read_source_bounded(path: &Path) -> Result<String, ShellError> {
-    let file = fs::File::open(path).map_err(|error| script_read_error(path, error))?;
-    let size = file
+    let bytes_max_u64 = u64::try_from(MAX_LUA_SOURCE_BYTES).unwrap_or(u64::MAX);
+    let file = match open_source_nonblocking(path) {
+        Ok(file) => file,
+        Err(error) if open_error_identifies_special_file(&error) => {
+            return Err(nonregular_source_error(path).with_context(error.to_string()));
+        }
+        Err(error) => return Err(script_read_error(path, error)),
+    };
+    let metadata = file
         .metadata()
-        .map_err(|error| script_read_error(path, error))?
-        .len();
-    if size > MAX_LUA_SOURCE_BYTES as u64 {
-        return Err(lua_source_limit_error(path, size));
+        .map_err(|error| script_read_error(path, error))?;
+    if !metadata.file_type().is_file() {
+        return Err(nonregular_source_error(path));
     }
-    let mut bytes = Vec::with_capacity(size as usize);
-    file.take(MAX_LUA_SOURCE_BYTES.saturating_add(1) as u64)
+    if metadata.len() > bytes_max_u64 {
+        return Err(lua_source_limit_error(path, metadata.len(), false));
+    }
+    let capacity = usize::try_from(metadata.len())
+        .unwrap_or(MAX_LUA_SOURCE_BYTES)
+        .min(MAX_LUA_SOURCE_BYTES);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(bytes_max_u64.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| script_read_error(path, error))?;
     if bytes.len() > MAX_LUA_SOURCE_BYTES {
-        return Err(lua_source_limit_error(path, bytes.len() as u64));
+        let observed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        return Err(lua_source_limit_error(path, observed, true));
     }
     String::from_utf8(bytes).map_err(|error| {
         ShellError::new(
@@ -5044,18 +5057,63 @@ fn read_source_bounded(path: &Path) -> Result<String, ShellError> {
     })
 }
 
-fn lua_source_limit_error(path: &Path, size: u64) -> ShellError {
+fn open_source_nonblocking(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+fn nonregular_source_error(path: &Path) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        format!("Lua source {} is not a regular file", path.display()),
+    )
+    .with_context("directories, FIFOs, sockets, and device nodes are rejected")
+    .with_help("Pass executable Lua source in a bounded regular file")
+}
+
+#[cfg(unix)]
+fn open_error_identifies_special_file(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == nix::libc::EOPNOTSUPP
+                || code == nix::libc::ENXIO
+                || code == nix::libc::ENODEV
+    )
+}
+
+#[cfg(not(unix))]
+fn open_error_identifies_special_file(_error: &std::io::Error) -> bool {
+    false
+}
+
+fn lua_source_limit_error(path: &Path, observed: u64, is_lower_bound: bool) -> ShellError {
+    let observed = if is_lower_bound {
+        format!("at least {observed}")
+    } else {
+        observed.to_string()
+    };
     ShellError::new(
         ErrorCode::ResourceLimit,
         format!("Lua source {} exceeds its read limit", path.display()),
     )
-    .with_context(format!("bytes: {size}; limit: {MAX_LUA_SOURCE_BYTES}"))
+    .with_context(format!(
+        "limit: {MAX_LUA_SOURCE_BYTES}; observed: {observed}"
+    ))
     .with_help("Keep executable Lua source below 4 MiB and load data through bounded host APIs")
 }
 
 fn validate_source_length(source: &str, path: &Path) -> Result<(), ShellError> {
     if source.len() > MAX_LUA_SOURCE_BYTES {
-        Err(lua_source_limit_error(path, source.len() as u64))
+        let observed = u64::try_from(source.len()).unwrap_or(u64::MAX);
+        Err(lua_source_limit_error(path, observed, false))
     } else {
         Ok(())
     }
@@ -5156,6 +5214,25 @@ fn validation_error(source: &str, message: impl Into<String>) -> ShellError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+    static TEST_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestFile(std::path::PathBuf);
+
+    impl Drop for TestFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn test_file_path(label: &str) -> TestFile {
+        TestFile(std::env::temp_dir().join(format!(
+            "quirl-lua-{label}-{}-{}",
+            std::process::id(),
+            TEST_FILE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
+        )))
+    }
 
     fn runner_context(
         runtime: &LuaRuntime,
@@ -5758,6 +5835,44 @@ mod tests {
         let error = LuaRuntime::check_source(&source, "oversized.lua").unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert!(error.details.context[0].contains("limit"));
+    }
+
+    #[test]
+    fn source_file_reader_accepts_exact_limit_and_rejects_limit_plus_one() {
+        let path = test_file_path("source-limit.lua");
+        fs::write(&path.0, vec![b' '; MAX_LUA_SOURCE_BYTES]).unwrap();
+        assert_eq!(
+            read_source_bounded(&path.0).unwrap().len(),
+            MAX_LUA_SOURCE_BYTES
+        );
+
+        fs::write(&path.0, vec![b' '; MAX_LUA_SOURCE_BYTES + 1]).unwrap();
+        let error = read_source_bounded(&path.0).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("limit:"));
+        assert!(error.details.context[0].contains("observed:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_file_reader_rejects_fifo_without_blocking() {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+        use std::{sync::mpsc, time::Duration};
+
+        let path = test_file_path("source-fifo.lua");
+        mkfifo(&path.0, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let worker_path = path.0.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = sender.send(read_source_bounded(&worker_path));
+        });
+        let error = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Lua FIFO admission must not block")
+            .unwrap_err();
+        worker.join().unwrap();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("not a regular file"));
     }
 
     #[test]

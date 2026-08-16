@@ -6,7 +6,8 @@ Result: release readiness remains blocked; canonical automated evidence
 attribution and outstanding human requirements follow below
 
 <!-- BEGIN QUIRL RELEASE EVIDENCE STATUS -->
-> **Release evidence status — current.** The record for measured candidate `631d7849a22d04a028cbe90315dd63b8a526b03a` and artifact `6ab5d8c5069956b5b5fe2d0b37b50e7d3c2a287df33a36ae75b88c87f900d8a0` is current exact-candidate evidence.
+> **Release evidence status — historical.** Artifact evidence for measured candidate `631d7849a22d04a028cbe90315dd63b8a526b03a` and artifact `6ab5d8c5069956b5b5fe2d0b37b50e7d3c2a287df33a36ae75b88c87f900d8a0` is historical.
+> Evidence commit `31e9b9b9c6ee8b0b7fdcc8f4ebc7aabbdb006bf8` documents that measurement. It is not evidence for the corrected implementation, which has no fresh exact-candidate measurement.
 > Human review on named Linux and macOS terminals, remote-PTY review, and real-terminal demo review remain incomplete.
 <!-- END QUIRL RELEASE EVIDENCE STATUS -->
 
@@ -23,6 +24,24 @@ as untrusted inputs. It covers denial of service, capability escalation, path
 escape, terminal-control injection, cancellation, and text-only operation. It
 does not claim that a trusted local plugin is isolated from the Quirl process;
 that is deliberately not the `trusted_lua` contract.
+
+### Filesystem admission failure model
+
+User-selected paths can name FIFOs, sockets, devices, symlinks, or entries that
+are replaced between namespace inspection and opening. Filesystem readers in
+the audited product surface therefore admit input from metadata on the exact
+opened handle, never from a prior path-metadata check. Unix opens are
+nonblocking until that handle is proven to be a regular file; no extension or
+script callback runs during admission. Readers reject every non-regular handle
+with a structured validation error, retain at most the configured byte limit
+plus one sentinel byte, and report limit violations as `ResourceLimit` with the
+configured and observed byte counts. The handle is RAII-owned through every
+error path, so failed admission and partial reads require no separate cleanup.
+
+This design does not add an unsafe platform boundary. Windows keeps the safe
+standard-library open path and applies the same exact-handle regular-file and
+limit checks after open; native Windows terminal and special-device behavior
+remains within ADR 0010's best-effort evidence scope.
 
 Linux and macOS are the supported interactive platforms. Windows evidence in
 this audit covers cross-compilation and portable contract behavior only; it is
@@ -45,12 +64,12 @@ the release checklist's named terminal or Linux signoffs.
 | Boundary | Enforced v0.1 property | Adversarial evidence |
 | --- | --- | --- |
 | Lua VM | Restricted standard library; typed deny-unknown registrations; exact grants; memory, instruction, callback, wall-time, and cancellation budgets | `quirl-lua` tests for unavailable modules, unknown fields, scoped process grants, deadlines, cancellation recovery, return shapes, and oversized source |
-| Script input | File and stdin source is UTF-8 and at most 4 MiB before parsing or Lua compilation | `oversized_source_is_rejected_before_lua_compilation`; `script_reader_rejects_source_beyond_the_runtime_limit` |
-| Plugin package | Manifest is at most 256 KiB; entry is at most 4 MiB; lexical parent traversal, absolute paths, and canonical symlink escapes are rejected; trusted Lua executes the verified bytes, and Unix process adapters launch a private staged snapshot of those bytes | `plugin_entry_symlink_cannot_escape_package_directory`; `managed_activation_rejects_checksum_matching_entry_symlink_escape`; `managed_activation_executes_the_exact_bytes_that_passed_integrity_verification`; `isolated_adapter_executes_the_verified_snapshot_after_package_replacement`; oversized manifest/entry tests |
+| Script input | Regular-file source and stdin source is UTF-8 and at most 4 MiB before parsing or Lua compilation; Unix special-file admission cannot block | `source_file_reader_rejects_fifo_without_blocking`; `source_file_reader_accepts_exact_limit_and_rejects_limit_plus_one`; `oversized_source_is_rejected_before_lua_compilation`; `script_reader_rejects_source_beyond_the_runtime_limit` |
+| Plugin package | Manifest, entry, and lock inputs must be regular files; manifest is at most 256 KiB and entry/lock inputs are at most 4 MiB; lexical parent traversal, absolute paths, and canonical symlink escapes are rejected; trusted Lua executes the verified bytes, and Unix process adapters launch a private staged snapshot of those bytes | filesystem admission FIFO/growth/path-replacement tests; `plugin_entry_symlink_cannot_escape_package_directory`; `managed_activation_rejects_checksum_matching_entry_symlink_escape`; `managed_activation_executes_the_exact_bytes_that_passed_integrity_verification`; `isolated_adapter_executes_the_verified_snapshot_after_package_replacement`; oversized manifest/entry tests |
 | Plugin capability boundary | Requested/granted capabilities are sorted, validated, locked, and checked again at each Lua host callback; scoped process grants reject shell operators and control characters | plugin manifest/lock capability tests and `scoped_process_capability_cannot_smuggle_shell_syntax` |
 | Native/reference process | Unix process groups and Windows Job Objects contain normal child lifecycles; interactive native output streams directly to the terminal; programmatic native capture retains at most 1 MiB per stream and drains excess with exact discard accounting; Bash/Zsh reference capture retains 64 KiB per stream | `quirl-process` backend contract/job, interactive streaming, and bounded-capture tests plus script reference-runner bounded capture/cancellation tests |
 | Recovery | Snapshot capture is truncated before persistence; reads and files are bounded; count/byte retention is enforced; environment/argument secrets, authorization headers, credentialed URLs, and high-confidence token shapes are redacted; text display neutralizes ANSI, OSC, C1, CR, and BEL; symlink escapes are rejected | recovery atomic/bounds/structured-redaction, ANSI/OSC, retention, oversized-read, ID traversal, and symlink tests |
-| Events and live views | Typed deny-unknown event documents, strictly increasing sequences, action capability validation, callback deadlines, 4 MiB trace input, bounded live buffers, and cooperative cancellation | core event/action tests, event trace bound/order tests, UI live-buffer cancellation test |
+| Events and live views | Typed deny-unknown event documents, strictly increasing sequences, action capability validation, callback deadlines, regular-file-only 4 MiB trace input, bounded live buffers, and cooperative cancellation | core event/action tests, event trace bound/order tests, filesystem admission FIFO liveness test, UI live-buffer cancellation test |
 | Picker input | Standard input is UTF-8, at most 4 MiB, and at most 20,000 newline-delimited values before fuzzy selection | `picker_stdin_rejects_oversized_input_and_item_counts_before_selection` |
 | Terminal output | Untrusted diagnostic, catalog, completion, plugin, picker, rich-frame, agent, index, package, config, authoring documentation, recovery, and JSON text cannot emit active control bytes; JSON escaping preserves parsed values | core terminal escaping tests, picker C0/C1 test, author stdout C0/C1 test, Ratatui hostile editor/completion buffer test, UI hostile-error test, recovery ANSI/OSC test |
 | Accessibility | `auto` selects Ratatui only for a capable TTY; `simple`, non-TTY stderr, `TERM=dumb`, or height below five rows selects Reedline; `NO_COLOR` retains rich layout without color; dumb or non-UTF-8 terminals use ASCII automatically; patched-font glyphs require explicit opt-in; mode/editor state is textual; panels require a plain fallback; noninteractive structured output has no decoration | `explicit_simple_surface_always_degrades`; rich frame/status buffer tests; `terminal_styles_require_an_interactive_color_capable_terminal`; `auto_symbols_only_use_unicode_for_a_unicode_locale`; prompt injection/profile tests; panel fallback/control tests; manual capability checks below |
