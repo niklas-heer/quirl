@@ -16,6 +16,13 @@ pub use runtime::{
     PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
 };
 
+/// One-shot rich-session loader that returns the complete immutable catalog.
+///
+/// The rich surface invokes this only after its first frame has been flushed
+/// and before terminal input is polled. An error leaves terminal restoration to
+/// the surface's existing RAII guard and is returned unchanged.
+pub type CatalogLoader = Box<dyn FnOnce() -> Result<Arc<Catalog>, ShellError>>;
+
 use self::{
     completion::CompletionState,
     editor::{EditAction, EditorState},
@@ -89,7 +96,8 @@ pub enum InteractiveSignal {
 /// Completion and prompt-analysis queues retain at most one pending generation,
 /// preventing stale work from repainting newer input.
 pub struct RichSurface {
-    catalog: Arc<Catalog>,
+    catalog: Option<Arc<Catalog>>,
+    catalog_loader: Option<CatalogLoader>,
     completion: CompletionState,
     picker: PickerOverlay,
     picker_layout: PickerLayout,
@@ -137,7 +145,8 @@ impl RichSurface {
             picker_layout: PickerLayout::from_config(&config.picker.layout),
             picker_preview: config.picker.preview,
             expand_completion_pending: false,
-            catalog,
+            catalog: Some(catalog),
+            catalog_loader: None,
             keymap: config.editor.keymap.clone(),
             history_path,
             history,
@@ -155,6 +164,74 @@ impl RichSurface {
             theme,
             runtime: RuntimeSurfaceState::new(),
         })
+    }
+
+    /// Construct a rich surface whose complete catalog is admitted after the
+    /// first successful terminal flush and before the first input poll.
+    ///
+    /// Configuration, theme, keymap, history, picker policy, and terminal
+    /// acquisition remain eager. The loader is consumed exactly once. Its
+    /// returned [`Arc<Catalog>`] is published as one complete generation to
+    /// analysis, completion, picker/help, and the composition root.
+    pub fn new_deferred(
+        catalog_loader: CatalogLoader,
+        extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
+        picker_ranker: Arc<dyn PickerRanker>,
+        config: &QuirlConfig,
+        history_path: PathBuf,
+    ) -> Result<Self, ShellError> {
+        let history = read_history(&history_path).unwrap_or_default();
+        let theme = Theme::from_config(config, true)?;
+        Ok(Self {
+            catalog: None,
+            catalog_loader: Some(catalog_loader),
+            completion: CompletionState::unpublished(extension_completer),
+            picker: PickerOverlay::new(picker_ranker),
+            picker_layout: PickerLayout::from_config(&config.picker.layout),
+            picker_preview: config.picker.preview,
+            expand_completion_pending: false,
+            keymap: config.editor.keymap.clone(),
+            history_path,
+            history,
+            terminal: SurfaceTerminal::default(),
+            draw_times: VecDeque::with_capacity(TIMING_WINDOW),
+            input_analysis: InputAnalyzer::unpublished(),
+            show_timings: env::var("QUIRL_UI_TIMINGS").is_ok_and(|value| value == "1"),
+            hints: config.ui.statusline.hints,
+            transient: config.prompt.transient,
+            completion_auto: config.completion.auto,
+            completion_min_chars: usize::from(config.completion.min_chars),
+            semantic_hints: config.editor.semantic_hints,
+            help_active: false,
+            help_detail_scroll: 0,
+            theme,
+            runtime: RuntimeSurfaceState::new(),
+        })
+    }
+
+    /// Return the complete catalog after deferred admission has succeeded.
+    pub fn published_catalog(&self) -> Option<Arc<Catalog>> {
+        self.catalog.as_ref().map(Arc::clone)
+    }
+
+    fn admit_catalog(&mut self) -> Result<(), ShellError> {
+        if self.catalog.is_some() {
+            return Ok(());
+        }
+        let loader = self.catalog_loader.take().ok_or_else(|| {
+            ShellError::new(ErrorCode::Io, "interactive catalog loader is unavailable")
+                .with_help("Restart Quirl to create a fresh interactive session")
+        })?;
+        let catalog = loader()?;
+
+        // Failure model: the terminal is already raw and owns an inline
+        // viewport. No input observer runs during this transaction. Publish
+        // clones to every consumer first, then expose the catalog slot last so
+        // no reachable state can observe a partial generation.
+        self.completion.publish_catalog(Arc::clone(&catalog));
+        self.input_analysis.publish_catalog(Arc::clone(&catalog));
+        self.catalog = Some(catalog);
+        Ok(())
     }
 
     /// Replace the bounded immutable job and typed-result sources for the next frame.
@@ -193,7 +270,7 @@ impl RichSurface {
         loop {
             if dirty {
                 let (_, terminal_height) = terminal::size().unwrap_or((80, 24));
-                if self.semantic_hints {
+                if self.semantic_hints && self.catalog.is_some() {
                     self.input_analysis
                         .ensure(editor.revision(), editor.buffer(), prompt.mode);
                 }
@@ -237,7 +314,12 @@ impl RichSurface {
                 self.terminal.ensure_height(height)?;
                 let started = Instant::now();
                 self.terminal.draw(&model)?;
-                self.record_draw(started.elapsed());
+                let draw_elapsed = started.elapsed();
+                // Ratatui flushes the backend before `draw` returns. Catalog
+                // admission is deliberately the next effect: terminal input
+                // remains queued until this complete generation is published.
+                self.admit_catalog()?;
+                self.record_draw(draw_elapsed);
                 dirty = false;
             }
 
@@ -494,16 +576,21 @@ impl RichSurface {
         let items = match kind {
             editor::PickerKind::Jobs => self.runtime.job_items(line.len()),
             editor::PickerKind::Data => self.runtime.data_items(line.len()),
-            _ => overlay::items(kind, &self.catalog, &self.history, line, cursor),
+            _ => self.catalog.as_deref().map_or_else(Vec::new, |catalog| {
+                overlay::items(kind, catalog, &self.history, line, cursor)
+            }),
         };
         self.open_picker_items(items, label, expanded);
     }
 
     fn open_context_help(&mut self, line: &str, cursor: usize) {
-        let query = contextual_help_query(&self.catalog, line, cursor);
+        let Some(catalog) = self.catalog.as_deref() else {
+            return;
+        };
+        let query = contextual_help_query(catalog, line, cursor);
         let items = overlay::items(
             editor::PickerKind::Palette,
-            &self.catalog,
+            catalog,
             &self.history,
             line,
             cursor,
@@ -916,6 +1003,7 @@ fn timing_p95(samples: &VecDeque<Duration>) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn incomplete_quotes_continue_instead_of_executing() {
@@ -975,5 +1063,91 @@ mod tests {
 
         assert!(terminal.finish_release(None).is_ok());
         assert!(!terminal.active);
+    }
+
+    #[test]
+    fn deferred_catalog_publishes_one_complete_arc_exactly_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let loader_calls = Arc::clone(&calls);
+        let expected = Arc::new(Catalog::builtin());
+        let loader_catalog = Arc::clone(&expected);
+        let mut surface = RichSurface::new_deferred(
+            Box::new(move || {
+                loader_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(loader_catalog)
+            }),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+
+        assert!(surface.published_catalog().is_none());
+        surface.admit_catalog().unwrap();
+        surface.admit_catalog().unwrap();
+
+        let published = surface.published_catalog().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(Arc::ptr_eq(&expected, &published));
+        assert!(Arc::ptr_eq(
+            &published,
+            surface.completion.published_catalog().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &published,
+            surface.input_analysis.published_catalog().unwrap()
+        ));
+        assert!(published.find("quirl run").is_some());
+    }
+
+    #[test]
+    fn deferred_catalog_failure_preserves_the_original_error() {
+        let expected = ShellError::new(ErrorCode::Validation, "catalog fixture is corrupt")
+            .with_context("observed fixture bytes: 9")
+            .with_help("Rebuild the fixture");
+        let mut surface = RichSurface::new_deferred(
+            Box::new(move || Err(expected)),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+
+        let error = surface.admit_catalog().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert_eq!(error.message, "catalog fixture is corrupt");
+        assert_eq!(error.details.context, ["observed fixture bytes: 9"]);
+        assert_eq!(error.details.help, ["Rebuild the fixture"]);
+        assert!(surface.published_catalog().is_none());
+    }
+
+    #[test]
+    fn deferred_surface_applies_theme_and_keymap_before_catalog_admission() {
+        let mut config = QuirlConfig::default();
+        config.editor.keymap = "vim".to_owned();
+        config.ui.theme = "first-frame".to_owned();
+        config.ui.themes.insert(
+            "first-frame".to_owned(),
+            quirl_lua::builtin_theme("dracula").unwrap(),
+        );
+        let expected_theme = Theme::from_config(&config, true).unwrap();
+        let surface = RichSurface::new_deferred(
+            Box::new(|| Ok(Arc::new(Catalog::builtin()))),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+
+        assert_eq!(surface.keymap, "vim");
+        assert_eq!(
+            EditorState::new(&surface.keymap, Vec::new()).mode(),
+            editor::EditorMode::VimInsert
+        );
+        assert_eq!(surface.theme, expected_theme);
+        assert!(surface.published_catalog().is_none());
     }
 }

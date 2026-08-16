@@ -616,6 +616,9 @@ mod tests {
 
     #[test]
     fn corrupt_or_incompatible_default_cache_recovers_to_current_builtins() {
+        let missing = load_catalog_at(Path::new("/definitely/missing/quirl-index.json"));
+        assert!(missing.find("quirl run").is_some());
+
         let corrupt = load_catalog_at(Path::new("/dev/null"));
         assert!(corrupt.find("quirl run").is_some());
 
@@ -625,6 +628,19 @@ mod tests {
         incompatible.schema_version += 1;
         fs::write(&path, serde_json::to_string(&incompatible).unwrap()).unwrap();
         let recovered = load_catalog_at(&path);
+        assert_eq!(recovered.schema_version, Catalog::builtin().schema_version);
+        assert!(recovered.find("quirl agent manifest").is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn oversized_default_cache_falls_back_without_parsing_past_the_bound() {
+        let directory = temporary_directory();
+        let path = directory.join("oversized-catalog.json");
+        fs::write(&path, vec![b' '; INDEX_READ_LIMIT + 1]).unwrap();
+
+        let recovered = load_catalog_at(&path);
+
         assert_eq!(recovered.schema_version, Catalog::builtin().schema_version);
         assert!(recovered.find("quirl agent manifest").is_some());
         fs::remove_dir_all(directory).unwrap();

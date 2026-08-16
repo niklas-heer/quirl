@@ -48,11 +48,11 @@ use quirl_process::{sandboxed_process_host, JobStatus, NativeExecutor, DEFAULT_C
 use quirl_syntax::{classify, InteractiveLine, Mode};
 use quirl_ui::{
     editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
-    terminal_supports_unicode, terminal_width, InteractiveDataSnapshot, InteractiveJobAction,
-    InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
-    InteractiveRuntimeSnapshot, InteractiveSignal, PickerItem, PickerItemKind, PickerMatch,
-    PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind, DATA_ITEMS_MAX,
-    DATA_RETAINED_BYTES_MAX, MODE_TOGGLE_HOST_COMMAND,
+    terminal_supports_unicode, terminal_width, CatalogLoader, InteractiveDataSnapshot,
+    InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch,
+    InteractivePanelProvider, InteractiveRuntimeSnapshot, InteractiveSignal, PickerItem,
+    PickerItemKind, PickerMatch, PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface,
+    SurfaceKind, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, MODE_TOGGLE_HOST_COMMAND,
 };
 use recovery::RecoveryCommand;
 use script::ScriptLanguage;
@@ -431,8 +431,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
         None if !io::stdin().is_terminal() => run_stdin(),
         None => {
             let host = LuaExtensionHost::discover();
-            let catalog = load_composed_catalog()?;
-            repl(catalog, Arc::new(Mutex::new(host)))
+            repl(Arc::new(Mutex::new(host)))
         }
     }
 }
@@ -441,6 +440,49 @@ fn load_composed_catalog() -> Result<Catalog, ShellError> {
     let mut catalog = index::load_default_catalog();
     merge_installed_catalog_snapshot(&mut catalog)?;
     Ok(catalog)
+}
+
+fn load_rich_catalog() -> Result<Arc<Catalog>, ShellError> {
+    #[cfg(debug_assertions)]
+    catalog_admission_test_hook()?;
+    load_composed_catalog().map(Arc::new)
+}
+
+#[cfg(debug_assertions)]
+fn catalog_admission_test_hook() -> Result<(), ShellError> {
+    const TEST_GATE_TIMEOUT: Duration = Duration::from_secs(5);
+    if let Some(gate) = std::env::var_os("QUIRL_TEST_CATALOG_GATE") {
+        let gate = PathBuf::from(gate);
+        let reached = PathBuf::from(format!("{}.reached", gate.display()));
+        std::fs::write(&reached, b"first frame flushed").map_err(|error| {
+            ShellError::new(ErrorCode::Io, "could not publish catalog test gate marker")
+                .with_context(error.to_string())
+                .with_help("Use a writable QUIRL_TEST_CATALOG_GATE path")
+        })?;
+        let started = Instant::now();
+        while !gate.exists() {
+            if started.elapsed() >= TEST_GATE_TIMEOUT {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "catalog test gate exceeded its bounded wait",
+                )
+                .with_context(format!(
+                    "limit: {} ms; observed: at least {} ms",
+                    TEST_GATE_TIMEOUT.as_millis(),
+                    started.elapsed().as_millis()
+                ))
+                .with_help("Release the test gate before its five-second deadline"));
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    if std::env::var_os("QUIRL_TEST_CATALOG_FAILURE").is_some() {
+        return Err(
+            ShellError::new(ErrorCode::Validation, "injected catalog admission failure")
+                .with_help("Remove QUIRL_TEST_CATALOG_FAILURE outside restoration tests"),
+        );
+    }
+    Ok(())
 }
 
 fn extension_completion(suggestion: quirl_ui::ExtensionSuggestion) -> Completion {
@@ -1548,8 +1590,7 @@ fn interactive_job_snapshots(jobs: &[quirl_process::JobState]) -> Vec<Interactiv
         .collect()
 }
 
-fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
-    let catalog = Arc::new(catalog);
+fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     let runtime_extensions_present = extensions
         .lock()
         .map(|extensions| extensions.has_runtime_extensions())
@@ -1568,8 +1609,8 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
         (config, host.config_revision())
     };
     let history_path = history_path()?;
-    let mut line_editor =
-        configured_editor(&catalog, &extensions, active_config.clone(), &history_path)?;
+    let (mut line_editor, mut catalog) =
+        configured_initial_editor(&extensions, active_config.clone(), &history_path)?;
     print_banner(&active_config);
     let mut mode = Mode::Command;
     let mut executor = NativeExecutor::default();
@@ -1612,9 +1653,10 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
         let (extension_segments, next_config) = extensions
             .lock()
             .map(|mut extensions| {
-                // `active_config` and catalog composition already loaded and
-                // fingerprinted the first generation. Avoid repeating its
-                // bounded filesystem snapshot before the first paint.
+                // `active_config` already loaded and fingerprinted the first
+                // extension generation. Rich catalog admission happens inside
+                // the first editor session after its initial flush, so avoid a
+                // second bounded extension snapshot before that first paint.
                 if !first_prompt {
                     extensions.reload_if_changed();
                 }
@@ -1638,8 +1680,19 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
             if config != active_config {
                 sync_history(&mut line_editor, &history_path)?;
                 active_config = config;
-                line_editor =
-                    configured_editor(&catalog, &extensions, active_config.clone(), &history_path)?;
+                let published_catalog = catalog.as_ref().ok_or_else(|| {
+                    ShellError::new(
+                        ErrorCode::Io,
+                        "interactive catalog was not published before reconfiguration",
+                    )
+                    .with_help("Restart Quirl to create a fresh interactive session")
+                })?;
+                line_editor = configured_editor(
+                    published_catalog,
+                    &extensions,
+                    active_config.clone(),
+                    &history_path,
+                )?;
             }
         }
         print_extension_errors(&extensions);
@@ -1672,6 +1725,9 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
             data: data_cache.snapshot(),
         });
         let signal = line_editor.read_line(&prompt);
+        if signal.is_ok() && catalog.is_none() {
+            catalog = line_editor.published_catalog();
+        }
         first_prompt = false;
         if prompt_context.is_none() {
             let scheduler = PromptContextScheduler::default();
@@ -1695,7 +1751,16 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
                         mode = mode.toggled();
                         print_mode_feedback(mode, &active_config);
                     }
-                    InteractiveLine::Help(topic) => print_help(catalog.as_ref(), topic),
+                    InteractiveLine::Help(topic) => {
+                        let published_catalog = catalog.as_deref().ok_or_else(|| {
+                            ShellError::new(
+                                ErrorCode::Io,
+                                "interactive catalog publication is incomplete",
+                            )
+                            .with_help("Restart Quirl before requesting help again")
+                        })?;
+                        print_help(published_catalog, topic);
+                    }
                     InteractiveLine::Command(command) => {
                         let started = Instant::now();
                         let journal = recovery_journal(&mut recovery)?;
@@ -1874,12 +1939,7 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
             }
             Ok(InteractiveSignal::Suspend) => suspend_self()?,
             Ok(_) => {}
-            Err(error) => {
-                return Err(
-                    ShellError::new(ErrorCode::Io, "the interactive editor failed")
-                        .with_context(error.to_string()),
-                );
-            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -2233,6 +2293,40 @@ impl SessionEditor {
             editor.install_runtime_snapshot(snapshot);
         }
     }
+
+    fn published_catalog(&self) -> Option<Arc<Catalog>> {
+        match self {
+            Self::Rich(editor) => editor.published_catalog(),
+            Self::Simple(_) => None,
+        }
+    }
+}
+
+fn configured_initial_editor(
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+    config: QuirlConfig,
+    history_path: &Path,
+) -> Result<(SessionEditor, Option<Arc<Catalog>>), ShellError> {
+    if select_surface(&config.ui.surface) == SurfaceKind::Rich {
+        let completion_adapter = LuaCompletionAdapter::new(Arc::clone(extensions));
+        let picker_ranker: Arc<dyn PickerRanker> = Arc::new(SharedPickerRanker);
+        let loader: CatalogLoader = Box::new(load_rich_catalog);
+        let mut editor = RichSurface::new_deferred(
+            loader,
+            Some(Box::new(completion_adapter)),
+            picker_ranker,
+            &config,
+            history_path.to_path_buf(),
+        )?;
+        editor.set_panel_provider(Box::new(CachedPanelAdapter::new(Arc::clone(extensions))));
+        return Ok((SessionEditor::Rich(Box::new(editor)), None));
+    }
+
+    // The simple/degraded editor requires its catalog during construction and
+    // remains intentionally eager; only the rich first-frame path is deferred.
+    let catalog = Arc::new(load_composed_catalog()?);
+    let editor = configured_editor(&catalog, extensions, config, history_path)?;
+    Ok((editor, Some(catalog)))
 }
 
 fn configured_editor(

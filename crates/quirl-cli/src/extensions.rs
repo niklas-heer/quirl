@@ -2073,7 +2073,13 @@ fn installed_plugin_commands_from_root(root: &Path) -> Result<Vec<CommandSpec>, 
             MAX_HOST_MANAGED_COMMANDS,
         ));
     }
-    validate_catalog_contribution(&Catalog::builtin(), &commands)?;
+    // An empty snapshot has no metadata or collision semantics to validate.
+    // Skipping it avoids constructing a second builtin catalog during the
+    // common no-installed-plugin startup path; the composed catalog owner also
+    // validates the complete contribution immediately before merging it.
+    if !commands.is_empty() {
+        validate_catalog_contribution(&Catalog::builtin(), &commands)?;
+    }
     Ok(commands)
 }
 
@@ -3630,7 +3636,7 @@ error_codes = { "0" = "success" }
     }
 
     #[test]
-    fn installed_command_snapshot_is_nonexecuting_and_typed_dispatch_uses_the_scheduler() {
+    fn installed_commands_reach_first_completion_help_and_typed_dispatch() {
         let directory = temporary_extension_directory();
         let root = directory.join("managed-state");
         let (_manifest, lock) = write_managed_prompt_plugin(&directory);
@@ -3646,6 +3652,9 @@ error_codes = { "0" = "success" }
             .complete("managed r", "managed r".len())
             .iter()
             .any(|completion| completion.value == "managed run"));
+        let first_help = catalog.find("managed run").unwrap();
+        assert_eq!(first_help.signature, "managed run");
+        assert_eq!(first_help.summary, "Run managed");
         let agent_catalog = crate::agent::installed_agent_catalog(&catalog).unwrap();
         let exported = agent_catalog
             .commands
@@ -3992,6 +4001,38 @@ error_codes = { "0" = "success" }
             .handle()
             .wait_generation_idle(host_guard.revision, Duration::from_secs(1)));
         drop(host_guard);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn empty_installed_command_snapshot_has_no_catalog_semantics() {
+        let directory = temporary_extension_directory();
+        let root = directory.join("managed-state");
+
+        assert!(installed_plugin_commands_from_root(&root)
+            .unwrap()
+            .is_empty());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn tampered_installed_lock_fails_closed_before_catalog_publication() {
+        let directory = temporary_extension_directory();
+        let root = directory.join("managed-state");
+        let (_manifest, mut lock) = write_managed_prompt_plugin(&directory);
+        lock.schema_hash = "tampered".to_owned();
+        write_managed_lock(&root, &lock);
+
+        let error = installed_plugin_commands_from_root(&root).unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert_eq!(error.message, "managed plugin lockfile is corrupt");
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("installed plugin catalog snapshot")));
         fs::remove_dir_all(directory).unwrap();
     }
 

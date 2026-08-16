@@ -540,7 +540,7 @@ Budgets (restating §12 as per-component obligations):
 | Keystroke → frame flushed | ≤8 ms P95 | event loop; one draw per batch |
 | Lex + resolve + style | ≤8 ms P95 | §6 cache |
 | First prompt paint | ≤21 ms P95 | context row paints with cached/stale segments; scheduler fills in |
-| Cold start → editable | ≤25 ms P50 | no catalog/`$PATH` warmup on the critical path |
+| Cold start → editable | ≤25 ms P50 | rich catalog admission follows the first flush and completes before input polling; `$PATH` warmup remains lazy |
 | Completion: local results visible | ≤8 ms | catalog worker publishes independently; extensions merge later |
 | Memory | virtualized/bounded popup and picker; one revision-cached span vector; 64 KiB editor; bounded undo/history | |
 
@@ -727,6 +727,16 @@ The integration maintains these invariants:
   cursor visibility, bracketed-paste state, and the inline viewport on explicit
   return and again best-effort from `Drop`. The original write error wins over
   cleanup errors.
+- **Post-flush catalog admission.** Extension discovery, active configuration,
+  theme, keymap, runtime activation, terminal guards, cursor negotiation, and
+  the initial empty-editor frame remain eager. Rich mode then invokes one
+  bounded catalog loader synchronously after the first successful flush and
+  before event polling. It publishes one immutable `Arc<Catalog>` generation to
+  analysis, completion, picker/help, and the REPL only after every consumer is
+  ready. Input arriving meanwhile remains queued by the terminal. Loader
+  failure preserves the catalog error while the existing drop guards restore
+  cooked mode, cursor visibility and shape, bracketed paste, and the inline
+  viewport. Simple/degraded mode keeps eager catalog construction.
 - **Queue or output flood.** One UI turn polls at most one provider snapshot,
   applies at most eight panel updates, and performs at most sixteen data pulls
   before checking cancellation and scheduler state again. The panel queue holds

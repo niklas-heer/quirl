@@ -204,7 +204,7 @@ impl Drop for ExtensionWorker {
 
 pub struct CompletionState {
     worker: Option<CompletionWorker>,
-    catalog: Arc<Catalog>,
+    catalog: Option<Arc<Catalog>>,
     extension_source: Option<Box<dyn ExtensionCompleter + Send>>,
     extension_worker: Option<ExtensionWorker>,
     extension_pending: Option<Vec<ExtensionSuggestion>>,
@@ -226,7 +226,7 @@ impl CompletionState {
     ) -> Self {
         Self {
             worker: None,
-            catalog: catalog.into(),
+            catalog: Some(catalog.into()),
             extension_source: extensions,
             extension_worker: None,
             extension_pending: None,
@@ -242,6 +242,42 @@ impl CompletionState {
         }
     }
 
+    pub fn unpublished(extensions: Option<Box<dyn ExtensionCompleter + Send>>) -> Self {
+        Self {
+            worker: None,
+            catalog: None,
+            extension_source: extensions,
+            extension_worker: None,
+            extension_pending: None,
+            catalog_ready: false,
+            extension_ready: false,
+            request_id: 0,
+            items: Vec::new(),
+            selected: 0,
+            open: false,
+            streaming: false,
+            source_label: "catalog",
+            resource_notice: None,
+        }
+    }
+
+    pub fn publish_catalog(&mut self, catalog: Arc<Catalog>) {
+        assert!(
+            self.catalog.is_none(),
+            "catalog publication must be one-shot"
+        );
+        assert!(
+            self.worker.is_none(),
+            "completion cannot start before catalog publication"
+        );
+        self.catalog = Some(catalog);
+    }
+
+    #[cfg(test)]
+    pub(super) fn published_catalog(&self) -> Option<&Arc<Catalog>> {
+        self.catalog.as_ref()
+    }
+
     pub fn request(&mut self, line: &str, cursor: usize) -> Result<(), ShellError> {
         if line.len() > quirl_catalog::MAX_COMPLETION_QUERY_BYTES {
             self.cancel_for_edit();
@@ -251,7 +287,7 @@ impl CompletionState {
             ));
             return Ok(());
         }
-        self.start_workers();
+        self.start_workers()?;
         self.resource_notice = None;
         if self.request_id > 0 {
             if let Some(worker) = &mut self.worker {
@@ -324,7 +360,11 @@ impl CompletionState {
             self.items = bounded_items(match response.outcome {
                 CompletionOutcome::Ready { items } => items
                     .into_iter()
-                    .map(|item| catalog_item(&self.catalog, item))
+                    .filter_map(|item| {
+                        self.catalog
+                            .as_deref()
+                            .map(|catalog| catalog_item(catalog, item))
+                    })
                     .collect(),
                 CompletionOutcome::Cancelled | CompletionOutcome::DeadlineExceeded => Vec::new(),
             });
@@ -365,17 +405,25 @@ impl CompletionState {
         true
     }
 
-    fn start_workers(&mut self) {
+    fn start_workers(&mut self) -> Result<(), ShellError> {
         // The empty first frame cannot consume completion results. Defer both
         // worker threads until the first actual request so process startup and
         // first paint do not pay for idle control-plane resources.
         if self.worker.is_none() {
-            self.worker = Some(CompletionWorker::new(self.catalog.as_ref().clone()));
+            let catalog = self.catalog.as_ref().ok_or_else(|| {
+                ShellError::new(
+                    quirl_core::ErrorCode::Io,
+                    "interactive catalog publication is incomplete",
+                )
+                .with_help("Restart Quirl before requesting completion again")
+            })?;
+            self.worker = Some(CompletionWorker::new(catalog.as_ref().clone()));
         }
         if self.extension_worker.is_none() {
             self.extension_worker = self.extension_source.take().map(ExtensionWorker::new);
         }
         self.extension_ready = self.extension_worker.is_none();
+        Ok(())
     }
 
     pub fn next(&mut self) {

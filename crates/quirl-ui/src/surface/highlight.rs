@@ -63,7 +63,7 @@ pub struct InputAnalysis {
 /// The editor revision is the cache key. Filesystem discovery runs on a bounded
 /// worker and only publishes complete snapshots, so a keystroke never scans PATH.
 pub struct InputAnalyzer {
-    catalog: Arc<Catalog>,
+    catalog: Option<Arc<Catalog>>,
     path_commands: PathCommandCache,
     cached_revision: Option<u64>,
     cached_mode: Mode,
@@ -74,13 +74,38 @@ pub struct InputAnalyzer {
 impl InputAnalyzer {
     pub fn new(catalog: impl Into<Arc<Catalog>>) -> Self {
         Self {
-            catalog: catalog.into(),
+            catalog: Some(catalog.into()),
             path_commands: PathCommandCache::dormant(),
             cached_revision: None,
             cached_mode: Mode::Command,
             current: InputAnalysis::default(),
             highlight_times: VecDeque::with_capacity(TIMING_WINDOW),
         }
+    }
+
+    pub fn unpublished() -> Self {
+        Self {
+            catalog: None,
+            path_commands: PathCommandCache::dormant(),
+            cached_revision: None,
+            cached_mode: Mode::Command,
+            current: InputAnalysis::default(),
+            highlight_times: VecDeque::with_capacity(TIMING_WINDOW),
+        }
+    }
+
+    pub fn publish_catalog(&mut self, catalog: Arc<Catalog>) {
+        assert!(
+            self.catalog.is_none(),
+            "catalog publication must be one-shot"
+        );
+        self.catalog = Some(catalog);
+        self.cached_revision = None;
+    }
+
+    #[cfg(test)]
+    pub(super) fn published_catalog(&self) -> Option<&Arc<Catalog>> {
+        self.catalog.as_ref()
     }
 
     /// Refresh PATH at prompt boundaries, never at the per-keystroke boundary.
@@ -104,7 +129,10 @@ impl InputAnalyzer {
         }
         let started = Instant::now();
         let spans = highlight(buffer, mode);
-        let diagnostic = diagnostic_for(&self.catalog, &self.path_commands, buffer, mode, &spans);
+        let diagnostic = self
+            .catalog
+            .as_deref()
+            .and_then(|catalog| diagnostic_for(catalog, &self.path_commands, buffer, mode, &spans));
         self.current = InputAnalysis { spans, diagnostic };
         self.cached_revision = Some(revision);
         self.cached_mode = mode;

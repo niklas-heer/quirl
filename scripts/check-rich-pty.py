@@ -35,6 +35,8 @@ class Session:
         symbols: str = "plain",
         semantic_hints: bool = True,
         no_color: bool = False,
+        catalog_gate: bool = False,
+        catalog_failure: bool = False,
     ) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="quirl-pty-")
         private = Path(self.temp.name)
@@ -80,6 +82,12 @@ return quirl.config {{
             "XDG_DATA_HOME": str(private / "data"),
             "XDG_STATE_HOME": str(private / "state"),
         }
+        self.catalog_gate = private / "catalog-admission.gate"
+        self.catalog_gate_reached = Path(f"{self.catalog_gate}.reached")
+        if catalog_gate:
+            environment["QUIRL_TEST_CATALOG_GATE"] = str(self.catalog_gate)
+        if catalog_failure:
+            environment["QUIRL_TEST_CATALOG_FAILURE"] = "1"
         if no_color:
             environment["NO_COLOR"] = "1"
 
@@ -331,6 +339,78 @@ def check_completion(binary: Path, root: Path) -> None:
         session.wait_for(b"^C")
         session.send(b"\x04")
         session.wait_exit()
+    finally:
+        session.close()
+
+
+def wait_for_file(session: Session, path: Path, timeout: float = TIMEOUT) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.is_file() and time.monotonic() < deadline:
+        session.read(0.02)
+    if not path.is_file():
+        raise AssertionError(f"timed out waiting for catalog gate marker {path}")
+
+
+def check_deferred_catalog_admission(binary: Path, root: Path) -> None:
+    session = Session(binary, root, catalog_gate=True)
+    try:
+        wait_for_file(session, session.catalog_gate_reached)
+        session.read(0.1)
+        if STARTUP_MARKER not in session.output:
+            raise AssertionError("catalog loader ran before the first frame was flushed")
+        gated_modes = termios.tcgetattr(session.master)
+        if gated_modes[3] & (termios.ICANON | termios.ECHO):
+            raise AssertionError("catalog gate did not run inside the owned raw terminal session")
+
+        # Resize and input arrive while admission is blocked. Neither can be
+        # consumed before publication; the PTY keeps both queued for the first
+        # post-admission event turns.
+        session.resize(4, 40)
+        session.send(b"\x1b[200~/usr/bin/printf QUEUED_AFTER_ADMISSION\x1b[201~\r")
+        session.read(0.15)
+        if b"QUEUED_AFTER_ADMISSION" in session.output:
+            raise AssertionError("terminal input was consumed before catalog publication")
+
+        session.catalog_gate.write_text("release\n", encoding="utf-8")
+        session.wait_for(b"QUEUED_AFTER_ADMISSION")
+        session.resize(30, 120)
+        wait_for_prompt(session)
+        session.type("git st")
+        session.send(b"\t")
+        session.wait_for(b"git status [--short]")
+        session.send(b"\x03")
+        session.wait_for(b"^C")
+        session.send(b"\x04")
+        session.wait_exit()
+    finally:
+        session.close()
+
+
+def check_catalog_failure_restores_terminal(binary: Path, root: Path) -> None:
+    session = Session(binary, root, catalog_gate=True, catalog_failure=True)
+    try:
+        wait_for_file(session, session.catalog_gate_reached)
+        session.read(0.1)
+        if STARTUP_MARKER not in session.output:
+            raise AssertionError("catalog failure was injected before the first frame")
+        session.catalog_gate.write_text("fail\n", encoding="utf-8")
+        status = session.wait_exit()
+        if status == 0:
+            raise AssertionError("injected catalog failure exited successfully")
+        observed = bytes(session.output)
+        if b"injected catalog admission failure" not in observed:
+            raise AssertionError("catalog error was replaced during terminal cleanup")
+        for marker, state in [
+            (b"\x1b[?2004l", "bracketed paste"),
+            (b"\x1b[?25h", "cursor visibility"),
+            (b"\x1b[0 q", "cursor shape"),
+            (b"\x1b[J", "inline viewport"),
+        ]:
+            if marker not in observed:
+                raise AssertionError(f"catalog failure did not restore {state}")
+        restored_modes = termios.tcgetattr(session.master)
+        if not restored_modes[3] & termios.ICANON or not restored_modes[3] & termios.ECHO:
+            raise AssertionError("catalog failure did not restore cooked terminal modes")
     finally:
         session.close()
 
@@ -637,7 +717,8 @@ def check_noninteractive_dialect_islands(binary: Path, root: Path) -> None:
 
 
 def check_fallbacks(binary: Path, root: Path) -> None:
-    dumb = Session(binary, root, term="dumb")
+    # The rich-only injected failure must not run on the eager simple path.
+    dumb = Session(binary, root, term="dumb", catalog_failure=True)
     try:
         dumb.read(0.5)
         if STARTUP_MARKER in dumb.output:
@@ -687,6 +768,8 @@ def main() -> None:
 
     checks = [
         check_rich_editing,
+        check_deferred_catalog_admission,
+        check_catalog_failure_restores_terminal,
         check_completion,
         check_interactive_runtime,
         check_rich_review_regressions,
