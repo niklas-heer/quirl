@@ -2,6 +2,7 @@
 
 mod panel;
 mod surface;
+mod theme;
 
 pub use panel::{
     directory_panel, process_panel, LiveBuffer, LiveSample, LiveSnapshot, PanelModel,
@@ -23,7 +24,7 @@ use quirl_core::{
     escape_terminal_controls, escape_terminal_line, ErrorCode, ShellError, VersionPolicy,
 };
 use quirl_lua::QuirlConfig;
-use quirl_syntax::Mode;
+use quirl_syntax::{HighlightKind, Mode};
 use reedline::{
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
     Completer, CursorConfig, DefaultHinter, DefaultValidator, DescriptionMenu, DescriptionMode,
@@ -49,6 +50,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use theme::Theme;
 #[cfg(test)]
 use unicode_width::UnicodeWidthStr;
 
@@ -283,6 +285,7 @@ pub fn editor_with_extensions_config_history_and_picker(
     history_path: PathBuf,
     picker_ranker: Arc<dyn PickerRanker>,
 ) -> Result<Reedline, ShellError> {
+    Theme::from_config(&config, true)?;
     let history =
         FileBackedHistory::with_file(HISTORY_CAPACITY, history_path.clone()).map_err(|error| {
             ShellError::new(
@@ -319,6 +322,7 @@ fn configured_editor(
         env::var_os("NO_COLOR").is_some(),
         dumb_terminal(),
     );
+    let theme = Theme::from_config_or_default(&config, terminal_styles);
     let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::None as u8));
     let completer = Box::new(CatalogCompleter::with_extensions_and_picker(
         catalog.clone(),
@@ -355,13 +359,9 @@ fn configured_editor(
         .with_menu(ReedlineMenu::EngineCompleter(history_picker_menu))
         .with_menu(ReedlineMenu::EngineCompleter(file_picker_menu))
         .with_menu(ReedlineMenu::EngineCompleter(action_picker_menu))
-        .with_hinter(Box::new(DefaultHinter::default().with_style(
-            if terminal_styles {
-                Style::new().italic().fg(Color::DarkGray)
-            } else {
-                Style::new()
-            },
-        )))
+        .with_hinter(Box::new(
+            DefaultHinter::default().with_style(theme.ansi_hint()),
+        ))
         .with_validator(Box::new(DefaultValidator))
         .with_edit_mode(configured_edit_mode_with_picker(
             &config.editor.keymap,
@@ -376,7 +376,8 @@ fn configured_editor(
         line_editor = line_editor.with_cursor_config(editor_cursor_config());
     }
     if config.editor.semantic_hints && terminal_styles {
-        line_editor = line_editor.with_highlighter(Box::new(SemanticHighlighter::new(catalog)));
+        line_editor =
+            line_editor.with_highlighter(Box::new(SemanticHighlighter::new(catalog, theme)));
     }
     line_editor
 }
@@ -1256,6 +1257,7 @@ pub struct QuirlPrompt {
     configured_symbols: String,
     named_extension_segments: HashMap<String, String>,
     styled: bool,
+    theme: Theme,
 }
 
 /// Prompt glyphs are intentionally separate from color. Terminal-derived text
@@ -1383,6 +1385,11 @@ impl QuirlPrompt {
             .map(display_directory)
             .map(|directory| safe_prompt_text(&directory))
             .unwrap_or_else(|| "/".to_owned());
+        let styled = terminal_styling_enabled(
+            std::io::stdout().is_terminal(),
+            env::var_os("NO_COLOR").is_some(),
+            dumb_terminal(),
+        );
         Self {
             mode,
             cwd,
@@ -1396,11 +1403,8 @@ impl QuirlPrompt {
             configured_right: Vec::new(),
             configured_symbols: "auto".to_owned(),
             named_extension_segments: HashMap::new(),
-            styled: terminal_styling_enabled(
-                std::io::stdout().is_terminal(),
-                env::var_os("NO_COLOR").is_some(),
-                dumb_terminal(),
-            ),
+            styled,
+            theme: Theme::new(styled),
         }
     }
 
@@ -1414,6 +1418,7 @@ impl QuirlPrompt {
         prompt.configured_left = Some(config.prompt.left.clone());
         prompt.configured_right = config.prompt.right.clone();
         prompt.configured_symbols.clone_from(&config.prompt.symbols);
+        prompt.theme = Theme::from_config_or_default(config, prompt.styled);
         prompt
     }
 
@@ -1516,14 +1521,10 @@ impl QuirlPrompt {
         if !self.styled {
             return value;
         }
-        let style = match name {
-            "directory" => Style::new().bold().fg(Color::Cyan),
-            "git_branch" | "git_state" => Style::new().bold().fg(Color::Purple),
-            "status" => Style::new().bold().fg(Color::Red),
-            "duration" | "jobs" => Style::new().fg(Color::Purple),
-            _ => Style::new(),
-        };
-        style.paint(value).to_string()
+        self.theme
+            .ansi_prompt_segment(name)
+            .paint(value)
+            .to_string()
     }
 
     fn symbols(&self) -> PromptSymbols {
@@ -1705,14 +1706,11 @@ impl Prompt for QuirlPrompt {
     }
 
     fn get_prompt_right_color(&self) -> reedline::Color {
-        reedline::Color::Magenta
+        self.theme.prompt_right_color()
     }
 
     fn get_indicator_color(&self) -> reedline::Color {
-        match self.mode {
-            Mode::Command => reedline::Color::Green,
-            Mode::Data => reedline::Color::Cyan,
-        }
+        self.theme.prompt_accent_color(self.mode)
     }
 
     fn right_prompt_on_last_line(&self) -> bool {
@@ -2451,11 +2449,12 @@ fn picker_item(index: usize, kind: PickerItemKind, value: &str, description: &st
 
 struct SemanticHighlighter {
     catalog: Catalog,
+    theme: Theme,
 }
 
 impl SemanticHighlighter {
-    fn new(catalog: Catalog) -> Self {
-        Self { catalog }
+    fn new(catalog: Catalog, theme: Theme) -> Self {
+        Self { catalog, theme }
     }
 }
 
@@ -2471,21 +2470,28 @@ impl Highlighter for SemanticHighlighter {
         });
         let mut first_word = true;
         for segment in split_preserving_whitespace(line) {
-            let style = if segment.trim().is_empty() {
-                Style::new()
+            let kind = if segment.trim().is_empty() {
+                None
             } else if first_word {
                 first_word = false;
-                if known {
-                    Style::new().bold().fg(Color::Green)
+                Some(if known {
+                    HighlightKind::Command
                 } else {
-                    Style::new().bold().fg(Color::Red)
-                }
+                    HighlightKind::Error
+                })
             } else if segment.starts_with('-') {
-                Style::new().fg(Color::Cyan)
-            } else if segment.starts_with('"') || segment.starts_with('\'') {
-                Style::new().fg(Color::Yellow)
+                Some(HighlightKind::Flag)
+            } else if segment.starts_with('"') {
+                Some(HighlightKind::StringDouble)
+            } else if segment.starts_with('\'') {
+                Some(HighlightKind::StringSingle)
             } else {
-                Style::new().fg(Color::White)
+                Some(HighlightKind::Argument)
+            };
+            let style = if let Some(kind) = kind {
+                self.theme.ansi_highlight(kind)
+            } else {
+                Style::new()
             };
             highlighted.push((style, segment.to_owned()));
         }
@@ -3461,14 +3467,40 @@ mod tests {
             },
         );
         prompt.styled = true;
+        prompt.theme = Theme::from_config(&config, true).unwrap();
 
         let rendered = prompt.render_prompt_left();
 
-        assert!(rendered.starts_with("\u{1b}[1;36m~/P/g/n/quirl"));
-        assert!(rendered.contains("\u{1b}[1;35mon main"));
+        assert!(rendered.starts_with("\u{1b}[1;38;2;125;207;255m~/P/g/n/quirl"));
+        assert!(rendered.contains("\u{1b}[1;38;2;187;154;247mon main"));
         assert!(rendered.contains("dirty"));
         assert!(rendered.ends_with('\n'));
         assert!(!rendered.contains("\u{1b}]"));
+    }
+
+    #[test]
+    fn simple_highlighter_uses_the_selected_custom_theme() {
+        let mut config = QuirlConfig::default();
+        let mut colors = config.active_theme().unwrap();
+        colors.accent_command = "#010203".to_owned();
+        colors.context_primary = "#040506".to_owned();
+        config.ui.theme = "custom".to_owned();
+        config.ui.themes.insert("custom".to_owned(), colors);
+        let highlighter = SemanticHighlighter::new(
+            Catalog::builtin(),
+            Theme::from_config(&config, true).unwrap(),
+        );
+
+        let highlighted = highlighter.highlight("cd --help", 0);
+
+        assert_eq!(
+            highlighted.buffer[0].0.foreground,
+            Some(Color::Rgb(1, 2, 3))
+        );
+        assert_eq!(
+            highlighted.buffer[2].0.foreground,
+            Some(Color::Rgb(4, 5, 6))
+        );
     }
 
     #[test]

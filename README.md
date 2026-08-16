@@ -180,6 +180,9 @@ The architecture and decisions behind it are documented in depth:
 - [ADR 0012: Ratatui interactive surface](docs/decisions/0012-ratatui-interactive-surface.md) —
   capable-TTY default selection, inline-terminal lifecycle, Reedline fallback,
   and config schema v2 migration.
+- [ADR 0013: Lua-configured themes](docs/decisions/0013-lua-config-themes.md) —
+  bounded semantic palettes shared by both terminal surfaces, with Tokyo Night
+  as the default.
 - [Security and accessibility audit](docs/security-accessibility-audit-v0.1.md)
   and [1.0 performance record](docs/benchmarks/release-v1.0.md) — adversarial
   boundaries, text fallbacks, named hardware, reproducible budgets, and outcomes.
@@ -354,7 +357,7 @@ Configuration, scripts, and plugins share the same Lua 5.4 SDK. A minimal
 ```lua
 ---@type quirl.Config
 local config = quirl.config {
-  schema_version = 2,
+  schema_version = 3,
   editor = { keymap = "emacs", semantic_hints = true, banner = "full" },
   picker = { layout = "adaptive", preview = true },
   prompt = {
@@ -363,7 +366,7 @@ local config = quirl.config {
     right = { "jobs", "duration", "status" },
     transient = true,
   },
-  ui = { surface = "auto", statusline = { hints = true } },
+  ui = { theme = "tokyo-night", surface = "auto", statusline = { hints = true } },
   completion = { auto = false, min_chars = 2 },
 }
 
@@ -378,12 +381,43 @@ experimental compatibility option.
 The welcome is shown on every interactive launch by default; set
 `editor.banner` to `compact` or `none` if you prefer less startup chrome.
 
-Config schema v2 introduced the rich-surface, status-line, transient-prompt,
-and automatic-completion settings above. Unversioned v0 and explicit v1
-configuration migrate deterministically to v2 defaults before validation;
-future versions fail closed. `ui.surface = "auto"` prefers Ratatui only when
+Config schema v3 adds named semantic themes shared by both terminal surfaces;
+Tokyo Night is the default. Quirl includes 30 widely used dark themes, with
+palettes curated from the maintained [Gogh terminal-theme catalog](https://github.com/Gogh-Co/Gogh),
+plus `ansi` as a conservative compatibility alternative:
+
+```text
+ayu-dark             catppuccin-mocha  cobalt-2         dracula
+everforest-dark-medium  github-dark    gotham           gruvbox-dark
+horizon-dark         kanagawa-wave     material         monokai-dark
+moonfly              night-owl         nord             oceanic-next
+one-dark             one-half-black    oxocarbon-dark   palenight
+papercolor-dark      rose-pine-moon    snazzy           solarized-dark
+sonokai              srcery            synthwave        tokyo-night
+tomorrow-night       zenburn
+```
+
+Unversioned v0 and explicit v1/v2 configuration migrate deterministically to
+v3 defaults before validation; future versions fail closed. `ui.surface = "auto"` prefers Ratatui only when
 terminal capabilities are sufficient, `rich` requests that same rich path, and
 `simple` selects Reedline explicitly.
+
+Custom themes are ordinary, bounded Lua data under `ui.themes`. Each theme must
+provide every generated `quirl.ThemeColors` role as an exact `#RRGGBB` value;
+select it by assigning its table key to `ui.theme`. Quirl validates the complete
+palette before activation and never calls Lua while painting the terminal.
+
+```lua
+config.ui.themes["my-theme"] = {
+  accent_command = "#a6e3a1", accent_data = "#cba6f7",
+  context_primary = "#89dceb", context_secondary = "#f5c2e7",
+  muted = "#6c7086", border = "#45475a", status_background = "#313244",
+  error = "#f38ba8", warning = "#f9e2af", hint = "#89b4fa",
+  string = "#a6e3a1", operator = "#cdd6f4",
+  expansion = "#89b4fa", number = "#fab387",
+}
+config.ui.theme = "my-theme"
+```
 
 `prompt.symbols` makes font support explicit:
 

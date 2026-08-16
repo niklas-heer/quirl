@@ -598,8 +598,9 @@ Alt-M repaint, completion, execution handoff, and Ctrl-D on a real Unix PTY.
 ## 12. Configuration
 
 Additions to `QuirlConfig` (Lua `config.lua`). The config schema fingerprint
-is frozen under ADR 0008. These fields shipped as config schema v2 with
-defaults and a deterministic v0/v1-to-v2 migration:
+is frozen under ADR 0008. The interactive-surface fields shipped as config
+schema v2; theme selection and bounded custom palettes advance the contract to
+v3 with a deterministic v0/v1/v2-to-v3 migration:
 
 ```lua
 local config = quirl.config {
@@ -612,6 +613,8 @@ local config = quirl.config {
     transient = true,                                      -- new (§5.5)
   },
   ui = {                                                   -- new
+    theme = "tokyo-night",        -- one of 30 built-ins, or a key in ui.themes
+    themes = {},                  -- bounded semantic #RRGGBB palettes
     surface = "auto",              -- auto | rich | simple
     statusline = { hints = true },
   },

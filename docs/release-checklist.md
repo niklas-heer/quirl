@@ -6,7 +6,8 @@ commit is useful history, not release evidence. Linux and macOS are the
 supported interactive platforms. Windows is explicitly outside this release
 gate under [ADR 0010](decisions/0010-unix-first-release-scope.md).
 The capable-TTY default and retained Reedline fallback are governed by
-[ADR 0012](decisions/0012-ratatui-interactive-surface.md).
+[ADR 0012](decisions/0012-ratatui-interactive-surface.md); shared theme behavior
+is governed by [ADR 0013](decisions/0013-lua-config-themes.md).
 
 This checklist uses two explicit revisions:
 
@@ -23,8 +24,8 @@ This checklist uses two explicit revisions:
 - [ ] `Cargo.lock`, `rust-toolchain.toml`, the release profile, version strings,
   generated SDK, protocol manifest, and user-facing status text describe the
   candidate being shipped.
-- [ ] The reviewed config descriptor is schema v2, its golden fingerprint
-  matches the candidate, and v0/v1-to-v2 migration tests pass.
+- [ ] The reviewed config descriptor is schema v3, its golden fingerprint
+  matches the candidate, and v0/v1/v2-to-v3 migration tests pass.
 - [ ] The supported compatibility boundary is unchanged: C0/C1-core is native
   on Linux/macOS; here-documents, process substitution, loops, functions,
   conditionals, and dialect control forms are explicit Bash/Zsh islands.
@@ -71,6 +72,9 @@ font or a Nerd Font was used. A glyph difference must never change behavior.
 - [ ] With `ui.surface = "auto"`, the shell reaches the Ratatui inline frame in
   a normal capable TTY; context, input, diagnostics, and textual status remain
   legible across redraw and resize.
+- [ ] The default `tokyo-night` theme and one Lua-configured custom theme apply
+  the same semantic roles on rich and simple surfaces; `NO_COLOR` suppresses
+  foreground and background colors for both.
 - [ ] The mode indicator is always visible; `Alt-M` switches command/data
   mode and the text labels remain understandable without relying on color.
 - [ ] Tab completion, `Ctrl-R` history, `Ctrl-T` files, `Alt-C` directories,
@@ -202,10 +206,10 @@ Before publishing the capture:
   checksums, and version tag all identify the already-gated A artifact.
 - [ ] Draft release notes with supported platforms, native compatibility scope,
   reference-shell behavior, known residual risks, and upgrade/migration notes.
-  For 0.1, note that config schema v2 adds the rich-surface, status-line,
-  transient-prompt, and completion-policy settings; legacy unversioned v0 and
-  explicit v1 config migrate to v2 defaults, and no published config contract
-  is being superseded.
+  For 0.1, note that config schema v3 adds shared semantic themes on top of the
+  v2 rich-surface settings; legacy unversioned v0 and explicit v1/v2 config
+  migrate to v3 defaults, and no published config contract is being silently
+  reinterpreted.
 - [ ] Create an annotated version tag only after every required Linux/macOS gate
   above is signed off, and point it explicitly at A, even if HEAD has moved to
   evidence commit B: `git tag -a v0.1.0 "$QUIRL_CANDIDATE_COMMIT"`.

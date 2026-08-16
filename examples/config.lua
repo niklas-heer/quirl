@@ -1,6 +1,6 @@
 ---@type quirl.Config
 local config = quirl.config {
-  schema_version = 2,
+  schema_version = 3,
   editor = { keymap = "emacs", semantic_hints = true, banner = "full" },
   picker = { layout = "adaptive", preview = true },
   prompt = {
@@ -11,7 +11,7 @@ local config = quirl.config {
     right = { "jobs", "duration", "status" },
     transient = true,
   },
-  ui = { surface = "auto", statusline = { hints = true } },
+  ui = { theme = "tokyo-night", surface = "auto", statusline = { hints = true } },
   completion = { auto = false, min_chars = 2 },
 }
 

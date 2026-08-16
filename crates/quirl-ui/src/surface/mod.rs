@@ -2,10 +2,9 @@ mod completion;
 mod degrade;
 mod editor;
 mod frame;
-mod highlight;
+pub(crate) mod highlight;
 mod overlay;
 mod statusbar;
-mod theme;
 
 pub use degrade::{select_surface, SurfaceKind};
 
@@ -18,11 +17,11 @@ use self::{
     frame::FrameModel,
     highlight::InputAnalyzer,
     overlay::{contextual_help_query, PickerLayout, PickerOverlay},
-    theme::Theme,
 };
 use super::{
     ExtensionCompleter, PickerRanker, QuirlPrompt, SurfaceSymbols, MODE_TOGGLE_HOST_COMMAND,
 };
+use crate::theme::Theme;
 use crossterm::{
     cursor::{SetCursorStyle, Show},
     event::{
@@ -102,6 +101,7 @@ pub struct RichSurface {
     semantic_hints: bool,
     help_active: bool,
     help_detail_scroll: u16,
+    theme: Theme,
 }
 
 impl RichSurface {
@@ -121,6 +121,7 @@ impl RichSurface {
     ) -> Result<Self, ShellError> {
         let history = read_history(&history_path);
         let input_analysis = InputAnalyzer::new(Arc::clone(&catalog));
+        let theme = Theme::from_config(config, true)?;
         Ok(Self {
             completion: CompletionState::new(Arc::clone(&catalog), extension_completer),
             picker: PickerOverlay::new(picker_ranker),
@@ -142,6 +143,7 @@ impl RichSurface {
             semantic_hints: config.editor.semantic_hints,
             help_active: false,
             help_detail_scroll: 0,
+            theme,
         })
     }
 
@@ -164,7 +166,7 @@ impl RichSurface {
         let color = std::io::stderr().is_terminal()
             && env::var_os("NO_COLOR").is_none()
             && !env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb"));
-        let theme = Theme::new(color);
+        let theme = self.theme.with_color(color);
         let mut dirty = true;
         let mut prompt_prepared = false;
 
