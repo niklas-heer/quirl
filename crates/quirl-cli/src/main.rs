@@ -29,14 +29,17 @@ use plugin::PluginCommand;
 use quirl_catalog::{Catalog, CommandSpec, Completion};
 use quirl_core::{
     escape_json_terminal_controls, escape_terminal_controls, reject_terminal_controls,
-    CommandOutcome, ErrorCode, ExtensionAction, ExtensionEventData, OutputStream, ShellError,
+    CommandOutcome, ErrorCode, ExecutionCleanupState, ExecutionEffect, ExecutionEffects,
+    ExecutionInput, ExecutionMode, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget,
+    ExecutionRequest, ExecutionSource, ExecutionStatus, ExtensionAction, ExtensionEventData,
+    OutputStream, ProcessRequest, ShellError, StructuredValue,
 };
-use quirl_data::{DataRenderFormat, DataRuntime};
+use quirl_data::{DataEnvelope, DataRenderFormat, DataRuntime};
 use quirl_lua::{
     sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig, MAX_LUA_SOURCE_BYTES,
 };
 use quirl_picker::{ItemKind, PickItem, Picker, MAX_PICKER_ITEMS};
-use quirl_process::{sandboxed_process_host, JobStatus, NativeExecutor};
+use quirl_process::{sandboxed_process_host, JobStatus, NativeExecutor, DEFAULT_CAPTURE_BYTES};
 use quirl_syntax::{classify, InteractiveLine, Mode};
 use quirl_ui::{
     editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
@@ -51,7 +54,7 @@ use std::{
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -310,10 +313,16 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             Ok(output.status)
         }
         Some(Command::Eval { expression }) => {
-            let lua =
-                LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
-            print_json_value(lua.eval(&expression)?);
-            Ok(0)
+            let request = execution_request(
+                "<eval>",
+                &expression,
+                ExecutionMode::Lua,
+                ExecutionOutputTarget::Value,
+                ExecutionEffects::from_effects(&[ExecutionEffect::SpawnProcess]),
+            )?;
+            let outcome = execute_execution_request(&mut NativeExecutor::default(), request)?;
+            print_execution_value(&outcome)?;
+            Ok(outcome.status_code())
         }
         Some(Command::Data { expression, format }) => {
             let format = match format {
@@ -321,16 +330,19 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
                 DataOutputFormat::Plain => DataRenderFormat::Plain,
                 DataOutputFormat::Table => DataRenderFormat::Table,
             };
-            let stdout = io::stdout();
-            let mut output = stdout.lock();
-            DataRuntime::with_process_host(sandboxed_process_host())
-                .render_to_with_cancellation_handle(
-                    &expression,
-                    format,
-                    Arc::new(AtomicBool::new(false)),
-                    &mut output,
-                )?;
-            Ok(0)
+            let request = execution_request(
+                "<data>",
+                &expression,
+                ExecutionMode::Data,
+                ExecutionOutputTarget::Value,
+                ExecutionEffects::from_effects(&[
+                    ExecutionEffect::ReadFilesystem,
+                    ExecutionEffect::SpawnProcess,
+                ]),
+            )?;
+            let outcome = execute_execution_request(&mut NativeExecutor::default(), request)?;
+            render_execution_value(&outcome, format)?;
+            Ok(outcome.status_code())
         }
         Some(Command::Check { file, format }) => {
             script::analyze(&file, matches!(format, DiagnosticFormat::Json), false)
@@ -525,6 +537,198 @@ fn run_exec_with_recovery(source: &str) -> Result<i32, ShellError> {
     )
 }
 
+fn execution_request(
+    source_name: &str,
+    source: &str,
+    mode: ExecutionMode,
+    output: ExecutionOutputTarget,
+    declared_effects: ExecutionEffects,
+) -> Result<ExecutionRequest, ShellError> {
+    Ok(
+        ExecutionRequest::new(ExecutionSource::new(source_name, source)?, mode)
+            .with_output(output)
+            .with_effects(declared_effects, ExecutionEffects::all()),
+    )
+}
+
+/// The sole CLI mode-selection point for executable command, data, Lua, and
+/// explicit reference-shell requests. Each branch delegates resource ownership
+/// to its existing engine and returns only bounded passive values.
+fn execute_execution_request(
+    executor: &mut NativeExecutor,
+    request: ExecutionRequest,
+) -> Result<ExecutionOutcome, ShellError> {
+    let plan = request.plan()?;
+    plan.cancellation()
+        .ensure_active("before engine initialization")?;
+    if !matches!(plan.input(), ExecutionInput::None) {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "the selected front door does not yet consume execution input",
+        )
+        .with_command(plan.source().text())
+        .with_help("Use an explicit engine adapter until P08/P09 add typed stream composition"));
+    }
+    let result = match plan.mode() {
+        ExecutionMode::NativeCommand => execute_native_plan(executor, &plan),
+        ExecutionMode::Data => execute_data_plan(&plan),
+        ExecutionMode::Lua => execute_lua_plan(&plan),
+        ExecutionMode::Bash | ExecutionMode::Zsh => execute_reference_plan(&plan),
+        ExecutionMode::Plugin | ExecutionMode::Protocol => Err(ShellError::new(
+            ErrorCode::InvalidCommand,
+            "the selected execution adapter is not installed",
+        )
+        .with_command(plan.source().text())
+        .with_help("Use a native, data, Lua, Bash, or Zsh front door in this release")),
+    };
+    result.map_err(|error| preserve_execution_source(error, plan.source()))
+}
+
+fn execute_native_plan(
+    executor: &mut NativeExecutor,
+    plan: &quirl_core::ExecutionPlan,
+) -> Result<ExecutionOutcome, ShellError> {
+    let outcome = match plan.output() {
+        ExecutionOutputTarget::Capture {
+            max_bytes_per_stream,
+        } => executor.execute_capture_request(ProcessRequest {
+            command: plan.source().text().to_owned(),
+            deadline: plan.deadline(),
+            cancelled: plan.cancellation().atomic(),
+            max_output_bytes: max_bytes_per_stream,
+        })?,
+        ExecutionOutputTarget::Inherit => executor.execute_interactive(plan.source().text())?,
+        ExecutionOutputTarget::Value => {
+            return Err(representation_error(plan, "native commands return bytes"));
+        }
+    };
+    command_execution_outcome(outcome, plan.output())
+}
+
+fn execute_data_plan(plan: &quirl_core::ExecutionPlan) -> Result<ExecutionOutcome, ShellError> {
+    if plan.output() != ExecutionOutputTarget::Value {
+        return Err(representation_error(
+            plan,
+            "data execution returns structured values",
+        ));
+    }
+    let cancelled = plan.cancellation().atomic();
+    let value = DataRuntime::with_process_host(sandboxed_process_host())
+        .eval_output_with_cancellation_handle(plan.source().text(), Arc::clone(&cancelled))?
+        .into_envelope(&cancelled)?;
+    let output = data_envelope_output(value)?;
+    plan.cancellation().ensure_active("after data execution")?;
+    ExecutionOutcome::new(
+        ExecutionStatus::Exited(0),
+        output,
+        Vec::new(),
+        ExecutionCleanupState::Complete,
+    )
+}
+
+fn data_envelope_output(envelope: DataEnvelope) -> Result<ExecutionOutput, ShellError> {
+    match envelope {
+        DataEnvelope::Value { value } => Ok(ExecutionOutput::Value { value }),
+        DataEnvelope::Stream { items } => Ok(ExecutionOutput::Values { values: items }),
+        DataEnvelope::Option { .. } | DataEnvelope::Result { .. } | DataEnvelope::Task { .. } => {
+            Err(ShellError::new(
+                ErrorCode::Data,
+                "data execution returned a control-flow envelope where a value was required",
+            )
+            .with_help("Handle Option, Result, or Task before crossing this execution boundary"))
+        }
+    }
+}
+
+fn execute_lua_plan(plan: &quirl_core::ExecutionPlan) -> Result<ExecutionOutcome, ShellError> {
+    if plan.output() != ExecutionOutputTarget::Value {
+        return Err(representation_error(
+            plan,
+            "Lua execution returns structured values",
+        ));
+    }
+    let mut policy = LuaPolicy::script();
+    policy.wall_time = policy.wall_time.min(plan.deadline());
+    let runtime = LuaRuntime::new_with_process_host_and_cancellation(
+        policy,
+        sandboxed_process_host(),
+        plan.cancellation().atomic(),
+    )?;
+    plan.cancellation()
+        .ensure_active("after Lua initialization")?;
+    let value = runtime.eval(plan.source().text())?;
+    plan.cancellation().ensure_active("after Lua execution")?;
+    ExecutionOutcome::new(
+        ExecutionStatus::Exited(0),
+        ExecutionOutput::Value {
+            value: StructuredValue::from_json(value),
+        },
+        Vec::new(),
+        ExecutionCleanupState::Complete,
+    )
+}
+
+fn execute_reference_plan(
+    plan: &quirl_core::ExecutionPlan,
+) -> Result<ExecutionOutcome, ShellError> {
+    if !matches!(plan.output(), ExecutionOutputTarget::Capture { .. }) {
+        return Err(representation_error(
+            plan,
+            "explicit Bash/Zsh execution requires bounded byte capture",
+        ));
+    }
+    let language = match plan.mode() {
+        ExecutionMode::Bash => ScriptLanguage::Bash,
+        ExecutionMode::Zsh => ScriptLanguage::Zsh,
+        _ => unreachable!("reference adapter received a non-reference mode"),
+    };
+    let cancellation = script::ScriptCancellation::from_atomic(plan.cancellation().atomic());
+    let outcome = script::run_interactive_island(language, plan.source().text(), &cancellation)?;
+    command_execution_outcome(outcome, plan.output())
+}
+
+fn command_execution_outcome(
+    outcome: CommandOutcome,
+    target: ExecutionOutputTarget,
+) -> Result<ExecutionOutcome, ShellError> {
+    let output = match target {
+        ExecutionOutputTarget::Inherit => ExecutionOutput::Inherited,
+        ExecutionOutputTarget::Capture { .. } => ExecutionOutput::Bytes {
+            stdout: outcome.stdout.unwrap_or_default().into_bytes(),
+            stderr: outcome.stderr.unwrap_or_default().into_bytes(),
+        },
+        ExecutionOutputTarget::Value => unreachable!("byte engine accepted value output"),
+    };
+    ExecutionOutcome::new(
+        ExecutionStatus::Exited(outcome.status),
+        output,
+        Vec::new(),
+        ExecutionCleanupState::Complete,
+    )
+}
+
+fn representation_error(plan: &quirl_core::ExecutionPlan, expected: &str) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        "execution output representation is incompatible",
+    )
+    .with_command(plan.source().text())
+    .with_context(expected)
+    .with_help("Choose the output representation declared by the selected execution mode")
+}
+
+fn preserve_execution_source(mut error: ShellError, source: &ExecutionSource) -> ShellError {
+    if error.details.command.is_none() {
+        error.details.command = Some(source.text().to_owned());
+    }
+    for label in &mut error.details.labels {
+        if matches!(label.source.as_deref(), Some("command" | "eval")) {
+            label.source = Some(source.text().to_owned());
+        }
+    }
+    error
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionOutputMode {
     Capture,
@@ -650,28 +854,62 @@ fn execute_command_or_dialect_island(
     source: &str,
     output_mode: ExecutionOutputMode,
 ) -> Result<CommandOutcome, ShellError> {
-    if let Some((language, body)) = interactive_dialect_island(source) {
-        return script::run_interactive_island(
-            language,
-            body,
-            &script::ScriptCancellation::default(),
-        );
-    }
-    let result = match output_mode {
-        ExecutionOutputMode::Capture => executor.execute_capture(source),
-        ExecutionOutputMode::Interactive => executor.execute_interactive(source),
-    };
-    result.map_err(|mut error| {
-        // Native syntax diagnostics currently identify their label source with the logical name
-        // `command`. At the CLI boundary, replace only that sentinel with the exact accepted source
-        // so text rendering and the already-exact ShellError command field agree.
-        for label in &mut error.details.labels {
-            if label.source.as_deref() == Some("command") {
-                label.source = Some(source.to_owned());
-            }
-        }
+    let (mode, engine_source, source_name, target) =
+        if let Some((language, body)) = interactive_dialect_island(source) {
+            let mode = match language {
+                ScriptLanguage::Bash => ExecutionMode::Bash,
+                ScriptLanguage::Zsh => ExecutionMode::Zsh,
+                ScriptLanguage::Lua | ScriptLanguage::Quirl => {
+                    unreachable!("interactive islands admit only Bash or Zsh")
+                }
+            };
+            (
+                mode,
+                body,
+                "<dialect-island>",
+                ExecutionOutputTarget::Capture {
+                    max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
+                },
+            )
+        } else {
+            let target = match output_mode {
+                ExecutionOutputMode::Capture => ExecutionOutputTarget::Capture {
+                    max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
+                },
+                ExecutionOutputMode::Interactive => ExecutionOutputTarget::Inherit,
+            };
+            (ExecutionMode::NativeCommand, source, "<command>", target)
+        };
+    let request = execution_request(
+        source_name,
+        engine_source,
+        mode,
+        target,
+        ExecutionEffects::all(),
+    )?;
+    let outcome = execute_execution_request(executor, request).map_err(|mut error| {
+        error.details.command = Some(source.to_owned());
         error
-    })
+    })?;
+    let status = outcome.status_code();
+    match outcome.output {
+        ExecutionOutput::Inherited => Ok(CommandOutcome {
+            status,
+            stdout: None,
+            stderr: None,
+        }),
+        ExecutionOutput::Bytes { stdout, stderr } => Ok(CommandOutcome {
+            status,
+            stdout: Some(String::from_utf8_lossy(&stdout).into_owned()),
+            stderr: Some(String::from_utf8_lossy(&stderr).into_owned()),
+        }),
+        ExecutionOutput::Value { .. } | ExecutionOutput::Values { .. } => Err(ShellError::new(
+            ErrorCode::Validation,
+            "command execution returned a value outcome",
+        )
+        .with_command(source)
+        .with_help("Report this as an execution adapter representation defect")),
+    }
 }
 
 fn recovery_journal(
@@ -1661,6 +1899,55 @@ fn print_json_value(value: serde_json::Value) {
     }
 }
 
+fn print_execution_value(outcome: &ExecutionOutcome) -> Result<(), ShellError> {
+    match &outcome.output {
+        ExecutionOutput::Value { value } => {
+            print_json_value(value.json_value());
+            Ok(())
+        }
+        ExecutionOutput::Inherited
+        | ExecutionOutput::Bytes { .. }
+        | ExecutionOutput::Values { .. } => Err(ShellError::new(
+            ErrorCode::Validation,
+            "execution outcome did not contain a structured value",
+        )
+        .with_help("Report this as an execution adapter representation defect")),
+    }
+}
+
+fn render_execution_value(
+    outcome: &ExecutionOutcome,
+    format: DataRenderFormat,
+) -> Result<(), ShellError> {
+    match &outcome.output {
+        ExecutionOutput::Value { value } => {
+            print!(
+                "{}",
+                DataEnvelope::Value {
+                    value: value.clone()
+                }
+                .render(format)?
+            );
+            Ok(())
+        }
+        ExecutionOutput::Values { values } => {
+            print!(
+                "{}",
+                DataEnvelope::Stream {
+                    items: values.clone()
+                }
+                .render(format)?
+            );
+            Ok(())
+        }
+        ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => Err(ShellError::new(
+            ErrorCode::Validation,
+            "data execution outcome did not contain a structured value",
+        )
+        .with_help("Report this as an execution adapter representation defect")),
+    }
+}
+
 fn print_outcome(outcome: &quirl_core::CommandOutcome) {
     if let Some(stdout) = &outcome.stdout {
         if !stdout.is_empty() {
@@ -2074,6 +2361,177 @@ mod tests {
         let decoded: ShellError = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.details.command.as_deref(), Some(source));
         assert_eq!(decoded.details.help, error.details.help);
+    }
+
+    #[test]
+    fn shared_execution_contract_preserves_mode_output_and_status() {
+        let cases = [
+            (
+                ExecutionMode::NativeCommand,
+                "false",
+                ExecutionOutputTarget::Capture {
+                    max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
+                },
+                1,
+            ),
+            (
+                ExecutionMode::Data,
+                "[1,2,3] | length",
+                ExecutionOutputTarget::Value,
+                0,
+            ),
+            (
+                ExecutionMode::Lua,
+                "return 42",
+                ExecutionOutputTarget::Value,
+                0,
+            ),
+        ];
+        for (mode, source, output, status) in cases {
+            let request = execution_request(
+                "<contract-test>",
+                source,
+                mode,
+                output,
+                ExecutionEffects::all(),
+            )
+            .unwrap();
+            let outcome =
+                execute_execution_request(&mut NativeExecutor::default(), request).unwrap();
+            assert_eq!(outcome.status_code(), status, "mode {mode:?}");
+            assert_eq!(outcome.cleanup, ExecutionCleanupState::Complete);
+            assert!(matches!(
+                (mode, outcome.output),
+                (ExecutionMode::NativeCommand, ExecutionOutput::Bytes { .. })
+                    | (
+                        ExecutionMode::Data | ExecutionMode::Lua,
+                        ExecutionOutput::Value { .. }
+                    )
+            ));
+        }
+
+        for mode in [ExecutionMode::Bash, ExecutionMode::Zsh] {
+            let executable = match mode {
+                ExecutionMode::Bash => "bash",
+                ExecutionMode::Zsh => "zsh",
+                _ => unreachable!(),
+            };
+            if !shell_is_available(executable) {
+                continue;
+            }
+            let request = execution_request(
+                "<contract-test>",
+                "printf value; exit 7",
+                mode,
+                ExecutionOutputTarget::Capture {
+                    max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
+                },
+                ExecutionEffects::all(),
+            )
+            .unwrap();
+            let outcome =
+                execute_execution_request(&mut NativeExecutor::default(), request).unwrap();
+            assert_eq!(outcome.status_code(), 7);
+            assert!(matches!(
+                outcome.output,
+                ExecutionOutput::Bytes { ref stdout, .. } if stdout == b"value"
+            ));
+        }
+    }
+
+    #[test]
+    fn shared_execution_contract_denies_effects_and_cancellation_before_every_mode() {
+        for mode in [
+            ExecutionMode::NativeCommand,
+            ExecutionMode::Data,
+            ExecutionMode::Lua,
+            ExecutionMode::Bash,
+            ExecutionMode::Zsh,
+        ] {
+            let source = format!("source for {mode:?}");
+            let denied = ExecutionRequest::new(
+                ExecutionSource::new("<contract-test>", &source).unwrap(),
+                mode,
+            )
+            .with_effects(
+                ExecutionEffects::from_effects(&[ExecutionEffect::SpawnProcess]),
+                ExecutionEffects::none(),
+            );
+            let error =
+                execute_execution_request(&mut NativeExecutor::default(), denied).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Validation);
+            assert_eq!(error.details.command.as_deref(), Some(source.as_str()));
+
+            let cancellation = quirl_core::ExecutionCancellation::default();
+            cancellation.cancel();
+            let cancelled = ExecutionRequest::new(
+                ExecutionSource::new("<contract-test>", &source).unwrap(),
+                mode,
+            )
+            .with_cancellation(cancellation)
+            .with_effects(ExecutionEffects::none(), ExecutionEffects::all());
+            let error =
+                execute_execution_request(&mut NativeExecutor::default(), cancelled).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+        }
+    }
+
+    #[test]
+    fn shared_execution_contract_attaches_exact_source_to_engine_errors() {
+        let cases = [
+            (ExecutionMode::NativeCommand, "printf 'unterminated"),
+            (ExecutionMode::Data, "[1,2 | length"),
+            (ExecutionMode::Lua, "error('contract failure')"),
+        ];
+        for (mode, source) in cases {
+            let output = if mode == ExecutionMode::NativeCommand {
+                ExecutionOutputTarget::Capture {
+                    max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
+                }
+            } else {
+                ExecutionOutputTarget::Value
+            };
+            let request = execution_request(
+                "<contract-test>",
+                source,
+                mode,
+                output,
+                ExecutionEffects::all(),
+            )
+            .unwrap();
+            let error =
+                execute_execution_request(&mut NativeExecutor::default(), request).unwrap_err();
+            assert_eq!(
+                error.details.command.as_deref(),
+                Some(source),
+                "mode {mode:?}"
+            );
+        }
+
+        for mode in [ExecutionMode::Bash, ExecutionMode::Zsh] {
+            let executable = if mode == ExecutionMode::Bash {
+                "bash"
+            } else {
+                "zsh"
+            };
+            if !shell_is_available(executable) {
+                continue;
+            }
+            let source = "if true; then";
+            let request = execution_request(
+                "<contract-test>",
+                source,
+                mode,
+                ExecutionOutputTarget::Capture {
+                    max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
+                },
+                ExecutionEffects::all(),
+            )
+            .unwrap();
+            let error =
+                execute_execution_request(&mut NativeExecutor::default(), request).unwrap_err();
+            assert_eq!(error.details.command.as_deref(), Some(source));
+        }
     }
 
     #[test]

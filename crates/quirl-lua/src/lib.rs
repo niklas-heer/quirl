@@ -1286,7 +1286,7 @@ pub const HOST_API: &[HostApiSpec] = &[
     },
     HostApiSpec {
         path: "quirl.process.run",
-        summary: "Run a command through Quirl's compatibility shell.",
+        summary: "Run a command through the composed bounded native process host.",
         parameters: COMMAND_PARAMETER,
         returns: "quirl.Result",
         capability: Some("process.spawn"),
@@ -1462,6 +1462,25 @@ impl LuaRuntime {
         )
     }
 
+    /// Construct a process-capable runtime that observes an existing cancellation flag.
+    ///
+    /// The CLI composition root uses this boundary so cancellation before VM
+    /// initialization, Lua instruction hooks, callbacks, and injected process
+    /// work all share one identity. The caller must not clear the flag while an
+    /// invocation is running.
+    pub fn new_with_process_host_and_cancellation(
+        policy: LuaPolicy,
+        process_host: ProcessHost,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self, ShellError> {
+        Self::new_with_capabilities_process_host_and_cancellation(
+            policy,
+            &default_capabilities(policy),
+            Some(process_host),
+            cancelled,
+        )
+    }
+
     /// Construct a runtime whose host handles are limited to explicit grants.
     pub fn new_with_capabilities(
         policy: LuaPolicy,
@@ -1476,6 +1495,20 @@ impl LuaRuntime {
         policy: LuaPolicy,
         granted_capabilities: &[String],
         process_host: Option<ProcessHost>,
+    ) -> Result<Self, ShellError> {
+        Self::new_with_capabilities_process_host_and_cancellation(
+            policy,
+            granted_capabilities,
+            process_host,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn new_with_capabilities_process_host_and_cancellation(
+        policy: LuaPolicy,
+        granted_capabilities: &[String],
+        process_host: Option<ProcessHost>,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<Self, ShellError> {
         policy.validate()?;
         let libraries = StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8;
@@ -1497,7 +1530,6 @@ impl LuaRuntime {
             deadline,
             wall_time: policy.wall_time,
         }));
-        let cancelled = Arc::new(AtomicBool::new(false));
         let registrations = Arc::new(Mutex::new(PluginRegistrations::default()));
         let callbacks = Arc::new(Mutex::new(PluginCallbacks::default()));
         let last_event_sequence = Arc::new(Mutex::new(None));

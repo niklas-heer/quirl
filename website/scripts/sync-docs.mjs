@@ -59,6 +59,7 @@ const documents = [
   ['docs/decisions/0014-external-history-provider-boundary.md', 'architecture/decisions/0014-external-history-provider-boundary.mdx'],
   ['docs/decisions/0015-bounded-theme-preview-gallery.md', 'architecture/decisions/0015-bounded-theme-preview-gallery.mdx'],
   ['docs/decisions/0016-runtime-layering-contract.md', 'architecture/decisions/0016-runtime-layering-contract.mdx'],
+  ['docs/decisions/0017-shared-execution-contract.md', 'architecture/decisions/0017-shared-execution-contract.mdx'],
 ];
 
 const pageBySource = new Map(documents);

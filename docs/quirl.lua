@@ -105,7 +105,7 @@ quirl = {}
 ---@return string
 function quirl.cwd() end
 
----Run a command through Quirl's compatibility shell.
+---Run a command through the composed bounded native process host.
 ---@param command string
 ---@return quirl.Result
 function quirl.process.run(command) end

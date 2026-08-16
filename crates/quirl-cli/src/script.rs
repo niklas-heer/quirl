@@ -47,6 +47,13 @@ pub struct ScriptCancellation {
     cancelled: Arc<AtomicBool>,
 }
 
+impl ScriptCancellation {
+    /// Share an existing cancellation identity with a composed execution request.
+    pub(crate) fn from_atomic(cancelled: Arc<AtomicBool>) -> Self {
+        Self { cancelled }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct AnalysisReport {
     document_type: &'static str,

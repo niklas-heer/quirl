@@ -6,13 +6,14 @@
 //! values at `open`/`files`.
 
 use quirl_core::{
-    directory_entries, escape_terminal_controls, ErrorCode, ProcessHost, ProcessRequest, ShellError,
+    directory_entries, escape_terminal_controls, ErrorCode, ProcessHost, ProcessRequest,
+    ShellError, StructuredValue,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -61,122 +62,11 @@ impl Default for DataLimits {
     }
 }
 
-/// Stable machine-facing typed values. The native expression parser currently
-/// emits JSON-compatible values; domain variants are reserved for adapters and
-/// host boundaries so a path or size does not need to masquerade as text.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(
-    tag = "type",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum DataValue {
-    /// Absence of a value, equivalent to JSON `null`.
-    Nothing,
-    /// A Boolean value.
-    Bool(bool),
-    /// A signed 64-bit integer.
-    Int(i64),
-    /// An unsigned 64-bit integer.
-    UInt(u64),
-    /// A decimal represented as text without conversion through binary floating point.
-    Decimal(String),
-    /// UTF-8 text without domain-specific semantics.
-    String(String),
-    /// An ordered sequence of typed values.
-    List(Vec<DataValue>),
-    /// A deterministically ordered mapping from field names to values.
-    Record(BTreeMap<String, DataValue>),
-    /// A filesystem path represented as UTF-8 text.
-    ///
-    /// Human-facing renderers are responsible for escaping terminal controls.
-    Path(String),
-    /// An elapsed duration represented in nanoseconds.
-    Duration {
-        /// Unsigned duration magnitude in nanoseconds.
-        nanoseconds: u64,
-    },
-    /// A byte size.
-    Size {
-        /// Unsigned size magnitude in bytes.
-        bytes: u64,
-    },
-    /// A date and time represented as UTF-8 text; consumers define the accepted syntax.
-    DateTime(String),
-    /// A pattern preserved in its source representation.
-    Pattern(String),
-}
-
-impl DataValue {
-    /// Convert a JSON-compatible value into Quirl's stable typed representation.
-    pub fn from_json(value: Value) -> Self {
-        match value {
-            Value::Null => Self::Nothing,
-            Value::Bool(value) => Self::Bool(value),
-            Value::Number(value) => match (value.as_i64(), value.as_u64()) {
-                (Some(value), _) => Self::Int(value),
-                (_, Some(value)) => Self::UInt(value),
-                _ => Self::Decimal(value.to_string()),
-            },
-            Value::String(value) => Self::String(value),
-            Value::Array(values) => Self::List(values.into_iter().map(Self::from_json).collect()),
-            Value::Object(values) => Self::Record(
-                values
-                    .into_iter()
-                    .map(|(key, value)| (key, Self::from_json(value)))
-                    .collect(),
-            ),
-        }
-    }
-
-    fn display_value(&self) -> String {
-        match self {
-            Self::Nothing => "null".to_owned(),
-            Self::Bool(value) => value.to_string(),
-            Self::Int(value) => value.to_string(),
-            Self::UInt(value) => value.to_string(),
-            Self::Decimal(value)
-            | Self::String(value)
-            | Self::Path(value)
-            | Self::DateTime(value)
-            | Self::Pattern(value) => value.clone(),
-            Self::Duration { nanoseconds } => format!("{nanoseconds}ns"),
-            Self::Size { bytes } => format!("{bytes}B"),
-            // Plain output is for people. Keep the typed/tagged representation
-            // at the JSON ABI boundary, but do not expose those implementation
-            // tags when showing a nested native value at a terminal.
-            Self::List(_) | Self::Record(_) => serde_json::to_string(&self.json_value())
-                .unwrap_or_else(|_| "<unrenderable structured value>".to_owned()),
-        }
-    }
-
-    fn json_value(&self) -> Value {
-        match self {
-            Self::Nothing => Value::Null,
-            Self::Bool(value) => Value::Bool(*value),
-            Self::Int(value) => Value::from(*value),
-            Self::UInt(value) => Value::from(*value),
-            // Accept only numeric re-parses so a hand-built `Decimal` holding
-            // `null`, `true`, or structured JSON cannot change kind here.
-            Self::Decimal(value) => serde_json::from_str::<serde_json::Number>(value)
-                .map_or_else(|_| Value::String(value.clone()), Value::Number),
-            Self::String(value)
-            | Self::Path(value)
-            | Self::DateTime(value)
-            | Self::Pattern(value) => Value::String(value.clone()),
-            Self::Duration { nanoseconds } => Value::String(format!("{nanoseconds}ns")),
-            Self::Size { bytes } => Value::String(format!("{bytes}B")),
-            Self::List(values) => Value::Array(values.iter().map(Self::json_value).collect()),
-            Self::Record(values) => Value::Object(
-                values
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.json_value()))
-                    .collect(),
-            ),
-        }
-    }
-}
+/// Compatibility name for the shared structured value owned by `quirl-core`.
+///
+/// Data parsing, streams, and rendering remain in this crate; the value itself
+/// is shared with other execution front doors without a second ABI type.
+pub type DataValue = StructuredValue;
 
 /// Stable machine-facing data shapes. `Option`, `Result`, and `Task` are
 /// envelopes rather than hidden control flow. Runtime failures remain
@@ -507,7 +397,11 @@ impl DataOutput {
         }
     }
 
-    fn into_envelope(self, cancelled: &AtomicBool) -> Result<DataEnvelope, ShellError> {
+    /// Materialize this output into the stable bounded data envelope.
+    ///
+    /// Live streams are collected only at this explicit boundary and remain
+    /// subject to their configured row, field, depth, and retained-value limits.
+    pub fn into_envelope(self, cancelled: &AtomicBool) -> Result<DataEnvelope, ShellError> {
         match self {
             Self::Value(value) => Ok(DataEnvelope::value(value)),
             // The JSON envelope is an explicit machine boundary, so it owns the

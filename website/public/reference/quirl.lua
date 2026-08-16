@@ -105,7 +105,7 @@ quirl = {}
 ---@return string
 function quirl.cwd() end
 
----Run a command through Quirl's compatibility shell.
+---Run a command through the composed bounded native process host.
 ---@param command string
 ---@return quirl.Result
 function quirl.process.run(command) end
@@ -131,6 +131,6 @@ function quirl.plugin.command(spec) end
 ---@param spec quirl.EventSubscription
 function quirl.events.subscribe(spec) end
 
----Register a typed catalog, completion, analysis, view, panel, or knowledge contribution.
+---Register a typed catalog, completion, or panel contribution.
 ---@param spec quirl.Contribution
 function quirl.extension.contribute(spec) end

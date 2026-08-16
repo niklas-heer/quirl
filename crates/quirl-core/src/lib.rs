@@ -1,11 +1,21 @@
 //! Shared execution and error contracts for every Quirl surface.
 
 mod error;
+mod execution;
 mod extension;
 mod process;
 mod protocol;
 
 pub use error::{ErrorCode, ErrorLabel, ShellError};
+pub use execution::{
+    ExecutionCancellation, ExecutionCleanupOwner, ExecutionCleanupState, ExecutionEffect,
+    ExecutionEffects, ExecutionInput, ExecutionMode, ExecutionOutcome, ExecutionOutput,
+    ExecutionOutputTarget, ExecutionPlan, ExecutionRequest, ExecutionSource, ExecutionSpan,
+    ExecutionStatus, StructuredValue, EXECUTION_ARGUMENTS_MAX, EXECUTION_ARGUMENT_BYTES_MAX,
+    EXECUTION_BYTES_MAX, EXECUTION_DEADLINE_MAX, EXECUTION_DIAGNOSTICS_MAX,
+    EXECUTION_SOURCE_BYTES_MAX, EXECUTION_SOURCE_NAME_BYTES_MAX, EXECUTION_VALUE_DEPTH_MAX,
+    EXECUTION_VALUE_NODES_MAX, EXECUTION_VALUE_TEXT_BYTES_MAX,
+};
 pub use extension::{
     escape_json_terminal_controls, escape_terminal_controls, escape_terminal_line,
     extension_schema_hash, reject_json_terminal_controls, reject_terminal_controls,
