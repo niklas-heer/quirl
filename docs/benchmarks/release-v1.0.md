@@ -1,19 +1,21 @@
 # 0.1.0 release performance record
 
-**Measured:** 16 August 2026 at 00:23:37 UTC
+**Measured:** 16 August 2026 at 00:49:55 UTC
 
-**Source:** `0dfc3a481f5a9eb8865d0a6106ffb8d5aada524e` (clean)
+**Source:** `c5a8d757a35a92a9a269686a1cd166c5a486e2b3` (clean)
 
-**Artifact SHA-256:** `d2199715c8fc4b2acfac9df0f41a6cdc0febddcb63395a22e4f78ef79234f0cf`
+**Artifact SHA-256:** `12989bce23eccda4330cd815f5b234fb7c59e5c5cc23f5f93987592af3f0341e`
 
 **Release gate:** **passed all release budgets**
 
 This record measures the exact `quirl 0.1.0` artifact named above. Report
-schema v4 rejects tracked or untracked source changes, verifies the artifact's
-embedded source revision, profile, optimization level, panic strategy,
-operating system, and architecture, and hashes the measured executable. The
-artifact therefore cannot be silently replaced by a different build while
-retaining a passing report.
+schema v5 rejects tracked or untracked source changes, requires an independently
+supplied SHA-256, copies the artifact into a private read-only staging directory,
+and verifies the staged copy before any execution. It also verifies the
+artifact's embedded source revision, profile, optimization level, panic
+strategy, operating system, and architecture. The report therefore does not
+trust the artifact's self-description as its identity and uses one read-only
+staged copy for metadata, timing, and size measurements.
 
 The harness runs the actual Quirl binary in a fresh pseudo-terminal for each
 end-to-end sample and reconstructs terminal frames from the PTY byte stream.
@@ -29,7 +31,7 @@ monitor-scanout latency.
 | Rust | `rustc 1.88.0 (6b00bc388 2025-06-23)`, LLVM 20.1.5 |
 | Cargo | `cargo 1.88.0 (873a06493 2025-05-10)` |
 | Build | Cargo `release`; `opt-level=z`; fat LTO; one codegen unit; symbols stripped; `panic=unwind` |
-| Quirl | `quirl 0.1.0`, 3,861,728-byte executable |
+| Quirl | `quirl 0.1.0`, 3,861,808-byte executable |
 | PTY | 120 columns × 40 rows, `TERM=xterm-256color`, truecolor advertised |
 
 The machine was not isolated. CPU frequency, thermal state, scheduler load,
@@ -43,10 +45,10 @@ phase timeout.
 
 | Measurement | Valid samples | P50 | P95 | Target | Outcome |
 | --- | ---: | ---: | ---: | --- | --- |
-| Process start to editable prompt | 101/101 | 12.164 | 13.321 | P50 ≤25 ms | **Within** |
-| Final keystroke to corresponding frame | 101/101 | 0.190 | 0.243 | P95 ≤8 ms | **Within** |
-| Process start to first prompt frame | 101/101 | 11.953 | 13.057 | ≤16 ms | **Within (conservative P95)** |
-| Release executable size | — | 3,861,728 bytes | — | ≤5,242,880 bytes | **Within: 1,381,152 bytes headroom** |
+| Process start to editable prompt | 101/101 | 12.093 | 13.323 | P50 ≤25 ms | **Within** |
+| Final keystroke to corresponding frame | 101/101 | 0.187 | 0.237 | P95 ≤8 ms | **Within** |
+| Process start to first prompt frame | 101/101 | 11.936 | 13.145 | ≤16 ms | **Within (conservative P95)** |
+| Release executable size | — | 3,861,808 bytes | — | ≤5,242,880 bytes | **Within: 1,381,072 bytes headroom** |
 
 The language specification leaves the first-prompt percentile unspecified, so
 the gate conservatively enforces P95. The 5 MiB binary limit is the frozen
@@ -73,9 +75,9 @@ gate.
 
 | Probe | Samples | P50 | P95 | Scope |
 | --- | ---: | ---: | ---: | --- |
-| `quirl --version` subprocess | 31 | 3.582 ms | 5.258 ms | Process/loading/argument lower bound |
-| Completion, semantic-highlight proxy, prompt render | 2,000 | 0.0172 ms | 0.0217 ms | Headless CPU only |
-| Fresh prompt construction and render | 500 | 0.0071 ms | 0.0077 ms | Headless CPU only |
+| `quirl --version` subprocess | 31 | 3.571 ms | 5.325 ms | Process/loading/argument lower bound |
+| Completion, semantic-highlight proxy, prompt render | 2,000 | 0.0170 ms | 0.0214 ms | Headless CPU only |
+| Fresh prompt construction and render | 500 | 0.0072 ms | 0.0100 ms | Headless CPU only |
 
 ## Reproduce
 
