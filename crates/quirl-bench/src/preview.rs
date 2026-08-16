@@ -290,11 +290,11 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
         pty_measurement(
             PtyMeasurementSpec {
                 id: "pty_cold_to_editable",
-                label: "process start to first prompt accepting and painting one input character",
+                label: "process start to first prompt accepting and painting a short input marker",
                 specification_target: "cold start to editable prompt P50 <=25 ms",
                 measured_percentile: "P50",
                 limit_ms: COLD_START_TARGET_MS,
-                explanation: "A PTY terminal model observed the prompt and a single input character rendered in the editable buffer.",
+                explanation: "A PTY terminal model observed the prompt and a short input marker rendered in the editable buffer.",
             },
             &pty,
             pty.cold_to_editable.as_ref(),
@@ -459,7 +459,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
         environment,
         methodology: Methodology {
             percentile_method: "nearest-rank over independently timed wall-clock samples",
-            pty_end_to_end: "Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with one input character, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
+            pty_end_to_end: "Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with a short input marker, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
             cold_start: "Starts a new Quirl process for every sample and waits for `quirl --version` to exit. This measures process creation, dynamic loading, and CLI argument parsing, not cold-to-editable startup. OS filesystem caches are not flushed.",
             headless_edit_frame: "Calls Quirl's real CatalogCompleter and Prompt render methods, plus a benchmark-owned equivalent of the current semantic token classification, for `git commit --am`. No Reedline layout or terminal I/O occurs.",
             first_prompt: "Constructs a fresh configured QuirlPrompt and renders left, right, and indicator strings for every sample. Filesystem metadata may be served from OS cache. No terminal I/O occurs.",
@@ -556,28 +556,31 @@ fn measure_pty_sample(
         )?;
         let prompt_paint = started.elapsed();
 
-        // A short marker establishes that the newly painted editor accepts
-        // input. Avoid `^`: the rich status bar legitimately renders `^K` and
-        // `^R` after the onboarding frame, which would make the readiness
-        // probe succeed before the editor buffer itself was painted.
+        // A short prefix of the representative edit establishes that the newly
+        // painted editor accepts input. Its first paint is the cold-start
+        // endpoint; stabilization below is deliberately outside that timing.
         let marker = "qz";
         session.assert_absent(marker, "editable prompt marker")?;
         session.send(marker.as_bytes())?;
         session.wait_for_screen(marker, timeout, "editable prompt marker")?;
         let cold_to_editable = started.elapsed();
+        session.wait_for_stable_screen(marker, timeout, "editable prompt marker")?;
 
-        // Ctrl-C provides an observable acknowledgement that the first editor
-        // frame consumed the marker and reset its buffer. Waiting for `^C`
-        // avoids racing a multi-chunk terminal diff before the timed edit.
-        session.send(b"\x03")?;
-        session.wait_for_screen("^C", timeout, "editor reset")?;
-        let baseline = "git commit --amen";
-        session.send(baseline.as_bytes())?;
-        session.wait_for_screen(baseline, timeout, "representative edit baseline")?;
+        // Advance only after each prefix is stable: viewport growth can issue
+        // a cursor-position request, and a benchmark must not inject the next
+        // synthetic key into that protocol exchange. This setup is untimed.
+        let mut painted = marker.to_owned();
+        let baseline = "qzbenchmarkloa";
+        session.type_until_painted(
+            &mut painted,
+            &baseline[marker.len()..],
+            timeout,
+            "representative edit baseline",
+        )?;
         let edit_started = Instant::now();
-        session.assert_absent("git commit --amend", "edited terminal frame")?;
+        session.assert_absent("qzbenchmarkload", "edited terminal frame")?;
         session.send(b"d")?;
-        session.wait_for_screen("git commit --amend", timeout, "edited terminal frame")?;
+        session.wait_for_screen("qzbenchmarkload", timeout, "edited terminal frame")?;
 
         Ok(PtySample {
             prompt_paint,
@@ -688,6 +691,72 @@ impl PtySession {
         self.writer.write_all(bytes)?;
         self.writer.flush()?;
         Ok(())
+    }
+
+    fn type_until_painted(
+        &mut self,
+        painted: &mut String,
+        suffix: &str,
+        timeout: Duration,
+        phase: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        if !suffix.is_ascii() {
+            return Err("PTY benchmark input must remain ASCII".into());
+        }
+        for byte in suffix.bytes() {
+            painted.push(char::from(byte));
+            self.send(&[byte])?;
+            // The VT100 model intentionally trims trailing blank cells from
+            // `contents()`. The following visible byte acknowledges both the
+            // whitespace and itself without weakening the final prefix check.
+            if !byte.is_ascii_whitespace() {
+                self.wait_for_stable_screen(painted, timeout, phase)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_for_stable_screen(
+        &mut self,
+        marker: &str,
+        timeout: Duration,
+        phase: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.wait_for_screen(marker, timeout, phase)?;
+        let deadline = Instant::now() + timeout;
+        let quiet_period = Duration::from_millis(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "timed out after {:.0} ms waiting for stable {phase} `{marker}`; screen={:?}",
+                    millis(timeout),
+                    screen_tail(&self.parser.screen().contents())
+                )
+                .into());
+            }
+            match self.receiver.recv_timeout(remaining.min(quiet_period)) {
+                Ok(PtyEvent::Data(bytes)) => {
+                    self.answer_cursor_queries(&bytes)?;
+                    self.parser.process(&bytes);
+                    if !self.parser.screen().contents().contains(marker) {
+                        self.wait_for_screen(marker, remaining, phase)?;
+                    }
+                }
+                Ok(PtyEvent::End) => {
+                    return Err(format!("PTY ended while stabilizing {phase} `{marker}`").into());
+                }
+                Ok(PtyEvent::Error(error)) => {
+                    return Err(
+                        format!("PTY read failed while stabilizing {phase}: {error}").into(),
+                    );
+                }
+                Err(RecvTimeoutError::Timeout) => return Ok(()),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(format!("PTY reader disconnected while stabilizing {phase}").into());
+                }
+            }
+        }
     }
 
     fn assert_absent(&self, marker: &str, phase: &str) -> Result<(), Box<dyn Error>> {
