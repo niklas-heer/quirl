@@ -348,6 +348,17 @@ impl EditMode for QuirlEditMode {
             PickerInvocation::Action.activate(&self.picker_invocation);
             return picker_menu_event(ACTION_PICKER_MENU, replace_active);
         }
+        if matches!(
+            event,
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            })
+        ) {
+            PickerInvocation::None.activate(&self.picker_invocation);
+            return ReedlineEvent::Enter;
+        }
         if PickerInvocation::from_state(&self.picker_invocation) != PickerInvocation::None
             && ends_picker_session(&event)
         {
@@ -2011,6 +2022,31 @@ mod tests {
         let mut helix = configured_edit_mode("helix");
 
         assert_eq!(helix.parse_event(event), completion_menu_event());
+    }
+
+    #[test]
+    fn every_keymap_submits_enter_and_closes_picker_state() {
+        for keymap in ["emacs", "vim", "helix"] {
+            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
+            let mut edit_mode =
+                configured_edit_mode_with_picker(keymap, Arc::clone(&picker_invocation));
+            let enter = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+            assert_eq!(
+                edit_mode.parse_event(enter),
+                ReedlineEvent::Enter,
+                "{keymap}"
+            );
+            assert_eq!(
+                PickerInvocation::from_state(&picker_invocation),
+                PickerInvocation::None,
+                "picker state in {keymap}"
+            );
+        }
     }
 
     #[test]

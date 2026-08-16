@@ -693,7 +693,7 @@ mod platform {
             }
 
             let process_group = spawned.process_group;
-            let terminal = ForegroundTerminal::give_to(process_group)?;
+            let mut terminal = ForegroundTerminal::give_to(process_group)?;
             let mut children = spawned.release();
             let output_limit = request.map_or(usize::MAX, |request| request.max_output_bytes);
             let stdout_reader = capture_reader.map(|reader| spawn_reader(reader, output_limit));
@@ -715,13 +715,13 @@ mod platform {
             }
             if let Some(error) = wait_error {
                 terminate_children(&mut children, process_group);
-                drop(terminal);
+                let _ = terminal.restore();
                 let _ = join_reader(stdout_reader, "pipeline output");
                 let _ = join_readers(stderr_readers, "command error output");
                 let _ = join_writers(writers);
                 return Err(error);
             }
-            drop(terminal);
+            terminal.restore()?;
             let status = children
                 .get(child_count.saturating_sub(1))
                 .and_then(|child| child.exit_status)
@@ -800,7 +800,7 @@ mod platform {
         fn foreground(&mut self, id: Option<u32>) -> Result<CommandOutcome, ShellError> {
             self.refresh_jobs();
             let index = select_job(&self.jobs, id)?;
-            let terminal = ForegroundTerminal::give_to(self.jobs[index].state.process_group)?;
+            let mut terminal = ForegroundTerminal::give_to(self.jobs[index].state.process_group)?;
             resume_job(&self.jobs[index])?;
             let mut job = self.jobs.remove(index);
             let mut wait_error = None;
@@ -821,7 +821,7 @@ mod platform {
                 terminate_children(&mut job.children, job.state.process_group);
                 return Err(error);
             }
-            drop(terminal);
+            terminal.restore()?;
             let status = job
                 .children
                 .last()
@@ -1738,18 +1738,39 @@ mod platform {
                 restore_modes,
             })
         }
+
+        fn restore(&mut self) -> Result<(), ShellError> {
+            let Some(group) = self.restore_group else {
+                return Ok(());
+            };
+            let _blocked = BlockedTerminalSignals::new()?;
+            tcsetpgrp(std::io::stdin(), group).map_err(|error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not return the terminal to Quirl after the foreground job",
+                )
+                .with_context(error.to_string())
+                .with_help("Run `jobs`, then retry the command from a controlling terminal")
+            })?;
+            if let Some(modes) = &self.restore_modes {
+                tcsetattr(std::io::stdin(), SetArg::TCSADRAIN, modes).map_err(|error| {
+                    ShellError::new(
+                        ErrorCode::Io,
+                        "could not restore terminal modes after the foreground job",
+                    )
+                    .with_context(error.to_string())
+                    .with_help("Run `reset` in the controlling terminal, then restart Quirl")
+                })?;
+            }
+            self.restore_group = None;
+            self.restore_modes = None;
+            Ok(())
+        }
     }
 
     impl Drop for ForegroundTerminal {
         fn drop(&mut self) {
-            if let Some(group) = self.restore_group {
-                if let Ok(_blocked) = BlockedTerminalSignals::new() {
-                    let _ = tcsetpgrp(std::io::stdin(), group);
-                    if let Some(modes) = &self.restore_modes {
-                        let _ = tcsetattr(std::io::stdin(), SetArg::TCSADRAIN, modes);
-                    }
-                }
-            }
+            let _ = self.restore();
         }
     }
 
