@@ -1718,6 +1718,23 @@ impl LuaRuntime {
         )
     }
 
+    /// Construct a restricted runtime that observes an existing cancellation
+    /// flag without injecting a process capability.
+    ///
+    /// Composition roots use this when an execution plan does not declare
+    /// [`ExecutionEffect::SpawnProcess`].
+    pub fn new_with_cancellation(
+        policy: LuaPolicy,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self, ShellError> {
+        Self::new_with_capabilities_process_host_and_cancellation(
+            policy,
+            &default_capabilities(policy),
+            None,
+            cancelled,
+        )
+    }
+
     /// Construct a runtime whose host handles are limited to explicit grants.
     pub fn new_with_capabilities(
         policy: LuaPolicy,

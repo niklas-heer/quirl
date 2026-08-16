@@ -391,6 +391,14 @@ def check_interactive_runtime(binary: Path, root: Path) -> None:
 
         session.send(b"\x1bm")
         session.wait_for(b"processes and byte pipelines")
+
+        # A Lua process callback narrows the shared plan deadline to the VM's
+        # security budget. Expiry must reap the child and restore the real PTY
+        # before the next native command is admitted.
+        session.type("lua return quirl.process.run('/bin/sleep 30')")
+        session.send(b"\r")
+        session.wait_for(b"exceeded its deadline")
+        wait_for_prompt(session)
         enter_and_wait(
             session,
             "/usr/bin/printf AFTER_%s DATA_CANCEL_RESTORED",

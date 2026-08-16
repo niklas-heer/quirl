@@ -399,6 +399,22 @@ impl ExtensionScheduler {
         cancelled_count
     }
 
+    /// Wait until every queued or running item from `batch` has quiesced.
+    ///
+    /// Callers use this only after cancellation so recovery and event
+    /// observers cannot overlap a partially stopped command callback.
+    pub(crate) fn wait_batch_idle(&self, batch: &ExtensionWorkBatch, timeout: Duration) -> bool {
+        let state = lock_recover(&self.shared.state);
+        let waited = self
+            .shared
+            .state_changed
+            .wait_timeout_while(state, timeout, |state| batch_is_retained(state, batch));
+        match waited {
+            Ok((state, _)) => !batch_is_retained(&state, batch),
+            Err(poisoned) => !batch_is_retained(&poisoned.into_inner().0, batch),
+        }
+    }
+
     pub(crate) fn shutdown(&mut self, timeout: Duration) -> ExtensionShutdownReport {
         let (queued_discarded, in_flight_cancelled, cancellations) = {
             let mut state = lock_recover(&self.shared.state);
@@ -454,6 +470,11 @@ impl ExtensionScheduler {
             let _ = monitor.join();
         }
     }
+}
+
+fn batch_is_retained(state: &SchedulerState, batch: &ExtensionWorkBatch) -> bool {
+    state.queue.iter().any(|work| batch.ids.contains(&work.id))
+        || batch.ids.iter().any(|id| state.in_flight.contains_key(id))
 }
 
 impl ExtensionSchedulerHandle {

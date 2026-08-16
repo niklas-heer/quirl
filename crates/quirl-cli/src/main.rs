@@ -60,7 +60,8 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{atomic::AtomicBool, mpsc, Arc, Mutex},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -314,9 +315,10 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             lang,
             arguments,
         }) => {
-            let output = script::run(&file, lang, &arguments)?;
-            print_json_value(output.value);
-            Ok(output.status)
+            let (request, _signals) = script::execution_request(&file, lang, &arguments)?;
+            let outcome = execute_execution_request(&mut NativeExecutor::default(), request, None)?;
+            print_execution_outcome(&outcome)?;
+            Ok(outcome.status_code())
         }
         Some(Command::Eval { expression }) => {
             let request = execution_request(
@@ -553,6 +555,109 @@ fn execution_request(
     )
 }
 
+/// Scoped deadline observer for engines whose public pull API accepts only the
+/// shared cancellation flag. The worker is always stopped and joined before
+/// outcome publication, so no deadline task can outlive its execution plan.
+struct DeadlineCancellationGuard {
+    stop: Option<mpsc::Sender<()>>,
+    worker: Option<JoinHandle<()>>,
+    expired: Arc<AtomicBool>,
+}
+
+impl DeadlineCancellationGuard {
+    fn arm(plan: &quirl_core::ExecutionPlan, stage: &str) -> Result<Self, ShellError> {
+        plan.ensure_active(stage)?;
+        let remaining = plan.deadline().ensure_remaining(stage)?;
+        let cancelled = plan.cancellation().atomic();
+        let expired = Arc::new(AtomicBool::new(false));
+        let worker_expired = Arc::clone(&expired);
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("quirl-execution-deadline".to_owned())
+            .spawn(move || {
+                if matches!(
+                    receiver.recv_timeout(remaining),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) && cancelled
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    worker_expired.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+            .map_err(|error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not start the execution deadline observer",
+                )
+                .with_context(error.to_string())
+                .with_help("Retry the operation; report repeated deadline observer failures")
+            })?;
+        Ok(Self {
+            stop: Some(sender),
+            worker: Some(worker),
+            expired,
+        })
+    }
+
+    fn finish<T>(
+        mut self,
+        result: Result<T, ShellError>,
+        plan: &quirl_core::ExecutionPlan,
+        stage: &str,
+    ) -> Result<T, ShellError> {
+        if let Err(cleanup_error) = self.stop_and_join() {
+            return match result {
+                Err(error) => Err(error.with_context(format!(
+                    "deadline observer cleanup also failed: {}",
+                    cleanup_error.message
+                ))),
+                Ok(_) => Err(cleanup_error),
+            };
+        }
+        if self.expired.load(std::sync::atomic::Ordering::Relaxed) {
+            return match plan.deadline().ensure_remaining(stage) {
+                Err(error) => Err(error),
+                Ok(_) => Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "execution deadline observer stopped the operation",
+                )
+                .with_context(format!("deadline observed {stage}"))
+                .with_help("Use a shorter-running operation or increase the execution deadline")),
+            };
+        }
+        if plan.cancellation().is_cancelled() {
+            return plan.cancellation().ensure_active(stage).and(result);
+        }
+        result
+    }
+
+    fn stop_and_join(&mut self) -> Result<(), ShellError> {
+        self.stop.take();
+        let Some(worker) = self.worker.take() else {
+            return Ok(());
+        };
+        worker.join().map_err(|_| {
+            ShellError::new(ErrorCode::Io, "execution deadline observer failed")
+                .with_help("Retry the operation; report repeated deadline observer failures")
+        })
+    }
+}
+
+impl Drop for DeadlineCancellationGuard {
+    fn drop(&mut self) {
+        self.stop.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// The sole CLI mode-selection point for executable command, data, Lua, and
 /// explicit reference-shell requests. Each branch delegates resource ownership
 /// to its existing engine and returns only bounded passive values.
@@ -562,8 +667,7 @@ fn execute_execution_request(
     extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
 ) -> Result<ExecutionOutcome, ShellError> {
     let plan = request.plan()?;
-    plan.cancellation()
-        .ensure_active("before engine initialization")?;
+    plan.ensure_active("before engine initialization")?;
     if !matches!(plan.input(), ExecutionInput::None) {
         return Err(ShellError::new(
             ErrorCode::Validation,
@@ -572,8 +676,12 @@ fn execute_execution_request(
         .with_command(plan.source().text())
         .with_help("Use an explicit engine adapter until P08/P09 add typed stream composition"));
     }
+    let deadline_guard = DeadlineCancellationGuard::arm(&plan, "before mode dispatch")?;
     let result = match plan.mode() {
         ExecutionMode::NativeCommand => execute_native_plan(executor, &plan),
+        ExecutionMode::QuirlScript | ExecutionMode::LuaScript => {
+            script::execute_plan(executor, &plan)
+        }
         ExecutionMode::Data => execute_data_plan(&plan),
         ExecutionMode::Lua => execute_lua_plan(&plan),
         ExecutionMode::Bash | ExecutionMode::Zsh => execute_reference_plan(&plan),
@@ -602,28 +710,55 @@ fn execute_execution_request(
         .with_command(plan.source().text())
         .with_help("Use a native, data, Lua, Bash, or Zsh front door in this release")),
     };
-    result.map_err(|error| preserve_execution_source(error, plan.source()))
+    let result = deadline_guard.finish(result, &plan, "during engine execution");
+    match result {
+        Ok(outcome) => {
+            plan.ensure_active("before outcome commit")
+                .map_err(|error| preserve_execution_source(error, plan.source()))?;
+            Ok(outcome)
+        }
+        Err(error) => Err(preserve_execution_source(error, plan.source())),
+    }
 }
 
 fn execute_native_plan(
     executor: &mut NativeExecutor,
     plan: &quirl_core::ExecutionPlan,
 ) -> Result<ExecutionOutcome, ShellError> {
+    require_declared_effect(plan, ExecutionEffect::SpawnProcess)?;
+    let deadline = plan
+        .deadline()
+        .ensure_remaining("before native process startup")?;
+    let request = ProcessRequest {
+        command: plan.source().text().to_owned(),
+        deadline,
+        cancelled: plan.cancellation().atomic(),
+        max_output_bytes: match plan.output() {
+            ExecutionOutputTarget::Capture {
+                max_bytes_per_stream,
+            } => max_bytes_per_stream,
+            ExecutionOutputTarget::Inherit => 1,
+            ExecutionOutputTarget::Value => {
+                return Err(representation_error(plan, "native commands return bytes"));
+            }
+        },
+    };
     let outcome = match plan.output() {
         ExecutionOutputTarget::Capture {
-            max_bytes_per_stream,
-        } => executor.execute_capture_request(ProcessRequest {
-            command: plan.source().text().to_owned(),
-            deadline: plan.deadline(),
-            cancelled: plan.cancellation().atomic(),
-            max_output_bytes: max_bytes_per_stream,
-        })?,
-        ExecutionOutputTarget::Inherit => executor.execute_interactive(plan.source().text())?,
-        ExecutionOutputTarget::Value => {
-            return Err(representation_error(plan, "native commands return bytes"));
-        }
+            max_bytes_per_stream: _,
+        } => executor.execute_capture_request(request)?,
+        ExecutionOutputTarget::Inherit => executor.execute_interactive_request(request)?,
+        ExecutionOutputTarget::Value => unreachable!("value output was rejected above"),
     };
-    command_execution_outcome(outcome, plan.output())
+    let mut normalized = ExecutionOutcome::from_command(outcome, plan.output())?;
+    if executor
+        .jobs()
+        .iter()
+        .any(|job| job.status != JobStatus::Done)
+    {
+        normalized.cleanup = ExecutionCleanupState::RetainedByEngine;
+    }
+    Ok(normalized)
 }
 
 fn execute_data_plan(plan: &quirl_core::ExecutionPlan) -> Result<ExecutionOutcome, ShellError> {
@@ -634,11 +769,19 @@ fn execute_data_plan(plan: &quirl_core::ExecutionPlan) -> Result<ExecutionOutcom
         ));
     }
     let cancelled = plan.cancellation().atomic();
-    let value = DataRuntime::with_process_host(sandboxed_process_host())
+    let runtime = if plan
+        .declared_effects()
+        .contains(ExecutionEffect::SpawnProcess)
+    {
+        DataRuntime::with_process_host(sandboxed_process_host())
+    } else {
+        DataRuntime::new()
+    };
+    let value = runtime
         .eval_output_with_cancellation_handle(plan.source().text(), Arc::clone(&cancelled))?
         .into_envelope(&cancelled)?;
     let output = data_envelope_output(value)?;
-    plan.cancellation().ensure_active("after data execution")?;
+    plan.ensure_active("after data execution")?;
     ExecutionOutcome::new(
         ExecutionStatus::Exited(0),
         output,
@@ -669,16 +812,25 @@ fn execute_lua_plan(plan: &quirl_core::ExecutionPlan) -> Result<ExecutionOutcome
         ));
     }
     let mut policy = LuaPolicy::script();
-    policy.wall_time = policy.wall_time.min(plan.deadline());
-    let runtime = LuaRuntime::new_with_process_host_and_cancellation(
-        policy,
-        sandboxed_process_host(),
-        plan.cancellation().atomic(),
-    )?;
-    plan.cancellation()
-        .ensure_active("after Lua initialization")?;
+    policy.wall_time = policy.wall_time.min(
+        plan.deadline()
+            .ensure_remaining("before Lua initialization")?,
+    );
+    let runtime = if plan
+        .declared_effects()
+        .contains(ExecutionEffect::SpawnProcess)
+    {
+        LuaRuntime::new_with_process_host_and_cancellation(
+            policy,
+            sandboxed_process_host(),
+            plan.cancellation().atomic(),
+        )?
+    } else {
+        LuaRuntime::new_with_cancellation(policy, plan.cancellation().atomic())?
+    };
+    plan.ensure_active("after Lua initialization")?;
     let value = runtime.eval(plan.source().text())?;
-    plan.cancellation().ensure_active("after Lua execution")?;
+    plan.ensure_active("after Lua execution")?;
     ExecutionOutcome::new(
         ExecutionStatus::Exited(0),
         ExecutionOutput::Value {
@@ -692,6 +844,7 @@ fn execute_lua_plan(plan: &quirl_core::ExecutionPlan) -> Result<ExecutionOutcome
 fn execute_reference_plan(
     plan: &quirl_core::ExecutionPlan,
 ) -> Result<ExecutionOutcome, ShellError> {
+    require_declared_effect(plan, ExecutionEffect::SpawnProcess)?;
     if !matches!(plan.output(), ExecutionOutputTarget::Capture { .. }) {
         return Err(representation_error(
             plan,
@@ -704,28 +857,39 @@ fn execute_reference_plan(
         _ => unreachable!("reference adapter received a non-reference mode"),
     };
     let cancellation = script::ScriptCancellation::from_atomic(plan.cancellation().atomic());
-    let outcome = script::run_interactive_island(language, plan.source().text(), &cancellation)?;
-    command_execution_outcome(outcome, plan.output())
+    let outcome = script::run_interactive_island(
+        language,
+        plan.source().text(),
+        plan.source().name(),
+        plan.arguments(),
+        plan.deadline(),
+        match plan.output() {
+            ExecutionOutputTarget::Capture {
+                max_bytes_per_stream,
+            } => max_bytes_per_stream,
+            ExecutionOutputTarget::Inherit | ExecutionOutputTarget::Value => {
+                unreachable!("reference representation was validated above")
+            }
+        },
+        &cancellation,
+    )?;
+    ExecutionOutcome::from_command(outcome, plan.output())
 }
 
-fn command_execution_outcome(
-    outcome: CommandOutcome,
-    target: ExecutionOutputTarget,
-) -> Result<ExecutionOutcome, ShellError> {
-    let output = match target {
-        ExecutionOutputTarget::Inherit => ExecutionOutput::Inherited,
-        ExecutionOutputTarget::Capture { .. } => ExecutionOutput::Bytes {
-            stdout: outcome.stdout.unwrap_or_default().into_bytes(),
-            stderr: outcome.stderr.unwrap_or_default().into_bytes(),
-        },
-        ExecutionOutputTarget::Value => unreachable!("byte engine accepted value output"),
-    };
-    ExecutionOutcome::new(
-        ExecutionStatus::Exited(outcome.status),
-        output,
-        Vec::new(),
-        ExecutionCleanupState::Complete,
+fn require_declared_effect(
+    plan: &quirl_core::ExecutionPlan,
+    effect: ExecutionEffect,
+) -> Result<(), ShellError> {
+    if plan.declared_effects().contains(effect) {
+        return Ok(());
+    }
+    Err(ShellError::new(
+        ErrorCode::Validation,
+        "execution plan does not declare required engine authority",
     )
+    .with_command(plan.source().text())
+    .with_context(format!("required effect: {effect:?}"))
+    .with_help("Declare and allow every effect before selecting this execution engine"))
 }
 
 fn representation_error(plan: &quirl_core::ExecutionPlan, expected: &str) -> ShellError {
@@ -887,19 +1051,52 @@ fn execute_with_recovery(
                 eprintln!("warning: {}", render_stderr_error(&journal_error));
             }
             if let Some(extensions) = extensions {
-                apply_observation_actions(
-                    notify_extensions(
-                        extensions,
-                        ExtensionEventData::Error {
-                            error: error.clone(),
-                        },
-                    ),
-                    &mut annotations,
-                );
+                notify_execution_error(extensions, &error, &mut annotations);
                 print_extension_annotations(&annotations);
             }
             Err(error)
         }
+    }
+}
+
+fn notify_execution_error(
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+    error: &ShellError,
+    annotations: &mut BTreeMap<String, serde_json::Value>,
+) {
+    if let Some(reason) = execution_interruption_reason(error) {
+        apply_observation_actions(
+            notify_extensions(
+                extensions,
+                ExtensionEventData::Cancellation {
+                    reason: reason.to_owned(),
+                },
+            ),
+            annotations,
+        );
+    }
+    apply_observation_actions(
+        notify_extensions(
+            extensions,
+            ExtensionEventData::Error {
+                error: error.clone(),
+            },
+        ),
+        annotations,
+    );
+}
+
+fn execution_interruption_reason(error: &ShellError) -> Option<&'static str> {
+    if error.code != ErrorCode::ResourceLimit {
+        return None;
+    }
+    let message = error.message.to_ascii_lowercase();
+    if message.contains("cancel") {
+        Some("execution cancelled")
+    } else if message.contains("deadline") || message.contains("wall_time") {
+        Some("execution deadline expired")
+    } else {
+        None
     }
 }
 
@@ -1191,23 +1388,27 @@ fn execute_interactive_data(
     )?
     .with_cancellation(signals.cancellation.clone());
     let plan = request.plan()?;
-    plan.cancellation()
-        .ensure_active("before interactive data initialization")?;
-    let cancelled = plan.cancellation().atomic();
-    let output = DataRuntime::with_process_host(sandboxed_process_host())
-        .eval_output_with_cancellation_handle(plan.source().text(), Arc::clone(&cancelled))?;
-    let mut stage = cache.stage();
-    let mut stdout = io::stdout().lock();
-    let bytes = render_interactive_data_output(output, &cancelled, &mut stdout, &mut stage)?;
-    plan.cancellation()
-        .ensure_active("after interactive data rendering")?;
+    let deadline_guard =
+        DeadlineCancellationGuard::arm(&plan, "before interactive data initialization")?;
+    let result = (|| {
+        let cancelled = plan.cancellation().atomic();
+        let output = DataRuntime::with_process_host(sandboxed_process_host())
+            .eval_output_with_cancellation_handle(plan.source().text(), Arc::clone(&cancelled))?;
+        let mut stage = cache.stage();
+        let mut stdout = io::stdout().lock();
+        let bytes = render_interactive_data_output(output, &cancelled, &mut stdout, &mut stage)?;
+        let outcome = ExecutionOutcome::new(
+            ExecutionStatus::Exited(0),
+            ExecutionOutput::Inherited,
+            Vec::new(),
+            ExecutionCleanupState::Complete,
+        )?;
+        Ok((outcome, bytes, stage))
+    })();
+    let (outcome, bytes, stage) =
+        deadline_guard.finish(result, &plan, "during interactive data execution")?;
+    plan.ensure_active("before interactive data cache commit")?;
     cache.commit(stage);
-    let outcome = ExecutionOutcome::new(
-        ExecutionStatus::Exited(0),
-        ExecutionOutput::Inherited,
-        Vec::new(),
-        ExecutionCleanupState::Complete,
-    )?;
     Ok((outcome, bytes))
 }
 
@@ -1578,15 +1779,7 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
                             }
                             Err(error) => {
                                 last_status = 1;
-                                apply_observation_actions(
-                                    notify_extensions(
-                                        &extensions,
-                                        ExtensionEventData::Error {
-                                            error: error.clone(),
-                                        },
-                                    ),
-                                    &mut annotations,
-                                );
+                                notify_execution_error(&extensions, &error, &mut annotations);
                                 print_extension_annotations(&annotations);
                                 eprintln!("{}", render_stderr_error(&error));
                             }
@@ -1617,10 +1810,14 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
                         );
                         let started = Instant::now();
                         match eval_lua(&mut lua, &planned.source) {
-                            Ok(value) => {
-                                last_status = 0;
-                                emit_value_output(&extensions, &value, &mut annotations);
-                                print_json_value(value);
+                            Ok(outcome) => {
+                                last_status = outcome.status_code();
+                                if let Some(value) = execution_value_json(&outcome) {
+                                    emit_value_output(&extensions, &value, &mut annotations);
+                                }
+                                if let Err(error) = print_execution_outcome(&outcome) {
+                                    eprintln!("{}", render_stderr_error(&error));
+                                }
                                 apply_observation_actions(
                                     notify_extensions(
                                         &extensions,
@@ -1636,7 +1833,7 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
                                     notify_extensions(
                                         &extensions,
                                         ExtensionEventData::Result {
-                                            status: 0,
+                                            status: outcome.status_code(),
                                             duration_ms: duration_millis(started.elapsed()),
                                         },
                                     ),
@@ -1646,15 +1843,7 @@ fn repl(catalog: Catalog, extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i3
                             }
                             Err(error) => {
                                 last_status = 1;
-                                apply_observation_actions(
-                                    notify_extensions(
-                                        &extensions,
-                                        ExtensionEventData::Error {
-                                            error: error.clone(),
-                                        },
-                                    ),
-                                    &mut annotations,
-                                );
+                                notify_execution_error(&extensions, &error, &mut annotations);
                                 print_extension_annotations(&annotations);
                                 eprintln!("{}", render_stderr_error(&error));
                             }
@@ -2339,18 +2528,58 @@ fn is_dumb_terminal(term: Option<&str>) -> bool {
 fn eval_lua(
     runtime: &mut Option<LuaRuntime>,
     source: &str,
-) -> Result<serde_json::Value, ShellError> {
-    if runtime.is_none() {
-        *runtime = Some(LuaRuntime::new_with_process_host(
-            LuaPolicy::script(),
-            sandboxed_process_host(),
-        )?);
+) -> Result<ExecutionOutcome, ShellError> {
+    if let Some(runtime) = runtime.as_ref() {
+        runtime.clear_cancellation();
     }
-    let runtime = runtime.as_ref().ok_or_else(|| {
-        ShellError::new(ErrorCode::Lua, "could not initialize the Lua runtime")
-            .with_help("Run the command again; if this persists, report the configuration used.")
-    })?;
-    runtime.eval(source)
+    let cancellation = runtime.as_ref().map_or_else(
+        ExecutionCancellation::default,
+        LuaRuntime::execution_cancellation,
+    );
+    let request = execution_request(
+        "<interactive-lua>",
+        source,
+        ExecutionMode::Lua,
+        ExecutionOutputTarget::Value,
+        ExecutionEffects::from_effects(&[ExecutionEffect::SpawnProcess]),
+    )?
+    .with_cancellation(cancellation);
+    let plan = request.plan()?;
+    let deadline_guard =
+        DeadlineCancellationGuard::arm(&plan, "before interactive Lua initialization")?;
+    let result = (|| {
+        if runtime.is_none() {
+            let mut policy = LuaPolicy::script();
+            policy.wall_time = policy.wall_time.min(
+                plan.deadline()
+                    .ensure_remaining("before interactive Lua VM construction")?,
+            );
+            *runtime = Some(LuaRuntime::new_with_process_host_and_cancellation(
+                policy,
+                sandboxed_process_host(),
+                plan.cancellation().atomic(),
+            )?);
+        }
+        let runtime = runtime.as_ref().ok_or_else(|| {
+            ShellError::new(ErrorCode::Lua, "could not initialize the Lua runtime").with_help(
+                "Run the command again; if this persists, report the configuration used.",
+            )
+        })?;
+        plan.ensure_active("before interactive Lua evaluation")?;
+        let value = runtime.eval(plan.source().text())?;
+        plan.ensure_active("after interactive Lua evaluation")?;
+        ExecutionOutcome::new(
+            ExecutionStatus::Exited(0),
+            ExecutionOutput::Value {
+                value: StructuredValue::from_json(value),
+            },
+            Vec::new(),
+            ExecutionCleanupState::Complete,
+        )
+    })();
+    let outcome = deadline_guard.finish(result, &plan, "during interactive Lua execution")?;
+    plan.ensure_active("before interactive Lua outcome commit")?;
+    Ok(outcome)
 }
 
 fn run_stdin() -> Result<i32, ShellError> {
@@ -2381,9 +2610,16 @@ fn run_stdin() -> Result<i32, ShellError> {
         .with_context(error.to_string())
         .with_help("Encode Lua source as UTF-8")
     })?;
-    let lua = LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
-    print_json_value(lua.eval(&source)?);
-    Ok(0)
+    let request = execution_request(
+        "<stdin>",
+        &source,
+        ExecutionMode::Lua,
+        ExecutionOutputTarget::Value,
+        ExecutionEffects::from_effects(&[ExecutionEffect::SpawnProcess]),
+    )?;
+    let outcome = execute_execution_request(&mut NativeExecutor::default(), request, None)?;
+    print_execution_value(&outcome)?;
+    Ok(outcome.status_code())
 }
 
 fn print_help(catalog: &Catalog, topic: Option<&str>) {
@@ -2466,6 +2702,16 @@ fn print_execution_value(outcome: &ExecutionOutcome) -> Result<(), ShellError> {
             "execution outcome did not contain a structured value",
         )
         .with_help("Report this as an execution adapter representation defect")),
+    }
+}
+
+fn execution_value_json(outcome: &ExecutionOutcome) -> Option<serde_json::Value> {
+    match &outcome.output {
+        ExecutionOutput::Value { value } => Some(value.json_value()),
+        ExecutionOutput::Values { values } => Some(serde_json::Value::Array(
+            values.iter().map(StructuredValue::json_value).collect(),
+        )),
+        ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => None,
     }
 }
 
@@ -3028,6 +3274,18 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
         }
+
+        let missing_authority = ExecutionRequest::new(
+            ExecutionSource::new("<contract-test>", "true").unwrap(),
+            ExecutionMode::NativeCommand,
+        )
+        .with_output(ExecutionOutputTarget::Inherit)
+        .with_effects(ExecutionEffects::none(), ExecutionEffects::all());
+        let error =
+            execute_execution_request(&mut NativeExecutor::default(), missing_authority, None)
+                .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("required engine authority"));
     }
 
     #[test]
@@ -3086,6 +3344,253 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.details.command.as_deref(), Some(source));
         }
+    }
+
+    #[test]
+    fn shared_plan_deadline_stops_every_reachable_engine() {
+        let mut cases = vec![
+            (
+                ExecutionMode::NativeCommand,
+                "sleep 10",
+                ExecutionOutputTarget::Inherit,
+            ),
+            (
+                ExecutionMode::NativeCommand,
+                "sleep 10",
+                ExecutionOutputTarget::Capture {
+                    max_bytes_per_stream: 64,
+                },
+            ),
+            (
+                ExecutionMode::QuirlScript,
+                "sleep 10",
+                ExecutionOutputTarget::Value,
+            ),
+            (
+                ExecutionMode::Data,
+                "^external sleep 10",
+                ExecutionOutputTarget::Value,
+            ),
+            (
+                ExecutionMode::Lua,
+                "return quirl.process.run('sleep 10')",
+                ExecutionOutputTarget::Value,
+            ),
+            (
+                ExecutionMode::LuaScript,
+                "return { abi_version = 1, main = function() quirl.process.run('sleep 10'); return { abi_version = 1, ok = true, status = 0, output = { kind = 'value', value = { type = 'nothing' } } } end }",
+                ExecutionOutputTarget::Value,
+            ),
+        ];
+        for (mode, executable) in [(ExecutionMode::Bash, "bash"), (ExecutionMode::Zsh, "zsh")] {
+            if shell_is_available(executable) {
+                cases.push((
+                    mode,
+                    "sleep 10",
+                    ExecutionOutputTarget::Capture {
+                        max_bytes_per_stream: 64,
+                    },
+                ));
+            } else {
+                eprintln!("skipping {executable} deadline contract: executable is unavailable");
+            }
+        }
+
+        for (mode, source, output) in cases {
+            let request = execution_request(
+                "<deadline-contract>",
+                source,
+                mode,
+                output,
+                ExecutionEffects::all(),
+            )
+            .unwrap()
+            .with_deadline(Duration::from_millis(20));
+            let started = Instant::now();
+            let error = execute_execution_request(&mut NativeExecutor::default(), request, None)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit, "mode {mode:?}");
+            assert!(started.elapsed() < Duration::from_secs(1), "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn shared_plan_cancellation_reaches_every_reachable_engine() {
+        let mut cases = vec![
+            (
+                ExecutionMode::NativeCommand,
+                "sleep 10",
+                ExecutionOutputTarget::Inherit,
+            ),
+            (
+                ExecutionMode::NativeCommand,
+                "sleep 10",
+                ExecutionOutputTarget::Capture {
+                    max_bytes_per_stream: 64,
+                },
+            ),
+            (
+                ExecutionMode::QuirlScript,
+                "sleep 10",
+                ExecutionOutputTarget::Value,
+            ),
+            (
+                ExecutionMode::Data,
+                "^external sleep 10",
+                ExecutionOutputTarget::Value,
+            ),
+            (
+                ExecutionMode::Lua,
+                "return quirl.process.run('sleep 10')",
+                ExecutionOutputTarget::Value,
+            ),
+            (
+                ExecutionMode::LuaScript,
+                "return { abi_version = 1, main = function() quirl.process.run('sleep 10'); return { abi_version = 1, ok = true, status = 0, output = { kind = 'value', value = { type = 'nothing' } } } end }",
+                ExecutionOutputTarget::Value,
+            ),
+        ];
+        for (mode, executable) in [(ExecutionMode::Bash, "bash"), (ExecutionMode::Zsh, "zsh")] {
+            if shell_is_available(executable) {
+                cases.push((
+                    mode,
+                    "sleep 10",
+                    ExecutionOutputTarget::Capture {
+                        max_bytes_per_stream: 64,
+                    },
+                ));
+            } else {
+                eprintln!("skipping {executable} cancellation contract: executable is unavailable");
+            }
+        }
+
+        for (mode, source, output) in cases {
+            let cancellation = ExecutionCancellation::default();
+            let worker_cancellation = cancellation.clone();
+            let request = execution_request(
+                "<cancellation-contract>",
+                source,
+                mode,
+                output,
+                ExecutionEffects::all(),
+            )
+            .unwrap()
+            .with_cancellation(worker_cancellation)
+            .with_deadline(Duration::from_secs(1));
+            let worker = thread::spawn(move || {
+                execute_execution_request(&mut NativeExecutor::default(), request, None)
+            });
+            thread::sleep(Duration::from_millis(20));
+            cancellation.cancel();
+            let error = worker.join().unwrap().unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit, "mode {mode:?}");
+            assert!(
+                error.message.contains("cancel"),
+                "mode {mode:?}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn plan_capture_limit_is_exact_for_native_and_reference_shells() {
+        let mut modes = vec![ExecutionMode::NativeCommand];
+        for (mode, executable) in [(ExecutionMode::Bash, "bash"), (ExecutionMode::Zsh, "zsh")] {
+            if shell_is_available(executable) {
+                modes.push(mode);
+            } else {
+                eprintln!("skipping {executable} capture contract: executable is unavailable");
+            }
+        }
+        for mode in modes {
+            let exact = execution_request(
+                "<capture-contract>",
+                "printf 1234",
+                mode,
+                ExecutionOutputTarget::Capture {
+                    max_bytes_per_stream: 4,
+                },
+                ExecutionEffects::all(),
+            )
+            .unwrap();
+            let outcome =
+                execute_execution_request(&mut NativeExecutor::default(), exact, None).unwrap();
+            assert!(matches!(
+                outcome.output,
+                ExecutionOutput::Bytes { ref stdout, .. } if stdout == b"1234"
+            ));
+
+            let overflow = execution_request(
+                "<capture-contract>",
+                "printf 12345",
+                mode,
+                ExecutionOutputTarget::Capture {
+                    max_bytes_per_stream: 4,
+                },
+                ExecutionEffects::all(),
+            )
+            .unwrap();
+            let error = execute_execution_request(&mut NativeExecutor::default(), overflow, None)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit, "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn inherited_native_output_has_no_capture_but_keeps_plan_control() {
+        let request = execution_request(
+            "<inherit-contract>",
+            "true",
+            ExecutionMode::NativeCommand,
+            ExecutionOutputTarget::Inherit,
+            ExecutionEffects::all(),
+        )
+        .unwrap();
+        let outcome =
+            execute_execution_request(&mut NativeExecutor::default(), request, None).unwrap();
+        assert_eq!(outcome.status_code(), 0);
+        assert_eq!(outcome.output, ExecutionOutput::Inherited);
+    }
+
+    #[test]
+    fn native_background_outcome_reports_retained_engine_cleanup() {
+        let request = execution_request(
+            "<cleanup-contract>",
+            "sleep 1 &",
+            ExecutionMode::NativeCommand,
+            ExecutionOutputTarget::Capture {
+                max_bytes_per_stream: 64,
+            },
+            ExecutionEffects::all(),
+        )
+        .unwrap();
+        let mut executor = NativeExecutor::default();
+        let outcome = execute_execution_request(&mut executor, request, None).unwrap();
+        assert_eq!(outcome.cleanup, ExecutionCleanupState::RetainedByEngine);
+        let job = executor.jobs()[0].clone();
+        executor.cancel_job(job.id).unwrap();
+    }
+
+    #[test]
+    fn interruption_events_distinguish_cancellation_and_deadline_from_other_limits() {
+        let cancelled = ShellError::new(ErrorCode::ResourceLimit, "execution was cancelled");
+        assert_eq!(
+            execution_interruption_reason(&cancelled),
+            Some("execution cancelled")
+        );
+        let deadline = ShellError::new(
+            ErrorCode::ResourceLimit,
+            "execution exceeded its absolute deadline",
+        );
+        assert_eq!(
+            execution_interruption_reason(&deadline),
+            Some("execution deadline expired")
+        );
+        let capture = ShellError::new(
+            ErrorCode::ResourceLimit,
+            "captured output exceeded its limit",
+        );
+        assert_eq!(execution_interruption_reason(&capture), None);
     }
 
     #[test]

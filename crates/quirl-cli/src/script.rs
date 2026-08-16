@@ -1,8 +1,10 @@
 use clap::ValueEnum;
 use quirl_core::{
     escape_json_terminal_controls, replace_file_atomically, AtomicReplaceOptions, ErrorCode,
-    ExecutionEffect, ExecutionEffects, ExecutionInput, ExecutionOutput, ExecutionOutputTarget,
-    ShellError,
+    ExecutionCancellation, ExecutionCleanupState, ExecutionDeadline, ExecutionEffects,
+    ExecutionInput, ExecutionMode, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget,
+    ExecutionPlan, ExecutionRequest, ExecutionSource, ExecutionStatus, ProcessRequest, ShellError,
+    StructuredValue, EXECUTION_CAPTURE_BYTES_MAX,
 };
 use quirl_data::{
     syntax::{
@@ -15,7 +17,7 @@ use quirl_process::{sandboxed_process_host, ChildProcessTree, NativeExecutor};
 use quirl_syntax::{check_script, parse_command_list};
 use quirl_ui::render_error;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::{
     collections::BTreeSet,
     fs,
@@ -28,14 +30,19 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+#[cfg(test)]
+use quirl_core::ExecutionEffect;
+#[cfg(test)]
+use serde_json::Value;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-const MAX_REFERENCE_CAPTURE_BYTES: usize = 64 * 1024;
 const QUIRL_CANONICAL_EXTENSION: &str = "qrl";
+const SCRIPT_EXECUTION_DEADLINE: Duration = Duration::from_secs(30);
 const QUIRL_EXTENSION_ALIASES: [&str; 2] = ["quirl", "🌀"];
 const AUTHORING_DISCOVERY_LIMITS: ScriptDiscoveryLimits = ScriptDiscoveryLimits {
     depth_max: 32,
@@ -66,8 +73,9 @@ pub enum ScriptLanguage {
     Zsh,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
-pub struct ScriptRunOutput {
+pub(crate) struct ScriptRunOutput {
     pub status: i32,
     pub value: Value,
 }
@@ -81,6 +89,19 @@ impl ScriptCancellation {
     /// Share an existing cancellation identity with a composed execution request.
     pub(crate) fn from_atomic(cancelled: Arc<AtomicBool>) -> Self {
         Self { cancelled }
+    }
+}
+
+/// Signal registrations kept alive for one planned `quirl run` invocation.
+pub(crate) struct ScriptSignalGuard {
+    signal_ids: Vec<signal_hook::SigId>,
+}
+
+impl Drop for ScriptSignalGuard {
+    fn drop(&mut self) {
+        for signal_id in self.signal_ids.drain(..) {
+            signal_hook::low_level::unregister(signal_id);
+        }
     }
 }
 
@@ -848,7 +869,8 @@ fn is_test_module(path: &Path) -> bool {
             .any(|component| component.as_os_str() == "tests")
 }
 
-pub fn run(
+#[cfg(test)]
+pub(crate) fn run(
     file: &Path,
     requested_language: Option<ScriptLanguage>,
     arguments: &[String],
@@ -894,6 +916,58 @@ pub fn run(
         signal_hook::low_level::unregister(signal_id);
     }
     result
+}
+
+/// Read, classify, and lower one script invocation into the shared execution
+/// request. The returned guard keeps the request's exact cancellation atomic
+/// connected to `SIGINT` until execution and cleanup finish.
+pub(crate) fn execution_request(
+    file: &Path,
+    requested_language: Option<ScriptLanguage>,
+    arguments: &[String],
+) -> Result<(ExecutionRequest, ScriptSignalGuard), ShellError> {
+    let (source, source_name) = if file == Path::new("-") {
+        (read_script_stdin()?, "<stdin>".to_owned())
+    } else {
+        (read_script_file(file)?, file.display().to_string())
+    };
+    let path = (file != Path::new("-")).then_some(file);
+    let language = detect_language(&source, path, requested_language)?;
+    let mode = match language {
+        ScriptLanguage::Lua => ExecutionMode::LuaScript,
+        ScriptLanguage::Quirl => ExecutionMode::QuirlScript,
+        ScriptLanguage::Bash => ExecutionMode::Bash,
+        ScriptLanguage::Zsh => ExecutionMode::Zsh,
+    };
+    let output = match language {
+        ScriptLanguage::Bash | ScriptLanguage::Zsh => ExecutionOutputTarget::Capture {
+            max_bytes_per_stream: EXECUTION_CAPTURE_BYTES_MAX,
+        },
+        ScriptLanguage::Lua | ScriptLanguage::Quirl => ExecutionOutputTarget::Value,
+    };
+    let cancellation = ExecutionCancellation::default();
+    let signal_id = signal_hook::flag::register(signal_hook::consts::SIGINT, cancellation.atomic())
+        .map_err(|error| {
+            ShellError::new(
+                ErrorCode::Io,
+                "could not install script cancellation handler",
+            )
+            .with_context(error.to_string())
+            .with_help("Retry the script; report repeated signal-handler failures")
+        })?;
+    let request = ExecutionRequest::new(ExecutionSource::new(source_name, source)?, mode)
+        .with_cancellation(cancellation)
+        .with_input(ExecutionInput::None)
+        .with_arguments(arguments.to_vec())
+        .with_deadline(SCRIPT_EXECUTION_DEADLINE)
+        .with_output(output)
+        .with_effects(ExecutionEffects::all(), ExecutionEffects::all());
+    Ok((
+        request,
+        ScriptSignalGuard {
+            signal_ids: vec![signal_id],
+        },
+    ))
 }
 
 fn read_script_file(path: &Path) -> Result<String, ShellError> {
@@ -948,7 +1022,7 @@ fn script_source_limit_error(source_name: &str, size: u64) -> ShellError {
 }
 
 #[cfg(test)]
-pub fn run_source(
+pub(crate) fn run_source(
     source: &str,
     source_name: &str,
     path: Option<&Path>,
@@ -965,7 +1039,8 @@ pub fn run_source(
     )
 }
 
-pub fn run_source_with_cancellation(
+#[cfg(test)]
+pub(crate) fn run_source_with_cancellation(
     source: &str,
     source_name: &str,
     path: Option<&Path>,
@@ -1006,14 +1081,27 @@ pub fn run_source_with_cancellation(
             Ok(ScriptRunOutput { status, value })
         }
         ScriptLanguage::Quirl => run_quirl_source(source, source_name, arguments),
-        ScriptLanguage::Bash | ScriptLanguage::Zsh => run_reference_script(
-            source,
-            source_name,
-            language,
-            arguments,
-            cancellation,
-            language.executable(),
-        ),
+        ScriptLanguage::Bash | ScriptLanguage::Zsh => {
+            let outcome = run_reference_script(ReferenceScriptRequest {
+                source,
+                source_name,
+                language,
+                arguments,
+                cancellation,
+                executable: language.executable(),
+                deadline: script_deadline()?,
+                max_bytes_per_stream: EXECUTION_CAPTURE_BYTES_MAX,
+            })?;
+            Ok(ScriptRunOutput {
+                status: outcome.status,
+                value: json!({
+                    "language": language.executable(),
+                    "status": outcome.status,
+                    "stdout": outcome.stdout.unwrap_or_default(),
+                    "stderr": outcome.stderr.unwrap_or_default(),
+                }),
+            })
+        }
     }
 }
 
@@ -1025,6 +1113,10 @@ pub fn run_source_with_cancellation(
 pub fn run_interactive_island(
     language: ScriptLanguage,
     source: &str,
+    source_name: &str,
+    arguments: &[String],
+    deadline: ExecutionDeadline,
+    max_bytes_per_stream: usize,
     cancellation: &ScriptCancellation,
 ) -> Result<quirl_core::CommandOutcome, ShellError> {
     let signal_id = signal_hook::flag::register(
@@ -1054,35 +1146,182 @@ pub fn run_interactive_island(
         .with_help("Retry the island; report repeated signal-handler failures")
     })?;
     let executable = language.executable();
-    let result = run_reference_script(
+    let result = run_reference_script(ReferenceScriptRequest {
         source,
-        "<interactive island>",
+        source_name,
         language,
-        &[],
+        arguments,
         cancellation,
         executable,
-    );
+        deadline: deadline.expires_at(),
+        max_bytes_per_stream,
+    });
     signal_hook::low_level::unregister(signal_id);
     #[cfg(unix)]
     signal_hook::low_level::unregister(stop_signal_id);
-    let output = result?;
-    let stdout = output
-        .value
-        .get("stdout")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let stderr = output
-        .value
-        .get("stderr")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    Ok(quirl_core::CommandOutcome {
-        status: output.status,
-        stdout: Some(stdout),
-        stderr: Some(stderr),
-    })
+    result
+}
+
+/// Execute a validated script plan without introducing a script-specific
+/// status or result envelope.
+pub(crate) fn execute_plan(
+    executor: &mut NativeExecutor,
+    plan: &ExecutionPlan,
+) -> Result<ExecutionOutcome, ShellError> {
+    match plan.mode() {
+        ExecutionMode::LuaScript => execute_lua_script_plan(plan),
+        ExecutionMode::QuirlScript => execute_quirl_script_plan(executor, plan),
+        _ => Err(ShellError::new(
+            ErrorCode::Validation,
+            "script adapter received a non-script execution mode",
+        )
+        .with_command(plan.source().text())
+        .with_help("Dispatch the validated plan through its selected execution adapter")),
+    }
+}
+
+fn execute_lua_script_plan(plan: &ExecutionPlan) -> Result<ExecutionOutcome, ShellError> {
+    if plan.output() != ExecutionOutputTarget::Value {
+        return Err(script_representation_error(
+            plan,
+            "typed Lua scripts return structured values",
+        ));
+    }
+    let mut policy = LuaPolicy::script();
+    policy.wall_time = policy.wall_time.min(
+        plan.deadline()
+            .ensure_remaining("before Lua script initialization")?,
+    );
+    let runtime = if plan
+        .declared_effects()
+        .contains(quirl_core::ExecutionEffect::SpawnProcess)
+    {
+        LuaRuntime::new_with_process_host_and_cancellation(
+            policy,
+            sandboxed_process_host(),
+            plan.cancellation().atomic(),
+        )?
+    } else {
+        LuaRuntime::new_with_cancellation(policy, plan.cancellation().atomic())?
+    };
+    plan.ensure_active("after Lua script initialization")?;
+    let context = LuaRunnerContext::from_current_process(
+        plan.arguments(),
+        plan.input().clone(),
+        plan.output(),
+        plan.declared_effects(),
+        plan.cancellation().atomic(),
+    )?;
+    let outcome =
+        runtime.run_source_with_context(plan.source().text(), plan.source().name(), &context)?;
+    plan.ensure_active("after Lua script execution")?;
+    Ok(outcome)
+}
+
+fn execute_quirl_script_plan(
+    executor: &mut NativeExecutor,
+    plan: &ExecutionPlan,
+) -> Result<ExecutionOutcome, ShellError> {
+    if plan.output() != ExecutionOutputTarget::Value {
+        return Err(script_representation_error(
+            plan,
+            "native Quirl scripts return one structured value",
+        ));
+    }
+    if !plan
+        .declared_effects()
+        .contains(quirl_core::ExecutionEffect::SpawnProcess)
+    {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "Quirl script plan does not declare process authority",
+        )
+        .with_command(plan.source().text())
+        .with_help("Declare and allow process spawning before executing a Quirl script"));
+    }
+    let data = DataRuntime::with_process_host(sandboxed_process_host());
+    let cancelled = plan.cancellation().atomic();
+    let mut value = StructuredValue::from_json(json!({
+        "args": plan.arguments(),
+        "status": 0,
+    }));
+    let mut status = 0;
+    for statement in native_script_statements(plan.source().text(), plan.source().name())? {
+        plan.ensure_active("between Quirl script statements")?;
+        let statement_source = &plan.source().text()[statement.body.clone()];
+        match statement.kind {
+            NativeStatementKind::Data => {
+                let envelope = data
+                    .eval_output_with_cancellation_handle(
+                        statement_source.trim(),
+                        Arc::clone(&cancelled),
+                    )?
+                    .into_envelope(&cancelled)
+                    .map_err(|error| {
+                        error.with_label(
+                            Some(plan.source().name().to_owned()),
+                            statement.body.start,
+                            statement.body.end,
+                            "failed Quirl data statement",
+                        )
+                    })?;
+                value = match envelope {
+                    quirl_data::DataEnvelope::Value { value } => value,
+                    quirl_data::DataEnvelope::Stream { items } => StructuredValue::List(items),
+                    quirl_data::DataEnvelope::Option { .. }
+                    | quirl_data::DataEnvelope::Result { .. }
+                    | quirl_data::DataEnvelope::Task { .. } => {
+                        return Err(ShellError::new(
+                            ErrorCode::Data,
+                            "Quirl script data statement returned an unhandled control envelope",
+                        )
+                        .with_help(
+                            "Handle Option, Result, or Task before returning from the script",
+                        ));
+                    }
+                };
+            }
+            NativeStatementKind::Command => {
+                let outcome = if statement.explicit {
+                    execute_command_block(executor, plan, statement.body.clone())?
+                } else {
+                    execute_native_command(
+                        executor,
+                        plan,
+                        statement_source,
+                        statement.body.clone(),
+                    )?
+                };
+                status = outcome.status;
+                value = StructuredValue::from_json(json!({
+                    "status": outcome.status,
+                    "stdout": outcome.stdout.unwrap_or_default(),
+                    "stderr": outcome.stderr.unwrap_or_default(),
+                }));
+                if status != 0 {
+                    break;
+                }
+            }
+        }
+        value.validate()?;
+    }
+    plan.ensure_active("after Quirl script execution")?;
+    ExecutionOutcome::new(
+        ExecutionStatus::Exited(status),
+        ExecutionOutput::Value { value },
+        Vec::new(),
+        ExecutionCleanupState::Complete,
+    )
+}
+
+fn script_representation_error(plan: &ExecutionPlan, expected: &str) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        "script output representation is incompatible",
+    )
+    .with_command(plan.source().text())
+    .with_context(expected)
+    .with_help("Use the output representation selected by the script execution request")
 }
 
 impl ScriptLanguage {
@@ -1205,14 +1444,40 @@ fn unsupported_shebang_language(language: &str) -> ShellError {
     .with_help("Use `--lang bash` or `--lang zsh`; generic `sh` remains intentionally ambiguous")
 }
 
-fn run_reference_script(
-    source: &str,
-    source_name: &str,
+struct ReferenceScriptRequest<'a> {
+    source: &'a str,
+    source_name: &'a str,
     language: ScriptLanguage,
-    arguments: &[String],
-    cancellation: &ScriptCancellation,
-    executable: &str,
-) -> Result<ScriptRunOutput, ShellError> {
+    arguments: &'a [String],
+    cancellation: &'a ScriptCancellation,
+    executable: &'a str,
+    deadline: Instant,
+    max_bytes_per_stream: usize,
+}
+
+fn run_reference_script(
+    request: ReferenceScriptRequest<'_>,
+) -> Result<quirl_core::CommandOutcome, ShellError> {
+    let ReferenceScriptRequest {
+        source,
+        source_name,
+        language,
+        arguments,
+        cancellation,
+        executable,
+        deadline,
+        max_bytes_per_stream,
+    } = request;
+    if max_bytes_per_stream == 0 || max_bytes_per_stream > EXECUTION_CAPTURE_BYTES_MAX {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "reference runner capture limit is outside the shared contract",
+        )
+        .with_context(format!(
+            "maximum: {EXECUTION_CAPTURE_BYTES_MAX}; requested: {max_bytes_per_stream}"
+        ))
+        .with_help("Use the validated execution plan capture ceiling"));
+    }
     let mut command = Command::new(executable);
     match language {
         ScriptLanguage::Bash => {
@@ -1271,8 +1536,14 @@ fn run_reference_script(
             "reference interpreter containment failed",
         )
     })?;
-    let stdout = child.stdout.take().map(spawn_stream_reader);
-    let stderr = child.stderr.take().map(spawn_stream_reader);
+    let stdout = child
+        .stdout
+        .take()
+        .map(|stream| spawn_stream_reader(stream, max_bytes_per_stream));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stream| spawn_stream_reader(stream, max_bytes_per_stream));
     let status = loop {
         if cancellation.cancelled.load(Ordering::Relaxed) {
             let termination = terminate_reference_process(&mut child, &containment);
@@ -1290,6 +1561,23 @@ fn run_reference_script(
                 "cancelled reference script",
             )
             .with_help("Run the script again when cancellation is no longer requested"));
+        }
+        if Instant::now() >= deadline {
+            let termination = terminate_reference_process(&mut child, &containment);
+            let _ = join_stream_reader(stdout, "reference runner stdout");
+            let _ = join_stream_reader(stderr, "reference runner stderr");
+            termination?;
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                format!("{executable} script execution exceeded its absolute deadline"),
+            )
+            .with_label(
+                Some(source_name.to_owned()),
+                0,
+                source.len(),
+                "reference script deadline expired",
+            )
+            .with_help("Reduce script work or increase the shared execution deadline"));
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1311,6 +1599,21 @@ fn run_reference_script(
     containment.terminate(&mut child)?;
     let stdout = join_stream_reader(stdout, "reference runner stdout")?;
     let stderr = join_stream_reader(stderr, "reference runner stderr")?;
+    if Instant::now() >= deadline {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!("{executable} script execution exceeded its absolute deadline"),
+        )
+        .with_label(
+            Some(source_name.to_owned()),
+            0,
+            source.len(),
+            "reference script deadline expired",
+        )
+        .with_help("Reduce script work or increase the shared execution deadline"));
+    }
+    ensure_reference_capture_within_limit(executable, "stdout", &stdout, max_bytes_per_stream)?;
+    ensure_reference_capture_within_limit(executable, "stderr", &stderr, max_bytes_per_stream)?;
     let status_code = status.code().unwrap_or(1);
     if status_code != 0 && is_dialect_syntax_error(&stderr.value) {
         let (start, end) = dialect_error_span(source, &stderr.value);
@@ -1329,16 +1632,10 @@ fn run_reference_script(
             "Run `{executable} -n {source_name}` for the interpreter's full syntax check"
         )));
     }
-    Ok(ScriptRunOutput {
+    Ok(quirl_core::CommandOutcome {
         status: status_code,
-        value: json!({
-            "language": language.executable(),
-            "status": status_code,
-            "stdout": stdout.value,
-            "stderr": stderr.value,
-            "stdout_discarded_bytes": stdout.discarded_bytes,
-            "stderr_discarded_bytes": stderr.discarded_bytes,
-        }),
+        stdout: Some(stdout.value),
+        stderr: Some(stderr.value),
     })
 }
 
@@ -1362,9 +1659,10 @@ struct StreamCapture {
 
 fn spawn_stream_reader(
     mut stream: impl Read + Send + 'static,
+    max_bytes: usize,
 ) -> thread::JoinHandle<io::Result<StreamCapture>> {
     thread::spawn(move || {
-        let mut retained = Vec::with_capacity(MAX_REFERENCE_CAPTURE_BYTES);
+        let mut retained = Vec::with_capacity(max_bytes);
         let mut discarded_bytes = 0_u64;
         let mut buffer = [0_u8; 8 * 1024];
         loop {
@@ -1372,7 +1670,7 @@ fn spawn_stream_reader(
             if read == 0 {
                 break;
             }
-            let available = MAX_REFERENCE_CAPTURE_BYTES.saturating_sub(retained.len());
+            let available = max_bytes.saturating_sub(retained.len());
             let keep = available.min(read);
             retained.extend_from_slice(&buffer[..keep]);
             discarded_bytes = discarded_bytes.saturating_add((read - keep) as u64);
@@ -1382,6 +1680,43 @@ fn spawn_stream_reader(
             discarded_bytes,
         })
     })
+}
+
+fn ensure_reference_capture_within_limit(
+    executable: &str,
+    stream: &str,
+    capture: &StreamCapture,
+    limit: usize,
+) -> Result<(), ShellError> {
+    if capture.discarded_bytes == 0 {
+        return Ok(());
+    }
+    let observed = u64::try_from(capture.value.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(capture.discarded_bytes);
+    Err(ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{executable} {stream} exceeded the execution capture limit"),
+    )
+    .with_context(format!(
+        "limit: {limit}; retained: {}; discarded: {}; observed: {observed}",
+        capture.value.len(),
+        capture.discarded_bytes
+    ))
+    .with_help("Reduce output, redirect it to a file, or request a larger valid capture ceiling"))
+}
+
+#[cfg(test)]
+fn script_deadline() -> Result<Instant, ShellError> {
+    Instant::now()
+        .checked_add(SCRIPT_EXECUTION_DEADLINE)
+        .ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::ResourceLimit,
+                "script deadline is outside the monotonic clock range",
+            )
+            .with_help("Retry with the configured bounded script deadline")
+        })
 }
 
 fn join_stream_reader(
@@ -1453,58 +1788,37 @@ fn truncate_capture(value: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn run_quirl_source(
     source: &str,
     source_name: &str,
     arguments: &[String],
 ) -> Result<ScriptRunOutput, ShellError> {
+    let request = ExecutionRequest::new(
+        ExecutionSource::new(source_name, source)?,
+        ExecutionMode::QuirlScript,
+    )
+    .with_arguments(arguments.to_vec())
+    .with_deadline(SCRIPT_EXECUTION_DEADLINE)
+    .with_output(ExecutionOutputTarget::Value)
+    .with_effects(ExecutionEffects::all(), ExecutionEffects::all());
+    let plan = request.plan()?;
     let mut executor = NativeExecutor::default();
-    let data = DataRuntime::new();
-    let mut value = json!({ "args": arguments, "status": 0 });
-    for statement in native_script_statements(source, source_name)? {
-        let statement_source = &source[statement.body.clone()];
-        match statement.kind {
-            NativeStatementKind::Data => {
-                value = data.eval(statement_source.trim()).map_err(|error| {
-                    error.with_label(
-                        Some(source_name.to_owned()),
-                        statement.body.start,
-                        statement.body.end,
-                        "failed Quirl data statement",
-                    )
-                })?;
-            }
-            NativeStatementKind::Command => {
-                let outcome = if statement.explicit {
-                    execute_command_block(
-                        &mut executor,
-                        source,
-                        source_name,
-                        statement.body.clone(),
-                    )?
-                } else {
-                    execute_native_command(
-                        &mut executor,
-                        statement_source,
-                        source_name,
-                        statement.body.clone(),
-                    )?
-                };
-                value = json!({
-                    "status": outcome.status,
-                    "stdout": outcome.stdout.unwrap_or_default(),
-                    "stderr": outcome.stderr.unwrap_or_default(),
-                });
-                if outcome.status != 0 {
-                    return Ok(ScriptRunOutput {
-                        status: outcome.status,
-                        value,
-                    });
-                }
-            }
+    let outcome = execute_quirl_script_plan(&mut executor, &plan)?;
+    let status = outcome.status_code();
+    let value = match outcome.output {
+        ExecutionOutput::Value { value } => value.json_value(),
+        ExecutionOutput::Values { values } => {
+            Value::Array(values.into_iter().map(|value| value.json_value()).collect())
         }
-    }
-    Ok(ScriptRunOutput { status: 0, value })
+        ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => {
+            return Err(script_representation_error(
+                &plan,
+                "expected structured value output",
+            ));
+        }
+    };
+    Ok(ScriptRunOutput { status, value })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1745,8 +2059,7 @@ fn command_block_diagnostics(
 
 fn execute_command_block(
     executor: &mut NativeExecutor,
-    source: &str,
-    source_name: &str,
+    plan: &ExecutionPlan,
     body: Range<usize>,
 ) -> Result<quirl_core::CommandOutcome, ShellError> {
     let mut outcome = quirl_core::CommandOutcome {
@@ -1755,7 +2068,7 @@ fn execute_command_block(
         stderr: Some(String::new()),
     };
     let mut offset = body.start;
-    for raw_line in source[body].split_inclusive('\n') {
+    for raw_line in plan.source().text()[body].split_inclusive('\n') {
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
         let line = line.strip_suffix('\r').unwrap_or(line);
         let leading = line.len().saturating_sub(line.trim_start().len());
@@ -1763,22 +2076,24 @@ fn execute_command_block(
         if !trimmed.is_empty() && !trimmed.starts_with('#') {
             let line_outcome = execute_native_command(
                 executor,
+                plan,
                 trimmed,
-                source_name,
                 (offset + leading)..(offset + leading + trimmed.len()),
             )?;
             outcome.status = line_outcome.status;
             if let Some(stdout) = line_outcome.stdout {
-                outcome
-                    .stdout
-                    .get_or_insert_with(String::new)
-                    .push_str(&stdout);
+                append_script_capture(
+                    outcome.stdout.get_or_insert_with(String::new),
+                    &stdout,
+                    "stdout",
+                )?;
             }
             if let Some(stderr) = line_outcome.stderr {
-                outcome
-                    .stderr
-                    .get_or_insert_with(String::new)
-                    .push_str(&stderr);
+                append_script_capture(
+                    outcome.stderr.get_or_insert_with(String::new),
+                    &stderr,
+                    "stderr",
+                )?;
             }
             if outcome.status != 0 {
                 return Ok(outcome);
@@ -1791,18 +2106,46 @@ fn execute_command_block(
 
 fn execute_native_command(
     executor: &mut NativeExecutor,
+    plan: &ExecutionPlan,
     command: &str,
-    source_name: &str,
     span: Range<usize>,
 ) -> Result<quirl_core::CommandOutcome, ShellError> {
-    executor.execute_capture(command).map_err(|error| {
+    let request = ProcessRequest {
+        command: command.to_owned(),
+        deadline: plan
+            .deadline()
+            .ensure_remaining("before Quirl script command startup")?,
+        cancelled: plan.cancellation().atomic(),
+        max_output_bytes: EXECUTION_CAPTURE_BYTES_MAX,
+    };
+    executor.execute_capture_request(request).map_err(|error| {
         error.with_label(
-            Some(source_name.to_owned()),
+            Some(plan.source().name().to_owned()),
             span.start,
             span.end,
             "failed Quirl command statement",
         )
     })
+}
+
+fn append_script_capture(
+    retained: &mut String,
+    next: &str,
+    stream: &str,
+) -> Result<(), ShellError> {
+    let observed = retained.len().saturating_add(next.len());
+    if observed > EXECUTION_CAPTURE_BYTES_MAX {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!("Quirl script aggregate {stream} exceeded its capture limit"),
+        )
+        .with_context(format!(
+            "limit: {EXECUTION_CAPTURE_BYTES_MAX}; observed: {observed}"
+        ))
+        .with_help("Reduce command-block output or redirect intermediate output to a file"));
+    }
+    retained.push_str(next);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1932,35 +2275,77 @@ mod tests {
     }
 
     #[test]
+    fn run_front_door_returns_shared_outcomes_for_script_engines() {
+        let directory = test_directory("shared-run-outcome");
+        fs::create_dir_all(&directory).unwrap();
+        let cases = [
+            (
+                "runner.lua",
+                r#"return { abi_version = 1, main = function(ctx)
+                  return { abi_version = 1, ok = true, status = 7,
+                    output = { kind = "value", value = { type = "string", value = ctx.args[1] } } }
+                end }"#,
+                Some(ScriptLanguage::Lua),
+                7,
+            ),
+            ("runner.qrl", "data 42", Some(ScriptLanguage::Quirl), 0),
+        ];
+        for (name, source, language, expected_status) in cases {
+            let path = directory.join(name);
+            fs::write(&path, source).unwrap();
+            let (request, _signals) =
+                execution_request(&path, language, &["argument".to_owned()]).unwrap();
+            let outcome =
+                crate::execute_execution_request(&mut NativeExecutor::default(), request, None)
+                    .unwrap();
+            assert_eq!(outcome.status_code(), expected_status, "{name}");
+            assert!(matches!(outcome.output, ExecutionOutput::Value { .. }));
+        }
+
+        for (name, language, executable) in [
+            ("runner.bash", ScriptLanguage::Bash, "bash"),
+            ("runner.zsh", ScriptLanguage::Zsh, "zsh"),
+        ] {
+            if !reference_interpreter_available(executable) {
+                eprintln!("skipping {executable} run outcome: executable is unavailable");
+                continue;
+            }
+            let path = directory.join(name);
+            fs::write(&path, "printf '%s' \"$1\"; exit 9").unwrap();
+            let (request, _signals) =
+                execution_request(&path, Some(language), &["argument".to_owned()]).unwrap();
+            let outcome =
+                crate::execute_execution_request(&mut NativeExecutor::default(), request, None)
+                    .unwrap();
+            assert_eq!(outcome.status_code(), 9);
+            assert!(matches!(
+                outcome.output,
+                ExecutionOutput::Bytes { ref stdout, .. } if stdout == b"argument"
+            ));
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn reference_runner_drains_but_does_not_retain_unbounded_output() {
         if !reference_interpreter_available("bash") {
             eprintln!("skipping bash: interpreter is unavailable");
             return;
         }
-        let output = run_source(
-            "i=0; while [ \"$i\" -lt 7000 ]; do printf 0123456789; printf abcdefghij >&2; i=$((i+1)); done",
-            "bounded.bash",
-            None,
-            Some(ScriptLanguage::Bash),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(
-            output.value["stdout"].as_str().unwrap().len(),
-            MAX_REFERENCE_CAPTURE_BYTES
-        );
-        assert_eq!(
-            output.value["stderr"].as_str().unwrap().len(),
-            MAX_REFERENCE_CAPTURE_BYTES
-        );
-        assert_eq!(
-            output.value["stdout_discarded_bytes"],
-            70_000 - MAX_REFERENCE_CAPTURE_BYTES
-        );
-        assert_eq!(
-            output.value["stderr_discarded_bytes"],
-            70_000 - MAX_REFERENCE_CAPTURE_BYTES
-        );
+        let cancellation = ScriptCancellation::default();
+        let error = run_reference_script(ReferenceScriptRequest {
+            source: "i=0; while [ \"$i\" -lt 7000 ]; do printf 0123456789; printf abcdefghij >&2; i=$((i+1)); done",
+            source_name: "bounded.bash",
+            language: ScriptLanguage::Bash,
+            arguments: &[],
+            cancellation: &cancellation,
+            executable: "bash",
+            deadline: script_deadline().unwrap(),
+            max_bytes_per_stream: 64 * 1024,
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("discarded"));
     }
 
     #[test]
@@ -1983,14 +2368,17 @@ mod tests {
 
     #[test]
     fn missing_reference_interpreter_has_a_labeled_actionable_error() {
-        let error = run_reference_script(
-            "echo unreachable",
-            "missing.bash",
-            ScriptLanguage::Bash,
-            &[],
-            &ScriptCancellation::default(),
-            "/definitely/missing/quirl-reference-interpreter",
-        )
+        let cancellation = ScriptCancellation::default();
+        let error = run_reference_script(ReferenceScriptRequest {
+            source: "echo unreachable",
+            source_name: "missing.bash",
+            language: ScriptLanguage::Bash,
+            arguments: &[],
+            cancellation: &cancellation,
+            executable: "/definitely/missing/quirl-reference-interpreter",
+            deadline: script_deadline().unwrap(),
+            max_bytes_per_stream: EXECUTION_CAPTURE_BYTES_MAX,
+        })
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::ProcessSpawn);
         assert_eq!(
@@ -2051,8 +2439,24 @@ mod tests {
         }
         let cancellation = ScriptCancellation::default();
         let worker_cancellation = cancellation.clone();
+        let deadline = ExecutionRequest::new(
+            ExecutionSource::new("island", "sleep 10").unwrap(),
+            ExecutionMode::Bash,
+        )
+        .with_deadline(Duration::from_secs(1))
+        .plan()
+        .unwrap()
+        .deadline();
         let worker = thread::spawn(move || {
-            run_interactive_island(ScriptLanguage::Bash, "sleep 10", &worker_cancellation)
+            run_interactive_island(
+                ScriptLanguage::Bash,
+                "sleep 10",
+                "island",
+                &[],
+                deadline,
+                EXECUTION_CAPTURE_BYTES_MAX,
+                &worker_cancellation,
+            )
         });
         thread::sleep(Duration::from_millis(20));
         cancellation.cancelled.store(true, Ordering::Relaxed);

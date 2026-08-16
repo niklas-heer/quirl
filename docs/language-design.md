@@ -436,7 +436,11 @@ Target-adjacent familiarity matters: TypeScript and Python dominate broad popula
 
 ### One runner, multiple language engines
 
-`quirl run` is the stable script entry point. It detects a shebang or known extension, accepts `--lang`, and supplies every engine with the same arguments, environment, working directory, byte streams, cancellation signal, and structured exit result.
+`quirl run` is the stable script entry point. It detects a shebang or known
+extension, accepts `--lang`, and lowers once into the same validated execution
+plan as other front doors. Every engine receives the same bounded arguments,
+environment, working directory, input/output intent, absolute deadline,
+cancellation identity, effects, source identity, and structured outcome.
 
 ```lua
 #!/usr/bin/env -S quirl run
@@ -466,6 +470,8 @@ return { abi_version = 1, main = main }
 
 Runner ABI v1 captures bounded arguments, a UTF-8 environment view, cwd, typed
 input/output intent, declared effects, and one shared cancellation identity.
+The host's monotonic plan deadline covers VM construction and `main`; Lua's
+memory, instruction, and callback policies may narrow it but never restart it.
 Results use the shared tagged value and structured `ShellError` representations.
 Only finite value batches of at most 512 items cross this ABI; live streams stay
 engine-owned and are never collected merely to fit a Lua or JSON table.
@@ -864,7 +870,9 @@ and accessible text output, per the release criterion in §10.
   Wasm components remain validated but disabled until a component runtime is
   selected; the checked-in WIT world and its hash bind that future work.
 - **Platform processes and recovery are bounded.** Bash/Zsh runners preserve
-  arguments, environment, status, cancellation, and fixed-size output windows.
+  arguments, environment, status, the plan deadline and cancellation identity,
+  and the exact validated per-stream capture ceiling. Inherited native output
+  retains no copy while remaining deadline- and cancellation-bound.
   Recovery is versioned, atomic, quota-limited, terminal-safe in text mode, and
   retains exact stored values in JSON.
 - **Windows has a best-effort lifecycle backend.** Cross-target checks exercise

@@ -67,6 +67,7 @@ const EXTENSION_PANEL_REFRESH_WALL_TIME: Duration = Duration::from_millis(250);
 const EXTENSION_PANEL_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const EXTENSION_SAFE_POINT_WAIT: Duration = Duration::from_millis(125);
 const PLUGIN_COMMAND_WALL_TIME: Duration = Duration::from_millis(50);
+const PLUGIN_COMMAND_CLEANUP_WAIT: Duration = Duration::from_millis(125);
 
 static NEXT_RUNTIME_KEY: AtomicU64 = AtomicU64::new(1);
 
@@ -634,6 +635,7 @@ impl LuaExtensionHost {
         &mut self,
         plan: &ExecutionPlan,
     ) -> Result<ExecutionOutcome, ShellError> {
+        plan.ensure_active("before plugin reconciliation")?;
         if self.reload_if_changed() == ExtensionReloadState::Rejected {
             let mut error = ShellError::new(
                 ErrorCode::Validation,
@@ -680,17 +682,14 @@ impl LuaExtensionHost {
             plan.declared_effects(),
             plan.cancellation().atomic(),
         )?;
-        let deadline = Instant::now().checked_add(plan.deadline()).ok_or_else(|| {
-            ShellError::new(
-                ErrorCode::ResourceLimit,
-                "plugin command deadline exceeded the host monotonic clock",
-            )
-            .with_help("Retry with the configured bounded plugin command deadline")
-        })?;
+        plan.ensure_active("after plugin context construction")?;
+        let deadline = plan.deadline().expires_at();
         let (sender, receiver) = mpsc::sync_channel(1);
         let runtime = Arc::clone(&binding.runtime);
         let command_name = binding.command.path.clone();
-        let callback_deadline = plan.deadline();
+        let callback_deadline = plan
+            .deadline()
+            .ensure_remaining("before plugin scheduler admission")?;
         let work = vec![ExtensionWork::new(runtime.key, move |mut control| {
             let invocation = runtime.run_scheduled(&mut control, true, |runtime| {
                 runtime.run_plugin_command_with_context(&command_name, &context, callback_deadline)
@@ -701,10 +700,27 @@ impl LuaExtensionHost {
             return Err(unavailable_plugin_scheduler_error());
         };
         let batch = scheduler.submit_batch(self.revision, deadline, WorkPriority::Command, work)?;
-        let result = match receiver.recv_timeout(plan.deadline()) {
+        let wait = plan
+            .deadline()
+            .ensure_remaining("before waiting for plugin execution")?;
+        let result = match receiver.recv_timeout(wait) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
                 scheduler.cancel_batch(&batch);
+                if !scheduler.wait_batch_idle(&batch, PLUGIN_COMMAND_CLEANUP_WAIT) {
+                    return Err(ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        format!(
+                            "plugin command `{}` did not quiesce after cancellation",
+                            binding.command.path
+                        ),
+                    )
+                    .with_context(format!(
+                        "cleanup wait: {} ms",
+                        PLUGIN_COMMAND_CLEANUP_WAIT.as_millis()
+                    ))
+                    .with_help("Disable the blocked plugin and restart Quirl before retrying"));
+                }
                 return Err(ShellError::new(
                     ErrorCode::ResourceLimit,
                     format!(
@@ -712,7 +728,10 @@ impl LuaExtensionHost {
                         binding.command.path
                     ),
                 )
-                .with_context(format!("deadline: {} ms", plan.deadline().as_millis()))
+                .with_context(format!(
+                    "deadline: {} ms",
+                    plan.deadline().budget().as_millis()
+                ))
                 .with_help("Reduce callback work or disable the blocked plugin"));
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -3361,6 +3380,38 @@ error_codes = { "0" = "success" }
                 value: quirl_core::StructuredValue::String("managed".to_owned())
             }
         );
+        let cancelled_plan = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(&installed, "managed run")
+            .unwrap()
+            .plan()
+            .unwrap();
+        cancelled_plan.cancellation().cancel();
+        let cancelled = host
+            .lock()
+            .unwrap()
+            .dispatch_plugin_plan(&cancelled_plan)
+            .unwrap_err();
+        assert_eq!(cancelled.code, ErrorCode::ResourceLimit);
+        assert!(cancelled.message.contains("cancelled"));
+
+        let expired_plan = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(&installed, "managed run")
+            .unwrap()
+            .plan()
+            .unwrap();
+        std::thread::sleep(PLUGIN_COMMAND_WALL_TIME + Duration::from_millis(5));
+        let expired = host
+            .lock()
+            .unwrap()
+            .dispatch_plugin_plan(&expired_plan)
+            .unwrap_err();
+        assert_eq!(expired.code, ErrorCode::ResourceLimit);
+        assert!(expired.message.contains("deadline"));
+
         let stale_request = host
             .lock()
             .unwrap()

@@ -4,7 +4,7 @@
 //! Engines retain those resources and the CLI composition root selects an
 //! engine only after a request validates into an [`ExecutionPlan`].
 
-use crate::{ErrorCode, ShellError};
+use crate::{CommandOutcome, ErrorCode, ShellError};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -12,7 +12,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Maximum UTF-8 bytes retained for one execution source.
@@ -25,6 +25,11 @@ pub const EXECUTION_ARGUMENTS_MAX: usize = 1_024;
 pub const EXECUTION_ARGUMENT_BYTES_MAX: usize = 1024 * 1024;
 /// Maximum bytes retained in one request input or outcome byte stream.
 pub const EXECUTION_BYTES_MAX: usize = 8 * 1024 * 1024;
+/// Maximum retained bytes permitted separately for stdout and stderr capture.
+///
+/// Engines may use a smaller default when no plan is present, but a validated
+/// plan's requested ceiling is authoritative throughout this complete range.
+pub const EXECUTION_CAPTURE_BYTES_MAX: usize = 1024 * 1024;
 /// Maximum nodes accepted in one structured execution value.
 pub const EXECUTION_VALUE_NODES_MAX: usize = 100_000;
 /// Maximum nesting depth accepted in one structured execution value.
@@ -124,10 +129,14 @@ impl ExecutionSpan {
 pub enum ExecutionMode {
     /// Quirl's native command and process graph.
     NativeCommand,
+    /// A native Quirl script containing explicit command and data statements.
+    QuirlScript,
     /// Quirl's focused structured-data evaluator.
     Data,
     /// The restricted Lua 5.4 runtime.
     Lua,
+    /// A typed Lua runner module invoked through `quirl run`.
+    LuaScript,
     /// An explicit bounded Bash reference interpreter.
     Bash,
     /// An explicit bounded Zsh reference interpreter.
@@ -619,6 +628,7 @@ impl ExecutionRequest {
                     ),
             );
         }
+        let deadline = ExecutionDeadline::after(self.deadline)?;
         Ok(ExecutionPlan {
             source: self.source,
             mode: self.mode,
@@ -626,7 +636,7 @@ impl ExecutionRequest {
             input: self.input,
             output: self.output,
             arguments: self.arguments,
-            deadline: self.deadline,
+            deadline,
             declared_effects: self.declared_effects,
             cleanup_owner: ExecutionCleanupOwner::Engine,
         })
@@ -642,7 +652,7 @@ pub struct ExecutionPlan {
     input: ExecutionInput,
     output: ExecutionOutputTarget,
     arguments: Vec<String>,
-    deadline: Duration,
+    deadline: ExecutionDeadline,
     declared_effects: ExecutionEffects,
     cleanup_owner: ExecutionCleanupOwner,
 }
@@ -672,9 +682,18 @@ impl ExecutionPlan {
     pub fn arguments(&self) -> &[String] {
         &self.arguments
     }
-    /// Positive wall-clock budget for initialization and execution.
-    pub const fn deadline(&self) -> Duration {
+    /// One monotonic absolute deadline for initialization, execution, output,
+    /// cleanup, and outcome normalization.
+    pub const fn deadline(&self) -> ExecutionDeadline {
         self.deadline
+    }
+    /// Reject cancellation or expiry at one adapter safe point.
+    ///
+    /// Explicit cancellation is checked first and therefore remains the
+    /// originating error when it was already observable at the race boundary.
+    pub fn ensure_active(&self, stage: &str) -> Result<(), ShellError> {
+        self.cancellation.ensure_active(stage)?;
+        self.deadline.ensure_remaining(stage).map(|_| ())
     }
     /// Effects validated before this plan was created.
     pub const fn declared_effects(&self) -> ExecutionEffects {
@@ -683,6 +702,49 @@ impl ExecutionPlan {
     /// Layer responsible for process, VM, stream, and job cleanup.
     pub const fn cleanup_owner(&self) -> ExecutionCleanupOwner {
         self.cleanup_owner
+    }
+}
+
+/// Copyable monotonic deadline created exactly once while a request is planned.
+///
+/// Engines receive either this value or a remaining duration sampled from it.
+/// Sampling never extends the absolute expiry, and local security policies may
+/// only narrow the returned duration.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionDeadline {
+    expires_at: Instant,
+    budget: Duration,
+}
+
+impl ExecutionDeadline {
+    fn after(budget: Duration) -> Result<Self, ShellError> {
+        let expires_at = Instant::now().checked_add(budget).ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::ResourceLimit,
+                "execution deadline is outside the monotonic clock range",
+            )
+            .with_context(format!("requested duration: {budget:?}"))
+            .with_help("Choose a shorter execution deadline")
+        })?;
+        Ok(Self { expires_at, budget })
+    }
+
+    /// Return the absolute monotonic expiry instant.
+    pub const fn expires_at(self) -> Instant {
+        self.expires_at
+    }
+
+    /// Return the originally validated positive wall-time budget.
+    pub const fn budget(self) -> Duration {
+        self.budget
+    }
+
+    /// Return time remaining at `stage`, or the common deadline error.
+    pub fn ensure_remaining(self, stage: &str) -> Result<Duration, ShellError> {
+        self.expires_at
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| execution_deadline_error(stage, self.budget))
     }
 }
 
@@ -782,6 +844,55 @@ impl ExecutionOutcome {
         })
     }
 
+    /// Normalize a process-style result without erasing inherited versus
+    /// captured output semantics.
+    ///
+    /// Captured streams are checked against the plan ceiling again at this
+    /// reader boundary. Exactly the ceiling succeeds; a larger engine result
+    /// fails rather than being truncated or silently reclassified.
+    pub fn from_command(
+        outcome: CommandOutcome,
+        target: ExecutionOutputTarget,
+    ) -> Result<Self, ShellError> {
+        let status = outcome.status;
+        let output = match target {
+            ExecutionOutputTarget::Inherit => {
+                if outcome.stdout.is_some() || outcome.stderr.is_some() {
+                    return Err(ShellError::new(
+                        ErrorCode::Validation,
+                        "inherited process execution retained output",
+                    )
+                    .with_help(
+                        "Use bounded capture when output must cross the execution boundary",
+                    ));
+                }
+                ExecutionOutput::Inherited
+            }
+            ExecutionOutputTarget::Capture {
+                max_bytes_per_stream,
+            } => {
+                let stdout = outcome.stdout.unwrap_or_default().into_bytes();
+                let stderr = outcome.stderr.unwrap_or_default().into_bytes();
+                validate_bytes("execution stdout", stdout.len(), max_bytes_per_stream)?;
+                validate_bytes("execution stderr", stderr.len(), max_bytes_per_stream)?;
+                ExecutionOutput::Bytes { stdout, stderr }
+            }
+            ExecutionOutputTarget::Value => {
+                return Err(ShellError::new(
+                    ErrorCode::Validation,
+                    "process outcome cannot satisfy structured value output",
+                )
+                .with_help("Request inherited output or bounded byte capture"));
+            }
+        };
+        Self::new(
+            ExecutionStatus::Exited(status),
+            output,
+            Vec::new(),
+            ExecutionCleanupState::Complete,
+        )
+    }
+
     /// Return the process-style status code.
     pub const fn status_code(&self) -> i32 {
         match self.status {
@@ -814,10 +925,19 @@ fn validate_output_target(output: ExecutionOutputTarget) -> Result<(), ShellErro
         } => validate_bytes(
             "execution capture limit",
             max_bytes_per_stream,
-            EXECUTION_BYTES_MAX,
+            EXECUTION_CAPTURE_BYTES_MAX,
         ),
         ExecutionOutputTarget::Inherit | ExecutionOutputTarget::Value => Ok(()),
     }
+}
+
+fn execution_deadline_error(stage: &str, budget: Duration) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        "execution exceeded its absolute deadline",
+    )
+    .with_context(format!("deadline observed {stage}; budget: {budget:?}"))
+    .with_help("Use a shorter-running operation or increase the execution deadline")
 }
 
 fn validate_output(output: &ExecutionOutput) -> Result<(), ShellError> {
@@ -958,5 +1078,53 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.status_code(), 7);
         assert!(matches!(outcome.output, ExecutionOutput::Bytes { .. }));
+    }
+
+    #[test]
+    fn absolute_deadline_expires_after_planning() {
+        let plan = ExecutionRequest::new(
+            ExecutionSource::new("deadline", "true").unwrap(),
+            ExecutionMode::NativeCommand,
+        )
+        .with_deadline(Duration::from_millis(1))
+        .plan()
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let error = plan.ensure_active("in the contract test").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.message.contains("absolute deadline"));
+    }
+
+    #[test]
+    fn command_normalization_accepts_exact_capture_and_rejects_limit_plus_one() {
+        let exact = ExecutionOutcome::from_command(
+            CommandOutcome {
+                status: 0,
+                stdout: Some("1234".to_owned()),
+                stderr: Some(String::new()),
+            },
+            ExecutionOutputTarget::Capture {
+                max_bytes_per_stream: 4,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            exact.output,
+            ExecutionOutput::Bytes { ref stdout, .. } if stdout == b"1234"
+        ));
+
+        let error = ExecutionOutcome::from_command(
+            CommandOutcome {
+                status: 0,
+                stdout: Some("12345".to_owned()),
+                stderr: None,
+            },
+            ExecutionOutputTarget::Capture {
+                max_bytes_per_stream: 4,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("limit: 4"));
     }
 }

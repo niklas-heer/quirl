@@ -6,6 +6,12 @@
   pull, and before each transform or renderer write. Cancellation after a
   partial write remains an error; already-written bytes are not reported as a
   successful value.
+- CLI execution also arms the plan's one monotonic absolute deadline before
+  data initialization. Expiry sets the same engine-observed cancellation flag,
+  covers parsing, adapters, transforms, pulls, materialization, and interactive
+  writes, and is normalized back to the plan deadline error only after readers
+  and external processes have cleaned up. The external-process policy may
+  choose its earlier two-second security deadline but cannot extend the plan.
 - A lazy source owns its reader until the stream is dropped. Adapter failure
   after earlier rows does not manufacture a successful partial result, and
   dropping the stream after success, cancellation, or error closes the reader.
@@ -123,9 +129,10 @@ YAML requires string mapping keys and rejects application-specific tags. TOML
 converts directly without passing through JSON. `^external <command>` is the
 only external byte producer. A
 standalone `DataRuntime` has no ambient process capability and rejects it. The
-CLI injects the sandboxed process host with a 2-second deadline and a 1 MiB
-combined retained-output limit; cancellation is passed through the shareable
-token used for that command. Non-zero exits remain `ShellError` failures with
+CLI injects the sandboxed process host only when the plan declares process
+authority, with a two-second engine-local deadline and a 1 MiB combined
+retained-output limit. The local deadline is intersected with the plan through
+the same shareable cancellation token. Non-zero exits remain `ShellError` failures with
 the bounded stderr context, rather than being silently converted into values.
 
 This release intentionally does not implement SQLite, zip/compressed archive
@@ -138,7 +145,8 @@ capability limits. Those remain design targets rather than silently available
 The rich interactive data branch also uses a shared `ExecutionRequest` with an
 inherited output target. It writes terminal-safe plain values one row at a time,
 flushes each row, checks the shared SIGINT/SIGTERM cancellation identity before
-every pull and write, and yields after at most 16 pulls. A failed or cancelled
+every pull and write, observes the same absolute plan deadline, and yields after
+at most 16 pulls. A failed, cancelled, or expired
 stream may already have produced scrollback but never commits its partial rows
 to the picker cache. Only successful typed rows enter the 128-item, 512 KiB
 session cache used by Alt-D; opening that picker performs no evaluation.

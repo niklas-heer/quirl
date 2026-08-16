@@ -486,6 +486,16 @@ mod platform {
             self.execute_inner_with_request(&request.command, true, Some(context))
         }
 
+        /// Execute a foreground command with inherited streams under the
+        /// caller's cancellation and deadline. No stdout or stderr is retained.
+        pub fn execute_interactive_request(
+            &mut self,
+            request: ProcessRequest,
+        ) -> Result<CommandOutcome, ShellError> {
+            let context = RequestContext::new(&request)?;
+            self.execute_inner_with_request(&request.command, false, Some(context))
+        }
+
         /// Refresh and return snapshots for every job owned by this executor.
         pub fn jobs(&mut self) -> Vec<JobState> {
             self.refresh_jobs();
@@ -2844,6 +2854,42 @@ mod platform {
         }
 
         #[test]
+        fn inherited_execution_observes_deadline_without_retaining_output() {
+            let request = ProcessRequest {
+                command: "sh -c 'sleep 5'".to_owned(),
+                deadline: Duration::from_millis(20),
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: 1,
+            };
+            let started = Instant::now();
+            let error = NativeExecutor::default()
+                .execute_interactive_request(request)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("deadline"));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn inherited_execution_observes_shared_cancellation() {
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_cancelled = Arc::clone(&cancelled);
+            let worker = std::thread::spawn(move || {
+                NativeExecutor::default().execute_interactive_request(ProcessRequest {
+                    command: "sh -c 'sleep 5'".to_owned(),
+                    deadline: Duration::from_secs(1),
+                    cancelled: worker_cancelled,
+                    max_output_bytes: 1,
+                })
+            });
+            std::thread::sleep(Duration::from_millis(20));
+            cancelled.store(true, Ordering::Relaxed);
+            let error = worker.join().unwrap().unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("cancelled"));
+        }
+
+        #[test]
         fn exited_leader_cannot_leave_a_descendant_holding_capture_open() {
             let started = Instant::now();
             let outcome = NativeExecutor::default()
@@ -3544,6 +3590,16 @@ mod platform {
         ) -> Result<CommandOutcome, ShellError> {
             let context = RequestContext::new(&request)?;
             self.execute_inner_with_request(&request.command, true, Some(context))
+        }
+
+        /// Execute a foreground command with inherited streams under the
+        /// caller's cancellation and deadline. No stdout or stderr is retained.
+        pub fn execute_interactive_request(
+            &mut self,
+            request: ProcessRequest,
+        ) -> Result<CommandOutcome, ShellError> {
+            let context = RequestContext::new(&request)?;
+            self.execute_inner_with_request(&request.command, false, Some(context))
         }
 
         /// Refresh and return snapshots for every job owned by this executor.

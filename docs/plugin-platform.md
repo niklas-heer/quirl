@@ -92,7 +92,12 @@ Argument schemas and declared effects are checked before scheduler admission or
 callback effects. The fixed worker pool provides bounded queue admission,
 per-runtime FIFO ownership, deadlines, cancellation, saturation errors, and
 bounded shutdown; command dispatch never creates a thread per plugin. Lua runs
-only at scheduler safe points. Malformed or oversized typed input/output,
+only at scheduler safe points. Installed command dispatch receives the shared
+execution plan's absolute deadline and cancellation identity before reload,
+binding reconciliation, context construction, queue admission, and callback
+work. A timeout cancels its exact batch and waits a separate bounded cleanup
+interval for quiescence before recovery or result/error observers run.
+Malformed or oversized typed input/output,
 undocumented status codes, byte output, partial ABI results, callback failures,
 timeouts, and cancellation remain structured `ShellError` values. A callback
 cannot publish partial typed output: only a completely validated outcome is
