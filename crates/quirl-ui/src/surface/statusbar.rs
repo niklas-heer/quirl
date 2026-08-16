@@ -1,4 +1,5 @@
-use super::{completion::CompletionState, editor::EditorState, theme::Theme};
+use super::{completion::CompletionState, editor::EditorState};
+use crate::theme::Theme;
 use quirl_syntax::Mode;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;

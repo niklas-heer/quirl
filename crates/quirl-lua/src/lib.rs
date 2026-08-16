@@ -31,10 +31,14 @@ const COMPLETION_CALLBACK_DEADLINE: Duration = Duration::from_millis(50);
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_LUA_COMPLETION_RESULTS: usize = 1_000;
 const MAX_LUA_COMPLETION_ITEM_BYTES: usize = 16 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const MAX_CUSTOM_THEMES: usize = 32;
+pub const MAX_THEME_NAME_BYTES: usize = 64;
+pub const POPULAR_THEME_COUNT: usize = 30;
+pub const DEFAULT_THEME_NAME: &str = "tokyo-night";
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 pub const CONFIG_OLDEST_READABLE_VERSION: u32 = 0;
 pub const MAX_LUA_SOURCE_BYTES: usize = 4 * 1024 * 1024;
-pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@2{QuirlConfig{deny_unknown;schema_version:u32(default=2,legacy=0|1-migrates-to-2);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=full)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);statusline:StatuslineConfig(default)};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=false);min_chars:u16(0..=4096,default=2)};migration:unversioned-or-v1-to-v2}";
+pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@3{QuirlConfig{deny_unknown;schema_version:u32(default=3,legacy=0|1|2-migrates-to-3);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=full)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);theme:string(default=tokyo-night);themes:map<string,ThemeColors>(max=32,default={});statusline:StatuslineConfig(default)};ThemeColors{deny_unknown;accent_command:#RRGGBB;accent_data:#RRGGBB;context_primary:#RRGGBB;context_secondary:#RRGGBB;muted:#RRGGBB;border:#RRGGBB;status_background:#RRGGBB;error:#RRGGBB;warning:#RRGGBB;hint:#RRGGBB;string:#RRGGBB;operator:#RRGGBB;expansion:#RRGGBB;number:#RRGGBB};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=false);min_chars:u16(0..=4096,default=2)};builtins:ansi|ayu-dark|catppuccin-mocha|cobalt-2|dracula|everforest-dark-medium|github-dark|gotham|gruvbox-dark|horizon-dark|kanagawa-wave|material|monokai-dark|moonfly|night-owl|nord|oceanic-next|one-dark|one-half-black|oxocarbon-dark|palenight|papercolor-dark|rose-pine-moon|snazzy|solarized-dark|sonokai|srcery|synthwave|tokyo-night|tomorrow-night|zenburn;migration:unversioned-or-v1-or-v2-to-v3}";
 
 pub fn config_schema_hash() -> String {
     quirl_core::schema_fingerprint(CONFIG_SCHEMA_DESCRIPTOR)
@@ -176,6 +180,8 @@ impl Default for PromptConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
     pub surface: String,
+    pub theme: String,
+    pub themes: BTreeMap<String, ThemeColors>,
     pub statusline: StatuslineConfig,
 }
 
@@ -183,8 +189,67 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             surface: "auto".to_owned(),
+            theme: DEFAULT_THEME_NAME.to_owned(),
+            themes: BTreeMap::new(),
             statusline: StatuslineConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ThemeColors {
+    pub accent_command: String,
+    pub accent_data: String,
+    pub context_primary: String,
+    pub context_secondary: String,
+    pub muted: String,
+    pub border: String,
+    pub status_background: String,
+    pub error: String,
+    pub warning: String,
+    pub hint: String,
+    pub string: String,
+    pub operator: String,
+    pub expansion: String,
+    pub number: String,
+}
+
+impl ThemeColors {
+    fn validate(&self, source: &str, theme_name: &str) -> Result<(), ShellError> {
+        for (role, color) in [
+            ("accent_command", self.accent_command.as_str()),
+            ("accent_data", self.accent_data.as_str()),
+            ("context_primary", self.context_primary.as_str()),
+            ("context_secondary", self.context_secondary.as_str()),
+            ("muted", self.muted.as_str()),
+            ("border", self.border.as_str()),
+            ("status_background", self.status_background.as_str()),
+            ("error", self.error.as_str()),
+            ("warning", self.warning.as_str()),
+            ("hint", self.hint.as_str()),
+            ("string", self.string.as_str()),
+            ("operator", self.operator.as_str()),
+            ("expansion", self.expansion.as_str()),
+            ("number", self.number.as_str()),
+        ] {
+            if color.len() > 7 {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    format!("ui.themes.{theme_name}.{role} exceeds its byte limit"),
+                )
+                .with_context(format!("bytes: {}; limit: 7", color.len()))
+                .with_label(Some(source.to_owned()), 0, 0, "theme color is too long")
+                .with_help("Use one exact #RRGGBB color"));
+            }
+            if !valid_theme_color(color) {
+                return Err(validation_error(
+                    source,
+                    format!("ui.themes.{theme_name}.{role} must be an exact #RRGGBB color"),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -261,6 +326,7 @@ impl QuirlConfig {
                 "ui.surface must be `auto`, `rich`, or `simple`",
             ));
         }
+        self.validate_theme_configuration(source)?;
         if self.completion.min_chars > 4096 {
             return Err(validation_error(
                 source,
@@ -269,6 +335,499 @@ impl QuirlConfig {
         }
         Ok(())
     }
+
+    fn validate_theme_configuration(&self, source: &str) -> Result<(), ShellError> {
+        validate_theme_name(source, "ui.theme", &self.ui.theme)?;
+        if self.ui.themes.len() > MAX_CUSTOM_THEMES {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "custom theme count exceeds its configured limit",
+            )
+            .with_context(format!(
+                "themes: {}; limit: {MAX_CUSTOM_THEMES}",
+                self.ui.themes.len()
+            ))
+            .with_label(Some(source.to_owned()), 0, 0, "too many custom themes")
+            .with_help("Keep only the themes used by this configuration"));
+        }
+        for (name, colors) in &self.ui.themes {
+            validate_theme_name(source, "custom theme name", name)?;
+            if builtin_theme(name).is_some() {
+                return Err(validation_error(
+                    source,
+                    format!("custom theme `{name}` must not shadow a built-in theme"),
+                ));
+            }
+            colors.validate(source, name)?;
+        }
+        if builtin_theme(&self.ui.theme).is_none() && !self.ui.themes.contains_key(&self.ui.theme) {
+            return Err(validation_error(
+                source,
+                format!(
+                    "ui.theme `{}` is not built in or defined in ui.themes",
+                    self.ui.theme
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve the selected built-in or validated custom theme.
+    pub fn active_theme(&self) -> Result<ThemeColors, ShellError> {
+        self.validate_theme_configuration("active configuration")?;
+        if let Some(theme) = builtin_theme(&self.ui.theme) {
+            return Ok(theme);
+        }
+        self.ui.themes.get(&self.ui.theme).cloned().ok_or_else(|| {
+            validation_error(
+                "active configuration",
+                format!("ui.theme `{}` is unavailable", self.ui.theme),
+            )
+        })
+    }
+}
+
+fn validate_theme_name(source: &str, description: &str, name: &str) -> Result<(), ShellError> {
+    if name.len() > MAX_THEME_NAME_BYTES {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!("{description} exceeds its byte limit"),
+        )
+        .with_context(format!(
+            "bytes: {}; limit: {MAX_THEME_NAME_BYTES}",
+            name.len()
+        ))
+        .with_label(Some(source.to_owned()), 0, 0, "theme name is too long")
+        .with_help("Use a shorter stable ASCII theme name"));
+    }
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(validation_error(
+            source,
+            format!("{description} `{name}` must use lowercase ASCII letters, digits, or dash"),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_theme_color(color: &str) -> bool {
+    color.len() == 7
+        && color.starts_with('#')
+        && color.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BuiltinTheme {
+    name: &'static str,
+    colors: [&'static str; 14],
+}
+
+impl BuiltinTheme {
+    fn to_owned_colors(self) -> ThemeColors {
+        let [accent_command, accent_data, context_primary, context_secondary, muted, border, status_background, error, warning, hint, string, operator, expansion, number] =
+            self.colors;
+        ThemeColors {
+            accent_command: accent_command.to_owned(),
+            accent_data: accent_data.to_owned(),
+            context_primary: context_primary.to_owned(),
+            context_secondary: context_secondary.to_owned(),
+            muted: muted.to_owned(),
+            border: border.to_owned(),
+            status_background: status_background.to_owned(),
+            error: error.to_owned(),
+            warning: warning.to_owned(),
+            hint: hint.to_owned(),
+            string: string.to_owned(),
+            operator: operator.to_owned(),
+            expansion: expansion.to_owned(),
+            number: number.to_owned(),
+        }
+    }
+}
+
+macro_rules! builtin_theme {
+    ($name:literal, $($color:literal),+ $(,)?) => {
+        BuiltinTheme { name: $name, colors: [$($color),+] }
+    };
+}
+
+// The popular palettes are sourced from Gogh's maintained terminal-theme
+// catalog. Its ANSI colors map once into Quirl's fixed semantic roles, so
+// render-time code remains theme-agnostic and bounded.
+const BUILTIN_THEMES: &[BuiltinTheme] = &[
+    builtin_theme!(
+        "ansi", "#00aa00", "#aa00aa", "#00aaaa", "#aa00aa", "#555555", "#555555", "#000000",
+        "#aa0000", "#aa5500", "#0000aa", "#aa5500", "#aaaaaa", "#0000aa", "#aa00aa"
+    ),
+    builtin_theme!(
+        "ayu-dark", "#c2d94c", "#ffee99", "#95e6cb", "#ffee99", "#4d5566", "#4d5566", "#0a0e14",
+        "#ff3333", "#ff8f40", "#59c2ff", "#c2d94c", "#95e6cb", "#59c2ff", "#ffee99"
+    ),
+    builtin_theme!(
+        "catppuccin-mocha",
+        "#a6e3a1",
+        "#f5c2e7",
+        "#94e2d5",
+        "#f5c2e7",
+        "#585b70",
+        "#585b70",
+        "#1e1e2e",
+        "#f38ba8",
+        "#f9e2af",
+        "#89b4fa",
+        "#a6e3a1",
+        "#94e2d5",
+        "#89b4fa",
+        "#f5c2e7"
+    ),
+    builtin_theme!(
+        "cobalt-2", "#3bd01d", "#ff55ff", "#6ae3fa", "#ff55ff", "#555555", "#555555", "#132738",
+        "#f40e17", "#edc809", "#5555ff", "#38de21", "#6ae3fa", "#5555ff", "#ff005d"
+    ),
+    builtin_theme!(
+        "dracula", "#50fa7b", "#ff79c6", "#8be9fd", "#ff79c6", "#7a7a7a", "#7a7a7a", "#282a36",
+        "#ff5555", "#f1fa8c", "#bd93f9", "#42e66c", "#8be9fd", "#bd93f9", "#e356a7"
+    ),
+    builtin_theme!(
+        "everforest-dark-medium",
+        "#8da101",
+        "#df69ba",
+        "#35a77c",
+        "#df69ba",
+        "#5c6a72",
+        "#5c6a72",
+        "#2d353b",
+        "#f85552",
+        "#dfa000",
+        "#3a94c5",
+        "#a7c080",
+        "#35a77c",
+        "#3a94c5",
+        "#d699b6"
+    ),
+    builtin_theme!(
+        "github-dark",
+        "#56d364",
+        "#db61a2",
+        "#2b7489",
+        "#db61a2",
+        "#4d4d4d",
+        "#4d4d4d",
+        "#101216",
+        "#f78166",
+        "#e3b341",
+        "#6ca4f8",
+        "#56d364",
+        "#2b7489",
+        "#6ca4f8",
+        "#db61a2"
+    ),
+    builtin_theme!(
+        "gotham", "#081f2d", "#888ba5", "#599caa", "#888ba5", "#10151b", "#10151b", "#0a0f14",
+        "#d26939", "#245361", "#093748", "#26a98b", "#599caa", "#093748", "#4e5165"
+    ),
+    builtin_theme!(
+        "gruvbox-dark",
+        "#b8bb26",
+        "#d3869b",
+        "#8ec07c",
+        "#d3869b",
+        "#928374",
+        "#928374",
+        "#282828",
+        "#fb4934",
+        "#fabd2f",
+        "#83a598",
+        "#98971a",
+        "#8ec07c",
+        "#83a598",
+        "#b16286"
+    ),
+    builtin_theme!(
+        "horizon-dark",
+        "#3fdaa4",
+        "#f075b7",
+        "#6be6e6",
+        "#f075b7",
+        "#232530",
+        "#232530",
+        "#1c1e26",
+        "#ec6a88",
+        "#fbc3a7",
+        "#3fc6de",
+        "#29d398",
+        "#6be6e6",
+        "#3fc6de",
+        "#ee64ae"
+    ),
+    builtin_theme!(
+        "kanagawa-wave",
+        "#98bb6c",
+        "#938aa9",
+        "#7aa89f",
+        "#938aa9",
+        "#727169",
+        "#727169",
+        "#1f1f28",
+        "#e82424",
+        "#e6c384",
+        "#7fb4ca",
+        "#76946a",
+        "#7aa89f",
+        "#7fb4ca",
+        "#957fb8"
+    ),
+    builtin_theme!(
+        "material", "#c3e88d", "#6c71c3", "#34434d", "#6c71c3", "#002b36", "#002b36", "#1e282c",
+        "#eb606b", "#f7eb95", "#7dc6bf", "#c3e88d", "#34434d", "#7dc6bf", "#ff2490"
+    ),
+    builtin_theme!(
+        "monokai-dark",
+        "#a6e22e",
+        "#ae81ff",
+        "#2aa198",
+        "#ae81ff",
+        "#272822",
+        "#272822",
+        "#272822",
+        "#f92672",
+        "#f4bf75",
+        "#66d9ef",
+        "#a6e22e",
+        "#2aa198",
+        "#66d9ef",
+        "#ae81ff"
+    ),
+    builtin_theme!(
+        "moonfly", "#36c692", "#ae81ff", "#85dc85", "#ae81ff", "#949494", "#949494", "#080808",
+        "#ff5189", "#c2c292", "#74b2ff", "#8cc85f", "#85dc85", "#74b2ff", "#cf87e8"
+    ),
+    builtin_theme!(
+        "night-owl",
+        "#22da6e",
+        "#c792ea",
+        "#7fdbca",
+        "#c792ea",
+        "#575656",
+        "#575656",
+        "#011627",
+        "#ef5350",
+        "#ffeb95",
+        "#82aaff",
+        "#22da6e",
+        "#7fdbca",
+        "#82aaff",
+        "#c792ea"
+    ),
+    builtin_theme!(
+        "nord", "#a3be8c", "#b48ead", "#8fbcbb", "#b48ead", "#4c566a", "#4c566a", "#2e3440",
+        "#bf616a", "#ebcb8b", "#81a1c1", "#a3be8c", "#8fbcbb", "#81a1c1", "#b48ead"
+    ),
+    builtin_theme!(
+        "oceanic-next",
+        "#89bd82",
+        "#b77eb8",
+        "#50a5a4",
+        "#b77eb8",
+        "#52606b",
+        "#52606b",
+        "#121b21",
+        "#e44754",
+        "#f7bd51",
+        "#5486c0",
+        "#89bd82",
+        "#50a5a4",
+        "#5486c0",
+        "#b77eb8"
+    ),
+    builtin_theme!(
+        "one-dark", "#98c379", "#c678dd", "#56b6c2", "#c678dd", "#5c6370", "#5c6370", "#1e2127",
+        "#e06c75", "#d19a66", "#61afef", "#98c379", "#56b6c2", "#61afef", "#c678dd"
+    ),
+    builtin_theme!(
+        "one-half-black",
+        "#98c379",
+        "#c678dd",
+        "#56b6c2",
+        "#c678dd",
+        "#282c34",
+        "#282c34",
+        "#000000",
+        "#e06c75",
+        "#e5c07b",
+        "#61afef",
+        "#98c379",
+        "#56b6c2",
+        "#61afef",
+        "#c678dd"
+    ),
+    builtin_theme!(
+        "oxocarbon-dark",
+        "#42be65",
+        "#ff7eb6",
+        "#3ddbd9",
+        "#ff7eb6",
+        "#393939",
+        "#393939",
+        "#161616",
+        "#ee5396",
+        "#ffe97b",
+        "#33b1ff",
+        "#42be65",
+        "#3ddbd9",
+        "#33b1ff",
+        "#ff7eb6"
+    ),
+    builtin_theme!(
+        "palenight",
+        "#c3e88d",
+        "#ffcb6b",
+        "#676e95",
+        "#ffcb6b",
+        "#959dcb",
+        "#959dcb",
+        "#292d3e",
+        "#f07178",
+        "#ff5572",
+        "#82aaff",
+        "#c3e88d",
+        "#676e95",
+        "#82aaff",
+        "#c792ea"
+    ),
+    builtin_theme!(
+        "papercolor-dark",
+        "#afd700",
+        "#ff5faf",
+        "#00afaf",
+        "#ff5faf",
+        "#585858",
+        "#585858",
+        "#1c1c1c",
+        "#5faf5f",
+        "#af87d7",
+        "#ffaf00",
+        "#5faf00",
+        "#00afaf",
+        "#ffaf00",
+        "#808080"
+    ),
+    builtin_theme!(
+        "rose-pine-moon",
+        "#9ccfd8",
+        "#c4a7e7",
+        "#ea9a97",
+        "#c4a7e7",
+        "#6e6a86",
+        "#6e6a86",
+        "#232136",
+        "#eb6f92",
+        "#f6c177",
+        "#3e8fb0",
+        "#9ccfd8",
+        "#ea9a97",
+        "#3e8fb0",
+        "#c4a7e7"
+    ),
+    builtin_theme!(
+        "snazzy", "#5af78e", "#ff6ac1", "#9aedfe", "#ff6ac1", "#686868", "#686868", "#282a36",
+        "#ff5c57", "#f3f99d", "#57c7ff", "#5af78e", "#9aedfe", "#57c7ff", "#ff6ac1"
+    ),
+    builtin_theme!(
+        "solarized-dark",
+        "#859900",
+        "#d33682",
+        "#2aa198",
+        "#d33682",
+        "#657b83",
+        "#657b83",
+        "#002b36",
+        "#cb4b16",
+        "#cf9a6b",
+        "#6c71c4",
+        "#859900",
+        "#2aa198",
+        "#6c71c4",
+        "#d33682"
+    ),
+    builtin_theme!(
+        "sonokai", "#9ed072", "#b39df3", "#76cce0", "#b39df3", "#7f8490", "#7f8490", "#2c2e34",
+        "#fc5d7c", "#e7c664", "#f39660", "#9ed072", "#76cce0", "#f39660", "#b39df3"
+    ),
+    builtin_theme!(
+        "srcery", "#98bc37", "#ff5c8f", "#2be4d0", "#ff5c8f", "#918175", "#918175", "#1c1b19",
+        "#f75341", "#fed06e", "#68a8e4", "#519f50", "#2be4d0", "#68a8e4", "#e02c6d"
+    ),
+    builtin_theme!(
+        "synthwave",
+        "#72f1b8",
+        "#ff7edb",
+        "#03edf9",
+        "#ff7edb",
+        "#575656",
+        "#575656",
+        "#262335",
+        "#fe4450",
+        "#fede5d",
+        "#03edf9",
+        "#72f1b8",
+        "#03edf9",
+        "#03edf9",
+        "#ff7edb"
+    ),
+    builtin_theme!(
+        "tokyo-night",
+        "#9ece6a",
+        "#bb9af7",
+        "#7dcfff",
+        "#bb9af7",
+        "#565f89",
+        "#414868",
+        "#24283b",
+        "#f7768e",
+        "#e0af68",
+        "#7aa2f7",
+        "#9ece6a",
+        "#89ddff",
+        "#7aa2f7",
+        "#ff9e64"
+    ),
+    builtin_theme!(
+        "tomorrow-night",
+        "#b5bd68",
+        "#b294bb",
+        "#8abeb7",
+        "#b294bb",
+        "#969896",
+        "#969896",
+        "#1d1f21",
+        "#cc6666",
+        "#f0c674",
+        "#81a2be",
+        "#b5bd68",
+        "#8abeb7",
+        "#81a2be",
+        "#b294bb"
+    ),
+    builtin_theme!(
+        "zenburn", "#ffff87", "#d7afaf", "#93bea3", "#d7afaf", "#757575", "#757575", "#3a3a3a",
+        "#dfaf87", "#ffcfaf", "#d7d7af", "#efef87", "#93bea3", "#d7d7af", "#bca3a3"
+    ),
+];
+
+pub fn builtin_theme_names() -> impl ExactSizeIterator<Item = &'static str> {
+    BUILTIN_THEMES.iter().map(|theme| theme.name)
+}
+
+fn builtin_theme(name: &str) -> Option<ThemeColors> {
+    BUILTIN_THEMES
+        .iter()
+        .find(|theme| theme.name == name)
+        .copied()
+        .map(BuiltinTheme::to_owned_colors)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1434,7 +1993,7 @@ pub fn format_file(path: &Path, check: bool) -> Result<bool, ShellError> {
 
 pub fn sdk_lua() -> String {
     let mut output = String::from(
-        "---@meta quirl\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? string\n\n---@alias quirl.PromptSymbols 'auto'|'plain'|'unicode'|'nerd_font'\n---@alias quirl.WelcomeBanner 'full'|'compact'|'none'\n---@alias quirl.Surface 'auto'|'rich'|'simple'\n\n---@class quirl.EditorConfig\n---@field keymap? 'emacs'|'vim'|'helix' Emacs is the complete default.\n---@field semantic_hints? boolean\n---@field banner? quirl.WelcomeBanner\n\n---@class quirl.PickerConfig\n---@field layout? 'adaptive'|'bottom'|'full'\n---@field preview? boolean\n\n---@class quirl.PromptConfig\n---@field symbols? quirl.PromptSymbols Auto never assumes a patched font; nerd_font enables Powerline glyphs explicitly.\n---@field left? string[] Ordered prompt segments before the input.\n---@field right? string[] Ordered prompt segments aligned on the right.\n---@field transient? boolean Collapse accepted input to one scrollback line before execution.\n\n---@class quirl.StatuslineConfig\n---@field hints? boolean\n\n---@class quirl.UiConfig\n---@field surface? quirl.Surface\n---@field statusline? quirl.StatuslineConfig\n\n---@class quirl.CompletionConfig\n---@field auto? boolean\n---@field min_chars? integer\n\n---@class quirl.Config\n---@field schema_version? integer\n---@field editor? quirl.EditorConfig\n---@field picker? quirl.PickerConfig\n---@field prompt? quirl.PromptConfig\n---@field ui? quirl.UiConfig\n---@field completion? quirl.CompletionConfig\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
+        "---@meta quirl\n\n---@class quirl.Result\n---@field ok boolean\n---@field value? any\n---@field error? string\n\n---@alias quirl.PromptSymbols 'auto'|'plain'|'unicode'|'nerd_font'\n---@alias quirl.WelcomeBanner 'full'|'compact'|'none'\n---@alias quirl.Surface 'auto'|'rich'|'simple'\n\n---@class quirl.EditorConfig\n---@field keymap? 'emacs'|'vim'|'helix' Emacs is the complete default.\n---@field semantic_hints? boolean\n---@field banner? quirl.WelcomeBanner\n\n---@class quirl.PickerConfig\n---@field layout? 'adaptive'|'bottom'|'full'\n---@field preview? boolean\n\n---@class quirl.PromptConfig\n---@field symbols? quirl.PromptSymbols Auto never assumes a patched font; nerd_font enables Powerline glyphs explicitly.\n---@field left? string[] Ordered prompt segments before the input.\n---@field right? string[] Ordered prompt segments aligned on the right.\n---@field transient? boolean Collapse accepted input to one scrollback line before execution.\n\n---@class quirl.ThemeColors\n---@field accent_command string #RRGGBB color for command-mode accents.\n---@field accent_data string #RRGGBB color for data-mode accents.\n---@field context_primary string #RRGGBB color for primary context.\n---@field context_secondary string #RRGGBB color for secondary context.\n---@field muted string #RRGGBB color for subdued text.\n---@field border string #RRGGBB color for borders.\n---@field status_background string #RRGGBB status background color.\n---@field error string #RRGGBB error color.\n---@field warning string #RRGGBB warning color.\n---@field hint string #RRGGBB hint color.\n---@field string string #RRGGBB string syntax color.\n---@field operator string #RRGGBB operator syntax color.\n---@field expansion string #RRGGBB expansion syntax color.\n---@field number string #RRGGBB number syntax color.\n\n---@class quirl.StatuslineConfig\n---@field hints? boolean\n\n---@class quirl.UiConfig\n---@field surface? quirl.Surface\n---@field theme? string Built-in or custom theme name; defaults to tokyo-night.\n---@field themes? table<string, quirl.ThemeColors> At most 32 custom themes.\n---@field statusline? quirl.StatuslineConfig\n\n---@class quirl.CompletionConfig\n---@field auto? boolean\n---@field min_chars? integer\n\n---@class quirl.Config\n---@field schema_version? integer\n---@field editor? quirl.EditorConfig\n---@field picker? quirl.PickerConfig\n---@field prompt? quirl.PromptConfig\n---@field ui? quirl.UiConfig\n---@field completion? quirl.CompletionConfig\n\n---@class quirl.PromptSegment\n---@field name string\n---@field deadline_ms? integer\n---@field render fun(context: table): string?\n\n---@class quirl.CompletionProvider\n---@field command string\n---@field complete fun(context: table): table\n\n---@class quirl.PluginCommand\n---@field name string\n---@field signature string\n---@field summary string\n---@field details string\n---@field input_type string\n---@field output_type string\n---@field examples string[]\n---@field effects string[]\n---@field error_codes table<string, string>\n---@field run fun(arguments: table): any\n\n---@alias quirl.EventKind 'session_start'|'session_restore'|'directory_changed'|'command_plan'|'execution_progress'|'output'|'cancellation'|'result'|'error'\n---@alias quirl.ExtensionCapability 'events_observe'|'plan_rewrite'|'environment_mutate'|'output_read'|'execution_block'|'catalog_contribute'|'completion_contribute'|'ui_panel'\n---@class quirl.EventSubscription\n---@field name string\n---@field events quirl.EventKind[]\n---@field capabilities quirl.ExtensionCapability[]\n---@field deadline_ms integer\n---@field observe fun(event: table): table[]\n\n---@alias quirl.ContributionKind 'catalog'|'completion'|'panel'\n---@class quirl.Contribution\n---@field kind quirl.ContributionKind\n---@field name string\n---@field deadline_ms integer\n---@field plain_fallback? string\n---@field provide fun(context: table): any\n\nquirl = {}\n\n",
     );
     for spec in HOST_API {
         output.push_str(&format!("---{}\n", spec.summary));
@@ -2425,6 +2984,25 @@ fn validation_error(source: &str, message: impl Into<String>) -> ShellError {
 mod tests {
     use super::*;
 
+    fn test_theme(color: &str) -> ThemeColors {
+        ThemeColors {
+            accent_command: color.to_owned(),
+            accent_data: color.to_owned(),
+            context_primary: color.to_owned(),
+            context_secondary: color.to_owned(),
+            muted: color.to_owned(),
+            border: color.to_owned(),
+            status_background: color.to_owned(),
+            error: color.to_owned(),
+            warning: color.to_owned(),
+            hint: color.to_owned(),
+            string: color.to_owned(),
+            operator: color.to_owned(),
+            expansion: color.to_owned(),
+            number: color.to_owned(),
+        }
+    }
+
     #[test]
     fn evaluates_values_in_a_persistent_vm() {
         let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
@@ -2464,7 +3042,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_unversioned_config_migrates_to_v2_and_future_versions_fail() {
+    fn legacy_configs_through_v2_migrate_to_v3_and_future_versions_fail() {
         let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
         let legacy = runtime
             .lua
@@ -2475,9 +3053,25 @@ mod tests {
         assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
         migrated.validate("legacy.lua").unwrap();
 
+        for legacy_version in 0..CONFIG_SCHEMA_VERSION {
+            let path = std::env::temp_dir().join(format!(
+                "quirl-config-v{legacy_version}-{}.lua",
+                std::process::id()
+            ));
+            fs::write(
+                &path,
+                format!("return quirl.config {{ schema_version = {legacy_version} }}"),
+            )
+            .unwrap();
+            let migrated = runtime.load_config_file(&path).unwrap();
+            assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
+            assert_eq!(migrated.ui.theme, DEFAULT_THEME_NAME);
+            fs::remove_file(path).unwrap();
+        }
+
         let future = runtime
             .lua
-            .load("return quirl.config { schema_version = 3 }")
+            .load("return quirl.config { schema_version = 4 }")
             .eval::<Value>()
             .unwrap();
         let future = runtime.lua.from_value::<QuirlConfig>(future).unwrap();
@@ -2487,8 +3081,162 @@ mod tests {
     #[test]
     fn config_schema_descriptor_has_a_stable_identity() {
         assert_eq!(CONFIG_OLDEST_READABLE_VERSION, 0);
-        assert!(CONFIG_SCHEMA_DESCRIPTOR.contains("migration:unversioned-or-v1-to-v2"));
+        assert!(CONFIG_SCHEMA_DESCRIPTOR.contains("migration:unversioned-or-v1-or-v2-to-v3"));
         assert!(config_schema_hash().starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn default_and_custom_themes_resolve_to_fixed_color_roles() {
+        let default = QuirlConfig::default();
+        let tokyo_night = default.active_theme().unwrap();
+        assert_eq!(default.ui.theme, "tokyo-night");
+        assert_eq!(tokyo_night.accent_command, "#9ece6a");
+        assert_eq!(tokyo_night.status_background, "#24283b");
+
+        let mut custom = QuirlConfig::default();
+        custom.ui.theme = "quiet".to_owned();
+        custom
+            .ui
+            .themes
+            .insert("quiet".to_owned(), test_theme("#123abc"));
+        custom.validate("custom.lua").unwrap();
+        assert_eq!(custom.active_theme().unwrap(), test_theme("#123abc"));
+
+        let mut ansi = QuirlConfig::default();
+        ansi.ui.theme = "ansi".to_owned();
+        assert_eq!(ansi.active_theme().unwrap().accent_command, "#00aa00");
+    }
+
+    #[test]
+    fn popular_builtin_theme_registry_is_complete_unique_and_valid() {
+        let names = builtin_theme_names().collect::<Vec<_>>();
+        assert_eq!(names.len(), POPULAR_THEME_COUNT + 1);
+        assert_eq!(names.first(), Some(&"ansi"));
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let unique = names.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), names.len());
+        for name in names {
+            validate_theme_name("builtins", "built-in theme", name).unwrap();
+            let colors = builtin_theme(name).unwrap();
+            colors.validate("builtins", name).unwrap();
+            assert!(CONFIG_SCHEMA_DESCRIPTOR.contains(name));
+
+            let mut config = QuirlConfig::default();
+            config.ui.theme = name.to_owned();
+            config.validate("builtins").unwrap();
+            assert_eq!(config.active_theme().unwrap(), colors);
+        }
+    }
+
+    #[test]
+    fn representative_popular_theme_palettes_keep_their_source_identity() {
+        assert_eq!(builtin_theme("dracula").unwrap().error, "#ff5555");
+        assert_eq!(
+            builtin_theme("catppuccin-mocha").unwrap().status_background,
+            "#1e1e2e"
+        );
+        assert_eq!(
+            builtin_theme("gruvbox-dark").unwrap().accent_command,
+            "#b8bb26"
+        );
+        assert_eq!(builtin_theme("nord").unwrap().hint, "#81a1c1");
+        assert_eq!(builtin_theme("solarized-dark").unwrap().operator, "#2aa198");
+    }
+
+    #[test]
+    fn lua_config_deserializes_custom_theme_roles_exactly() {
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let value = runtime
+            .lua
+            .load(
+                r##"return quirl.config {
+                  ui = {
+                    theme = "quiet",
+                    themes = {
+                      quiet = {
+                        accent_command = "#010101", accent_data = "#020202",
+                        context_primary = "#030303", context_secondary = "#040404",
+                        muted = "#050505", border = "#060606",
+                        status_background = "#070707", error = "#080808",
+                        warning = "#090909", hint = "#0a0a0a", string = "#0b0b0b",
+                        operator = "#0c0c0c", expansion = "#0d0d0d", number = "#0e0e0e",
+                      },
+                    },
+                  },
+                }"##,
+            )
+            .eval::<Value>()
+            .unwrap();
+        let config = runtime.lua.from_value::<QuirlConfig>(value).unwrap();
+        config.validate("theme.lua").unwrap();
+        let active = config.active_theme().unwrap();
+        assert_eq!(active.accent_command, "#010101");
+        assert_eq!(active.number, "#0e0e0e");
+    }
+
+    #[test]
+    fn theme_validation_rejects_unknown_malformed_and_shadowing_values() {
+        let mut unknown = QuirlConfig::default();
+        unknown.ui.theme = "missing".to_owned();
+        let error = unknown.validate("unknown.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.details.context[0].contains("not built in"));
+
+        let mut malformed = QuirlConfig::default();
+        malformed.ui.theme = "quiet".to_owned();
+        malformed
+            .ui
+            .themes
+            .insert("quiet".to_owned(), test_theme("123456"));
+        let error = malformed.validate("malformed.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.details.context[0].contains("#RRGGBB"));
+
+        let mut shadowing = QuirlConfig::default();
+        shadowing
+            .ui
+            .themes
+            .insert("tokyo-night".to_owned(), test_theme("#123456"));
+        let error = shadowing.validate("shadow.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.details.context[0].contains("must not shadow"));
+    }
+
+    #[test]
+    fn theme_names_colors_and_collection_sizes_are_bounded() {
+        let mut long_name = QuirlConfig::default();
+        long_name.ui.theme = "a".repeat(MAX_THEME_NAME_BYTES + 1);
+        let error = long_name.validate("long-name.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("bytes: 65; limit: 64"));
+
+        let mut unsafe_name = QuirlConfig::default();
+        unsafe_name.ui.theme = "Tokyo_Night".to_owned();
+        let error = unsafe_name.validate("unsafe-name.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.details.context[0].contains("lowercase ASCII"));
+
+        let mut long_color = QuirlConfig::default();
+        long_color.ui.theme = "quiet".to_owned();
+        long_color
+            .ui
+            .themes
+            .insert("quiet".to_owned(), test_theme("#1234567"));
+        let error = long_color.validate("long-color.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("bytes: 8; limit: 7"));
+
+        let mut too_many = QuirlConfig::default();
+        for index in 0..=MAX_CUSTOM_THEMES {
+            too_many
+                .ui
+                .themes
+                .insert(format!("theme-{index}"), test_theme("#123456"));
+        }
+        let error = too_many.validate("too-many.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("themes: 33; limit: 32"));
     }
 
     #[test]
@@ -2539,20 +3287,19 @@ mod tests {
               editor = { keymap = "vim", semantic_hints = true },
               picker = { layout = "adaptive", preview = true },
               prompt = { left = {}, right = {} },
+              ui = { theme = "ansi" },
             }"#,
         )
         .unwrap();
         let mut store = ConfigStore::default();
         store.reload(&runtime, &path).unwrap();
         assert_eq!(store.active().editor.keymap, "vim");
+        assert_eq!(store.active().ui.theme, "ansi");
 
-        fs::write(
-            &path,
-            "return quirl.config { editor = { keymap = 'broken' } }",
-        )
-        .unwrap();
+        fs::write(&path, "return quirl.config { ui = { theme = 'missing' } }").unwrap();
         assert!(store.reload(&runtime, &path).is_err());
         assert_eq!(store.active().editor.keymap, "vim");
+        assert_eq!(store.active().ui.theme, "ansi");
         fs::remove_file(path).unwrap();
     }
 

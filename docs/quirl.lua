@@ -24,11 +24,29 @@
 ---@field right? string[] Ordered prompt segments aligned on the right.
 ---@field transient? boolean Collapse accepted input to one scrollback line before execution.
 
+---@class quirl.ThemeColors
+---@field accent_command string #RRGGBB color for command-mode accents.
+---@field accent_data string #RRGGBB color for data-mode accents.
+---@field context_primary string #RRGGBB color for primary context.
+---@field context_secondary string #RRGGBB color for secondary context.
+---@field muted string #RRGGBB color for subdued text.
+---@field border string #RRGGBB color for borders.
+---@field status_background string #RRGGBB status background color.
+---@field error string #RRGGBB error color.
+---@field warning string #RRGGBB warning color.
+---@field hint string #RRGGBB hint color.
+---@field string string #RRGGBB string syntax color.
+---@field operator string #RRGGBB operator syntax color.
+---@field expansion string #RRGGBB expansion syntax color.
+---@field number string #RRGGBB number syntax color.
+
 ---@class quirl.StatuslineConfig
 ---@field hints? boolean
 
 ---@class quirl.UiConfig
 ---@field surface? quirl.Surface
+---@field theme? string Built-in or custom theme name; defaults to tokyo-night.
+---@field themes? table<string, quirl.ThemeColors> At most 32 custom themes.
 ---@field statusline? quirl.StatuslineConfig
 
 ---@class quirl.CompletionConfig

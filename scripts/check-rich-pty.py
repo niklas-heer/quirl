@@ -45,7 +45,7 @@ class Session:
         (config_dir / "config.lua").write_text(
             f"""---@type quirl.Config
 return quirl.config {{
-  schema_version = 2,
+  schema_version = 3,
   editor = {{ keymap = "emacs", semantic_hints = {str(semantic_hints).lower()}, banner = "none" }},
   picker = {{ layout = "adaptive", preview = true }},
   prompt = {{
@@ -54,7 +54,7 @@ return quirl.config {{
     right = {{ "duration", "status" }},
     transient = false,
   }},
-  ui = {{ surface = "rich", statusline = {{ hints = true }} }},
+  ui = {{ theme = "tokyo-night", surface = "rich", statusline = {{ hints = true }} }},
   completion = {{ auto = false, min_chars = 2 }},
 }}
 """,

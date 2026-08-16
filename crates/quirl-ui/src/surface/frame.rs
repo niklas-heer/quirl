@@ -4,8 +4,8 @@ use super::{
     highlight::{DiagnosticSeverity, SurfaceDiagnostic},
     overlay::PickerLayout,
     statusbar::StatusBarModel,
-    theme::Theme,
 };
+use crate::theme::Theme;
 use crate::SurfaceSymbols;
 use quirl_core::{escape_terminal_controls, escape_terminal_line};
 use quirl_syntax::{HighlightKind, HighlightSpan, Mode};
@@ -622,7 +622,7 @@ mod tests {
         assert!(row(&terminal, 2).contains("command"));
         assert_eq!(
             terminal.backend().buffer().cell((2, 1)).unwrap().fg,
-            Color::Green
+            Color::Rgb(158, 206, 106)
         );
     }
 
@@ -675,7 +675,7 @@ mod tests {
                 .cell((u16::try_from(end_x).unwrap(), 1))
                 .unwrap()
                 .fg,
-            Color::Yellow
+            Color::Rgb(158, 206, 106)
         );
         let cursor = terminal.get_cursor_position().unwrap();
         assert!(cursor.x < 24);
@@ -946,7 +946,7 @@ mod tests {
             .buffer()
             .cell((u16::try_from(range.start + 2).unwrap(), 1))
             .unwrap();
-        assert_eq!(flag_cell.fg, Color::Yellow);
+        assert_eq!(flag_cell.fg, Color::Rgb(224, 175, 104));
         assert!(flag_cell.modifier.contains(Modifier::UNDERLINED));
         assert!(row(&terminal, 2).contains("▲ unknown flag"));
     }

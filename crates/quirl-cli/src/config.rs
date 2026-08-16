@@ -1,7 +1,8 @@
 use clap::{Subcommand, ValueEnum};
 use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
 use quirl_lua::{
-    format_source, LuaPolicy, LuaRuntime, QuirlConfig, CONFIG_SCHEMA_VERSION, MAX_LUA_SOURCE_BYTES,
+    builtin_theme_names, format_source, LuaPolicy, LuaRuntime, QuirlConfig, CONFIG_SCHEMA_VERSION,
+    MAX_LUA_SOURCE_BYTES, MAX_THEME_NAME_BYTES,
 };
 use serde::Serialize;
 use std::{
@@ -208,6 +209,15 @@ fn tui(file: &Path) -> Result<i32, ShellError> {
         config.prompt.transient
     );
     println!("\n[ui]");
+    println!(
+        "ui.theme = {}  (built-ins: {})",
+        escape_terminal_controls(&config.ui.theme),
+        builtin_theme_names().collect::<Vec<_>>().join(" | ")
+    );
+    println!(
+        "ui.themes = {}",
+        escape_terminal_controls(&ConfigField::UiThemes.value(&config))
+    );
     println!(
         "ui.surface = {}  (auto | rich | simple)",
         escape_terminal_controls(&config.ui.surface)
@@ -861,6 +871,12 @@ fn apply_web_form(
     )?;
     collect_web_change(
         &mut replacements,
+        ConfigField::UiTheme,
+        required_form_value(form, "ui_theme")?,
+        &session.config.ui.theme,
+    )?;
+    collect_web_change(
+        &mut replacements,
         ConfigField::UiSurface,
         required_form_value(form, "ui_surface")?,
         &session.config.ui.surface,
@@ -1002,6 +1018,11 @@ impl HttpResponse {
 fn render_form(session: &WebSession, notice: Option<&str>) -> String {
     let config = &session.config;
     let selected = |value: &str, option: &str| if value == option { " selected" } else { "" };
+    let theme_options = builtin_theme_names()
+        .map(str::to_owned)
+        .chain(config.ui.themes.keys().cloned())
+        .map(|name| format!("<option value=\"{}\"></option>", html_escape(&name)))
+        .collect::<String>();
     let notice = notice.map_or_else(String::new, |message| {
         format!(
             "<p role=\"status\" aria-live=\"polite\">{}</p>",
@@ -1012,14 +1033,14 @@ fn render_form(session: &WebSession, notice: Option<&str>) -> String {
         "<!doctype html>
 <html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
 <meta name=\"referrer\" content=\"no-referrer\"><title>Quirl configuration</title>
-<style>body{{font:1rem system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem}}fieldset{{margin:1rem 0;padding:1rem}}label{{display:block;margin:.75rem 0}}select,textarea{{font:inherit;max-width:100%;width:24rem}}textarea{{height:7rem}}button{{font:inherit;padding:.5rem 1rem}}[role=status]{{padding:.75rem;background:#eef}}</style></head>
+<style>body{{font:1rem system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem}}fieldset{{margin:1rem 0;padding:1rem}}label{{display:block;margin:.75rem 0}}input,select,textarea{{font:inherit;max-width:100%;width:24rem}}textarea{{height:7rem}}button{{font:inherit;padding:.5rem 1rem}}[role=status]{{padding:.75rem;background:#eef}}</style></head>
 <body><main><h1>Quirl configuration</h1><p><code>config.lua</code> is the source of truth. Saves validate Lua, retain a <code>.bak</code>, and refuse concurrent edits.</p>{notice}
 <form method=\"post\" action=\"/\"><input type=\"hidden\" name=\"csrf\" value=\"{token}\"><input type=\"hidden\" name=\"revision\" value=\"{revision}\">
 <fieldset><legend>Schema</legend><p>Version <output>{schema}</output> (managed by Quirl; not edited by this form).</p></fieldset>
 <fieldset><legend>Editor</legend><label for=\"editor-keymap\">Keymap <select id=\"editor-keymap\" name=\"editor_keymap\"><option value=\"emacs\"{key_emacs}>emacs — complete default</option><option value=\"vim\"{key_vim}>vim</option><option value=\"helix\"{key_helix}>helix — experimental</option></select></label><label for=\"editor-semantic-hints\">Semantic hints <select id=\"editor-semantic-hints\" name=\"editor_semantic_hints\"><option value=\"true\"{semantic_true}>true</option><option value=\"false\"{semantic_false}>false</option></select></label><label for=\"editor-banner\">Welcome <select id=\"editor-banner\" name=\"editor_banner\"><option value=\"full\"{banner_full}>full</option><option value=\"compact\"{banner_compact}>compact</option><option value=\"none\"{banner_none}>none</option></select></label></fieldset>
 <fieldset><legend>Picker</legend><label for=\"picker-layout\">Layout <select id=\"picker-layout\" name=\"picker_layout\"><option value=\"adaptive\"{layout_adaptive}>adaptive</option><option value=\"bottom\"{layout_bottom}>bottom</option><option value=\"full\"{layout_full}>full</option></select></label><label for=\"picker-preview\">Preview <select id=\"picker-preview\" name=\"picker_preview\"><option value=\"true\"{preview_true}>true</option><option value=\"false\"{preview_false}>false</option></select></label></fieldset>
 <fieldset><legend>Prompt</legend><label for=\"prompt-symbols\">Symbols <select id=\"prompt-symbols\" name=\"prompt_symbols\"><option value=\"auto\"{symbols_auto}>auto — safe Unicode</option><option value=\"plain\"{symbols_plain}>plain — ASCII only</option><option value=\"unicode\"{symbols_unicode}>unicode</option><option value=\"nerd_font\"{symbols_nerd_font}>Nerd Font / Powerline</option></select></label><p><strong>Nerd Font</strong> is an explicit opt-in and requires a patched terminal font. Auto never assumes one. Segment lists use one name per line.</p><label for=\"prompt-left\">Left <textarea id=\"prompt-left\" name=\"prompt_left\">{prompt_left}</textarea></label><label for=\"prompt-right\">Right <textarea id=\"prompt-right\" name=\"prompt_right\">{prompt_right}</textarea></label><label for=\"prompt-transient\">Transient prompt <select id=\"prompt-transient\" name=\"prompt_transient\"><option value=\"true\"{transient_true}>true</option><option value=\"false\"{transient_false}>false</option></select></label></fieldset>
-<fieldset><legend>Interactive surface</legend><label for=\"ui-surface\">Surface <select id=\"ui-surface\" name=\"ui_surface\"><option value=\"auto\"{surface_auto}>auto</option><option value=\"rich\"{surface_rich}>rich</option><option value=\"simple\"{surface_simple}>simple</option></select></label><label for=\"ui-statusline-hints\">Status-line hints <select id=\"ui-statusline-hints\" name=\"ui_statusline_hints\"><option value=\"true\"{statusline_true}>true</option><option value=\"false\"{statusline_false}>false</option></select></label></fieldset>
+<fieldset><legend>Interactive surface</legend><label for=\"ui-theme\">Theme <input id=\"ui-theme\" name=\"ui_theme\" type=\"text\" list=\"ui-theme-options\" maxlength=\"{theme_name_bytes_max}\" value=\"{theme}\"><datalist id=\"ui-theme-options\">{theme_options}</datalist></label><label for=\"ui-surface\">Surface <select id=\"ui-surface\" name=\"ui_surface\"><option value=\"auto\"{surface_auto}>auto</option><option value=\"rich\"{surface_rich}>rich</option><option value=\"simple\"{surface_simple}>simple</option></select></label><label for=\"ui-statusline-hints\">Status-line hints <select id=\"ui-statusline-hints\" name=\"ui_statusline_hints\"><option value=\"true\"{statusline_true}>true</option><option value=\"false\"{statusline_false}>false</option></select></label></fieldset>
 <fieldset><legend>Completion</legend><label for=\"completion-auto\">Open automatically <select id=\"completion-auto\" name=\"completion_auto\"><option value=\"true\"{completion_auto_true}>true</option><option value=\"false\"{completion_auto_false}>false</option></select></label><label for=\"completion-min-chars\">Minimum characters <input id=\"completion-min-chars\" name=\"completion_min_chars\" type=\"number\" min=\"0\" max=\"4096\" value=\"{completion_min_chars}\"></label></fieldset>
 <button type=\"submit\">Save configuration</button></form></main></body></html>",
         token = html_escape(&session.token),
@@ -1046,6 +1067,9 @@ fn render_form(session: &WebSession, notice: Option<&str>) -> String {
         prompt_right = html_escape(&config.prompt.right.join("\n")),
         transient_true = selected(&config.prompt.transient.to_string(), "true"),
         transient_false = selected(&config.prompt.transient.to_string(), "false"),
+        theme = html_escape(&config.ui.theme),
+        theme_options = theme_options,
+        theme_name_bytes_max = MAX_THEME_NAME_BYTES,
         surface_auto = selected(&config.ui.surface, "auto"),
         surface_rich = selected(&config.ui.surface, "rich"),
         surface_simple = selected(&config.ui.surface, "simple"),
@@ -1785,6 +1809,8 @@ enum ConfigField {
     PromptLeft,
     PromptRight,
     PromptTransient,
+    UiTheme,
+    UiThemes,
     UiSurface,
     UiStatuslineHints,
     CompletionAuto,
@@ -1792,7 +1818,7 @@ enum ConfigField {
 }
 
 impl ConfigField {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 15] = [
         Self::EditorKeymap,
         Self::EditorSemanticHints,
         Self::EditorBanner,
@@ -1802,6 +1828,8 @@ impl ConfigField {
         Self::PromptLeft,
         Self::PromptRight,
         Self::PromptTransient,
+        Self::UiTheme,
+        Self::UiThemes,
         Self::UiSurface,
         Self::UiStatuslineHints,
         Self::CompletionAuto,
@@ -1819,6 +1847,8 @@ impl ConfigField {
             Self::PromptLeft => "prompt.left",
             Self::PromptRight => "prompt.right",
             Self::PromptTransient => "prompt.transient",
+            Self::UiTheme => "ui.theme",
+            Self::UiThemes => "ui.themes",
             Self::UiSurface => "ui.surface",
             Self::UiStatuslineHints => "ui.statusline.hints",
             Self::CompletionAuto => "completion.auto",
@@ -1837,19 +1867,21 @@ impl ConfigField {
             "prompt.left" => Ok(Self::PromptLeft),
             "prompt.right" => Ok(Self::PromptRight),
             "prompt.transient" => Ok(Self::PromptTransient),
+            "ui.theme" => Ok(Self::UiTheme),
+            "ui.themes" => Ok(Self::UiThemes),
             "ui.surface" => Ok(Self::UiSurface),
             "ui.statusline.hints" => Ok(Self::UiStatuslineHints),
             "completion.auto" => Ok(Self::CompletionAuto),
             "completion.min_chars" => Ok(Self::CompletionMinChars),
             _ => Err(ShellError::new(
                 ErrorCode::InvalidArgument,
-                format!("`{key}` is not an editable literal configuration field"),
+                format!("`{key}` is not a recognized configuration field"),
             )
-            .with_help(format!("Editable fields: {}", Self::KEYS.join(", ")))),
+            .with_help(format!("Recognized fields: {}", Self::KEYS.join(", ")))),
         }
     }
 
-    const KEYS: [&'static str; 13] = [
+    const KEYS: [&'static str; 15] = [
         "editor.keymap",
         "editor.semantic_hints",
         "editor.banner",
@@ -1859,6 +1891,8 @@ impl ConfigField {
         "prompt.left",
         "prompt.right",
         "prompt.transient",
+        "ui.theme",
+        "ui.themes",
         "ui.surface",
         "ui.statusline.hints",
         "completion.auto",
@@ -1876,6 +1910,8 @@ impl ConfigField {
             Self::PromptLeft => ("prompt", "left"),
             Self::PromptRight => ("prompt", "right"),
             Self::PromptTransient => ("prompt", "transient"),
+            Self::UiTheme => ("ui", "theme"),
+            Self::UiThemes => ("ui", "themes"),
             Self::UiSurface => ("ui", "surface"),
             Self::UiStatuslineHints => ("ui.statusline", "hints"),
             Self::CompletionAuto => ("completion", "auto"),
@@ -1884,6 +1920,17 @@ impl ConfigField {
     }
 
     fn lua_literal(self, value: &str) -> Result<String, ShellError> {
+        if self == Self::UiTheme && value.len() > MAX_THEME_NAME_BYTES {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "theme name exceeds its byte limit",
+            )
+            .with_context(format!(
+                "bytes: {}; limit: {MAX_THEME_NAME_BYTES}",
+                value.len()
+            ))
+            .with_help("Use a shorter stable ASCII theme name"));
+        }
         let valid = match self {
             Self::EditorKeymap => matches!(value, "helix" | "emacs" | "vim"),
             Self::EditorBanner => matches!(value, "full" | "compact" | "none"),
@@ -1891,6 +1938,8 @@ impl ConfigField {
             Self::PromptSymbols => {
                 matches!(value, "auto" | "plain" | "unicode" | "nerd_font")
             }
+            Self::UiTheme => valid_theme_name(value),
+            Self::UiThemes => false,
             Self::UiSurface => matches!(value, "auto" | "rich" | "simple"),
             Self::CompletionMinChars => value.parse::<u16>().is_ok_and(|value| value <= 4096),
             Self::EditorSemanticHints
@@ -1908,6 +1957,10 @@ impl ConfigField {
                 Self::EditorBanner => "full, compact, or none",
                 Self::PickerLayout => "adaptive, bottom, or full",
                 Self::PromptSymbols => "auto, plain, unicode, or nerd_font",
+                Self::UiTheme => {
+                    "a non-empty theme name using lowercase letters, digits, or hyphens"
+                }
+                Self::UiThemes => "custom theme definitions edited directly in Lua",
                 Self::UiSurface => "auto, rich, or simple",
                 Self::CompletionMinChars => "an integer from 0 through 4096",
                 Self::EditorSemanticHints
@@ -1930,8 +1983,16 @@ impl ConfigField {
             | Self::EditorBanner
             | Self::PickerLayout
             | Self::PromptSymbols
+            | Self::UiTheme
             | Self::UiSurface => {
                 format!("\"{value}\"")
+            }
+            Self::UiThemes => {
+                return Err(ShellError::new(
+                    ErrorCode::InvalidArgument,
+                    "ui.themes is code-controlled",
+                )
+                .with_help("Edit custom theme definitions directly in config.lua"));
             }
             Self::EditorSemanticHints
             | Self::PickerPreview
@@ -1960,12 +2021,22 @@ impl ConfigField {
             Self::PromptLeft => serde_json::to_string(&config.prompt.left).unwrap_or_default(),
             Self::PromptRight => serde_json::to_string(&config.prompt.right).unwrap_or_default(),
             Self::PromptTransient => config.prompt.transient.to_string(),
+            Self::UiTheme => config.ui.theme.clone(),
+            Self::UiThemes => serde_json::to_string(&config.ui.themes).unwrap_or_default(),
             Self::UiSurface => config.ui.surface.clone(),
             Self::UiStatuslineHints => config.ui.statusline.hints.to_string(),
             Self::CompletionAuto => config.completion.auto.to_string(),
             Self::CompletionMinChars => config.completion.min_chars.to_string(),
         }
     }
+}
+
+fn valid_theme_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_THEME_NAME_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn valid_prompt_item(value: &str) -> bool {
@@ -2047,9 +2118,11 @@ fn patch_literal(
         | ConfigField::EditorBanner
         | ConfigField::PickerLayout
         | ConfigField::PromptSymbols
+        | ConfigField::UiTheme
         | ConfigField::UiSurface => {
             matches!(&tokens[*value].kind, TokenKind::String)
         }
+        ConfigField::UiThemes => false,
         ConfigField::EditorSemanticHints
         | ConfigField::PickerPreview
         | ConfigField::PromptTransient
@@ -2436,18 +2509,42 @@ return config
     }
 
     #[test]
+    fn theme_name_is_a_bounded_patchable_literal() {
+        assert_eq!(
+            ConfigField::UiTheme.lua_literal("tokyo-night").unwrap(),
+            "\"tokyo-night\""
+        );
+        assert!(ConfigField::UiTheme.lua_literal("").is_err());
+        assert!(ConfigField::UiTheme.lua_literal("Tokyo Night").is_err());
+        let oversized = ConfigField::UiTheme
+            .lua_literal(&"a".repeat(MAX_THEME_NAME_BYTES + 1))
+            .unwrap_err();
+        assert_eq!(oversized.code, ErrorCode::ResourceLimit);
+        assert!(oversized.details.context[0].contains(&format!("limit: {MAX_THEME_NAME_BYTES}")));
+
+        let source = r#"return quirl.config {
+  ui = { theme = "tokyo-night", surface = "auto" },
+}"#;
+        let patched = patch_literal(source, ConfigField::UiTheme, "\"gruvbox-dark\"").unwrap();
+        assert!(patched.contains("theme = \"gruvbox-dark\""));
+        assert!(patched.contains("surface = \"auto\""));
+    }
+
+    #[test]
     fn rich_surface_fields_are_nested_patchable_and_validated() {
         let directory = test_directory();
         fs::create_dir_all(&directory).unwrap();
         let file = directory.join("config.lua");
         fs::write(&file, include_str!("../../../examples/config.lua")).unwrap();
 
+        assert_eq!(set(&file, "ui.theme", "ansi").unwrap(), 0);
         assert_eq!(set(&file, "ui.surface", "rich").unwrap(), 0);
         assert_eq!(set(&file, "ui.statusline.hints", "false").unwrap(), 0);
         assert_eq!(set(&file, "completion.min_chars", "4").unwrap(), 0);
 
         let config = load(&file).unwrap();
-        assert_eq!(config.schema_version, 2);
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.ui.theme, "ansi");
         assert_eq!(config.ui.surface, "rich");
         assert!(!config.ui.statusline.hints);
         assert_eq!(config.completion.min_chars, 4);
@@ -2474,7 +2571,7 @@ return config
     }
 
     #[test]
-    fn migration_preview_inserts_v2_without_mutating_the_source() {
+    fn migration_preview_inserts_the_current_schema_without_mutating_the_source() {
         let directory = test_directory();
         fs::create_dir_all(&directory).unwrap();
         let file = directory.join("config.lua");
@@ -2484,7 +2581,7 @@ return config
         let (version, candidate) = migration_candidate(&source).unwrap();
 
         assert_eq!(version, None);
-        assert!(candidate.contains("schema_version = 2"));
+        assert!(candidate.contains(&format!("schema_version = {CONFIG_SCHEMA_VERSION}")));
         assert_eq!(read_config_source(&file).unwrap(), source);
         assert!(!backup_path(&file).exists());
         fs::remove_dir_all(directory).unwrap();
@@ -2494,7 +2591,10 @@ return config
     fn migration_preview_rejects_a_future_schema_instead_of_calling_it_current() {
         let source = example_source().replace(
             "editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
-            "schema_version = 3,\n  editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
+            &format!(
+                "schema_version = {},\n  editor = {{ keymap = \"helix\", semantic_hints = true, banner = \"full\" }},",
+                CONFIG_SCHEMA_VERSION + 1
+            ),
         );
 
         let error = migration_candidate(&source).unwrap_err();
@@ -2505,7 +2605,7 @@ return config
     }
 
     #[test]
-    fn migration_preview_projects_v1_to_v2_without_rewriting_other_source() {
+    fn migration_preview_projects_v1_to_the_current_schema_without_rewriting_other_source() {
         let source = example_source().replace(
             "editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
             "schema_version = 1,\n  editor = { keymap = \"helix\", semantic_hints = true, banner = \"full\" },",
@@ -2514,7 +2614,7 @@ return config
         let (version, candidate) = migration_candidate(&source).unwrap();
 
         assert_eq!(version, Some(1));
-        assert!(candidate.contains("schema_version = 2"));
+        assert!(candidate.contains(&format!("schema_version = {CONFIG_SCHEMA_VERSION}")));
         assert!(candidate.contains("-- Keep this comment"));
         assert!(candidate.contains("render = function() return \"ok\" end"));
     }
@@ -2551,6 +2651,39 @@ return config
     }
 
     #[test]
+    fn diff_reports_the_selected_theme() {
+        let left = load_test_config();
+        let mut right = left.clone();
+        right.ui.theme = "gruvbox-dark".to_owned();
+
+        assert_eq!(
+            config_differences(&left, &right),
+            vec![ConfigDifference {
+                key: "ui.theme",
+                before: left.ui.theme,
+                after: "gruvbox-dark".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn custom_theme_map_diff_is_deterministic() {
+        let left = load_test_config();
+        let mut right = left.clone();
+        let colors = right.active_theme().unwrap();
+        right.ui.themes.insert("z-last".to_owned(), colors.clone());
+        right.ui.themes.insert("a-first".to_owned(), colors);
+
+        let differences = config_differences(&left, &right);
+        assert_eq!(differences.len(), 1);
+        assert_eq!(differences[0].key, "ui.themes");
+        assert_eq!(differences[0].before, "{}");
+        let first = differences[0].after.find("a-first").unwrap();
+        let last = differences[0].after.find("z-last").unwrap();
+        assert!(first < last);
+    }
+
+    #[test]
     fn doctor_distinguishes_literal_and_code_controlled_fields_without_writing() {
         let source = example_source().replace("keymap = \"helix\"", "keymap = \"helix\" .. \"\"");
         let config = load_test_config();
@@ -2558,6 +2691,7 @@ return config
 
         assert!(!literal.contains(&"editor.keymap"));
         assert!(code_controlled.contains(&"editor.keymap"));
+        assert!(code_controlled.contains(&"ui.themes"));
     }
 
     #[test]
@@ -2617,6 +2751,7 @@ return config
             ("prompt_left".to_owned(), "directory".to_owned()),
             ("prompt_right".to_owned(), String::new()),
             ("prompt_transient".to_owned(), "true".to_owned()),
+            ("ui_theme".to_owned(), "tokyo-night".to_owned()),
             ("ui_surface".to_owned(), "auto".to_owned()),
             ("ui_statusline_hints".to_owned(), "true".to_owned()),
             ("completion_auto".to_owned(), "false".to_owned()),
@@ -2638,10 +2773,42 @@ return config
         assert!(page.contains("editor_banner"));
         assert!(page.contains("picker_layout"));
         assert!(page.contains("prompt_left"));
+        assert!(page.contains("ui_theme"));
+        assert!(page.contains("value=\"tokyo-night\""));
+        assert!(page.contains("ui-theme-options"));
+        assert!(page.contains("value=\"dracula\""));
+        assert!(page.contains("value=\"solarized-dark\""));
         assert!(page.contains("ui_surface"));
         assert!(page.contains("completion_min_chars"));
         assert!(!page.contains("Cache-Control"));
         assert!(!page.contains("<script"));
+    }
+
+    #[test]
+    fn web_form_patches_a_builtin_theme_selection() {
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("config.lua");
+        let source = example_source().replace(
+            "  prompt = { symbols = \"auto\", left = { \"directory\" }, right = {} },\n}",
+            "  prompt = { symbols = \"auto\", left = { \"directory\" }, right = {} },\n  ui = { theme = \"tokyo-night\", surface = \"auto\", statusline = { hints = true } },\n}",
+        );
+        fs::write(&file, &source).unwrap();
+        let mut session = WebSession {
+            token: "private".to_owned(),
+            source: source.clone(),
+            config: load(&file).unwrap(),
+        };
+        let mut form = web_form("private", &source, "helix");
+        form.insert("ui_theme".to_owned(), "ansi".to_owned());
+
+        apply_web_form(&file, &mut session, &form).unwrap();
+
+        assert_eq!(load(&file).unwrap().ui.theme, "ansi");
+        assert!(fs::read_to_string(&file)
+            .unwrap()
+            .contains("theme = \"ansi\""));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

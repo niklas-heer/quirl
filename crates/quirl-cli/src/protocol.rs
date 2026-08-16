@@ -109,7 +109,7 @@ fn current_manifest() -> Result<ProtocolFreezeManifest, quirl_core::ShellError> 
             quirl_lua::CONFIG_OLDEST_READABLE_VERSION,
             CompatibilityPolicy::MigratedRange,
             quirl_lua::config_schema_hash(),
-            "v0_v1_migrate_to_v2",
+            "v0_v1_v2_migrate_to_v3",
         ),
         contract(
             "extension",
