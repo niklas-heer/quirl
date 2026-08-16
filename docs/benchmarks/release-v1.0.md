@@ -81,13 +81,21 @@ gate.
 
 ```sh
 cargo build --release -p quirl-cli -p quirl-bench
+shasum -a 256 target/release/quirl
+# Copy the independently recorded digest; do not derive it from the binary's
+# self-reported metadata.
+QUIRL_EXPECTED_SHA256=<64-hex-digit-digest>
 target/release/quirl-bench release \
   --quirl target/release/quirl \
+  --expected-sha256 "$QUIRL_EXPECTED_SHA256" \
   --json
 ```
 
 `release` exits non-zero when any release budget misses, while still emitting
-the complete JSON evidence. `preview` emits the same schema without enforcing
-the final exit status. The release run defaults to 101 PTY samples; preview
-uses 31. Both use 31 version samples, 2,000 headless edit samples, 500 prompt
-samples, and 100,000 stream samples for every tested window.
+the complete JSON evidence. It requires the independently recorded SHA-256,
+copies the supplied binary into a private read-only staging directory, verifies
+the copy before executing it, and uses only that staged copy throughout the
+run. `preview` emits the same schema without enforcing the final exit status or
+requiring a digest. The release run defaults to 101 PTY samples; preview uses
+31. Both use 31 version samples, 2,000 headless edit samples, 500 prompt samples,
+and 100,000 stream samples for every tested window.
