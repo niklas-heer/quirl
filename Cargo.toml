@@ -45,6 +45,7 @@ toml = "0.9"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 wasmparser = { version = "0.256", default-features = false, features = ["std", "validate", "component-model"] }
+xshell = "0.2.7"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

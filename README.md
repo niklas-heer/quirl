@@ -527,13 +527,20 @@ in [`CHANGELOG.md`](CHANGELOG.md).
 
 The repository-local Cargo `xtask` is the task runner, so development requires
 no tool beyond the pinned Rust toolchain. Run `cargo xtask check` before every
-commit; it is the canonical quality gate while the project deliberately
-operates without CI.
+commit; it remains the canonical local quality gate. A bounded daily CI swarm
+is reserved for replayable Bash/Zsh compatibility exploration.
 
 Generated native-shell cases are deterministic and replayable:
 
 ```console
 cargo xtask test --seed 123456789 --cases 2048
+```
+
+Stateful session swarms compare exact status, output, and filesystem effects
+against both clean references and leave an inspectable trace:
+
+```console
+cargo xtask simulate --seed 123456789 --sessions 2048 --steps 12
 ```
 
 See the [testing strategy](docs/testing-strategy.md) and

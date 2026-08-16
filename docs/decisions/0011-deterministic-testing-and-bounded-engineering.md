@@ -40,8 +40,16 @@ Quirl adopts the following engineering contract:
 6. Assertions are for internal programmer invariants. User input, unavailable
    resources, and operating failures remain structured `ShellError` values.
 7. Dependencies must justify their boundary, maintenance, binary-size, and
-   supply-chain costs. A zero-dependency rule is not adopted; the Cargo-native
-   `xtask` uses only the already-approved workspace `clap` dependency.
+   supply-chain costs. A zero-dependency rule is not adopted. The Cargo-native
+   `xtask` uses approved workspace dependencies only: `clap` for its typed
+   interface, `xshell` for readable injection-safe command orchestration, and
+   Serde/JSON for replayable simulation artifacts. Lifecycle-sensitive capture
+   and timeout paths continue to use `std::process::Command` directly.
+8. A scheduled compatibility swarm is the narrow CI exception while repository
+   traffic remains low. It invokes only the typed `xtask` simulator, requires
+   both clean references, uploads its evidence, and opens an issue only for a
+   completed report that proves a mismatch. The canonical pre-commit gate stays
+   local.
 
 The canonical commands are `cargo xtask check` and `cargo xtask test`. Both use
 the stable default seed. A reported failure can be replayed with:
@@ -56,6 +64,9 @@ cargo xtask test --seed <seed> --cases <case-count>
   runner.
 - Differential coverage can grow by adding generators and oracles without
   turning tests into nondeterministic flakes.
+- Daily exploration varies the recorded seed without making a single run
+  nondeterministic, and produces durable evidence that can be inspected or
+  replayed locally.
 - Every new simulator or generator must remain bounded and emit replay data.
 - We deliberately do not require no allocation after startup, architecture-wide
   fixed-width integers, an assertion quota, or zero external dependencies.

@@ -37,6 +37,56 @@ Case counts are restricted to `1..=10000`. A failure message contains everything
 needed to replay it. Never seed from wall-clock time inside a test; a scheduled
 or external swarm may choose seeds, but it must record them before execution.
 
+## Stateful compatibility simulation
+
+The inspectable compatibility swarm is a separate, wider gate:
+
+```console
+cargo xtask simulate --seed 123456789 --sessions 2048 --steps 12
+```
+
+Each generated session has `3..=steps` stateful operations. It starts in an
+isolated directory, changes into a session workspace, exports a value, and then
+mixes bounded C1 command lists, pipelines, redirects, append operations,
+parameter and arithmetic expansion, command substitution, here-strings,
+status propagation, stdout, and stderr. The final observation exposes retained
+environment and filesystem state. Quirl, clean Bash, and clean Zsh each receive
+an identical fresh filesystem and an environment reduced to explicit locale,
+path, home, temporary-directory, and terminal values.
+
+Both references are required. A Bash/Zsh disagreement is reported as
+`reference_divergence`, because the generator has escaped the promised common
+subset or a reference changed. When the references agree and Quirl differs in
+status, exact output, or the bounded filesystem manifest, the result is
+`native_mismatch`. No majority vote can hide a divergence.
+
+The seed-specific directory under `target/simulations/` contains:
+
+- `summary.json`, including result counts, exact interpreter paths and
+  versions, and the first divergent session;
+- `report.jsonl`, with every source, step list, outcome, filesystem manifest,
+  deadline result, and classification;
+- `failures/session-N/`, with standalone `.sh` and `.qrl` replay sources plus
+  the complete case record; and
+- `issue.md`, only on mismatch, with the exact focused replay command.
+
+To rerun only a reported session while preserving generator position:
+
+```console
+cargo xtask simulate --seed 123456789 --sessions 2048 --steps 12 --session 731 --output target/simulations/replay
+```
+
+Sessions are bounded to `1..=10000`, steps to `3..=32`, source and retained
+output to 64 KiB, the filesystem manifest to 64 files and 64 KiB at depth eight,
+and every interpreter to five seconds. Timeouts terminate the isolated process
+group before the result is recorded.
+
+The daily GitHub Actions swarm chooses the explicit seed from the workflow run
+ID, installs both references, runs 2,048 sessions, and uploads the trace. It
+opens a public issue only when a completed `summary.json` proves a compatibility
+mismatch; checkout, installation, build, or runner failures fail the workflow
+without being mislabeled as shell defects.
+
 ## Lifecycle simulation
 
 The process lifecycle simulator adapts TigerBeetle's

@@ -38,9 +38,11 @@ cargo run -p quirl-cli
 commit. It checks formatting, Quirl source formatting, Clippy, all workspace
 tests, the real-PTY interaction matrix on Unix, and the guest-side Lua tests.
 Generated shell cases use a stable seed; replay or expand them with
-`cargo xtask test --seed <seed> --cases <count>`. The complete layered strategy
-is in [`docs/testing-strategy.md`](docs/testing-strategy.md). The project
-intentionally does not use CI while its traffic is low, so include the local
+`cargo xtask test --seed <seed> --cases <count>`. Stateful compatibility swarms
+run with `cargo xtask simulate --seed <seed> --sessions <count>`, producing an
+inspectable JSONL trace. The complete layered strategy is in
+[`docs/testing-strategy.md`](docs/testing-strategy.md). Only that bounded swarm
+runs daily in CI while traffic is low, so include the local `cargo xtask check`
 result in your pull request.
 
 Prefer package-targeted commands during iteration so research-only workspace
