@@ -41,8 +41,7 @@ and methods. The source-of-truth and evidence order is defined in [the
 documentation system](documentation-system.md).
 
 <!-- BEGIN QUIRL RELEASE EVIDENCE STATUS -->
-> **Release evidence status — historical.** P14 evidence for measured candidate `7bf188344ca61798a3cd8657787eacb8ec26ef84` and artifact `81cd33388cf610a7aac23a9781dbf2771b5dfb6b01b17522c2257cd3676d0ae6` is historical.
-> Evidence commit `05df4b09349394cfd34f24d514e0e005365d0ed8` documents that measurement. It is not evidence for the corrected implementation, which has no fresh exact-candidate measurement.
+> **Release evidence status — current.** The record for measured candidate `631d7849a22d04a028cbe90315dd63b8a526b03a` and artifact `6ab5d8c5069956b5b5fe2d0b37b50e7d3c2a287df33a36ae75b88c87f900d8a0` is current exact-candidate evidence.
 > Human review on named Linux and macOS terminals, remote-PTY review, and real-terminal demo review remain incomplete.
 <!-- END QUIRL RELEASE EVIDENCE STATUS -->
 
