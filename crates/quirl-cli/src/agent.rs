@@ -256,9 +256,12 @@ fn print_agent_catalog(catalog: &AgentCatalog) {
     println!("\nCommands:");
     for command in &catalog.commands {
         println!(
-            "  {:<32} {}",
+            "  {:<32} {} [{} -> {}; live={}]",
             escape_terminal_controls(&command.signature),
-            escape_terminal_controls(&command.summary)
+            escape_terminal_controls(&command.summary),
+            escape_terminal_controls(&command.io.input),
+            escape_terminal_controls(&command.io.output),
+            command.io.streaming
         );
     }
     println!("\nCapabilities:");

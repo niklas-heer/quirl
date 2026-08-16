@@ -441,7 +441,11 @@ Target-adjacent familiarity matters: TypeScript and Python dominate broad popula
 
 ### One runner, multiple language engines
 
-`quirl run` is the stable script entry point. It detects a shebang or known extension, accepts `--lang`, and supplies every engine with the same arguments, environment, working directory, byte streams, cancellation signal, and structured exit result.
+`quirl run` is the stable script entry point. It detects a shebang or known
+extension, accepts `--lang`, and lowers once into the same validated execution
+plan as other front doors. Every engine receives the same bounded arguments,
+environment, working directory, input/output intent, absolute deadline,
+cancellation identity, effects, source identity, and structured outcome.
 
 ```lua
 #!/usr/bin/env -S quirl run
@@ -471,6 +475,8 @@ return { abi_version = 1, main = main }
 
 Runner ABI v1 captures bounded arguments, a UTF-8 environment view, cwd, typed
 input/output intent, declared effects, and one shared cancellation identity.
+The host's monotonic plan deadline covers VM construction and `main`; Lua's
+memory, instruction, and callback policies may narrow it but never restart it.
 Results use the shared tagged value and structured `ShellError` representations.
 Only finite value batches of at most 512 items cross this ABI; live streams stay
 engine-owned and are never collected merely to fit a Lua or JSON table.
@@ -817,7 +823,25 @@ and accessible text output, per the release criterion in §10.
 - **Deterministic authoring tools.** `fmt`, `check`, `lint`, and `test` accept
   files or deterministic project discovery. They skip build/VCS directories
   and symlink directories, aggregate every diagnostic, never execute checks,
-  and isolate test modules under the script policy.
+  and isolate test modules under the script policy. Discovery uses an explicit
+  stack and filesystem identities rather than recursion: depth is capped at 32,
+  directories at 4,096, entries per directory at 4,096, total entries at
+  65,536, supported files at 8,192, live retained path state at 4 MiB, and
+  scanned filename bytes at 4 MiB. A bind-mount or other directory alias is
+  rejected; permission and disappearing-entry failures are reported rather
+  than silently producing a partial project view.
+- **Crash-safe formatting.** Changed Lua and native Quirl sources are written to
+  a create-new sibling, flushed and synchronized, assigned the original
+  permissions, and atomically installed only after the complete bounded output
+  is durable. Formatting rejects symlinks, special files, and observed
+  concurrent changes; Unix also rejects pre-existing hard-link aliases, while
+  platforms without a stable link-count API replace only the named entry. A
+  synchronized same-directory recovery link retains the original across
+  replacement and parent-directory sync; returned failures roll back and clean
+  transaction files. On Unix each namespace transition is
+  directory-synchronized. Other platforms retain the synchronized-file
+  guarantee but depend on the operating system's rename durability because
+  portable Rust cannot sync a directory.
 - **Generated knowledge.** `new`, `describe`, and `doc` use checked templates
   and the semantic catalog. Lua annotations, editor completion, hover,
   signatures, module docs, runtime bindings, and SDK output derive from the
@@ -851,7 +875,9 @@ and accessible text output, per the release criterion in §10.
   Wasm components remain validated but disabled until a component runtime is
   selected; the checked-in WIT world and its hash bind that future work.
 - **Platform processes and recovery are bounded.** Bash/Zsh runners preserve
-  arguments, environment, status, cancellation, and fixed-size output windows.
+  arguments, environment, status, the plan deadline and cancellation identity,
+  and the exact validated per-stream capture ceiling. Inherited native output
+  retains no copy while remaining deadline- and cancellation-bound.
   Recovery is versioned, atomic, quota-limited, terminal-safe in text mode, and
   retains exact stored values in JSON.
 - **Windows has a best-effort lifecycle backend.** Cross-target checks exercise

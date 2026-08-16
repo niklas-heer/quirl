@@ -1,6 +1,7 @@
 use clap::{ArgAction, Subcommand, ValueEnum};
 use quirl_catalog::{
     import_bash, import_fish, import_help, import_man, import_zsh, Catalog, ImportDiagnostic,
+    Provenance,
 };
 use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
 use serde::Serialize;
@@ -124,7 +125,13 @@ fn load_catalog_at(path: &Path) -> Catalog {
     }
 }
 
-fn merge_cached_catalog(cached: Catalog) -> Catalog {
+fn merge_cached_catalog(mut cached: Catalog) -> Catalog {
+    // The index cache contains imported discovery facts, not authenticated
+    // installation state. Only the validated plugin lock snapshot may confer
+    // plugin provenance and make a command eligible for agent execution.
+    cached
+        .commands
+        .retain(|command| command.provenance.source != Provenance::Plugin);
     let mut current = Catalog::builtin();
     current.merge(cached.commands);
     current
@@ -610,6 +617,22 @@ mod tests {
             merged.find("quirl run").unwrap().summary,
             "stale cached summary"
         );
+    }
+
+    #[test]
+    fn cached_catalog_cannot_forge_installed_plugin_authority() {
+        let mut cached = Catalog::builtin();
+        let mut forged = cached.find("quirl run").unwrap().clone();
+        forged.path = "forged plugin command".to_owned();
+        forged.id = "plugin:forged:command".to_owned();
+        forged.version = Some("9.9.9".to_owned());
+        forged.provenance.source = Provenance::Plugin;
+        cached.commands.push(forged);
+
+        let merged = merge_cached_catalog(cached);
+
+        assert!(merged.find("forged plugin command").is_none());
+        assert!(merged.find("quirl run").is_some());
     }
 
     #[test]

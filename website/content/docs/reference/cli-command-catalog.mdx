@@ -11,6 +11,10 @@ Resume a stopped job in the background
 
 Sends SIGCONT to the selected process group without transferring terminal ownership.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `%job` — Positional `%job` declared by the builtin command signature.
@@ -20,6 +24,10 @@ Options:
 Change the shell working directory
 
 Changes Quirl's process directory so later commands and prompt context follow it.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -31,11 +39,19 @@ Set environment variables for later commands
 
 The Preview grammar accepts explicit NAME=value assignments without shell expansion.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 ## `fg [%job]`
 
 Resume a job in the foreground
 
 Transfers terminal ownership to the selected process group and waits until it exits or stops again.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -46,6 +62,10 @@ Options:
 Record changes to the repository
 
 External command metadata demonstrates imported completion knowledge.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -60,6 +80,10 @@ Show repository and working-tree status
 
 External command metadata can eventually be imported from generated specs and help output.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `-s`, `--short` — Use the compact status format
@@ -69,6 +93,10 @@ Options:
 Explore commands and their contracts
 
 Reads this same catalog used by completion and AI discovery.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -80,11 +108,19 @@ List structured background job state
 
 Shows Quirl job ids, running/stopped/done state, and the original command.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 ## `ls [path] [options]`
 
 List a directory as structured entries
 
 Quirl's bounded native ls renders terminal-safe plain rows for humans and preserves exact entry values in stable JSON. Sorting is deterministic; symlink targets are lazy and opt-in. `--max-entries` is a positive, explicit resource bound.
+
+- Input: `Nothing`
+- Output: `Stream<Entry>`
+- Live streaming: `true`
 
 Options:
 
@@ -105,6 +141,10 @@ Evaluate Lua without leaving command mode
 
 Runs an expression in the persistent restricted Lua 5.4 VM.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `expression` — Positional `expression` declared by the builtin command signature.
@@ -114,6 +154,10 @@ Options:
 Switch the visible interactive grammar
 
 Command mode carries bytes and process status. Data mode evaluates Quirl's native structured values and pipelines.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -125,6 +169,10 @@ Export installed commands and Lua host capabilities
 
 Emits a versioned deny-unknown schema with deterministic catalog and HOST_API content hashes, provenance, installed capabilities, and their versions.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `--format` — Choose accessible text or stable machine JSON
@@ -134,6 +182,10 @@ Options:
 Build deterministic token-budgeted agent context
 
 Ranks only installed command and HOST_API facts, selects the smallest relevant subtree within a documented deterministic token estimate, and records truncation and source hashes.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -147,6 +199,10 @@ Export installed tools, versions, schemas, and validators
 
 Lists only tools and capabilities installed in this Quirl composition, with schema/content hashes and validation commands grounded in the semantic catalog and generated Lua HOST_API.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `--format` — Choose accessible text or stable machine JSON
@@ -156,6 +212,10 @@ Options:
 Validate a versioned agent contract without execution
 
 Rejects unknown fields, unsupported schema versions, tampered content hashes, nondeterministic ordering, and context payloads that exceed their declared token budget.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -169,6 +229,10 @@ Export installed command knowledge for humans or AI
 
 Emits the versioned semantic catalog bundled with this binary.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `--format` — Choose a stable output format
@@ -177,7 +241,11 @@ Options:
 
 Validate scripts without executing them
 
-Deterministically discovers Lua and Quirl scripts, checks Lua syntax, annotations, modules, and restricted APIs plus Quirl statement structure, and aggregates structured diagnostics without executing source.
+Deterministically discovers Lua and Quirl scripts through a bounded, non-recursive traversal that skips links and build/VCS directories; checks Lua syntax, annotations, modules, and restricted APIs plus Quirl statement structure; and aggregates structured diagnostics without executing source.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -190,6 +258,10 @@ Query the semantic completion engine
 
 Returns the same attributed completion items used by the interactive editor.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `input` — Positional `input` declared by the builtin command signature.
@@ -201,6 +273,10 @@ Validate Lua configuration through Rust schemas
 
 Evaluates under config restrictions and preserves the active last-known-good value on failure.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `file` — Positional `file` declared by the builtin command signature.
@@ -211,6 +287,10 @@ Options:
 Compare two evaluated configurations
 
 Loads both authoritative Lua files under the restricted schema policy and reports deterministic field-level differences without changing either file.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -224,6 +304,10 @@ Diagnose configuration schema and editability
 
 Validates the authoritative configuration and reports which recognized settings are safe literal patches versus code-controlled expressions; it never writes source.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `file` — Positional `file` declared by the builtin command signature.
@@ -234,6 +318,10 @@ Options:
 Export evaluated schema-backed configuration
 
 Reads and validates config.lua, then emits a deterministic terminal-safe text view or versioned JSON document without modifying source.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -246,6 +334,10 @@ Format a Lua configuration deterministically
 
 Validates the authoritative configuration, then applies Quirl's deterministic Lua formatter. `--check` reports drift and never writes.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `file` — Positional `file` declared by the builtin command signature.
@@ -257,6 +349,10 @@ Read one evaluated configuration value
 
 Evaluates the complete restricted Lua configuration, validates it through Rust schemas, and prints one recognized typed field.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `file` — Positional `file` declared by the builtin command signature.
@@ -267,6 +363,10 @@ Options:
 Preview a schema migration without rewriting configuration
 
 0.1.0 only previews the unversioned-to-v1 schema insertion. `--dry-run` is required and no source or backup file is written.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -280,6 +380,10 @@ Safely patch one literal configuration value
 
 Changes only a recognized literal field in `quirl.config`, including `prompt.symbols` (`auto`, `plain`, `unicode`, or explicit `nerd_font`), validates the complete candidate before an atomic replacement, and retains the previous source as `.bak`.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `file` — Positional `file` declared by the builtin command signature.
@@ -292,6 +396,10 @@ Inspect schema-backed configuration in the terminal
 
 Shows current editor, picker, and prompt symbol values, allowed values, and textual editing guidance in an accessible line-oriented view.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `file` — Positional `file` declared by the builtin command signature.
@@ -301,6 +409,10 @@ Options:
 Open the local schema-backed configuration form
 
 Serves an accessible configuration form only on IPv4 loopback. The private session URL carries a CSRF token; saves validate the complete Lua configuration, retain a `.bak`, preserve non-overlapping concurrent source edits, and reject conflicting or code-controlled fields.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -314,6 +426,10 @@ Evaluate a native structured-data pipeline
 
 Sources are `pwd`, `files [path]` (or `ls`), `open <path>`, JSON, or explicit `^external <command>`. Values stay typed through streams and transforms: filesystem rows retain Path, Size, and DateTime; tar retains Path and Size; TOML retains DateTime. JSON/YAML/TOML and bytes are explicit conversion boundaries, and `to json` documents its lossy domain encoding. The CLI injects a deadline-, cancellation-, and output-bounded external host; library runtimes fail closed without one. CSV/tar rows are pulled lazily and all adapters enforce byte, row, field, depth, node, retained-text, and materialization limits. `sort`, table output, envelopes, and collected convenience APIs intentionally materialize within those limits. Transforms include typed `where` comparisons with `and`/`or`, dotted `get`, `select`, `sort`, `take`, Option-producing `first`, and `length`. Task remains declarative state; HTTP is not an implicit source.
 
+- Input: `Nothing`
+- Output: `Value`
+- Live streaming: `true`
+
 Options:
 
 - `source` — Positional `source` declared by the builtin command signature.
@@ -325,6 +441,10 @@ Describe one installed command
 
 Renders one exact entry from the same semantic catalog used by completion, documentation, language services, and agents.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `command` — Positional `command` declared by the builtin command signature.
@@ -335,6 +455,10 @@ Options:
 Generate installed command documentation
 
 Generates deterministic human or machine documentation from the installed catalog, writes requested files atomically, and can open an explicit output in the platform viewer.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -348,6 +472,10 @@ Evaluate Lua and print the returned value
 
 Runs one expression in the same restricted, budgeted Lua runtime used by scripts.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `lua-expression` — Positional `lua-expression` declared by the builtin command signature.
@@ -358,6 +486,10 @@ Describe the installed typed extension protocol
 
 Lists immutable lifecycle, directory, plan, progress, output, cancellation, result, and error events together with declared mutation capabilities and the composed catalog, completion, and panel contribution kinds.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `--format` — Choose accessible text or versioned machine JSON
@@ -367,6 +499,10 @@ Options:
 Validate an immutable extension event trace
 
 Checks the deny-unknown versioned envelope, protocol version, safe output text, and strictly increasing event sequence without invoking a plugin.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -379,6 +515,10 @@ Execute Quirl's native command graph
 
 Accepts complete Quirl source as exactly one outer-shell argument and passes it unchanged to extension planning. Without an explicit extension rewrite, the same source is parsed, diagnosed, and captured for bounded, redacted recovery. Quoting, empty arguments, byte pipes, redirects, boolean lists, and background jobs must be written inside that source operand; additional argv elements are rejected rather than joined into executable syntax.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `source` — Positional `source` declared by the builtin command signature.
@@ -386,9 +526,13 @@ Options:
 
 ## `quirl fmt <file|directory> [--check]`
 
-Format Lua scripts deterministically
+Format Lua and Quirl scripts deterministically
 
-Deterministically discovers scripts, applies Quirl's idempotent literal-safe Lua formatting contract, reports all CI drift, and leaves native `.qrl` source (including `.quirl` and `.🌀` aliases) unchanged.
+Deterministically discovers Lua and native `.qrl` scripts (including `.quirl` and `.🌀` aliases), formats them through their bounded formatters, and installs changed source through a synchronized same-directory atomic replacement that rejects links, aliases, special files, and observed concurrent changes. `--check` never writes.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -400,6 +544,10 @@ Options:
 Build the attributed completion index
 
 Imports declarative Fish, Bash, and Zsh completions plus bounded supplied help/man text without sourcing or executing providers, commands, or man, then atomically writes a versioned catalog.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -417,6 +565,10 @@ Explain where indexed command facts came from
 
 Shows source kind, confidence, origin, and fingerprint for command metadata and each retained option.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `command` — Positional `command` declared by the builtin command signature.
@@ -427,7 +579,11 @@ Options:
 
 Lint scripts without executing them
 
-Aggregates annotation and capability diagnostics for deterministically discovered scripts and rejects ambient APIs that bypass Quirl capabilities.
+Aggregates annotation and capability diagnostics for scripts found through the same bounded non-recursive discovery contract and rejects ambient APIs that bypass Quirl capabilities.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -440,11 +596,19 @@ Serve generated Lua and native Quirl (`.qrl`) editor intelligence
 
 Speaks a deterministic LSP subset over stdio, using the generated Lua HOST_API and semantic command catalog for diagnostics, completion, hover, signatures, and module docs without evaluating documents.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 ## `quirl new <name> [--lang lua|quirl] [--directory path]`
 
 Create a checked script
 
 Writes a deterministic Lua or native Quirl script with create-new semantics, so an existing script is never overwritten. Lua is the default; `--lang quirl` generates the canonical `.qrl` extension. `.quirl` and `.🌀` remain accepted input aliases.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -458,6 +622,10 @@ Validate and build a deterministic package contract
 
 Checks the entry path, Quirl version range, installed capabilities, and the public-command quality gate for summaries, argument docs and types, examples, effects, and error codes; it returns content hashes without executing Lua.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `--format` — Choose accessible diagnostics or stable JSON
@@ -468,6 +636,10 @@ Options:
 Parse a versioned project package manifest
 
 Reads a deny-unknown plugin.toml schema and shows normalized package identity, Quirl compatibility, requested capabilities, and contributions without loading its Lua entry.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -480,6 +652,10 @@ Preview a deterministic network-free package publication
 
 Runs the complete package build quality gate and emits the files, build hash, and requested permissions that would be published. Phase 2 performs no network publication.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `--format` — Choose accessible text or stable JSON
@@ -491,6 +667,10 @@ Options:
 Select typed values with Quirl's shared fuzzy engine
 
 The same deterministic exact/fuzzy/inverse query model ranks history, files, actions, jobs, completions, and data while returning the original value.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -507,6 +687,10 @@ Install a local plugin with explicit permission approval
 
 Validates the versioned manifest and runtime boundary, shows the permission diff, records SHA-256 source checksums, and atomically installs a disabled permission lock without implicit network access.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `source` — Positional `source` declared by the builtin command signature.
@@ -519,6 +703,10 @@ Validate Lua plugin registrations
 
 Loads a trusted plugin with process access denied and validates prompt and completion callbacks.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `file` — Positional `file` declared by the builtin command signature.
@@ -529,6 +717,10 @@ Options:
 Disable a plugin while retaining its permission lock
 
 Atomically changes only enabled state; source, checksums, versions, and granted capabilities remain locked for inspection and recovery.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -541,6 +733,10 @@ Diagnose plugin schema, source integrity, permissions, and runtime boundaries
 
 Verifies lock schema/API versions and SHA-256 checksums, then validates trusted Lua registrations or isolated Wasm/out-of-process boundaries with accessible diagnostics.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `name` — Positional `name` declared by the builtin command signature.
@@ -551,6 +747,10 @@ Options:
 Enable a checksum-verified installed plugin
 
 Runs doctor and the declared non-executing or budgeted trusted boundary before atomically enabling the existing locked plugin.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -563,6 +763,10 @@ Inspect requested and granted plugin authority
 
 Reads the permission lock and emits requested, granted, added, removed, and unchanged capabilities without loading plugin code.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `name` — Positional `name` declared by the builtin command signature.
@@ -573,6 +777,10 @@ Options:
 Remove an installed plugin lock without deleting source
 
 Atomically removes the named permission record; external source directories are never deleted by the plugin manager.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -585,6 +793,10 @@ Verify installed plugins without changing locked authority
 
 Re-resolves every local source and rejects any version, checksum, API, or permission change; platform v0.1 does not perform network updates.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `--format` — Choose accessible text or stable machine JSON
@@ -595,6 +807,10 @@ Options:
 Inspect recoverable command-failure snapshots
 
 Lists or displays versioned atomic snapshots containing a redacted command, working directory, environment diff, bounded captured output, timing, status, and error chain.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -607,6 +823,10 @@ List recoverable command-failure snapshots
 
 Lists versioned snapshot identifiers newest first without reading or replaying command contents.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `--format` — Choose stable text or JSON output
@@ -616,6 +836,10 @@ Options:
 Inspect one recoverable command-failure snapshot
 
 Displays an explicit snapshot or the newest available snapshot, including redacted context and bounded captured output; it never replays the command.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -627,6 +851,10 @@ Options:
 Run a script through its explicit language engine
 
 Selects a language by explicit flag, shebang, or extension; Lua uses the restricted VM, `.qrl` uses native executors, and `.quirl` plus `.🌀` are accepted native aliases. Bash/Zsh use reference interpreters with startup files disabled and structured capture.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -640,6 +868,10 @@ Export the generated Lua extension SDK
 
 LuaLS stubs, AI JSON, and human documentation are generated from the same Rust host API definitions.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `--format` — Choose the generated SDK view
@@ -650,6 +882,10 @@ Serve explicitly granted source intelligence over MCP stdio
 
 Supports modern 2026-07-28 discovery and explicitly negotiated legacy clients. Each process exposes only the requested bounded catalog, completion, source-check, and source-format tools; it grants no filesystem, network, plugin, or command-execution authority.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `--capabilities` — Grant one or more comma-separated MCP tools
@@ -658,7 +894,11 @@ Options:
 
 Run a Lua test module under resource limits
 
-Discovers conventional Lua test modules deterministically and runs every returned `test_*` function in an isolated restricted runtime.
+Discovers conventional Lua test modules through the bounded non-recursive authoring traversal and runs every returned `test_*` function in an isolated restricted runtime.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -669,6 +909,10 @@ Options:
 Render a directory as an escape-safe typed panel
 
 Produces a line-oriented name, kind, byte-size, and modification view with a plain fallback; raw terminal control bytes are rejected.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
 
 Options:
 
@@ -682,6 +926,10 @@ Render an enabled plugin's typed panel contribution
 
 Invokes one permission-locked, deadline-bounded panel provider, validates its escape-free PanelModel and declared plain fallback, then renders accessible text or JSON.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `name` — Positional `name` declared by the builtin command signature.
@@ -693,6 +941,10 @@ Render the process table as an escape-safe typed panel
 
 Reads the platform process table into typed pid, parent, state, and command cells and renders an accessible plain fallback without accepting terminal escapes.
 
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
 Options:
 
 - `--format` — Choose the plain view or typed panel model
@@ -702,6 +954,10 @@ Options:
 Watch a typed data pipeline with bounded live samples
 
 Re-evaluates the native data expression until the declared sample bound or Ctrl-C, checks cancellation between stages and during refresh waits, retains a bounded completed-sample history, and reports older samples dropped from retention.
+
+- Input: `Nothing`
+- Output: `Stream<Value>`
+- Live streaming: `true`
 
 Options:
 

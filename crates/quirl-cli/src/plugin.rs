@@ -3,7 +3,7 @@ use quirl_core::{
     escape_json_terminal_controls, escape_terminal_controls, ContributionKind, ErrorCode,
     ShellError,
 };
-use quirl_lua::{LuaPolicy, LuaRuntime};
+use quirl_lua::{CommandRegistration, LuaPolicy, LuaRuntime};
 use quirl_plugin::{
     doctor_plugin, parse_plugin_manifest, permission_diff, resolve_plugin,
     validate_plugin_manifest, AdapterInitializeRequest, AdapterInitializeResponse, DoctorReport,
@@ -13,6 +13,7 @@ use quirl_plugin::{
 use quirl_process::{sandboxed_process_host, ChildProcessTree};
 use serde::Serialize;
 use std::{
+    collections::BTreeSet,
     env, fs,
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
@@ -506,6 +507,68 @@ fn validate_runtime(
         .with_help(
             "Keep manifest contributions and typed Lua registrations identical and sorted",
         ));
+    }
+    validate_registered_command_metadata(manifest, &registrations.commands)?;
+    Ok(())
+}
+
+fn validate_registered_command_metadata(
+    manifest: &PluginManifest,
+    registrations: &[CommandRegistration],
+) -> Result<(), ShellError> {
+    for command in &manifest.public_commands {
+        let registration = registrations
+            .iter()
+            .find(|registration| registration.name == command.path)
+            .ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::Validation,
+                    format!("plugin command `{}` registration disappeared", command.path),
+                )
+                .with_help("Keep Lua registrations identical to plugin.toml")
+            })?;
+        let registered_effects = registration
+            .effects
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let declared_effects = command
+            .effects
+            .iter()
+            .map(|effect| match effect {
+                quirl_catalog::Effect::ReadFilesystem => "read_filesystem",
+                quirl_catalog::Effect::WriteFilesystem => "write_filesystem",
+                quirl_catalog::Effect::SpawnProcess => "spawn_process",
+                quirl_catalog::Effect::ChangeDirectory => "change_directory",
+            })
+            .collect::<BTreeSet<_>>();
+        let matches = registration.signature == command.signature
+            && registration.summary == command.summary
+            && registration.details == command.details
+            && registration.input_type == command.input_type
+            && registration.output_type == command.output_type
+            && registration.examples == command.examples
+            && registration.error_codes == command.error_codes
+            && registered_effects == declared_effects;
+        if !matches {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!(
+                    "plugin command `{}` registration differs from plugin.toml",
+                    command.path
+                ),
+            )
+            .with_context(format!(
+                "declared I/O: {} -> {}; registered I/O: {} -> {}",
+                command.input_type,
+                command.output_type,
+                registration.input_type,
+                registration.output_type
+            ))
+            .with_help(
+                "Keep signature, documentation, I/O, examples, effects, and statuses byte-for-byte aligned",
+            ));
+        }
     }
     Ok(())
 }
@@ -1363,7 +1426,7 @@ mod tests {
 
     fn trusted_manifest(entry: &str) -> String {
         format!(
-            r#"schema_version = 1
+            r#"schema_version = 2
 [plugin]
 name = "bounded"
 version = "0.1.0"
@@ -1428,7 +1491,7 @@ summary = "Bounded plugin"
         permissions.set_mode(0o700);
         fs::set_permissions(&entry, permissions).unwrap();
         let source = format!(
-            r#"schema_version = 1
+            r#"schema_version = 2
 [plugin]
 name = "adapter"
 version = "0.1.0"
@@ -1476,6 +1539,7 @@ max_message_bytes = {max_bytes}
             true,
         );
         assert!(result.is_ok(), "{result:?}");
+
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1655,7 +1719,7 @@ max_message_bytes = {max_bytes}
 
     #[cfg(unix)]
     #[test]
-    fn granted_trusted_plugin_process_runs_through_the_bounded_host() {
+    fn trusted_plugin_requires_full_registration_parity_and_bounded_process_grants() {
         let directory = test_package_directory("trusted-process");
         fs::create_dir_all(&directory).unwrap();
         let entry = directory.join("plugin.lua");
@@ -1672,7 +1736,7 @@ quirl.plugin.command {
         )
         .unwrap();
         let manifest = parse_plugin_manifest(
-            r#"schema_version = 1
+            r#"schema_version = 2
 [plugin]
 name = "trusted"
 version = "0.1.0"
@@ -1710,6 +1774,23 @@ error_codes = { "resource_limit" = "bounded" }
             true,
         );
         assert!(result.is_ok(), "{result:?}");
+        let mismatched_entry = fs::read_to_string(&entry)
+            .unwrap()
+            .replace("input_type = \"Nothing\"", "input_type = \"String\"");
+        let mismatch = validate_runtime(
+            &manifest,
+            &entry,
+            mismatched_entry.as_bytes(),
+            &[
+                "commands.register".to_owned(),
+                "process.spawn:printf".to_owned(),
+            ],
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(mismatch.code, ErrorCode::Validation);
+        assert!(mismatch.message.contains("registration differs"));
+        assert!(mismatch.details.context[0].contains("Nothing -> String"));
         fs::remove_dir_all(directory).unwrap();
     }
 

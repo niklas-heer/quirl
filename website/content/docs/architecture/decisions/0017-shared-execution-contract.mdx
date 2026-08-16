@@ -12,13 +12,12 @@ description: "Canonical Quirl project documentation synced from docs/decisions/0
 
 ## Context
 
-Quirl's native command, focused data, Lua, and explicit Bash/Zsh front doors
-currently enter their engines through unrelated argument and result shapes. The
-engines intentionally retain different semantics, but the composition root has
-no common place to preserve source identity, reject undeclared authority, carry
-cancellation, distinguish byte and value output, or state who owns cleanup.
-Plugin, script, and protocol adapters cannot safely compose on a collection of
-implicit conventions.
+Quirl's native command, focused data, Lua, script, plugin, and explicit
+Bash/Zsh front doors originally entered their engines through unrelated
+argument and result shapes. The engines intentionally retain different
+semantics, so the composition root needs one common place to preserve source
+identity, reject undeclared authority, carry cancellation and an absolute
+deadline, distinguish byte and value output, and state who owns cleanup.
 
 The common boundary must remain passive. Native process execution and job
 ownership stay in `quirl-process`, data evaluation stays in `quirl-data`, Lua
@@ -27,11 +26,27 @@ policy and VM ownership stay in `quirl-lua`, and interpreter selection stays in
 documents; making it a runtime owner would add catalog knowledge to every
 engine and would conflict with ADR 0016.
 
-This decision introduces the minimum contract. It does not define a new parser,
-executor, plugin dispatcher, typed Lua ABI, or streaming implementation.
+This decision defines and now enforces that common contract. It does not define
+a new parser, executor, typed Lua ABI, or streaming implementation.
 
 ## Failure model and invariants
 
+- **One absolute deadline.** Planning converts the validated positive duration
+  into one monotonic absolute deadline. Every startup step, wait, callback,
+  process request, VM budget, stream pull, and final normalization uses the
+  remaining time from that deadline. An engine-local policy may choose an
+  earlier deadline for security, but no adapter may restart, extend, or ignore
+  the plan deadline.
+- **Deadline before and after planning.** A zero or out-of-range requested
+  duration fails before planning. Once a plan exists, expiry before engine
+  startup, during initialization, during execution or output, and after partial
+  completion returns `ResourceLimit`. No successful outcome is constructed
+  after the absolute deadline has expired.
+- **Deadline/cancellation race.** Adapters check explicit cancellation before
+  deadline expiry at every shared safe point. If cancellation is already
+  visible it remains the originating error; otherwise reaching the absolute
+  deadline produces the deadline error. Engines preserve that originating
+  error while cleaning partial work rather than manufacturing a status.
 - **Cancellation before dispatch.** A set cancellation handle rejects planning
   before effect checks can be followed by engine initialization or side
   effects. Cancellation is a `ResourceLimit` `ShellError`, not a synthetic exit
@@ -48,6 +63,17 @@ executor, plugin dispatcher, typed Lua ABI, or streaming implementation.
   output cannot be rolled back. A failure remains `Err(ShellError)` and never
   claims a successful status or value; the engine drains or closes owned
   streams and releases children or VM work before returning.
+- **Capture boundaries.** A captured stdout or stderr stream containing exactly
+  `max_bytes_per_stream` bytes succeeds. Observing the next byte causes the
+  engine to continue draining both streams, terminate or reap owned work as
+  appropriate, and then return `ResourceLimit` with the configured limit and
+  observed/discarded usage. The plan ceiling is the authority; adapters do not
+  substitute a hidden fixed capture window.
+- **Inherited output.** Inherited stdout and stderr are never copied into the
+  outcome. The engine still observes the same cancellation and absolute
+  deadline, owns terminal handoff and child cleanup, and returns only
+  `ExecutionOutput::Inherited` after those invariants hold. Output already
+  written to an inherited sink cannot be rolled back.
 - **Effect denial.** A plan is created only when every declared effect is in the
   request's allowed set. Denial happens before engine initialization, file
   access, process creation, working-directory mutation, or output writes.
@@ -66,6 +92,12 @@ executor, plugin dispatcher, typed Lua ABI, or streaming implementation.
   returned only through `ShellError`; diagnostics cannot be used as a second
   error hierarchy. Bounded non-fatal diagnostics may accompany a successful
   outcome.
+- **Recovery and event consistency.** Recovery capture and execution events are
+  emitted only around the one normalized result. A non-zero engine status is a
+  successful outcome and produces result/status observations; cancellation,
+  expiry, capture overflow, or another operating failure produces the same
+  `ShellError` for recovery and error events. Source identity is repaired once
+  at that boundary before either observer sees it.
 - **Partial adapter initialization.** The adapter that creates a process tree,
   Lua VM, reader, writer, or worker immediately owns it through RAII. Partial
   initialization unwinds in that adapter and preserves the original error even
@@ -111,12 +143,22 @@ but no protocol version or freeze inventory changes until a protocol front door
 adopts them as wire data.
 
 `quirl-cli` owns one execution composition function. It validates a request into
-a plan, selects the existing engine exactly once, injects process capability and
-cancellation, maps catalog effects into runtime effects, and returns the common
-outcome. Native interactive execution may still inherit terminal streams, while
-bounded capture, data, Lua, and explicit reference modes return their real byte
-or structured-value representation. Unsupported plugin/protocol modes remain
-typed modes that fail closed until their owning tasks add dispatch.
+a plan, creates one monotonic absolute deadline, selects the existing engine
+exactly once, injects only declared process capability, propagates the same
+cancellation identity, maps catalog effects into runtime effects, and returns
+the common outcome. `quirl exec`, `quirl run`, piped and interactive execution,
+native command and script statements, data, Lua, installed plugin commands, and
+explicit Bash/Zsh all use that contract. Native inherited execution retains no
+output but uses the same process request cancellation and deadline. Protocol
+mode remains typed and fails closed because no protocol executor is installed.
+
+The validated capture range is 1..=1 MiB separately for stdout and stderr.
+Within that range the plan value is exact and authoritative: native and
+reference engines accept exactly the ceiling, drain limit+1 without deadlock,
+and return `ResourceLimit` rather than a truncated success. Value output keeps
+the separate structured-value bounds. Data's external two-second policy and
+Lua/plugin callback policies may end earlier than the plan for security, but
+they cannot extend the plan deadline.
 
 Existing public engine APIs remain available as narrow adapters. P01 exact
 source handling, P02 process lifecycle and terminal handoff, and P05 Lua policy
@@ -130,10 +172,9 @@ and fail-closed capability behavior remain authoritative.
 - Effect and cancellation policy has one composition point before dispatch.
 - Core gains passive runtime types but no executor, parser, process, Lua, data,
   UI, catalog, or CLI dependency; the ADR 0016 graph is unchanged.
-- The initial data adapter may collect only where the existing front door
-  already requests an owned value or bounded renderer. P08/P09 remain
-  responsible for end-to-end typed streaming.
-- The initial Lua adapter carries JSON-compatible structured values only. P10
-  remains responsible for the typed Lua ABI.
-- Plugin and protocol variants define a fail-closed target but do not add plugin
-  dispatch. P11 remains responsible for that integration.
+- Data collects only where the front door requests an owned value or bounded
+  renderer; interactive rendering remains pull-based and shares plan timing.
+- Lua runner modules preserve typed value or finite-values outcomes through the
+  ABI defined by ADR 0018 instead of projecting through a script-only result.
+- Installed trusted-Lua plugin commands use the same plan and bounded scheduler;
+  protocol mode remains fail closed.

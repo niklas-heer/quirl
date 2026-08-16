@@ -40,7 +40,7 @@ Compatibility is explicit per surface:
 - `migrated_range` accepts only a documented inclusive range and deterministically
   projects older documents to the current shape before validation.
 
-Catalog v2/v3 migrates to v4. Plugin lock v1 migrates to v2 without changing
+Catalog v2/v3 migrates to v4. Historically, plugin lock v1 migrated to v2 without changing
 identity, checksums, requested permissions, grants, or enabled state; the new
 runtime-schema hash is derived from the locked runtime. Recovery v1 migrates to
 v2 with explicit unavailable markers for facts v1 never stored and never
@@ -54,6 +54,15 @@ than v2, like future versions of every frozen-major surface, fail closed.
 ADR 0013 subsequently moves configuration to schema v3 for bounded built-in
 and custom semantic themes. Legacy v0/v1/v2 documents receive the Tokyo Night
 default before v3 validation; versions newer than v3 fail closed.
+
+The executable plugin-I/O transition later supersedes that historical lock
+migration under ADR 0016's fail-closed rule. Plugin manifest v2 gives command
+I/O a closed Lua ABI-v1 interpretation, and lock v3 binds that identity. Lock
+v1/v2 bytes are still decoded and authenticated for precise diagnostics, but
+are not readable as current state because their metadata cannot prove the new
+reviewed command contract. Users preserve the old lock under a legacy filename
+and re-add reviewed manifest-v2 plugins; Quirl does not synthesize a v3 runtime
+schema hash from older lock data.
 
 ## Consequences
 

@@ -668,7 +668,7 @@ fn execute_execution_request(
 ) -> Result<ExecutionOutcome, ShellError> {
     let plan = request.plan()?;
     plan.ensure_active("before engine initialization")?;
-    if !matches!(plan.input(), ExecutionInput::None) {
+    if !matches!(plan.input(), ExecutionInput::None) && plan.mode() != ExecutionMode::Plugin {
         return Err(ShellError::new(
             ErrorCode::Validation,
             "the selected front door does not yet consume execution input",
@@ -1153,7 +1153,7 @@ fn execute_command_or_dialect_island_with_extensions(
             ShellError::new(ErrorCode::Lua, "the extension host lock was poisoned")
                 .with_help("Restart Quirl before executing another plugin command")
         })?;
-        extensions.plugin_execution_request(installed, source)?
+        extensions.plugin_execution_request(installed, source, ExecutionInput::None)?
     } else {
         let target = match output_mode {
             ExecutionOutputMode::Capture => ExecutionOutputTarget::Capture {

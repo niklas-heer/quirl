@@ -11,11 +11,12 @@ use quirl_core::{
     validate_contribution_set, ContributionKind, ContributionRegistration, ErrorCode,
     ExecutionEffect, ExecutionEffects, ExecutionInput, ExecutionOutcome, ExecutionOutput,
     ExecutionOutputTarget, ExecutionPlan, ExecutionRequest, ExecutionSource, ExtensionAction,
-    ExtensionEvent, ExtensionEventData, ShellError,
+    ExtensionEvent, ExtensionEventData, ShellError, StructuredValue, StructuredValueKind,
+    ValueInputContract, ValueOutputContract,
 };
 use quirl_lua::{
     CommandRegistration, ConfigStore, EventHandlerReport, LuaCancellation, LuaPolicy,
-    LuaRunnerContext, LuaRuntime, PluginRegistrations, QuirlConfig,
+    LuaRunnerContext, LuaRuntime, PluginRegistrations, QuirlConfig, MAX_LUA_RUNNER_STREAM_VALUES,
 };
 use quirl_plugin::{
     doctor_plugin, normalize_plugin_commands, parse_plugin_manifest, validate_plugin_manifest,
@@ -68,6 +69,13 @@ const EXTENSION_PANEL_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const EXTENSION_SAFE_POINT_WAIT: Duration = Duration::from_millis(125);
 const PLUGIN_COMMAND_WALL_TIME: Duration = Duration::from_millis(50);
 const PLUGIN_COMMAND_CLEANUP_WAIT: Duration = Duration::from_millis(125);
+// These logical payload bounds leave fixed space inside the stricter raw Lua
+// return envelope (4,096 nodes, depth 16, and 256 KiB retained text). The
+// relationship is covered end to end at every exact boundary below.
+const MAX_PLUGIN_VALUE_NODES: usize = 512;
+const MAX_PLUGIN_VALUE_DEPTH: usize = 6;
+const MAX_PLUGIN_VALUE_FIELDS: usize = 256;
+const MAX_PLUGIN_VALUE_TEXT_BYTES: usize = 240 * 1024;
 
 static NEXT_RUNTIME_KEY: AtomicU64 = AtomicU64::new(1);
 
@@ -578,6 +586,7 @@ impl LuaExtensionHost {
         &mut self,
         installed: &InstalledPluginCommand,
         source: &str,
+        input: ExecutionInput,
     ) -> Result<ExecutionRequest, ShellError> {
         self.reload_if_changed();
         let binding = self
@@ -602,20 +611,7 @@ impl LuaExtensionHost {
         if binding.command != installed.command {
             return Err(stale_plugin_snapshot_error(&installed.command, source));
         }
-        if binding.command.io.input != "Nothing" {
-            return Err(ShellError::new(
-                ErrorCode::Validation,
-                format!(
-                    "plugin command `{}` requires typed pipeline input",
-                    binding.command.path
-                ),
-            )
-            .with_command(source)
-            .with_context(format!("declared input: {}", binding.command.io.input))
-            .with_help(
-                "Invoke this command from a typed pipeline after that adapter is installed",
-            ));
-        }
+        validate_plugin_input(&binding.command, &input, source, None)?;
         let declared_effects = catalog_execution_effects(&binding.command.effects);
         let cancellation = binding.runtime.prepare_execution_cancellation()?;
         Ok(ExecutionRequest::new(
@@ -623,7 +619,7 @@ impl LuaExtensionHost {
             quirl_core::ExecutionMode::Plugin,
         )
         .with_cancellation(cancellation)
-        .with_input(ExecutionInput::None)
+        .with_input(input)
         .with_arguments(installed.arguments.clone())
         .with_deadline(PLUGIN_COMMAND_WALL_TIME)
         .with_output(ExecutionOutputTarget::Value)
@@ -675,6 +671,23 @@ impl LuaExtensionHost {
                 plan.source().text(),
             ));
         }
+        validate_plugin_input(
+            &binding.command,
+            plan.input(),
+            plan.source().text(),
+            Some(plan),
+        )?;
+        if plan.output() != ExecutionOutputTarget::Value {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!(
+                    "plugin command `{}` requires typed value output",
+                    binding.command.path
+                ),
+            )
+            .with_command(plan.source().text())
+            .with_help("Request the shared typed value output target"));
+        }
         let context = LuaRunnerContext::from_current_process(
             plan.arguments(),
             plan.input().clone(),
@@ -687,12 +700,16 @@ impl LuaExtensionHost {
         let (sender, receiver) = mpsc::sync_channel(1);
         let runtime = Arc::clone(&binding.runtime);
         let command_name = binding.command.path.clone();
-        let callback_deadline = plan
-            .deadline()
+        plan.deadline()
             .ensure_remaining("before plugin scheduler admission")?;
+        let callback_expires_at = plan.deadline().expires_at();
         let work = vec![ExtensionWork::new(runtime.key, move |mut control| {
             let invocation = runtime.run_scheduled(&mut control, true, |runtime| {
-                runtime.run_plugin_command_with_context(&command_name, &context, callback_deadline)
+                runtime.run_plugin_command_with_context(
+                    &command_name,
+                    &context,
+                    callback_expires_at,
+                )
             });
             let _ = sender.try_send(PluginCommandResult { invocation });
         })];
@@ -748,7 +765,9 @@ impl LuaExtensionHost {
         };
         match result.invocation {
             ScheduledInvocation::Finished(Ok(outcome)) => {
+                plan.ensure_active("before plugin output conversion")?;
                 validate_plugin_outcome(&binding.command, &outcome)?;
+                plan.ensure_active("after plugin output conversion")?;
                 Ok(outcome)
             }
             ScheduledInvocation::Finished(Err(error)) => Err(error),
@@ -2419,6 +2438,158 @@ fn catalog_effect_name(effect: Effect) -> &'static str {
     }
 }
 
+fn validate_plugin_input(
+    command: &CommandSpec,
+    input: &ExecutionInput,
+    source: &str,
+    plan: Option<&ExecutionPlan>,
+) -> Result<(), ShellError> {
+    let contract = ValueInputContract::parse_exact(&command.io.input).ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "plugin command `{}` has an unsupported executable input contract",
+                command.path
+            ),
+        )
+        .with_command(source)
+        .with_context(format!("declared input: {}", command.io.input))
+        .with_help("Re-add the plugin with a manifest-v2 Nothing or exact value-kind input")
+    })?;
+    if !contract.matches(input) {
+        let (message, observed) = match (contract, input) {
+            (ValueInputContract::Nothing, _) => (
+                format!(
+                    "plugin command `{}` does not accept pipeline input",
+                    command.path
+                ),
+                plugin_input_name(input),
+            ),
+            (ValueInputContract::Value(_), ExecutionInput::None) => (
+                format!("plugin command `{}` requires pipeline input", command.path),
+                "missing".to_owned(),
+            ),
+            (ValueInputContract::Value(_), _) => (
+                format!("plugin command `{}` input type did not match", command.path),
+                plugin_input_name(input),
+            ),
+        };
+        let expected = match contract {
+            ValueInputContract::Nothing => "Nothing",
+            ValueInputContract::Value(kind) => kind.name(),
+        };
+        return Err(ShellError::new(ErrorCode::Validation, message)
+            .with_command(source)
+            .with_context(format!("expected: {expected}; observed: {observed}"))
+            .with_help("Supply exactly the typed input declared by the installed plugin command"));
+    }
+    if let ExecutionInput::Value(value) = input {
+        let mut budget = PluginValueBudget::default();
+        validate_plugin_value(value, "plugin command input", &mut budget, plan)?;
+    }
+    Ok(())
+}
+
+fn plugin_input_name(input: &ExecutionInput) -> String {
+    match input {
+        ExecutionInput::None => "missing".to_owned(),
+        ExecutionInput::Bytes(_) => "Bytes".to_owned(),
+        ExecutionInput::Value(value) => StructuredValueKind::of(value).name().to_owned(),
+    }
+}
+
+#[derive(Default)]
+struct PluginValueBudget {
+    nodes: usize,
+    fields: usize,
+    text_bytes: usize,
+}
+
+fn validate_plugin_value(
+    value: &StructuredValue,
+    description: &str,
+    budget: &mut PluginValueBudget,
+    plan: Option<&ExecutionPlan>,
+) -> Result<(), ShellError> {
+    let mut stack = vec![(value, 0_usize)];
+    while let Some((value, depth)) = stack.pop() {
+        if let Some(plan) = plan {
+            plan.ensure_active("during plugin value conversion")?;
+        }
+        budget.nodes = budget.nodes.saturating_add(1);
+        validate_plugin_value_limit(description, "nodes", budget.nodes, MAX_PLUGIN_VALUE_NODES)?;
+        match value {
+            StructuredValue::Decimal(value)
+            | StructuredValue::String(value)
+            | StructuredValue::Path(value)
+            | StructuredValue::DateTime(value)
+            | StructuredValue::Pattern(value) => {
+                budget.text_bytes = budget.text_bytes.saturating_add(value.len());
+            }
+            StructuredValue::List(values) => {
+                validate_plugin_container_depth(description, depth)?;
+                stack.extend(values.iter().rev().map(|value| (value, depth + 1)));
+            }
+            StructuredValue::Record(values) => {
+                validate_plugin_container_depth(description, depth)?;
+                budget.fields = budget.fields.saturating_add(values.len());
+                validate_plugin_value_limit(
+                    description,
+                    "record fields",
+                    budget.fields,
+                    MAX_PLUGIN_VALUE_FIELDS,
+                )?;
+                for (key, value) in values.iter().rev() {
+                    budget.text_bytes = budget.text_bytes.saturating_add(key.len());
+                    stack.push((value, depth + 1));
+                }
+            }
+            StructuredValue::Nothing
+            | StructuredValue::Bool(_)
+            | StructuredValue::Int(_)
+            | StructuredValue::UInt(_)
+            | StructuredValue::Duration { .. }
+            | StructuredValue::Size { .. } => {}
+        }
+        validate_plugin_value_limit(
+            description,
+            "string and key bytes",
+            budget.text_bytes,
+            MAX_PLUGIN_VALUE_TEXT_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_plugin_container_depth(description: &str, depth: usize) -> Result<(), ShellError> {
+    if depth < MAX_PLUGIN_VALUE_DEPTH {
+        return Ok(());
+    }
+    validate_plugin_value_limit(
+        description,
+        "depth",
+        depth.saturating_add(1),
+        MAX_PLUGIN_VALUE_DEPTH,
+    )
+}
+
+fn validate_plugin_value_limit(
+    description: &str,
+    unit: &str,
+    observed: usize,
+    limit: usize,
+) -> Result<(), ShellError> {
+    if observed <= limit {
+        return Ok(());
+    }
+    Err(ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{description} exceeded its Lua ABI-v1 conversion limit"),
+    )
+    .with_context(format!("{unit}: {observed}; limit: {limit}"))
+    .with_help("Reduce the typed value before invoking the plugin command"))
+}
+
 fn validate_plugin_outcome(
     command: &CommandSpec,
     outcome: &ExecutionOutcome,
@@ -2436,32 +2607,51 @@ fn validate_plugin_outcome(
             "Declare every possible signed status in plugin.toml and the Lua registration",
         ));
     }
-    match (&outcome.output, command.io.streaming) {
-        (ExecutionOutput::Value { .. }, false) | (ExecutionOutput::Values { .. }, true) => Ok(()),
-        (ExecutionOutput::Value { .. }, true) => Err(ShellError::new(
+    let contract = ValueOutputContract::parse_exact(&command.io.output).ok_or_else(|| {
+        ShellError::new(
             ErrorCode::Validation,
             format!(
-                "plugin command `{}` declared streaming output",
+                "plugin command `{}` has an unsupported executable output contract",
                 command.path
             ),
         )
-        .with_help("Return a bounded `values` batch or declare a non-streaming output type")),
-        (ExecutionOutput::Values { .. }, false) => Err(ShellError::new(
+        .with_context(format!("declared output: {}", command.io.output))
+        .with_help("Re-add the plugin with one exact value kind or bounded `Values<T>` output")
+    })?;
+    if !contract.matches(&outcome.output) {
+        return Err(ShellError::new(
             ErrorCode::Validation,
             format!(
-                "plugin command `{}` returned an undeclared value batch",
-                command.path
+                "plugin command `{}` returned output that does not match `{}`",
+                command.path, command.io.output
             ),
         )
-        .with_help("Declare `Stream<T>` output or return one typed value")),
-        (ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. }, _) => Err(ShellError::new(
-            ErrorCode::Validation,
-            format!(
-                "plugin command `{}` returned byte-oriented output",
-                command.path
-            ),
-        )
-        .with_help("Return one typed value or bounded finite value batch")),
+        .with_help(
+            "Return exactly the top-level value kind and finite shape declared in plugin.toml",
+        ));
+    }
+    let mut budget = PluginValueBudget::default();
+    match &outcome.output {
+        ExecutionOutput::Value { value } => {
+            validate_plugin_value(value, "plugin command output", &mut budget, None)
+        }
+        ExecutionOutput::Values { values } => {
+            if values.len() > MAX_LUA_RUNNER_STREAM_VALUES {
+                return validate_plugin_value_limit(
+                    "plugin command output batch",
+                    "values",
+                    values.len(),
+                    MAX_LUA_RUNNER_STREAM_VALUES,
+                );
+            }
+            for value in values {
+                validate_plugin_value(value, "plugin command output batch", &mut budget, None)?;
+            }
+            Ok(())
+        }
+        ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => {
+            unreachable!("the closed value output contract rejected byte-oriented output")
+        }
     }
 }
 
@@ -3208,10 +3398,64 @@ quirl.completion.add_provider {{
             return { abi_version = 1, ok = true, status = 0,
               output = { kind = "value", value = { type = "string", value = "managed" } } }
           end,
+        }
+        quirl.plugin.command {
+          name = "managed echo", signature = "managed echo", summary = "Echo managed path",
+          details = "Return one typed path input.", input_type = "Path",
+          output_type = "Path", examples = { "managed echo" },
+          effects = { "read_filesystem" }, error_codes = { ["0"] = "success" },
+          run = function(ctx)
+            return { abi_version = 1, ok = true, status = 0,
+              output = { kind = "value", value = ctx.input.content } }
+          end,
+        }
+        quirl.plugin.command {
+          name = "managed batch", signature = "managed batch", summary = "Batch managed values",
+          details = "Return a bounded finite size batch.", input_type = "Int",
+          output_type = "Values<Size>", examples = { "managed batch" },
+          effects = { "read_filesystem" }, error_codes = { ["0"] = "success" },
+          run = function(ctx)
+            local values = {}
+            for index = 1, ctx.input.content.value do
+              values[index] = { type = "size", value = { bytes = index } }
+            end
+            return { abi_version = 1, ok = true, status = 0,
+              output = { kind = "values", values = values } }
+          end,
+        }
+        quirl.plugin.command {
+          name = "managed list", signature = "managed list", summary = "Mirror managed list",
+          details = "Return one bounded list input.", input_type = "List",
+          output_type = "List", examples = { "managed list" },
+          effects = { "read_filesystem" }, error_codes = { ["0"] = "success" },
+          run = function(ctx)
+            return { abi_version = 1, ok = true, status = 0,
+              output = { kind = "value", value = ctx.input.content } }
+          end,
+        }
+        quirl.plugin.command {
+          name = "managed record", signature = "managed record", summary = "Mirror managed record",
+          details = "Return one bounded record input.", input_type = "Record",
+          output_type = "Record", examples = { "managed record" },
+          effects = { "read_filesystem" }, error_codes = { ["0"] = "success" },
+          run = function(ctx)
+            return { abi_version = 1, ok = true, status = 0,
+              output = { kind = "value", value = ctx.input.content } }
+          end,
+        }
+        quirl.plugin.command {
+          name = "managed text", signature = "managed text", summary = "Mirror managed text",
+          details = "Return one bounded string input.", input_type = "String",
+          output_type = "String", examples = { "managed text" },
+          effects = { "read_filesystem" }, error_codes = { ["0"] = "success" },
+          run = function(ctx)
+            return { abi_version = 1, ok = true, status = 0,
+              output = { kind = "value", value = ctx.input.content } }
+          end,
         }"#;
         fs::write(&entry, entry_source).unwrap();
         let manifest_path = package.join("plugin.toml");
-        let manifest_source = r#"schema_version = 1
+        let manifest_source = r#"schema_version = 2
 
 [plugin]
 name = "managed"
@@ -3226,7 +3470,51 @@ summary = "Managed prompt test"
 request = ["commands.register", "filesystem.read:.", "prompt.register"]
 
 [contributes]
-commands = ["managed run"]
+commands = ["managed batch", "managed echo", "managed list", "managed record", "managed run", "managed text"]
+
+[[public_commands]]
+path = "managed batch"
+signature = "managed batch"
+summary = "Batch managed values"
+details = "Return a bounded finite size batch."
+input_type = "Int"
+output_type = "Values<Size>"
+examples = ["managed batch"]
+effects = ["read_filesystem"]
+error_codes = { "0" = "success" }
+
+[[public_commands]]
+path = "managed echo"
+signature = "managed echo"
+summary = "Echo managed path"
+details = "Return one typed path input."
+input_type = "Path"
+output_type = "Path"
+examples = ["managed echo"]
+effects = ["read_filesystem"]
+error_codes = { "0" = "success" }
+
+[[public_commands]]
+path = "managed list"
+signature = "managed list"
+summary = "Mirror managed list"
+details = "Return one bounded list input."
+input_type = "List"
+output_type = "List"
+examples = ["managed list"]
+effects = ["read_filesystem"]
+error_codes = { "0" = "success" }
+
+[[public_commands]]
+path = "managed record"
+signature = "managed record"
+summary = "Mirror managed record"
+details = "Return one bounded record input."
+input_type = "Record"
+output_type = "Record"
+examples = ["managed record"]
+effects = ["read_filesystem"]
+error_codes = { "0" = "success" }
 
 [[public_commands]]
 path = "managed run"
@@ -3236,6 +3524,17 @@ details = "Return one managed test value."
 input_type = "Nothing"
 output_type = "String"
 examples = ["managed run"]
+effects = ["read_filesystem"]
+error_codes = { "0" = "success" }
+
+[[public_commands]]
+path = "managed text"
+signature = "managed text"
+summary = "Mirror managed text"
+details = "Return one bounded string input."
+input_type = "String"
+output_type = "String"
+examples = ["managed text"]
 effects = ["read_filesystem"]
 error_codes = { "0" = "success" }
 "#;
@@ -3340,8 +3639,8 @@ error_codes = { "0" = "success" }
         write_managed_lock(&root, &lock);
 
         let commands = installed_plugin_commands_from_root(&root).unwrap();
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].path, "managed run");
+        assert_eq!(commands.len(), 6);
+        assert_eq!(commands[0].path, "managed batch");
         let mut catalog = Catalog::builtin();
         catalog.merge(commands.clone());
         assert!(catalog.find("managed run").is_some());
@@ -3350,10 +3649,13 @@ error_codes = { "0" = "success" }
             .iter()
             .any(|completion| completion.value == "managed run"));
         let agent_catalog = crate::agent::installed_agent_catalog(&catalog).unwrap();
-        assert!(agent_catalog
+        let exported = agent_catalog
             .commands
             .iter()
-            .any(|command| command.path == "managed run"));
+            .find(|command| command.path == "managed echo")
+            .unwrap();
+        assert_eq!(exported.io.input, "Path");
+        assert_eq!(exported.io.output, "Path");
         let installed = bind_plugin_invocation(&commands, "managed run")
             .unwrap()
             .unwrap();
@@ -3365,7 +3667,7 @@ error_codes = { "0" = "success" }
         let request = host
             .lock()
             .unwrap()
-            .plugin_execution_request(&installed, "managed run")
+            .plugin_execution_request(&installed, "managed run", ExecutionInput::None)
             .unwrap();
         let outcome = crate::execute_execution_request(
             &mut quirl_process::NativeExecutor::default(),
@@ -3380,10 +3682,268 @@ error_codes = { "0" = "success" }
                 value: quirl_core::StructuredValue::String("managed".to_owned())
             }
         );
+
+        let echo = bind_plugin_invocation(&commands, "managed echo")
+            .unwrap()
+            .unwrap();
+        let missing = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(&echo, "managed echo", ExecutionInput::None)
+            .unwrap_err();
+        assert!(missing.message.contains("requires pipeline input"));
+        let mismatch = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(
+                &echo,
+                "managed echo",
+                ExecutionInput::Value(StructuredValue::String("wrong".to_owned())),
+            )
+            .unwrap_err();
+        assert!(mismatch.message.contains("input type did not match"));
+        let unexpected = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(
+                &installed,
+                "managed run",
+                ExecutionInput::Value(StructuredValue::String("unexpected".to_owned())),
+            )
+            .unwrap_err();
+        assert!(unexpected
+            .message
+            .contains("does not accept pipeline input"));
+
+        let echo_request = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(
+                &echo,
+                "managed echo",
+                ExecutionInput::Value(StructuredValue::Path("services.toml".to_owned())),
+            )
+            .unwrap();
+        let echo_outcome = crate::execute_execution_request(
+            &mut quirl_process::NativeExecutor::default(),
+            echo_request,
+            Some(&host),
+        )
+        .unwrap();
+        assert_eq!(
+            echo_outcome.output,
+            ExecutionOutput::Value {
+                value: StructuredValue::Path("services.toml".to_owned())
+            }
+        );
+
+        let mirror_list = bind_plugin_invocation(&commands, "managed list")
+            .unwrap()
+            .unwrap();
+        let exact_nodes =
+            StructuredValue::List(vec![StructuredValue::Nothing; MAX_PLUGIN_VALUE_NODES - 1]);
+        let exact_nodes_request = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(
+                &mirror_list,
+                "managed list",
+                ExecutionInput::Value(exact_nodes.clone()),
+            )
+            .unwrap();
+        let exact_nodes_outcome = crate::execute_execution_request(
+            &mut quirl_process::NativeExecutor::default(),
+            exact_nodes_request,
+            Some(&host),
+        )
+        .unwrap();
+        assert_eq!(
+            exact_nodes_outcome.output,
+            ExecutionOutput::Value { value: exact_nodes }
+        );
+        let excess_nodes =
+            StructuredValue::List(vec![StructuredValue::Nothing; MAX_PLUGIN_VALUE_NODES]);
+        assert_eq!(
+            host.lock()
+                .unwrap()
+                .plugin_execution_request(
+                    &mirror_list,
+                    "managed list",
+                    ExecutionInput::Value(excess_nodes),
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceLimit
+        );
+
+        let mut exact_depth = StructuredValue::Nothing;
+        for _ in 0..MAX_PLUGIN_VALUE_DEPTH {
+            exact_depth = StructuredValue::List(vec![exact_depth]);
+        }
+        let exact_depth_request = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(
+                &mirror_list,
+                "managed list",
+                ExecutionInput::Value(exact_depth.clone()),
+            )
+            .unwrap();
+        let exact_depth_outcome = crate::execute_execution_request(
+            &mut quirl_process::NativeExecutor::default(),
+            exact_depth_request,
+            Some(&host),
+        )
+        .unwrap();
+        assert_eq!(
+            exact_depth_outcome.output,
+            ExecutionOutput::Value {
+                value: exact_depth.clone()
+            }
+        );
+        assert_eq!(
+            host.lock()
+                .unwrap()
+                .plugin_execution_request(
+                    &mirror_list,
+                    "managed list",
+                    ExecutionInput::Value(StructuredValue::List(vec![exact_depth])),
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceLimit
+        );
+
+        let mirror_record = bind_plugin_invocation(&commands, "managed record")
+            .unwrap()
+            .unwrap();
+        let exact_fields = (0..MAX_PLUGIN_VALUE_FIELDS)
+            .map(|index| (format!("f{index}"), StructuredValue::Nothing))
+            .collect::<BTreeMap<_, _>>();
+        let exact_fields_request = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(
+                &mirror_record,
+                "managed record",
+                ExecutionInput::Value(StructuredValue::Record(exact_fields.clone())),
+            )
+            .unwrap();
+        let exact_fields_outcome = crate::execute_execution_request(
+            &mut quirl_process::NativeExecutor::default(),
+            exact_fields_request,
+            Some(&host),
+        )
+        .unwrap();
+        assert_eq!(
+            exact_fields_outcome.output,
+            ExecutionOutput::Value {
+                value: StructuredValue::Record(exact_fields)
+            }
+        );
+        let excess_fields = (0..=MAX_PLUGIN_VALUE_FIELDS)
+            .map(|index| (format!("f{index}"), StructuredValue::Nothing))
+            .collect();
+        assert_eq!(
+            host.lock()
+                .unwrap()
+                .plugin_execution_request(
+                    &mirror_record,
+                    "managed record",
+                    ExecutionInput::Value(StructuredValue::Record(excess_fields)),
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceLimit
+        );
+
+        let mirror_text = bind_plugin_invocation(&commands, "managed text")
+            .unwrap()
+            .unwrap();
+        let exact_text = "x".repeat(MAX_PLUGIN_VALUE_TEXT_BYTES);
+        let exact_text_request = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(
+                &mirror_text,
+                "managed text",
+                ExecutionInput::Value(StructuredValue::String(exact_text.clone())),
+            )
+            .unwrap();
+        let exact_text_outcome = crate::execute_execution_request(
+            &mut quirl_process::NativeExecutor::default(),
+            exact_text_request,
+            Some(&host),
+        )
+        .unwrap();
+        assert_eq!(
+            exact_text_outcome.output,
+            ExecutionOutput::Value {
+                value: StructuredValue::String(exact_text)
+            }
+        );
+        assert_eq!(
+            host.lock()
+                .unwrap()
+                .plugin_execution_request(
+                    &mirror_text,
+                    "managed text",
+                    ExecutionInput::Value(StructuredValue::String(
+                        "x".repeat(MAX_PLUGIN_VALUE_TEXT_BYTES + 1),
+                    )),
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceLimit
+        );
+
+        let batch = bind_plugin_invocation(&commands, "managed batch")
+            .unwrap()
+            .unwrap();
+        let exact_batch_request = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(
+                &batch,
+                "managed batch",
+                ExecutionInput::Value(StructuredValue::Int(
+                    i64::try_from(MAX_LUA_RUNNER_STREAM_VALUES).unwrap(),
+                )),
+            )
+            .unwrap();
+        let exact_batch = crate::execute_execution_request(
+            &mut quirl_process::NativeExecutor::default(),
+            exact_batch_request,
+            Some(&host),
+        )
+        .unwrap();
+        assert!(matches!(
+            exact_batch.output,
+            ExecutionOutput::Values { ref values }
+                if values.len() == MAX_LUA_RUNNER_STREAM_VALUES
+        ));
+        let overflow_request = host
+            .lock()
+            .unwrap()
+            .plugin_execution_request(
+                &batch,
+                "managed batch",
+                ExecutionInput::Value(StructuredValue::Int(
+                    i64::try_from(MAX_LUA_RUNNER_STREAM_VALUES + 1).unwrap(),
+                )),
+            )
+            .unwrap();
+        let overflow = crate::execute_execution_request(
+            &mut quirl_process::NativeExecutor::default(),
+            overflow_request,
+            Some(&host),
+        )
+        .unwrap_err();
+        assert_eq!(overflow.code, ErrorCode::ResourceLimit);
         let cancelled_plan = host
             .lock()
             .unwrap()
-            .plugin_execution_request(&installed, "managed run")
+            .plugin_execution_request(&installed, "managed run", ExecutionInput::None)
             .unwrap()
             .plan()
             .unwrap();
@@ -3399,7 +3959,7 @@ error_codes = { "0" = "success" }
         let expired_plan = host
             .lock()
             .unwrap()
-            .plugin_execution_request(&installed, "managed run")
+            .plugin_execution_request(&installed, "managed run", ExecutionInput::None)
             .unwrap()
             .plan()
             .unwrap();
@@ -3415,7 +3975,7 @@ error_codes = { "0" = "success" }
         let stale_request = host
             .lock()
             .unwrap()
-            .plugin_execution_request(&installed, "managed run")
+            .plugin_execution_request(&installed, "managed run", ExecutionInput::None)
             .unwrap();
         write_managed_lock(&root, &PluginLockfile::empty());
         let removed = crate::execute_execution_request(
@@ -3468,6 +4028,112 @@ error_codes = { "0" = "success" }
         let denied = request.plan().unwrap_err();
         assert_eq!(denied.code, ErrorCode::Validation);
         assert!(denied.details.context[0].contains("ReadFilesystem"));
+    }
+
+    #[test]
+    fn plugin_value_conversion_accepts_exact_limits_and_rejects_limit_plus_one() {
+        let exact_nodes =
+            StructuredValue::List(vec![StructuredValue::Nothing; MAX_PLUGIN_VALUE_NODES - 1]);
+        validate_plugin_value(
+            &exact_nodes,
+            "test input",
+            &mut PluginValueBudget::default(),
+            None,
+        )
+        .unwrap();
+        let excess_nodes =
+            StructuredValue::List(vec![StructuredValue::Nothing; MAX_PLUGIN_VALUE_NODES]);
+        assert_eq!(
+            validate_plugin_value(
+                &excess_nodes,
+                "test input",
+                &mut PluginValueBudget::default(),
+                None,
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::ResourceLimit
+        );
+
+        let exact_fields = (0..MAX_PLUGIN_VALUE_FIELDS)
+            .map(|index| (format!("f{index}"), StructuredValue::Nothing))
+            .collect();
+        validate_plugin_value(
+            &StructuredValue::Record(exact_fields),
+            "test input",
+            &mut PluginValueBudget::default(),
+            None,
+        )
+        .unwrap();
+        let excess_fields = (0..=MAX_PLUGIN_VALUE_FIELDS)
+            .map(|index| (format!("f{index}"), StructuredValue::Nothing))
+            .collect();
+        let field_error = validate_plugin_value(
+            &StructuredValue::Record(excess_fields),
+            "test input",
+            &mut PluginValueBudget::default(),
+            None,
+        )
+        .unwrap_err();
+        assert!(field_error.details.context[0].contains("record fields"));
+
+        validate_plugin_value(
+            &StructuredValue::String("x".repeat(MAX_PLUGIN_VALUE_TEXT_BYTES)),
+            "test input",
+            &mut PluginValueBudget::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_plugin_value(
+                &StructuredValue::String("x".repeat(MAX_PLUGIN_VALUE_TEXT_BYTES + 1)),
+                "test input",
+                &mut PluginValueBudget::default(),
+                None,
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::ResourceLimit
+        );
+
+        let mut exact_depth = StructuredValue::Nothing;
+        for _ in 0..MAX_PLUGIN_VALUE_DEPTH {
+            exact_depth = StructuredValue::List(vec![exact_depth]);
+        }
+        validate_plugin_value(
+            &exact_depth,
+            "test input",
+            &mut PluginValueBudget::default(),
+            None,
+        )
+        .unwrap();
+        let excess_depth = StructuredValue::List(vec![exact_depth]);
+        let depth_error = validate_plugin_value(
+            &excess_depth,
+            "test input",
+            &mut PluginValueBudget::default(),
+            None,
+        )
+        .unwrap_err();
+        assert!(depth_error.details.context[0].contains("depth"));
+
+        let mut command = Catalog::builtin().commands[0].clone();
+        command.path = "plugin mismatch".to_owned();
+        command.io.input = "Nothing".to_owned();
+        command.io.output = "String".to_owned();
+        command.io.streaming = false;
+        command.exit_codes.insert(0, "success".to_owned());
+        let outcome = ExecutionOutcome::new(
+            quirl_core::ExecutionStatus::Exited(0),
+            ExecutionOutput::Value {
+                value: StructuredValue::Int(1),
+            },
+            Vec::new(),
+            quirl_core::ExecutionCleanupState::Complete,
+        )
+        .unwrap();
+        let mismatch = validate_plugin_outcome(&command, &outcome).unwrap_err();
+        assert!(mismatch.message.contains("does not match `String`"));
     }
 
     #[test]

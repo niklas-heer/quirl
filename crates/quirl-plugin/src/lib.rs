@@ -9,16 +9,17 @@ use quirl_catalog::{
     Provenance, ProvenanceInfo,
 };
 use quirl_contract::{stable_hash, ArgumentKind as PackageArgumentKind, PackageCommand};
-use quirl_core::{ErrorCode, ShellError};
+use quirl_core::{ErrorCode, ShellError, ValueInputContract, ValueOutputContract};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use wasmparser::{Encoding, Parser, Payload, Validator};
 
 /// Current version of the deny-unknown plugin manifest contract.
-pub const PLUGIN_SCHEMA_VERSION: u32 = 1;
-/// Current lockfile version; version 1 is accepted only through explicit migration.
-pub const LOCK_SCHEMA_VERSION: u32 = 2;
+pub const PLUGIN_SCHEMA_VERSION: u32 = 2;
+/// Current lockfile version. Versions 1 and 2 are authenticated, then fail
+/// closed because they cannot prove the executable manifest-v2 contract.
+pub const LOCK_SCHEMA_VERSION: u32 = 3;
 /// Plugin host API version required by manifests and lock entries.
 pub const PLUGIN_API_VERSION: &str = "0.1.0";
 /// Canonical filename used when persisting the deterministic plugin lock.
@@ -45,10 +46,14 @@ pub const MAX_ADAPTER_CALLBACK_TIMEOUT_MS: u64 = 60_000;
 pub const WASM_WIT: &str = include_str!("../wit/quirl-plugin.wit");
 
 /// Canonical structural description used to fingerprint [`PluginManifest`].
-pub const PLUGIN_SCHEMA_DESCRIPTOR: &str = "PluginManifest{deny_unknown;schema_version:u32;plugin:PluginMetadata{deny_unknown;name:string;version:string;entry:relative-path;quirl:version-range;api:string;runtime:trusted_lua|wasm_component|out_of_process;summary:string};capabilities:PluginCapabilities{deny_unknown;request:array<capability>};contributes:PluginContributions{deny_unknown;commands:array<string>;completions:array<string>;events:array<string>;panels:array<string>;indexers:array<string>};public_commands:array<PackageCommand@quirl.package@1>;wasm:null|WasmComponentBoundary{deny_unknown;world:string;max_memory_bytes:u64;fuel:u64;callback_timeout_ms:u64};adapter:null|OutOfProcessBoundary{deny_unknown;protocol:string;executable:string;arguments:array<string>;callback_timeout_ms:u64;max_message_bytes:u64}}";
+pub const PLUGIN_SCHEMA_DESCRIPTOR: &str = "PluginManifest{deny_unknown;schema_version:2;plugin:PluginMetadata{deny_unknown;name:string;version:string;entry:relative-path;quirl:version-range;api:string;runtime:trusted_lua|wasm_component|out_of_process;summary:string};capabilities:PluginCapabilities{deny_unknown;request:array<capability>};contributes:PluginContributions{deny_unknown;commands:array<string>;completions:array<string>;events:array<string>;panels:array<string>;indexers:array<string>};public_commands:array<PackageCommand@quirl.package@1+LuaExecutableIo{input:Nothing|Bool|Int|UInt|Decimal|String|List|Record|Path|Duration|Size|DateTime|Pattern;output:Nothing|Bool|Int|UInt|Decimal|String|List|Record|Path|Duration|Size|DateTime|Pattern|Values<same>;live_streams:rejected;limits{values:512;nodes:512;depth:6;fields:256;text_bytes:245760}}>;wasm:null|WasmComponentBoundary{deny_unknown;world:string;max_memory_bytes:u64;fuel:u64;callback_timeout_ms:u64};adapter:null|OutOfProcessBoundary{deny_unknown;protocol:string;executable:string;arguments:array<string>;callback_timeout_ms:u64;max_message_bytes:u64}}";
+/// Historical manifest-v1 descriptor retained for fail-closed identity tests.
+pub const PLUGIN_SCHEMA_V1_DESCRIPTOR: &str = "PluginManifest{deny_unknown;schema_version:u32;plugin:PluginMetadata{deny_unknown;name:string;version:string;entry:relative-path;quirl:version-range;api:string;runtime:trusted_lua|wasm_component|out_of_process;summary:string};capabilities:PluginCapabilities{deny_unknown;request:array<capability>};contributes:PluginContributions{deny_unknown;commands:array<string>;completions:array<string>;events:array<string>;panels:array<string>;indexers:array<string>};public_commands:array<PackageCommand@quirl.package@1>;wasm:null|WasmComponentBoundary{deny_unknown;world:string;max_memory_bytes:u64;fuel:u64;callback_timeout_ms:u64};adapter:null|OutOfProcessBoundary{deny_unknown;protocol:string;executable:string;arguments:array<string>;callback_timeout_ms:u64;max_message_bytes:u64}}";
 /// Canonical structural description used to fingerprint current [`PluginLockfile`] data.
-pub const LOCK_SCHEMA_DESCRIPTOR: &str = "PluginLockfile{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;resolved_api_version:string;plugins:array<LockedPlugin{deny_unknown;name:string;version:string;source:string;runtime:PluginRuntime;resolved_api_version:string;runtime_schema_hash:string;manifest_checksum:string;entry_checksum:string;source_checksum:string;requested_capabilities:array<string>;granted_capabilities:array<string>;enabled:bool}>}";
-/// Historical descriptor used exclusively to authenticate and migrate lock schema v1.
+pub const LOCK_SCHEMA_DESCRIPTOR: &str = "PluginLockfile{deny_unknown;document_type:string;schema_version:3;schema_hash:string;resolved_api_version:string;plugins:array<LockedPlugin{deny_unknown;name:string;version:string;source:string;runtime:PluginRuntime;resolved_api_version:string;runtime_schema_hash:plugin-manifest-v2|wasm-world;manifest_checksum:string;entry_checksum:string;source_checksum:string;requested_capabilities:array<string>;granted_capabilities:array<string>;enabled:bool}>}";
+/// Historical descriptor used exclusively to authenticate and reject lock schema v2.
+pub const LOCK_SCHEMA_V2_DESCRIPTOR: &str = "PluginLockfile{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;resolved_api_version:string;plugins:array<LockedPlugin{deny_unknown;name:string;version:string;source:string;runtime:PluginRuntime;resolved_api_version:string;runtime_schema_hash:string;manifest_checksum:string;entry_checksum:string;source_checksum:string;requested_capabilities:array<string>;granted_capabilities:array<string>;enabled:bool}>}";
+/// Historical descriptor used exclusively to authenticate and reject lock schema v1.
 pub const LOCK_SCHEMA_V1_DESCRIPTOR: &str = "PluginLockfile{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;resolved_api_version:string;plugins:array<LockedPlugin{deny_unknown;name:string;version:string;source:string;runtime:PluginRuntime;resolved_api_version:string;manifest_checksum:string;entry_checksum:string;source_checksum:string;requested_capabilities:array<string>;granted_capabilities:array<string>;enabled:bool}>}";
 
 /// Computes the structural identity of the plugin manifest and embedded command schema.
@@ -56,6 +61,17 @@ pub fn plugin_manifest_schema_hash() -> String {
     stable_hash(
         format!(
             "{PLUGIN_SCHEMA_DESCRIPTOR};{}",
+            quirl_contract::package_manifest_schema_hash()
+        )
+        .as_bytes(),
+    )
+}
+
+#[cfg(test)]
+fn plugin_manifest_schema_v1_hash() -> String {
+    stable_hash(
+        format!(
+            "{PLUGIN_SCHEMA_V1_DESCRIPTOR};{}",
             quirl_contract::PACKAGE_SCHEMA_DESCRIPTOR
         )
         .as_bytes(),
@@ -503,12 +519,13 @@ impl PluginLockfile {
         Ok(())
     }
 
-    /// Parses, migrates, and validates a deny-unknown JSON lockfile.
+    /// Parses and validates a deny-unknown JSON lockfile.
     ///
-    /// Current version-2 data is validated directly. Authenticated version-1 data is
-    /// migrated in memory by adding the runtime schema identity, then subjected to
-    /// current validation. Unsupported versions and malformed JSON return
-    /// [`ErrorCode::Validation`].
+    /// Current version-3 data is validated directly. Historical version-1 and
+    /// version-2 data is decoded with its exact deny-unknown shape and identity,
+    /// then rejected with migration guidance: a lock alone cannot prove that its
+    /// reviewed manifest satisfies the executable manifest-v2 I/O contract.
+    /// Unsupported versions and malformed JSON return [`ErrorCode::Validation`].
     pub fn from_json(bytes: &[u8]) -> Result<Self, ShellError> {
         let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
             validation_error(
@@ -526,7 +543,7 @@ impl PluginLockfile {
                 )
             })?;
         match version {
-            2 => {
+            3 => {
                 let lock: Self = serde_json::from_value(value).map_err(|error| {
                     validation_error(
                         format!("plugin lockfile schema is invalid: {error}"),
@@ -535,6 +552,24 @@ impl PluginLockfile {
                 })?;
                 lock.validate()?;
                 Ok(lock)
+            }
+            2 => {
+                let legacy: Self = serde_json::from_value(value).map_err(|error| {
+                    validation_error(
+                        format!("legacy plugin lockfile v2 schema is invalid: {error}"),
+                        "Restore the original v2 lockfile before migration",
+                    )
+                })?;
+                if legacy.document_type != "quirl.plugin.lock"
+                    || legacy.schema_hash != stable_hash(LOCK_SCHEMA_V2_DESCRIPTOR.as_bytes())
+                    || legacy.resolved_api_version != PLUGIN_API_VERSION
+                {
+                    return Err(validation_error(
+                        "legacy plugin lockfile v2 identity is invalid",
+                        "Restore the original v2 lockfile before migration",
+                    ));
+                }
+                Err(legacy_lock_contract_error(2))
             }
             1 => {
                 let legacy: LegacyPluginLockfileV1 =
@@ -553,37 +588,7 @@ impl PluginLockfile {
                         "Restore the original v1 lockfile before migration",
                     ));
                 }
-                let lock = Self {
-                    document_type: legacy.document_type,
-                    schema_version: LOCK_SCHEMA_VERSION,
-                    schema_hash: plugin_lock_schema_hash(),
-                    resolved_api_version: legacy.resolved_api_version,
-                    plugins: legacy
-                        .plugins
-                        .into_iter()
-                        .map(|plugin| LockedPlugin {
-                            runtime_schema_hash: match plugin.runtime {
-                                PluginRuntime::WasmComponent => wasm_world_hash(),
-                                PluginRuntime::TrustedLua | PluginRuntime::OutOfProcess => {
-                                    plugin_manifest_schema_hash()
-                                }
-                            },
-                            name: plugin.name,
-                            version: plugin.version,
-                            source: plugin.source,
-                            runtime: plugin.runtime,
-                            resolved_api_version: plugin.resolved_api_version,
-                            manifest_checksum: plugin.manifest_checksum,
-                            entry_checksum: plugin.entry_checksum,
-                            source_checksum: plugin.source_checksum,
-                            requested_capabilities: plugin.requested_capabilities,
-                            granted_capabilities: plugin.granted_capabilities,
-                            enabled: plugin.enabled,
-                        })
-                        .collect(),
-                };
-                lock.validate()?;
-                Ok(lock)
+                Err(legacy_lock_contract_error(1))
             }
             _ => Err(validation_error(
                 format!("plugin lockfile schema version {version} is unsupported"),
@@ -719,7 +724,7 @@ pub fn parse_plugin_manifest(source: &str, origin: &str) -> Result<PluginManifes
             format!("invalid plugin manifest {origin}"),
         )
         .with_context(error.to_string())
-        .with_help("Use schema_version = 1 and remove unknown plugin manifest fields")
+        .with_help("Use schema_version = 2 and remove unknown plugin manifest fields")
     })
 }
 
@@ -758,6 +763,14 @@ pub fn validate_plugin_manifest(
     validate_sorted_unique(&manifest.capabilities.request, "requested capabilities")?;
     validate_capabilities(&manifest.capabilities.request)?;
     validate_contributions(manifest)?;
+    if manifest.plugin.runtime != PluginRuntime::TrustedLua
+        && !manifest.contributes.commands.is_empty()
+    {
+        return Err(validation_error(
+            "only trusted-Lua plugins can contribute executable commands in ABI v1",
+            "Remove command contributions or select runtime = `trusted_lua`; Wasm and out-of-process command execution are not installed",
+        ));
+    }
     match manifest.plugin.runtime {
         PluginRuntime::TrustedLua => {
             if !manifest.plugin.entry.ends_with(".lua")
@@ -956,7 +969,9 @@ pub fn normalize_plugin_commands(
             io: IoContract {
                 input: command.input_type.clone(),
                 output: command.output_type.clone(),
-                streaming: command.output_type.starts_with("Stream<"),
+                // `Values<T>` is a bounded materialized batch. Catalog streaming
+                // means a live incremental source, which Lua ABI v1 cannot expose.
+                streaming: false,
             },
             effects: command.effects.clone(),
             exit_codes,
@@ -1111,8 +1126,31 @@ fn validate_command(command: &PackageCommand) -> Result<(), ShellError> {
             "Document its signature, types, examples, effects, and error codes",
         ));
     }
+    if ValueInputContract::parse_exact(&command.input_type).is_none() {
+        return Err(executable_type_error(
+            &command.path,
+            "input_type",
+            &command.input_type,
+            "Use `Nothing` or one exact value kind: Bool, Int, UInt, Decimal, String, List, Record, Path, Duration, Size, DateTime, or Pattern",
+        ));
+    }
+    if ValueOutputContract::parse_exact(&command.output_type).is_none() {
+        return Err(executable_type_error(
+            &command.path,
+            "output_type",
+            &command.output_type,
+            "Use one exact value kind, or `Values<T>` for a bounded finite batch; live `Stream<T>` output is unsupported",
+        ));
+    }
     let _effects = command.effects.iter().map(effect_name).collect::<Vec<_>>();
     Ok(())
+}
+
+fn executable_type_error(command: &str, field: &str, declaration: &str, help: &str) -> ShellError {
+    validation_error(
+        format!("plugin command `{command}` has unsupported executable {field} `{declaration}`"),
+        help,
+    )
 }
 
 fn validate_wasm_component(
@@ -1479,6 +1517,15 @@ fn unknown_plugin(name: &str) -> ShellError {
     )
 }
 
+fn legacy_lock_contract_error(version: u64) -> ShellError {
+    validation_error(
+        format!(
+            "plugin lockfile schema v{version} predates executable command I/O contracts"
+        ),
+        format!("Move plugins.lock.json intact to plugins.lock.json.legacy-v{version}, then re-add each plugin after reviewing a schema_version = 2 manifest; Quirl cannot infer the new runtime contract from an old lock"),
+    )
+}
+
 fn validation_error(message: impl Into<String>, help: impl Into<String>) -> ShellError {
     ShellError::new(ErrorCode::Validation, message).with_help(help)
 }
@@ -1496,8 +1543,11 @@ fn effect_name(effect: &Effect) -> &'static str {
 mod tests {
     use super::*;
 
+    const LOCK_V1_FIXTURE: &str = r#"{"document_type":"quirl.plugin.lock","schema_version":1,"schema_hash":"fnv1a64:afa6bbde57eacd2a","resolved_api_version":"0.1.0","plugins":[{"name":"demo","version":"0.1.0","source":"file:/fixture","runtime":"trusted_lua","resolved_api_version":"0.1.0","manifest_checksum":"sha256:manifest","entry_checksum":"sha256:entry","source_checksum":"sha256:source","requested_capabilities":["commands.register"],"granted_capabilities":["commands.register"],"enabled":false}]}"#;
+    const LOCK_V2_FIXTURE: &str = r#"{"document_type":"quirl.plugin.lock","schema_version":2,"schema_hash":"fnv1a64:97ae63dc47a0d36f","resolved_api_version":"0.1.0","plugins":[{"name":"demo","version":"0.1.0","source":"file:/fixture","runtime":"trusted_lua","resolved_api_version":"0.1.0","runtime_schema_hash":"fnv1a64:9d9e259ca934cb9c","manifest_checksum":"sha256:manifest","entry_checksum":"sha256:entry","source_checksum":"sha256:source","requested_capabilities":["commands.register"],"granted_capabilities":["commands.register"],"enabled":false}]}"#;
+
     const LUA_MANIFEST: &str = r#"
-schema_version = 1
+schema_version = 2
 
 [plugin]
 name = "demo"
@@ -1557,6 +1607,7 @@ error_codes = { "0" = "success" }
         let shallow = stable_hash(PLUGIN_SCHEMA_DESCRIPTOR.as_bytes());
         assert_ne!(actual, shallow);
         assert_eq!(actual, plugin_manifest_schema_hash());
+        assert_eq!(plugin_manifest_schema_v1_hash(), "fnv1a64:9d9e259ca934cb9c");
     }
 
     #[test]
@@ -1608,39 +1659,37 @@ error_codes = { "0" = "success" }
     }
 
     #[test]
-    fn lock_v1_migrates_without_changing_identity_permissions_or_checksums() {
-        let plugin = resolved(&["commands.register".to_owned()]).unwrap();
-        let legacy = LegacyPluginLockfileV1 {
-            document_type: "quirl.plugin.lock".to_owned(),
-            schema_version: 1,
-            schema_hash: stable_hash(LOCK_SCHEMA_V1_DESCRIPTOR.as_bytes()),
-            resolved_api_version: PLUGIN_API_VERSION.to_owned(),
-            plugins: vec![LegacyLockedPluginV1 {
-                name: plugin.name.clone(),
-                version: plugin.version.clone(),
-                source: plugin.source.clone(),
-                runtime: plugin.runtime,
-                resolved_api_version: plugin.resolved_api_version.clone(),
-                manifest_checksum: plugin.manifest_checksum.clone(),
-                entry_checksum: plugin.entry_checksum.clone(),
-                source_checksum: plugin.source_checksum.clone(),
-                requested_capabilities: plugin.requested_capabilities.clone(),
-                granted_capabilities: plugin.granted_capabilities.clone(),
-                enabled: plugin.enabled,
-            }],
-        };
-        let bytes = serde_json::to_vec(&legacy).unwrap();
-        let migrated = PluginLockfile::from_json(&bytes).unwrap();
-        assert_eq!(migrated.schema_version, LOCK_SCHEMA_VERSION);
-        assert_eq!(migrated.plugins[0].name, plugin.name);
+    fn historical_locks_authenticate_then_fail_closed_without_inventing_contracts() {
         assert_eq!(
-            migrated.plugins[0].granted_capabilities,
-            plugin.granted_capabilities
+            stable_hash(LOCK_SCHEMA_V1_DESCRIPTOR.as_bytes()),
+            "fnv1a64:afa6bbde57eacd2a"
         );
-        assert_eq!(migrated.plugins[0].entry_checksum, plugin.entry_checksum);
+        assert_eq!(
+            stable_hash(LOCK_SCHEMA_V2_DESCRIPTOR.as_bytes()),
+            "fnv1a64:97ae63dc47a0d36f"
+        );
+        let v1_error = PluginLockfile::from_json(LOCK_V1_FIXTURE.as_bytes()).unwrap_err();
+        assert!(v1_error.message.contains("schema v1 predates executable"));
+        assert!(v1_error.details.help[0].contains("plugins.lock.json.legacy-v1"));
 
-        let mut future = serde_json::to_value(&migrated).unwrap();
-        future["schema_version"] = serde_json::json!(3);
+        let v2_error = PluginLockfile::from_json(LOCK_V2_FIXTURE.as_bytes()).unwrap_err();
+        assert!(v2_error.message.contains("schema v2 predates executable"));
+        assert!(v2_error.details.help[0].contains("plugins.lock.json.legacy-v2"));
+
+        let unknown = LOCK_V2_FIXTURE.replace(
+            "\"schema_version\":2",
+            "\"schema_version\":2,\"unexpected\":true",
+        );
+        assert!(PluginLockfile::from_json(unknown.as_bytes()).is_err());
+        assert!(PluginLockfile::from_json(b"{").is_err());
+
+        let current = PluginLockfile::empty();
+        assert_eq!(
+            PluginLockfile::from_json(&serde_json::to_vec(&current).unwrap()).unwrap(),
+            current
+        );
+        let mut future = serde_json::to_value(&current).unwrap();
+        future["schema_version"] = serde_json::json!(4);
         assert!(PluginLockfile::from_json(&serde_json::to_vec(&future).unwrap()).is_err());
     }
 
@@ -1695,6 +1744,22 @@ error_codes = { "0" = "success" }
         let source = LUA_MANIFEST
             .replace("entry = \"plugin.lua\"", "entry = \"plugin.wasm\"")
             .replace("runtime = \"trusted_lua\"", "runtime = \"wasm_component\"")
+            .replace("request = [\"commands.register\"]", "request = []")
+            .replace("commands = [\"demo run\"]", "commands = []")
+            .replace(
+                r#"[[public_commands]]
+path = "demo run"
+signature = "demo run"
+summary = "Run the demo"
+details = "Returns one deterministic demo record."
+input_type = "Nothing"
+output_type = "Record"
+examples = ["demo run"]
+effects = ["read_filesystem"]
+error_codes = { "0" = "success" }
+"#,
+                "",
+            )
             + r#"
 
 [wasm]
@@ -1753,7 +1818,7 @@ callback_timeout_ms = 25
 
     #[test]
     fn process_adapter_requires_an_exact_scoped_launch_grant_and_bounded_contract() {
-        let manifest = r#"schema_version = 1
+        let manifest = r#"schema_version = 2
 [plugin]
 name = "adapter"
 version = "0.1.0"
@@ -1773,7 +1838,7 @@ max_message_bytes = 1024
         let manifest = parse_plugin_manifest(manifest, "plugin.toml").unwrap();
         assert!(validate_plugin_manifest(&manifest, b"adapter", "0.1.0").is_ok());
 
-        let extra_capability = r#"schema_version = 1
+        let extra_capability = r#"schema_version = 2
 [plugin]
 name = "adapter"
 version = "0.1.0"
@@ -1833,10 +1898,54 @@ max_message_bytes = 1024"#;
             quirl_catalog::Confidence::Exact
         );
         assert_eq!(command.provenance.trust, quirl_catalog::Trust::Trusted);
+        assert!(!command.io.streaming);
         assert_eq!(
             command.provenance.fingerprint.as_deref(),
             Some("sha256:demo")
         );
+    }
+
+    #[test]
+    fn executable_command_contracts_reject_unknown_ambiguous_and_live_types() {
+        for (field, declaration) in [
+            ("input_type", "Unknown"),
+            ("input_type", "String | Path"),
+            ("input_type", "Stream<String>"),
+            ("output_type", "Unknown"),
+            ("output_type", "String | Path"),
+            ("output_type", "Stream<String>"),
+        ] {
+            let original = if field == "input_type" {
+                "input_type = \"Nothing\""
+            } else {
+                "output_type = \"Record\""
+            };
+            let source = LUA_MANIFEST.replace(original, &format!("{field} = \"{declaration}\""));
+            let manifest = parse_plugin_manifest(&source, "plugin.toml").unwrap();
+            let error = validate_plugin_manifest(&manifest, b"return true", "0.1.0").unwrap_err();
+            assert_eq!(error.code, ErrorCode::Validation);
+            assert!(error.message.contains("unsupported executable"));
+            assert!(!error.details.help.is_empty());
+        }
+
+        let finite = LUA_MANIFEST.replace(
+            "output_type = \"Record\"",
+            "output_type = \"Values<String>\"",
+        );
+        let manifest = parse_plugin_manifest(&finite, "plugin.toml").unwrap();
+        validate_plugin_manifest(&manifest, b"return true", "0.1.0").unwrap();
+        let command =
+            &normalize_plugin_commands(&manifest, "file:/demo", "sha256:demo").unwrap()[0];
+        assert_eq!(command.io.output, "Values<String>");
+        assert!(!command.io.streaming);
+
+        let legacy = LUA_MANIFEST.replace("schema_version = 2", "schema_version = 1");
+        let manifest = parse_plugin_manifest(&legacy, "plugin.toml").unwrap();
+        let error = validate_plugin_manifest(&manifest, b"return true", "0.1.0").unwrap_err();
+        assert!(error
+            .message
+            .contains("unsupported plugin schema version 1"));
+        assert!(error.details.help[0].contains("schema_version = 2"));
     }
 
     #[test]

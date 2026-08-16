@@ -510,7 +510,7 @@ fn quirl_completions(catalog: &Catalog, text: &str, offset: usize, prefix: &str)
                 "label": command.path,
                 "kind": 3,
                 "detail": command.signature,
-                "documentation": {"kind": "markdown", "value": command.details},
+                "documentation": {"kind": "markdown", "value": command_documentation(command)},
                 "insertText": command.path,
             }));
         }
@@ -556,7 +556,9 @@ fn quirl_hover(catalog: &Catalog, text: &str, offset: usize) -> Option<Value> {
     command_at(catalog, current_line(text, offset)).map(|command| {
         markdown_hover(&format!(
             "```quirl\n{}\n```\n\n{}\n\n{}",
-            command.signature, command.summary, command.details
+            command.signature,
+            command.summary,
+            command_documentation(command)
         ))
     })
 }
@@ -586,7 +588,7 @@ fn quirl_signature(catalog: &Catalog, text: &str, offset: usize) -> Option<Value
     Some(json!({
         "signatures": [{
             "label": command.signature,
-            "documentation": {"kind": "markdown", "value": command.details},
+            "documentation": {"kind": "markdown", "value": command_documentation(command)},
             "parameters": []
         }],
         "activeSignature": 0,
@@ -605,6 +607,13 @@ fn command_at<'a>(catalog: &'a Catalog, line: &str) -> Option<&'a CommandSpec> {
 fn command_starts_line(command: &CommandSpec, line: &str) -> bool {
     line.strip_prefix(&command.path)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+fn command_documentation(command: &CommandSpec) -> String {
+    format!(
+        "{}\n\nInput: `{}`  \nOutput: `{}`  \nLive streaming: `{}`",
+        command.details, command.io.input, command.io.output, command.io.streaming
+    )
 }
 
 fn module_docs(catalog: &Catalog) -> String {
@@ -1214,6 +1223,9 @@ mod tests {
         plugin.path = "demo run".to_owned();
         plugin.signature = "demo run".to_owned();
         plugin.parent = None;
+        plugin.io.input = "Path".to_owned();
+        plugin.io.output = "Values<String>".to_owned();
+        plugin.io.streaming = false;
         plugin.provenance =
             quirl_catalog::ProvenanceInfo::builtin(quirl_catalog::Provenance::Plugin);
         for argument in &mut plugin.options {
@@ -1223,14 +1235,29 @@ mod tests {
         let mut service = LanguageService::new(catalog);
 
         let docs = request(&mut service, 1, "quirl/moduleDocs", json!({}));
-        assert!(docs["result"]["value"]
+        let docs = docs["result"]["value"].as_str().unwrap();
+        assert!(docs.contains("demo run"));
+        assert!(docs.contains("Input: `Path`"));
+        assert!(docs.contains("Output: `Values<String>`"));
+        let completions = quirl_completions(&service.catalog, "demo r", "demo r".len(), "r");
+        let completion = completions
+            .iter()
+            .find(|completion| completion["label"] == "demo run")
+            .unwrap();
+        assert!(completion["documentation"]["value"]
             .as_str()
             .unwrap()
-            .contains("demo run"));
-        let completions = quirl_completions(&service.catalog, "demo r", "demo r".len(), "r");
-        assert!(completions
-            .iter()
-            .any(|completion| completion["label"] == "demo run"));
+            .contains("Output: `Values<String>`"));
+        let hover = quirl_hover(&service.catalog, "demo run", 4).unwrap();
+        assert!(hover["contents"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("Input: `Path`"));
+        let signature = quirl_signature(&service.catalog, "demo run", 8).unwrap();
+        assert!(signature["signatures"][0]["documentation"]["value"]
+            .as_str()
+            .unwrap()
+            .contains("Output: `Values<String>`"));
     }
 
     #[test]

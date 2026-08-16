@@ -11,8 +11,8 @@ use quirl_core::{
     ExecutionCancellation, ExecutionCleanupState, ExecutionEffect, ExecutionEffects,
     ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget, ExecutionStatus,
     ExtensionAction, ExtensionCapability, ExtensionEvent, ExtensionEventData, ProcessHost,
-    ProcessRequest, ShellError, StructuredValue, EXECUTION_ARGUMENTS_MAX,
-    EXECUTION_ARGUMENT_BYTES_MAX, EXECUTION_BYTES_MAX,
+    ProcessRequest, ShellError, StructuredValue, ValueInputContract, ValueOutputContract,
+    EXECUTION_ARGUMENTS_MAX, EXECUTION_ARGUMENT_BYTES_MAX, EXECUTION_BYTES_MAX,
 };
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
@@ -36,7 +36,10 @@ const MAX_LUA_COMPLETION_RESULTS: usize = 1_000;
 const MAX_LUA_COMPLETION_ITEM_BYTES: usize = 16 * 1024;
 const MAX_LUA_COMPLETION_RETAINED_BYTES: usize = 256 * 1024;
 const MAX_LUA_RETURN_RETAINED_BYTES: usize = 256 * 1024;
-const MAX_LUA_RETURN_NODES: usize = 4_096;
+// A maximum-size ABI-v1 batch of 512 Size or Duration values expands to 4,109
+// raw Lua key/value nodes after its typed and result envelopes are included.
+// Keep a small fixed margin so every accepted logical payload reaches decoding.
+const MAX_LUA_RETURN_NODES: usize = 4_112;
 const MAX_LUA_RETURN_INDEX: i64 = 4_096;
 const MAX_LUA_RETURN_DEPTH: usize = 16;
 const MAX_PROMPT_RETURN_BYTES: usize = 16 * 1024;
@@ -1252,9 +1255,9 @@ pub struct CommandRegistration {
     pub summary: String,
     /// Behavioral documentation for help, hover, and agent context, capped at 16 KiB.
     pub details: String,
-    /// Semantic input type expression capped at 256 UTF-8 bytes.
+    /// Exact executable ABI-v1 input contract capped at 256 UTF-8 bytes.
     pub input_type: String,
-    /// Semantic output type expression capped at 256 UTF-8 bytes.
+    /// Exact executable ABI-v1 output contract capped at 256 UTF-8 bytes.
     pub output_type: String,
     /// At most 32 bounded invocation examples required by the quality gate.
     pub examples: Vec<String>,
@@ -1551,7 +1554,8 @@ pub const HOST_API: &[HostApiSpec] = &[
     },
     HostApiSpec {
         path: "quirl.plugin.command",
-        summary: "Register a typed, documented plugin command.",
+        summary:
+            "Register a documented command with exact ABI-v1 value I/O; live streams are rejected.",
         parameters: PLUGIN_COMMAND_PARAMETER,
         returns: "nil",
         capability: Some("commands.register"),
@@ -2188,15 +2192,16 @@ impl LuaRuntime {
         Ok(value)
     }
 
+    /// Test-only legacy seam for bounded JSON callback migration coverage.
+    ///
+    /// The callback runs under a 50 ms deadline capped by the runtime policy, and
+    /// its Lua return value must deserialize into JSON.
+    #[cfg(test)]
     #[allow(
         clippy::expect_used,
         reason = "a poisoned plugin callback mutex may contain inconsistent callbacks after a host callback panic"
     )]
-    /// Dispatch a registered plugin command with JSON arguments.
-    ///
-    /// The callback runs under a 50 ms deadline capped by the runtime policy, and
-    /// its Lua return value must deserialize into JSON.
-    pub fn run_plugin_command(
+    fn run_plugin_command(
         &self,
         name: &str,
         arguments: &serde_json::Value,
@@ -2249,7 +2254,7 @@ impl LuaRuntime {
         &self,
         name: &str,
         context: &LuaRunnerContext,
-        deadline: Duration,
+        expires_at: Instant,
     ) -> Result<ExecutionOutcome, ShellError> {
         context.validate()?;
         if !Arc::ptr_eq(&context.cancelled, &self.cancelled) {
@@ -2272,7 +2277,18 @@ impl LuaRuntime {
                 .map_err(|error| lua_error(error, None, 0))?
         };
         let context = self.create_runner_context(context, Path::new(name), 0)?;
-        self.reset_budget_with_deadline(deadline);
+        ensure_runner_active(&self.cancelled, "after plugin input conversion")?;
+        let remaining = expires_at
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "plugin command input conversion exceeded its absolute deadline",
+                )
+                .with_help("Reduce typed input size or callback work before retrying")
+            })?;
+        self.reset_budget_with_deadline(remaining);
         let value = function
             .call::<Value>(context)
             .map_err(|error| lua_error(error, Some(Path::new(name)), 0))?;
@@ -3389,6 +3405,14 @@ pub fn sdk_lua() -> String {
         "---@field run fun(arguments: table): any",
         "---@field run fun(context: quirl.Context): quirl.RunnerResult",
     );
+    output = output.replace(
+        "---@class quirl.PluginCommand",
+        "---@alias quirl.PluginInputType 'Nothing'|'Bool'|'Int'|'UInt'|'Decimal'|'String'|'List'|'Record'|'Path'|'Duration'|'Size'|'DateTime'|'Pattern'\n---@alias quirl.PluginOutputType quirl.PluginInputType|'Values<Nothing>'|'Values<Bool>'|'Values<Int>'|'Values<UInt>'|'Values<Decimal>'|'Values<String>'|'Values<List>'|'Values<Record>'|'Values<Path>'|'Values<Duration>'|'Values<Size>'|'Values<DateTime>'|'Values<Pattern>'\n\n---@class quirl.PluginCommand",
+    );
+    output = output.replace(
+        "---@field input_type string\n---@field output_type string",
+        "---@field input_type quirl.PluginInputType Exact top-level input kind; Nothing accepts no input.\n---@field output_type quirl.PluginOutputType Exact value kind or bounded finite Values<T>; live streams are unsupported.",
+    );
     for spec in HOST_API {
         output.push_str(&format!("---{}\n", spec.summary));
         for parameter in spec.parameters {
@@ -4072,6 +4096,18 @@ fn validate_command_registration(registration: &CommandRegistration) -> Result<(
         ),
     ] {
         validate_bounded_text(&format!("plugin command {field}"), value, limit)?;
+    }
+    if ValueInputContract::parse_exact(&registration.input_type).is_none() {
+        return Err(registration_validation_error(format!(
+            "plugin command input_type `{}` is unsupported; use `Nothing` or one exact structured value kind",
+            registration.input_type
+        )));
+    }
+    if ValueOutputContract::parse_exact(&registration.output_type).is_none() {
+        return Err(registration_validation_error(format!(
+            "plugin command output_type `{}` is unsupported; use one exact value kind or bounded `Values<T>`, never `Stream<T>`",
+            registration.output_type
+        )));
     }
     validate_string_collection(
         "plugin command examples",
@@ -5844,6 +5880,48 @@ mod tests {
     }
 
     #[test]
+    fn plugin_command_registration_accepts_only_executable_io_contracts() {
+        let registration = |input_type: &str, output_type: &str| {
+            format!(
+                r#"quirl.plugin.command {{
+                  name = "demo run", signature = "demo run", summary = "Run demo",
+                  details = "Exercise one executable contract.",
+                  input_type = "{input_type}", output_type = "{output_type}",
+                  examples = {{ "demo run" }}, effects = {{ "none" }},
+                  error_codes = {{ ["0"] = "success" }}, run = function() end,
+                }}"#
+            )
+        };
+        for (input_type, output_type) in [
+            ("Unknown", "String"),
+            ("String | Path", "String"),
+            ("Stream<String>", "String"),
+            ("Nothing", "Unknown"),
+            ("Nothing", "String | Path"),
+            ("Nothing", "Stream<String>"),
+        ] {
+            let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+            let error = runtime
+                .load_plugin_source(&registration(input_type, output_type), "contract.lua")
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::Validation);
+            assert!(error
+                .details
+                .context
+                .iter()
+                .any(|item| item.contains("unsupported")));
+            assert_eq!(runtime.registrations(), PluginRegistrations::default());
+        }
+
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        let registrations = runtime
+            .load_plugin_source(&registration("Path", "Values<String>"), "contract.lua")
+            .unwrap();
+        assert_eq!(registrations.commands[0].input_type, "Path");
+        assert_eq!(registrations.commands[0].output_type, "Values<String>");
+    }
+
+    #[test]
     fn failed_plugin_load_discards_partial_callbacks_and_allows_recovery() {
         let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
         let error = runtime
@@ -6424,7 +6502,11 @@ return { main = exported }
         )
         .unwrap();
         let typed = runtime
-            .run_plugin_command_with_context("demo run", &context, Duration::from_millis(50))
+            .run_plugin_command_with_context(
+                "demo run",
+                &context,
+                Instant::now() + Duration::from_millis(50),
+            )
             .unwrap();
         assert_eq!(typed.status_code(), 0);
         assert_eq!(
@@ -6445,7 +6527,7 @@ return { main = exported }
             .run_plugin_command_with_context(
                 "demo run",
                 &malformed_context,
-                Duration::from_millis(50),
+                Instant::now() + Duration::from_millis(50),
             )
             .unwrap_err();
         assert_eq!(malformed.code, ErrorCode::Validation);
@@ -6455,7 +6537,7 @@ return { main = exported }
             .run_plugin_command_with_context(
                 "demo run",
                 &malformed_context,
-                Duration::from_millis(50),
+                Instant::now() + Duration::from_millis(50),
             )
             .unwrap_err();
         assert_eq!(cancelled.code, ErrorCode::ResourceLimit);

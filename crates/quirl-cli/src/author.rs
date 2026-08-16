@@ -193,8 +193,13 @@ fn render_catalog_text(catalog: &Catalog) -> String {
 
 fn render_command_text(command: &CommandSpec) -> String {
     let mut output = format!(
-        "{}\n  {}\n\n{}\n",
-        command.signature, command.summary, command.details
+        "{}\n  {}\n\n{}\n\nInput: {}\nOutput: {}\nLive streaming: {}\n",
+        command.signature,
+        command.summary,
+        command.details,
+        command.io.input,
+        command.io.output,
+        command.io.streaming
     );
     if !command.options.is_empty() {
         output.push_str("\nOptions:\n");
@@ -217,8 +222,13 @@ fn render_command_text(command: &CommandSpec) -> String {
 
 fn render_command_markdown(command: &CommandSpec) -> String {
     let mut output = format!(
-        "# `{}`\n\n{}\n\n{}\n",
-        command.signature, command.summary, command.details
+        "# `{}`\n\n{}\n\n{}\n\n## I/O contract\n\n- Input: `{}`\n- Output: `{}`\n- Live streaming: `{}`\n",
+        command.signature,
+        command.summary,
+        command.details,
+        command.io.input,
+        command.io.output,
+        command.io.streaming
     );
     if !command.options.is_empty() {
         output.push_str("\n## Options\n\n");
@@ -252,10 +262,13 @@ fn render_catalog_html(catalog: &Catalog) -> String {
 
 fn render_command_html(command: &CommandSpec) -> String {
     let mut output = format!(
-        "<section><h2><code>{}</code></h2><p>{}</p><p>{}</p>",
+        "<section><h2><code>{}</code></h2><p>{}</p><p>{}</p><p>Input: <code>{}</code><br>Output: <code>{}</code><br>Live streaming: <code>{}</code></p>",
         escape_html(&command.signature),
         escape_html(&command.summary),
-        escape_html(&command.details)
+        escape_html(&command.details),
+        escape_html(&command.io.input),
+        escape_html(&command.io.output),
+        command.io.streaming
     );
     if !command.options.is_empty() {
         output.push_str("<h3>Options</h3><ul>");
@@ -459,6 +472,17 @@ mod tests {
         assert!(render_catalog(&catalog, DocumentationFormat::Json)
             .unwrap()
             .contains("schema_version"));
+        let command = catalog.find("quirl doc").unwrap();
+        for format in [
+            DocumentationFormat::Text,
+            DocumentationFormat::Markdown,
+            DocumentationFormat::Html,
+            DocumentationFormat::Json,
+        ] {
+            let rendered = render_command(command, format).unwrap();
+            assert!(rendered.contains(&command.io.input));
+            assert!(rendered.contains(&command.io.output));
+        }
     }
 
     #[test]

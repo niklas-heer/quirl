@@ -33,8 +33,8 @@ content, and add the local result. Requested permissions must be sorted and
 each new permission must be repeated as `--allow`. The lock records requested
 and granted permissions separately, source identity, resolved API, runtime,
 enabled state, runtime/WIT schema hash, and SHA-256 manifest/entry/source
-checksums. Lock schema v2 binds portable components to the checked-in WIT
-world instead of trusting a manifest world string alone.
+checksums. Lock schema v3 binds executable trusted-Lua entries to manifest v2's
+closed command I/O contract and portable components to the checked-in WIT world.
 New additions remain disabled until `plugin enable` repeats integrity and
 runtime-boundary checks.
 
@@ -49,7 +49,7 @@ API, or permission changes.
 
 ## Manifest
 
-Plugin manifests are deny-unknown TOML with `schema_version = 1`. The
+Plugin manifests are deny-unknown TOML with `schema_version = 2`. The
 `[plugin]` table declares name, version, relative entry, Quirl range, exact
 plugin API (`0.1.0`), runtime, and summary. `[capabilities]` lists sorted
 requested grants. `[contributes]` lists sorted commands, completions, events,
@@ -69,6 +69,58 @@ process handle accepts one physical command/argv line and rejects shell
 operators, tabs, and newlines before the shell-backed runner is reached.
 
 ## Runtime boundaries
+
+### Executable command I/O failure model
+
+Plugin command I/O declarations are executable contracts, not a general type
+language. Input accepts exactly `Nothing` for no pipeline input or one bounded
+value whose top-level kind is `Bool`, `Int`, `UInt`, `Decimal`, `String`,
+`List`, `Record`, `Path`, `Duration`, `Size`, `DateTime`, or `Pattern`. Output
+accepts one value of those kinds (including `Nothing`) or a bounded finite batch
+written `Values<T>`, where `T` is one of the same value kinds. `Stream<T>`, byte
+input/output, nested type expressions, aliases, unions, unknown names, and
+case/whitespace variants are unsupported by Lua ABI v1 and fail registration
+before an enabled command reaches catalog composition. A `List` is one typed
+value; `Values<T>` is a materialized batch, never a live or backpressured
+stream.
+
+The executable boundary maintains these invariants:
+
+- `Nothing` rejects unexpected input. Every other input contract rejects a
+  missing value and a mismatched top-level kind before Lua evaluation.
+- Dispatch-time input conversion and callback execution share the plan
+  cancellation identity and absolute deadline. Conversion polls both while
+  walking the value; cancellation or expiry before, during, or immediately
+  after conversion/callback remains a `ResourceLimit` error and cannot publish
+  output.
+- One command input or complete output batch is limited to 512 logical value
+  nodes, 6 collection levels, 256 aggregate record fields, and 240 KiB of
+  string/key bytes, inside the shared execution and raw Lua-envelope limits.
+  Finite output batches accept at most 512 values of their declared supported
+  kind; 512 values are accepted and value 513 is rejected. Nested batch items
+  share the same aggregate logical limits.
+- Unknown fields, hostile/cyclic Lua tables, mixed success/error envelopes,
+  byte or inherited output, undocumented status, output-shape mismatch, and
+  limit overflow fail before outcome commit. A callback has no partial-output
+  channel.
+- Discovery reads only bounded, checksummed manifest and lock metadata. It does
+  not evaluate Lua. Disable, removal, source replacement, rejected reload, or a
+  changed registration between snapshot and execution fails reconciliation and
+  never falls through to native execution.
+- Scheduler cancellation waits for bounded quiescence before error/recovery
+  observers run. Cleanup failure supplements rather than replaces the
+  originating error; only a fully validated outcome reaches result events.
+- Plugin manifest v1 and lock v1/v2 predate executable I/O contracts. Their
+  historical identities remain recognized for diagnostics, but they fail
+  closed: old lock data cannot prove the newly reviewed manifest/runtime hash.
+  Preserve the old file by moving `plugins.lock.json` to
+  `plugins.lock.json.legacy-v1` or `.legacy-v2`, then re-add each plugin under
+  manifest v2 after explicit review to create lock v3. Quirl never fabricates a
+  new runtime schema hash from an old lock.
+
+Lua ABI v1 has no finite input-batch or live-stream handle. Adding either would
+require a later versioned ABI with backpressure, cancellation, cleanup, and
+ownership semantics.
 
 Trusted Lua uses the pinned restricted Lua 5.4 runtime. Managed runtimes are
 constructed with exactly the granted capability strings. Host registration
@@ -97,7 +149,12 @@ Argument schemas and declared effects are checked before scheduler admission or
 callback effects. The fixed worker pool provides bounded queue admission,
 per-runtime FIFO ownership, deadlines, cancellation, saturation errors, and
 bounded shutdown; command dispatch never creates a thread per plugin. Lua runs
-only at scheduler safe points. Malformed or oversized typed input/output,
+only at scheduler safe points. Installed command dispatch receives the shared
+execution plan's absolute deadline and cancellation identity before reload,
+binding reconciliation, context construction, queue admission, and callback
+work. A timeout cancels its exact batch and waits a separate bounded cleanup
+interval for quiescence before recovery or result/error observers run.
+Malformed or oversized typed input/output,
 undocumented status codes, byte output, partial ABI results, callback failures,
 timeouts, and cancellation remain structured `ShellError` values. A callback
 cannot publish partial typed output: only a completely validated outcome is

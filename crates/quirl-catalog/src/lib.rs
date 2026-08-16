@@ -1845,6 +1845,10 @@ impl Catalog {
                 command.signature, command.summary
             ));
             output.push_str(&format!("{}\n\n", command.details));
+            output.push_str(&format!(
+                "- Input: `{}`\n- Output: `{}`\n- Live streaming: `{}`\n\n",
+                command.io.input, command.io.output, command.io.streaming
+            ));
             if !command.options.is_empty() {
                 output.push_str("Options:\n\n");
                 for option in &command.options {

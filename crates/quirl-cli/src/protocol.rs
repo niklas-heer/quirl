@@ -151,10 +151,10 @@ fn current_manifest() -> Result<ProtocolFreezeManifest, quirl_core::ShellError> 
             "plugin_lock",
             "quirl-plugin",
             quirl_plugin::LOCK_SCHEMA_VERSION,
-            1,
-            CompatibilityPolicy::MigratedRange,
+            quirl_plugin::LOCK_SCHEMA_VERSION,
+            CompatibilityPolicy::FrozenMajor,
             quirl_plugin::plugin_lock_schema_hash(),
-            "v1_migrates_to_v2",
+            "v1_v2_fail_closed_readd_for_executable_io",
         ),
         contract(
             "plugin_manifest",
@@ -163,7 +163,7 @@ fn current_manifest() -> Result<ProtocolFreezeManifest, quirl_core::ShellError> 
             quirl_plugin::PLUGIN_SCHEMA_VERSION,
             CompatibilityPolicy::FrozenMajor,
             quirl_plugin::plugin_manifest_schema_hash(),
-            "frozen",
+            "executable_io_v2",
         ),
         contract(
             "recovery",

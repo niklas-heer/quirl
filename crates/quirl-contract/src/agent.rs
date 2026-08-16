@@ -432,16 +432,30 @@ pub fn build_agent_catalog(
 
 /// Derives the compact agent discovery manifest from an installed catalog snapshot.
 ///
+/// The tool list contains Quirl's own command namespace plus exact, trusted,
+/// versioned plugin commands. Imported and heuristic external catalog facts
+/// remain discoverable in [`AgentCatalog`] but never become executable tools.
+///
 /// Returns a [`ShellError`] only if the deterministic manifest payload cannot be
 /// serialized for its content hash.
 pub fn build_agent_manifest(catalog: &AgentCatalog) -> Result<AgentManifest, ShellError> {
     let mut tools = catalog
         .commands
         .iter()
-        .filter(|command| command.path.starts_with("quirl "))
+        .filter(|command| {
+            command.path.starts_with("quirl ")
+                || (command.provenance.source == Provenance::Plugin
+                    && command.provenance.confidence == Confidence::Exact
+                    && command.provenance.trust == Trust::Trusted
+                    && command.id.starts_with("plugin:")
+                    && command.version.is_some())
+        })
         .map(|command| AgentTool {
             name: command.path.clone(),
-            version: catalog.quirl_version.clone(),
+            version: command
+                .version
+                .clone()
+                .unwrap_or_else(|| catalog.quirl_version.clone()),
             summary: command.summary.clone(),
             effects: command.effects.clone(),
         })
@@ -665,8 +679,13 @@ pub fn render_context_markdown(context: &AgentContext) -> String {
         output.push_str("## Relevant commands\n\n");
         for command in &context.commands {
             output.push_str(&format!(
-                "### `{}`\n\n{}\n\n{}\n\n",
-                command.signature, command.summary, command.details
+                "### `{}`\n\n{}\n\n{}\n\nInput: `{}`  \nOutput: `{}`  \nLive streaming: `{}`\n\n",
+                command.signature,
+                command.summary,
+                command.details,
+                command.io.input,
+                command.io.output,
+                command.io.streaming
             ));
             if !command.examples.is_empty() {
                 output.push_str("Examples:\n\n");
@@ -1330,6 +1349,7 @@ mod tests {
 
         assert_eq!(exported.summary, source_command.summary);
         assert_eq!(exported.details, source_command.details);
+        assert_eq!(exported.io, source_command.io);
         assert_eq!(
             exported.options[0].documentation,
             source_command.options[0].documentation
@@ -1343,7 +1363,11 @@ mod tests {
             .find(|command| command.path == "quirl doc")
             .unwrap();
         assert_eq!(selected.details, source_command.details);
-        assert!(render_context_markdown(&context).contains(&source_command.details));
+        assert_eq!(selected.io, source_command.io);
+        let markdown = render_context_markdown(&context);
+        assert!(markdown.contains(&source_command.details));
+        assert!(markdown.contains(&format!("Input: `{}`", source_command.io.input)));
+        assert!(markdown.contains(&format!("Output: `{}`", source_command.io.output)));
     }
 
     #[test]
@@ -1475,13 +1499,34 @@ mod tests {
     }
 
     #[test]
-    fn manifest_lists_only_installed_quirl_commands_and_capabilities() {
-        let catalog = build_agent_catalog(&Catalog::builtin(), &host_api(), "0.1.0").unwrap();
+    fn manifest_lists_builtin_tools_and_validated_plugin_commands() {
+        let mut source = Catalog::builtin();
+        let mut plugin = source.find("ls").unwrap().clone();
+        plugin.id = "plugin:demo/demo/run".to_owned();
+        plugin.path = "demo run".to_owned();
+        plugin.signature = "demo run".to_owned();
+        plugin.version = Some("2.3.4".to_owned());
+        plugin.parent = None;
+        plugin.provenance.source = Provenance::Plugin;
+        plugin.provenance.confidence = Confidence::Exact;
+        plugin.provenance.trust = Trust::Trusted;
+        source.merge(vec![plugin]);
+        let catalog = build_agent_catalog(&source, &host_api(), "0.1.0").unwrap();
         let manifest = build_agent_manifest(&catalog).unwrap();
+        assert_eq!(
+            manifest
+                .tools
+                .iter()
+                .find(|tool| tool.name == "demo run")
+                .unwrap()
+                .version,
+            "2.3.4"
+        );
         assert!(manifest
             .tools
             .iter()
-            .all(|tool| tool.name.starts_with("quirl ")));
+            .all(|tool| tool.name.starts_with("quirl ") || tool.name == "demo run"));
+        assert!(!manifest.tools.iter().any(|tool| tool.name == "ls"));
         assert_eq!(manifest.capabilities[0].name, "process.spawn");
     }
 }

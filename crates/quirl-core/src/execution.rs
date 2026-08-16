@@ -321,6 +321,179 @@ pub enum StructuredValue {
     Pattern(String),
 }
 
+/// Closed top-level kind of one [`StructuredValue`].
+///
+/// This is a parsed executable contract rather than a recursive schema
+/// language. Collection kinds constrain only the top-level representation;
+/// their contents remain ordinary bounded structured values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredValueKind {
+    /// The explicit structured null value.
+    Nothing,
+    /// A Boolean value.
+    Bool,
+    /// A signed integer.
+    Int,
+    /// An unsigned integer.
+    UInt,
+    /// Exact decimal source text.
+    Decimal,
+    /// Plain UTF-8 text.
+    String,
+    /// One ordered list value.
+    List,
+    /// One keyed record value.
+    Record,
+    /// A UTF-8 filesystem path.
+    Path,
+    /// An unsigned duration.
+    Duration,
+    /// An unsigned byte size.
+    Size,
+    /// Date-time source text.
+    DateTime,
+    /// Pattern source text.
+    Pattern,
+}
+
+impl StructuredValueKind {
+    /// Parse one exact canonical kind name.
+    ///
+    /// Whitespace, aliases, case variants, nested expressions, and unknown
+    /// names return `None` so an owning boundary can provide contextual help.
+    pub fn parse_exact(name: &str) -> Option<Self> {
+        match name {
+            "Nothing" => Some(Self::Nothing),
+            "Bool" => Some(Self::Bool),
+            "Int" => Some(Self::Int),
+            "UInt" => Some(Self::UInt),
+            "Decimal" => Some(Self::Decimal),
+            "String" => Some(Self::String),
+            "List" => Some(Self::List),
+            "Record" => Some(Self::Record),
+            "Path" => Some(Self::Path),
+            "Duration" => Some(Self::Duration),
+            "Size" => Some(Self::Size),
+            "DateTime" => Some(Self::DateTime),
+            "Pattern" => Some(Self::Pattern),
+            _ => None,
+        }
+    }
+
+    /// Return the canonical declaration spelling.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Nothing => "Nothing",
+            Self::Bool => "Bool",
+            Self::Int => "Int",
+            Self::UInt => "UInt",
+            Self::Decimal => "Decimal",
+            Self::String => "String",
+            Self::List => "List",
+            Self::Record => "Record",
+            Self::Path => "Path",
+            Self::Duration => "Duration",
+            Self::Size => "Size",
+            Self::DateTime => "DateTime",
+            Self::Pattern => "Pattern",
+        }
+    }
+
+    /// Return the top-level kind carried by `value`.
+    pub const fn of(value: &StructuredValue) -> Self {
+        match value {
+            StructuredValue::Nothing => Self::Nothing,
+            StructuredValue::Bool(_) => Self::Bool,
+            StructuredValue::Int(_) => Self::Int,
+            StructuredValue::UInt(_) => Self::UInt,
+            StructuredValue::Decimal(_) => Self::Decimal,
+            StructuredValue::String(_) => Self::String,
+            StructuredValue::List(_) => Self::List,
+            StructuredValue::Record(_) => Self::Record,
+            StructuredValue::Path(_) => Self::Path,
+            StructuredValue::Duration { .. } => Self::Duration,
+            StructuredValue::Size { .. } => Self::Size,
+            StructuredValue::DateTime(_) => Self::DateTime,
+            StructuredValue::Pattern(_) => Self::Pattern,
+        }
+    }
+}
+
+/// Closed value-only input contract used at executable adapter boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueInputContract {
+    /// No input is accepted.
+    Nothing,
+    /// Exactly one value with the declared top-level kind is required.
+    Value(StructuredValueKind),
+}
+
+impl ValueInputContract {
+    /// Parse the exact ABI-v1 input vocabulary.
+    ///
+    /// `Nothing` means absence, so an explicit structured null is deliberately
+    /// not a distinct input form. Finite batches and bytes are unsupported.
+    pub fn parse_exact(declaration: &str) -> Option<Self> {
+        if declaration == "Nothing" {
+            return Some(Self::Nothing);
+        }
+        StructuredValueKind::parse_exact(declaration).map(Self::Value)
+    }
+
+    /// Return whether the runtime input satisfies this contract.
+    pub fn matches(self, input: &ExecutionInput) -> bool {
+        match (self, input) {
+            (Self::Nothing, ExecutionInput::None) => true,
+            (Self::Value(expected), ExecutionInput::Value(value)) => {
+                expected == StructuredValueKind::of(value)
+            }
+            (Self::Nothing | Self::Value(_), ExecutionInput::Bytes(_))
+            | (Self::Nothing, ExecutionInput::Value(_))
+            | (Self::Value(_), ExecutionInput::None) => false,
+        }
+    }
+}
+
+/// Closed value-only output contract used at executable adapter boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueOutputContract {
+    /// Exactly one value with the declared top-level kind.
+    Value(StructuredValueKind),
+    /// A bounded finite batch whose items share one top-level kind.
+    Values(StructuredValueKind),
+}
+
+impl ValueOutputContract {
+    /// Parse one value kind or the exact non-live `Values<T>` batch spelling.
+    pub fn parse_exact(declaration: &str) -> Option<Self> {
+        if let Some(item) = declaration
+            .strip_prefix("Values<")
+            .and_then(|value| value.strip_suffix('>'))
+        {
+            return StructuredValueKind::parse_exact(item).map(Self::Values);
+        }
+        StructuredValueKind::parse_exact(declaration).map(Self::Value)
+    }
+
+    /// Return whether a typed runtime output has the declared shape and kinds.
+    pub fn matches(self, output: &ExecutionOutput) -> bool {
+        match (self, output) {
+            (Self::Value(expected), ExecutionOutput::Value { value }) => {
+                expected == StructuredValueKind::of(value)
+            }
+            (Self::Values(expected), ExecutionOutput::Values { values }) => values
+                .iter()
+                .all(|value| expected == StructuredValueKind::of(value)),
+            (Self::Value(_), ExecutionOutput::Values { .. })
+            | (Self::Values(_), ExecutionOutput::Value { .. })
+            | (
+                Self::Value(_) | Self::Values(_),
+                ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. },
+            ) => false,
+        }
+    }
+}
+
 impl StructuredValue {
     /// Convert a JSON-compatible value without losing integer sign or width.
     ///
@@ -1062,6 +1235,44 @@ mod tests {
             value = StructuredValue::List(vec![value]);
         }
         assert_eq!(value.validate().unwrap_err().code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn executable_value_contracts_are_closed_and_exact() {
+        assert_eq!(
+            ValueInputContract::parse_exact("String"),
+            Some(ValueInputContract::Value(StructuredValueKind::String))
+        );
+        assert_eq!(
+            ValueOutputContract::parse_exact("Values<Path>"),
+            Some(ValueOutputContract::Values(StructuredValueKind::Path))
+        );
+        for unsupported in [
+            "string",
+            " String",
+            "Value",
+            "Stream<String>",
+            "Values<Values<String>>",
+            "String | Path",
+        ] {
+            assert!(ValueInputContract::parse_exact(unsupported).is_none());
+            assert!(ValueOutputContract::parse_exact(unsupported).is_none());
+        }
+
+        assert!(ValueInputContract::Nothing.matches(&ExecutionInput::None));
+        assert!(
+            !ValueInputContract::Nothing.matches(&ExecutionInput::Value(StructuredValue::Nothing))
+        );
+        assert!(
+            ValueInputContract::Value(StructuredValueKind::Path).matches(&ExecutionInput::Value(
+                StructuredValue::Path("a".to_owned())
+            ))
+        );
+        assert!(
+            !ValueInputContract::Value(StructuredValueKind::String).matches(
+                &ExecutionInput::Value(StructuredValue::Path("a".to_owned()))
+            )
+        );
     }
 
     #[test]

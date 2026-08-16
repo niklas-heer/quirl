@@ -118,13 +118,16 @@
 ---@field command string
 ---@field complete fun(context: table): table
 
+---@alias quirl.PluginInputType 'Nothing'|'Bool'|'Int'|'UInt'|'Decimal'|'String'|'List'|'Record'|'Path'|'Duration'|'Size'|'DateTime'|'Pattern'
+---@alias quirl.PluginOutputType quirl.PluginInputType|'Values<Nothing>'|'Values<Bool>'|'Values<Int>'|'Values<UInt>'|'Values<Decimal>'|'Values<String>'|'Values<List>'|'Values<Record>'|'Values<Path>'|'Values<Duration>'|'Values<Size>'|'Values<DateTime>'|'Values<Pattern>'
+
 ---@class quirl.PluginCommand
 ---@field name string
 ---@field signature string
 ---@field summary string
 ---@field details string
----@field input_type string
----@field output_type string
+---@field input_type quirl.PluginInputType Exact top-level input kind; Nothing accepts no input.
+---@field output_type quirl.PluginOutputType Exact value kind or bounded finite Values<T>; live streams are unsupported.
 ---@field examples string[]
 ---@field effects string[]
 ---@field error_codes table<string, string>
@@ -171,7 +174,7 @@ function quirl.prompt.add_segment(spec) end
 ---@param spec quirl.CompletionProvider
 function quirl.completion.add_provider(spec) end
 
----Register a typed, documented plugin command.
+---Register a documented command with exact ABI-v1 value I/O; live streams are rejected.
 ---@param spec quirl.PluginCommand
 function quirl.plugin.command(spec) end
 

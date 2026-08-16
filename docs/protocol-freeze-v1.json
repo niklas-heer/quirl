@@ -16,8 +16,8 @@
     {"name":"mcp","owner":"quirl-cli","current_version":"1","oldest_readable":"1","compatibility":"frozen_major","schema_hash":"fnv1a64:07810b391f9d8e17","status":"modern_2026_07_28_and_legacy_negotiated"},
     {"name":"package","owner":"quirl-contract","current_version":"1","oldest_readable":"1","compatibility":"frozen_major","schema_hash":"fnv1a64:a1caea99e3832838","status":"frozen_current_shape"},
     {"name":"picker","owner":"quirl-picker","current_version":"1","oldest_readable":"1","compatibility":"frozen_major","schema_hash":"fnv1a64:c9d9c0164ecf5e85","status":"versioned_async_frozen"},
-    {"name":"plugin_lock","owner":"quirl-plugin","current_version":"2","oldest_readable":"1","compatibility":"migrated_range","schema_hash":"fnv1a64:97ae63dc47a0d36f","status":"v1_migrates_to_v2"},
-    {"name":"plugin_manifest","owner":"quirl-plugin","current_version":"1","oldest_readable":"1","compatibility":"frozen_major","schema_hash":"fnv1a64:9d9e259ca934cb9c","status":"frozen"},
+    {"name":"plugin_lock","owner":"quirl-plugin","current_version":"3","oldest_readable":"3","compatibility":"frozen_major","schema_hash":"fnv1a64:c2aef703ffa4e3a0","status":"v1_v2_fail_closed_readd_for_executable_io"},
+    {"name":"plugin_manifest","owner":"quirl-plugin","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:cd9e015e537c31ea","status":"executable_io_v2"},
     {"name":"recovery","owner":"quirl-cli","current_version":"2","oldest_readable":"1","compatibility":"migrated_range","schema_hash":"fnv1a64:4afec9433ad12939","status":"v1_migrates_to_v2"},
     {"name":"runner","owner":"quirl-process","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:b6d406d9edbd6322","status":"bounded_capture_streaming_interactive"},
     {"name":"wasm_world","owner":"quirl-plugin","current_version":"0.1.0","oldest_readable":"0.1.0","compatibility":"frozen_major","schema_hash":"fnv1a64:81faa899f0811884","status":"nonexecuting_boundary"}
