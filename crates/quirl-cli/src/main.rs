@@ -243,9 +243,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     if cli.build_info {
         print_json_value(serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "version": env!("CARGO_PKG_VERSION"),
             "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "optimization_level": env!("QUIRL_BUILD_OPT_LEVEL"),
             "panic_strategy": if cfg!(panic = "unwind") { "unwind" } else { "abort" },
             "operating_system": std::env::consts::OS,
             "architecture": std::env::consts::ARCH,

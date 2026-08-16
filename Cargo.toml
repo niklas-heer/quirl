@@ -48,6 +48,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [profile.release]
+opt-level = "z"
 lto = "fat"
 strip = "symbols"
 # mlua converts host-callback panics into Lua errors via unwinding. abort

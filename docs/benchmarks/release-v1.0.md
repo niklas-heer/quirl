@@ -6,7 +6,7 @@
 > enforcing gate before using this record for a release decision. Benchmark
 > report schema v4 now records the source commit, tracked and untracked dirty
 > state and exact binary SHA-256. The measured `quirl` binary reports its own
-> profile, panic strategy, operating system, architecture, source commit, and
+> profile, optimization level, panic strategy, operating system, architecture, source commit, and
 > build-time dirty state. The gate verifies them against `quirl-bench` and the
 > current clean checkout before accepting evidence. Future evidence therefore
 > fails closed instead of silently drifting.

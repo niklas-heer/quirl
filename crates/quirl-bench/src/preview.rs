@@ -63,6 +63,7 @@ struct Environment {
     artifact_profile_verified: bool,
     artifact_source_verified: bool,
     build_profile: String,
+    optimization_level: String,
     panic_strategy: String,
     quirl_binary: String,
     quirl_binary_bytes: Option<u64>,
@@ -76,6 +77,7 @@ struct QuirlBuildInfo {
     schema_version: u32,
     version: String,
     build_profile: String,
+    optimization_level: String,
     panic_strategy: String,
     operating_system: String,
     architecture: String,
@@ -225,7 +227,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
         .is_some_and(build_info_matches_benchmark);
     if enforce && !artifact_profile_verified {
         return Err(
-            "the release gate requires the measured quirl binary to report build profile, panic strategy, operating system, and architecture matching quirl-bench; build both together with `cargo build --release -p quirl-cli -p quirl-bench` and pass that build's quirl binary"
+            "the release gate requires the measured quirl binary to report the canonical build profile, optimization level, panic strategy, operating system, and architecture matching quirl-bench; build both together with `cargo build --release -p quirl-cli -p quirl-bench` and pass that build's quirl binary"
                 .into(),
         );
     }
@@ -1166,6 +1168,9 @@ fn discover_environment(
         build_profile: build_info
             .map(|info| info.build_profile.clone())
             .unwrap_or_else(|| "unknown".to_owned()),
+        optimization_level: build_info
+            .map(|info| info.optimization_level.clone())
+            .unwrap_or_else(|| "unknown".to_owned()),
         panic_strategy: build_info
             .map(|info| info.panic_strategy.clone())
             .unwrap_or_else(|| "unknown".to_owned()),
@@ -1192,7 +1197,7 @@ fn quirl_build_info(quirl: &Path) -> Option<QuirlBuildInfo> {
         return None;
     }
     let info: QuirlBuildInfo = serde_json::from_slice(&output.stdout).ok()?;
-    (info.schema_version == 1).then_some(info)
+    (info.schema_version == 2).then_some(info)
 }
 
 fn build_info_matches_benchmark(info: &QuirlBuildInfo) -> bool {
@@ -1206,7 +1211,9 @@ fn build_info_matches_benchmark(info: &QuirlBuildInfo) -> bool {
     } else {
         "abort"
     };
+    let expected_optimization = if cfg!(debug_assertions) { "0" } else { "z" };
     info.build_profile == expected_profile
+        && info.optimization_level == expected_optimization
         && info.panic_strategy == expected_panic
         && info.operating_system == env::consts::OS
         && info.architecture == env::consts::ARCH
@@ -1299,11 +1306,12 @@ fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
 fn print_text(report: &PreviewReport) {
     println!("Quirl 1.0 release performance gate\n");
     println!(
-        "{} · {} · {} · {}",
+        "{} · {} · {} · {} (opt={})",
         report.environment.operating_system,
         report.environment.architecture,
         report.environment.cpu,
-        report.environment.build_profile
+        report.environment.build_profile,
+        report.environment.optimization_level
     );
     println!(
         "source {}{} · panic={} · binary sha256={}",
@@ -1486,9 +1494,10 @@ mod tests {
             "abort"
         };
         let matching = QuirlBuildInfo {
-            schema_version: 1,
+            schema_version: 2,
             version: "0.1.0".to_owned(),
             build_profile: profile.to_owned(),
+            optimization_level: if cfg!(debug_assertions) { "0" } else { "z" }.to_owned(),
             panic_strategy: panic_strategy.to_owned(),
             operating_system: env::consts::OS.to_owned(),
             architecture: env::consts::ARCH.to_owned(),

@@ -25,4 +25,8 @@ fn main() {
         .unwrap_or("unknown");
     println!("cargo:rustc-env=QUIRL_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=QUIRL_BUILD_DIRTY={dirty}");
+    println!(
+        "cargo:rustc-env=QUIRL_BUILD_OPT_LEVEL={}",
+        env::var("OPT_LEVEL").unwrap_or_else(|_| "unknown".to_owned())
+    );
 }
