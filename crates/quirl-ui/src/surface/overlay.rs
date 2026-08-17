@@ -39,6 +39,7 @@ pub struct PickerOverlay {
     label: &'static str,
     active: bool,
     expanded: bool,
+    bottom_anchored: bool,
 }
 
 impl PickerOverlay {
@@ -51,6 +52,7 @@ impl PickerOverlay {
             label: "picker",
             active: false,
             expanded: false,
+            bottom_anchored: false,
         }
     }
 
@@ -61,6 +63,16 @@ impl PickerOverlay {
         expanded: bool,
     ) -> Vec<CompletionItem> {
         self.open_with_query(items, label, expanded, "")
+    }
+
+    pub fn open_bottom_anchored(
+        &mut self,
+        items: Vec<CompletionItem>,
+        label: &'static str,
+    ) -> Vec<CompletionItem> {
+        let visible = self.open_with_query(items, label, false, "");
+        self.bottom_anchored = true;
+        visible
     }
 
     pub fn open_with_query(
@@ -105,6 +117,10 @@ impl PickerOverlay {
 
     pub const fn expanded(&self) -> bool {
         self.expanded
+    }
+
+    pub const fn bottom_anchored(&self) -> bool {
+        self.bottom_anchored
     }
 
     pub fn query(&self) -> Option<&str> {
@@ -159,6 +175,7 @@ impl PickerOverlay {
         self.query.clear();
         self.active = false;
         self.expanded = false;
+        self.bottom_anchored = false;
     }
 
     fn ranked_items(&self) -> Vec<CompletionItem> {
@@ -376,6 +393,20 @@ mod tests {
         overlay.insert_query("e\u{301}").unwrap();
         overlay.backspace_query().unwrap();
         assert_eq!(overlay.query(), Some(""));
+    }
+
+    #[test]
+    fn bottom_anchored_overlay_state_is_bounded_to_its_active_lifetime() {
+        let mut overlay = PickerOverlay::new(Arc::new(StablePickerRanker));
+        overlay.open_bottom_anchored(vec![item("git status")], "actions");
+
+        assert!(overlay.active());
+        assert!(overlay.bottom_anchored());
+        assert!(!overlay.expanded());
+
+        overlay.dismiss();
+        assert!(!overlay.active());
+        assert!(!overlay.bottom_anchored());
     }
 
     #[test]

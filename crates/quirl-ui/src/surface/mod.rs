@@ -306,6 +306,7 @@ impl RichSurface {
                     } else {
                         self.picker_layout
                     },
+                    picker_bottom_anchored: self.picker.bottom_anchored(),
                     picker_preview: self.picker_preview,
                     detail_scroll: self.help_detail_scroll,
                     runtime: &self.runtime,
@@ -525,13 +526,7 @@ impl RichSurface {
                         }
                         EditAction::Dismiss => self.dismiss_picker(),
                         EditAction::OpenPicker(kind) => {
-                            self.open_picker(
-                                kind,
-                                editor.buffer(),
-                                editor.cursor(),
-                                "picker",
-                                false,
-                            );
+                            self.open_picker(kind, editor.buffer(), editor.cursor(), "picker");
                         }
                         EditAction::ClearScreen => {
                             execute!(io::stderr(), terminal::Clear(ClearType::All))
@@ -581,7 +576,6 @@ impl RichSurface {
         line: &str,
         cursor: usize,
         label: &'static str,
-        expanded: bool,
     ) {
         self.help_active = false;
         self.help_detail_scroll = 0;
@@ -592,7 +586,11 @@ impl RichSurface {
                 overlay::items(kind, catalog, &self.history, line, cursor)
             }),
         };
-        self.open_picker_items(items, label, expanded);
+        if kind.bottom_anchored() {
+            self.open_bottom_anchored_picker(items, label);
+        } else {
+            self.open_picker_items(items, label, false);
+        }
     }
 
     fn open_context_help(&mut self, line: &str, cursor: usize) {
@@ -624,6 +622,17 @@ impl RichSurface {
         self.help_active = false;
         self.help_detail_scroll = 0;
         let visible = self.picker.open(items, label, expanded);
+        self.completion.show_picker_results(visible, label);
+    }
+
+    fn open_bottom_anchored_picker(
+        &mut self,
+        items: Vec<completion::CompletionItem>,
+        label: &'static str,
+    ) {
+        self.help_active = false;
+        self.help_detail_scroll = 0;
+        let visible = self.picker.open_bottom_anchored(items, label);
         self.completion.show_picker_results(visible, label);
     }
 
@@ -783,6 +792,21 @@ impl SurfaceTerminal {
             return Ok(());
         }
         if let Some(mut terminal) = self.terminal.take() {
+            // Failure model: viewport recreation happens only while the raw-mode
+            // guard is armed and no foreground child owns the terminal. Growing
+            // starts at the prior viewport top so Ratatui scrolls earlier output
+            // into native scrollback; shrinking preserves the prior bottom edge.
+            // Every failed step restores the cursor and disarms terminal features.
+            let previous_area = terminal.get_frame().area();
+            let terminal_height = match terminal.size() {
+                Ok(size) => size.height,
+                Err(error) => {
+                    let _ = terminal.clear();
+                    let _ = terminal.show_cursor();
+                    self.reset_best_effort();
+                    return Err(terminal_error("measure the interactive terminal")(error));
+                }
+            };
             if let Err(error) = terminal.clear() {
                 let _ = terminal.show_cursor();
                 self.reset_best_effort();
@@ -791,6 +815,13 @@ impl SurfaceTerminal {
             if let Err(error) = terminal.show_cursor() {
                 self.reset_best_effort();
                 return Err(terminal_error("restore the terminal cursor")(error));
+            }
+            let anchor_row = resized_viewport_anchor_row(previous_area, terminal_height, height);
+            if let Err(error) = terminal.set_cursor_position(Position::new(0, anchor_row)) {
+                self.reset_best_effort();
+                return Err(terminal_error("anchor the resized interactive frame")(
+                    error,
+                ));
             }
         }
         let backend = CrosstermBackend::new(io::stderr());
@@ -933,6 +964,20 @@ fn retain_error(slot: &mut Option<ShellError>, error: ShellError) {
     if slot.is_none() {
         *slot = Some(error);
     }
+}
+
+fn resized_viewport_anchor_row(
+    previous_area: ratatui::layout::Rect,
+    terminal_height: u16,
+    next_height: u16,
+) -> u16 {
+    let visible_bottom = previous_area.bottom().min(terminal_height);
+    let next_height = next_height.max(1).min(terminal_height.max(1));
+    let previous_height = previous_area.height.min(terminal_height);
+    if next_height > previous_height {
+        return previous_area.top().min(terminal_height.saturating_sub(1));
+    }
+    visible_bottom.saturating_sub(next_height)
 }
 
 fn trim_history(history: &mut Vec<String>) {
@@ -1116,6 +1161,47 @@ mod tests {
 
         assert!(terminal.finish_release(None).is_ok());
         assert!(!terminal.active);
+    }
+
+    #[test]
+    fn viewport_contraction_preserves_the_visible_bottom_edge() {
+        let full = ratatui::layout::Rect::new(0, 0, 120, 30);
+        assert_eq!(resized_viewport_anchor_row(full, 30, 3), 27);
+
+        let compact = ratatui::layout::Rect::new(0, 17, 120, 13);
+        assert_eq!(resized_viewport_anchor_row(compact, 30, 3), 27);
+    }
+
+    #[test]
+    fn viewport_growth_starts_at_the_prior_top_to_preserve_scrollback() {
+        let compact = ratatui::layout::Rect::new(0, 17, 120, 13);
+        assert_eq!(resized_viewport_anchor_row(compact, 30, 30), 17);
+    }
+
+    #[test]
+    fn viewport_recreation_clamps_a_stale_area_after_terminal_shrink() {
+        let stale = ratatui::layout::Rect::new(0, 17, 120, 13);
+        assert_eq!(resized_viewport_anchor_row(stale, 8, 3), 5);
+        assert_eq!(resized_viewport_anchor_row(stale, 8, 30), 0);
+    }
+
+    #[test]
+    fn default_adaptive_command_palette_requests_bottom_anchored_viewport() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        assert_eq!(surface.picker_layout, PickerLayout::Adaptive);
+
+        surface.open_picker(editor::PickerKind::Palette, "", 0, "picker");
+        assert!(surface.picker.active());
+        assert!(surface.picker.bottom_anchored());
+        assert!(!surface.picker.expanded());
     }
 
     #[test]

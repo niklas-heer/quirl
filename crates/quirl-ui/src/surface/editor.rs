@@ -51,6 +51,12 @@ pub enum PickerKind {
     Data,
 }
 
+impl PickerKind {
+    pub const fn bottom_anchored(self) -> bool {
+        matches!(self, Self::Palette)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditAction {
     None,
@@ -704,6 +710,19 @@ mod tests {
             ),
             EditAction::ToggleGrammarMode
         );
+    }
+
+    #[test]
+    fn ctrl_k_selects_the_only_bottom_anchored_picker() {
+        let mut editor = EditorState::new("emacs", Vec::new());
+        let action = editor.apply_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            false,
+        );
+
+        assert_eq!(action, EditAction::OpenPicker(PickerKind::Palette));
+        assert!(PickerKind::Palette.bottom_anchored());
+        assert!(!PickerKind::History.bottom_anchored());
     }
 
     #[test]
