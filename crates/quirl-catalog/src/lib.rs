@@ -381,7 +381,8 @@ pub struct CompletionRequest {
     pub request_id: u64,
     /// Complete UTF-8 input buffer, bounded by [`MAX_COMPLETION_QUERY_BYTES`].
     pub line: String,
-    /// UTF-8 byte offset of the cursor; callers must supply a character boundary.
+    /// UTF-8 byte offset of the cursor. Protocol boundaries reject offsets that
+    /// are not character boundaries; [`Catalog::complete`] also clamps defensively.
     pub cursor: usize,
     /// Maximum requested candidates, no greater than [`MAX_COMPLETION_RESULTS`].
     pub limit: usize,
@@ -1357,7 +1358,7 @@ impl Catalog {
                     "quirl index build",
                     "quirl index build [--fish path]... [--bash path]... [--zsh path]... [--help path]... [--man path]... [--output path] [--format text|json]",
                     "Build the attributed completion index",
-                    "Imports declarative Fish, Bash, and Zsh completions from admitted regular files up to 4 MiB each, plus admitted help/man text up to 1 MiB each. It never sources or executes providers, commands, or man, then atomically writes a versioned catalog.",
+                    "Imports declarative Fish, Bash, and Zsh completions from admitted regular files up to 4 MiB each, retaining at most 256 commands per declaration, 2,048 commands, 4,096 candidates, and 4 MiB of normalized catalog text per file. Help/man text is limited to 1 MiB each. It never sources or executes providers, commands, or man, then atomically writes a versioned catalog.",
                     vec![
                         repeatable_option(&["--fish"], "path", "Import a Fish completion file or directory"),
                         repeatable_option(&["--bash"], "path", "Import a Bash completion file or directory"),
@@ -1433,8 +1434,11 @@ impl Catalog {
     }
 
     /// Complete command paths or options using a deterministic fuzzy subsequence score.
+    ///
+    /// A cursor past the input or inside a UTF-8 code point is clamped backward to
+    /// the nearest valid boundary so malformed protocol input cannot create a panic.
     pub fn complete(&self, input: &str, cursor: usize) -> Vec<Completion> {
-        let cursor = cursor.min(input.len());
+        let cursor = clamped_cursor(input, cursor);
         let before = &input[..cursor];
         let trimmed_start = before.len() - before.trim_start().len();
         let query = before.trim_start();
@@ -1871,7 +1875,7 @@ impl Catalog {
     ) -> Option<(&'catalog CommandSpec, usize, &'query str)> {
         let token_start = query
             .rfind(char::is_whitespace)
-            .map_or(0, |index| index + 1);
+            .map_or(0, |index| index + whitespace_width_at(query, index));
         let token = &query[token_start..];
         if !token.starts_with('-') {
             return None;
@@ -1901,7 +1905,7 @@ impl Catalog {
     )> {
         let token_start = query
             .rfind(char::is_whitespace)
-            .map_or(0, |index| index + 1);
+            .map_or(0, |index| index + whitespace_width_at(query, index));
         let token = &query[token_start..];
         let (option_name, value_query, replace_start, command_text) =
             if let Some((name, value)) = token.split_once('=') {
@@ -1915,7 +1919,7 @@ impl Catalog {
                 let preceding = query[..token_start].trim_end();
                 let option_start = preceding
                     .rfind(char::is_whitespace)
-                    .map_or(0, |index| index + 1);
+                    .map_or(0, |index| index + whitespace_width_at(preceding, index));
                 (
                     &preceding[option_start..],
                     token,
@@ -1954,24 +1958,49 @@ fn unsupported_catalog_schema_error(found: &str) -> serde_json::Error {
     ))
 }
 
+fn clamped_cursor(input: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(input.len());
+    while !input.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
+}
+
+fn whitespace_width_at(input: &str, index: usize) -> usize {
+    input[index..].chars().next().map_or(0, char::len_utf8)
+}
+
 fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
     let query = query.to_lowercase();
-    let candidate_lower = candidate.to_lowercase();
+    let mut candidate_lower = String::new();
+    let mut original_indices = Vec::new();
+    for (original_index, character) in candidate.chars().enumerate() {
+        for lowercase in character.to_lowercase() {
+            candidate_lower.push(lowercase);
+            original_indices.push(original_index);
+        }
+    }
     if query.is_empty() {
         return Some((0, vec![]));
     }
     if candidate_lower.starts_with(&query) {
-        return Some((
-            10_000 - candidate.len() as i32,
-            (0..query.chars().count()).collect(),
-        ));
+        let mut indices = original_indices
+            .iter()
+            .take(query.chars().count())
+            .copied()
+            .collect::<Vec<_>>();
+        indices.dedup();
+        return Some((10_000 - candidate.len() as i32, indices));
     }
 
     let mut indices = Vec::new();
-    let mut candidate_chars = candidate_lower.char_indices();
+    let mut candidate_chars = candidate_lower.chars().enumerate();
     for wanted in query.chars() {
-        let (byte_index, _) = candidate_chars.find(|(_, actual)| *actual == wanted)?;
-        indices.push(candidate_lower[..byte_index].chars().count());
+        let (folded_index, _) = candidate_chars.find(|(_, actual)| *actual == wanted)?;
+        let original_index = *original_indices.get(folded_index)?;
+        if indices.last() != Some(&original_index) {
+            indices.push(original_index);
+        }
     }
     let spread = indices.last().copied().unwrap_or_default() as i32;
     Some((1_000 - spread - candidate.len() as i32, indices))
@@ -2307,6 +2336,49 @@ mod tests {
         let equals = Catalog::builtin().complete("quirl index build --format=j", 28);
         assert_eq!(equals[0].value, "json");
         assert_eq!(equals[0].replace_start, 27);
+    }
+
+    #[test]
+    fn unicode_whitespace_preserves_completion_spans_in_every_context() {
+        for whitespace in ['\u{00a0}', '\u{3000}', '\u{2003}'] {
+            let command_line = format!("{whitespace}git c");
+            let commands = Catalog::builtin().complete(&command_line, command_line.len());
+            assert_eq!(commands[0].value, "git commit");
+            assert_eq!(commands[0].replace_start, whitespace.len_utf8());
+
+            let option_line = format!("git commit{whitespace}--am");
+            let options = Catalog::builtin().complete(&option_line, option_line.len());
+            assert_eq!(options[0].value, "--amend");
+            assert_eq!(
+                options[0].replace_start,
+                "git commit".len() + whitespace.len_utf8()
+            );
+
+            let value_line = format!("quirl index build --format{whitespace}j");
+            let values = Catalog::builtin().complete(&value_line, value_line.len());
+            assert_eq!(values[0].value, "json");
+            assert_eq!(
+                values[0].replace_start,
+                "quirl index build --format".len() + whitespace.len_utf8()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_protocol_cursor_clamps_before_a_partial_code_point() {
+        let line = "git \u{00e9}";
+        let inside_e_acute = line.len() - 1;
+        let completions = Catalog::builtin().complete(line, inside_e_acute);
+        assert!(!completions.is_empty());
+        assert!(completions
+            .iter()
+            .all(|completion| completion.replace_end == "git ".len()));
+    }
+
+    #[test]
+    fn fuzzy_unicode_indices_address_the_original_display_characters() {
+        assert_eq!(fuzzy_match("i", "\u{0130}").unwrap().1, [0]);
+        assert_eq!(fuzzy_match("x", "\u{0130}x").unwrap().1, [1]);
     }
 
     #[test]

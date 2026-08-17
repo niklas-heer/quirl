@@ -1,6 +1,6 @@
 use crate::{
-    imported_argument, imported_command, Catalog, CommandSpec, Confidence, OptionSpec, Provenance,
-    ProvenanceInfo, CATALOG_SCHEMA_VERSION,
+    imported_argument, imported_command, Catalog, CommandSpec, CompletionSource, Confidence,
+    OptionSpec, Provenance, ProvenanceInfo, CATALOG_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path};
@@ -8,6 +8,15 @@ use std::{collections::HashMap, path::Path};
 const MAX_HELP_BYTES: usize = 1024 * 1024;
 const MAX_HELP_LINES: usize = 20_000;
 const MAX_HELP_OPTIONS: usize = 2_048;
+const MAX_COMPLETION_IMPORT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_COMPLETION_IMPORT_ORIGIN_BYTES: usize = 4 * 1024;
+const MAX_COMPLETION_IMPORT_LINES: usize = 20_000;
+const MAX_IMPORT_TOKENS_PER_DECLARATION: usize = 16_384;
+const MAX_COMMANDS_PER_DECLARATION: usize = 256;
+const MAX_RETAINED_COMMANDS: usize = 2_048;
+const MAX_IMPORT_CANDIDATES: usize = 4_096;
+const MAX_RETAINED_IMPORT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IMPORT_DIAGNOSTICS: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Non-fatal problem encountered while importing external command metadata.
@@ -38,18 +47,61 @@ pub struct ImportReport {
 /// condition declarations are retained. Dynamic command substitutions remain
 /// attributed in command details but are never executed by the importer.
 pub fn import_fish(source: &str, origin: &str) -> ImportReport {
+    let (source, source_truncated) = bounded_prefix(source, MAX_COMPLETION_IMPORT_BYTES);
+    let (origin, origin_truncated) = bounded_prefix(origin, MAX_COMPLETION_IMPORT_ORIGIN_BYTES);
     let fingerprint = fingerprint(source);
     let mut report = ImportReport::default();
-    for (line_number, line) in logical_lines(source) {
+    if origin_truncated {
+        push_diagnostic(
+            &mut report.diagnostics,
+            diagnostic(
+                origin,
+                1,
+                format!(
+                    "Fish completion origin truncated at {MAX_COMPLETION_IMPORT_ORIGIN_BYTES} UTF-8 bytes"
+                ),
+            ),
+        );
+    }
+    if source_truncated {
+        push_diagnostic(
+            &mut report.diagnostics,
+            diagnostic(
+                origin,
+                1,
+                format!(
+                    "Fish completion source truncated at {MAX_COMPLETION_IMPORT_BYTES} UTF-8 bytes"
+                ),
+            ),
+        );
+    }
+    let (lines, lines_truncated) = logical_lines(source);
+    if lines_truncated {
+        push_diagnostic(
+            &mut report.diagnostics,
+            diagnostic(
+                origin,
+                MAX_COMPLETION_IMPORT_LINES,
+                format!(
+                    "Fish completion source stopped at {MAX_COMPLETION_IMPORT_LINES} logical lines"
+                ),
+            ),
+        );
+    }
+    let mut staged = Vec::new();
+    let mut candidate_count = 0;
+    let mut retained_bytes = 0;
+    for (line_number, line) in lines {
         if !line.contains("complete") {
             continue;
         }
         let tokens = match shell_words(&line) {
             Ok(tokens) => tokens,
             Err(message) => {
-                report
-                    .diagnostics
-                    .push(diagnostic(origin, line_number, message));
+                push_diagnostic(
+                    &mut report.diagnostics,
+                    diagnostic(origin, line_number, message),
+                );
                 continue;
             }
         };
@@ -57,13 +109,26 @@ pub fn import_fish(source: &str, origin: &str) -> ImportReport {
             continue;
         };
         let declaration = &tokens[complete_index + 1..];
-        match parse_fish_declaration(declaration, origin, &fingerprint) {
-            Ok(commands) => merge_report_commands(&mut report, commands),
-            Err(message) => report
-                .diagnostics
-                .push(diagnostic(origin, line_number, message)),
+        match parse_fish_declaration(declaration, origin, &fingerprint, &mut candidate_count) {
+            Ok(commands) => {
+                if !retain_commands(
+                    &mut staged,
+                    commands,
+                    &mut retained_bytes,
+                    &mut report.diagnostics,
+                    origin,
+                    line_number,
+                ) {
+                    break;
+                }
+            }
+            Err(message) => push_diagnostic(
+                &mut report.diagnostics,
+                diagnostic(origin, line_number, message),
+            ),
         }
     }
+    merge_report_commands(&mut report, staged);
     report
 }
 
@@ -73,18 +138,61 @@ pub fn import_fish(source: &str, origin: &str) -> ImportReport {
 /// declarations create attributable command entries so an index can explain
 /// where dynamic completion would come from without granting it authority.
 pub fn import_bash(source: &str, origin: &str) -> ImportReport {
+    let (source, source_truncated) = bounded_prefix(source, MAX_COMPLETION_IMPORT_BYTES);
+    let (origin, origin_truncated) = bounded_prefix(origin, MAX_COMPLETION_IMPORT_ORIGIN_BYTES);
     let fingerprint = fingerprint(source);
     let mut report = ImportReport::default();
-    for (line_number, line) in logical_lines(source) {
+    if origin_truncated {
+        push_diagnostic(
+            &mut report.diagnostics,
+            diagnostic(
+                origin,
+                1,
+                format!(
+                    "Bash completion origin truncated at {MAX_COMPLETION_IMPORT_ORIGIN_BYTES} UTF-8 bytes"
+                ),
+            ),
+        );
+    }
+    if source_truncated {
+        push_diagnostic(
+            &mut report.diagnostics,
+            diagnostic(
+                origin,
+                1,
+                format!(
+                    "Bash completion source truncated at {MAX_COMPLETION_IMPORT_BYTES} UTF-8 bytes"
+                ),
+            ),
+        );
+    }
+    let (lines, lines_truncated) = logical_lines(source);
+    if lines_truncated {
+        push_diagnostic(
+            &mut report.diagnostics,
+            diagnostic(
+                origin,
+                MAX_COMPLETION_IMPORT_LINES,
+                format!(
+                    "Bash completion source stopped at {MAX_COMPLETION_IMPORT_LINES} logical lines"
+                ),
+            ),
+        );
+    }
+    let mut staged = Vec::new();
+    let mut candidate_count = 0;
+    let mut retained_bytes = 0;
+    for (line_number, line) in lines {
         if !line.contains("complete") {
             continue;
         }
         let tokens = match shell_words(&line) {
             Ok(tokens) => tokens,
             Err(message) => {
-                report
-                    .diagnostics
-                    .push(diagnostic(origin, line_number, message));
+                push_diagnostic(
+                    &mut report.diagnostics,
+                    diagnostic(origin, line_number, message),
+                );
                 continue;
             }
         };
@@ -92,13 +200,26 @@ pub fn import_bash(source: &str, origin: &str) -> ImportReport {
             continue;
         };
         let declaration = &tokens[complete_index + 1..];
-        match parse_bash_declaration(declaration, origin, &fingerprint) {
-            Ok(commands) => merge_report_commands(&mut report, commands),
-            Err(message) => report
-                .diagnostics
-                .push(diagnostic(origin, line_number, message)),
+        match parse_bash_declaration(declaration, origin, &fingerprint, &mut candidate_count) {
+            Ok(commands) => {
+                if !retain_commands(
+                    &mut staged,
+                    commands,
+                    &mut retained_bytes,
+                    &mut report.diagnostics,
+                    origin,
+                    line_number,
+                ) {
+                    break;
+                }
+            }
+            Err(message) => push_diagnostic(
+                &mut report.diagnostics,
+                diagnostic(origin, line_number, message),
+            ),
         }
     }
+    merge_report_commands(&mut report, staged);
     report
 }
 
@@ -108,22 +229,62 @@ pub fn import_bash(source: &str, origin: &str) -> ImportReport {
 /// literal/static-array `_values` candidates are recognized. Functions,
 /// substitutions, and dynamic providers are recorded but never executed.
 pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
+    let (source, source_truncated) = bounded_prefix(source, MAX_COMPLETION_IMPORT_BYTES);
+    let (origin, origin_truncated) = bounded_prefix(origin, MAX_COMPLETION_IMPORT_ORIGIN_BYTES);
     let fingerprint = fingerprint(source);
     let provenance =
         ProvenanceInfo::imported(Provenance::Zsh, Confidence::High, origin, &fingerprint);
-    let commands = zsh_commands(source, origin);
-    let arrays = zsh_static_arrays(source);
+    let mut diagnostics = Vec::new();
+    if origin_truncated {
+        push_diagnostic(
+            &mut diagnostics,
+            diagnostic(
+                origin,
+                1,
+                format!(
+                    "Zsh completion origin truncated at {MAX_COMPLETION_IMPORT_ORIGIN_BYTES} UTF-8 bytes"
+                ),
+            ),
+        );
+    }
+    if source_truncated {
+        push_diagnostic(
+            &mut diagnostics,
+            diagnostic(
+                origin,
+                1,
+                format!(
+                    "Zsh completion source truncated at {MAX_COMPLETION_IMPORT_BYTES} UTF-8 bytes"
+                ),
+            ),
+        );
+    }
+    let (lines, lines_truncated) = logical_lines(source);
+    if lines_truncated {
+        push_diagnostic(
+            &mut diagnostics,
+            diagnostic(
+                origin,
+                MAX_COMPLETION_IMPORT_LINES,
+                format!(
+                    "Zsh completion source stopped at {MAX_COMPLETION_IMPORT_LINES} logical lines"
+                ),
+            ),
+        );
+    }
+    let commands = zsh_commands(&lines, origin, &mut diagnostics);
+    let mut candidate_count = 0;
+    let arrays = zsh_static_arrays(source, origin, &mut candidate_count, &mut diagnostics);
     let mut options = Vec::new();
     let mut described = Vec::new();
     let mut values = Vec::new();
-    let mut diagnostics = Vec::new();
     let mut dynamic = Vec::new();
 
-    for (line_number, line) in logical_lines(source) {
+    for (line_number, line) in lines {
         let tokens = match shell_words(&line) {
             Ok(tokens) => tokens,
             Err(message) => {
-                diagnostics.push(diagnostic(origin, line_number, message));
+                push_diagnostic(&mut diagnostics, diagnostic(origin, line_number, message));
                 continue;
             }
         };
@@ -142,10 +303,22 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
                     continue;
                 }
                 if is_dynamic_zsh(spec) {
+                    if let Err(message) =
+                        admit_candidates(&mut candidate_count, 1, "Zsh dynamic declarations")
+                    {
+                        push_diagnostic(&mut diagnostics, diagnostic(origin, line_number, message));
+                        break;
+                    }
                     dynamic.push(spec.clone());
                     continue;
                 }
                 if let Some(option) = parse_zsh_argument(spec, &provenance) {
+                    if let Err(message) =
+                        admit_candidates(&mut candidate_count, 1, "Zsh argument candidates")
+                    {
+                        push_diagnostic(&mut diagnostics, diagnostic(origin, line_number, message));
+                        break;
+                    }
                     options.push(option);
                 }
             }
@@ -153,14 +326,46 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
         if let Some(call) = tokens.iter().position(|token| token == "_describe") {
             let candidates = zsh_call_candidates(&tokens[call + 1..], &arrays);
             if candidates.dynamic {
+                if let Err(message) =
+                    admit_candidates(&mut candidate_count, 1, "Zsh `_describe` candidates")
+                {
+                    push_diagnostic(&mut diagnostics, diagnostic(origin, line_number, message));
+                    continue;
+                }
                 dynamic.push(format!("_describe {}", candidates.source));
+            }
+            if !candidates.from_array {
+                if let Err(message) = admit_candidates(
+                    &mut candidate_count,
+                    candidates.values.len(),
+                    "Zsh `_describe` candidates",
+                ) {
+                    push_diagnostic(&mut diagnostics, diagnostic(origin, line_number, message));
+                    continue;
+                }
             }
             described.extend(candidates.values);
         }
         if let Some(call) = tokens.iter().position(|token| token == "_values") {
             let candidates = zsh_call_candidates(&tokens[call + 1..], &arrays);
             if candidates.dynamic {
+                if let Err(message) =
+                    admit_candidates(&mut candidate_count, 1, "Zsh `_values` candidates")
+                {
+                    push_diagnostic(&mut diagnostics, diagnostic(origin, line_number, message));
+                    continue;
+                }
                 dynamic.push(format!("_values {}", candidates.source));
+            }
+            if !candidates.from_array {
+                if let Err(message) = admit_candidates(
+                    &mut candidate_count,
+                    candidates.values.len(),
+                    "Zsh `_values` candidates",
+                ) {
+                    push_diagnostic(&mut diagnostics, diagnostic(origin, line_number, message));
+                    continue;
+                }
             }
             values.extend(candidates.values);
         }
@@ -188,34 +393,56 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
         details.push_str(&dynamic.join(", "));
         details.push('.');
     }
-    let mut imported = commands
-        .iter()
-        .map(|path| {
-            imported_command(
+    let mut imported = Vec::new();
+    let mut retained_bytes = 0;
+    for path in &commands {
+        if !retain_commands(
+            &mut imported,
+            vec![imported_command(
                 path.clone(),
                 format!("{path} [options]"),
                 "Command discovered from Zsh completion metadata".to_owned(),
                 details.clone(),
                 options.clone(),
                 provenance.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
+            )],
+            &mut retained_bytes,
+            &mut diagnostics,
+            origin,
+            1,
+        ) {
+            break;
+        }
+    }
+    let mut retention_exhausted = imported.len() < commands.len();
     for command in &commands {
+        if retention_exhausted {
+            break;
+        }
         for candidate in &described {
             let (name, summary) = split_zsh_description(candidate);
             if name.starts_with('-') || name.is_empty() {
                 continue;
             }
             let path = format!("{command} {name}");
-            imported.push(imported_command(
-                path.clone(),
-                format!("{path} [options]"),
-                summary.unwrap_or("Subcommand imported from Zsh").to_owned(),
-                "Imported from a static Zsh `_describe` candidate.".to_owned(),
-                Vec::new(),
-                provenance.clone(),
-            ));
+            retention_exhausted = !retain_commands(
+                &mut imported,
+                vec![imported_command(
+                    path.clone(),
+                    format!("{path} [options]"),
+                    summary.unwrap_or("Subcommand imported from Zsh").to_owned(),
+                    "Imported from a static Zsh `_describe` candidate.".to_owned(),
+                    Vec::new(),
+                    provenance.clone(),
+                )],
+                &mut retained_bytes,
+                &mut diagnostics,
+                origin,
+                1,
+            );
+            if retention_exhausted {
+                break;
+            }
         }
     }
     let mut report = ImportReport {
@@ -223,11 +450,14 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
         diagnostics,
     };
     if commands.is_empty() {
-        report.diagnostics.push(diagnostic(
-            origin,
-            1,
-            "Zsh completion has no `#compdef`, `compdef`, or inferable file name".to_owned(),
-        ));
+        push_diagnostic(
+            &mut report.diagnostics,
+            diagnostic(
+                origin,
+                1,
+                "Zsh completion has no `#compdef`, `compdef`, or inferable file name".to_owned(),
+            ),
+        );
     } else {
         merge_report_commands(&mut report, imported);
     }
@@ -312,28 +542,73 @@ fn import_documentation(source: &str, origin: &str, source_kind: Provenance) -> 
     }
 }
 
-fn zsh_commands(source: &str, origin: &str) -> Vec<String> {
+fn zsh_commands(
+    lines: &[(usize, String)],
+    origin: &str,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Vec<String> {
     let mut commands = Vec::new();
-    for line in source.lines() {
+    for (line_number, line) in lines {
         let trimmed = line.trim();
         if let Some(declaration) = trimmed.strip_prefix("#compdef") {
-            commands.extend(
-                declaration
-                    .split_whitespace()
-                    .filter(|value| !value.starts_with('-'))
-                    .map(str::to_owned),
-            );
+            let declared = declaration
+                .split_whitespace()
+                .filter(|value| !value.starts_with('-'))
+                .collect::<Vec<_>>();
+            if declared.len() > MAX_COMMANDS_PER_DECLARATION {
+                push_diagnostic(
+                    diagnostics,
+                    diagnostic(
+                        origin,
+                        *line_number,
+                        format!(
+                            "Zsh `#compdef` declaration has {} commands; limit is {MAX_COMMANDS_PER_DECLARATION}",
+                            declared.len()
+                        ),
+                    ),
+                );
+            } else {
+                commands.extend(declared.into_iter().map(str::to_owned));
+            }
         }
         if trimmed.starts_with("compdef ") {
             if let Ok(tokens) = shell_words(trimmed) {
-                commands.extend(
-                    tokens
-                        .iter()
-                        .skip(2)
-                        .filter(|value| !value.starts_with('-'))
-                        .cloned(),
-                );
+                let declared = tokens
+                    .iter()
+                    .skip(2)
+                    .filter(|value| !value.starts_with('-'))
+                    .collect::<Vec<_>>();
+                if declared.len() > MAX_COMMANDS_PER_DECLARATION {
+                    push_diagnostic(
+                        diagnostics,
+                        diagnostic(
+                            origin,
+                            *line_number,
+                            format!(
+                                "Zsh `compdef` declaration has {} commands; limit is {MAX_COMMANDS_PER_DECLARATION}",
+                                declared.len()
+                            ),
+                        ),
+                    );
+                } else {
+                    commands.extend(declared.into_iter().map(|value| (*value).clone()));
+                }
             }
+        }
+        if commands.len() > MAX_RETAINED_COMMANDS {
+            push_diagnostic(
+                diagnostics,
+                diagnostic(
+                    origin,
+                    *line_number,
+                    format!(
+                        "Zsh completion would retain {} command names; limit is {MAX_RETAINED_COMMANDS}",
+                        commands.len()
+                    ),
+                ),
+            );
+            commands.truncate(MAX_RETAINED_COMMANDS);
+            break;
         }
     }
     if commands.is_empty() {
@@ -359,7 +634,12 @@ fn inferred_name_from_origin(origin: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_owned())
 }
 
-fn zsh_static_arrays(source: &str) -> HashMap<String, Vec<String>> {
+fn zsh_static_arrays(
+    source: &str,
+    origin: &str,
+    candidate_count: &mut usize,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> HashMap<String, Vec<String>> {
     let bytes = source.as_bytes();
     let mut arrays = HashMap::new();
     let mut index = 0usize;
@@ -395,7 +675,19 @@ fn zsh_static_arrays(source: &str) -> HashMap<String, Vec<String>> {
             continue;
         };
         if let Ok(values) = shell_words(&source[cursor + 1..end]) {
-            arrays.insert(name.to_owned(), values);
+            match admit_candidates(candidate_count, values.len(), "Zsh static array candidates") {
+                Ok(()) => {
+                    arrays.insert(name.to_owned(), values);
+                }
+                Err(message) => {
+                    let line = source[..start]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                        + 1;
+                    push_diagnostic(diagnostics, diagnostic(origin, line, message));
+                }
+            }
         }
         index = end + 1;
     }
@@ -440,6 +732,7 @@ struct ZshCandidates {
     values: Vec<String>,
     dynamic: bool,
     source: String,
+    from_array: bool,
 }
 
 fn zsh_call_candidates(tokens: &[String], arrays: &HashMap<String, Vec<String>>) -> ZshCandidates {
@@ -452,6 +745,7 @@ fn zsh_call_candidates(tokens: &[String], arrays: &HashMap<String, Vec<String>>)
                 values: values.clone(),
                 dynamic: false,
                 source: remaining[0].clone(),
+                from_array: true,
             };
         }
     }
@@ -471,6 +765,7 @@ fn zsh_call_candidates(tokens: &[String], arrays: &HashMap<String, Vec<String>>)
         values,
         dynamic,
         source: remaining.join(" "),
+        from_array: false,
     }
 }
 
@@ -661,6 +956,7 @@ fn parse_fish_declaration(
     tokens: &[String],
     origin: &str,
     fingerprint: &str,
+    candidate_count: &mut usize,
 ) -> Result<Vec<CommandSpec>, String> {
     let mut commands = Vec::new();
     let mut names = Vec::new();
@@ -725,6 +1021,20 @@ fn parse_fish_declaration(
     if commands.is_empty() {
         return Err("Fish completion declaration has no command (`-c`)".to_owned());
     }
+    if commands.len() > MAX_COMMANDS_PER_DECLARATION {
+        return Err(format!(
+            "Fish completion declaration has {} commands; limit is {MAX_COMMANDS_PER_DECLARATION}",
+            commands.len()
+        ));
+    }
+    admit_candidates(
+        candidate_count,
+        names
+            .len()
+            .saturating_add(arguments.len())
+            .saturating_add(conditions.len()),
+        "Fish completion declaration",
+    )?;
     names.sort();
     names.dedup();
     let provenance =
@@ -764,6 +1074,7 @@ fn parse_bash_declaration(
     tokens: &[String],
     origin: &str,
     fingerprint: &str,
+    candidate_count: &mut usize,
 ) -> Result<Vec<CommandSpec>, String> {
     let mut commands = Vec::new();
     let mut word_lists = Vec::new();
@@ -812,6 +1123,12 @@ fn parse_bash_declaration(
     if commands.is_empty() {
         return Err("Bash completion declaration has no command".to_owned());
     }
+    if commands.len() > MAX_COMMANDS_PER_DECLARATION {
+        return Err(format!(
+            "Bash completion declaration has {} commands; limit is {MAX_COMMANDS_PER_DECLARATION}",
+            commands.len()
+        ));
+    }
     let command_confidence = if word_lists.is_empty() {
         Confidence::Medium
     } else {
@@ -821,11 +1138,25 @@ fn parse_bash_declaration(
         ProvenanceInfo::imported(Provenance::Bash, command_confidence, origin, fingerprint);
     let option_provenance =
         ProvenanceInfo::imported(Provenance::Bash, Confidence::High, origin, fingerprint);
-    let mut option_names = word_lists
-        .iter()
-        .flat_map(|words| shell_words(words).unwrap_or_default())
-        .filter_map(|candidate| normalize_bash_option(&candidate))
-        .collect::<Vec<_>>();
+    let mut option_names = Vec::new();
+    for words in &word_lists {
+        let candidates = shell_words(words)?;
+        admit_candidates(
+            candidate_count,
+            candidates.len(),
+            "Bash completion candidates",
+        )?;
+        option_names.extend(
+            candidates
+                .iter()
+                .filter_map(|candidate| normalize_bash_option(candidate)),
+        );
+    }
+    admit_candidates(
+        candidate_count,
+        providers.len(),
+        "Bash completion providers",
+    )?;
     option_names.sort();
     option_names.dedup();
     let options = option_names
@@ -871,6 +1202,132 @@ fn merge_report_commands(report: &mut ImportReport, commands: Vec<CommandSpec>) 
     };
     catalog.merge(commands);
     report.commands = catalog.commands;
+}
+
+fn admit_candidates(
+    candidate_count: &mut usize,
+    additional: usize,
+    context: &str,
+) -> Result<(), String> {
+    let observed = candidate_count.saturating_add(additional);
+    if observed > MAX_IMPORT_CANDIDATES {
+        return Err(format!(
+            "{context} would retain {observed} candidates; limit is {MAX_IMPORT_CANDIDATES}"
+        ));
+    }
+    *candidate_count = observed;
+    Ok(())
+}
+
+fn retain_commands(
+    retained: &mut Vec<CommandSpec>,
+    commands: Vec<CommandSpec>,
+    retained_bytes: &mut usize,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    origin: &str,
+    line: usize,
+) -> bool {
+    for command in commands {
+        let observed_commands = retained.len().saturating_add(1);
+        if observed_commands > MAX_RETAINED_COMMANDS {
+            push_diagnostic(
+                diagnostics,
+                diagnostic(
+                    origin,
+                    line,
+                    format!(
+                        "completion import would retain {observed_commands} commands; limit is {MAX_RETAINED_COMMANDS}"
+                    ),
+                ),
+            );
+            return false;
+        }
+        let command_bytes = command_retained_bytes(&command);
+        let observed_bytes = retained_bytes.saturating_add(command_bytes);
+        if observed_bytes > MAX_RETAINED_IMPORT_BYTES {
+            push_diagnostic(
+                diagnostics,
+                diagnostic(
+                    origin,
+                    line,
+                    format!(
+                        "completion import would retain {observed_bytes} UTF-8 bytes; limit is {MAX_RETAINED_IMPORT_BYTES}"
+                    ),
+                ),
+            );
+            return false;
+        }
+        *retained_bytes = observed_bytes;
+        retained.push(command);
+    }
+    true
+}
+
+fn command_retained_bytes(command: &CommandSpec) -> usize {
+    let mut bytes = command
+        .id
+        .len()
+        .saturating_add(command.path.len())
+        .saturating_add(command.signature.len())
+        .saturating_add(command.summary.len())
+        .saturating_add(command.details.len());
+    bytes = command
+        .aliases
+        .iter()
+        .chain(command.examples.iter())
+        .fold(bytes, |total, value| total.saturating_add(value.len()));
+    if let Some(parent) = &command.parent {
+        bytes = bytes.saturating_add(parent.len());
+    }
+    if let Some(version) = &command.version {
+        bytes = bytes.saturating_add(version.len());
+    }
+    bytes = bytes
+        .saturating_add(command.io.input.len())
+        .saturating_add(command.io.output.len())
+        .saturating_add(provenance_retained_bytes(&command.provenance));
+    bytes = command
+        .exit_codes
+        .values()
+        .fold(bytes, |total, value| total.saturating_add(value.len()));
+    for option in &command.options {
+        bytes = option
+            .names
+            .iter()
+            .chain(option.conflicts.iter())
+            .chain(option.examples.iter())
+            .fold(bytes, |total, value| total.saturating_add(value.len()));
+        bytes = bytes
+            .saturating_add(option.value_type.len())
+            .saturating_add(option.documentation.len())
+            .saturating_add(provenance_retained_bytes(&option.provenance));
+        if let Some(values) = &option.values {
+            bytes = match values {
+                CompletionSource::Static { values } => values
+                    .iter()
+                    .fold(bytes, |total, value| total.saturating_add(value.len())),
+                CompletionSource::Dynamic { provider } => bytes.saturating_add(provider.len()),
+            };
+        }
+    }
+    bytes
+}
+
+fn provenance_retained_bytes(provenance: &ProvenanceInfo) -> usize {
+    [
+        &provenance.origin,
+        &provenance.fingerprint,
+        &provenance.generated_at,
+    ]
+    .into_iter()
+    .flatten()
+    .fold(0, |total, value| total.saturating_add(value.len()))
+}
+
+fn push_diagnostic(diagnostics: &mut Vec<ImportDiagnostic>, diagnostic: ImportDiagnostic) {
+    if diagnostics.len() < MAX_IMPORT_DIAGNOSTICS {
+        diagnostics.push(diagnostic);
+    }
 }
 
 fn normalize_bash_option(candidate: &str) -> Option<String> {
@@ -919,7 +1376,7 @@ fn fingerprint(source: &str) -> String {
     format!("fnv1a64:{hash:016x}")
 }
 
-fn logical_lines(source: &str) -> Vec<(usize, String)> {
+fn logical_lines(source: &str) -> (Vec<(usize, String)>, bool) {
     let mut lines = Vec::new();
     let mut buffer = String::new();
     let mut start = 1;
@@ -939,12 +1396,15 @@ fn logical_lines(source: &str) -> Vec<(usize, String)> {
             buffer.push(' ');
         } else {
             lines.push((start, std::mem::take(&mut buffer)));
+            if lines.len() == MAX_COMPLETION_IMPORT_LINES {
+                return (lines, source.lines().count() > number);
+            }
         }
     }
     if !buffer.is_empty() {
         lines.push((start, buffer));
     }
-    lines
+    (lines, false)
 }
 
 fn shell_words(source: &str) -> Result<Vec<String>, String> {
@@ -984,6 +1444,11 @@ fn shell_words(source: &str) -> Result<Vec<String>, String> {
             character if character.is_whitespace() => {
                 if started {
                     words.push(std::mem::take(&mut word));
+                    if words.len() > MAX_IMPORT_TOKENS_PER_DECLARATION {
+                        return Err(format!(
+                            "completion declaration has more than {MAX_IMPORT_TOKENS_PER_DECLARATION} tokens"
+                        ));
+                    }
                     started = false;
                 }
             }
@@ -1001,6 +1466,11 @@ fn shell_words(source: &str) -> Result<Vec<String>, String> {
     }
     if started {
         words.push(word);
+    }
+    if words.len() > MAX_IMPORT_TOKENS_PER_DECLARATION {
+        return Err(format!(
+            "completion declaration has more than {MAX_IMPORT_TOKENS_PER_DECLARATION} tokens"
+        ));
     }
     Ok(words)
 }
@@ -1118,6 +1588,218 @@ _values 'environment' staging production
             .commands
             .iter()
             .any(|command| command.path == "deploy start" && command.summary == "Start services"));
+    }
+
+    #[test]
+    fn completion_import_command_declarations_stop_at_exact_and_plus_one_bounds() {
+        let fish_commands = (0..MAX_COMMANDS_PER_DECLARATION)
+            .map(|index| format!("-c fish{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fish_exact = import_fish(&format!("complete {fish_commands}"), "commands.fish");
+        assert_eq!(fish_exact.commands.len(), MAX_COMMANDS_PER_DECLARATION);
+        assert!(fish_exact.diagnostics.is_empty());
+        let fish_plus_one = import_fish(
+            &format!("complete {fish_commands} -c overflow"),
+            "commands.fish",
+        );
+        assert!(fish_plus_one.commands.is_empty());
+        assert!(fish_plus_one.diagnostics[0]
+            .message
+            .contains(&format!("limit is {MAX_COMMANDS_PER_DECLARATION}")));
+
+        let bash_commands = (0..MAX_COMMANDS_PER_DECLARATION)
+            .map(|index| format!("bash{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let bash_exact = import_bash(&format!("complete {bash_commands}"), "commands.bash");
+        assert_eq!(bash_exact.commands.len(), MAX_COMMANDS_PER_DECLARATION);
+        assert!(bash_exact.diagnostics.is_empty());
+        let bash_plus_one = import_bash(
+            &format!("complete {bash_commands} overflow"),
+            "commands.bash",
+        );
+        assert!(bash_plus_one.commands.is_empty());
+        assert!(bash_plus_one.diagnostics[0]
+            .message
+            .contains(&format!("limit is {MAX_COMMANDS_PER_DECLARATION}")));
+
+        let zsh_commands = (0..MAX_COMMANDS_PER_DECLARATION)
+            .map(|index| format!("zsh{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let zsh_exact = import_zsh(&format!("#compdef {zsh_commands}"), "_commands");
+        assert_eq!(zsh_exact.commands.len(), MAX_COMMANDS_PER_DECLARATION);
+        assert!(zsh_exact.diagnostics.is_empty());
+        let zsh_plus_one = import_zsh(&format!("#compdef {zsh_commands} overflow"), "_commands");
+        assert!(zsh_plus_one.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains(&format!("limit is {MAX_COMMANDS_PER_DECLARATION}"))));
+    }
+
+    #[test]
+    fn completion_import_candidates_stop_at_exact_and_plus_one_bounds() {
+        let candidates = (0..MAX_IMPORT_CANDIDATES)
+            .map(|index| format!("--value{index}"))
+            .collect::<Vec<_>>();
+
+        let fish_arguments = candidates
+            .iter()
+            .map(|candidate| format!("-l {}", candidate.trim_start_matches('-')))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fish_exact = import_fish(
+            &format!("complete -c demo {fish_arguments}"),
+            "candidates.fish",
+        );
+        assert_eq!(
+            fish_exact.commands[0].options[0].names.len(),
+            MAX_IMPORT_CANDIDATES
+        );
+        assert!(fish_exact.diagnostics.is_empty());
+        let fish_plus_one = import_fish(
+            &format!("complete -c demo {fish_arguments} -l overflow"),
+            "candidates.fish",
+        );
+        assert!(fish_plus_one.commands.is_empty());
+        assert!(fish_plus_one.diagnostics[0]
+            .message
+            .contains(&format!("limit is {MAX_IMPORT_CANDIDATES}")));
+
+        let joined = candidates.join(" ");
+        let bash_exact = import_bash(&format!("complete -W '{joined}' demo"), "candidates.bash");
+        assert_eq!(bash_exact.commands[0].options.len(), MAX_IMPORT_CANDIDATES);
+        assert!(bash_exact.diagnostics.is_empty());
+        let bash_plus_one = import_bash(
+            &format!("complete -W '{joined} --overflow' demo"),
+            "candidates.bash",
+        );
+        assert!(bash_plus_one.commands.is_empty());
+        assert!(bash_plus_one.diagnostics[0]
+            .message
+            .contains(&format!("limit is {MAX_IMPORT_CANDIDATES}")));
+
+        let zsh_candidates = (0..MAX_IMPORT_CANDIDATES)
+            .map(|index| format!("value{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let zsh_exact = import_zsh(
+            &format!("#compdef demo\n_values values {zsh_candidates}"),
+            "_candidates",
+        );
+        assert!(zsh_exact.commands[0].details.contains("value4095"));
+        assert!(zsh_exact.diagnostics.is_empty());
+        let zsh_plus_one = import_zsh(
+            &format!("#compdef demo\n_values values {zsh_candidates} overflow"),
+            "_candidates",
+        );
+        assert!(zsh_plus_one.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains(&format!("limit is {MAX_IMPORT_CANDIDATES}"))));
+    }
+
+    #[test]
+    fn zsh_command_candidate_cross_product_has_a_retained_command_bound() {
+        let exact_candidates = (0..MAX_RETAINED_COMMANDS - 1)
+            .map(|index| format!("candidate{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let exact = import_zsh(
+            &format!("#compdef demo\n_describe actions {exact_candidates}"),
+            "_amplification",
+        );
+        assert_eq!(exact.commands.len(), MAX_RETAINED_COMMANDS);
+        assert!(exact.diagnostics.is_empty());
+
+        let plus_one = import_zsh(
+            &format!("#compdef demo\n_describe actions {exact_candidates} overflow"),
+            "_amplification",
+        );
+        assert_eq!(plus_one.commands.len(), MAX_RETAINED_COMMANDS);
+        assert!(plus_one.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains(&format!("limit is {MAX_RETAINED_COMMANDS}"))));
+    }
+
+    #[test]
+    fn completion_import_sources_stop_at_exact_and_plus_one_byte_bounds() {
+        for (declaration, origin, importer) in [
+            (
+                "complete -c fish\n#",
+                "source.fish",
+                import_fish as fn(&str, &str) -> ImportReport,
+            ),
+            ("complete bash\n#", "source.bash", import_bash),
+            ("#compdef zsh\n#", "_source", import_zsh),
+        ] {
+            let exact = format!(
+                "{declaration}{}",
+                "x".repeat(MAX_COMPLETION_IMPORT_BYTES - declaration.len())
+            );
+            assert_eq!(exact.len(), MAX_COMPLETION_IMPORT_BYTES);
+            assert!(importer(&exact, origin).diagnostics.is_empty());
+
+            let plus_one = format!("{exact}x");
+            let report = importer(&plus_one, origin);
+            assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains(&format!("{MAX_COMPLETION_IMPORT_BYTES} UTF-8 bytes"))));
+        }
+    }
+
+    #[test]
+    fn retained_output_bytes_accept_the_exact_bound_and_reject_plus_one() {
+        let provenance =
+            ProvenanceInfo::imported(Provenance::Fish, Confidence::High, "exact", "hash");
+        let mut exact = imported_command(
+            "exact".to_owned(),
+            "exact".to_owned(),
+            "exact".to_owned(),
+            String::new(),
+            Vec::new(),
+            provenance.clone(),
+        );
+        let fixed_bytes = command_retained_bytes(&exact);
+        exact.details = "x".repeat(MAX_RETAINED_IMPORT_BYTES - fixed_bytes);
+        assert_eq!(command_retained_bytes(&exact), MAX_RETAINED_IMPORT_BYTES);
+        let mut retained = Vec::new();
+        let mut retained_bytes = 0;
+        let mut diagnostics = Vec::new();
+        assert!(retain_commands(
+            &mut retained,
+            vec![exact.clone()],
+            &mut retained_bytes,
+            &mut diagnostics,
+            "exact",
+            1,
+        ));
+        assert!(diagnostics.is_empty());
+
+        exact.details.push('x');
+        assert!(!retain_commands(
+            &mut Vec::new(),
+            vec![exact],
+            &mut 0,
+            &mut diagnostics,
+            "plus-one",
+            1,
+        ));
+        assert!(diagnostics[0]
+            .message
+            .contains(&format!("limit is {MAX_RETAINED_IMPORT_BYTES}")));
+    }
+
+    #[test]
+    fn completion_import_diagnostics_are_bounded_for_every_shell() {
+        let malformed = "complete -c 'broken\n".repeat(MAX_IMPORT_DIAGNOSTICS + 1);
+        for importer in [
+            import_fish as fn(&str, &str) -> ImportReport,
+            import_bash,
+            import_zsh,
+        ] {
+            let report = importer(&malformed, "malformed");
+            assert_eq!(report.diagnostics.len(), MAX_IMPORT_DIAGNOSTICS);
+        }
     }
 
     #[test]

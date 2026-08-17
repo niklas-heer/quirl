@@ -17,6 +17,8 @@ pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 3;
 /// corresponding protocol version.
 pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@2{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or|sequence>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;word_ir:array<Word>;redirects:array<Redirect>};Word{deny_unknown;parts:nonempty-array<WordPart>};WordPart{deny_unknown;text:string;quoting:unquoted|single|double|escaped};Redirect{deny_unknown;fd:u8;kind:input|output|append|here_string|duplicate_input|duplicate_output;path:string;target:Word};tokens:word|pipe|and|or|semicolon|input|output|append|here_string|fd_duplicate|background;expansion:parameter|special|arithmetic|command|pathname;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema3}";
 
+const MAX_COMMAND_SUBSTITUTION_DEPTH: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// Parsed native command list composed of pipelines and their control connectors.
@@ -731,15 +733,24 @@ fn syntax_error(token: &Token, message: &str, help: &str) -> CommandSyntaxError 
     }
 }
 
+struct SubstitutionOpening {
+    depth: usize,
+    start: usize,
+    suspended_quote: Option<(char, usize)>,
+}
+
 fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
     let mut tokens = Vec::new();
     let mut word_start = None;
     let mut quote = None;
+    let mut quote_open = None;
     let mut parts = Vec::new();
     let mut fragment = String::new();
     let mut fragment_quoting = Quoting::Unquoted;
-    let mut substitution_depth = 0_u32;
+    let mut substitution_depth = 0;
+    let mut substitution_openings = Vec::new();
     let mut substitution_quote = None;
+    let mut substitution_quote_open = None;
     let mut substitution_escaped = false;
     let mut characters = input.char_indices().peekable();
 
@@ -755,16 +766,44 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                 substitution_escaped = false;
             } else if character == '\\' && substitution_quote != Some('\'') {
                 substitution_escaped = true;
+            } else if character == '('
+                && fragment.ends_with('$')
+                && substitution_quote != Some('\'')
+            {
+                open_command_substitution(
+                    &mut substitution_depth,
+                    &mut substitution_openings,
+                    &mut substitution_quote,
+                    &mut substitution_quote_open,
+                    index,
+                )?;
             } else if let Some(active) = substitution_quote {
                 if character == active {
                     substitution_quote = None;
+                    substitution_quote_open = None;
                 }
             } else if matches!(character, '\'' | '"') {
                 substitution_quote = Some(character);
+                substitution_quote_open = Some(index);
             } else {
                 match character {
-                    '(' => substitution_depth = substitution_depth.saturating_add(1),
-                    ')' => substitution_depth = substitution_depth.saturating_sub(1),
+                    '(' => {
+                        substitution_depth = substitution_depth.saturating_add(1);
+                    }
+                    ')' => {
+                        if substitution_openings
+                            .last()
+                            .is_some_and(|opening| opening.depth == substitution_depth)
+                        {
+                            if let Some(opening) = substitution_openings.pop() {
+                                if let Some((active, start)) = opening.suspended_quote {
+                                    substitution_quote = Some(active);
+                                    substitution_quote_open = Some(start);
+                                }
+                            }
+                        }
+                        substitution_depth = substitution_depth.saturating_sub(1);
+                    }
                     _ => {}
                 }
             }
@@ -803,7 +842,13 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                 Quoting::Double
             };
             if active != '\'' && character == '(' && fragment.ends_with('$') {
-                substitution_depth = substitution_depth.saturating_add(1);
+                open_command_substitution(
+                    &mut substitution_depth,
+                    &mut substitution_openings,
+                    &mut substitution_quote,
+                    &mut substitution_quote_open,
+                    index,
+                )?;
                 append_fragment(
                     &mut parts,
                     &mut fragment,
@@ -816,6 +861,7 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             if character == active {
                 push_fragment(&mut parts, &mut fragment, fragment_quoting);
                 quote = None;
+                quote_open = None;
             } else {
                 append_fragment(
                     &mut parts,
@@ -828,7 +874,13 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             continue;
         }
         if character == '(' && fragment.ends_with('$') {
-            substitution_depth = substitution_depth.saturating_add(1);
+            open_command_substitution(
+                &mut substitution_depth,
+                &mut substitution_openings,
+                &mut substitution_quote,
+                &mut substitution_quote_open,
+                index,
+            )?;
             append_fragment(
                 &mut parts,
                 &mut fragment,
@@ -842,6 +894,7 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             word_start.get_or_insert(index);
             push_fragment(&mut parts, &mut fragment, fragment_quoting);
             quote = Some(character);
+            quote_open = Some(index);
             continue;
         }
         if character.is_whitespace() {
@@ -989,11 +1042,32 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             );
         }
     }
+    if let Some(active) = substitution_quote {
+        let start = substitution_quote_open.unwrap_or(input.len());
+        return Err(CommandSyntaxError {
+            message: format!("unclosed {active} quote in command substitution"),
+            start,
+            end: start + active.len_utf8(),
+            help: format!("Close the quote with {active} before closing the command substitution"),
+        });
+    }
+    if substitution_depth > 0 {
+        let start = substitution_openings
+            .last()
+            .map_or(input.len(), |opening| opening.start);
+        return Err(CommandSyntaxError {
+            message: "unclosed command substitution".to_owned(),
+            start,
+            end: (start + 2).min(input.len()),
+            help: "Close the command substitution with `)`".to_owned(),
+        });
+    }
     if let Some(active) = quote {
+        let start = quote_open.unwrap_or(input.len());
         return Err(CommandSyntaxError {
             message: format!("unclosed {active} quote"),
-            start: word_start.unwrap_or(input.len()),
-            end: input.len(),
+            start,
+            end: start + active.len_utf8(),
             help: format!("Close the quote with {active}"),
         });
     }
@@ -1006,6 +1080,34 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
         input.len(),
     );
     Ok(tokens)
+}
+
+fn open_command_substitution(
+    depth: &mut usize,
+    openings: &mut Vec<SubstitutionOpening>,
+    active_quote: &mut Option<char>,
+    active_quote_open: &mut Option<usize>,
+    parenthesis_index: usize,
+) -> Result<(), CommandSyntaxError> {
+    let observed = depth.saturating_add(1);
+    if observed > MAX_COMMAND_SUBSTITUTION_DEPTH {
+        return Err(CommandSyntaxError {
+            message: "command substitution nesting exceeds the supported limit".to_owned(),
+            start: parenthesis_index - 1,
+            end: parenthesis_index + 1,
+            help: format!(
+                "Reduce command substitution nesting to {MAX_COMMAND_SUBSTITUTION_DEPTH} levels or fewer"
+            ),
+        });
+    }
+    let suspended_quote = active_quote.take().zip(active_quote_open.take());
+    *depth = observed;
+    openings.push(SubstitutionOpening {
+        depth: observed,
+        start: parenthesis_index - 1,
+        suspended_quote,
+    });
+    Ok(())
 }
 
 fn append_fragment(
@@ -1526,6 +1628,67 @@ mod tests {
             assert!(word.parts[0].text.starts_with("$("));
             assert!(word.parts[0].text.ends_with(')'));
         }
+    }
+
+    #[test]
+    fn unterminated_substitutions_and_quotes_report_the_opening_utf8_span() {
+        for (source, message, start, end) in [
+            ("printf $(date", "unclosed command substitution", 7, 9),
+            (
+                "printf $(printf $(date",
+                "unclosed command substitution",
+                16,
+                18,
+            ),
+            (
+                "printf $(printf \"$(date",
+                "unclosed command substitution",
+                17,
+                19,
+            ),
+            ("echo prefix'missing", "unclosed ' quote", 11, 12),
+            (
+                "echo $(printf 'missing",
+                "unclosed ' quote in command substitution",
+                14,
+                15,
+            ),
+        ] {
+            let error = parse_command_list(source).unwrap_err();
+            assert_eq!(error.message, message, "{source}");
+            assert_eq!((error.start, error.end), (start, end), "{source}");
+            assert!(error.help.contains("Close"), "{source}: {}", error.help);
+        }
+    }
+
+    #[test]
+    fn closed_substitutions_return_to_the_surrounding_quote_and_word_states() {
+        for source in [
+            "printf $(date)",
+            "printf $(printf $(date))",
+            "printf $(printf \"$(date)\")",
+            "printf \"$(date)\" suffix",
+            "printf before$(date)after",
+        ] {
+            assert!(parse_command_list(source).is_ok(), "{source}");
+        }
+    }
+
+    #[test]
+    fn command_substitution_nesting_accepts_the_exact_bound_and_rejects_plus_one() {
+        let exact = format!(
+            "printf {}true{}",
+            "$(".repeat(MAX_COMMAND_SUBSTITUTION_DEPTH),
+            ")".repeat(MAX_COMMAND_SUBSTITUTION_DEPTH)
+        );
+        assert!(parse_command_list(&exact).is_ok());
+
+        let plus_one = format!("printf $({}", &exact["printf ".len()..]);
+        let error = parse_command_list(&plus_one).unwrap_err();
+        assert!(error.message.contains("nesting"));
+        assert!(error
+            .help
+            .contains(&MAX_COMMAND_SUBSTITUTION_DEPTH.to_string()));
     }
 
     #[test]
