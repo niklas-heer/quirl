@@ -21,6 +21,8 @@ pub const MCP_SCHEMA_DESCRIPTOR: &str = "quirl.mcp@1{transport:stdio-json-rpc-li
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_INPUT_BYTES: usize = 256 * 1024;
 const MAX_DEPTH: usize = 32;
+// Correlation IDs are not payloads, so validate their encoded size before cloning or reflection.
+const MAX_REQUEST_ID_BYTES: usize = 128;
 
 #[derive(Debug, Subcommand)]
 pub enum ServeCommand {
@@ -144,7 +146,7 @@ impl McpServer {
             ));
         }
         let id = request_id(&value);
-        let notification = id.is_null();
+        let notification = value.get("id").is_none_or(Value::is_null);
         let request: Request = match serde_json::from_value(value) {
             Ok(request) => request,
             Err(_) => {
@@ -600,7 +602,8 @@ fn request_id(value: &Value) -> Value {
 }
 
 fn valid_id(value: &Value) -> bool {
-    value.is_null() || value.is_string() || value.is_number()
+    let valid_scalar = value.is_null() || value.is_string() || value.is_number();
+    valid_scalar && serialized_size(value) <= MAX_REQUEST_ID_BYTES
 }
 
 fn serialized_size(value: &Value) -> usize {
@@ -847,7 +850,138 @@ mod tests {
     }
 
     #[test]
+    fn malformed_line_returns_parse_error_then_serves_next_request() {
+        let input = format!(
+            "{{\n{}\n",
+            request(
+                1,
+                "initialize",
+                json!({ "protocolVersion": LEGACY_PROTOCOL_VERSIONS[2] })
+            )
+        );
+        let mut output = Vec::new();
+
+        serve(
+            &mut Cursor::new(input),
+            &mut output,
+            vec![McpCapability::Catalog],
+        )
+        .unwrap();
+
+        let responses = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], Value::Null);
+        assert_eq!(responses[0]["error"]["code"], -32700);
+        assert_eq!(responses[1]["id"], 1);
+        assert_eq!(
+            responses[1]["result"]["protocolVersion"],
+            LEGACY_PROTOCOL_VERSIONS[2]
+        );
+    }
+
+    #[test]
+    fn request_ids_are_bounded_before_reflection_and_session_mutation() {
+        let exact_id = Value::String("i".repeat(MAX_REQUEST_ID_BYTES - 2));
+        let oversized_id = Value::String("i".repeat(MAX_REQUEST_ID_BYTES - 1));
+        assert_eq!(serialized_size(&exact_id), MAX_REQUEST_ID_BYTES);
+        assert_eq!(serialized_size(&oversized_id), MAX_REQUEST_ID_BYTES + 1);
+        assert!(valid_id(&exact_id));
+        assert!(!valid_id(&oversized_id));
+
+        let mut exact_server = McpServer::new(vec![McpCapability::Catalog]);
+        let exact_response = exact_server
+            .handle_bytes(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": exact_id,
+                    "method": "initialize",
+                    "params": {"protocolVersion": LEGACY_PROTOCOL_VERSIONS[2]}
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(serialized_size(&exact_response.id), MAX_REQUEST_ID_BYTES);
+        assert!(exact_response.error.is_none());
+
+        let mut oversized_server = McpServer::new(vec![McpCapability::Catalog]);
+        let oversized_response = oversized_server
+            .handle_bytes(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": oversized_id,
+                    "method": "initialize",
+                    "params": {"protocolVersion": LEGACY_PROTOCOL_VERSIONS[2]}
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(oversized_response.id, Value::Null);
+        assert_eq!(oversized_response.error.unwrap().code, -32600);
+        assert_eq!(oversized_server.era, None);
+
+        let recovered = oversized_server
+            .handle_bytes(
+                request(
+                    2,
+                    "initialize",
+                    json!({ "protocolVersion": LEGACY_PROTOCOL_VERSIONS[2] }),
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        assert!(recovered.error.is_none());
+    }
+
+    #[test]
+    fn stdio_eof_distinguishes_clean_completion_from_truncated_json() {
+        let mut empty_output = Vec::new();
+        serve(
+            &mut Cursor::new(Vec::<u8>::new()),
+            &mut empty_output,
+            vec![McpCapability::Catalog],
+        )
+        .unwrap();
+        assert!(empty_output.is_empty());
+
+        let complete = request(
+            1,
+            "initialize",
+            json!({ "protocolVersion": LEGACY_PROTOCOL_VERSIONS[2] }),
+        );
+        let mut complete_output = Vec::new();
+        serve(
+            &mut Cursor::new(complete),
+            &mut complete_output,
+            vec![McpCapability::Catalog],
+        )
+        .unwrap();
+        let complete_response: Value = serde_json::from_slice(&complete_output).unwrap();
+        assert_eq!(complete_response["id"], 1);
+
+        let mut truncated_output = Vec::new();
+        serve(
+            &mut Cursor::new(b"{\"jsonrpc\":"),
+            &mut truncated_output,
+            vec![McpCapability::Catalog],
+        )
+        .unwrap();
+        let truncated_response: Value = serde_json::from_slice(&truncated_output).unwrap();
+        assert_eq!(truncated_response["id"], Value::Null);
+        assert_eq!(truncated_response["error"]["code"], -32700);
+    }
+
+    #[test]
     fn oversized_stdio_message_is_a_resource_error_with_help() {
+        let exact = vec![b' '; MAX_MESSAGE_BYTES];
+        let exact_message = read_message(&mut Cursor::new(exact)).unwrap().unwrap();
+        assert_eq!(exact_message.len(), MAX_MESSAGE_BYTES);
+
         let input = format!("{}\n", "x".repeat(MAX_MESSAGE_BYTES + 1));
         let error = serve(
             &mut Cursor::new(input),

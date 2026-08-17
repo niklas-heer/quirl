@@ -18,6 +18,9 @@ use std::{
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const MAX_HEADER_COUNT: usize = 64;
+// Correlation IDs are not payloads, so validate their encoded size before cloning or reflection.
+const MAX_REQUEST_ID_BYTES: usize = 128;
+const MAX_METHOD_BYTES: usize = 128;
 const MAX_OPEN_DOCUMENTS: usize = 128;
 const MAX_URI_BYTES: usize = 8 * 1024;
 const MAX_LANGUAGE_ID_BYTES: usize = 64;
@@ -91,12 +94,32 @@ impl LanguageService {
 
     /// Handle one JSON-RPC message and return zero or more response/notification messages.
     pub fn handle(&mut self, message: Value) -> Vec<Value> {
-        let id = message.get("id").cloned();
-        let Some(method) = message.get("method").and_then(Value::as_str) else {
-            return id
-                .map(|id| vec![rpc_error(id, -32600, "invalid JSON-RPC request", None)])
-                .unwrap_or_default();
+        let id = bounded_request_id(&message);
+        let Some(object) = message.as_object() else {
+            return vec![rpc_error(
+                Value::Null,
+                -32600,
+                "invalid JSON-RPC request",
+                None,
+            )];
         };
+        let method = object.get("method").and_then(Value::as_str);
+        let params_are_structured = object
+            .get("params")
+            .is_none_or(|params| params.is_array() || params.is_object());
+        let valid_envelope = object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+            && object.get("id").is_none_or(valid_request_id)
+            && method.is_some_and(|method| method.len() <= MAX_METHOD_BYTES)
+            && params_are_structured;
+        if !valid_envelope {
+            return vec![rpc_error(
+                id.unwrap_or(Value::Null),
+                -32600,
+                "invalid JSON-RPC request",
+                None,
+            )];
+        };
+        let method = method.unwrap_or_default();
         let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
         match self.dispatch(method, params) {
             Ok(Dispatch::Result(result)) => id
@@ -202,7 +225,7 @@ impl LanguageService {
             version: item.get("version").and_then(Value::as_i64).unwrap_or(0),
             text: text.to_owned(),
         };
-        let diagnostics = diagnostics(uri, &document, self.native_analyzer);
+        let diagnostics = diagnostics(uri, &document, self.native_analyzer)?;
         let version = document.version;
         self.documents.insert(uri.to_owned(), document);
         self.retained_document_bytes = next_retained_bytes;
@@ -247,7 +270,7 @@ impl LanguageService {
             version,
             text: text.to_owned(),
         };
-        let diagnostics = diagnostics(uri, &document, self.native_analyzer);
+        let diagnostics = diagnostics(uri, &document, self.native_analyzer)?;
         self.documents.insert(uri.to_owned(), document);
         self.retained_document_bytes = next_retained_bytes;
         Ok(Dispatch::Messages(vec![publish_diagnostics(
@@ -317,7 +340,7 @@ impl LanguageService {
             .ok_or_else(|| invalid_params("diagnostic refers to a document that is not open"))?;
         Ok(Dispatch::Result(json!({
             "kind": "full",
-            "items": diagnostics(uri, document, self.native_analyzer),
+            "items": diagnostics(uri, document, self.native_analyzer)?,
         })))
     }
 
@@ -333,8 +356,7 @@ impl LanguageService {
         let position = field(params, "position")?;
         let line = usize_field(position, "line")?;
         let character = usize_field(position, "character")?;
-        let offset = position_to_offset(&document.text, line, character)
-            .ok_or_else(|| invalid_params("position is outside the document"))?;
+        let offset = position_to_offset(&document.text, line, character)?;
         Ok((uri, document, offset))
     }
 }
@@ -352,16 +374,7 @@ pub fn serve<R: BufRead, W: Write>(
     writer: &mut W,
     catalog: Catalog,
 ) -> Result<(), ShellError> {
-    let mut service = LanguageService::new(catalog);
-    while let Some(message) = read_message(reader)? {
-        for outgoing in service.handle(message) {
-            write_message(writer, &outgoing)?;
-        }
-        if service.should_exit() {
-            break;
-        }
-    }
-    Ok(())
+    serve_session(reader, writer, LanguageService::new(catalog))
 }
 
 /// Serve LSP with a side-effect-free native analyzer supplied by the composition root.
@@ -371,10 +384,25 @@ pub fn serve_with_native_analyzer<R: BufRead, W: Write>(
     catalog: Catalog,
     analyzer: NativeAnalyzer,
 ) -> Result<(), ShellError> {
-    let mut service = LanguageService::new_with_native_analyzer(catalog, analyzer);
-    while let Some(message) = read_message(reader)? {
-        for outgoing in service.handle(message) {
-            write_message(writer, &outgoing)?;
+    serve_session(
+        reader,
+        writer,
+        LanguageService::new_with_native_analyzer(catalog, analyzer),
+    )
+}
+
+fn serve_session<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    mut service: LanguageService,
+) -> Result<(), ShellError> {
+    while let Some(body) = read_message(reader)? {
+        let outgoing = match serde_json::from_slice(&body) {
+            Ok(message) => service.handle(message),
+            Err(_) => vec![rpc_error(Value::Null, -32700, "parse error", None)],
+        };
+        for message in outgoing {
+            write_message(writer, &message)?;
         }
         if service.should_exit() {
             break;
@@ -404,10 +432,10 @@ fn diagnostics(
     uri: &str,
     document: &Document,
     native_analyzer: Option<NativeAnalyzer>,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, ShellError> {
     if is_lua(uri, document) {
         match LuaRuntime::check_source(&document.text, uri) {
-            Ok(()) => Vec::new(),
+            Ok(()) => Ok(Vec::new()),
             Err(error) => shell_error_diagnostics(&document.text, &error),
         }
     } else {
@@ -415,15 +443,15 @@ fn diagnostics(
     }
 }
 
-fn shell_error_diagnostics(text: &str, error: &ShellError) -> Vec<Value> {
+fn shell_error_diagnostics(text: &str, error: &ShellError) -> Result<Vec<Value>, ShellError> {
     if error.details.labels.is_empty() {
-        return vec![diagnostic_value(
+        return Ok(vec![diagnostic_value(
             text,
             0,
             text.chars().next().map(char::len_utf8).unwrap_or(0),
             &error.message,
             "quirl-lua",
-        )];
+        )?]);
     }
     error
         .details
@@ -441,7 +469,10 @@ fn shell_error_diagnostics(text: &str, error: &ShellError) -> Vec<Value> {
         .collect()
 }
 
-fn quirl_diagnostics(text: &str, native_analyzer: Option<NativeAnalyzer>) -> Vec<Value> {
+fn quirl_diagnostics(
+    text: &str,
+    native_analyzer: Option<NativeAnalyzer>,
+) -> Result<Vec<Value>, ShellError> {
     if let Some(analyzer) = native_analyzer {
         analyzer(text)
             .into_iter()
@@ -471,13 +502,19 @@ fn quirl_diagnostics(text: &str, native_analyzer: Option<NativeAnalyzer>) -> Vec
     }
 }
 
-fn diagnostic_value(text: &str, start: usize, end: usize, message: &str, source: &str) -> Value {
-    json!({
-        "range": range(text, start.min(text.len()), end.min(text.len())),
+fn diagnostic_value(
+    text: &str,
+    start: usize,
+    end: usize,
+    message: &str,
+    source: &str,
+) -> Result<Value, ShellError> {
+    Ok(json!({
+        "range": range(text, start, end)?,
         "severity": 1,
         "source": source,
         "message": message,
-    })
+    }))
 }
 
 fn lua_completions(prefix: &str) -> Vec<Value> {
@@ -651,49 +688,85 @@ fn publish_diagnostics(uri: &str, version: i64, diagnostics: Vec<Value>) -> Valu
     })
 }
 
-fn range(text: &str, start: usize, end: usize) -> Value {
-    let (start_line, start_character) = offset_to_position(text, start);
-    let (end_line, end_character) = offset_to_position(text, end);
-    json!({
+fn range(text: &str, start: usize, end: usize) -> Result<Value, ShellError> {
+    if start > end {
+        return Err(invalid_diagnostic_range(text, start, end));
+    }
+    let (start_line, start_character) = offset_to_position(text, start)
+        .ok_or_else(|| invalid_diagnostic_range(text, start, end))?;
+    let (end_line, end_character) =
+        offset_to_position(text, end).ok_or_else(|| invalid_diagnostic_range(text, start, end))?;
+    Ok(json!({
         "start": {"line": start_line, "character": start_character},
         "end": {"line": end_line, "character": end_character},
-    })
+    }))
 }
 
-fn offset_to_position(text: &str, offset: usize) -> (usize, usize) {
-    let mut safe_offset = offset.min(text.len());
-    while !text.is_char_boundary(safe_offset) {
-        safe_offset = safe_offset.saturating_sub(1);
+fn offset_to_position(text: &str, offset: usize) -> Option<(usize, usize)> {
+    if offset > text.len() || !text.is_char_boundary(offset) {
+        return None;
     }
-    let before = &text[..safe_offset];
+    let before = &text[..offset];
     let line = before.bytes().filter(|byte| *byte == b'\n').count();
     let line_start = before.rfind('\n').map(|index| index + 1).unwrap_or(0);
-    let character = text[line_start..safe_offset].encode_utf16().count();
-    (line, character)
+    let character = text[line_start..offset].encode_utf16().count();
+    Some((line, character))
 }
 
-fn position_to_offset(text: &str, target_line: usize, target_character: usize) -> Option<usize> {
+fn position_to_offset(
+    text: &str,
+    target_line: usize,
+    target_character: usize,
+) -> Result<usize, ShellError> {
     let mut line = 0;
-    let mut character = 0;
+    let mut line_start = 0;
     for (offset, ch) in text.char_indices() {
-        if line == target_line && character == target_character {
-            return Some(offset);
-        }
         if ch == '\n' {
             if line == target_line {
-                return (character == target_character).then_some(offset);
+                return character_to_offset(
+                    &text[line_start..offset],
+                    line_start,
+                    target_character,
+                );
             }
             line += 1;
-            character = 0;
-        } else if line == target_line {
-            let width = ch.len_utf16();
-            if character + width > target_character {
-                return None;
-            }
-            character += width;
+            line_start = offset + 1;
         }
     }
-    (line == target_line && character == target_character).then_some(text.len())
+    if line == target_line {
+        character_to_offset(&text[line_start..], line_start, target_character)
+    } else {
+        Err(invalid_params(
+            "position line is past the end of the document",
+        ))
+    }
+}
+
+fn character_to_offset(
+    line: &str,
+    line_start: usize,
+    target_character: usize,
+) -> Result<usize, ShellError> {
+    let mut character = 0;
+    for (offset, ch) in line.char_indices() {
+        if character == target_character {
+            return Ok(line_start + offset);
+        }
+        let next_character = character + ch.len_utf16();
+        if target_character < next_character {
+            return Err(invalid_params(
+                "position character splits a UTF-16 surrogate pair",
+            ));
+        }
+        character = next_character;
+    }
+    if character == target_character {
+        Ok(line_start + line.len())
+    } else {
+        Err(invalid_params(
+            "position character is past the end of the line",
+        ))
+    }
 }
 
 fn token_at(text: &str, offset: usize) -> (usize, usize, &str) {
@@ -787,6 +860,18 @@ fn invalid_params(message: &str) -> ShellError {
         .with_help("Send the standard LSP textDocument and position fields")
 }
 
+fn invalid_diagnostic_range(text: &str, start: usize, end: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        "language-service diagnostic range is invalid for the document",
+    )
+    .with_context(format!(
+        "start_bytes: {start}; end_bytes: {end}; document_bytes: {}",
+        text.len()
+    ))
+    .with_help("Report the diagnostic producer that returned the invalid source range")
+}
+
 fn retained_bytes(uri: &str, language_id: &str, text: &str) -> Result<usize, ShellError> {
     uri.len()
         .checked_add(language_id.len())
@@ -866,7 +951,16 @@ fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value 
     json!({"jsonrpc": "2.0", "id": id, "error": error})
 }
 
-fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>, ShellError> {
+fn bounded_request_id(message: &Value) -> Option<Value> {
+    message.get("id").filter(|id| valid_request_id(id)).cloned()
+}
+
+fn valid_request_id(id: &Value) -> bool {
+    let valid_scalar = id.is_null() || id.is_string() || id.is_number();
+    valid_scalar && serde_json::to_vec(id).is_ok_and(|bytes| bytes.len() <= MAX_REQUEST_ID_BYTES)
+}
+
+fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, ShellError> {
     let mut content_length = None;
     let mut header_bytes: usize = 0;
     let mut header_count: usize = 0;
@@ -931,9 +1025,7 @@ fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>, ShellError>
             Err(error) => return Err(io_error(error)),
         }
     }
-    serde_json::from_slice(&body).map(Some).map_err(|error| {
-        protocol_error("language-service message is not valid JSON").with_context(error.to_string())
-    })
+    Ok(Some(body))
 }
 
 fn read_header_line<R: BufRead>(
@@ -985,6 +1077,7 @@ fn write_message<W: Write>(writer: &mut W, message: &Value) -> Result<(), ShellE
         protocol_error("could not serialize a language-service response")
             .with_context(error.to_string())
     })?;
+    validate_byte_limit("language-service response", body.len(), MAX_MESSAGE_BYTES)?;
     write!(writer, "Content-Length: {}\r\n\r\n", body.len()).map_err(io_error)?;
     writer.write_all(&body).map_err(io_error)?;
     writer.flush().map_err(io_error)
@@ -1042,6 +1135,23 @@ mod tests {
             .map(|(uri, document)| uri.len() + document.language_id.len() + document.text.len())
             .sum::<usize>();
         assert_eq!(service.retained_document_bytes, expected);
+    }
+
+    fn frame(body: &[u8]) -> Vec<u8> {
+        format!("Content-Length: {}\r\n\r\n", body.len())
+            .into_bytes()
+            .into_iter()
+            .chain(body.iter().copied())
+            .collect()
+    }
+
+    fn framed_json_values(bytes: Vec<u8>) -> Vec<Value> {
+        let mut reader = BufReader::new(Cursor::new(bytes));
+        let mut values = Vec::new();
+        while let Some(body) = read_message(&mut reader).unwrap() {
+            values.push(serde_json::from_slice(&body).unwrap());
+        }
+        values
     }
 
     #[test]
@@ -1194,11 +1304,14 @@ mod tests {
     fn quirl_diagnostics_share_native_unsupported_constructs_and_spans() {
         let source = "echo $HOME\nprintf ok |\n";
         let expected = check_script(source);
-        let actual = quirl_diagnostics(source, None);
+        let actual = quirl_diagnostics(source, None).unwrap();
         assert_eq!(actual.len(), expected.len());
         for (actual, expected) in actual.iter().zip(expected) {
             assert_eq!(actual["message"], expected.message);
-            assert_eq!(actual["range"], range(source, expected.start, expected.end));
+            assert_eq!(
+                actual["range"],
+                range(source, expected.start, expected.end).unwrap()
+            );
         }
     }
 
@@ -1277,6 +1390,125 @@ mod tests {
         let rendered = String::from_utf8(output).unwrap();
         assert!(rendered.starts_with("Content-Length:"));
         assert!(rendered.contains("completionProvider"));
+    }
+
+    #[test]
+    fn malformed_complete_message_returns_parse_error_then_serves_next_frame() {
+        let valid = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": 7, "method": "initialize", "params": {}
+        }))
+        .unwrap();
+        let input = frame(b"{")
+            .into_iter()
+            .chain(frame(&valid))
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+
+        serve(
+            &mut BufReader::new(Cursor::new(input)),
+            &mut output,
+            Catalog::builtin(),
+        )
+        .unwrap();
+
+        let responses = framed_json_values(output);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], Value::Null);
+        assert_eq!(responses[0]["error"]["code"], -32700);
+        assert_eq!(responses[1]["id"], 7);
+        assert_eq!(responses[1]["result"]["serverInfo"]["name"], "quirl-lsp");
+    }
+
+    #[test]
+    fn invalid_envelope_uses_bounded_null_id_then_serves_next_frame() {
+        let exact_id = Value::String("i".repeat(MAX_REQUEST_ID_BYTES - 2));
+        let oversized_id = Value::String("i".repeat(MAX_REQUEST_ID_BYTES - 1));
+        assert_eq!(
+            serde_json::to_vec(&exact_id).unwrap().len(),
+            MAX_REQUEST_ID_BYTES
+        );
+        assert_eq!(
+            serde_json::to_vec(&oversized_id).unwrap().len(),
+            MAX_REQUEST_ID_BYTES + 1
+        );
+        assert!(valid_request_id(&exact_id));
+        assert!(!valid_request_id(&oversized_id));
+        let invalid = serde_json::to_vec(&json!({
+            "jsonrpc": "1.0", "id": oversized_id, "method": "initialize", "params": {}
+        }))
+        .unwrap();
+        let valid = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": 8, "method": "initialize", "params": {}
+        }))
+        .unwrap();
+        let input = frame(&invalid)
+            .into_iter()
+            .chain(frame(&valid))
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+
+        serve(
+            &mut BufReader::new(Cursor::new(input)),
+            &mut output,
+            Catalog::builtin(),
+        )
+        .unwrap();
+
+        let responses = framed_json_values(output);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], Value::Null);
+        assert_eq!(responses[0]["error"]["code"], -32600);
+        assert!(serde_json::to_vec(&responses[0]).unwrap().len() < 256);
+        assert_eq!(responses[1]["id"], 8);
+    }
+
+    #[test]
+    fn positions_and_ranges_require_exact_unicode_boundaries() {
+        let text = "a😀b\né";
+        assert_eq!(position_to_offset(text, 0, 1).unwrap(), 1);
+        let midpoint = position_to_offset(text, 0, 2).unwrap_err();
+        assert!(midpoint.message.contains("surrogate pair"));
+        assert_eq!(position_to_offset(text, 0, 3).unwrap(), 5);
+        let past_line = position_to_offset(text, 0, 5).unwrap_err();
+        assert!(past_line.message.contains("end of the line"));
+        let past_document = position_to_offset(text, 2, 0).unwrap_err();
+        assert!(past_document.message.contains("end of the document"));
+
+        assert_eq!(offset_to_position(text, 1), Some((0, 1)));
+        assert_eq!(offset_to_position(text, 2), None);
+        assert_eq!(offset_to_position(text, text.len() + 1), None);
+        assert_eq!(
+            range(text, 1, 5).unwrap(),
+            json!({
+                "start": {"line": 0, "character": 1},
+                "end": {"line": 0, "character": 3}
+            })
+        );
+        for (start, end) in [(2, 5), (1, text.len() + 1), (5, 1)] {
+            let error = range(text, start, end).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Validation);
+        }
+    }
+
+    #[test]
+    fn invalid_analyzer_range_rejects_open_without_retaining_document() {
+        fn invalid_analyzer(_: &str) -> Vec<NativeDiagnostic> {
+            vec![NativeDiagnostic {
+                message: "invalid test range".to_owned(),
+                start: 1,
+                end: 2,
+                source: "test-analyzer",
+            }]
+        }
+
+        let mut service =
+            LanguageService::new_with_native_analyzer(Catalog::builtin(), invalid_analyzer);
+        let error = service
+            .did_open(&open_params("file:///invalid.qrl", "quirl", 1, "é"))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(service.documents.is_empty());
+        assert_eq!(service.retained_document_bytes, 0);
     }
 
     #[test]
@@ -1453,6 +1685,13 @@ mod tests {
 
     #[test]
     fn framing_bounds_headers_lengths_and_partial_bodies() {
+        let exact_body = vec![b' '; MAX_MESSAGE_BYTES];
+        let exact_frame = frame(&exact_body);
+        let exact = read_message(&mut BufReader::new(Cursor::new(exact_frame)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.len(), MAX_MESSAGE_BYTES);
+
         let oversized_header = vec![b'x'; MAX_HEADER_BYTES + 1];
         let error = read_message(&mut BufReader::new(Cursor::new(oversized_header))).unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
@@ -1483,6 +1722,30 @@ mod tests {
         let header_error =
             read_message(&mut BufReader::new(Cursor::new(partial_headers))).unwrap_err();
         assert_eq!(header_error.code, ErrorCode::Validation);
+    }
+
+    #[test]
+    fn framing_treats_boundary_eof_as_clean_and_truncated_frames_as_terminal() {
+        assert!(
+            read_message(&mut BufReader::new(Cursor::new(Vec::<u8>::new())))
+                .unwrap()
+                .is_none()
+        );
+
+        let complete = frame(b"{}");
+        let mut complete_reader = BufReader::new(Cursor::new(complete));
+        assert_eq!(read_message(&mut complete_reader).unwrap().unwrap(), b"{}");
+        assert!(read_message(&mut complete_reader).unwrap().is_none());
+
+        let truncated = frame(b"{}");
+        let truncated = &truncated[..truncated.len() - 1];
+        let error = read_message(&mut BufReader::new(Cursor::new(truncated))).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("received_bytes")));
     }
 
     #[test]
