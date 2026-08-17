@@ -29,10 +29,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::{
-    fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
-    process::CommandExt,
-};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 const MANIFEST_FILE: &str = "plugin.toml";
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
@@ -767,9 +764,8 @@ pub(crate) fn execute_out_of_process_adapter(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
     let containment = ChildProcessTree::new()?;
+    containment.configure(&mut command);
     let mut child = command.spawn().map_err(|error| {
         ShellError::new(
             ErrorCode::ProcessSpawn,

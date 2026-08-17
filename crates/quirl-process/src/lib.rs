@@ -400,9 +400,10 @@ mod platform {
         fs::{File, OpenOptions},
         io::{ErrorKind, IsTerminal, Read, Write},
         path::{Path, PathBuf},
-        process::{Child, Command, Stdio},
+        process::{Child, ChildStdin, ChildStdout, Command, Stdio},
         sync::{
             atomic::{AtomicUsize, Ordering},
+            mpsc::{sync_channel, Receiver, RecvTimeoutError},
             Arc, Mutex, MutexGuard, OnceLock, TryLockError,
         },
         thread::{self, JoinHandle},
@@ -446,6 +447,7 @@ mod platform {
     struct Job {
         state: JobState,
         children: Vec<JobChild>,
+        process_group_anchor: Option<ProcessGroupAnchor>,
         terminal_modes: Option<Termios>,
         capture: bool,
         stdout_reader: Option<ReaderTask>,
@@ -537,6 +539,13 @@ mod platform {
     type PendingWriter = (PipeWriter, Vec<u8>);
     type OutputStdio = (Stdio, Option<PipeReader>, Option<PipeWriter>, Option<File>);
     const FOREGROUND_TERMINAL_LEASE_WAIT_MAX: Duration = Duration::from_secs(30);
+    const PROCESS_GROUP_ANCHOR_STARTUP_WAIT_MAX: Duration = Duration::from_secs(2);
+    const PROCESS_GROUP_ANCHOR_PATH: &str = "/bin/sh";
+    const PROCESS_GROUP_ANCHOR_READY: u8 = b'R';
+    const PROCESS_GROUP_ANCHOR_SCRIPT: &str =
+        "trap '' HUP INT QUIT TERM TSTP TTIN TTOU; printf R; IFS= read -r _";
+    const PROCESS_GROUP_LEADER_STAGE_SCRIPT: &str =
+        "command -v \"$1\" >/dev/null 2>&1 || exit 127; kill -STOP $$; exec \"$@\"";
 
     struct PreparedInput {
         stdio: Stdio,
@@ -592,33 +601,39 @@ mod platform {
 
     /// Cross-platform containment hook for a directly spawned child process.
     pub struct ChildProcessTree {
-        process_group: Mutex<ContainedProcessGroup>,
+        process_group: i32,
+        state: Mutex<ContainedProcessGroup>,
     }
 
     enum ContainedProcessGroup {
-        Unassigned,
-        Live(i32),
-        Exited,
+        Unassigned(ProcessGroupAnchor),
+        Assigned(ProcessGroupAnchor),
+        Released,
     }
 
     impl ChildProcessTree {
-        /// Create the Unix containment hook.
+        /// Create a verified Unix process-group anchor.
+        ///
+        /// The anchor adds one direct child and fails if absolute `/bin/sh`
+        /// cannot complete its bounded readiness handshake.
         pub fn new() -> Result<Self, ShellError> {
+            let anchor = ProcessGroupAnchor::spawn()?;
             Ok(Self {
-                process_group: Mutex::new(ContainedProcessGroup::Unassigned),
+                process_group: anchor.process_group(),
+                state: Mutex::new(ContainedProcessGroup::Unassigned(anchor)),
             })
         }
 
-        /// Configure `command` so its child becomes the leader of a fresh
-        /// process group before any guest code can run.
+        /// Configure `command` to join the already-owned process group before
+        /// any guest code can run.
         pub fn configure(&self, command: &mut Command) {
-            command.process_group(0);
+            command.process_group(self.process_group);
         }
 
-        /// Complete Unix containment setup for `child`.
+        /// Verify that `child` joined this object's anchored process group.
         ///
-        /// Unix callers establish the process group while spawning, so this
-        /// cross-platform hook requires no additional post-spawn operation.
+        /// Callers must apply [`Self::configure`] before spawning. Assignment
+        /// fails closed and does not attempt to move already-running guest code.
         pub fn assign(&self, child: &mut Child) -> Result<(), ShellError> {
             let process_id = i32::try_from(child.id()).map_err(|error| {
                 ShellError::new(
@@ -628,38 +643,46 @@ mod platform {
                 .with_context(error.to_string())
                 .with_help("Report this platform-specific process error")
             })?;
-            let verification = verify_process_group(child, process_id, process_id)?;
-            let mut group = self.process_group.lock().map_err(|_| {
+            let verification = verify_process_group(child, process_id, self.process_group)?;
+            let mut state = self.state.lock().map_err(|_| {
                 ShellError::new(ErrorCode::Io, "process containment state is unavailable")
                     .with_help("Restart Quirl before launching another contained process")
             })?;
-            if !matches!(*group, ContainedProcessGroup::Unassigned) {
-                return Err(ShellError::new(
-                    ErrorCode::InvalidArgument,
-                    "process containment object already owns a child",
-                )
-                .with_help("Create one containment object for each direct child tree"));
-            }
-            *group = match verification {
-                ProcessGroupVerification::Live => ContainedProcessGroup::Live(process_id),
-                ProcessGroupVerification::Exited(_) => ContainedProcessGroup::Exited,
+            let _ = verification;
+            *state = match std::mem::replace(&mut *state, ContainedProcessGroup::Released) {
+                ContainedProcessGroup::Unassigned(anchor) => {
+                    ContainedProcessGroup::Assigned(anchor)
+                }
+                previous => {
+                    *state = previous;
+                    return Err(ShellError::new(
+                        ErrorCode::InvalidArgument,
+                        "process containment object already owns a child",
+                    )
+                    .with_help("Create one containment object for each direct child tree"));
+                }
             };
             Ok(())
         }
 
-        /// Terminate a directly spawned child if it is still live.
+        /// Terminate the anchored group and directly spawned child if live.
+        ///
+        /// The anchor is reaped after the only group signal; this object never
+        /// addresses the released numeric process-group identifier again.
         pub fn terminate(&self, child: &mut Child) -> Result<(), ShellError> {
-            let child_exited = matches!(child.try_wait(), Ok(Some(_)));
-            let group = self.process_group.lock().ok().and_then(|group| {
-                if let ContainedProcessGroup::Live(process_group) = *group {
-                    Some(process_group)
-                } else {
-                    None
+            let mut anchor = self.state.lock().ok().and_then(|mut state| {
+                match std::mem::replace(&mut *state, ContainedProcessGroup::Released) {
+                    ContainedProcessGroup::Unassigned(anchor)
+                    | ContainedProcessGroup::Assigned(anchor) => Some(anchor),
+                    ContainedProcessGroup::Released => None,
                 }
             });
-            let group_result =
-                group.map(|group| terminate_process_group(Pid::from_raw(group), child_exited));
+            let group_signal = anchor.as_mut().map(ProcessGroupAnchor::begin_termination);
             let child_result = child.kill();
+            let group_result = anchor.map(|mut anchor| {
+                let group_signal = group_signal.unwrap_or(Ok(()));
+                anchor.finish_termination(group_signal)
+            });
             let group_ok = matches!(group_result, None | Some(Ok(())));
             let child_ok = match &child_result {
                 Ok(()) => true,
@@ -687,56 +710,275 @@ mod platform {
         }
     }
 
-    fn terminate_process_group(
-        process_group: Pid,
-        owned_processes_exited: bool,
-    ) -> Result<(), Errno> {
-        let cleanup_result = killpg(process_group, Signal::SIGKILL);
-        resolve_process_group_cleanup(process_group, cleanup_result, owned_processes_exited)
+    #[derive(Debug)]
+    struct ProcessGroupAnchor {
+        child: Child,
+        keepalive: Option<ChildStdin>,
+        process_group: i32,
+        termination_signaled: bool,
+        released: bool,
     }
 
-    fn resolve_process_group_cleanup(
-        process_group: Pid,
-        cleanup_result: Result<(), Errno>,
-        owned_processes_exited: bool,
-    ) -> Result<(), Errno> {
-        match cleanup_result {
-            Ok(()) | Err(Errno::ESRCH) => Ok(()),
-            Err(Errno::EPERM) if cfg!(target_os = "macos") && owned_processes_exited => {
-                if macos_eperm_group_is_gone(owned_processes_exited, || killpg(process_group, None))
-                {
-                    Ok(())
-                } else {
-                    Err(Errno::EPERM)
+    impl ProcessGroupAnchor {
+        fn spawn() -> Result<Self, ShellError> {
+            Self::spawn_with_group(
+                PROCESS_GROUP_ANCHOR_PATH,
+                PROCESS_GROUP_ANCHOR_SCRIPT,
+                None,
+                None,
+            )
+        }
+
+        #[cfg(test)]
+        fn spawn_with(path: &str, script: &str) -> Result<Self, ShellError> {
+            Self::spawn_with_group(path, script, None, None)
+        }
+
+        fn join(
+            process_group: i32,
+            request: Option<RequestContext<'_>>,
+        ) -> Result<Self, ShellError> {
+            Self::spawn_with_group(
+                PROCESS_GROUP_ANCHOR_PATH,
+                PROCESS_GROUP_ANCHOR_SCRIPT,
+                Some(process_group),
+                request,
+            )
+        }
+
+        fn spawn_with_group(
+            path: &str,
+            script: &str,
+            process_group: Option<i32>,
+            request: Option<RequestContext<'_>>,
+        ) -> Result<Self, ShellError> {
+            let (child, keepalive, readiness, process_group) =
+                spawn_anchor_process(path, script, process_group)?;
+            let mut anchor = Self {
+                child,
+                keepalive: Some(keepalive),
+                process_group,
+                termination_signaled: false,
+                released: false,
+            };
+            anchor.await_readiness(readiness, request)?;
+            Ok(anchor)
+        }
+
+        fn await_readiness(
+            &mut self,
+            mut readiness: ChildStdout,
+            request: Option<RequestContext<'_>>,
+        ) -> Result<(), ShellError> {
+            let (sender, receiver) = sync_channel(1);
+            let reader = thread::spawn(move || {
+                let mut byte = [0_u8; 1];
+                let result = readiness.read_exact(&mut byte).map(|()| byte[0]);
+                let _ = sender.send(result);
+            });
+            let readiness_result = receive_anchor_readiness(&receiver, request);
+            if !matches!(readiness_result, Ok(Ok(PROCESS_GROUP_ANCHOR_READY))) {
+                let cleanup = self.terminate();
+                let _ = reader.join();
+                let mut error = anchor_readiness_error(readiness_result);
+                if let Err(cleanup) = cleanup {
+                    error = error.with_context(format!("anchor cleanup: {}", cleanup.message));
+                }
+                return Err(error);
+            }
+            if reader.join().is_err() {
+                let _ = self.terminate();
+                return Err(ShellError::new(
+                    ErrorCode::Io,
+                    "process-group anchor readiness task failed",
+                )
+                .with_help("Retry the command; report repeated anchor startup failures"));
+            }
+            Ok(())
+        }
+
+        fn process_group(&self) -> i32 {
+            self.process_group
+        }
+
+        fn signal(&self, signal: Signal) -> Result<(), Errno> {
+            debug_assert!(!self.released, "released process-group anchor was signaled");
+            killpg(Pid::from_raw(self.process_group), signal)
+        }
+
+        fn terminate_owned_group(mut self) -> Result<(), ShellError> {
+            let group_result = self.begin_termination();
+            self.finish_termination(group_result)
+        }
+
+        fn terminate(&mut self) -> Result<(), ShellError> {
+            if self.released {
+                return Ok(());
+            }
+            let group_result = self.begin_termination();
+            self.finish_termination(group_result)
+        }
+
+        fn begin_termination(&mut self) -> Result<(), Errno> {
+            debug_assert!(
+                !self.termination_signaled,
+                "process group was signaled twice"
+            );
+            self.termination_signaled = true;
+            self.signal(Signal::SIGKILL)
+        }
+
+        fn finish_termination(
+            &mut self,
+            group_result: Result<(), Errno>,
+        ) -> Result<(), ShellError> {
+            let child_result = self.child.kill();
+            self.keepalive.take();
+            let wait_result = self.child.wait();
+            self.released = true;
+
+            let group_ok = matches!(group_result, Ok(()) | Err(Errno::ESRCH));
+            if group_ok && wait_result.is_ok() {
+                return Ok(());
+            }
+            Err(
+                ShellError::new(ErrorCode::Io, "could not terminate owned process group")
+                    .with_context(format!(
+                "group={group_result:?}; anchor_kill={child_result:?}; anchor_wait={wait_result:?}"
+            ))
+                    .with_help(
+                        "Retry the command; report repeated anchored-group cleanup failures",
+                    ),
+            )
+        }
+    }
+
+    fn spawn_anchor_process(
+        path: &str,
+        script: &str,
+        requested_group: Option<i32>,
+    ) -> Result<(Child, ChildStdin, ChildStdout, i32), ShellError> {
+        let mut command = Command::new(path);
+        command
+            .arg("-c")
+            .arg(script)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(requested_group.unwrap_or(0));
+        let mut child = command.spawn().map_err(|error| {
+            ShellError::new(
+                ErrorCode::ProcessSpawn,
+                "could not start process-group anchor",
+            )
+            .with_context(format!("anchor path {path}: {error}"))
+            .with_help("Restore /bin/sh and retry after reducing process pressure")
+        })?;
+        let child_id = i32::try_from(child.id()).map_err(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            ShellError::new(
+                ErrorCode::Io,
+                "process-group anchor id is outside the platform range",
+            )
+            .with_context(error.to_string())
+            .with_help("Report this platform-specific process error")
+        })?;
+        let process_group = requested_group.unwrap_or(child_id);
+        let observed_group = getpgid(Some(Pid::from_raw(child_id)));
+        if observed_group != Ok(Pid::from_raw(process_group)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ShellError::new(
+                ErrorCode::ProcessSpawn,
+                "could not establish the owned process-group anchor",
+            )
+            .with_context(format!(
+                "pid {child_id}; expected group {process_group}; getpgid={observed_group:?}"
+            ))
+            .with_help("Retry the command; report repeated anchor construction failures"));
+        }
+        let keepalive = child
+            .stdin
+            .take()
+            .ok_or_else(|| anchor_pipe_error(&mut child, "keepalive"))?;
+        let readiness = child
+            .stdout
+            .take()
+            .ok_or_else(|| anchor_pipe_error(&mut child, "readiness"))?;
+        Ok((child, keepalive, readiness, process_group))
+    }
+
+    fn anchor_pipe_error(child: &mut Child, pipe: &str) -> ShellError {
+        let _ = child.kill();
+        let _ = child.wait();
+        ShellError::new(
+            ErrorCode::Io,
+            format!("process-group anchor {pipe} pipe is unavailable"),
+        )
+        .with_help("Retry the command; report repeated anchor pipe failures")
+    }
+
+    type AnchorReadinessResult = Result<std::io::Result<u8>, ShellError>;
+
+    fn receive_anchor_readiness(
+        receiver: &Receiver<std::io::Result<u8>>,
+        request: Option<RequestContext<'_>>,
+    ) -> AnchorReadinessResult {
+        let started = Instant::now();
+        loop {
+            if let Some(request) = request {
+                request.ensure_active()?;
+            }
+            let remaining = PROCESS_GROUP_ANCHOR_STARTUP_WAIT_MAX.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "process-group anchor startup exceeded its limit",
+                )
+                .with_context(format!(
+                    "limit {} ms",
+                    PROCESS_GROUP_ANCHOR_STARTUP_WAIT_MAX.as_millis()
+                ))
+                .with_help("Retry after reducing system process pressure"));
+            }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(1))) {
+                Ok(result) => return Ok(result),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(ShellError::new(
+                        ErrorCode::Io,
+                        "process-group anchor readiness task disconnected",
+                    )
+                    .with_help("Retry the command; report repeated anchor startup failures"));
                 }
             }
-            Err(error) => Err(error),
         }
     }
 
-    const GROUP_RETIREMENT_PROBES_MAX: usize = 1_024;
+    fn anchor_readiness_error(result: AnchorReadinessResult) -> ShellError {
+        match result {
+            Ok(Ok(byte)) => ShellError::new(
+                ErrorCode::ProcessSpawn,
+                "process-group anchor returned malformed readiness",
+            )
+            .with_context(format!("unexpected readiness byte {byte}"))
+            .with_help("Retry the command; report repeated anchor startup failures"),
+            Ok(Err(error)) => ShellError::new(
+                ErrorCode::ProcessSpawn,
+                "process-group anchor did not become ready",
+            )
+            .with_context(error.to_string())
+            .with_help("Retry the command; report repeated anchor startup failures"),
+            Err(error) => error,
+        }
+    }
 
-    fn macos_eperm_group_is_gone(
-        owned_processes_exited: bool,
-        mut probe_group: impl FnMut() -> Result<(), Errno>,
-    ) -> bool {
-        // Darwin documents EPERM for a group containing any process with a
-        // different effective UID, so an exited leader alone proves nothing
-        // about descendants. Darwin can retain the zombie's group briefly
-        // after wait returns, so bounded probes admit only a later ESRCH.
-        // Persistent EPERM or success proves the group still exists and keeps
-        // cleanup fail-closed.
-        if !cfg!(target_os = "macos") || !owned_processes_exited {
-            return false;
+    impl Drop for ProcessGroupAnchor {
+        fn drop(&mut self) {
+            let _ = self.terminate();
         }
-        for _ in 0..GROUP_RETIREMENT_PROBES_MAX {
-            match probe_group() {
-                Err(Errno::ESRCH) => return true,
-                Ok(()) | Err(Errno::EPERM) => thread::yield_now(),
-                Err(_) => return false,
-            }
-        }
-        false
     }
 
     impl Default for NativeExecutor {
@@ -757,7 +999,7 @@ mod platform {
         fn drop(&mut self) {
             for job in &mut self.jobs {
                 if job.state.status != JobStatus::Done {
-                    terminate_children(&mut job.children, job.state.process_group);
+                    terminate_children(&mut job.children, &mut job.process_group_anchor);
                 }
                 finish_job_tasks_silently(job);
             }
@@ -892,7 +1134,7 @@ mod platform {
                     .with_help("Run `jobs` to list known jobs")
                 })?;
             if job.state.status != JobStatus::Done {
-                terminate_children(&mut job.children, job.state.process_group);
+                terminate_children(&mut job.children, &mut job.process_group_anchor);
                 finish_job_tasks_silently(job);
                 job.state.status = JobStatus::Done;
                 job.state.exit_status = Some(130);
@@ -1398,7 +1640,18 @@ mod platform {
                     .ok_or_else(|| {
                         ShellError::new(ErrorCode::InvalidCommand, "empty command stage")
                     })?;
-                let mut process = Command::new(executable);
+                let staged_group_leader = spawned.process_group.is_none();
+                let mut process = if staged_group_leader {
+                    let mut process = Command::new(PROCESS_GROUP_ANCHOR_PATH);
+                    process
+                        .arg("-c")
+                        .arg(PROCESS_GROUP_LEADER_STAGE_SCRIPT)
+                        .arg("quirl-process-group-stage")
+                        .arg(executable);
+                    process
+                } else {
+                    Command::new(executable)
+                };
                 self.configure_child(&mut process)?;
                 process.args(command.words.iter().skip(1));
                 let stderr = if command.redirects.iter().any(duplicates_stderr_to_stdout) {
@@ -1434,13 +1687,16 @@ mod platform {
                         "Check that the command exists on PATH, or use `help` to inspect built-ins",
                     )
                 })?;
-                if capture_streams {
-                    if let Some(stderr) = child.stderr.take() {
-                        stderr_readers
-                            .push(spawn_reader_with_budget(stderr, Arc::clone(&stderr_budget)));
-                    }
+                let child_stderr = capture_streams.then(|| child.stderr.take()).flatten();
+                if staged_group_leader {
+                    spawned.push_staged_group_leader(child, executable, source, request)?;
+                } else {
+                    spawned.push(child)?;
                 }
-                spawned.push(child)?;
+                if let Some(stderr) = child_stderr {
+                    stderr_readers
+                        .push(spawn_reader_with_budget(stderr, Arc::clone(&stderr_budget)));
+                }
                 if let Some(writer) = input.writer {
                     pending_writers.push(writer);
                 }
@@ -1467,6 +1723,7 @@ mod platform {
                     unreachable!("background pipeline reserved no job id");
                 };
                 let process_group = spawned.process_group;
+                let (children, process_group_anchor) = spawned.release();
                 self.jobs.push(Job {
                     state: JobState {
                         id,
@@ -1475,7 +1732,8 @@ mod platform {
                         process_group,
                         exit_status: None,
                     },
-                    children: spawned.release(),
+                    children,
+                    process_group_anchor,
                     terminal_modes: None,
                     capture: false,
                     stdout_reader: None,
@@ -1491,13 +1749,14 @@ mod platform {
 
             let process_group = spawned.process_group;
             let mut terminal = ForegroundTerminal::give_to(process_group, terminal_lease)?;
-            let mut children = spawned.release();
+            let (mut children, mut process_group_anchor) = spawned.release();
             let stdout_reader = capture_reader.map(|reader| spawn_reader(reader, output_limit));
             let child_count = children.len();
             let wait_error =
-                wait_for_foreground_children(&mut children, process_group, request).err();
+                wait_for_foreground_children(&mut children, process_group_anchor.as_ref(), request)
+                    .err();
             if let Some(error) = wait_error {
-                terminate_children(&mut children, process_group);
+                terminate_children(&mut children, &mut process_group_anchor);
                 let _ = terminal.restore();
                 let _ = join_reader(stdout_reader, "pipeline output");
                 let _ = join_readers(stderr_readers, "command error output");
@@ -1508,10 +1767,20 @@ mod platform {
                 .iter()
                 .any(|child| child.status == JobStatus::Stopped);
             if !stopped {
-                terminate_group_descendants(&children, process_group)?;
+                terminate_group_descendants(&mut process_group_anchor)?;
             }
             let stopped_terminal_modes = if stopped {
-                terminal.current_modes()?
+                match terminal.current_modes() {
+                    Ok(modes) => modes,
+                    Err(error) => {
+                        terminate_children(&mut children, &mut process_group_anchor);
+                        let _ = terminal.restore();
+                        let _ = join_reader(stdout_reader, "pipeline output");
+                        let _ = join_readers(stderr_readers, "command error output");
+                        let _ = join_writers(writers);
+                        return Err(error);
+                    }
+                }
             } else {
                 None
             };
@@ -1524,7 +1793,7 @@ mod platform {
                 let id = match self.reserve_job_id() {
                     Ok(id) => id,
                     Err(error) => {
-                        terminate_children(&mut children, process_group);
+                        terminate_children(&mut children, &mut process_group_anchor);
                         let _ = join_reader(stdout_reader, "pipeline output");
                         let _ = join_readers(stderr_readers, "command error output");
                         let _ = join_writers(writers);
@@ -1540,6 +1809,7 @@ mod platform {
                         exit_status: None,
                     },
                     children,
+                    process_group_anchor,
                     terminal_modes: stopped_terminal_modes,
                     capture: capture_streams,
                     stdout_reader,
@@ -1587,7 +1857,7 @@ mod platform {
                     // Direct children can exit before descendants close capture
                     // and input pipes. Contain the group before joining tasks so
                     // refresh remains bounded even when cleanup itself fails.
-                    let _ = terminate_group_descendants(&job.children, job.state.process_group);
+                    let _ = terminate_group_descendants(&mut job.process_group_anchor);
                     finish_job_tasks_silently(job);
                 }
             }
@@ -1601,11 +1871,11 @@ mod platform {
                 ForegroundTerminal::give_to(self.jobs[index].state.process_group, terminal_lease)?;
             terminal.apply_modes(self.jobs[index].terminal_modes.as_ref())?;
             if let Err(error) = resume_job(&self.jobs[index]) {
-                let process_group = self.jobs[index].state.process_group;
-                terminate_children(&mut self.jobs[index].children, process_group);
-                finish_job_tasks_silently(&mut self.jobs[index]);
-                self.jobs[index].state.status = JobStatus::Done;
-                self.jobs[index].state.exit_status = Some(130);
+                let job = &mut self.jobs[index];
+                terminate_children(&mut job.children, &mut job.process_group_anchor);
+                finish_job_tasks_silently(job);
+                job.state.status = JobStatus::Done;
+                job.state.exit_status = Some(130);
                 let _ = terminal.restore();
                 return Err(error);
             }
@@ -1618,7 +1888,11 @@ mod platform {
                 child.exit_status = None;
             }
             let result = (|| {
-                wait_for_foreground_children(&mut job.children, job.state.process_group, None)?;
+                wait_for_foreground_children(
+                    &mut job.children,
+                    job.process_group_anchor.as_ref(),
+                    None,
+                )?;
                 let status = job
                     .children
                     .last()
@@ -1634,7 +1908,7 @@ mod platform {
                     job.state.status = JobStatus::Stopped;
                     return Ok(None);
                 }
-                terminate_group_descendants(&job.children, job.state.process_group)?;
+                terminate_group_descendants(&mut job.process_group_anchor)?;
                 terminal.restore()?;
                 job.state.status = JobStatus::Done;
                 job.state.exit_status = Some(status);
@@ -1662,7 +1936,7 @@ mod platform {
                     Ok(outcome(status, None, None))
                 }
                 Err(error) => {
-                    terminate_children(&mut job.children, job.state.process_group);
+                    terminate_children(&mut job.children, &mut job.process_group_anchor);
                     let _ = terminal.restore();
                     finish_job_tasks_silently(&mut job);
                     Err(error)
@@ -2396,8 +2670,8 @@ mod platform {
     }
 
     fn suspend_running_children(job: &mut Job, id: u32) -> Result<(), ShellError> {
-        let group_stopped = match job.state.process_group {
-            Some(group) => match killpg(Pid::from_raw(group), Signal::SIGSTOP) {
+        let group_stopped = match job.process_group_anchor.as_ref() {
+            Some(anchor) => match anchor.signal(Signal::SIGSTOP) {
                 Ok(()) => true,
                 Err(Errno::ESRCH) => false,
                 Err(error) => return Err(suspend_error(id, error)),
@@ -2442,8 +2716,8 @@ mod platform {
     }
 
     fn resume_job(job: &Job) -> Result<(), ShellError> {
-        if let Some(group) = job.state.process_group {
-            if killpg(Pid::from_raw(group), Signal::SIGCONT).is_ok() {
+        if let Some(anchor) = job.process_group_anchor.as_ref() {
+            if anchor.signal(Signal::SIGCONT).is_ok() {
                 return Ok(());
             }
         }
@@ -2508,26 +2782,14 @@ mod platform {
             return Ok(ProcessGroupVerification::Live);
         }
         if set_result == Err(Errno::ESRCH) && observed_group == Err(Errno::ESRCH) {
-            let leader_cleanup = if process_id == expected_group {
-                killpg(expected_group, Signal::SIGKILL)
-            } else {
-                Err(Errno::ESRCH)
-            };
             let child_status = observe_fast_child_exit(child);
-            let child_exited = matches!(child_status, Ok(Some(_)));
-            let leader_contained =
-                resolve_process_group_cleanup(expected_group, leader_cleanup, child_exited).is_ok();
-            exited_child_context = Some(format!(
-                "; leader_cleanup={leader_cleanup:?}; child_status={child_status:?}"
-            ));
-            if leader_contained {
-                if let Ok(Some(status)) = child_status {
-                    let exit_status = status
-                        .code()
-                        .or_else(|| status.signal().map(|signal| 128 + signal))
-                        .unwrap_or(1);
-                    return Ok(ProcessGroupVerification::Exited(exit_status));
-                }
+            exited_child_context = Some(format!("; child_status={child_status:?}"));
+            if let Ok(Some(status)) = child_status {
+                let exit_status = status
+                    .code()
+                    .or_else(|| status.signal().map(|signal| 128 + signal))
+                    .unwrap_or(1);
+                return Ok(ProcessGroupVerification::Exited(exit_status));
             }
         }
         let _ = child.kill();
@@ -2546,6 +2808,7 @@ mod platform {
     struct PipelineConstructionGuard {
         children: Vec<JobChild>,
         process_group: Option<i32>,
+        process_group_anchor: Option<ProcessGroupAnchor>,
     }
 
     impl PipelineConstructionGuard {
@@ -2553,7 +2816,70 @@ mod platform {
             Self {
                 children: Vec::new(),
                 process_group: None,
+                process_group_anchor: None,
             }
+        }
+
+        fn push_staged_group_leader(
+            &mut self,
+            mut child: Child,
+            executable: &str,
+            source: &str,
+            request: Option<RequestContext<'_>>,
+        ) -> Result<(), ShellError> {
+            let process_group = i32::try_from(child.id()).map_err(|error| {
+                let _ = child.kill();
+                let _ = child.wait();
+                ShellError::new(
+                    ErrorCode::Io,
+                    "staged process-group leader id is outside the platform range",
+                )
+                .with_context(error.to_string())
+                .with_help("Report this platform-specific process error")
+            })?;
+            wait_for_staged_group_leader(&mut child, process_group, executable, source, request)?;
+            let observed_group = getpgid(Some(Pid::from_raw(process_group)));
+            if observed_group != Ok(Pid::from_raw(process_group)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ShellError::new(
+                    ErrorCode::ProcessSpawn,
+                    "could not verify the staged native process-group leader",
+                )
+                .with_command(source)
+                .with_context(format!(
+                    "pid {process_group}; expected group {process_group}; getpgid={observed_group:?}"
+                ))
+                .with_help("Retry the command; report repeated process-group staging failures"));
+            }
+            let mut anchor = match ProcessGroupAnchor::join(process_group, request) {
+                Ok(anchor) => anchor,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.with_command(source));
+                }
+            };
+            if let Err(error) = anchor.signal(Signal::SIGCONT) {
+                let _ = anchor.terminate();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ShellError::new(
+                    ErrorCode::ProcessSpawn,
+                    "could not release the staged native process-group leader",
+                )
+                .with_command(source)
+                .with_context(error.to_string())
+                .with_help("Retry the command; report repeated process-group staging failures"));
+            }
+            self.process_group = Some(process_group);
+            self.process_group_anchor = Some(anchor);
+            self.children.push(JobChild {
+                child,
+                status: JobStatus::Running,
+                exit_status: None,
+            });
+            Ok(())
         }
 
         fn push(&mut self, mut child: Child) -> Result<(), ShellError> {
@@ -2567,13 +2893,18 @@ mod platform {
                 .with_context(error.to_string())
                 .with_help("Report this platform-specific process error")
             })?;
-            let process_group = self.process_group.unwrap_or(process_id);
+            let process_group = self.process_group.ok_or_else(|| {
+                let _ = child.kill();
+                let _ = child.wait();
+                ShellError::new(
+                    ErrorCode::ProcessSpawn,
+                    "native pipeline child has no owned process-group anchor",
+                )
+                .with_help("Report this process construction invariant failure")
+            })?;
             let verification = verify_process_group(&mut child, process_id, process_group)?;
             let (status, exit_status) = match verification {
-                ProcessGroupVerification::Live => {
-                    self.process_group.get_or_insert(process_group);
-                    (JobStatus::Running, None)
-                }
+                ProcessGroupVerification::Live => (JobStatus::Running, None),
                 ProcessGroupVerification::Exited(exit_status) => {
                     (JobStatus::Done, Some(exit_status))
                 }
@@ -2586,26 +2917,103 @@ mod platform {
             Ok(())
         }
 
-        fn release(&mut self) -> Vec<JobChild> {
-            std::mem::take(&mut self.children)
+        fn release(&mut self) -> (Vec<JobChild>, Option<ProcessGroupAnchor>) {
+            (
+                std::mem::take(&mut self.children),
+                self.process_group_anchor.take(),
+            )
+        }
+    }
+
+    fn wait_for_staged_group_leader(
+        child: &mut Child,
+        process_group: i32,
+        executable: &str,
+        source: &str,
+        request: Option<RequestContext<'_>>,
+    ) -> Result<(), ShellError> {
+        let started = Instant::now();
+        let process_id = Pid::from_raw(process_group);
+        loop {
+            if let Some(request) = request {
+                if let Err(error) = request.ensure_active() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
+            match waitpid(
+                process_id,
+                Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WNOHANG),
+            ) {
+                Ok(WaitStatus::Stopped(_, Signal::SIGSTOP)) => return Ok(()),
+                Ok(WaitStatus::StillAlive) => {
+                    if started.elapsed() >= PROCESS_GROUP_ANCHOR_STARTUP_WAIT_MAX {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(ShellError::new(
+                            ErrorCode::ResourceLimit,
+                            "native process-group staging exceeded its startup limit",
+                        )
+                        .with_command(source)
+                        .with_context(format!(
+                            "limit {} ms; executable {executable}",
+                            PROCESS_GROUP_ANCHOR_STARTUP_WAIT_MAX.as_millis()
+                        ))
+                        .with_help("Retry after reducing system process pressure"));
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(WaitStatus::Exited(_, 127)) => {
+                    return Err(ShellError::new(
+                        ErrorCode::ProcessSpawn,
+                        format!("could not start `{executable}`"),
+                    )
+                    .with_command(source)
+                    .with_context("executable was not found by the trusted process-group stage")
+                    .with_help(
+                        "Check that the command exists on PATH, or use `help` to inspect built-ins",
+                    ));
+                }
+                Ok(status) => {
+                    return Err(ShellError::new(
+                        ErrorCode::ProcessSpawn,
+                        "trusted process-group staging exited before guest release",
+                    )
+                    .with_command(source)
+                    .with_context(format!("pid {process_group}; status {status:?}"))
+                    .with_help(
+                        "Retry the command; report repeated process-group staging failures",
+                    ));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ShellError::new(
+                        ErrorCode::Io,
+                        "could not observe the staged native process-group leader",
+                    )
+                    .with_command(source)
+                    .with_context(error.to_string())
+                    .with_help("Retry the command; report repeated process staging failures"));
+                }
+            }
         }
     }
 
     impl Drop for PipelineConstructionGuard {
         fn drop(&mut self) {
-            if !self.children.is_empty() {
-                terminate_children(&mut self.children, self.process_group);
-            }
+            terminate_children(&mut self.children, &mut self.process_group_anchor);
         }
     }
 
-    fn terminate_children(children: &mut [JobChild], process_group: Option<i32>) {
-        if children.is_empty() {
-            return;
-        }
-        if let Some(group) = process_group {
-            let _ = killpg(Pid::from_raw(group), Signal::SIGKILL);
-        }
+    fn terminate_children(
+        children: &mut [JobChild],
+        process_group_anchor: &mut Option<ProcessGroupAnchor>,
+    ) {
+        let group_result = process_group_anchor
+            .as_mut()
+            .map(ProcessGroupAnchor::begin_termination);
         for child in children {
             if child.status != JobStatus::Done {
                 // Group cleanup contains descendants; the direct fallback is
@@ -2616,29 +3024,26 @@ mod platform {
                 child.status = JobStatus::Done;
             }
         }
+        if let Some(mut anchor) = process_group_anchor.take() {
+            let _ = anchor.finish_termination(group_result.unwrap_or(Ok(())));
+        }
     }
 
     fn terminate_group_descendants(
-        children: &[JobChild],
-        process_group: Option<i32>,
+        process_group_anchor: &mut Option<ProcessGroupAnchor>,
     ) -> Result<(), ShellError> {
-        let Some(process_group) = process_group else {
+        let Some(anchor) = process_group_anchor.take() else {
             return Ok(());
         };
-        let owned_processes_exited = !children.is_empty()
-            && children
-                .iter()
-                .all(|child| child.status == JobStatus::Done && child.exit_status.is_some());
-        terminate_process_group(Pid::from_raw(process_group), owned_processes_exited).map_err(
-            |error| {
-                ShellError::new(
-                    ErrorCode::Io,
-                    "could not terminate remaining pipeline descendants",
-                )
-                .with_context(error.to_string())
-                .with_help("Retry the command; report repeated process-group cleanup failures")
-            },
-        )
+        anchor.terminate_owned_group().map_err(|error| {
+            ShellError::new(
+                ErrorCode::Io,
+                "could not terminate remaining pipeline descendants",
+            )
+            .with_context(error.message)
+            .with_context(error.details.context.join("; "))
+            .with_help("Retry the command; report repeated process-group cleanup failures")
+        })
     }
 
     fn spawn_reader(reader: impl Read + Send + 'static, limit: usize) -> ReaderTask {
@@ -3046,7 +3451,7 @@ mod platform {
 
     fn wait_for_foreground_children(
         children: &mut [JobChild],
-        process_group: Option<i32>,
+        process_group_anchor: Option<&ProcessGroupAnchor>,
         request: Option<RequestContext<'_>>,
     ) -> Result<(), ShellError> {
         // A pipeline is one job: if any member stops, stop every remaining
@@ -3061,17 +3466,14 @@ mod platform {
                 .iter_mut()
                 .filter(|child| child.status != JobStatus::Done)
             {
-                if let Err(error) = poll_child_checked(child) {
-                    terminate_children(children, process_group);
-                    return Err(error);
-                }
+                poll_child_checked(child)?;
             }
 
             let any_stopped = children
                 .iter()
                 .any(|child| child.status == JobStatus::Stopped);
             if any_stopped && !stop_propagated {
-                stop_live_children(children, process_group)?;
+                stop_live_children(children, process_group_anchor)?;
                 stop_propagated = true;
             }
 
@@ -3085,10 +3487,7 @@ mod platform {
             }
 
             if let Some(request) = request {
-                if let Err(error) = request.ensure_active() {
-                    terminate_children(children, process_group);
-                    return Err(error);
-                }
+                request.ensure_active()?;
             }
             thread::sleep(Duration::from_millis(1));
         }
@@ -3096,10 +3495,10 @@ mod platform {
 
     fn stop_live_children(
         children: &[JobChild],
-        process_group: Option<i32>,
+        process_group_anchor: Option<&ProcessGroupAnchor>,
     ) -> Result<(), ShellError> {
-        if let Some(group) = process_group {
-            return match killpg(Pid::from_raw(group), Signal::SIGSTOP) {
+        if let Some(anchor) = process_group_anchor {
+            return match anchor.signal(Signal::SIGSTOP) {
                 Ok(()) | Err(Errno::ESRCH) => Ok(()),
                 Err(error) => Err(ShellError::new(
                     ErrorCode::Io,
@@ -3201,6 +3600,40 @@ mod platform {
                 std::process::id(),
                 NEXT_TEMP_PATH.fetch_add(1, Ordering::Relaxed)
             ))
+        }
+
+        fn spawn_test_pipeline_stage(guard: &mut PipelineConstructionGuard, script: &str) -> Pid {
+            let first_stage = guard.process_group.is_none();
+            let mut command = if first_stage {
+                let mut command = Command::new(PROCESS_GROUP_ANCHOR_PATH);
+                command.args([
+                    "-c",
+                    PROCESS_GROUP_LEADER_STAGE_SCRIPT,
+                    "quirl-process-group-stage-test",
+                    "sh",
+                    "-c",
+                    script,
+                ]);
+                command.process_group(0);
+                command
+            } else {
+                let mut command = Command::new("sh");
+                command
+                    .arg("-c")
+                    .arg(script)
+                    .process_group(guard.process_group.unwrap_or(0));
+                command
+            };
+            let child = command.spawn().unwrap();
+            let process_id = Pid::from_raw(i32::try_from(child.id()).unwrap());
+            if first_stage {
+                guard
+                    .push_staged_group_leader(child, "sh", script, None)
+                    .unwrap();
+            } else {
+                guard.push(child).unwrap();
+            }
+            process_id
         }
 
         fn wait_for_status(executor: &mut NativeExecutor, status: JobStatus) -> Vec<JobState> {
@@ -4051,90 +4484,97 @@ mod platform {
 
         #[test]
         fn pipeline_construction_guard_kills_and_reaps_children_on_early_errors() {
-            let mut command = Command::new("sh");
-            command.arg("-c").arg("sleep 10");
-            #[cfg(unix)]
-            command.process_group(0);
-            let child = command.spawn().unwrap();
-            let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
             let mut guard = PipelineConstructionGuard::new();
-            guard.push(child).unwrap();
+            let pid = spawn_test_pipeline_stage(&mut guard, "sleep 10");
             drop(guard);
             assert!(kill(pid, None).is_err());
         }
 
-        #[cfg(target_os = "macos")]
-        fn guard_after_leader_kernel_exit(command: &str) -> PipelineConstructionGuard {
-            const STATUS_OBSERVATIONS_MAX: usize = 100_000;
-            let mut command_builder = Command::new("sh");
-            command_builder.arg("-c").arg(command).process_group(0);
-            let mut child = command_builder.spawn().unwrap();
-            let process_id = Pid::from_raw(i32::try_from(child.id()).unwrap());
-            for _ in 0..STATUS_OBSERVATIONS_MAX {
-                if getpgid(Some(process_id)) == Err(Errno::ESRCH) {
-                    let mut guard = PipelineConstructionGuard::new();
-                    guard.push(child).unwrap();
-                    return guard;
-                }
-                thread::yield_now();
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "child {process_id} did not exit within {STATUS_OBSERVATIONS_MAX} bounded observations"
+        #[test]
+        fn anchor_retains_group_identity_after_every_guest_is_reaped() {
+            let mut guard = PipelineConstructionGuard::new();
+            let group_leader = spawn_test_pipeline_stage(&mut guard, "exit 23");
+            let process_group = guard.process_group.unwrap();
+            let anchor_pid = Pid::from_raw(
+                i32::try_from(guard.process_group_anchor.as_ref().unwrap().child.id()).unwrap(),
             );
-        }
+            assert_eq!(group_leader.as_raw(), process_group);
+            assert_ne!(anchor_pid, group_leader);
 
-        #[cfg(target_os = "macos")]
-        #[test]
-        fn exited_leader_is_recorded_without_retaining_a_reusable_group_id() {
-            for (command, expected_status) in [("exit 0", 0), ("exit 23", 23)] {
-                let guard = guard_after_leader_kernel_exit(command);
-
-                assert_eq!(guard.process_group, None);
-                assert_eq!(guard.children[0].status, JobStatus::Done);
-                assert_eq!(guard.children[0].exit_status, Some(expected_status));
-            }
-        }
-
-        #[cfg(target_os = "macos")]
-        #[test]
-        fn eperm_cleanup_requires_terminal_owners_and_eventual_group_absence() {
-            let mut transient_probe_count = 0_usize;
-            let retired_group = macos_eperm_group_is_gone(true, || {
-                transient_probe_count += 1;
-                if transient_probe_count < 3 {
-                    Err(Errno::EPERM)
-                } else {
-                    Err(Errno::ESRCH)
+            for _ in 0..1_000 {
+                poll_child(&mut guard.children[0]);
+                if guard.children[0].status == JobStatus::Done {
+                    break;
                 }
-            });
-            assert!(retired_group);
-            assert_eq!(transient_probe_count, 3);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(guard.children[0].status, JobStatus::Done);
+            assert_eq!(guard.children[0].exit_status, Some(23));
+            assert_eq!(getpgid(Some(anchor_pid)), Ok(group_leader));
+            assert_eq!(killpg(group_leader, None), Ok(()));
 
-            let mut unverified_probe_count = 0_usize;
-            assert!(!macos_eperm_group_is_gone(false, || {
-                unverified_probe_count += 1;
-                Err(Errno::ESRCH)
-            }));
-            assert_eq!(unverified_probe_count, 0);
-
-            let mut changed_credentials_probe_count = 0_usize;
-            assert!(!macos_eperm_group_is_gone(true, || {
-                changed_credentials_probe_count += 1;
-                Err(Errno::EPERM)
-            }));
-            assert_eq!(changed_credentials_probe_count, GROUP_RETIREMENT_PROBES_MAX);
-
-            let mut live_group_probe_count = 0_usize;
-            assert!(!macos_eperm_group_is_gone(true, || {
-                live_group_probe_count += 1;
-                Ok(())
-            }));
-            assert_eq!(live_group_probe_count, GROUP_RETIREMENT_PROBES_MAX);
+            drop(guard);
         }
 
-        #[cfg(target_os = "macos")]
+        #[test]
+        fn anchor_spawn_and_readiness_failures_return_without_partial_ownership() {
+            let missing = ProcessGroupAnchor::spawn_with(
+                "/definitely/missing/quirl-process-group-anchor",
+                PROCESS_GROUP_ANCHOR_SCRIPT,
+            )
+            .unwrap_err();
+            assert_eq!(missing.code, ErrorCode::ProcessSpawn);
+            assert!(missing.message.contains("anchor"));
+
+            let early_exit = ProcessGroupAnchor::spawn_with("/bin/sh", "exit 0").unwrap_err();
+            assert_eq!(early_exit.code, ErrorCode::ProcessSpawn);
+            assert!(early_exit.message.contains("ready"));
+
+            let missing_group = ProcessGroupAnchor::join(i32::MAX, None).unwrap_err();
+            assert_eq!(missing_group.code, ErrorCode::ProcessSpawn);
+            assert!(missing_group.message.contains("anchor"));
+
+            let request = ProcessRequest {
+                command: "anchor cancellation fixture".to_owned(),
+                deadline: Duration::from_secs(30),
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                max_output_bytes: 0,
+            };
+            let request = RequestContext::new(&request).unwrap();
+            let cancelled =
+                ProcessGroupAnchor::spawn_with_group("/bin/sh", "sleep 30", None, Some(request))
+                    .unwrap_err();
+            assert_eq!(cancelled.code, ErrorCode::ResourceLimit);
+            assert!(cancelled.message.contains("cancelled"));
+        }
+
+        #[test]
+        fn anchor_ignores_foreground_terminal_signals_after_readiness() {
+            let anchor = ProcessGroupAnchor::spawn().unwrap();
+            let process_group = Pid::from_raw(anchor.process_group());
+            anchor.signal(Signal::SIGINT).unwrap();
+            anchor.signal(Signal::SIGTSTP).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            assert_eq!(getpgid(Some(process_group)), Ok(process_group));
+            anchor.terminate_owned_group().unwrap();
+        }
+
+        #[test]
+        fn eperm_cleanup_fails_closed_and_reaps_the_anchor_without_group_retry() {
+            let mut anchor = ProcessGroupAnchor::spawn().unwrap();
+            let process_group = Pid::from_raw(anchor.process_group());
+            anchor.termination_signaled = true;
+            let error = anchor.finish_termination(Err(Errno::EPERM)).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Io);
+            assert!(error
+                .details
+                .context
+                .iter()
+                .any(|value| value.contains("EPERM")));
+            assert!(anchor.released);
+            assert_eq!(anchor.process_group(), process_group.as_raw());
+        }
+
         #[test]
         fn contained_child_cleanup_preserves_a_reaped_exit_status() {
             let containment = ChildProcessTree::new().unwrap();
@@ -4155,6 +4595,36 @@ mod platform {
         }
 
         #[test]
+        fn containment_drop_kills_descendants_after_the_direct_child_is_reaped() {
+            let process_id_path = temporary_path("contained-descendant");
+            let containment = ChildProcessTree::new().unwrap();
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(format!(
+                "sleep 30 & printf %s $! > {}; exit 0",
+                process_id_path.display()
+            ));
+            containment.configure(&mut command);
+            let mut child = command.spawn().unwrap();
+            containment.assign(&mut child).unwrap();
+            assert!(child.wait().unwrap().success());
+            let descendant = fs::read_to_string(&process_id_path)
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+
+            drop(containment);
+            for _ in 0..1_000 {
+                if kill(Pid::from_raw(descendant), None).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(kill(Pid::from_raw(descendant), None).is_err());
+            fs::remove_file(process_id_path).unwrap();
+        }
+
+        #[test]
         fn live_child_in_the_wrong_group_fails_closed_and_is_reaped() {
             let mut command = Command::new("sh");
             command.arg("-c").arg("sleep 10");
@@ -4170,8 +4640,8 @@ mod platform {
         }
 
         #[test]
-        fn immediate_leader_exit_does_not_break_verified_group_construction() {
-            for _ in 0..128 {
+        fn immediate_guest_exit_does_not_release_the_owned_group_early() {
+            for _ in 0..512 {
                 let outcome = NativeExecutor::default()
                     .execute_capture("true | cat")
                     .unwrap();
@@ -4222,6 +4692,7 @@ mod platform {
                         exit_status: (status == JobStatus::Done).then_some(0),
                     },
                     children: Vec::new(),
+                    process_group_anchor: None,
                     terminal_modes: None,
                     capture: false,
                     stdout_reader: None,
@@ -4265,16 +4736,10 @@ mod platform {
                 let mut guard = PipelineConstructionGuard::new();
                 let mut process_ids = Vec::with_capacity(fault_after);
 
-                for stage in 0..planned_stages {
-                    let mut command = Command::new("sh");
-                    command.arg("-c").arg("sleep 10");
-                    command.process_group(guard.process_group.unwrap_or(0));
-                    let child = command.spawn().unwrap_or_else(|error| {
-                        panic!("seed={seed} case={case_index} stage={stage} spawn failed: {error}")
-                    });
-                    process_ids.push(Pid::from_raw(i32::try_from(child.id()).unwrap()));
-                    guard.push(child).unwrap();
-                    if stage + 1 == fault_after {
+                for stage_index in 0..planned_stages {
+                    let process_id = spawn_test_pipeline_stage(&mut guard, "sleep 10");
+                    process_ids.push(process_id);
+                    if stage_index + 1 == fault_after {
                         break;
                     }
                 }

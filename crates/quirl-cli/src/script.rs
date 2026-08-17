@@ -41,7 +41,7 @@ use quirl_core::ExecutionEffect;
 use serde_json::Value;
 
 #[cfg(unix)]
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 
 const QUIRL_CANONICAL_EXTENSION: &str = "qrl";
 const SCRIPT_EXECUTION_DEADLINE: Duration = Duration::from_secs(30);
@@ -1519,9 +1519,8 @@ fn run_reference_script(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
     let containment = ChildProcessTree::new()?;
+    containment.configure(&mut command);
     let mut child = command.spawn().map_err(|error| {
         ShellError::new(
             ErrorCode::ProcessSpawn,
