@@ -27,7 +27,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-const INDEX_READ_LIMIT: usize = 4 * 1024 * 1024;
+const INDEX_READ_LIMIT: usize = 16 * 1024 * 1024;
 const COMPLETION_READ_LIMIT: usize = 4 * 1024 * 1024;
 const DOCUMENTATION_READ_LIMIT: usize = 1024 * 1024;
 const INDEX_ROOTS_MAX: usize = 128;
@@ -39,6 +39,11 @@ const INDEX_RECORDS_MAX: usize = 65_536;
 const INDEX_RETAINED_BYTES_MAX: usize = 16 * 1024 * 1024;
 const INDEX_DIAGNOSTICS_MAX: usize = 4_096;
 const INDEX_TEMPORARY_ATTEMPTS_MAX: usize = 64;
+const AUTOMATIC_MAN_PAGES_MAX: usize = 512;
+const AUTOMATIC_MAN_DIAGNOSTICS_MAX: usize = 128;
+const MAN_CANDIDATE_PATH_BYTES_MAX: usize = 1024 * 1024;
+const INDEX_DIAGNOSTIC_ORIGIN_BYTES_MAX: usize = 1024;
+const INDEX_DIAGNOSTIC_MESSAGE_BYTES_MAX: usize = 512;
 const DISCOVERY_STATE_VERSION: u32 = 1;
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DISCOVERY_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
@@ -177,6 +182,8 @@ struct DiscoveryState {
     source_fingerprint: String,
     catalog_fingerprint: String,
     sources: Vec<DiscoverySource>,
+    #[serde(default)]
+    diagnostics: Vec<ImportDiagnostic>,
 }
 
 struct DiscoverySnapshot {
@@ -187,7 +194,15 @@ struct DiscoverySnapshot {
     zsh_files: Vec<PathBuf>,
     help_files: Vec<PathBuf>,
     man_files: Vec<PathBuf>,
+    diagnostics: Vec<ImportDiagnostic>,
     fingerprint: String,
+}
+
+struct ManCandidate {
+    command: String,
+    path: PathBuf,
+    root_priority: usize,
+    compressed: bool,
 }
 
 // Failure cleanup preserves every armed name because identity validation plus
@@ -769,7 +784,7 @@ impl DiscoveryConfig {
             bash_roots: default_bash_roots(),
             zsh_roots: default_zsh_roots(),
             help_roots: default_documentation_roots("QUIRL_HELP_PATH", "help"),
-            man_roots: default_documentation_roots("QUIRL_MAN_PATH", "man"),
+            man_roots: default_man_roots(),
             stale_after: DISCOVERY_STALE_AFTER,
         })
     }
@@ -878,7 +893,7 @@ fn refresh_catalog_cache(
         return Ok(false);
     }
     ensure_refresh_active(deadline, cancelled, "before source import")?;
-    let (mut catalog, _diagnostics) = catalog_from_files_checked(
+    let (mut catalog, mut import_diagnostics) = catalog_from_files_checked(
         &snapshot.fish_files,
         &snapshot.bash_files,
         &snapshot.zsh_files,
@@ -890,6 +905,8 @@ fn refresh_catalog_cache(
     catalog.merge(external_commands(&snapshot.executables, &snapshot.sources));
     ensure_refresh_active(deadline, cancelled, "before cache commit")?;
     let catalog_fingerprint = fingerprint_bytes(&encode_catalog(&catalog)?);
+    let mut diagnostics = snapshot.diagnostics;
+    diagnostics.append(&mut import_diagnostics);
     let state = DiscoveryState {
         version: DISCOVERY_STATE_VERSION,
         catalog_schema_version: catalog.schema_version,
@@ -897,6 +914,7 @@ fn refresh_catalog_cache(
         source_fingerprint: snapshot.fingerprint,
         catalog_fingerprint,
         sources: snapshot.sources,
+        diagnostics,
     };
     write_catalog_atomically(&config.index_path, &catalog, Some(&state))?;
     Ok(true)
@@ -1195,7 +1213,18 @@ fn catalog_from_files_checked(
     }
     for path in man_files {
         check_active()?;
-        let source = read_documentation(path, budget)?;
+        let source = match read_documentation(path, budget) {
+            Ok(source) => source,
+            Err(error) => {
+                push_index_diagnostic(
+                    &mut diagnostics,
+                    budget,
+                    path,
+                    format_index_error("skipped unreadable man page", &error),
+                )?;
+                continue;
+            }
+        };
         merge_bounded_report(
             &mut catalog,
             &mut diagnostics,
@@ -1428,6 +1457,318 @@ fn completion_files_checked(
     Ok(files)
 }
 
+fn discover_man_files(
+    roots: &[PathBuf],
+    command_names: &BTreeSet<String>,
+    budget: &mut IndexBuildBudget,
+    deadline: RefreshDeadline,
+    cancelled: &AtomicBool,
+) -> Result<(Vec<PathBuf>, Vec<ImportDiagnostic>), ShellError> {
+    let mut candidates = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut candidate_path_bytes = 0usize;
+    for (root_priority, root) in roots.iter().enumerate() {
+        ensure_refresh_active(deadline, cancelled, "while scanning man-page roots")?;
+        let metadata = match fs::metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                push_discovery_diagnostic(
+                    &mut diagnostics,
+                    budget,
+                    root,
+                    format!("skipped man-page root: {error}"),
+                )?;
+                continue;
+            }
+        };
+        if metadata.file_type().is_file() {
+            admit_man_candidate(
+                root,
+                root_priority,
+                command_names,
+                &mut candidates,
+                &mut diagnostics,
+                &mut candidate_path_bytes,
+                budget,
+            )?;
+            continue;
+        }
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        collect_man_root_candidates(
+            root,
+            root_priority,
+            command_names,
+            &mut candidates,
+            &mut diagnostics,
+            &mut candidate_path_bytes,
+            budget,
+            deadline,
+            cancelled,
+        )?;
+    }
+    select_man_candidates(candidates, diagnostics, budget)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_man_root_candidates(
+    root: &Path,
+    root_priority: usize,
+    command_names: &BTreeSet<String>,
+    candidates: &mut Vec<ManCandidate>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    candidate_path_bytes: &mut usize,
+    budget: &mut IndexBuildBudget,
+    deadline: RefreshDeadline,
+    cancelled: &AtomicBool,
+) -> Result<(), ShellError> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            push_discovery_diagnostic(
+                diagnostics,
+                budget,
+                root,
+                format!("skipped man-page root: {error}"),
+            )?;
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        ensure_refresh_active(deadline, cancelled, "while scanning man-page entries")?;
+        budget.entries = budget.entries.saturating_add(1);
+        ensure_index_limit(
+            "directory entries",
+            budget.bounds.entries_max,
+            budget.entries,
+        )?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                push_discovery_diagnostic(
+                    diagnostics,
+                    budget,
+                    root,
+                    format!("skipped unreadable man-page entry: {error}"),
+                )?;
+                continue;
+            }
+        };
+        admit_man_candidate(
+            &entry.path(),
+            root_priority,
+            command_names,
+            candidates,
+            diagnostics,
+            candidate_path_bytes,
+            budget,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_man_candidate(
+    path: &Path,
+    root_priority: usize,
+    command_names: &BTreeSet<String>,
+    candidates: &mut Vec<ManCandidate>,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    candidate_path_bytes: &mut usize,
+    budget: &mut IndexBuildBudget,
+) -> Result<(), ShellError> {
+    let Some((command, compressed)) = man_page_command(path) else {
+        return Ok(());
+    };
+    if !command_names.contains(&command) {
+        return Ok(());
+    }
+    let candidate_path = if compressed {
+        path.to_path_buf()
+    } else {
+        match resolve_plain_man_page(path) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                push_discovery_diagnostic(diagnostics, budget, path, error)?;
+                return Ok(());
+            }
+        }
+    };
+    let path_bytes = candidate_path.as_os_str().as_encoded_bytes().len();
+    let observed = candidate_path_bytes.saturating_add(path_bytes);
+    ensure_index_limit(
+        "man candidate path bytes",
+        MAN_CANDIDATE_PATH_BYTES_MAX,
+        observed,
+    )?;
+    *candidate_path_bytes = observed;
+    candidates.push(ManCandidate {
+        command,
+        path: candidate_path,
+        root_priority,
+        compressed,
+    });
+    Ok(())
+}
+
+fn resolve_plain_man_page(path: &Path) -> Result<PathBuf, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("skipped unreadable man page: {error}"))?;
+    let candidate = if metadata.file_type().is_symlink() {
+        fs::canonicalize(path)
+            .map_err(|error| format!("skipped unresolved man-page alias: {error}"))?
+    } else {
+        path.to_path_buf()
+    };
+    let metadata = fs::symlink_metadata(&candidate)
+        .map_err(|error| format!("skipped unreadable man-page target: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("skipped non-regular man-page target".to_owned());
+    }
+    if metadata.len() > u64::try_from(DOCUMENTATION_READ_LIMIT).unwrap_or(u64::MAX) {
+        return Err(format!(
+            "skipped oversized man page: limit {} bytes; observed {} bytes",
+            DOCUMENTATION_READ_LIMIT,
+            metadata.len()
+        ));
+    }
+    Ok(candidate)
+}
+
+fn select_man_candidates(
+    mut candidates: Vec<ManCandidate>,
+    mut diagnostics: Vec<ImportDiagnostic>,
+    budget: &mut IndexBuildBudget,
+) -> Result<(Vec<PathBuf>, Vec<ImportDiagnostic>), ShellError> {
+    candidates.sort_by(|left, right| {
+        left.command
+            .cmp(&right.command)
+            .then_with(|| left.compressed.cmp(&right.compressed))
+            .then_with(|| left.root_priority.cmp(&right.root_priority))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut files = Vec::new();
+    let mut selected_commands = BTreeSet::new();
+    let mut selected_targets = BTreeSet::new();
+    for candidate in candidates {
+        if files.len() == AUTOMATIC_MAN_PAGES_MAX {
+            break;
+        }
+        if !selected_commands.insert(candidate.command) {
+            continue;
+        }
+        if candidate.compressed {
+            push_discovery_diagnostic(
+                &mut diagnostics,
+                budget,
+                &candidate.path,
+                "skipped compressed man page because automatic discovery has no decompressor",
+            )?;
+            continue;
+        }
+        if selected_targets.insert(candidate.path.clone()) {
+            admit_index_path(&candidate.path, budget)?;
+            files.push(candidate.path);
+        }
+    }
+    files.sort();
+    Ok((files, diagnostics))
+}
+
+fn man_page_command(path: &Path) -> Option<(String, bool)> {
+    let file_name = path.file_name()?.to_str()?;
+    let (name, compressed) = file_name
+        .strip_suffix(".gz")
+        .map_or((file_name, false), |name| (name, true));
+    let command = name
+        .rsplit_once('.')
+        .filter(|(_, section)| {
+            section.starts_with(|character: char| character.is_ascii_digit())
+                && section
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .map(|(command, _)| command)
+        .or_else(|| name.strip_suffix(".man.txt"))
+        .or_else(|| name.strip_suffix(".man"))
+        .or_else(|| name.strip_suffix(".txt"))?;
+    (!command.is_empty()).then(|| (command.to_owned(), compressed))
+}
+
+fn push_discovery_diagnostic(
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    budget: &mut IndexBuildBudget,
+    origin: &Path,
+    message: impl AsRef<str>,
+) -> Result<(), ShellError> {
+    if diagnostics.len() == AUTOMATIC_MAN_DIAGNOSTICS_MAX {
+        return Ok(());
+    }
+    push_index_diagnostic(diagnostics, budget, origin, message)
+}
+
+fn push_index_diagnostic(
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    budget: &mut IndexBuildBudget,
+    origin: &Path,
+    message: impl AsRef<str>,
+) -> Result<(), ShellError> {
+    let diagnostic = ImportDiagnostic {
+        origin: truncate_utf8_owned(
+            &origin.display().to_string(),
+            INDEX_DIAGNOSTIC_ORIGIN_BYTES_MAX,
+        ),
+        line: 1,
+        message: truncate_utf8_owned(message.as_ref(), INDEX_DIAGNOSTIC_MESSAGE_BYTES_MAX),
+    };
+    admit_index_diagnostic(&diagnostic, budget)?;
+    diagnostics.push(diagnostic);
+    Ok(())
+}
+
+fn admit_index_diagnostic(
+    diagnostic: &ImportDiagnostic,
+    budget: &mut IndexBuildBudget,
+) -> Result<(), ShellError> {
+    let diagnostics = budget.diagnostics.saturating_add(1);
+    ensure_index_limit(
+        "import diagnostics",
+        budget.bounds.diagnostics_max,
+        diagnostics,
+    )?;
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, diagnostic).map_err(json_error)?;
+    let retained_bytes = budget.retained_bytes.saturating_add(counter.0);
+    ensure_index_limit(
+        "retained index text",
+        budget.bounds.retained_bytes_max,
+        retained_bytes,
+    )?;
+    budget.diagnostics = diagnostics;
+    budget.retained_bytes = retained_bytes;
+    Ok(())
+}
+
+fn truncate_utf8_owned(value: &str, bytes_max: usize) -> String {
+    if value.len() <= bytes_max {
+        return value.to_owned();
+    }
+    let mut end = bytes_max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn format_index_error(prefix: &str, error: &ShellError) -> String {
+    error.details.context.first().map_or_else(
+        || format!("{prefix}: {}", error.message),
+        |context| format!("{prefix}: {} ({context})", error.message),
+    )
+}
+
 fn discover_sources(
     config: &DiscoveryConfig,
     budget: &mut IndexBuildBudget,
@@ -1450,10 +1791,18 @@ fn discover_sources(
     let help_files = completion_files_checked(&config.help_roots, None, budget, true, || {
         ensure_refresh_active(deadline, cancelled, "while scanning help sources")
     })?;
-    let man_files = completion_files_checked(&config.man_roots, None, budget, true, || {
-        ensure_refresh_active(deadline, cancelled, "while scanning man sources")
-    })?;
     let executables = discover_path_executables(&config.path_roots, budget, deadline, cancelled)?;
+    let command_names: BTreeSet<String> = executables
+        .iter()
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .collect();
+    let (man_files, mut diagnostics) = discover_man_files(
+        &config.man_roots,
+        &command_names,
+        budget,
+        deadline,
+        cancelled,
+    )?;
 
     let mut sources = Vec::with_capacity(
         fish_files
@@ -1469,12 +1818,27 @@ fn discover_sources(
         (DiscoverySourceKind::Bash, bash_files.as_slice()),
         (DiscoverySourceKind::Zsh, zsh_files.as_slice()),
         (DiscoverySourceKind::Help, help_files.as_slice()),
-        (DiscoverySourceKind::Man, man_files.as_slice()),
         (DiscoverySourceKind::PathExecutable, executables.as_slice()),
     ] {
         for path in files {
             ensure_refresh_active(deadline, cancelled, "while fingerprinting sources")?;
             sources.push(observe_source(kind, path, budget)?);
+        }
+    }
+    let mut admitted_man_files = Vec::with_capacity(man_files.len());
+    for path in man_files {
+        ensure_refresh_active(deadline, cancelled, "while fingerprinting man pages")?;
+        match observe_source(DiscoverySourceKind::Man, &path, budget) {
+            Ok(source) => {
+                sources.push(source);
+                admitted_man_files.push(path);
+            }
+            Err(error) => push_discovery_diagnostic(
+                &mut diagnostics,
+                budget,
+                &path,
+                format_index_error("skipped man page during fingerprinting", &error),
+            )?,
         }
     }
     sources.sort();
@@ -1486,7 +1850,8 @@ fn discover_sources(
         bash_files,
         zsh_files,
         help_files,
-        man_files,
+        man_files: admitted_man_files,
+        diagnostics,
         fingerprint,
     })
 }
@@ -1693,6 +2058,16 @@ fn default_zsh_roots() -> Vec<PathBuf> {
         PathBuf::from("/usr/local/share/zsh/site-functions"),
         PathBuf::from("/opt/homebrew/share/zsh/site-functions"),
     ]
+}
+
+fn default_man_roots() -> Vec<PathBuf> {
+    let mut roots = default_documentation_roots("QUIRL_MAN_PATH", "man");
+    roots.extend([
+        PathBuf::from("/usr/share/man/man1"),
+        PathBuf::from("/usr/local/share/man/man1"),
+        PathBuf::from("/opt/homebrew/share/man/man1"),
+    ]);
+    roots
 }
 
 fn default_documentation_roots(variable: &str, kind: &str) -> Vec<PathBuf> {
@@ -2383,6 +2758,10 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    fn bsd_cp_man_page() -> &'static str {
+        ".Dd March 28, 2024\n.Dt CP 1\n.Os\n.Sh NAME\n.Nm cp\n.Nd copy files\n.Sh DESCRIPTION\n.Bl -tag -width flag\n.It Fl R\nIf the source_file designates a directory,\n.Nm\ncopies the directory and the entire subtree.\n.It Fl a\nArchive mode. Preserves structure and attributes of files.\n.It Fl p\nCause\n.Nm\nto preserve modification time, access time, file flags, file mode, user ID, and group ID, as allowed by permissions.\n.El\n"
+    }
+
     fn wait_for_observation(counter: &AtomicUsize) {
         let deadline = Instant::now() + Duration::from_secs(2);
         while counter.load(Ordering::Acquire) == 0 {
@@ -2847,6 +3226,119 @@ mod tests {
     }
 
     #[test]
+    fn automatic_man_discovery_merges_cp_intent_and_option_documents() {
+        let directory = temporary_directory();
+        let mut config = discovery_config(&directory);
+        let man = directory.join("man1");
+        fs::create_dir(&man).unwrap();
+        config.man_roots = vec![man.clone()];
+        write_executable(&config.path_roots[0].join("cp"));
+        fs::write(man.join("cp.1"), bsd_cp_man_page()).unwrap();
+
+        assert!(refresh(&config).unwrap());
+
+        let catalog = load_catalog_at(&config.index_path);
+        let cp = catalog.find("cp").unwrap();
+        assert_eq!(cp.summary, "copy files");
+        assert!(cp.options.iter().any(|option| {
+            option.names == ["-R"] && option.documentation.contains("entire subtree")
+        }));
+        assert!(cp.options.iter().any(|option| {
+            option.names == ["-p"] && option.documentation.contains("file mode")
+        }));
+        let bytes = read_index(&config.index_path).unwrap();
+        let results = intelligence::search(
+            &bytes,
+            &config.index_path,
+            "copy a directory while preserving permissions",
+            8,
+            None,
+        )
+        .unwrap();
+        assert!(results.iter().any(|result| result.command == "cp"));
+        let option_results = intelligence::search(
+            &bytes,
+            &config.index_path,
+            "preserve file mode permissions",
+            8,
+            None,
+        )
+        .unwrap();
+        assert!(option_results
+            .iter()
+            .any(|result| result.command == "cp" && result.target.contains("-p")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_man_discovery_isolates_bad_pages_and_deduplicates_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let mut config = discovery_config(&directory);
+        let man = directory.join("man1");
+        fs::create_dir(&man).unwrap();
+        config.man_roots = vec![man.clone()];
+        for command in ["bad", "copy", "cp", "dangling", "huge", "invalid", "locked"] {
+            write_executable(&config.path_roots[0].join(command));
+        }
+        fs::write(man.join("cp.1"), bsd_cp_man_page()).unwrap();
+        symlink(man.join("cp.1"), man.join("copy.1")).unwrap();
+        symlink(man.join("missing.1"), man.join("dangling.1")).unwrap();
+        fs::write(man.join("bad.1.gz"), b"compressed").unwrap();
+        fs::write(man.join("huge.1"), vec![b'x'; DOCUMENTATION_READ_LIMIT + 1]).unwrap();
+        fs::write(man.join("invalid.1"), [0xff, 0xfe]).unwrap();
+        let locked = man.join("locked.1");
+        fs::write(&locked, bsd_cp_man_page()).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut budget = test_budget();
+
+        let snapshot = discover_sources(
+            &config,
+            &mut budget,
+            RefreshDeadline::starting_now(Duration::from_secs(5)),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.man_files,
+            [fs::canonicalize(man.join("cp.1")).unwrap()]
+        );
+        let messages = snapshot
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("compressed")));
+        assert!(messages.iter().any(|message| message.contains("oversized")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("unresolved")));
+        assert!(messages.iter().any(|message| message.contains("UTF-8")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("during fingerprinting")));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn man_page_names_preserve_configured_text_formats() {
+        assert_eq!(
+            man_page_command(Path::new("demo.man.txt")),
+            Some(("demo".to_owned(), false))
+        );
+        assert_eq!(
+            man_page_command(Path::new("demo.txt")),
+            Some(("demo".to_owned(), false))
+        );
+    }
+
+    #[test]
     fn refresh_deadline_error_reports_the_active_background_limit() {
         let limit = Duration::from_secs(30);
         let error = ensure_refresh_active(
@@ -3152,6 +3644,21 @@ mod tests {
         assert_eq!(recovered.schema_version, Catalog::builtin().schema_version);
         assert!(recovered.find("quirl agent manifest").is_some());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn catalog_serialization_accepts_exact_limit_and_rejects_plus_one() {
+        let mut exact = BoundedBytesWriter::new(INDEX_READ_LIMIT);
+        exact.write_all(&vec![0_u8; INDEX_READ_LIMIT]).unwrap();
+        assert_eq!(exact.bytes.len(), INDEX_READ_LIMIT);
+        assert!(!exact.exceeded);
+
+        assert_eq!(
+            exact.write(&[0_u8]).unwrap_err().kind(),
+            io::ErrorKind::Other
+        );
+        assert!(exact.exceeded);
+        assert_eq!(exact.bytes.len(), INDEX_READ_LIMIT);
     }
 
     #[test]

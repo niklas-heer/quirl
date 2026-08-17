@@ -8,6 +8,7 @@ use std::{collections::HashMap, path::Path};
 const MAX_HELP_BYTES: usize = 1024 * 1024;
 const MAX_HELP_LINES: usize = 20_000;
 const MAX_HELP_OPTIONS: usize = 2_048;
+const MAX_MAN_OPTION_DESCRIPTION_BYTES: usize = 4 * 1024;
 const MAX_COMPLETION_IMPORT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_COMPLETION_IMPORT_ORIGIN_BYTES: usize = 4 * 1024;
 const MAX_COMPLETION_IMPORT_LINES: usize = 20_000;
@@ -469,7 +470,8 @@ pub fn import_help(source: &str, origin: &str) -> ImportReport {
     import_documentation(source, origin, Provenance::Help)
 }
 
-/// Import bounded option metadata from supplied rendered or simple roff man text.
+/// Import bounded option metadata from supplied rendered, simple roff, or BSD
+/// mdoc man text without interpreting macros or executing a formatter.
 pub fn import_man(source: &str, origin: &str) -> ImportReport {
     import_documentation(source, origin, Provenance::Man)
 }
@@ -495,7 +497,16 @@ fn import_documentation(source: &str, origin: &str, source_kind: Provenance) -> 
         ));
     }
     let command = documentation_command(&lines, origin);
-    let mut options = Vec::new();
+    let mut options = match source_kind {
+        Provenance::Man => parse_mdoc_options(
+            &lines,
+            command.as_deref(),
+            origin,
+            &provenance,
+            &mut diagnostics,
+        ),
+        _ => Vec::new(),
+    };
     for (line, text) in lines.iter().enumerate() {
         if options.len() == MAX_HELP_OPTIONS {
             diagnostics.push(diagnostic(
@@ -527,11 +538,16 @@ fn import_documentation(source: &str, origin: &str, source_kind: Provenance) -> 
         Provenance::Man => "man page",
         _ => "documentation",
     };
+    let summary = match source_kind {
+        Provenance::Man => documentation_summary(&lines)
+            .unwrap_or_else(|| format!("Command discovered from supplied {label} text")),
+        _ => format!("Command discovered from supplied {label} text"),
+    };
     ImportReport {
         commands: vec![imported_command(
             command.clone(),
             format!("{command} [options]"),
-            format!("Command discovered from supplied {label} text"),
+            summary,
             format!(
                 "Options were heuristically parsed from bounded, supplied {label} text; no command was executed."
             ),
@@ -624,6 +640,11 @@ fn zsh_commands(
 fn inferred_name_from_origin(origin: &str) -> Option<String> {
     let name = Path::new(origin).file_name()?.to_str()?;
     let name = name.trim_start_matches('_');
+    let name = name.strip_suffix(".gz").unwrap_or(name);
+    let name = name
+        .rsplit_once('.')
+        .filter(|(_, section)| is_man_section(section))
+        .map_or(name, |(stem, _)| stem);
     let name = name
         .strip_suffix(".help.txt")
         .or_else(|| name.strip_suffix(".man.txt"))
@@ -632,6 +653,13 @@ fn inferred_name_from_origin(origin: &str) -> Option<String> {
         .or_else(|| name.strip_suffix(".txt"))
         .unwrap_or(name);
     (!name.is_empty()).then(|| name.to_owned())
+}
+
+fn is_man_section(section: &str) -> bool {
+    section.starts_with(|character: char| character.is_ascii_digit())
+        && section
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
 }
 
 fn zsh_static_arrays(
@@ -870,8 +898,192 @@ fn documentation_command(lines: &[&str], origin: &str) -> Option<String> {
                 return Some(command.rsplit('/').next().unwrap_or(command).to_owned());
             }
         }
+        if let Some(name) = trimmed.strip_prefix(".Nm ") {
+            if let Some(command) = name.split_whitespace().next() {
+                return Some(command.to_owned());
+            }
+        }
     }
     inferred_name_from_origin(origin)
+}
+
+fn documentation_summary(lines: &[&str]) -> Option<String> {
+    let mut in_name_section = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if let Some(section) = trimmed.strip_prefix(".Sh ") {
+            in_name_section = section.trim_matches('"').eq_ignore_ascii_case("NAME");
+            continue;
+        }
+        if in_name_section {
+            if let Some(summary) = trimmed.strip_prefix(".Nd ") {
+                let summary = normalize_mdoc_text(summary, None);
+                if !summary.is_empty() {
+                    return Some(summary);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_mdoc_options(
+    lines: &[&str],
+    command: Option<&str>,
+    origin: &str,
+    provenance: &ProvenanceInfo,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+) -> Vec<OptionSpec> {
+    let mut options = Vec::new();
+    let mut line_index = 0usize;
+    while line_index < lines.len() && options.len() < MAX_HELP_OPTIONS {
+        let Some(names) = parse_mdoc_option_header(lines[line_index]) else {
+            line_index += 1;
+            continue;
+        };
+        let option_line = line_index + 1;
+        line_index += 1;
+        let mut description = String::new();
+        let mut description_truncated = false;
+        while line_index < lines.len() {
+            let trimmed = lines[line_index].trim();
+            if trimmed.starts_with(".It ") || trimmed == ".El" || trimmed.starts_with(".Sh ") {
+                break;
+            }
+            let text = normalize_mdoc_text(trimmed, command);
+            if !text.is_empty() {
+                let separator = usize::from(!description.is_empty());
+                let available = MAX_MAN_OPTION_DESCRIPTION_BYTES
+                    .saturating_sub(description.len())
+                    .saturating_sub(separator);
+                if available == 0 {
+                    description_truncated = true;
+                } else {
+                    if separator == 1 {
+                        description.push(' ');
+                    }
+                    let (bounded, truncated) = bounded_prefix(&text, available);
+                    description.push_str(bounded);
+                    description_truncated |= truncated;
+                }
+            }
+            line_index += 1;
+        }
+        if description_truncated {
+            push_diagnostic(
+                diagnostics,
+                diagnostic(
+                    origin,
+                    option_line,
+                    format!(
+                        "man option description truncated to {MAX_MAN_OPTION_DESCRIPTION_BYTES} bytes"
+                    ),
+                ),
+            );
+        }
+        options.push(imported_argument(
+            names,
+            None,
+            if description.is_empty() {
+                "Imported man-page option".to_owned()
+            } else {
+                description
+            },
+            provenance.clone(),
+        ));
+    }
+    if options.len() == MAX_HELP_OPTIONS && line_index < lines.len() {
+        push_diagnostic(
+            diagnostics,
+            diagnostic(
+                origin,
+                line_index + 1,
+                format!("option ingestion stopped at {MAX_HELP_OPTIONS} entries"),
+            ),
+        );
+    }
+    options
+}
+
+fn parse_mdoc_option_header(line: &str) -> Option<Vec<String>> {
+    let declaration = line.trim().strip_prefix(".It ")?;
+    let tokens: Vec<_> = declaration.split_whitespace().collect();
+    let mut names = Vec::new();
+    let mut index = 0usize;
+    while index < tokens.len() {
+        if tokens[index] == "Fl" {
+            let flag = tokens.get(index + 1)?.trim_matches(|character: char| {
+                matches!(character, ',' | ';' | '|' | '[' | ']' | '(' | ')' | '"')
+            });
+            if !flag.is_empty() {
+                names.push(if flag.starts_with('-') {
+                    flag.to_owned()
+                } else {
+                    format!("-{flag}")
+                });
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    names.sort();
+    names.dedup();
+    (!names.is_empty()).then_some(names)
+}
+
+fn normalize_mdoc_text(line: &str, command: Option<&str>) -> String {
+    let normalized = normalize_roff(line);
+    let trimmed = normalized.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with(".\\\"")
+        || matches!(trimmed, ".Pp" | ".Bl" | ".El")
+        || trimmed.starts_with(".Bl ")
+    {
+        return String::new();
+    }
+    let mut tokens = trimmed.split_whitespace();
+    let mut words = Vec::new();
+    while let Some(token) = tokens.next() {
+        let token = token.strip_prefix('.').unwrap_or(token);
+        match token {
+            "Fl" => {
+                if let Some(flag) = tokens.next() {
+                    words.push(format!("-{}", trim_mdoc_token(flag)));
+                }
+            }
+            "Nm" => {
+                let name = tokens
+                    .next()
+                    .map(trim_mdoc_token)
+                    .filter(|name| !name.is_empty())
+                    .or(command);
+                if let Some(name) = name {
+                    words.push(name.to_owned());
+                }
+            }
+            "Xr" => {
+                if let Some(name) = tokens.next() {
+                    let name = trim_mdoc_token(name);
+                    if let Some(section) = tokens.next() {
+                        words.push(format!("{name}({})", trim_mdoc_token(section)));
+                    } else {
+                        words.push(name.to_owned());
+                    }
+                }
+            }
+            "Ar" | "Pa" | "Dv" | "Ev" | "Cm" | "Ic" | "Li" | "Em" | "Sy" | "Ql" | "Dq" | "Sq"
+            | "Pf" | "Nd" | "Pp" => {}
+            _ => words.push(token.to_owned()),
+        }
+    }
+    words.join(" ")
+}
+
+fn trim_mdoc_token(token: &str) -> &str {
+    token.trim_matches(|character: char| {
+        matches!(character, ',' | ';' | '|' | '[' | ']' | '(' | ')' | '"')
+    })
 }
 
 fn parse_documentation_option(line: &str, provenance: &ProvenanceInfo) -> Option<OptionSpec> {
@@ -1842,6 +2054,43 @@ _values 'environment' staging production
             .options
             .iter()
             .any(|option| option.names == ["--format"]));
+    }
+
+    #[test]
+    fn bsd_cp_mdoc_normalizes_section_name_summary_and_option_semantics() {
+        let source = ".Dd March 28, 2024\n.Dt CP 1\n.Os\n.Sh NAME\n.Nm cp\n.Nd copy files\n.Sh DESCRIPTION\n.Bl -tag -width flag\n.It Fl R\nIf the\n.Ar source_file\ndesignates a directory,\n.Nm\ncopies the directory and the entire subtree.\n.It Fl a\nArchive mode. Preserves structure and attributes of files.\n.It Fl p\nCause\n.Nm\nto preserve modification time, access time, file flags, file mode, user ID, and group ID, as allowed by permissions.\n.El\n";
+
+        let report = import_man(source, "/usr/share/man/man1/cp.1");
+
+        assert!(report.diagnostics.is_empty());
+        let command = &report.commands[0];
+        assert_eq!(command.path, "cp");
+        assert_eq!(command.summary, "copy files");
+        let recursive = command
+            .options
+            .iter()
+            .find(|option| option.names == ["-R"])
+            .unwrap();
+        assert!(recursive.documentation.contains("copies the directory"));
+        let preserve = command
+            .options
+            .iter()
+            .find(|option| option.names == ["-p"])
+            .unwrap();
+        assert!(preserve.documentation.contains("file mode"));
+        assert!(preserve.documentation.contains("permissions"));
+    }
+
+    #[test]
+    fn man_origin_strips_section_and_compression_suffixes() {
+        assert_eq!(
+            inferred_name_from_origin("/man/cp.1").as_deref(),
+            Some("cp")
+        );
+        assert_eq!(
+            inferred_name_from_origin("/man/printf.1p.gz").as_deref(),
+            Some("printf")
+        );
     }
 
     #[test]
