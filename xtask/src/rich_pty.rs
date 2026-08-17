@@ -17,16 +17,23 @@ use std::{
     ffi::OsString,
     fs::{self, DirBuilder, File},
     io::{self, BufWriter, Write},
-    os::unix::fs::DirBuilderExt,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
 const STARTUP_MARKER: &[u8] = b"Tab complete";
+const ALTERNATE_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+const ALTERNATE_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
+const DISCOVERY_ARTIFACT_BYTES_MAX: usize = 4 * 1024 * 1024;
+const DISCOVERY_DIRECTORY_ENTRIES_MAX: usize = 8;
+const DISCOVERY_FIXTURE_BYTES_MAX: usize = 4 * 1024;
 const CHECK_NAMES: &[&str] = &[
     "rich-editing",
     "mode-switch-and-palette-screen",
+    "automatic-command-intelligence",
+    "durable-command-discovery",
     "deferred-catalog-admission",
     "catalog-failure-restores-terminal",
     "completion",
@@ -59,6 +66,9 @@ struct SessionOptions {
     redirect_stderr: bool,
     rows: Option<usize>,
     columns: Option<usize>,
+    path: Option<PathBuf>,
+    index_dir: Option<PathBuf>,
+    help_path: Option<PathBuf>,
 }
 
 struct Session {
@@ -98,7 +108,14 @@ return quirl.config {{
             ),
         )?;
 
-        let path = env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
+        let path = options.path.clone().map_or_else(
+            || env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin")),
+            PathBuf::into_os_string,
+        );
+        let index_dir = options
+            .index_dir
+            .clone()
+            .unwrap_or_else(|| private.path.join("index"));
         let mut environment = BTreeMap::from([
             (
                 OsString::from("HOME"),
@@ -135,7 +152,11 @@ return quirl.config {{
             ),
             (
                 OsString::from("QUIRL_INDEX_DIR"),
-                private.path.join("index").into_os_string(),
+                index_dir.clone().into_os_string(),
+            ),
+            (
+                OsString::from("QUIRL_INDEX_PATH"),
+                index_dir.join("catalog.json").into_os_string(),
             ),
             (
                 OsString::from("QUIRL_RECOVERY_DIR"),
@@ -174,6 +195,12 @@ return quirl.config {{
         }
         if options.no_color {
             environment.insert(OsString::from("NO_COLOR"), OsString::from("1"));
+        }
+        if let Some(help_path) = options.help_path {
+            environment.insert(
+                OsString::from("QUIRL_HELP_PATH"),
+                help_path.into_os_string(),
+            );
         }
 
         let argv = if let Some(shell) = options.shell.as_ref() {
@@ -235,6 +262,28 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
 impl Drop for TempDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+struct DirectoryPermissionsGuard {
+    path: PathBuf,
+    restore: fs::Permissions,
+}
+
+impl DirectoryPermissionsGuard {
+    fn make_read_only(path: &Path) -> io::Result<Self> {
+        let restore = fs::metadata(path)?.permissions();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o500))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            restore,
+        })
+    }
+}
+
+impl Drop for DirectoryPermissionsGuard {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, self.restore.clone());
     }
 }
 
@@ -327,7 +376,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 12] {
+fn checks() -> [CheckCase; 14] {
     [
         CheckCase {
             name: "rich-editing",
@@ -336,6 +385,14 @@ fn checks() -> [CheckCase; 12] {
         CheckCase {
             name: "mode-switch-and-palette-screen",
             run: check_mode_switch_and_palette_screen,
+        },
+        CheckCase {
+            name: "automatic-command-intelligence",
+            run: check_automatic_command_intelligence,
+        },
+        CheckCase {
+            name: "durable-command-discovery",
+            run: check_durable_command_discovery,
         },
         CheckCase {
             name: "deferred-catalog-admission",
@@ -565,6 +622,354 @@ fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.drain_for(Duration::from_millis(100))?;
     session.pty.send(key::CTRL_D)?;
     ensure_status(session.pty.wait_exit()?, 0, "screen-state session")
+}
+
+fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Error>> {
+    // Failure model: redraws may lag resize/input, commands may retain the PTY
+    // foreground group, and any return path may strand raw or alternate-screen
+    // state. Keep this ordered end-to-end transaction together so every phase
+    // proves the prior phase returned to an owned prompt before continuing.
+    let fixtures = TempDirectory::new("quirl-command-intelligence")?;
+    let binary_dir = fixtures.path.join("bin");
+    let index_dir = fixtures.path.join("index");
+    create_private_directory(&binary_dir)?;
+    create_private_directory(&index_dir)?;
+    write_executable(
+        &binary_dir.join("fixture-tool"),
+        "#!/bin/sh\nprintf 'FIXTURE_TOOL_EXECUTED\\n'\n",
+    )?;
+    write_executable(
+        &binary_dir.join("handoff-tool"),
+        "#!/bin/sh\nprintf 'HANDOFF_STARTED\\n'\n/bin/sleep 2\nprintf 'HANDOFF_DONE\\n'\n",
+    )?;
+
+    let mut session = Session::new(
+        binary,
+        SessionOptions {
+            rows: Some(18),
+            columns: Some(120),
+            path: Some(binary_dir),
+            index_dir: Some(index_dir),
+            ..SessionOptions::default()
+        },
+    )?;
+    let startup = session.pty.wait_for(STARTUP_MARKER)?;
+    if !contains(&startup, ALTERNATE_SCREEN_ENTER) {
+        return Err(io::Error::other("rich startup did not enter the alternate screen").into());
+    }
+    ensure_bottom_status(&session, "startup")?;
+
+    let resize_start = session.pty.output().len();
+    session.pty.resize(14, 96)?;
+    session
+        .pty
+        .wait_for_screen("bottom status after resize", |screen| {
+            screen.bottom_line().starts_with("command | Alt-M mode")
+        })?;
+    if contains(
+        &session.pty.output()[resize_start..],
+        ALTERNATE_SCREEN_LEAVE,
+    ) {
+        return Err(io::Error::other("resize released alternate-screen ownership").into());
+    }
+    session.pty.resize(18, 120)?;
+    session
+        .pty
+        .wait_for_screen("bottom status after resize restoration", |screen| {
+            screen.bottom_line().starts_with("command | Alt-M mode")
+        })?;
+
+    wait_for_command_information(
+        &mut session,
+        "ls",
+        &[
+            "List a directory as structured",
+            "Capabilities:",
+            "Enter run",
+        ],
+    )?;
+    session.pty.send(b"\x1b[B")?;
+    session
+        .pty
+        .wait_for_screen("navigated automatic results", |screen| {
+            screen.bottom_line().contains("Enter accept")
+        })?;
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(&mut session)?;
+    clear_editor(&mut session)?;
+    session.pty.resize(18, 400)?;
+    session
+        .pty
+        .wait_for_screen("wide provenance frame", |screen| {
+            screen.bottom_line().starts_with("command | Alt-M mode")
+        })?;
+
+    for (command, summary, provenance) in [
+        ("cd", "Change the shell working", "source: builtin"),
+        (
+            "git status",
+            "Show repository and working-tree",
+            "source: external",
+        ),
+        (
+            "fixture-tool",
+            "Installed command discovered",
+            "source: external",
+        ),
+    ] {
+        wait_for_command_information(
+            &mut session,
+            command,
+            &[summary, "Capabilities:", provenance],
+        )?;
+        session.pty.send(key::ESCAPE)?;
+        wait_for_standard_status(&mut session)?;
+        clear_editor(&mut session)?;
+    }
+    session.pty.resize(18, 120)?;
+    session
+        .pty
+        .wait_for_screen("normal-width flag frame", |screen| {
+            screen.bottom_line().starts_with("command | Alt-M mode")
+        })?;
+
+    session.pty.type_text("ls -")?;
+    session
+        .pty
+        .wait_for_screen("automatic flag options", |screen| {
+            let text = screen.text();
+            text.contains("--all") && text.contains("Include hidden entries")
+        })?;
+    clear_editor(&mut session)?;
+    session.pty.type_text("ls -al")?;
+    session.pty.wait_for_screen_text("ls -al")?;
+    session.pty.drain_for(Duration::from_millis(300))?;
+    if session.pty.screen().text().contains("unknown flag") {
+        return Err(screen_error(
+            "valid clustered ls flags produced an unknown-flag diagnostic",
+            session.pty.screen(),
+        ));
+    }
+    clear_editor(&mut session)?;
+    session.pty.type_text("ls -alz")?;
+    session
+        .pty
+        .wait_for_screen_text("unknown flag `-alz` for `ls`")?;
+    session.pty.send(key::CTRL_C)?;
+    wait_for_prompt(&mut session)?;
+
+    wait_for_command_information(
+        &mut session,
+        "ls",
+        &["List a directory as structured", "Enter run"],
+    )?;
+    write_fixture(
+        &session.private.path.join("FIRST_ENTER_EXECUTED"),
+        "visible to native ls\n",
+    )?;
+    let execution_start = session.pty.output().len();
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"FIRST_ENTER_EXECUTED")?;
+    wait_for_prompt(&mut session)?;
+    let execution = &session.pty.output()[execution_start..];
+    if !contains(execution, ALTERNATE_SCREEN_LEAVE) || !contains(execution, ALTERNATE_SCREEN_ENTER)
+    {
+        return Err(io::Error::other(
+            "command execution did not release and safely reacquire the alternate screen",
+        )
+        .into());
+    }
+    ensure_bottom_status(&session, "after first-Enter execution")?;
+
+    wait_for_command_information(
+        &mut session,
+        "handoff-tool",
+        &["Installed command discovered", "Enter run"],
+    )?;
+    let quirl_process = session
+        .pty
+        .child_pid()
+        .ok_or_else(|| io::Error::other("Quirl exited before foreground handoff"))?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"HANDOFF_STARTED")?;
+    if session.pty.foreground_group()? == quirl_process {
+        return Err(
+            io::Error::other("foreground command did not receive terminal ownership").into(),
+        );
+    }
+    session.pty.wait_for(b"HANDOFF_DONE")?;
+    wait_for_prompt(&mut session)?;
+    if session.pty.foreground_group()? != quirl_process {
+        return Err(
+            io::Error::other("Quirl did not recover terminal ownership after handoff").into(),
+        );
+    }
+
+    session.pty.resize(4, 48)?;
+    session
+        .pty
+        .wait_for_screen("compact bottom status", |screen| {
+            screen.bottom_line().starts_with("command")
+        })?;
+    session.pty.resize(18, 120)?;
+    session
+        .pty
+        .wait_for_screen("restored bottom status", |screen| {
+            screen.bottom_line().starts_with("command | Alt-M mode")
+        })?;
+    let cleanup_start = session.pty.output().len();
+    session.pty.send(key::CTRL_D)?;
+    ensure_status(session.pty.wait_exit()?, 0, "command-intelligence EOF")?;
+    ensure_terminal_restored(&session, cleanup_start, "command-intelligence EOF")
+}
+
+fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> {
+    // Failure model: a cold write may be partial, a warm read may rewrite state,
+    // refresh may publish inside an editor turn, hostile declarations may run,
+    // and corrupt state may prevent prompt or terminal cleanup. This sequence
+    // retains one isolated namespace so byte-for-byte transitions stay causal.
+    let fixtures = TempDirectory::new("quirl-durable-discovery")?;
+    let binary_dir = fixtures.path.join("bin");
+    let help_dir = fixtures.path.join("help");
+    let index_dir = fixtures.path.join("index");
+    create_private_directory(&binary_dir)?;
+    create_private_directory(&help_dir)?;
+    create_private_directory(&index_dir)?;
+    let hostile_marker = fixtures.path.join("HOSTILE_CONTENT_EXECUTED");
+    write_executable(
+        &binary_dir.join("cold-tool"),
+        &format!(
+            "#!/bin/sh\n/usr/bin/touch {}\n",
+            shell_quote(&hostile_marker)
+        ),
+    )?;
+    write_fixture(
+        &help_dir.join("declarative-cold.help"),
+        &format!(
+            "Usage: declarative-cold [options]\n  --safe  Safe fixture option\n/usr/bin/touch {}\n",
+            shell_quote(&hostile_marker)
+        ),
+    )?;
+    let catalog_path = index_dir.join("catalog.json");
+    let state_path = index_dir.join("catalog.json.discovery.json");
+
+    let mut cold = discovery_session(binary, &binary_dir, &index_dir, &help_dir)?;
+    cold.pty.wait_for(STARTUP_MARKER)?;
+    wait_for_file(&mut cold, catalog_path.clone())?;
+    wait_for_file(&mut cold, state_path.clone())?;
+    assert_discovery_artifacts_bounded(&index_dir)?;
+    wait_for_command_information(
+        &mut cold,
+        "cold-tool",
+        &["Installed command discovered", "source: external"],
+    )?;
+    clear_editor(&mut cold)?;
+    wait_for_command_information(
+        &mut cold,
+        "declarative-cold",
+        &["Command discovered from supplied", "source: help-import"],
+    )?;
+    if hostile_marker.exists() {
+        return Err(io::Error::other("cold discovery executed hostile fixture content").into());
+    }
+    cold.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(&mut cold)?;
+    clear_editor(&mut cold)?;
+    cold.pty.send(key::CTRL_D)?;
+    ensure_status(cold.pty.wait_exit()?, 0, "cold discovery session")?;
+    let cold_catalog = read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX)?;
+    let cold_state = read_bounded_fixture(&state_path, DISCOVERY_ARTIFACT_BYTES_MAX)?;
+    drop(cold);
+
+    let mut warm = discovery_session(binary, &binary_dir, &index_dir, &help_dir)?;
+    warm.pty.wait_for(STARTUP_MARKER)?;
+    if read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX)? != cold_catalog
+        || read_bounded_fixture(&state_path, DISCOVERY_ARTIFACT_BYTES_MAX)? != cold_state
+    {
+        return Err(io::Error::other("warm discovery rewrote matching durable state").into());
+    }
+    wait_for_command_information(
+        &mut warm,
+        "cold-tool",
+        &["Installed command discovered", "source: external"],
+    )?;
+    clear_editor(&mut warm)?;
+
+    write_executable(
+        &binary_dir.join("changed-path-tool"),
+        &format!(
+            "#!/bin/sh\n/usr/bin/touch {}\n",
+            shell_quote(&hostile_marker)
+        ),
+    )?;
+    write_fixture(
+        &help_dir.join("changed-declaration.help"),
+        &format!(
+            "Usage: changed-declaration [options]\n  --safe  Changed fixture option\n/usr/bin/touch {}\n",
+            shell_quote(&hostile_marker)
+        ),
+    )?;
+    enter_and_wait(&mut warm, "cd .", STARTUP_MARKER)?;
+    wait_for_prompt(&mut warm)?;
+    wait_for_file_contents(&mut warm, &catalog_path, b"changed-path-tool")?;
+    wait_for_file_contents(&mut warm, &catalog_path, b"changed-declaration")?;
+    wait_for_file_contents(&mut warm, &state_path, b"changed-declaration.help")?;
+    enter_and_wait(&mut warm, "cd .", STARTUP_MARKER)?;
+    wait_for_prompt(&mut warm)?;
+    wait_for_command_information(
+        &mut warm,
+        "changed-path-tool",
+        &["Installed command discovered", "source: external"],
+    )?;
+    clear_editor(&mut warm)?;
+    wait_for_command_information(
+        &mut warm,
+        "changed-declaration",
+        &["Command discovered from supplied", "source: help-import"],
+    )?;
+    if hostile_marker.exists() {
+        return Err(io::Error::other("refresh executed hostile fixture content").into());
+    }
+    warm.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(&mut warm)?;
+    clear_editor(&mut warm)?;
+    warm.pty.send(key::CTRL_D)?;
+    ensure_status(warm.pty.wait_exit()?, 0, "warm discovery session")?;
+    if read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX)? == cold_catalog
+        || read_bounded_fixture(&state_path, DISCOVERY_ARTIFACT_BYTES_MAX)? == cold_state
+    {
+        return Err(
+            io::Error::other("changed discovery sources did not replace durable state").into(),
+        );
+    }
+    assert_discovery_artifacts_bounded(&index_dir)?;
+
+    let corrupt = TempDirectory::new("quirl-corrupt-discovery")?;
+    let corrupt_index = corrupt.path.join("index");
+    create_private_directory(&corrupt_index)?;
+    write_fixture(
+        &corrupt_index.join("catalog.json"),
+        "{ definitely not catalog json",
+    )?;
+    let _permissions = DirectoryPermissionsGuard::make_read_only(&corrupt_index)?;
+    let mut degraded = discovery_session(binary, &binary_dir, &corrupt_index, &help_dir)?;
+    degraded.pty.wait_for(STARTUP_MARKER)?;
+    wait_for_command_information(
+        &mut degraded,
+        "ls",
+        &["List a directory as structured", "Capabilities:"],
+    )?;
+    write_fixture(
+        &degraded.private.path.join("FALLBACK_BUILTIN_VISIBLE"),
+        "visible to fallback ls\n",
+    )?;
+    degraded.pty.send(key::ENTER)?;
+    degraded.pty.wait_for(b"FALLBACK_BUILTIN_VISIBLE")?;
+    wait_for_prompt(&mut degraded)?;
+    let cleanup_start = degraded.pty.output().len();
+    degraded.pty.send(key::CTRL_D)?;
+    ensure_status(degraded.pty.wait_exit()?, 0, "corrupt-cache fallback")?;
+    ensure_terminal_restored(&degraded, cleanup_start, "corrupt-cache fallback")
 }
 
 fn check_completion(binary: &Path) -> Result<(), Box<dyn Error>> {
@@ -1070,6 +1475,182 @@ fn wait_for_file(session: &mut Session, path: PathBuf) -> Result<(), Box<dyn Err
             format!("timed out waiting for {}", path.display()),
         )
         .into());
+    }
+    Ok(())
+}
+
+fn discovery_session(
+    binary: &Path,
+    path: &Path,
+    index_dir: &Path,
+    help_path: &Path,
+) -> Result<Session, Box<dyn Error>> {
+    Session::new(
+        binary,
+        SessionOptions {
+            path: Some(path.to_path_buf()),
+            index_dir: Some(index_dir.to_path_buf()),
+            help_path: Some(help_path.to_path_buf()),
+            rows: Some(18),
+            columns: Some(400),
+            ..SessionOptions::default()
+        },
+    )
+}
+
+fn wait_for_command_information(
+    session: &mut Session,
+    command: &str,
+    markers: &[&str],
+) -> Result<(), Box<dyn Error>> {
+    session.pty.type_text(command)?;
+    session.pty.wait_for_screen(
+        &format!("automatic information for {command:?}"),
+        |screen| {
+            let text = screen.text();
+            markers.iter().all(|marker| text.contains(marker))
+        },
+    )?;
+    Ok(())
+}
+
+fn ensure_bottom_status(session: &Session, stage: &str) -> Result<(), Box<dyn Error>> {
+    if !session
+        .pty
+        .screen()
+        .bottom_line()
+        .starts_with("command | Alt-M mode")
+    {
+        return Err(screen_error(
+            &format!("rich status was not on the physical bottom at {stage}"),
+            session.pty.screen(),
+        ));
+    }
+    Ok(())
+}
+
+fn wait_for_standard_status(session: &mut Session) -> Result<(), Box<dyn Error>> {
+    session
+        .pty
+        .wait_for_screen("standard bottom status", |screen| {
+            let bottom = screen.bottom_line();
+            bottom.starts_with("command | Alt-M mode") && bottom.contains("Tab complete")
+        })?;
+    Ok(())
+}
+
+fn clear_editor(session: &mut Session) -> Result<(), Box<dyn Error>> {
+    session.pty.send(key::CTRL_U)?;
+    wait_for_standard_status(session)
+}
+
+fn ensure_terminal_restored(
+    session: &Session,
+    output_start: usize,
+    stage: &str,
+) -> Result<(), Box<dyn Error>> {
+    if !contains(
+        &session.pty.output()[output_start..],
+        ALTERNATE_SCREEN_LEAVE,
+    ) {
+        return Err(io::Error::other(format!("{stage} did not leave the alternate screen")).into());
+    }
+    let modes = session.pty.terminal_modes()?;
+    if !modes.local_flags.contains(LocalFlags::ICANON)
+        || !modes.local_flags.contains(LocalFlags::ECHO)
+    {
+        return Err(
+            io::Error::other(format!("{stage} did not restore cooked terminal modes")).into(),
+        );
+    }
+    Ok(())
+}
+
+fn write_fixture(path: &Path, contents: &str) -> io::Result<()> {
+    let bytes = contents.as_bytes();
+    if bytes.len() > DISCOVERY_FIXTURE_BYTES_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "fixture {} exceeds its byte limit; observed={} limit={DISCOVERY_FIXTURE_BYTES_MAX}",
+                path.display(),
+                bytes.len()
+            ),
+        ));
+    }
+    fs::write(path, bytes)
+}
+
+fn write_executable(path: &Path, contents: &str) -> io::Result<()> {
+    write_fixture(path, contents)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+fn read_bounded_fixture(path: &Path, bytes_max: usize) -> io::Result<Vec<u8>> {
+    let declared = fs::metadata(path)?.len();
+    let bytes_max_u64 = u64::try_from(bytes_max).unwrap_or(u64::MAX);
+    if declared > bytes_max_u64 {
+        return Err(io::Error::other(format!(
+            "{} exceeds its byte limit; observed={declared} limit={bytes_max}",
+            path.display()
+        )));
+    }
+    let bytes = fs::read(path)?;
+    if bytes.len() > bytes_max {
+        return Err(io::Error::other(format!(
+            "{} grew past its byte limit while reading; observed={} limit={bytes_max}",
+            path.display(),
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn wait_for_file_contents(
+    session: &mut Session,
+    path: &Path,
+    marker: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    while Instant::now() < deadline {
+        if read_bounded_fixture(path, DISCOVERY_ARTIFACT_BYTES_MAX)
+            .is_ok_and(|bytes| contains(&bytes, marker))
+        {
+            return Ok(());
+        }
+        session.pty.drain_for(Duration::from_millis(20))?;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "timed out waiting for {marker:?} in bounded artifact {}",
+            path.display()
+        ),
+    )
+    .into())
+}
+
+fn assert_discovery_artifacts_bounded(index_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let mut entries = 0_usize;
+    for entry in fs::read_dir(index_dir)? {
+        let entry = entry?;
+        entries = entries.saturating_add(1);
+        if entries > DISCOVERY_DIRECTORY_ENTRIES_MAX {
+            return Err(io::Error::other(format!(
+                "discovery directory exceeded its entry limit; observed={entries} limit={DISCOVERY_DIRECTORY_ENTRIES_MAX}"
+            ))
+            .into());
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::other(format!(
+                "discovery artifact {} was not a regular file",
+                path.display()
+            ))
+            .into());
+        }
+        let _ = read_bounded_fixture(&path, DISCOVERY_ARTIFACT_BYTES_MAX)?;
     }
     Ok(())
 }
