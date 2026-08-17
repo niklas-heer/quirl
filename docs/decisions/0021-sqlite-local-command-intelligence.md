@@ -34,7 +34,11 @@ Readers reject non-regular, linked, over-permissive, oversized, wrong
 application-id, wrong-version, malformed, or catalog-incompatible files.
 Discovery retains its existing source, record, byte, deadline, cancellation,
 and refresh bounds. Legacy JSON catalog schemas remain read-only migration
-inputs; all writes use SQLite.
+inputs; all writes use SQLite. If bounded first-run discovery fails before any
+valid database exists, interactive initialization atomically publishes a
+builtin-only SQLite image. A valid prior database is never replaced by this
+fallback, and a later successful discovery generation replaces the fallback
+through the normal publication path.
 
 Semantic inference uses `model2vec-rs` with only its `local-only` and `onig`
 features and the `minishlab/potion-base-8M` model. After the interactive catalog
@@ -69,7 +73,9 @@ subcommands only display suggestions and never execute one.
 ## Failure model and invariants
 
 - A failed discovery or embedding build cannot replace the last complete
-  database; transaction rollback and atomic replacement preserve it.
+  database; transaction rollback and atomic replacement preserve it. When no
+  complete database exists, failed discovery publishes an indexable builtin
+  SQLite fallback so automatic embedding construction still has a source.
 - Catalog and normalized SQL rows describe one generation because they commit
   together.
 - Discovery state cannot claim freshness for different catalog bytes because it

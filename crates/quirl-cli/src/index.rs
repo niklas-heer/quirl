@@ -540,14 +540,81 @@ pub fn start_interactive_catalog_refresh() -> Option<CatalogRefresh> {
 }
 
 /// Initialize or repair the default cache within the interactive discovery
-/// deadline. The caller intentionally ignores failures and loads builtins, so
-/// cache permissions or malformed declarations cannot prevent terminal setup.
+/// deadline. If first-run discovery fails, publish an atomic builtin-only
+/// SQLite fallback for local intelligence without replacing a valid prior
+/// database. The caller intentionally ignores remaining persistence failures,
+/// so cache permissions cannot prevent terminal setup.
 pub fn initialize_interactive_catalog() {
     let Some(config) = DiscoveryConfig::from_environment() else {
         return;
     };
+    let _ =
+        initialize_interactive_catalog_with_deadline(&config, Instant::now() + DISCOVERY_DEADLINE);
+}
+
+fn initialize_interactive_catalog_with_deadline(
+    config: &DiscoveryConfig,
+    deadline: Instant,
+) -> Result<bool, ShellError> {
     let cancelled = AtomicBool::new(false);
-    let _ = refresh_catalog_cache(&config, Instant::now() + DISCOVERY_DEADLINE, &cancelled);
+    match refresh_catalog_cache(config, deadline, &cancelled) {
+        Ok(refreshed) => Ok(refreshed),
+        Err(discovery_error) => ensure_builtin_database(&config.index_path).map_err(|error| {
+            error.with_context(format!(
+                "catalog discovery failed before fallback publication: {}",
+                discovery_error.message
+            ))
+        }),
+    }
+}
+
+fn ensure_builtin_database(path: &Path) -> Result<bool, ShellError> {
+    let encoded = intelligence::encode_database(&Catalog::builtin(), None)?;
+    let _publication = DATABASE_PUBLICATION.lock().map_err(|_| {
+        ShellError::new(
+            ErrorCode::Io,
+            "the command-database publication lock was poisoned",
+        )
+        .with_help("Restart Quirl before repairing the local command database")
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        create_index_directories(parent)?;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            validate_index_reader_metadata(
+                path,
+                &metadata,
+                "Use an unlinked regular index file with no group/other write access",
+            )?;
+            let expected = read_index_bytes(
+                path,
+                intelligence::DATABASE_BYTES_MAX,
+                "command database",
+                "Use an unlinked regular command database",
+            )?;
+            if intelligence::decode_database(&expected, path).is_ok() {
+                return Ok(false);
+            }
+            replace_file_atomically(
+                path,
+                &expected,
+                &encoded,
+                AtomicReplaceOptions {
+                    bytes_max: intelligence::DATABASE_BYTES_MAX,
+                },
+            )?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            install_new_index(path, &encoded, parent.unwrap_or_else(|| Path::new(".")))?;
+            Ok(true)
+        }
+        Err(error) => Err(index_io_error("inspect", path, error)),
+    }
 }
 
 impl DiscoveryConfig {
@@ -2187,6 +2254,62 @@ mod tests {
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
         #[cfg(unix)]
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn first_run_discovery_deadline_publishes_searchable_builtin_database() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+
+        assert!(initialize_interactive_catalog_with_deadline(&config, Instant::now()).unwrap());
+
+        let bytes = read_index(&config.index_path).unwrap();
+        assert!(bytes.starts_with(b"SQLite format 3\0"));
+        let stats = intelligence::database_stats(&bytes, &config.index_path).unwrap();
+        assert!(stats.commands > 0);
+        assert!(stats.documents > 0);
+        let results =
+            intelligence::search(&bytes, &config.index_path, "change directory", 8, None).unwrap();
+        assert!(results.iter().any(|result| result.command == "cd"));
+
+        write_executable(&config.path_roots[0].join("after-fallback"));
+        assert!(refresh(&config).unwrap());
+        assert!(load_catalog_at(&config.index_path)
+            .find("after-fallback")
+            .is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn first_run_discovery_limit_publishes_builtin_database() {
+        let directory = temporary_directory();
+        let mut config = discovery_config(&directory);
+        config.path_roots = vec![directory.clone(); INDEX_ROOTS_MAX + 1];
+
+        assert!(initialize_interactive_catalog_with_deadline(
+            &config,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap());
+
+        let bytes = read_index(&config.index_path).unwrap();
+        let (catalog, state) = intelligence::decode_database(&bytes, &config.index_path).unwrap();
+        assert!(catalog.find("quirl run").is_some());
+        assert_eq!(state, None);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn discovery_failure_preserves_valid_prior_database_bytes() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        write_catalog_atomically(&config.index_path, &Catalog::builtin(), None).unwrap();
+        let prior = read_index(&config.index_path).unwrap();
+
+        assert!(!initialize_interactive_catalog_with_deadline(&config, Instant::now()).unwrap());
+
+        assert_eq!(read_index(&config.index_path).unwrap(), prior);
         fs::remove_dir_all(directory).unwrap();
     }
 
