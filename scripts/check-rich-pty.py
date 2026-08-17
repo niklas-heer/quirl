@@ -271,17 +271,24 @@ def check_rich_editing(binary: Path, root: Path) -> None:
         session.wait_for(b"^C")
         enter_and_wait(session, "/usr/bin/printf AFTER_CTRLC", b"AFTER_CTRLC")
 
-        # Alt-M is encoded as Escape followed by `m` in a legacy PTY. Assert
-        # both the session feedback and the next rich status frame so this
-        # catches event-decoding bugs as well as missed repaints.
+        # Alt-M is encoded as Escape followed by `m` in a legacy PTY. The rich
+        # surface must repaint in place, preserve the active edit buffer, and
+        # avoid committing one feedback line to scrollback per toggle.
+        session.type("/usr/bin/printf MODE_BUFFER_OK")
         session.send(b"\x1bm")
-        toggled_to_data = session.wait_for(b"typed values and data pipelines")
+        toggled_to_data = session.wait_for(b"data")
         if b"Alt-M mode" not in toggled_to_data or b"data" not in toggled_to_data:
             raise AssertionError("Alt-M did not repaint the rich data-mode status")
+        if b"typed values and data pipelines" in toggled_to_data:
+            raise AssertionError("Alt-M committed rich mode feedback to scrollback")
         session.send(b"\x1bm")
-        toggled_to_command = session.wait_for(b"processes and byte pipelines")
+        toggled_to_command = session.wait_for(b"command")
         if b"Alt-M mode" not in toggled_to_command or b"command" not in toggled_to_command:
             raise AssertionError("Alt-M did not repaint the rich command-mode status")
+        if b"processes and byte pipelines" in toggled_to_command:
+            raise AssertionError("Alt-M committed rich mode feedback to scrollback")
+        session.send(b"\r")
+        session.wait_for(b"MODE_BUFFER_OK")
 
         session.type("/usr/bin/printf 'MULTI_ONE")
         session.send(b"\r")
@@ -445,7 +452,7 @@ def check_interactive_runtime(binary: Path, root: Path) -> None:
         # A successful typed stream becomes a bounded cached data source without
         # rerunning the expression when Alt-D opens the data picker.
         session.send(b"\x1bm")
-        session.wait_for(b"typed values and data pipelines")
+        session.wait_for(b"data")
         enter_and_wait(session, "[1,2]", STARTUP_MARKER)
         session.send(b"\x1bd")
         session.wait_for(b"cached typed result")
@@ -470,7 +477,7 @@ def check_interactive_runtime(binary: Path, root: Path) -> None:
         wait_for_prompt(session)
 
         session.send(b"\x1bm")
-        session.wait_for(b"processes and byte pipelines")
+        session.wait_for(b"command")
 
         # A Lua process callback narrows the shared plan deadline to the VM's
         # security budget. Expiry must reap the child and restore the real PTY

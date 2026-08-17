@@ -34,7 +34,6 @@ use self::{
 use super::{
     read_history, ExtensionCompleter, PickerRanker, QuirlPrompt, SurfaceSymbols,
     MAX_HISTORY_ENCODED_ENTRY_BYTES, MAX_HISTORY_ENTRY_BYTES, MAX_HISTORY_RETAINED_BYTES,
-    MODE_TOGGLE_HOST_COMMAND,
 };
 use crate::theme::Theme;
 use crossterm::{
@@ -249,11 +248,12 @@ impl RichSurface {
     /// Input is polled every 16 ms so completion and PATH-analysis results can be
     /// observed without blocking keyboard handling. Accepted non-empty input is
     /// appended and flushed to bounded history before returning. Ctrl-C, empty-buffer
-    /// Ctrl-D, mode toggles, and suspension return explicit signals only after
-    /// cooked mode, cursor visibility, bracketed paste, and the inline viewport
-    /// have been restored. Terminal/history I/O and invalid completion requests
+    /// Ctrl-D and suspension return explicit signals only after cooked mode,
+    /// cursor visibility, bracketed paste, and the inline viewport have been
+    /// restored. Grammar-mode toggles redraw within this session and preserve
+    /// the edit buffer. Terminal/history I/O and invalid completion requests
     /// return [`ShellError`]; the drop guard retries terminal cleanup on error.
-    pub fn read_line(&mut self, prompt: &QuirlPrompt) -> Result<InteractiveSignal, ShellError> {
+    pub fn read_line(&mut self, prompt: &mut QuirlPrompt) -> Result<InteractiveSignal, ShellError> {
         self.dismiss_picker();
         self.expand_completion_pending = false;
         let mut editor = EditorState::new(&self.keymap, self.history.clone());
@@ -503,10 +503,7 @@ impl RichSurface {
                             return Ok(InteractiveSignal::CtrlC);
                         }
                         EditAction::ToggleGrammarMode => {
-                            self.terminal.release(None)?;
-                            return Ok(InteractiveSignal::HostCommand(
-                                MODE_TOGGLE_HOST_COMMAND.to_owned(),
-                            ));
+                            self.toggle_grammar_mode(prompt);
                         }
                         EditAction::Complete => {
                             if self.completion.open {
@@ -561,6 +558,21 @@ impl RichSurface {
                 _ => {}
             }
         }
+    }
+
+    fn toggle_grammar_mode(&mut self, prompt: &mut QuirlPrompt) {
+        // Failure model: releasing the inline viewport here destroys the
+        // editor state, while host feedback commits an unbounded line per
+        // toggle to scrollback. A mode switch transfers no terminal or process
+        // ownership, so it must remain an in-frame state transition. Preserve
+        // the buffer and cursor, invalidate mode-sensitive transient UI, and
+        // let the already-dirty loop repaint exactly one current frame.
+        prompt.toggle_mode();
+        self.expand_completion_pending = false;
+        self.completion.cancel_for_edit();
+        self.picker.dismiss();
+        self.help_active = false;
+        self.help_detail_scroll = 0;
     }
 
     fn open_picker(
@@ -1009,6 +1021,47 @@ mod tests {
     fn incomplete_quotes_continue_instead_of_executing() {
         assert!(input_is_incomplete("printf 'hello", Mode::Command));
         assert!(!input_is_incomplete("printf hello", Mode::Command));
+    }
+
+    #[test]
+    fn repeated_mode_keys_redraw_state_without_discarding_the_edit_buffer() {
+        let mut config = QuirlConfig::default();
+        config.prompt.left = vec!["mode".to_owned()];
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        let mut prompt = QuirlPrompt::with_config(Mode::Command, &config);
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("printf preserved");
+        editor.apply(EditAction::MoveLeft);
+        let buffer = editor.buffer().to_owned();
+        let cursor = editor.cursor();
+
+        for expected_mode in [Mode::Data, Mode::Command] {
+            let action = editor.apply_key(
+                crossterm::event::KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+                false,
+            );
+            assert_eq!(action, EditAction::ToggleGrammarMode);
+            surface.expand_completion_pending = true;
+            surface.completion.open = true;
+            surface.help_active = true;
+
+            surface.toggle_grammar_mode(&mut prompt);
+
+            assert_eq!(prompt.mode(), expected_mode);
+            assert_eq!(prompt.surface_context_left(), expected_mode.to_string());
+            assert_eq!(editor.buffer(), buffer);
+            assert_eq!(editor.cursor(), cursor);
+            assert!(!surface.expand_completion_pending);
+            assert!(!surface.completion.open);
+            assert!(!surface.help_active);
+        }
     }
 
     #[test]
