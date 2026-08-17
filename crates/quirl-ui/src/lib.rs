@@ -82,6 +82,8 @@ const ACTION_PICKER_MENU: &str = "action_picker_menu";
 const HELP_MENU: &str = "catalog_help_menu";
 const PICKER_ITEMS_MAX: usize = 4_096;
 const PICKER_RESULTS_MAX: usize = 256;
+pub(crate) const PICKER_QUERY_BYTES_MAX: usize = 1_024;
+pub(crate) const PICKER_RANKING_TEXT_BYTES_MAX: usize = 2 * 1_024;
 
 #[derive(Debug)]
 /// Reedline adapter that keeps all file ingestion behind Quirl's history limits.
@@ -321,18 +323,24 @@ struct StablePickerRanker;
 
 impl PickerRanker for StablePickerRanker {
     fn rank(&self, items: &[PickerItem], query: &str, limit: usize) -> Vec<PickerMatch> {
-        let query = query.to_lowercase();
+        let query = truncate_utf8_ref(query, PICKER_QUERY_BYTES_MAX).to_lowercase();
         items
             .iter()
+            .take(PICKER_ITEMS_MAX)
             .enumerate()
             .filter_map(|(index, item)| {
-                let searchable = format!("{} {}", item.label, item.description).to_lowercase();
-                let mut search = searchable.char_indices();
+                let label = truncate_utf8_ref(&item.label, PICKER_RANKING_TEXT_BYTES_MAX);
+                let description =
+                    truncate_utf8_ref(&item.description, PICKER_RANKING_TEXT_BYTES_MAX);
+                let searchable = StableFoldedText::new(label, description);
+                let mut search = searchable.value.char_indices();
                 let mut matched = Vec::new();
                 for wanted in query.chars() {
                     let (byte, _) = search.find(|(_, character)| *character == wanted)?;
-                    if byte < item.label.len() {
-                        matched.push(searchable[..byte].chars().count());
+                    if let Some(character_index) = searchable.label_index_at(byte) {
+                        if matched.last().copied() != Some(character_index) {
+                            matched.push(character_index);
+                        }
                     }
                 }
                 Some(PickerMatch {
@@ -343,6 +351,53 @@ impl PickerRanker for StablePickerRanker {
             .take(limit)
             .collect()
     }
+}
+
+struct StableFoldedText {
+    value: String,
+    label_index_by_byte: Vec<Option<usize>>,
+}
+
+impl StableFoldedText {
+    fn new(label: &str, description: &str) -> Self {
+        let mut folded = Self {
+            value: String::with_capacity(label.len().saturating_add(description.len())),
+            label_index_by_byte: Vec::with_capacity(label.len().saturating_add(description.len())),
+        };
+        for (index, character) in label.chars().enumerate() {
+            folded.push(character, Some(index));
+        }
+        if !description.is_empty() {
+            folded.push(' ', None);
+            for character in description.chars() {
+                folded.push(character, None);
+            }
+        }
+        folded
+    }
+
+    fn push(&mut self, character: char, label_index: Option<usize>) {
+        for lowercase in character.to_lowercase() {
+            self.value.push(lowercase);
+            self.label_index_by_byte
+                .extend(std::iter::repeat_n(label_index, lowercase.len_utf8()));
+        }
+    }
+
+    fn label_index_at(&self, byte_index: usize) -> Option<usize> {
+        self.label_index_by_byte.get(byte_index).copied().flatten()
+    }
+}
+
+fn truncate_utf8_ref(value: &str, maximum: usize) -> &str {
+    if value.len() <= maximum {
+        return value;
+    }
+    let mut end = maximum;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1904,7 +1959,10 @@ impl Prompt for QuirlPrompt {
         } else {
             self.mode.prompt()
         };
-        Cow::Owned(format!("search `{}` {indicator} ", history_search.term))
+        Cow::Owned(format!(
+            "search `{}` {indicator} ",
+            bounded_terminal_line(&history_search.term)
+        ))
     }
 
     fn get_prompt_right_color(&self) -> reedline::Color {
@@ -2322,7 +2380,7 @@ impl Completer for CatalogCompleter {
                 extensions
                     .complete(line, pos)
                     .into_iter()
-                    .map(extension_suggestion),
+                    .filter_map(|suggestion| extension_suggestion(line, suggestion)),
             );
         }
         let mut seen = HashSet::new();
@@ -2452,40 +2510,68 @@ fn catalog_suggestion(completion: quirl_catalog::Completion) -> Suggestion {
     } else {
         "value"
     };
+    let display = bounded_terminal_line(&completion.display);
+    let summary = bounded_terminal_text(&completion.summary);
+    let detail = bounded_terminal_text(&completion.detail);
+    let match_indices = safe_match_indices(&completion.display, &display, completion.match_indices);
     Suggestion {
         value: completion.value,
-        display_override: Some(format!("{}  [{kind}]", completion.display)),
+        display_override: Some(format!("{display}  [{kind}]")),
         description: Some(format!(
-            "{}\nkind: {kind} | source: catalog\n{}",
-            completion.summary, completion.detail
+            "{summary}\nkind: {kind} | source: catalog\n{detail}"
         )),
-        extra: Some(vec![
-            format!("kind: {kind} | source: catalog"),
-            completion.detail,
-        ]),
+        extra: Some(vec![format!("kind: {kind} | source: catalog"), detail]),
         span: Span::new(completion.replace_start, completion.replace_end),
         append_whitespace: true,
-        match_indices: Some(completion.match_indices),
+        match_indices: Some(match_indices),
         ..Suggestion::default()
     }
 }
 
-fn extension_suggestion(completion: ExtensionSuggestion) -> Suggestion {
-    Suggestion {
+fn extension_suggestion(line: &str, completion: ExtensionSuggestion) -> Option<Suggestion> {
+    if !extension_replacement_is_valid(line, &completion) {
+        return None;
+    }
+    let display = bounded_terminal_line(&completion.display);
+    let summary = bounded_terminal_text(&completion.summary);
+    let detail = bounded_terminal_text(&completion.detail);
+    Some(Suggestion {
         value: completion.value,
-        display_override: Some(format!("{}  [plugin]", completion.display)),
-        description: Some(format!(
-            "{}\nkind: value | source: plugin\n{}",
-            completion.summary, completion.detail
-        )),
-        extra: Some(vec![
-            "kind: value | source: plugin".to_owned(),
-            completion.detail,
-        ]),
+        display_override: Some(format!("{display}  [plugin]")),
+        description: Some(format!("{summary}\nkind: value | source: plugin\n{detail}")),
+        extra: Some(vec!["kind: value | source: plugin".to_owned(), detail]),
         span: Span::new(completion.replace_start, completion.replace_end),
         append_whitespace: true,
         ..Suggestion::default()
+    })
+}
+
+pub(crate) fn extension_replacement_is_valid(line: &str, completion: &ExtensionSuggestion) -> bool {
+    completion.replace_start <= completion.replace_end
+        && completion.replace_end <= line.len()
+        && line.is_char_boundary(completion.replace_start)
+        && line.is_char_boundary(completion.replace_end)
+}
+
+fn bounded_terminal_line(value: &str) -> String {
+    let escaped = escape_terminal_line(value);
+    truncate_utf8_ref(&escaped, PICKER_RANKING_TEXT_BYTES_MAX).to_owned()
+}
+
+fn bounded_terminal_text(value: &str) -> String {
+    let escaped = escape_terminal_controls(value);
+    truncate_utf8_ref(&escaped, PICKER_RANKING_TEXT_BYTES_MAX).to_owned()
+}
+
+fn safe_match_indices(original: &str, rendered: &str, indices: Vec<usize>) -> Vec<usize> {
+    if original != rendered {
+        return Vec::new();
     }
+    let characters = rendered.chars().count();
+    indices
+        .into_iter()
+        .filter(|index| *index < characters)
+        .collect()
 }
 
 fn picker_query_and_span(kind: PickerItemKind, line: &str, pos: usize) -> (&str, usize, usize) {
@@ -2514,29 +2600,33 @@ fn rank_picker_suggestions(
     replace_start: usize,
     replace_end: usize,
 ) -> Vec<Suggestion> {
+    let query = truncate_utf8_ref(query, PICKER_QUERY_BYTES_MAX);
     ranker
         .rank(items, query, PICKER_RESULTS_MAX)
         .into_iter()
-        .map(|matched| {
-            let item = &items[matched.index];
+        .filter_map(|matched| {
+            let item = items.get(matched.index)?;
             let kind = picker_kind_label(item.kind);
-            let detail = format!("{}\nkind: {kind} | source: picker", item.description);
+            let label = bounded_terminal_line(&item.label);
+            let description = bounded_terminal_text(&item.description);
+            let match_indices = safe_match_indices(&item.label, &label, matched.match_indices);
+            let detail = format!("{description}\nkind: {kind} | source: picker");
             let extra = item
                 .preview
                 .iter()
-                .cloned()
+                .map(|preview| bounded_terminal_text(preview))
                 .chain([format!("kind: {kind} | source: picker")])
                 .collect::<Vec<_>>();
-            Suggestion {
+            Some(Suggestion {
                 value: item.value.clone(),
-                display_override: Some(format!("{}  [{kind}]", item.label)),
+                display_override: Some(format!("{label}  [{kind}]")),
                 description: Some(detail),
                 extra: Some(extra),
                 span: Span::new(replace_start, replace_end),
                 append_whitespace: false,
-                match_indices: Some(matched.match_indices),
+                match_indices: Some(match_indices),
                 ..Suggestion::default()
-            }
+            })
         })
         .collect()
 }
@@ -2589,7 +2679,7 @@ fn history_picker_items(history: &[String]) -> Vec<PickerItem> {
         .map(|(index, entry)| PickerItem {
             id: format!("History-{index}"),
             kind: PickerItemKind::History,
-            label: escape_terminal_line(entry),
+            label: bounded_terminal_line(entry),
             description: "history".to_owned(),
             preview: None,
             value: entry.clone(),
@@ -2614,7 +2704,13 @@ const HISTORY_READ_LIMITS: HistoryReadLimits = HistoryReadLimits {
     entry_bytes_max: MAX_HISTORY_ENTRY_BYTES,
 };
 
-fn read_history(path: &Path) -> Result<Vec<String>, ShellError> {
+/// Read the newest valid entries from Quirl's durable Reedline history format.
+///
+/// The reader scans at most about 32 MiB from the file tail, retains at most
+/// 50,000 entries or 8 MiB, skips invalid UTF-8 and oversized records, and
+/// decodes Reedline-compatible multiline escapes. A missing file is an empty
+/// history; other filesystem failures return [`ErrorCode::Io`].
+pub fn read_history(path: &Path) -> Result<Vec<String>, ShellError> {
     read_history_with_limits(path, HISTORY_READ_LIMITS)
 }
 
@@ -2720,9 +2816,12 @@ fn picker_sources(catalog: &Catalog, mut items: Vec<PickerItem>) -> Vec<PickerIt
             .map(|(index, command)| PickerItem {
                 id: format!("action-{}", next_id + index),
                 kind: PickerItemKind::Action,
-                label: command.path.clone(),
-                description: command.summary.clone(),
-                preview: Some(command.details.clone()),
+                label: truncate_utf8_ref(&command.path, PICKER_RANKING_TEXT_BYTES_MAX).to_owned(),
+                description: truncate_utf8_ref(&command.summary, PICKER_RANKING_TEXT_BYTES_MAX)
+                    .to_owned(),
+                preview: Some(
+                    truncate_utf8_ref(&command.details, PICKER_RANKING_TEXT_BYTES_MAX).to_owned(),
+                ),
                 value: command.path.clone(),
             }),
     );
@@ -2740,7 +2839,11 @@ fn picker_sources(catalog: &Catalog, mut items: Vec<PickerItem>) -> Vec<PickerIt
                     PickerItem {
                         id: format!("file-{}", next_id + index),
                         kind: PickerItemKind::File,
-                        label: path.to_string_lossy().into_owned(),
+                        label: truncate_utf8_ref(
+                            path.to_string_lossy().as_ref(),
+                            PICKER_RANKING_TEXT_BYTES_MAX,
+                        )
+                        .to_owned(),
                         description: if is_directory {
                             "directory".to_owned()
                         } else {
@@ -2908,6 +3011,135 @@ mod tests {
                 replace_end: pos,
             }]
         }
+    }
+
+    fn assert_terminal_fields_are_safe(suggestion: &Suggestion) {
+        let rendered = suggestion
+            .display_override
+            .iter()
+            .chain(suggestion.description.iter())
+            .chain(suggestion.extra.iter().flatten())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{009b}'));
+        assert!(!rendered.contains('\u{0007}'));
+        assert!(rendered.contains("\\u{1b}"));
+        assert!(rendered.contains("\\u{9b}"));
+        assert!(rendered.contains("\\u{7}"));
+    }
+
+    #[test]
+    fn simple_surface_escapes_completion_extension_picker_and_filename_fields() {
+        let hostile = "safe\u{1b}[31m\u{1b}]8;;url\u{7}\u{009b}2J";
+        let completion = catalog_suggestion(quirl_catalog::Completion {
+            value: hostile.to_owned(),
+            display: hostile.to_owned(),
+            summary: hostile.to_owned(),
+            detail: hostile.to_owned(),
+            replace_start: 0,
+            replace_end: 0,
+            match_indices: vec![0],
+        });
+        assert_eq!(completion.value, hostile);
+        assert_terminal_fields_are_safe(&completion);
+
+        let extension = extension_suggestion(
+            "",
+            ExtensionSuggestion {
+                value: hostile.to_owned(),
+                display: hostile.to_owned(),
+                summary: hostile.to_owned(),
+                detail: hostile.to_owned(),
+                replace_start: 0,
+                replace_end: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(extension.value, hostile);
+        assert_terminal_fields_are_safe(&extension);
+
+        for kind in [PickerItemKind::Completion, PickerItemKind::File] {
+            let item = PickerItem {
+                id: "hostile".to_owned(),
+                kind,
+                label: hostile.to_owned(),
+                description: hostile.to_owned(),
+                preview: Some(hostile.to_owned()),
+                value: hostile.to_owned(),
+            };
+            let suggestion = rank_picker_suggestions(&StablePickerRanker, &[item], "", 0, 0)
+                .pop()
+                .unwrap();
+            assert_eq!(suggestion.value, hostile);
+            assert_terminal_fields_are_safe(&suggestion);
+        }
+    }
+
+    #[test]
+    fn invalid_extension_replacement_offsets_are_discarded_at_ui_adapters() {
+        let line = "écho";
+        for (start, end) in [(3, 2), (0, line.len() + 1), (1, 2)] {
+            let item = ExtensionSuggestion {
+                value: "safe".to_owned(),
+                display: "safe".to_owned(),
+                summary: "safe".to_owned(),
+                detail: "safe".to_owned(),
+                replace_start: start,
+                replace_end: end,
+            };
+            assert!(!extension_replacement_is_valid(line, &item));
+            assert!(extension_suggestion(line, item).is_none());
+        }
+    }
+
+    #[test]
+    fn simple_picker_ranking_caps_items_labels_and_queries_without_shifting_indices() {
+        let label = "a".repeat(PICKER_RANKING_TEXT_BYTES_MAX);
+        let item = PickerItem {
+            id: "bounded".to_owned(),
+            kind: PickerItemKind::Completion,
+            label,
+            description: "z".repeat(PICKER_RANKING_TEXT_BYTES_MAX + 1),
+            preview: None,
+            value: "original".to_owned(),
+        };
+        let maximum_query = "a".repeat(PICKER_QUERY_BYTES_MAX);
+        let matches = StablePickerRanker.rank(
+            std::slice::from_ref(&item),
+            &format!("{maximum_query}ignored"),
+            PICKER_RESULTS_MAX,
+        );
+        assert_eq!(
+            matches[0].match_indices,
+            (0..PICKER_QUERY_BYTES_MAX).collect::<Vec<_>>()
+        );
+
+        let mut items = vec![item; PICKER_ITEMS_MAX];
+        items.push(PickerItem {
+            id: "outside".to_owned(),
+            kind: PickerItemKind::Completion,
+            label: "unique".to_owned(),
+            description: String::new(),
+            preview: None,
+            value: "outside".to_owned(),
+        });
+        assert!(StablePickerRanker
+            .rank(&items, "unique", PICKER_RESULTS_MAX)
+            .is_empty());
+    }
+
+    #[test]
+    fn history_search_prompt_escapes_transient_terminal_controls() {
+        let prompt = QuirlPrompt::new(Mode::Command);
+        let rendered = prompt.render_prompt_history_search_indicator(PromptHistorySearch::new(
+            reedline::PromptHistorySearchStatus::Passing,
+            "find\u{1b}]8;;url\u{7}\u{009b}2J".to_owned(),
+        ));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{009b}'));
+        assert!(!rendered.contains('\u{0007}'));
     }
 
     #[test]

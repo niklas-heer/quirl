@@ -1,4 +1,6 @@
-use super::super::{CompletionWorker, ExtensionCompleter, ExtensionSuggestion};
+use super::super::{
+    extension_replacement_is_valid, CompletionWorker, ExtensionCompleter, ExtensionSuggestion,
+};
 use quirl_catalog::{
     Catalog, Completion, CompletionCancellation, CompletionOutcome, CompletionRequest, Provenance,
     Trust, COMPLETION_PROTOCOL_VERSION, MAX_COMPLETION_DEADLINE_MS, MAX_COMPLETION_RESULTS,
@@ -113,7 +115,12 @@ impl ExtensionWorker {
             let Some(request) = request else {
                 continue;
             };
-            let items = completer.complete(&request.line, request.cursor);
+            let items = completer
+                .complete(&request.line, request.cursor)
+                .into_iter()
+                .take(COMPLETION_ITEMS_MAX)
+                .filter(|item| extension_replacement_is_valid(&request.line, item))
+                .collect();
             if worker_latest.load(Ordering::Acquire) == request.request_id {
                 let mut slot = worker_response
                     .lock()
@@ -614,6 +621,21 @@ mod tests {
         delay: Duration,
     }
 
+    struct InvalidSpanCompleter;
+
+    impl ExtensionCompleter for InvalidSpanCompleter {
+        fn complete(&mut self, _line: &str, _cursor: usize) -> Vec<ExtensionSuggestion> {
+            vec![ExtensionSuggestion {
+                value: "invalid".to_owned(),
+                display: "invalid".to_owned(),
+                summary: "invalid".to_owned(),
+                detail: "invalid".to_owned(),
+                replace_start: 1,
+                replace_end: 2,
+            }]
+        }
+    }
+
     impl ExtensionCompleter for SlowCompleter {
         fn complete(&mut self, line: &str, cursor: usize) -> Vec<ExtensionSuggestion> {
             std::thread::sleep(self.delay);
@@ -691,6 +713,20 @@ mod tests {
         assert!(state
             .resource_notice()
             .is_some_and(|notice| notice.contains("4096 query bytes")));
+    }
+
+    #[test]
+    fn rich_extension_worker_discards_invalid_utf8_replacement_boundaries() {
+        let mut state =
+            CompletionState::new(Catalog::builtin(), Some(Box::new(InvalidSpanCompleter)));
+        state.request("é", "é".len()).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline && state.streaming {
+            state.poll("é", "é".len());
+            std::thread::yield_now();
+        }
+        assert!(!state.streaming);
+        assert!(state.items.iter().all(|item| item.source != "plugin"));
     }
 
     #[test]

@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
-        Arc,
+        Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -218,26 +217,37 @@ pub struct PickerResponse {
 /// A single-worker picker executor. Newer request IDs atomically invalidate
 /// older requests, so stale results can never be observed by the caller.
 pub struct PickerWorker {
-    requests: Option<Sender<PickerRequest>>,
-    responses: Receiver<PickerResponse>,
+    queue: Arc<(Mutex<PickerQueue>, Condvar)>,
+    response: Arc<Mutex<Option<PickerResponse>>>,
     latest_request_id: Arc<AtomicU64>,
     submitted_request_id: u64,
     worker: Option<JoinHandle<()>>,
 }
 
+#[derive(Default)]
+struct PickerQueue {
+    pending: Option<PickerRequest>,
+    shutdown: bool,
+}
+
 impl PickerWorker {
     /// Spawn a worker with no submitted request IDs.
     pub fn new() -> Self {
-        let (requests, request_receiver) = mpsc::channel();
-        let (response_sender, responses) = mpsc::channel();
+        // Failure model: input generations can arrive faster than ranking, and
+        // callers may stop polling while a result is produced. One replaceable
+        // request and response keep both directions bounded; request IDs make
+        // stale in-flight work unobservable.
+        let queue = Arc::new((Mutex::new(PickerQueue::default()), Condvar::new()));
+        let worker_queue = Arc::clone(&queue);
+        let response = Arc::new(Mutex::new(None));
+        let worker_response = Arc::clone(&response);
         let latest_request_id = Arc::new(AtomicU64::new(0));
         let worker_latest = Arc::clone(&latest_request_id);
-        let worker = thread::spawn(move || {
-            picker_worker_loop(request_receiver, response_sender, worker_latest)
-        });
+        let worker =
+            thread::spawn(move || picker_worker_loop(worker_queue, worker_response, worker_latest));
         Self {
-            requests: Some(requests),
-            responses,
+            queue,
+            response,
             latest_request_id,
             submitted_request_id: 0,
             worker: Some(worker),
@@ -257,17 +267,14 @@ impl PickerWorker {
         self.submitted_request_id = request.request_id;
         self.latest_request_id
             .store(request.request_id, Ordering::Release);
-        self.requests
-            .as_ref()
-            .ok_or_else(|| {
-                ShellError::new(ErrorCode::ResourceLimit, "picker worker is unavailable")
-                    .with_help("Create a new picker worker for the next interactive session")
-            })?
-            .send(request)
-            .map_err(|_| {
-                ShellError::new(ErrorCode::ResourceLimit, "picker worker is unavailable")
-                    .with_help("Create a new picker worker for the next interactive session")
-            })
+        let (lock, ready) = &*self.queue;
+        let mut state = lock_recover(lock);
+        if state.shutdown {
+            return Err(unavailable_picker_worker());
+        }
+        state.pending = Some(request);
+        ready.notify_one();
+        Ok(())
     }
 
     /// Invalidate `cancellation.request_id` if it is still current.
@@ -279,6 +286,23 @@ impl PickerWorker {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+        let (lock, _) = &*self.queue;
+        let mut state = lock_recover(lock);
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|request| request.request_id == cancellation.request_id)
+        {
+            state.pending = None;
+        }
+        drop(state);
+        let mut response = lock_recover(&self.response);
+        if response
+            .as_ref()
+            .is_some_and(|response| response.request_id == cancellation.request_id)
+        {
+            response.take();
+        }
         Ok(())
     }
 
@@ -286,18 +310,14 @@ impl PickerWorker {
     /// stale response that was produced before a new keystroke arrived.
     pub fn try_recv_latest(&self) -> Option<PickerResponse> {
         let expected = self.submitted_request_id;
+        let mut response = lock_recover(&self.response);
         if self.latest_request_id.load(Ordering::Acquire) != expected {
-            while self.responses.try_recv().is_ok() {}
+            response.take();
             return None;
         }
-        let mut newest = None;
-        loop {
-            match self.responses.try_recv() {
-                Ok(response) if response.request_id == expected => newest = Some(response),
-                Ok(_) => {}
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return newest,
-            }
-        }
+        response
+            .take()
+            .filter(|response| response.request_id == expected)
     }
 }
 
@@ -309,9 +329,15 @@ impl Default for PickerWorker {
 
 impl Drop for PickerWorker {
     fn drop(&mut self) {
-        // Dropping the sender closes the worker's receive loop. Joining avoids
-        // allowing a background query to outlive an interactive session.
-        self.requests.take();
+        self.latest_request_id.fetch_add(1, Ordering::AcqRel);
+        let (lock, ready) = &*self.queue;
+        let mut state = lock_recover(lock);
+        state.shutdown = true;
+        state.pending = None;
+        ready.notify_one();
+        drop(state);
+        // Ranking checks cancellation and its bounded deadline between items,
+        // so joining preserves the no-orphan-worker lifecycle invariant.
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -319,23 +345,53 @@ impl Drop for PickerWorker {
 }
 
 fn picker_worker_loop(
-    requests: Receiver<PickerRequest>,
-    responses: Sender<PickerResponse>,
+    queue: Arc<(Mutex<PickerQueue>, Condvar)>,
+    response_slot: Arc<Mutex<Option<PickerResponse>>>,
     latest_request_id: Arc<AtomicU64>,
 ) {
-    while let Ok(request) = requests.recv() {
+    loop {
+        let request = {
+            let (lock, ready) = &*queue;
+            let mut state = lock_recover(lock);
+            while state.pending.is_none() && !state.shutdown {
+                state = match ready.wait(state) {
+                    Ok(state) => state,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+            if state.shutdown {
+                return;
+            }
+            state.pending.take()
+        };
+        let Some(request) = request else {
+            continue;
+        };
         let request_id = request.request_id;
         let response = execute_request(&request, || {
             latest_request_id.load(Ordering::Acquire) != request_id
         });
         // A stale response is intentionally not published. The caller also
         // filters defensively in case it submitted a newer request concurrently.
-        if latest_request_id.load(Ordering::Acquire) == request_id
-            && responses.send(response).is_err()
-        {
-            return;
+        if latest_request_id.load(Ordering::Acquire) == request_id {
+            let mut slot = lock_recover(&response_slot);
+            if latest_request_id.load(Ordering::Acquire) == request_id {
+                *slot = Some(response);
+            }
         }
     }
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn unavailable_picker_worker() -> ShellError {
+    ShellError::new(ErrorCode::ResourceLimit, "picker worker is unavailable")
+        .with_help("Create a new picker worker for the next interactive session")
 }
 
 /// Execute a request synchronously for hosts that already own a worker.
@@ -820,6 +876,34 @@ mod tests {
         let response = response.expect("newest picker response should arrive");
         assert_eq!(response.request_id, 2);
         assert!(matches!(response.outcome, PickerOutcome::Ready { .. }));
+    }
+
+    #[test]
+    fn worker_flood_retains_only_the_latest_pending_request_and_response() {
+        let mut worker = PickerWorker::new();
+        const REQUESTS: u64 = 10_000;
+        for request_id in 1..=REQUESTS {
+            worker
+                .submit(request(
+                    request_id,
+                    vec![item("item", ItemKind::File, "cargo.toml")],
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(worker.latest_request_id.load(Ordering::Acquire), REQUESTS);
+        let pending_id = {
+            let (lock, _) = &*worker.queue;
+            lock_recover(lock)
+                .pending
+                .as_ref()
+                .map(|request| request.request_id)
+        };
+        let response_id = lock_recover(&worker.response)
+            .as_ref()
+            .map(|response| response.request_id);
+        assert!(pending_id.is_none() || pending_id == Some(REQUESTS));
+        assert!(response_id.is_none() || response_id.is_some_and(|id| id <= REQUESTS));
     }
 
     #[test]
