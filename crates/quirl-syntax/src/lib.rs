@@ -1,5 +1,13 @@
 //! Quirl's deliberately small interaction grammar.
 
+#![cfg_attr(
+    test,
+    allow(
+        dead_code_pub_in_binary,
+        reason = "the libtest harness is an executable, but these public items remain library API"
+    )
+)]
+
 use serde::{Deserialize, Serialize};
 use std::{fmt, ops::Range, str::FromStr};
 
@@ -429,7 +437,7 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                         "Use descriptor 0 for input, 1 or 2 for output, or an explicit `bash { ... }`/`zsh { ... }` island",
                     ));
                 }
-                let Some(next) = tokens.get(index + 1) else {
+                let Some([_, next]) = tokens[index..].array_windows::<2>().next() else {
                     return Err(syntax_error(
                         token,
                         "redirection needs a path",
@@ -498,9 +506,9 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                     commands: std::mem::take(&mut commands),
                     background: true,
                 });
-                if index + 1 < tokens.len() {
+                if let Some([_, next]) = tokens[index..].array_windows::<2>().next() {
                     return Err(syntax_error(
-                        &tokens[index + 1],
+                        next,
                         "background marker must end a command list",
                         "Run the following command on a new line",
                     ));
@@ -1444,6 +1452,23 @@ mod tests {
         let error = parse_command_list("echo 'unfinished").unwrap_err();
         assert_eq!(error.start, 5);
         assert!(error.help.contains("Close"));
+    }
+
+    #[test]
+    fn fixed_width_token_transitions_report_the_following_token() {
+        let redirect = parse_command_list("printf ok > | next").unwrap_err();
+        assert_eq!(redirect.message, "redirection path must be a word");
+        assert_eq!(&"printf ok > | next"[redirect.start..redirect.end], "|");
+
+        let background = parse_command_list("sleep 1 & echo after").unwrap_err();
+        assert_eq!(
+            background.message,
+            "background marker must end a command list"
+        );
+        assert_eq!(
+            &"sleep 1 & echo after"[background.start..background.end],
+            "echo"
+        );
     }
 
     #[test]

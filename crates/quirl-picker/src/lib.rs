@@ -1,5 +1,13 @@
 //! Terminal-independent typed fuzzy selection.
 
+#![cfg_attr(
+    test,
+    allow(
+        dead_code_pub_in_binary,
+        reason = "the libtest harness is an executable, but these public items remain library API"
+    )
+)]
+
 use quirl_core::{ErrorCode, ShellError, VersionPolicy};
 use serde::{Deserialize, Serialize};
 use std::{
