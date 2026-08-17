@@ -18,7 +18,7 @@
 - Values remain `DataValue` from source ingress through transforms and shared
   execution outcomes. JSON, YAML, TOML, and byte strings are named conversion
   boundaries; none is the evaluator's internal representation.
-- Every conversion validates bytes, rows, record width, nesting depth, value
+- Every conversion validates bytes, rows, record width, envelope/value nesting depth, value
   nodes, retained text, and materialized bytes. A bridge fails with
   `ResourceLimit` before retaining the first value beyond its configured bound,
   and reports the configured limit and observed use when safe.
@@ -107,6 +107,11 @@ script and watch consumers and therefore applies the same documented loss as
 `to json`.
 JSON, YAML, TOML, and directory entries are validated then materialized because
 their current underlying parsers expose whole-document APIs.
+YAML anchors and aliases are rejected by a syntax-aware preflight before the
+whole-document parser can expand them. Leading UTF-8 BOMs are consumed as text
+encoding markers, while malformed UTF-8 is a data encoding diagnostic with
+conversion guidance. CSV enforces record width while constructing both the
+header and each lazily pulled row, before retaining the first excess field.
 
 Every adapter enforces the default 8 MiB file size, 100,000 row/node, 256
 field, 64 nesting-depth, 8 MiB retained-text, 16 MiB materialization, and
