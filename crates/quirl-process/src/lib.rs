@@ -2231,26 +2231,51 @@ mod platform {
                 .with_context(error.to_string())
                 .with_help("Inspect the job with `jobs` and retry")
         })?;
+        Ok(record_wait_status(
+            status,
+            &mut child.status,
+            &mut child.exit_status,
+        ))
+    }
+
+    fn record_wait_status(
+        status: WaitStatus,
+        child_status: &mut JobStatus,
+        exit_status: &mut Option<i32>,
+    ) -> bool {
         match status {
             WaitStatus::Exited(_, code) => {
-                child.status = JobStatus::Done;
-                child.exit_status = Some(code);
+                *child_status = JobStatus::Done;
+                *exit_status = Some(code);
             }
             WaitStatus::Signaled(_, signal, _) => {
-                child.status = JobStatus::Done;
-                child.exit_status = Some(128 + signal as i32);
+                *child_status = JobStatus::Done;
+                *exit_status = Some(128 + signal as i32);
             }
             WaitStatus::Stopped(_, signal) => {
-                child.status = JobStatus::Stopped;
-                child.exit_status = Some(128 + signal as i32);
+                *child_status = JobStatus::Stopped;
+                *exit_status = Some(128 + signal as i32);
             }
             WaitStatus::Continued(_) => {
-                child.status = JobStatus::Running;
-                child.exit_status = None;
+                *child_status = JobStatus::Running;
+                *exit_status = None;
             }
-            WaitStatus::StillAlive => {}
+            WaitStatus::StillAlive => return false,
+            // Linux reports ptrace events as stops distinct from WIFSTOPPED.
+            // They remain live children, so retaining them as stopped keeps
+            // process ownership intact and prevents a false reap.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            WaitStatus::PtraceEvent(_, signal, _) => {
+                *child_status = JobStatus::Stopped;
+                *exit_status = Some(128 + signal as i32);
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            WaitStatus::PtraceSyscall(_) => {
+                *child_status = JobStatus::Stopped;
+                *exit_status = Some(128 + Signal::SIGTRAP as i32);
+            }
         }
-        Ok(!matches!(status, WaitStatus::StillAlive))
+        true
     }
 
     static FOREGROUND_TERMINAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3194,6 +3219,32 @@ mod platform {
             let finished = executor.execute_capture("fg %1").unwrap();
             assert_eq!(finished.status, 7);
             assert!(executor.jobs().is_empty());
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[test]
+        fn ptrace_wait_states_remain_live_and_stopped() {
+            let process_id = Pid::from_raw(7);
+            let mut child_status = JobStatus::Running;
+            let mut exit_status = None;
+
+            assert!(record_wait_status(
+                WaitStatus::PtraceEvent(process_id, Signal::SIGTRAP, 1),
+                &mut child_status,
+                &mut exit_status,
+            ));
+            assert_eq!(child_status, JobStatus::Stopped);
+            assert_eq!(exit_status, Some(128 + Signal::SIGTRAP as i32));
+
+            child_status = JobStatus::Running;
+            exit_status = None;
+            assert!(record_wait_status(
+                WaitStatus::PtraceSyscall(process_id),
+                &mut child_status,
+                &mut exit_status,
+            ));
+            assert_eq!(child_status, JobStatus::Stopped);
+            assert_eq!(exit_status, Some(128 + Signal::SIGTRAP as i32));
         }
 
         #[test]
