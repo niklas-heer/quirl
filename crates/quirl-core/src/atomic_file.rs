@@ -9,9 +9,11 @@
 //!   permissions can fail. The target is untouched until the complete candidate
 //!   contents and intended permissions have both been synchronized.
 //! - Replacement can succeed before the parent-directory sync fails. A verified
-//!   hard link retains the original inode before replacement; returned failures
-//!   roll it back, while a crash leaves either the old target or a complete new
-//!   target plus the recoverable original sibling. Directory sync makes each
+//!   hard link retains the original inode before replacement. A failure after
+//!   replacement preserves both the complete replacement and recoverable
+//!   original sibling: safe Rust has no conditional no-replace rename primitive,
+//!   so automatic restore does not risk overwriting a concurrent entry.
+//!   Directory sync makes each
 //!   committed namespace transition durable on Unix. Rust cannot portably sync
 //!   a directory on other platforms, so those platforms guarantee synchronized
 //!   file contents but only the operating system's rename durability.
@@ -24,9 +26,10 @@
 //!   Portable Rust has no compare-and-swap rename, so an uncooperative writer in
 //!   the final validation-to-rename window follows normal last-writer-wins rename
 //!   semantics; it cannot cause a partial candidate to be installed.
-//! - Cleanup failure never replaces the operation's originating [`ShellError`].
-//!   It is appended as context. If restoring the target fails, the error names
-//!   the retained recovery path instead of deleting the only original bytes.
+//! - Cleanup revalidates the identity captured from each open file immediately
+//!   before deletion on Unix. Platforms without a stable cleanup identity fail
+//!   closed and preserve the entry. Cleanup failure never replaces the
+//!   operation's originating [`ShellError`]; it is appended as context.
 //! - Output and validation reads are capped by the caller-supplied byte limit.
 //!   Temporary-name attempts are capped, and no operation follows a target link
 //!   intentionally.
@@ -41,7 +44,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 #[cfg(unix)]
 use nix::{
@@ -77,8 +80,10 @@ pub struct AtomicReplaceOptions {
 /// [`ErrorCode::Validation`]. I/O and durability failures return
 /// [`ErrorCode::Io`], resource violations return [`ErrorCode::ResourceLimit`],
 /// and unsupported target kinds return [`ErrorCode::InvalidArgument`]. Every
-/// returned failure leaves the original bytes at the target or, if rollback
-/// itself fails, at a recovery path named in the error context.
+/// returned failure leaves the original bytes at the target or at a recovery
+/// path named in the error context. A post-install failure also leaves the
+/// complete replacement in place for explicit review rather than overwriting a
+/// potentially concurrent destination during automatic rollback.
 pub fn replace_file_atomically(
     path: &Path,
     expected: &[u8],
@@ -146,17 +151,26 @@ struct FileIdentity {
 #[derive(Debug)]
 struct TransactionFiles {
     candidate: Option<PathBuf>,
+    candidate_identity: FileIdentity,
     recovery_path: PathBuf,
-    recovery_owned: bool,
+    recovery_identity: Option<FileIdentity>,
 }
 
 impl TransactionFiles {
-    fn new(candidate: PathBuf, recovery: PathBuf) -> Self {
-        Self {
+    fn new(
+        candidate: PathBuf,
+        candidate_file: &File,
+        recovery: PathBuf,
+    ) -> Result<Self, ShellError> {
+        let metadata = candidate_file.metadata().map_err(|error| {
+            transaction_io_error("inspect temporary candidate", &candidate, error)
+        })?;
+        Ok(Self {
             candidate: Some(candidate),
+            candidate_identity: file_identity(Path::new("<candidate>"), &metadata)?,
             recovery_path: recovery,
-            recovery_owned: false,
-        }
+            recovery_identity: None,
+        })
     }
 
     fn candidate(&self) -> &Path {
@@ -173,26 +187,42 @@ impl TransactionFiles {
         self.candidate = None;
     }
 
-    fn recovery_was_created(&mut self) {
-        self.recovery_owned = true;
+    fn recovery_was_created(&mut self, identity: FileIdentity) {
+        self.recovery_identity = Some(identity);
     }
 
     fn recovery_was_consumed(&mut self) {
-        self.recovery_owned = false;
+        self.recovery_identity = None;
     }
 
     fn preserve_recovery(&mut self) -> Option<PathBuf> {
-        self.recovery_owned.then(|| {
-            self.recovery_owned = false;
-            self.recovery_path.clone()
-        })
+        self.recovery_identity
+            .take()
+            .map(|_| self.recovery_path.clone())
+    }
+
+    fn candidate_owns(&self, path: &Path) -> bool {
+        path_matches_identity(path, &self.candidate_identity)
+    }
+
+    fn recovery_owns(&self) -> bool {
+        self.recovery_identity
+            .as_ref()
+            .is_some_and(|identity| path_matches_identity(&self.recovery_path, identity))
     }
 
     fn cleanup(&mut self, mut error: ShellError) -> ShellError {
         let mut namespace_changed = false;
         if let Some(candidate) = self.candidate.take() {
-            match remove_if_present(&candidate) {
-                Ok(()) => namespace_changed = true,
+            match remove_if_owned(&candidate, &self.candidate_identity) {
+                Ok(RemoveOutcome::Removed) => namespace_changed = true,
+                Ok(RemoveOutcome::Missing) => {}
+                Ok(RemoveOutcome::Preserved) => {
+                    error = error.with_context(format!(
+                        "temporary {} changed; cleanup preserved the concurrent entry",
+                        candidate.display()
+                    ));
+                }
                 Err(cleanup_error) => {
                     error = error.with_context(format!(
                         "temporary cleanup failed for {}: {cleanup_error}",
@@ -201,10 +231,16 @@ impl TransactionFiles {
                 }
             }
         }
-        if self.recovery_owned {
-            self.recovery_owned = false;
-            match remove_if_present(&self.recovery_path) {
-                Ok(()) => namespace_changed = true,
+        if let Some(identity) = self.recovery_identity.take() {
+            match remove_if_owned(&self.recovery_path, &identity) {
+                Ok(RemoveOutcome::Removed) => namespace_changed = true,
+                Ok(RemoveOutcome::Missing) => {}
+                Ok(RemoveOutcome::Preserved) => {
+                    error = error.with_context(format!(
+                        "recovery {} changed; cleanup preserved the concurrent entry",
+                        self.recovery_path.display()
+                    ));
+                }
                 Err(cleanup_error) => {
                     error = error.with_context(format!(
                         "recovery cleanup failed for {}: {cleanup_error}",
@@ -227,11 +263,10 @@ impl TransactionFiles {
 impl Drop for TransactionFiles {
     fn drop(&mut self) {
         if let Some(candidate) = self.candidate.take() {
-            let _ = remove_if_present(&candidate);
+            let _ = remove_if_owned(&candidate, &self.candidate_identity);
         }
-        if self.recovery_owned {
-            self.recovery_owned = false;
-            let _ = remove_if_present(&self.recovery_path);
+        if let Some(identity) = self.recovery_identity.take() {
+            let _ = remove_if_owned(&self.recovery_path, &identity);
         }
         let _ = sync_parent(&self.recovery_path);
     }
@@ -248,7 +283,7 @@ fn replace_file_atomically_with_hook(
     let snapshot = inspect_expected_target(path, expected, options.bytes_max)?;
     let (candidate_path, candidate_file) = create_candidate(path)?;
     let recovery_path = recovery_path(&candidate_path);
-    let mut files = TransactionFiles::new(candidate_path, recovery_path);
+    let mut files = TransactionFiles::new(candidate_path, &candidate_file, recovery_path)?;
 
     let candidate_permissions = snapshot.permissions.clone();
     let prepared = prepare_candidate(
@@ -413,9 +448,34 @@ fn commit_candidate(
         return Err(rollback_original(path, files, error));
     }
 
-    if let Err(error) = fs::remove_file(files.recovery()) {
-        let error = transaction_io_error("remove retained original", files.recovery(), error);
-        return Err(rollback_original(path, files, error));
+    let recovery_identity = files.recovery_identity.as_ref().cloned().ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "atomic transaction lost its retained-original identity",
+        )
+        .with_help("Report this internal persistence invariant failure")
+    })?;
+    match remove_if_owned(files.recovery(), &recovery_identity) {
+        Ok(RemoveOutcome::Removed | RemoveOutcome::Missing) => {}
+        Ok(RemoveOutcome::Preserved) => {
+            let recovery = files.preserve_recovery();
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "retained-original path changed after source replacement",
+            )
+            .with_context(format!(
+                "cleanup preserved the concurrent entry at {}",
+                recovery
+                    .as_deref()
+                    .unwrap_or_else(|| files.recovery())
+                    .display()
+            ))
+            .with_help("Review the replacement and concurrent entry before retrying"));
+        }
+        Err(error) => {
+            let error = transaction_io_error("remove retained original", files.recovery(), error);
+            return Err(rollback_original(path, files, error));
+        }
     }
     files.recovery_was_consumed();
     // The candidate and its directory entry are already durable. A failed
@@ -441,11 +501,12 @@ fn retain_original(
             );
         }
     }
-    files.recovery_was_created();
+    files.recovery_was_created(expected_identity.clone());
     let metadata = fs::symlink_metadata(&recovery)
         .map_err(|error| transaction_io_error("inspect retained original", &recovery, error))?;
     validate_regular_metadata(&recovery, &metadata, Some(2))?;
-    if &file_identity(&recovery, &metadata)? != expected_identity {
+    let recovery_identity = file_identity(&recovery, &metadata)?;
+    if &recovery_identity != expected_identity {
         return Err(concurrent_change_error(path));
     }
     Ok(())
@@ -487,27 +548,51 @@ fn rollback_original(
     mut originating_error: ShellError,
 ) -> ShellError {
     let recovery = files.recovery().to_path_buf();
-    match fs::rename(&recovery, path) {
-        Ok(()) => {
-            files.recovery_was_consumed();
-            if let Err(sync_error) = sync_parent(path) {
-                originating_error = originating_error.with_context(format!(
-                    "original source was restored but its directory sync failed: {sync_error}"
-                ));
-            }
-        }
-        Err(restore_error) => {
-            let retained = files.preserve_recovery();
-            originating_error = originating_error
-                .with_context(format!("automatic restore failed: {restore_error}"))
+    let candidate_owned = files.candidate_owns(path);
+    let recovery_owned = files.recovery_owns();
+    let retained = files.preserve_recovery();
+    if !candidate_owned {
+        originating_error = originating_error.with_context(format!(
+            "replacement destination {} changed; rollback preserved the concurrent entry",
+            path.display()
+        ));
+        if recovery_owned {
+            return originating_error
                 .with_context(format!(
                     "original source remains at {}",
                     retained.as_deref().unwrap_or(&recovery).display()
                 ))
-                .with_help("Restore the retained original before retrying the formatter");
+                .with_help(
+                    "Restore the retained original only after reviewing the concurrent entry",
+                );
         }
+        return originating_error
+            .with_context(format!(
+                "recovery {} changed; cleanup preserved the concurrent entry",
+                recovery.display()
+            ))
+            .with_context("the retained original no longer has a transaction-known path")
+            .with_help("Review the directory entries and recover the original before retrying");
+    }
+    if !recovery_owned {
+        return originating_error
+            .with_context(format!(
+                "recovery {} changed; cleanup preserved the concurrent entry",
+                recovery.display()
+            ))
+            .with_context("the retained original no longer has a transaction-known path")
+            .with_help("Review the directory entries and recover the original before retrying");
     }
     originating_error
+        .with_context(format!(
+            "complete replacement remains at {}; destructive automatic restore was not attempted",
+            path.display()
+        ))
+        .with_context(format!(
+            "original source remains at {}",
+            retained.as_deref().unwrap_or(&recovery).display()
+        ))
+        .with_help("Review both files, then restore or keep the replacement explicitly")
 }
 
 fn inspect_expected_target(
@@ -729,12 +814,38 @@ fn recovery_path(candidate: &Path) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn remove_if_present(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoveOutcome {
+    Removed,
+    Missing,
+    Preserved,
+}
+
+fn remove_if_owned(path: &Path, identity: &FileIdentity) -> io::Result<RemoveOutcome> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RemoveOutcome::Missing),
         Err(error) => Err(error),
+        Ok(_) if !path_matches_identity(path, identity) => Ok(RemoveOutcome::Preserved),
+        Ok(_) => match fs::remove_file(path) {
+            Ok(()) => Ok(RemoveOutcome::Removed),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RemoveOutcome::Missing),
+            Err(error) => Err(error),
+        },
     }
+}
+
+#[cfg(unix)]
+fn path_matches_identity(path: &Path, identity: &FileIdentity) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_file()
+            && metadata.dev() == identity.device
+            && metadata.ino() == identity.inode
+    })
+}
+
+#[cfg(not(unix))]
+fn path_matches_identity(_path: &Path, _identity: &FileIdentity) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -840,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn every_transaction_stage_failure_restores_original_and_cleans_temporary_files() {
+    fn every_transaction_stage_failure_preserves_owned_bytes_without_foreign_overwrite() {
         let stages = [
             TransactionStage::TemporaryCreated,
             TransactionStage::PartialWrite,
@@ -878,8 +989,24 @@ mod tests {
                 .context
                 .iter()
                 .any(|context| context.contains("injected transaction failure")));
-            assert_eq!(fs::read(&source).unwrap(), b"original bytes\n");
-            assert_only_source_remains(&directory.0, &source);
+            if matches!(
+                failed_stage,
+                TransactionStage::CandidateRenamed | TransactionStage::ParentSynced
+            ) {
+                assert_eq!(fs::read(&source).unwrap(), b"completely formatted bytes\n");
+                let recovery = fs::read_dir(&directory.0)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| path != &source)
+                    .unwrap();
+                assert_eq!(fs::read(recovery).unwrap(), b"original bytes\n");
+                assert!(error.details.context.iter().any(|context| {
+                    context.contains("destructive automatic restore was not attempted")
+                }));
+            } else {
+                assert_eq!(fs::read(&source).unwrap(), b"original bytes\n");
+                assert_only_source_remains(&directory.0, &source);
+            }
         }
     }
 
@@ -900,6 +1027,102 @@ mod tests {
         assert_eq!(error.code, ErrorCode::Validation);
         assert_eq!(fs::read(&source).unwrap(), b"changed elsewhere\n");
         assert_only_source_remains(&directory.0, &source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_a_concurrent_candidate_replacement() {
+        let directory = TestDirectory::new("candidate-replacement");
+        let source = directory.0.join("script.qrl");
+        let moved = directory.0.join("moved-owned-candidate");
+        fs::write(&source, b"old source\n").unwrap();
+
+        let error = replace_file_atomically_with_hook(
+            &source,
+            b"old source\n",
+            b"new source\n",
+            options(),
+            |stage| {
+                if stage == TransactionStage::PartialWrite {
+                    let candidate = fs::read_dir(&directory.0)?
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| path != &source)
+                        .ok_or_else(|| io::Error::other("candidate was not visible"))?;
+                    fs::rename(&candidate, &moved)?;
+                    fs::write(&candidate, b"foreign")?;
+                    return Err(io::Error::other("injected candidate replacement"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(fs::read(&source).unwrap(), b"old source\n");
+        assert!(fs::read(&moved).unwrap().starts_with(b"new"));
+        let replacement = fs::read_dir(&directory.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path != &source && path != &moved)
+            .unwrap();
+        assert_eq!(fs::read(replacement).unwrap(), b"foreign");
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("preserved the concurrent entry")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_preserves_colliding_destination_and_recovery_entries() {
+        let directory = TestDirectory::new("rollback-collision");
+        let source = directory.0.join("script.qrl");
+        let moved_candidate = directory.0.join("moved-owned-candidate");
+        let moved_recovery = directory.0.join("moved-owned-recovery");
+        fs::write(&source, b"old source\n").unwrap();
+
+        let error = replace_file_atomically_with_hook(
+            &source,
+            b"old source\n",
+            b"new source\n",
+            options(),
+            |stage| {
+                if stage == TransactionStage::CandidateRenamed {
+                    let recovery = fs::read_dir(&directory.0)?
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| path.as_os_str().as_encoded_bytes().ends_with(b".original"))
+                        .ok_or_else(|| io::Error::other("recovery was not visible"))?;
+                    fs::rename(&source, &moved_candidate)?;
+                    fs::rename(&recovery, &moved_recovery)?;
+                    fs::write(&source, b"foreign")?;
+                    fs::hard_link(&source, &recovery)?;
+                    return Err(io::Error::other("injected rollback collision"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(fs::read(&source).unwrap(), b"foreign");
+        let replacement_recovery = fs::read_dir(&directory.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.as_os_str().as_encoded_bytes().ends_with(b".original"))
+            .unwrap();
+        assert_eq!(fs::read(replacement_recovery).unwrap(), b"foreign");
+        assert_eq!(fs::read(&moved_candidate).unwrap(), b"new source\n");
+        assert_eq!(fs::read(&moved_recovery).unwrap(), b"old source\n");
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .filter(|context| context.contains("preserved the concurrent entry"))
+                .count()
+                >= 2
+        );
     }
 
     #[cfg(unix)]

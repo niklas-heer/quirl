@@ -29,9 +29,91 @@ enum CreateStage {
     PartialWrite,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputWriteStage {
+    ContentSynced,
+    Installed,
+}
+
+#[derive(Debug)]
+struct OwnedPath {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupOutcome {
+    Removed,
+    Missing,
+    Preserved,
+}
+
+impl OwnedPath {
+    fn from_file(path: PathBuf, file: &File) -> Result<Self, ShellError> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| io_error("inspect", &path, error))?;
+        Ok(Self::from_metadata(path, &metadata))
+    }
+
+    fn from_metadata(path: PathBuf, metadata: &fs::Metadata) -> Self {
+        Self {
+            path,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(unix)]
+    fn matches(&self, path: &Path) -> bool {
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+    }
+
+    #[cfg(not(unix))]
+    fn matches(&self, _path: &Path) -> bool {
+        false
+    }
+
+    fn remove(&self) -> io::Result<CleanupOutcome> {
+        match fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CleanupOutcome::Missing),
+            Err(error) => Err(error),
+            Ok(_) if !self.matches(&self.path) => Ok(CleanupOutcome::Preserved),
+            Ok(_) => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(CleanupOutcome::Removed),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Ok(CleanupOutcome::Missing)
+                }
+                Err(error) => Err(error),
+            },
+        }
+    }
+
+    fn remove_directory(&self) -> io::Result<CleanupOutcome> {
+        match fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CleanupOutcome::Missing),
+            Err(error) => Err(error),
+            // Stable safe Rust does not expose a conditional remove-by-identity
+            // primitive for directories. Preserve the entry instead of racing
+            // a concurrent rename-and-replacement between validation and rmdir.
+            Ok(_) => Ok(CleanupOutcome::Preserved),
+        }
+    }
+}
+
 struct CreationTransaction {
-    created_file: Option<PathBuf>,
-    created_directories: Vec<PathBuf>,
+    created_file: Option<OwnedPath>,
+    created_directories: Vec<OwnedPath>,
 }
 
 impl CreationTransaction {
@@ -43,22 +125,36 @@ impl CreationTransaction {
     }
 
     fn cleanup(&mut self, mut error: ShellError) -> ShellError {
-        if let Some(path) = self.created_file.take() {
-            if let Err(cleanup_error) = fs::remove_file(&path) {
-                if cleanup_error.kind() != io::ErrorKind::NotFound {
+        if let Some(owned) = self.created_file.take() {
+            match owned.remove() {
+                Ok(CleanupOutcome::Preserved) => {
+                    error = error.with_context(format!(
+                        "created file {} changed; rollback preserved the concurrent entry",
+                        owned.path().display()
+                    ));
+                }
+                Ok(CleanupOutcome::Removed | CleanupOutcome::Missing) => {}
+                Err(cleanup_error) => {
                     error = error.with_context(format!(
                         "created-file rollback failed for {}: {cleanup_error}",
-                        path.display()
+                        owned.path().display()
                     ));
                 }
             }
         }
-        while let Some(path) = self.created_directories.pop() {
-            if let Err(cleanup_error) = fs::remove_dir(&path) {
-                if cleanup_error.kind() != io::ErrorKind::NotFound {
+        while let Some(owned) = self.created_directories.pop() {
+            match owned.remove_directory() {
+                Ok(CleanupOutcome::Preserved) => {
+                    error = error.with_context(format!(
+                        "created directory {} was preserved because rollback cannot atomically prove path ownership",
+                        owned.path().display()
+                    ));
+                }
+                Ok(CleanupOutcome::Removed | CleanupOutcome::Missing) => {}
+                Err(cleanup_error) => {
                     error = error.with_context(format!(
                         "created-directory rollback failed for {}: {cleanup_error}",
-                        path.display()
+                        owned.path().display()
                     ));
                 }
             }
@@ -74,37 +170,90 @@ impl CreationTransaction {
 
 impl Drop for CreationTransaction {
     fn drop(&mut self) {
-        if let Some(path) = self.created_file.take() {
-            let _ = fs::remove_file(path);
+        if let Some(owned) = self.created_file.take() {
+            let _ = owned.remove();
         }
-        while let Some(path) = self.created_directories.pop() {
-            let _ = fs::remove_dir(path);
+        while let Some(owned) = self.created_directories.pop() {
+            let _ = owned.remove_directory();
         }
     }
 }
 
-struct TemporaryOutput(Option<PathBuf>);
+struct TemporaryOutput {
+    temporary: Option<OwnedPath>,
+    destination: Option<PathBuf>,
+}
 
 impl TemporaryOutput {
+    fn new(path: PathBuf, file: &File) -> Result<Self, ShellError> {
+        Ok(Self {
+            temporary: Some(OwnedPath::from_file(path, file)?),
+            destination: None,
+        })
+    }
+
     fn path(&self) -> &Path {
-        self.0
-            .as_deref()
+        self.temporary
+            .as_ref()
+            .map(OwnedPath::path)
             .unwrap_or_else(|| Path::new("<installed-temporary>"))
     }
 
+    fn installed(&mut self, destination: &Path) {
+        self.destination = Some(destination.to_path_buf());
+    }
+
+    fn owns(&self, path: &Path) -> bool {
+        self.temporary
+            .as_ref()
+            .is_some_and(|temporary| temporary.matches(path))
+    }
+
     fn disarm(&mut self) {
-        self.0 = None;
+        self.temporary = None;
+        self.destination = None;
     }
 
     fn cleanup(&mut self, mut error: ShellError) -> ShellError {
-        if let Some(path) = self.0.take() {
-            if let Err(cleanup_error) = fs::remove_file(&path) {
-                if cleanup_error.kind() != io::ErrorKind::NotFound {
+        if let Some(destination) = self.destination.take() {
+            error = self.cleanup_path(error, &destination, "installed documentation output");
+        }
+        if let Some(temporary) = self.temporary.take() {
+            match temporary.remove() {
+                Ok(CleanupOutcome::Preserved) => {
                     error = error.with_context(format!(
-                        "documentation temporary cleanup failed for {}: {cleanup_error}",
-                        path.display()
+                        "documentation temporary {} changed; cleanup preserved the concurrent entry",
+                        temporary.path().display()
                     ));
                 }
+                Ok(CleanupOutcome::Removed | CleanupOutcome::Missing) => {}
+                Err(cleanup_error) => {
+                    error = error.with_context(format!(
+                        "documentation temporary cleanup failed for {}: {cleanup_error}",
+                        temporary.path().display()
+                    ));
+                }
+            }
+        }
+        error
+    }
+
+    fn cleanup_path(&self, mut error: ShellError, path: &Path, label: &str) -> ShellError {
+        let Some(temporary) = self.temporary.as_ref() else {
+            return error;
+        };
+        if !temporary.matches(path) {
+            return error.with_context(format!(
+                "{label} {} changed; cleanup preserved the concurrent entry",
+                path.display()
+            ));
+        }
+        if let Err(cleanup_error) = fs::remove_file(path) {
+            if cleanup_error.kind() != io::ErrorKind::NotFound {
+                error = error.with_context(format!(
+                    "{label} cleanup failed for {}: {cleanup_error}",
+                    path.display()
+                ));
             }
         }
         error
@@ -113,8 +262,13 @@ impl TemporaryOutput {
 
 impl Drop for TemporaryOutput {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = fs::remove_file(path);
+        if let Some(destination) = self.destination.take() {
+            if self.owns(&destination) {
+                let _ = fs::remove_file(destination);
+            }
+        }
+        if let Some(temporary) = self.temporary.take() {
+            let _ = temporary.remove();
         }
     }
 }
@@ -446,7 +600,7 @@ fn write_new_file(
     let mut file = options
         .open(path)
         .map_err(|error| io_error("create", path, error))?;
-    transaction.created_file = Some(path.to_path_buf());
+    transaction.created_file = Some(OwnedPath::from_file(path.to_path_buf(), &file)?);
     #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|error| io_error("secure", path, error))?;
@@ -512,16 +666,30 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), ShellError> {
 }
 
 fn install_new_output(path: &Path, contents: &[u8], parent: &Path) -> Result<(), ShellError> {
+    install_new_output_with_hook(path, contents, parent, |_| Ok(()))
+}
+
+fn install_new_output_with_hook(
+    path: &Path,
+    contents: &[u8],
+    parent: &Path,
+    mut after_stage: impl FnMut(OutputWriteStage) -> io::Result<()>,
+) -> Result<(), ShellError> {
     let (temporary, mut file) = create_output_temporary(path)?;
-    let mut guard = TemporaryOutput(Some(temporary));
+    let mut guard = TemporaryOutput::new(temporary, &file)?;
     file.write_all(contents)
         .and_then(|()| file.sync_all())
+        .and_then(|()| after_stage(OutputWriteStage::ContentSynced))
         .map_err(|error| guard.cleanup(io_error("write", guard.path(), error)))?;
     validate_regular_output(guard.path(), Some(&file), 1).map_err(|error| guard.cleanup(error))?;
     drop(file);
     fs::hard_link(guard.path(), path)
         .map_err(|error| guard.cleanup(io_error("install", path, error)))?;
-    if !same_output_file(guard.path(), path) {
+    guard.installed(path);
+    if let Err(error) = after_stage(OutputWriteStage::Installed) {
+        return Err(guard.cleanup(io_error("install", path, error)));
+    }
+    if !guard.owns(path) {
         return Err(guard.cleanup(
             ShellError::new(
                 ErrorCode::Validation,
@@ -534,19 +702,26 @@ fn install_new_output(path: &Path, contents: &[u8], parent: &Path) -> Result<(),
         ));
     }
     if let Err(error) = validate_regular_output(path, None, 2) {
-        if same_output_file(guard.path(), path) {
-            let _ = fs::remove_file(path);
-        }
         return Err(guard.cleanup(error));
     }
     if let Err(error) = sync_parent_directory(parent) {
-        if same_output_file(guard.path(), path) {
-            let _ = fs::remove_file(path);
-        }
         return Err(guard.cleanup(error));
     }
-    fs::remove_file(guard.path())
+    let cleanup = guard
+        .temporary
+        .as_ref()
+        .map(OwnedPath::remove)
+        .transpose()
         .map_err(|error| guard.cleanup(io_error("clean", guard.path(), error)))?;
+    if cleanup == Some(CleanupOutcome::Preserved) {
+        return Err(guard.cleanup(
+            ShellError::new(
+                ErrorCode::Validation,
+                "documentation temporary changed before cleanup",
+            )
+            .with_help("Remove the preserved temporary only after verifying its ownership"),
+        ));
+    }
     guard.disarm();
     let _ = sync_parent_directory(parent);
     Ok(())
@@ -575,11 +750,23 @@ fn create_output_temporary(path: &Path) -> Result<(PathBuf, File), ShellError> {
                 #[cfg(unix)]
                 if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
                     let mut shell_error = io_error("secure", &temporary, error);
-                    if let Err(cleanup_error) = fs::remove_file(&temporary) {
-                        shell_error = shell_error.with_context(format!(
-                            "documentation temporary cleanup failed for {}: {cleanup_error}",
-                            temporary.display()
-                        ));
+                    let cleanup = OwnedPath::from_file(temporary.clone(), &file)
+                        .map_err(|identity_error| io::Error::other(identity_error.message))
+                        .and_then(|owned| owned.remove());
+                    match cleanup {
+                        Ok(CleanupOutcome::Removed | CleanupOutcome::Missing) => {}
+                        Ok(CleanupOutcome::Preserved) => {
+                            shell_error = shell_error.with_context(format!(
+                                "documentation temporary {} changed; cleanup preserved the concurrent entry",
+                                temporary.display()
+                            ));
+                        }
+                        Err(cleanup_error) => {
+                            shell_error = shell_error.with_context(format!(
+                                "documentation temporary cleanup failed for {}: {cleanup_error}",
+                                temporary.display()
+                            ));
+                        }
                     }
                     return Err(shell_error);
                 }
@@ -654,7 +841,13 @@ fn create_directories(
     }
     for path in missing.into_iter().rev() {
         match fs::create_dir(&path) {
-            Ok(()) => transaction.created_directories.push(path),
+            Ok(()) => {
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|error| io_error("inspect", &path, error))?;
+                transaction
+                    .created_directories
+                    .push(OwnedPath::from_metadata(path, &metadata));
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let metadata = fs::symlink_metadata(&path)
                     .map_err(|inspect_error| io_error("inspect", &path, inspect_error))?;
@@ -735,25 +928,6 @@ fn validate_regular_output(
         }
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn same_output_file(left: &Path, right: &Path) -> bool {
-    let Ok(left) = fs::symlink_metadata(left) else {
-        return false;
-    };
-    let Ok(right) = fs::symlink_metadata(right) else {
-        return false;
-    };
-    left.file_type().is_file()
-        && right.file_type().is_file()
-        && left.dev() == right.dev()
-        && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_output_file(_left: &Path, _right: &Path) -> bool {
-    false
 }
 
 #[cfg(unix)]
@@ -903,8 +1077,83 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::Io);
         assert_eq!(fs::read(&marker).unwrap(), b"keep");
-        assert!(!created_directory.exists());
+        assert!(created_directory.exists());
         assert!(preexisting.exists());
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("cannot atomically prove path ownership")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_script_rollback_preserves_a_concurrent_file_replacement() {
+        let directory = temporary_directory("file-replacement");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("script.qrl");
+        let moved = directory.join("moved-owned-script");
+
+        let error = create_with_hook(
+            NewCommand {
+                name: "script".to_owned(),
+                lang: NewLanguage::Quirl,
+                directory: directory.clone(),
+            },
+            |stage| {
+                if stage == CreateStage::PartialWrite {
+                    fs::rename(&path, &moved)?;
+                    fs::write(&path, b"foreign")?;
+                    return Err(io::Error::other("injected replacement failure"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(fs::read(&path).unwrap(), b"foreign");
+        assert!(moved.exists());
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("preserved the concurrent entry")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_script_rollback_preserves_a_concurrent_directory_replacement() {
+        let root = temporary_directory("directory-replacement");
+        fs::create_dir(&root).unwrap();
+        let directory = root.join("created/deep");
+        let moved = root.join("moved-owned-directory");
+
+        let error = create_with_hook(
+            NewCommand {
+                name: "script".to_owned(),
+                lang: NewLanguage::Quirl,
+                directory: directory.clone(),
+            },
+            |stage| {
+                if stage == CreateStage::DirectoriesReady {
+                    fs::rename(&directory, &moved)?;
+                    fs::create_dir(&directory)?;
+                    return Err(io::Error::other("injected directory replacement"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(directory.is_dir());
+        assert!(moved.is_dir());
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("cannot atomically prove path ownership")));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -976,6 +1225,91 @@ mod tests {
         atomic_write(&path, b"second\n").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
         assert!(!directory.join(".catalog.md.quirl.tmp").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn documentation_cleanup_preserves_a_concurrent_temporary_replacement() {
+        let directory = temporary_directory("temporary-replacement");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("catalog.md");
+        let moved = directory.join("moved-owned-temporary");
+
+        let error = install_new_output_with_hook(&path, b"content", &directory, |stage| {
+            if stage == OutputWriteStage::ContentSynced {
+                let temporary = fs::read_dir(&directory)?
+                    .next()
+                    .ok_or_else(|| io::Error::other("temporary was not visible"))??
+                    .path();
+                fs::rename(&temporary, &moved)?;
+                fs::write(&temporary, b"foreign")?;
+                return Err(io::Error::other("injected temporary replacement"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        let foreign = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| entry != &moved)
+            .unwrap();
+        assert_eq!(fs::read(foreign).unwrap(), b"foreign");
+        assert!(moved.exists());
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("preserved the concurrent entry")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn documentation_cleanup_preserves_colliding_temporary_and_destination_entries() {
+        let directory = temporary_directory("installed-replacement");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("catalog.md");
+        let moved_temporary = directory.join("moved-owned-temporary");
+        let moved_destination = directory.join("moved-owned-destination");
+
+        let error = install_new_output_with_hook(&path, b"content", &directory, |stage| {
+            if stage == OutputWriteStage::Installed {
+                let temporary = fs::read_dir(&directory)?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .find(|entry| entry.as_ref().is_ok_and(|entry| entry != &path))
+                    .ok_or_else(|| io::Error::other("temporary was not visible"))??;
+                fs::rename(&temporary, &moved_temporary)?;
+                fs::rename(&path, &moved_destination)?;
+                fs::write(&temporary, b"foreign")?;
+                fs::hard_link(&temporary, &path)?;
+                return Err(io::Error::other("injected installed replacement"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(fs::read(&path).unwrap(), b"foreign");
+        let replacement_temporary = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| {
+                entry != &path && entry != &moved_temporary && entry != &moved_destination
+            })
+            .unwrap();
+        assert_eq!(fs::read(replacement_temporary).unwrap(), b"foreign");
+        assert!(moved_temporary.exists());
+        assert!(moved_destination.exists());
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .filter(|context| context.contains("preserved the concurrent entry"))
+                .count()
+                >= 2
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
