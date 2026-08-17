@@ -26,10 +26,12 @@
 //!   Portable Rust has no compare-and-swap rename, so an uncooperative writer in
 //!   the final validation-to-rename window follows normal last-writer-wins rename
 //!   semantics; it cannot cause a partial candidate to be installed.
-//! - Cleanup revalidates the identity captured from each open file immediately
-//!   before deletion on Unix. Platforms without a stable cleanup identity fail
-//!   closed and preserve the entry. Cleanup failure never replaces the
-//!   operation's originating [`ShellError`]; it is appended as context.
+//! - Failure cleanup and `Drop` are non-destructive because safe Rust has no
+//!   conditional unlink-by-identity primitive. They preserve transaction names
+//!   and append their locations to the originating [`ShellError`]. Successful
+//!   cleanup removes only transaction-generated names after the commit has
+//!   completed; this assumes the containing namespace is cooperative during
+//!   that final unlink and is not a safety mechanism against a same-user racer.
 //! - Output and validation reads are capped by the caller-supplied byte limit.
 //!   Temporary-name attempts are capped, and no operation follows a target link
 //!   intentionally.
@@ -83,7 +85,11 @@ pub struct AtomicReplaceOptions {
 /// returned failure leaves the original bytes at the target or at a recovery
 /// path named in the error context. A post-install failure also leaves the
 /// complete replacement in place for explicit review rather than overwriting a
-/// potentially concurrent destination during automatic rollback.
+/// potentially concurrent destination during automatic rollback. Failure paths
+/// preserve at most one candidate and one recovery name because portable safe
+/// Rust cannot condition unlink on file identity. Successful cleanup removes
+/// the single transaction-generated recovery name and therefore requires the
+/// containing directory to remain cooperative for that final unlink.
 pub fn replace_file_atomically(
     path: &Path,
     expected: &[u8],
@@ -211,50 +217,50 @@ impl TransactionFiles {
             .is_some_and(|identity| path_matches_identity(&self.recovery_path, identity))
     }
 
-    fn cleanup(&mut self, mut error: ShellError) -> ShellError {
-        let mut namespace_changed = false;
+    fn cleanup(&mut self, error: ShellError) -> ShellError {
+        self.cleanup_with_hook(error, |_| Ok(()))
+    }
+
+    fn cleanup_with_hook(
+        &mut self,
+        mut error: ShellError,
+        mut after_identity_check: impl FnMut(&Path) -> io::Result<()>,
+    ) -> ShellError {
         if let Some(candidate) = self.candidate.take() {
-            match remove_if_owned(&candidate, &self.candidate_identity) {
-                Ok(RemoveOutcome::Removed) => namespace_changed = true,
-                Ok(RemoveOutcome::Missing) => {}
-                Ok(RemoveOutcome::Preserved) => {
-                    error = error.with_context(format!(
-                        "temporary {} changed; cleanup preserved the concurrent entry",
-                        candidate.display()
-                    ));
-                }
-                Err(cleanup_error) => {
-                    error = error.with_context(format!(
-                        "temporary cleanup failed for {}: {cleanup_error}",
-                        candidate.display()
-                    ));
-                }
-            }
-        }
-        if let Some(identity) = self.recovery_identity.take() {
-            match remove_if_owned(&self.recovery_path, &identity) {
-                Ok(RemoveOutcome::Removed) => namespace_changed = true,
-                Ok(RemoveOutcome::Missing) => {}
-                Ok(RemoveOutcome::Preserved) => {
-                    error = error.with_context(format!(
-                        "recovery {} changed; cleanup preserved the concurrent entry",
-                        self.recovery_path.display()
-                    ));
-                }
-                Err(cleanup_error) => {
-                    error = error.with_context(format!(
-                        "recovery cleanup failed for {}: {cleanup_error}",
-                        self.recovery_path.display()
-                    ));
-                }
-            }
-        }
-        if namespace_changed {
-            if let Err(cleanup_error) = sync_parent(&self.recovery_path) {
+            let matched = path_matches_identity(&candidate, &self.candidate_identity);
+            if let Err(hook_error) = after_identity_check(&candidate) {
                 error = error.with_context(format!(
-                    "transaction cleanup directory sync failed: {cleanup_error}"
+                    "temporary preservation hook failed for {}: {hook_error}",
+                    candidate.display()
                 ));
             }
+            error = error.with_context(format!(
+                "failure cleanup preserved temporary {} ({})",
+                candidate.display(),
+                if matched {
+                    "identity matched"
+                } else {
+                    "identity changed"
+                }
+            ));
+        }
+        if let Some(identity) = self.recovery_identity.take() {
+            let matched = path_matches_identity(&self.recovery_path, &identity);
+            if let Err(hook_error) = after_identity_check(&self.recovery_path) {
+                error = error.with_context(format!(
+                    "recovery preservation hook failed for {}: {hook_error}",
+                    self.recovery_path.display()
+                ));
+            }
+            error = error.with_context(format!(
+                "failure cleanup preserved recovery {} ({})",
+                self.recovery_path.display(),
+                if matched {
+                    "identity matched"
+                } else {
+                    "identity changed"
+                }
+            ));
         }
         error
     }
@@ -262,13 +268,8 @@ impl TransactionFiles {
 
 impl Drop for TransactionFiles {
     fn drop(&mut self) {
-        if let Some(candidate) = self.candidate.take() {
-            let _ = remove_if_owned(&candidate, &self.candidate_identity);
-        }
-        if let Some(identity) = self.recovery_identity.take() {
-            let _ = remove_if_owned(&self.recovery_path, &identity);
-        }
-        let _ = sync_parent(&self.recovery_path);
+        self.candidate = None;
+        self.recovery_identity = None;
     }
 }
 
@@ -283,7 +284,13 @@ fn replace_file_atomically_with_hook(
     let snapshot = inspect_expected_target(path, expected, options.bytes_max)?;
     let (candidate_path, candidate_file) = create_candidate(path)?;
     let recovery_path = recovery_path(&candidate_path);
-    let mut files = TransactionFiles::new(candidate_path, &candidate_file, recovery_path)?;
+    let mut files = TransactionFiles::new(candidate_path.clone(), &candidate_file, recovery_path)
+        .map_err(|error| {
+        error.with_context(format!(
+            "failure cleanup preserved temporary {}",
+            candidate_path.display()
+        ))
+    })?;
 
     let candidate_permissions = snapshot.permissions.clone();
     let prepared = prepare_candidate(
@@ -448,34 +455,16 @@ fn commit_candidate(
         return Err(rollback_original(path, files, error));
     }
 
-    let recovery_identity = files.recovery_identity.as_ref().cloned().ok_or_else(|| {
-        ShellError::new(
+    if files.recovery_identity.is_none() {
+        return Err(ShellError::new(
             ErrorCode::Validation,
             "atomic transaction lost its retained-original identity",
         )
-        .with_help("Report this internal persistence invariant failure")
-    })?;
-    match remove_if_owned(files.recovery(), &recovery_identity) {
-        Ok(RemoveOutcome::Removed | RemoveOutcome::Missing) => {}
-        Ok(RemoveOutcome::Preserved) => {
-            let recovery = files.preserve_recovery();
-            return Err(ShellError::new(
-                ErrorCode::Validation,
-                "retained-original path changed after source replacement",
-            )
-            .with_context(format!(
-                "cleanup preserved the concurrent entry at {}",
-                recovery
-                    .as_deref()
-                    .unwrap_or_else(|| files.recovery())
-                    .display()
-            ))
-            .with_help("Review the replacement and concurrent entry before retrying"));
-        }
-        Err(error) => {
-            let error = transaction_io_error("remove retained original", files.recovery(), error);
-            return Err(rollback_original(path, files, error));
-        }
+        .with_help("Report this internal persistence invariant failure"));
+    }
+    if let Err(error) = remove_committed_name(files.recovery()) {
+        let error = transaction_io_error("remove retained original", files.recovery(), error);
+        return Err(rollback_original(path, files, error));
     }
     files.recovery_was_consumed();
     // The candidate and its directory entry are already durable. A failed
@@ -814,24 +803,11 @@ fn recovery_path(candidate: &Path) -> PathBuf {
     PathBuf::from(value)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoveOutcome {
-    Removed,
-    Missing,
-    Preserved,
-}
-
-fn remove_if_owned(path: &Path, identity: &FileIdentity) -> io::Result<RemoveOutcome> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RemoveOutcome::Missing),
-        Err(error) => Err(error),
-        Ok(_) if !path_matches_identity(path, identity) => Ok(RemoveOutcome::Preserved),
-        Ok(_) => match fs::remove_file(path) {
-            Ok(()) => Ok(RemoveOutcome::Removed),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RemoveOutcome::Missing),
-            Err(error) => Err(error),
-        },
-    }
+fn remove_committed_name(path: &Path) -> io::Result<()> {
+    // Successful cleanup is bounded to one transaction-generated name. Safe
+    // Rust cannot condition unlink on inode identity, so callers must treat the
+    // containing namespace as cooperative for this final post-commit unlink.
+    fs::remove_file(path)
 }
 
 #[cfg(unix)]
@@ -1005,7 +981,12 @@ mod tests {
                 }));
             } else {
                 assert_eq!(fs::read(&source).unwrap(), b"original bytes\n");
-                assert_only_source_remains(&directory.0, &source);
+                assert!(fs::read_dir(&directory.0).unwrap().count() >= 2);
+                assert!(error
+                    .details
+                    .context
+                    .iter()
+                    .any(|context| context.contains("failure cleanup preserved")));
             }
         }
     }
@@ -1070,7 +1051,41 @@ mod tests {
             .details
             .context
             .iter()
-            .any(|context| context.contains("preserved the concurrent entry")));
+            .any(|context| context.contains("failure cleanup preserved temporary")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_cleanup_preserves_a_second_replacement_after_identity_observation() {
+        let directory = TestDirectory::new("last-cleanup-race");
+        let candidate = directory.0.join("candidate");
+        let moved_owned = directory.0.join("moved-owned-candidate");
+        let recovery = directory.0.join("candidate.original");
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .unwrap();
+        let mut files = TransactionFiles::new(candidate.clone(), &file, recovery).unwrap();
+        let primary = ShellError::new(ErrorCode::Io, "injected primary failure");
+
+        let error = files.cleanup_with_hook(primary, |observed_path| {
+            assert_eq!(observed_path, candidate);
+            fs::rename(observed_path, &moved_owned)?;
+            fs::write(observed_path, b"foreign-after-identity-check")
+        });
+
+        assert_eq!(
+            fs::read(&candidate).unwrap(),
+            b"foreign-after-identity-check"
+        );
+        assert!(moved_owned.exists());
+        assert_eq!(error.message, "injected primary failure");
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("failure cleanup preserved temporary")));
     }
 
     #[cfg(unix)]
@@ -1154,7 +1169,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::Validation);
         assert!(error.message.contains("permissions changed"));
         assert_eq!(fs::read(&source).unwrap(), b"old source\n");
-        assert_only_source_remains(&directory.0, &source);
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
     }
 
     #[cfg(unix)]
@@ -1187,7 +1202,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::InvalidArgument);
         assert_eq!(fs::read(&source).unwrap(), b"old source\n");
         assert_eq!(fs::read(&alias).unwrap(), b"new source\n");
-        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 3);
     }
 
     #[test]
@@ -1226,7 +1241,7 @@ mod tests {
         let collision = collision.unwrap();
         assert_eq!(fs::read(&collision).unwrap(), b"foreign entry\n");
         let entries = fs::read_dir(&directory.0).unwrap().count();
-        assert_eq!(entries, 2);
+        assert_eq!(entries, 3);
     }
 
     #[cfg(unix)]

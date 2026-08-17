@@ -34,6 +34,11 @@ const INDEX_DIAGNOSTICS_MAX: usize = 4_096;
 const INDEX_TEMPORARY_ATTEMPTS_MAX: usize = 64;
 static NEXT_INDEX_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
+// Failure cleanup preserves every armed name because identity validation plus
+// pathname unlink is racy. Only the bounded post-commit path removes the hidden
+// temporary, under the explicit assumption that the containing namespace is
+// cooperative for that final success cleanup.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IndexWriteStage {
     ContentSynced,
@@ -78,17 +83,10 @@ impl IndexOwnedPath {
         false
     }
 
-    fn remove(&self) -> io::Result<bool> {
-        match fs::symlink_metadata(&self.path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-            Err(error) => Err(error),
-            Ok(_) if !self.matches(&self.path) => Ok(false),
-            Ok(_) => match fs::remove_file(&self.path) {
-                Ok(()) => Ok(true),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-                Err(error) => Err(error),
-            },
-        }
+    fn remove_committed(&self) -> io::Result<()> {
+        // This is success-only cleanup of one bounded transaction name. The
+        // containing namespace must remain cooperative during this final unlink.
+        fs::remove_file(&self.path)
     }
 }
 
@@ -124,38 +122,16 @@ impl IndexTemporary {
 
     fn cleanup(&mut self, mut error: ShellError) -> ShellError {
         if let Some(destination) = self.destination.take() {
-            if self.owns(&destination) {
-                if let Err(cleanup_error) = fs::remove_file(&destination) {
-                    if cleanup_error.kind() != io::ErrorKind::NotFound {
-                        error = error.with_context(format!(
-                            "installed index cleanup failed for {}: {cleanup_error}",
-                            destination.display()
-                        ));
-                    }
-                }
-            } else {
-                error = error.with_context(format!(
-                    "installed index {} changed; cleanup preserved the concurrent entry",
-                    destination.display()
-                ));
-            }
+            error = error.with_context(format!(
+                "failure cleanup preserved installed index {}",
+                destination.display()
+            ));
         }
         if let Some(temporary) = self.temporary.take() {
-            match temporary.remove() {
-                Ok(true) => {}
-                Ok(false) => {
-                    error = error.with_context(format!(
-                        "index temporary {} changed; cleanup preserved the concurrent entry",
-                        temporary.path().display()
-                    ));
-                }
-                Err(cleanup_error) => {
-                    error = error.with_context(format!(
-                        "index temporary cleanup failed for {}: {cleanup_error}",
-                        temporary.path().display()
-                    ));
-                }
-            }
+            error = error.with_context(format!(
+                "failure cleanup preserved index temporary {}",
+                temporary.path().display()
+            ));
         }
         error
     }
@@ -168,14 +144,8 @@ impl IndexTemporary {
 
 impl Drop for IndexTemporary {
     fn drop(&mut self) {
-        if let Some(destination) = self.destination.take() {
-            if self.owns(&destination) {
-                let _ = fs::remove_file(destination);
-            }
-        }
-        if let Some(temporary) = self.temporary.take() {
-            let _ = temporary.remove();
-        }
+        self.destination = None;
+        self.temporary = None;
     }
 }
 
@@ -1034,7 +1004,12 @@ fn install_new_index_with_hook(
     mut after_stage: impl FnMut(IndexWriteStage) -> io::Result<()>,
 ) -> Result<(), ShellError> {
     let (temporary, mut file) = create_index_temporary(path)?;
-    let mut guard = IndexTemporary::new(temporary, &file)?;
+    let mut guard = IndexTemporary::new(temporary.clone(), &file).map_err(|error| {
+        error.with_context(format!(
+            "failure cleanup preserved index temporary {}",
+            temporary.display()
+        ))
+    })?;
     let split = encoded.len().div_ceil(2);
     file.write_all(&encoded[..split])
         .and_then(|()| file.write_all(&encoded[split..]))
@@ -1064,21 +1039,12 @@ fn install_new_index_with_hook(
     if let Err(error) = sync_index_directory(parent) {
         return Err(guard.cleanup(error));
     }
-    let removed = guard
+    guard
         .temporary
         .as_ref()
-        .map(IndexOwnedPath::remove)
+        .map(IndexOwnedPath::remove_committed)
         .transpose()
         .map_err(|error| guard.cleanup(index_io_error("clean", guard.path(), error)))?;
-    if removed == Some(false) {
-        return Err(guard.cleanup(
-            ShellError::new(
-                ErrorCode::Validation,
-                "index temporary changed before cleanup",
-            )
-            .with_help("Remove the preserved temporary only after verifying its ownership"),
-        ));
-    }
     guard.disarm();
     let _ = sync_index_directory(parent);
     Ok(())
@@ -1106,26 +1072,12 @@ fn create_index_temporary(path: &Path) -> Result<(PathBuf, File), ShellError> {
             Ok(file) => {
                 #[cfg(unix)]
                 if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-                    let mut shell_error = index_io_error("secure", &temporary, error);
-                    let cleanup = IndexOwnedPath::from_file(temporary.clone(), &file)
-                        .map_err(|identity_error| io::Error::other(identity_error.message))
-                        .and_then(|owned| owned.remove());
-                    match cleanup {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            shell_error = shell_error.with_context(format!(
-                                "index temporary {} changed; cleanup preserved the concurrent entry",
-                                temporary.display()
-                            ));
-                        }
-                        Err(cleanup_error) => {
-                            shell_error = shell_error.with_context(format!(
-                                "index temporary cleanup failed for {}: {cleanup_error}",
-                                temporary.display()
-                            ));
-                        }
-                    }
-                    return Err(shell_error);
+                    return Err(
+                        index_io_error("secure", &temporary, error).with_context(format!(
+                            "failure cleanup preserved index temporary {}",
+                            temporary.display()
+                        )),
+                    );
                 }
                 return Ok((temporary, file));
             }
@@ -1454,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_index_install_preserves_collision_and_cleans_temporary() {
+    fn failed_index_install_preserves_collision_and_temporary() {
         let directory = temporary_directory();
         let path = directory.join("catalog.json");
         fs::write(&path, b"foreign").unwrap();
@@ -1463,7 +1415,7 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::Io);
         assert_eq!(fs::read(&path).unwrap(), b"foreign");
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1499,7 +1451,7 @@ mod tests {
             .details
             .context
             .iter()
-            .any(|context| context.contains("preserved the concurrent entry")));
+            .any(|context| context.contains("failure cleanup preserved index temporary")));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1543,7 +1495,7 @@ mod tests {
                 .details
                 .context
                 .iter()
-                .filter(|context| context.contains("preserved the concurrent entry"))
+                .filter(|context| context.contains("failure cleanup preserved"))
                 .count()
                 >= 2
         );
@@ -1597,7 +1549,7 @@ mod tests {
             .details
             .context
             .iter()
-            .any(|context| context.contains("preserved the concurrent entry")));
+            .any(|context| context.contains("failure cleanup preserved index temporary")));
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -39,6 +39,11 @@ const RECOVERY_DIRECTORY_DEPTH_MAX: usize = 64;
 const TEMPORARY_NAME_ATTEMPTS_MAX: usize = 64;
 static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
 
+// Failure cleanup never unlinks an armed transaction name. The recovery
+// directory is private (0700), so successful writes may remove their one hidden
+// temporary under the narrower assumption that this private namespace remains
+// cooperative through the final post-commit unlink.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotWriteStage {
     PartialWrite,
@@ -90,17 +95,11 @@ impl SnapshotOwnedPath {
         false
     }
 
-    fn remove(&self) -> io::Result<bool> {
-        match fs::symlink_metadata(&self.path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-            Err(error) => Err(error),
-            Ok(_) if !self.matches(&self.path) => Ok(false),
-            Ok(_) => match fs::remove_file(&self.path) {
-                Ok(()) => Ok(true),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
-                Err(error) => Err(error),
-            },
-        }
+    fn remove_committed(&self) -> io::Result<()> {
+        // Recovery uses a private 0700 directory. This success-only unlink is
+        // bounded to one transaction name and assumes that namespace remains
+        // cooperative through the final post-commit cleanup.
+        fs::remove_file(&self.path)
     }
 }
 
@@ -120,43 +119,25 @@ impl SnapshotTransaction {
             .unwrap_or_else(|| Path::new("<removed-temporary>"))
     }
 
+    fn owns(&self, path: &Path) -> bool {
+        self.temporary
+            .as_ref()
+            .is_some_and(|temporary| temporary.matches(path))
+    }
+
     fn cleanup(&mut self, mut error: ShellError) -> ShellError {
         if self.destination_owned {
             self.destination_owned = false;
-            let removable = self
-                .temporary
-                .as_ref()
-                .is_some_and(|temporary| temporary.matches(&self.destination));
-            if removable {
-                if let Err(cleanup_error) = fs::remove_file(&self.destination) {
-                    error = error.with_context(format!(
-                        "recovery transaction cleanup failed for {}: {cleanup_error}",
-                        self.destination.display()
-                    ));
-                }
-            } else {
-                error = error.with_context(format!(
-                    "recovery destination {} changed; cleanup preserved the concurrent entry",
-                    self.destination.display()
-                ));
-            }
+            error = error.with_context(format!(
+                "failure cleanup preserved recovery destination {}",
+                self.destination.display()
+            ));
         }
         if let Some(temporary) = self.temporary.take() {
-            match temporary.remove() {
-                Ok(true) => {}
-                Ok(false) => {
-                    error = error.with_context(format!(
-                        "recovery temporary {} changed; cleanup preserved the concurrent entry",
-                        temporary.path().display()
-                    ));
-                }
-                Err(cleanup_error) => {
-                    error = error.with_context(format!(
-                        "recovery transaction cleanup failed for {}: {cleanup_error}",
-                        temporary.path().display()
-                    ));
-                }
-            }
+            error = error.with_context(format!(
+                "failure cleanup preserved recovery temporary {}",
+                temporary.path().display()
+            ));
         }
         error
     }
@@ -169,17 +150,8 @@ impl SnapshotTransaction {
 
 impl Drop for SnapshotTransaction {
     fn drop(&mut self) {
-        if self.destination_owned
-            && self
-                .temporary
-                .as_ref()
-                .is_some_and(|temporary| temporary.matches(&self.destination))
-        {
-            let _ = fs::remove_file(&self.destination);
-        }
-        if let Some(temporary) = self.temporary.take() {
-            let _ = temporary.remove();
-        }
+        self.destination_owned = false;
+        self.temporary = None;
     }
 }
 
@@ -399,7 +371,15 @@ impl RecoveryJournal {
         }
         reject_existing_snapshot_destination(&destination)?;
         let (temporary, mut file) = create_snapshot_temporary(&destination)?;
-        let mut transaction = SnapshotTransaction::new(temporary, &file, destination.clone())?;
+        let mut transaction =
+            SnapshotTransaction::new(temporary.clone(), &file, destination.clone()).map_err(
+                |error| {
+                    error.with_context(format!(
+                        "failure cleanup preserved recovery temporary {}",
+                        temporary.display()
+                    ))
+                },
+            )?;
         let split = bytes.len().div_ceil(2);
         if let Err(error) = file.write_all(&bytes[..split]).and_then(|()| {
             after_stage(SnapshotWriteStage::PartialWrite)?;
@@ -421,6 +401,18 @@ impl RecoveryJournal {
             return Err(transaction.cleanup(recovery_io_error("install", &destination, error)));
         }
         transaction.destination_owned = true;
+        if !transaction.owns(&destination) {
+            return Err(transaction.cleanup(
+                ShellError::new(
+                    ErrorCode::Validation,
+                    format!(
+                        "recovery destination {} changed during installation",
+                        destination.display()
+                    ),
+                )
+                .with_help("Review the preserved destination and temporary before retrying"),
+            ));
+        }
         if let Err(error) = validate_snapshot_path(&destination, 2) {
             return Err(transaction.cleanup(error));
         }
@@ -430,23 +422,14 @@ impl RecoveryJournal {
         if let Err(error) = sync_recovery_directory(&self.directory) {
             return Err(transaction.cleanup(error));
         }
-        let removed = transaction
+        transaction
             .temporary
             .as_ref()
-            .map(SnapshotOwnedPath::remove)
+            .map(SnapshotOwnedPath::remove_committed)
             .transpose()
             .map_err(|error| {
                 transaction.cleanup(recovery_io_error("clean", transaction.temporary(), error))
             })?;
-        if removed == Some(false) {
-            return Err(transaction.cleanup(
-                ShellError::new(
-                    ErrorCode::Validation,
-                    "recovery temporary changed before cleanup",
-                )
-                .with_help("Remove the preserved temporary only after verifying its ownership"),
-            ));
-        }
         transaction.temporary = None;
         // The installed snapshot is already durable. Failure to persist only
         // the temporary-name removal must not turn the committed write into an
@@ -468,6 +451,8 @@ impl RecoveryJournal {
                 retained += 1;
                 retained_bytes = retained_bytes.saturating_add(size);
             } else {
+                // Retention is successful policy cleanup inside the secured
+                // 0700 recovery namespace, not transaction failure cleanup.
                 fs::remove_file(&path).map_err(|error| recovery_io_error("prune", &path, error))?;
             }
         }
@@ -580,26 +565,12 @@ fn create_snapshot_temporary(destination: &Path) -> Result<(PathBuf, File), Shel
             Ok(file) => {
                 #[cfg(unix)]
                 if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-                    let mut shell_error = recovery_io_error("secure", &temporary, error);
-                    let cleanup = SnapshotOwnedPath::new(temporary.clone(), &file)
-                        .map_err(|identity_error| io::Error::other(identity_error.message))
-                        .and_then(|owned| owned.remove());
-                    match cleanup {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            shell_error = shell_error.with_context(format!(
-                                "recovery temporary {} changed; cleanup preserved the concurrent entry",
-                                temporary.display()
-                            ));
-                        }
-                        Err(cleanup_error) => {
-                            shell_error = shell_error.with_context(format!(
-                                "recovery transaction cleanup failed for {}: {cleanup_error}",
-                                temporary.display()
-                            ));
-                        }
-                    }
-                    return Err(shell_error);
+                    return Err(recovery_io_error("secure", &temporary, error).with_context(
+                        format!(
+                            "failure cleanup preserved recovery temporary {}",
+                            temporary.display()
+                        ),
+                    ));
                 }
                 return Ok((temporary, file));
             }
@@ -1533,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_write_and_install_failures_remove_owned_snapshot_entries() {
+    fn partial_write_and_install_failures_preserve_owned_snapshot_entries() {
         for failed_stage in [
             SnapshotWriteStage::PartialWrite,
             SnapshotWriteStage::Installed,
@@ -1561,8 +1532,18 @@ mod tests {
                 .context
                 .iter()
                 .any(|context| context.contains("injected snapshot failure")));
-            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
-            fs::remove_dir(directory).unwrap();
+            let expected_entries = if failed_stage == SnapshotWriteStage::Installed {
+                2
+            } else {
+                1
+            };
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), expected_entries);
+            assert!(error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("failure cleanup preserved recovery")));
+            fs::remove_dir_all(directory).unwrap();
         }
     }
 
@@ -1599,7 +1580,7 @@ mod tests {
             .details
             .context
             .iter()
-            .any(|context| context.contains("preserved the concurrent entry")));
+            .any(|context| context.contains("failure cleanup preserved recovery temporary")));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1638,7 +1619,7 @@ mod tests {
             .details
             .context
             .iter()
-            .any(|context| context.contains("preserved the concurrent entry")));
+            .any(|context| context.contains("failure cleanup preserved recovery temporary")));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1687,7 +1668,7 @@ mod tests {
                 .details
                 .context
                 .iter()
-                .filter(|context| context.contains("preserved the concurrent entry"))
+                .filter(|context| context.contains("failure cleanup preserved recovery"))
                 .count()
                 >= 2
         );

@@ -23,6 +23,11 @@ const DIRECTORY_DEPTH_MAX: usize = 64;
 const TEMPORARY_NAME_ATTEMPTS_MAX: usize = 64;
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
+// Failure cleanup is deliberately non-destructive: safe Rust cannot atomically
+// condition unlink or rmdir on the identity captured from an open handle. Only
+// the bounded success path removes a transaction-generated temporary name, and
+// that final unlink requires a cooperative containing namespace.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CreateStage {
     DirectoriesReady,
@@ -42,13 +47,6 @@ struct OwnedPath {
     device: u64,
     #[cfg(unix)]
     inode: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CleanupOutcome {
-    Removed,
-    Missing,
-    Preserved,
 }
 
 impl OwnedPath {
@@ -84,30 +82,11 @@ impl OwnedPath {
         false
     }
 
-    fn remove(&self) -> io::Result<CleanupOutcome> {
-        match fs::symlink_metadata(&self.path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CleanupOutcome::Missing),
-            Err(error) => Err(error),
-            Ok(_) if !self.matches(&self.path) => Ok(CleanupOutcome::Preserved),
-            Ok(_) => match fs::remove_file(&self.path) {
-                Ok(()) => Ok(CleanupOutcome::Removed),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    Ok(CleanupOutcome::Missing)
-                }
-                Err(error) => Err(error),
-            },
-        }
-    }
-
-    fn remove_directory(&self) -> io::Result<CleanupOutcome> {
-        match fs::symlink_metadata(&self.path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CleanupOutcome::Missing),
-            Err(error) => Err(error),
-            // Stable safe Rust does not expose a conditional remove-by-identity
-            // primitive for directories. Preserve the entry instead of racing
-            // a concurrent rename-and-replacement between validation and rmdir.
-            Ok(_) => Ok(CleanupOutcome::Preserved),
-        }
+    fn remove_committed(&self) -> io::Result<()> {
+        // This is success-only cleanup of a bounded transaction name. Safe Rust
+        // cannot condition unlink on identity, so the containing namespace must
+        // remain cooperative for this final post-commit unlink.
+        fs::remove_file(&self.path)
     }
 }
 
@@ -126,38 +105,16 @@ impl CreationTransaction {
 
     fn cleanup(&mut self, mut error: ShellError) -> ShellError {
         if let Some(owned) = self.created_file.take() {
-            match owned.remove() {
-                Ok(CleanupOutcome::Preserved) => {
-                    error = error.with_context(format!(
-                        "created file {} changed; rollback preserved the concurrent entry",
-                        owned.path().display()
-                    ));
-                }
-                Ok(CleanupOutcome::Removed | CleanupOutcome::Missing) => {}
-                Err(cleanup_error) => {
-                    error = error.with_context(format!(
-                        "created-file rollback failed for {}: {cleanup_error}",
-                        owned.path().display()
-                    ));
-                }
-            }
+            error = error.with_context(format!(
+                "failure cleanup preserved created file {}",
+                owned.path().display()
+            ));
         }
         while let Some(owned) = self.created_directories.pop() {
-            match owned.remove_directory() {
-                Ok(CleanupOutcome::Preserved) => {
-                    error = error.with_context(format!(
-                        "created directory {} was preserved because rollback cannot atomically prove path ownership",
-                        owned.path().display()
-                    ));
-                }
-                Ok(CleanupOutcome::Removed | CleanupOutcome::Missing) => {}
-                Err(cleanup_error) => {
-                    error = error.with_context(format!(
-                        "created-directory rollback failed for {}: {cleanup_error}",
-                        owned.path().display()
-                    ));
-                }
-            }
+            error = error.with_context(format!(
+                "failure cleanup preserved created directory {} because safe Rust cannot condition removal on identity",
+                owned.path().display()
+            ));
         }
         error
     }
@@ -170,12 +127,8 @@ impl CreationTransaction {
 
 impl Drop for CreationTransaction {
     fn drop(&mut self) {
-        if let Some(owned) = self.created_file.take() {
-            let _ = owned.remove();
-        }
-        while let Some(owned) = self.created_directories.pop() {
-            let _ = owned.remove_directory();
-        }
+        self.created_file = None;
+        self.created_directories.clear();
     }
 }
 
@@ -214,47 +167,40 @@ impl TemporaryOutput {
         self.destination = None;
     }
 
-    fn cleanup(&mut self, mut error: ShellError) -> ShellError {
-        if let Some(destination) = self.destination.take() {
-            error = self.cleanup_path(error, &destination, "installed documentation output");
-        }
-        if let Some(temporary) = self.temporary.take() {
-            match temporary.remove() {
-                Ok(CleanupOutcome::Preserved) => {
-                    error = error.with_context(format!(
-                        "documentation temporary {} changed; cleanup preserved the concurrent entry",
-                        temporary.path().display()
-                    ));
-                }
-                Ok(CleanupOutcome::Removed | CleanupOutcome::Missing) => {}
-                Err(cleanup_error) => {
-                    error = error.with_context(format!(
-                        "documentation temporary cleanup failed for {}: {cleanup_error}",
-                        temporary.path().display()
-                    ));
-                }
-            }
-        }
-        error
+    fn cleanup(&mut self, error: ShellError) -> ShellError {
+        self.cleanup_with_hook(error, |_| Ok(()))
     }
 
-    fn cleanup_path(&self, mut error: ShellError, path: &Path, label: &str) -> ShellError {
-        let Some(temporary) = self.temporary.as_ref() else {
-            return error;
-        };
-        if !temporary.matches(path) {
-            return error.with_context(format!(
-                "{label} {} changed; cleanup preserved the concurrent entry",
-                path.display()
-            ));
-        }
-        if let Err(cleanup_error) = fs::remove_file(path) {
-            if cleanup_error.kind() != io::ErrorKind::NotFound {
+    fn cleanup_with_hook(
+        &mut self,
+        mut error: ShellError,
+        mut after_identity_check: impl FnMut(&Path) -> io::Result<()>,
+    ) -> ShellError {
+        if let Some(destination) = self.destination.take() {
+            let _matched = self.owns(&destination);
+            if let Err(hook_error) = after_identity_check(&destination) {
                 error = error.with_context(format!(
-                    "{label} cleanup failed for {}: {cleanup_error}",
-                    path.display()
+                    "documentation output preservation hook failed for {}: {hook_error}",
+                    destination.display()
                 ));
             }
+            error = error.with_context(format!(
+                "failure cleanup preserved installed documentation output {}",
+                destination.display()
+            ));
+        }
+        if let Some(temporary) = self.temporary.take() {
+            let _matched = temporary.matches(temporary.path());
+            if let Err(hook_error) = after_identity_check(temporary.path()) {
+                error = error.with_context(format!(
+                    "documentation temporary preservation hook failed for {}: {hook_error}",
+                    temporary.path().display()
+                ));
+            }
+            error = error.with_context(format!(
+                "failure cleanup preserved documentation temporary {}",
+                temporary.path().display()
+            ));
         }
         error
     }
@@ -262,14 +208,8 @@ impl TemporaryOutput {
 
 impl Drop for TemporaryOutput {
     fn drop(&mut self) {
-        if let Some(destination) = self.destination.take() {
-            if self.owns(&destination) {
-                let _ = fs::remove_file(destination);
-            }
-        }
-        if let Some(temporary) = self.temporary.take() {
-            let _ = temporary.remove();
-        }
+        self.destination = None;
+        self.temporary = None;
     }
 }
 
@@ -676,7 +616,12 @@ fn install_new_output_with_hook(
     mut after_stage: impl FnMut(OutputWriteStage) -> io::Result<()>,
 ) -> Result<(), ShellError> {
     let (temporary, mut file) = create_output_temporary(path)?;
-    let mut guard = TemporaryOutput::new(temporary, &file)?;
+    let mut guard = TemporaryOutput::new(temporary.clone(), &file).map_err(|error| {
+        error.with_context(format!(
+            "failure cleanup preserved documentation temporary {}",
+            temporary.display()
+        ))
+    })?;
     file.write_all(contents)
         .and_then(|()| file.sync_all())
         .and_then(|()| after_stage(OutputWriteStage::ContentSynced))
@@ -707,21 +652,12 @@ fn install_new_output_with_hook(
     if let Err(error) = sync_parent_directory(parent) {
         return Err(guard.cleanup(error));
     }
-    let cleanup = guard
+    guard
         .temporary
         .as_ref()
-        .map(OwnedPath::remove)
+        .map(OwnedPath::remove_committed)
         .transpose()
         .map_err(|error| guard.cleanup(io_error("clean", guard.path(), error)))?;
-    if cleanup == Some(CleanupOutcome::Preserved) {
-        return Err(guard.cleanup(
-            ShellError::new(
-                ErrorCode::Validation,
-                "documentation temporary changed before cleanup",
-            )
-            .with_help("Remove the preserved temporary only after verifying its ownership"),
-        ));
-    }
     guard.disarm();
     let _ = sync_parent_directory(parent);
     Ok(())
@@ -749,26 +685,10 @@ fn create_output_temporary(path: &Path) -> Result<(PathBuf, File), ShellError> {
             Ok(file) => {
                 #[cfg(unix)]
                 if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-                    let mut shell_error = io_error("secure", &temporary, error);
-                    let cleanup = OwnedPath::from_file(temporary.clone(), &file)
-                        .map_err(|identity_error| io::Error::other(identity_error.message))
-                        .and_then(|owned| owned.remove());
-                    match cleanup {
-                        Ok(CleanupOutcome::Removed | CleanupOutcome::Missing) => {}
-                        Ok(CleanupOutcome::Preserved) => {
-                            shell_error = shell_error.with_context(format!(
-                                "documentation temporary {} changed; cleanup preserved the concurrent entry",
-                                temporary.display()
-                            ));
-                        }
-                        Err(cleanup_error) => {
-                            shell_error = shell_error.with_context(format!(
-                                "documentation temporary cleanup failed for {}: {cleanup_error}",
-                                temporary.display()
-                            ));
-                        }
-                    }
-                    return Err(shell_error);
+                    return Err(io_error("secure", &temporary, error).with_context(format!(
+                        "failure cleanup preserved documentation temporary {}",
+                        temporary.display()
+                    )));
                 }
                 return Ok((temporary, file));
             }
@@ -1051,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_new_script_rolls_back_only_entries_created_by_this_invocation() {
+    fn failed_new_script_preserves_owned_entries_and_preexisting_data() {
         let root = temporary_directory("rollback");
         let preexisting = root.join("preexisting");
         fs::create_dir_all(&preexisting).unwrap();
@@ -1078,12 +998,13 @@ mod tests {
         assert_eq!(error.code, ErrorCode::Io);
         assert_eq!(fs::read(&marker).unwrap(), b"keep");
         assert!(created_directory.exists());
+        assert!(created_directory.join("script.qrl").exists());
         assert!(preexisting.exists());
         assert!(error
             .details
             .context
             .iter()
-            .any(|context| context.contains("cannot atomically prove path ownership")));
+            .any(|context| context.contains("failure cleanup preserved created")));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1118,7 +1039,7 @@ mod tests {
             .details
             .context
             .iter()
-            .any(|context| context.contains("preserved the concurrent entry")));
+            .any(|context| context.contains("failure cleanup preserved created file")));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1153,7 +1074,7 @@ mod tests {
             .details
             .context
             .iter()
-            .any(|context| context.contains("cannot atomically prove path ownership")));
+            .any(|context| context.contains("failure cleanup preserved created directory")));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1261,7 +1182,39 @@ mod tests {
             .details
             .context
             .iter()
-            .any(|context| context.contains("preserved the concurrent entry")));
+            .any(|context| context.contains("failure cleanup preserved documentation temporary")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn documentation_failure_cleanup_preserves_replacement_after_final_identity_check() {
+        let directory = temporary_directory("last-cleanup-race");
+        fs::create_dir(&directory).unwrap();
+        let output = directory.join("catalog.md");
+        let moved_owned = directory.join("moved-owned-temporary");
+        let (temporary, file) = create_output_temporary(&output).unwrap();
+        let mut guard = TemporaryOutput::new(temporary.clone(), &file).unwrap();
+        drop(file);
+        let primary = ShellError::new(ErrorCode::Io, "injected primary failure");
+
+        let error = guard.cleanup_with_hook(primary, |observed_path| {
+            assert_eq!(observed_path, temporary);
+            fs::rename(observed_path, &moved_owned)?;
+            fs::write(observed_path, b"foreign-after-identity-check")
+        });
+
+        assert_eq!(
+            fs::read(&temporary).unwrap(),
+            b"foreign-after-identity-check"
+        );
+        assert!(moved_owned.exists());
+        assert_eq!(error.message, "injected primary failure");
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("failure cleanup preserved documentation temporary")));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1306,7 +1259,7 @@ mod tests {
                 .details
                 .context
                 .iter()
-                .filter(|context| context.contains("preserved the concurrent entry"))
+                .filter(|context| context.contains("failure cleanup preserved"))
                 .count()
                 >= 2
         );
