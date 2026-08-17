@@ -32,7 +32,7 @@ const COMPLETION_READ_LIMIT: usize = 4 * 1024 * 1024;
 const DOCUMENTATION_READ_LIMIT: usize = 1024 * 1024;
 const INDEX_ROOTS_MAX: usize = 128;
 const INDEX_DIRECTORY_ENTRIES_MAX: usize = 8_192;
-const INDEX_FILES_MAX: usize = 2_048;
+const INDEX_FILES_MAX: usize = 4_096;
 const INDEX_PATH_BYTES_MAX: usize = 1024 * 1024;
 const INDEX_SOURCE_BYTES_TOTAL_MAX: usize = 16 * 1024 * 1024;
 const INDEX_RECORDS_MAX: usize = 65_536;
@@ -130,6 +130,21 @@ struct CatalogRefreshWorker {
     refresh_interval: Duration,
     refresh_deadline: Duration,
     reload_environment: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RefreshDeadline {
+    expires_at: Instant,
+    limit: Duration,
+}
+
+impl RefreshDeadline {
+    fn starting_now(limit: Duration) -> Self {
+        Self {
+            expires_at: Instant::now() + limit,
+            limit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -673,7 +688,14 @@ fn initialize_interactive_catalog_with_deadline(
     deadline: Instant,
 ) -> Result<bool, ShellError> {
     let cancelled = AtomicBool::new(false);
-    match refresh_catalog_cache(config, deadline, &cancelled) {
+    match refresh_catalog_cache(
+        config,
+        RefreshDeadline {
+            expires_at: deadline,
+            limit: DISCOVERY_DEADLINE,
+        },
+        &cancelled,
+    ) {
         Ok(refreshed) => Ok(refreshed),
         Err(discovery_error) => ensure_builtin_database(&config.index_path).map_err(|error| {
             error.with_context(format!(
@@ -774,7 +796,7 @@ fn refresh_loop(worker: CatalogRefreshWorker) {
         worker.observer.refresh_started();
         match refresh_catalog_cache(
             &current,
-            Instant::now() + worker.refresh_deadline,
+            RefreshDeadline::starting_now(worker.refresh_deadline),
             &worker.cancelled,
         ) {
             Ok(true) => {
@@ -838,7 +860,7 @@ fn increment_generation(counter: &AtomicU64, name: &str) -> Result<u64, ShellErr
 
 fn refresh_catalog_cache(
     config: &DiscoveryConfig,
-    deadline: Instant,
+    deadline: RefreshDeadline,
     cancelled: &AtomicBool,
 ) -> Result<bool, ShellError> {
     let mut budget = IndexBuildBudget::new(IndexBounds::PRODUCTION);
@@ -914,7 +936,7 @@ fn discovery_cache_is_current(
 }
 
 fn ensure_refresh_active(
-    deadline: Instant,
+    deadline: RefreshDeadline,
     cancelled: &AtomicBool,
     stage: &str,
 ) -> Result<(), ShellError> {
@@ -925,15 +947,15 @@ fn ensure_refresh_active(
                 .with_help("Retry discovery in a running interactive session"),
         );
     }
-    if Instant::now() >= deadline {
+    if Instant::now() >= deadline.expires_at {
         return Err(ShellError::new(
             ErrorCode::ResourceLimit,
             "catalog discovery exceeded its refresh deadline",
         )
         .with_context(format!(
             "limit: {} ms; observed: at least {} ms; stage: {stage}",
-            DISCOVERY_DEADLINE.as_millis(),
-            DISCOVERY_DEADLINE.as_millis(),
+            deadline.limit.as_millis(),
+            deadline.limit.as_millis(),
         ))
         .with_help("Reduce PATH or declarative completion sources and retry"));
     }
@@ -1409,7 +1431,7 @@ fn completion_files_checked(
 fn discover_sources(
     config: &DiscoveryConfig,
     budget: &mut IndexBuildBudget,
-    deadline: Instant,
+    deadline: RefreshDeadline,
     cancelled: &AtomicBool,
 ) -> Result<DiscoverySnapshot, ShellError> {
     let fish_files =
@@ -1472,20 +1494,25 @@ fn discover_sources(
 fn discover_path_executables(
     roots: &[PathBuf],
     budget: &mut IndexBuildBudget,
-    deadline: Instant,
+    deadline: RefreshDeadline,
     cancelled: &AtomicBool,
 ) -> Result<Vec<PathBuf>, ShellError> {
     let mut commands = Vec::new();
     let mut names = BTreeSet::new();
     for root in roots {
         ensure_refresh_active(deadline, cancelled, "while scanning PATH")?;
-        match fs::symlink_metadata(root) {
+        match fs::metadata(root) {
             Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => return Err(nonregular_index_input(root)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Ok(_) => continue,
+            Err(error) if path_candidate_error_is_skippable(&error) => continue,
             Err(error) => return Err(index_io_error("inspect", root, error)),
         }
-        for entry in fs::read_dir(root).map_err(|error| index_io_error("enumerate", root, error))? {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if path_candidate_error_is_skippable(&error) => continue,
+            Err(error) => return Err(index_io_error("enumerate", root, error)),
+        };
+        for entry in entries {
             budget.entries = budget.entries.saturating_add(1);
             ensure_index_limit(
                 "directory entries",
@@ -1493,12 +1520,16 @@ fn discover_path_executables(
                 budget.entries,
             )?;
             ensure_refresh_active(deadline, cancelled, "while scanning PATH entries")?;
-            let entry = entry.map_err(|error| index_io_error("enumerate", root, error))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if path_candidate_error_is_skippable(&error) => continue,
+                Err(error) => return Err(index_io_error("enumerate", root, error)),
+            };
             let path = entry.path();
             let metadata = match fs::metadata(&path) {
                 Ok(metadata) if metadata.file_type().is_file() => metadata,
                 Ok(_) => continue,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if path_candidate_error_is_skippable(&error) => continue,
                 Err(error) => return Err(index_io_error("inspect", &path, error)),
             };
             if !is_executable(&metadata) {
@@ -1518,6 +1549,13 @@ fn discover_path_executables(
     }
     commands.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
     Ok(commands)
+}
+
+fn path_candidate_error_is_skippable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+    )
 }
 
 #[cfg(unix)]
@@ -2359,7 +2397,7 @@ mod tests {
     fn refresh(config: &DiscoveryConfig) -> Result<bool, ShellError> {
         refresh_catalog_cache(
             config,
-            Instant::now() + Duration::from_secs(5),
+            RefreshDeadline::starting_now(Duration::from_secs(5)),
             &AtomicBool::new(false),
         )
     }
@@ -2752,7 +2790,7 @@ mod tests {
         let error = discover_path_executables(
             std::slice::from_ref(&directory),
             &mut budget,
-            Instant::now() + Duration::from_secs(5),
+            RefreshDeadline::starting_now(Duration::from_secs(5)),
             &AtomicBool::new(false),
         )
         .unwrap_err();
@@ -2760,6 +2798,71 @@ mod tests {
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert!(error.details.context[0].contains("limit: 1"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn path_entry_permission_failure_is_a_skipped_candidate() {
+        assert!(path_candidate_error_is_skippable(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(path_candidate_error_is_skippable(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
+        assert!(!path_candidate_error_is_skippable(&io::Error::from(
+            io::ErrorKind::InvalidData
+        )));
+    }
+
+    #[test]
+    fn host_sized_discovery_accepts_path_and_completion_sources_above_old_limit() {
+        const EXECUTABLES: usize = 2_250;
+        const COMPLETIONS: usize = 150;
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        for index in 0..EXECUTABLES {
+            write_executable(&config.path_roots[0].join(format!("host-command-{index:04}")));
+        }
+        for index in 0..COMPLETIONS {
+            fs::write(
+                config.fish_roots[0].join(format!("host-command-{index:04}.fish")),
+                format!("complete -c host-command-{index:04} -l verbose"),
+            )
+            .unwrap();
+        }
+        let mut budget = test_budget();
+
+        let snapshot = discover_sources(
+            &config,
+            &mut budget,
+            RefreshDeadline::starting_now(Duration::from_secs(10)),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.executables.len(), EXECUTABLES);
+        assert_eq!(snapshot.fish_files.len(), COMPLETIONS);
+        assert_eq!(snapshot.sources.len(), EXECUTABLES + COMPLETIONS);
+        assert!(snapshot.sources.len() > 2_048);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn refresh_deadline_error_reports_the_active_background_limit() {
+        let limit = Duration::from_secs(30);
+        let error = ensure_refresh_active(
+            RefreshDeadline {
+                expires_at: Instant::now(),
+                limit,
+            },
+            &AtomicBool::new(false),
+            "while scanning PATH",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("limit: 30000 ms"));
+        assert!(error.details.context[0].contains("stage: while scanning PATH"));
+        assert!(!error.details.context[0].contains("limit: 750 ms"));
     }
 
     #[test]

@@ -44,9 +44,15 @@ Catalog admission also starts one session-owned discovery worker immediately;
 it does not wait for `read_line` to return. Its full scan has an explicit
 30-second background deadline and a 60-second periodic interval, while accepted
 input only requests an additional coalesced scan. Discovery activity is cached
-for the fixed bottom status row. A completed database publication sets the
-catalog-changed bit and requests embedding for that new generation before main
-adopts the catalog at its next safe prompt boundary.
+for the fixed bottom status row, including the bounded primary error and first
+context field when a generation fails. The source-file ceiling is 4,096 within
+the separate 8,192 directory-entry, 1 MiB retained-path, and 16 MiB source-byte
+bounds; this admits contemporary macOS installations with more than 2,000 PATH
+commands plus declarative completions. Missing or permission-denied individual
+PATH candidates are skipped because the shell could not execute them, while
+other filesystem failures remain visible diagnostics. A completed database
+publication sets the catalog-changed bit and requests embedding for that new
+generation before main adopts the catalog at its next safe prompt boundary.
 
 Semantic inference uses `model2vec-rs` with only its `local-only` and `onig`
 features and the `minishlab/potion-base-8M` model. After the interactive catalog
