@@ -44,75 +44,38 @@ pub struct FrameModel<'a> {
 }
 
 impl FrameModel<'_> {
-    fn content_height(&self, terminal_height: u16) -> u16 {
-        let input_rows =
-            u16::try_from(self.editor.buffer().lines().count().max(1)).unwrap_or(u16::MAX);
-        let diagnostics = u16::from(self.diagnostic.is_some() && !self.compact);
-        let picker_rows = if self.picker_layout == PickerLayout::Full && self.picker_query.is_some()
-        {
-            usize::from(terminal_height)
-        } else {
-            10
-        };
-        let popup = if self.completion.open {
-            u16::try_from(self.completion.items.len().min(picker_rows))
-                .unwrap_or(u16::MAX)
-                .saturating_add(2)
-                .saturating_add(u16::from(self.picker_query.is_some()))
-                .max(7)
-        } else {
-            0
-        };
-        let panel = if !self.completion.open && terminal_height >= 5 {
-            self.runtime.focused_panel().map_or(0, |(_, panel)| {
-                u16::try_from(panel.rows.len().min(PANEL_VISIBLE_ROWS_MAX))
-                    .unwrap_or(u16::MAX)
-                    .saturating_add(3)
-            })
-        } else {
-            0
-        };
-        let height = 2_u16
-            .saturating_add(input_rows)
-            .saturating_add(diagnostics)
-            .saturating_add(popup)
-            .saturating_add(panel)
-            .min(terminal_height.max(1));
-        if self.completion.open
-            && self.picker_query.is_some()
-            && self.picker_layout == PickerLayout::Full
-        {
-            terminal_height.max(1)
-        } else {
-            height
-        }
-    }
-
     pub fn render(&self, frame: &mut Frame<'_>) {
-        let viewport_area = frame.area();
-        let content_height = self.content_height(viewport_area.height);
-        let area = Rect::new(
-            viewport_area.x,
-            viewport_area.bottom().saturating_sub(content_height),
-            viewport_area.width,
-            content_height,
-        );
+        let area = frame.area();
         if area.height == 0 || area.width == 0 {
             return;
         }
-        self.render_context(frame, Rect::new(area.x, area.y, area.width, 1));
         let input = self.input_render(usize::from(area.width));
-        let input_height = u16::try_from(input.lines.len()).unwrap_or(u16::MAX);
-        let input_area = Rect::new(
-            area.x,
-            area.y.saturating_add(1),
-            area.width,
-            input_height.min(area.height.saturating_sub(1)),
+        let layout = frame_layout(
+            area,
+            u16::try_from(input.lines.len()).unwrap_or(u16::MAX),
+            self.diagnostic.is_some() && !self.compact,
         );
-        frame.render_widget(Paragraph::new(input.lines), input_area);
+        if let Some(context_area) = layout.context {
+            self.render_context(frame, context_area);
+        }
+        let input_line_start = visible_input_start(
+            input.lines.len(),
+            input.cursor_line,
+            usize::from(layout.input.height),
+        );
+        let visible_input = input
+            .lines
+            .into_iter()
+            .skip(input_line_start)
+            .take(usize::from(layout.input.height))
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(visible_input), layout.input);
 
-        let mut next_y = input_area.y.saturating_add(input_area.height);
-        if let Some(diagnostic) = self.diagnostic.filter(|_| !self.compact) {
+        if let Some((diagnostic, diagnostic_area)) = self
+            .diagnostic
+            .filter(|_| !self.compact)
+            .zip(layout.diagnostic)
+        {
             let glyph = diagnostic_glyph(diagnostic.severity, self.unicode);
             let style = self.theme.diagnostic(diagnostic.severity);
             frame.render_widget(
@@ -120,11 +83,45 @@ impl FrameModel<'_> {
                     Span::styled(glyph, style),
                     Span::styled(escape_terminal_line(&diagnostic.message), style),
                 ])),
-                Rect::new(area.x, next_y, area.width, 1),
+                diagnostic_area,
             );
-            next_y = next_y.saturating_add(1);
         }
-        if self.completion.open && next_y < area.bottom().saturating_sub(1) {
+        self.render_information(frame, layout.information);
+
+        let status = StatusBarModel {
+            editor: self.editor,
+            completion: self.completion,
+            mode: self.mode,
+            width: area.width,
+            hints: self.hints,
+            notice: self
+                .diagnostic
+                .filter(|_| self.compact)
+                .map(|diagnostic| diagnostic.message.as_str())
+                .or_else(|| self.runtime.notice()),
+            timings: self.timings,
+            unicode: self.unicode,
+        };
+        frame.render_widget(Paragraph::new(status.line(self.theme)), layout.status);
+
+        if layout.input.height == 0 {
+            return;
+        }
+        let x = area
+            .x
+            .saturating_add(u16::try_from(input.cursor_column).unwrap_or(u16::MAX))
+            .min(area.right().saturating_sub(1));
+        let cursor_line = input.cursor_line.saturating_sub(input_line_start);
+        let y = layout
+            .input
+            .y
+            .saturating_add(u16::try_from(cursor_line).unwrap_or(u16::MAX))
+            .min(layout.input.bottom().saturating_sub(1));
+        frame.set_cursor_position(Position::new(x, y));
+    }
+
+    fn render_information(&self, frame: &mut Frame<'_>, area: Rect) {
+        if self.completion.open && area.height >= 2 {
             let row_limit =
                 if self.picker_query.is_some() && self.picker_layout == PickerLayout::Full {
                     usize::from(area.height)
@@ -136,11 +133,7 @@ impl FrameModel<'_> {
                 .saturating_add(2)
                 .saturating_add(u16::from(self.picker_query.is_some()))
                 .max(if area.width >= 100 { 7 } else { 3 });
-            let popup_height = area
-                .bottom()
-                .saturating_sub(next_y)
-                .saturating_sub(1)
-                .min(desired_popup_height);
+            let popup_height = area.height.min(desired_popup_height);
             let replace_start = self
                 .completion
                 .selected_item()
@@ -156,7 +149,7 @@ impl FrameModel<'_> {
             };
             let popup_area = Rect::new(
                 area.x.saturating_add(offset),
-                next_y,
+                area.y,
                 area.width.saturating_sub(offset),
                 popup_height,
             );
@@ -166,46 +159,19 @@ impl FrameModel<'_> {
                         || (self.picker_layout == PickerLayout::Full && area.width >= 72))
             });
             self.render_completion(frame, popup_area, docs_allowed);
-        } else if next_y < area.bottom().saturating_sub(1) {
-            let available = area.bottom().saturating_sub(next_y).saturating_sub(1);
-            if let Some((id, panel)) = self.runtime.focused_panel().filter(|_| available >= 3) {
+        } else if area.height >= 3 {
+            if let Some((id, panel)) = self.runtime.focused_panel() {
                 let desired = u16::try_from(panel.rows.len().min(PANEL_VISIBLE_ROWS_MAX))
                     .unwrap_or(u16::MAX)
                     .saturating_add(3);
                 self.render_panel(
                     frame,
-                    Rect::new(area.x, next_y, area.width, available.min(desired)),
+                    Rect::new(area.x, area.y, area.width, area.height.min(desired)),
                     id,
                     panel,
                 );
             }
         }
-        let status_area = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
-        let status = StatusBarModel {
-            editor: self.editor,
-            completion: self.completion,
-            mode: self.mode,
-            width: area.width,
-            hints: self.hints,
-            notice: self
-                .diagnostic
-                .filter(|_| self.compact)
-                .map(|diagnostic| diagnostic.message.as_str())
-                .or_else(|| self.runtime.notice()),
-            timings: self.timings,
-            unicode: self.unicode,
-        };
-        frame.render_widget(Paragraph::new(status.line(self.theme)), status_area);
-
-        let x = area
-            .x
-            .saturating_add(u16::try_from(input.cursor_column).unwrap_or(u16::MAX))
-            .min(area.right().saturating_sub(1));
-        let y = input_area
-            .y
-            .saturating_add(u16::try_from(input.cursor_line).unwrap_or(u16::MAX))
-            .min(input_area.bottom().saturating_sub(1));
-        frame.set_cursor_position(Position::new(x, y));
     }
 
     fn render_context(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -520,6 +486,61 @@ impl FrameModel<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameLayout {
+    context: Option<Rect>,
+    input: Rect,
+    diagnostic: Option<Rect>,
+    information: Rect,
+    status: Rect,
+}
+
+fn frame_layout(area: Rect, input_rows: u16, diagnostic_visible: bool) -> FrameLayout {
+    // Completion and panel state deliberately do not participate in this partition. Both reuse
+    // the remaining bounded rectangle, so asynchronous completion transitions cannot move input.
+    let status_y = area.bottom().saturating_sub(1);
+    let status = Rect::new(area.x, status_y, area.width, 1);
+    let rows_above_status = status_y.saturating_sub(area.y);
+    let context_height = u16::from(rows_above_status >= 2);
+    let context = (context_height == 1).then_some(Rect::new(area.x, area.y, area.width, 1));
+    let input_y = area.y.saturating_add(context_height);
+    let available_after_context = status_y.saturating_sub(input_y);
+    let diagnostic_height = u16::from(diagnostic_visible && available_after_context >= 2);
+    let input_height = input_rows.min(available_after_context.saturating_sub(diagnostic_height));
+    let input = Rect::new(area.x, input_y, area.width, input_height);
+    let diagnostic_y = input.bottom();
+    let diagnostic = (diagnostic_height == 1).then_some(Rect::new(
+        area.x,
+        diagnostic_y,
+        area.width,
+        diagnostic_height,
+    ));
+    let information_y = diagnostic_y.saturating_add(diagnostic_height);
+    let information = Rect::new(
+        area.x,
+        information_y,
+        area.width,
+        status_y.saturating_sub(information_y),
+    );
+    FrameLayout {
+        context,
+        input,
+        diagnostic,
+        information,
+        status,
+    }
+}
+
+fn visible_input_start(line_count: usize, cursor_line: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 {
+        return 0;
+    }
+    cursor_line
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+        .min(line_count.saturating_sub(visible_rows))
+}
+
 struct InputRender {
     lines: Vec<Line<'static>>,
     cursor_line: usize,
@@ -691,6 +712,40 @@ mod tests {
             .filter_map(|x| buffer.cell((x, y)))
             .map(|cell| cell.symbol())
             .collect::<String>()
+    }
+
+    fn draw_runtime_model(
+        terminal: &mut Terminal<TestBackend>,
+        editor: &EditorState,
+        completion: &CompletionState,
+        runtime: &RuntimeSurfaceState,
+    ) {
+        terminal
+            .draw(|frame| {
+                FrameModel {
+                    context_left: "~/project",
+                    context_right: "",
+                    editor,
+                    completion,
+                    mode: Mode::Command,
+                    diagnostic: None,
+                    highlight_spans: &[],
+                    theme: Theme::new(true),
+                    unicode: true,
+                    symbols: SurfaceSymbols::Unicode,
+                    semantic_hints: true,
+                    hints: true,
+                    timings: None,
+                    compact: false,
+                    picker_query: None,
+                    picker_layout: PickerLayout::Adaptive,
+                    picker_preview: true,
+                    detail_scroll: 0,
+                    runtime,
+                }
+                .render(frame);
+            })
+            .unwrap();
     }
 
     #[test]
@@ -880,6 +935,62 @@ mod tests {
     }
 
     #[test]
+    fn completion_transitions_keep_editor_cursor_and_panel_region_stable() {
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("git st");
+        let mut completion = CompletionState::new(Catalog::builtin(), None);
+        let mut runtime = RuntimeSurfaceState::new();
+        assert!(
+            runtime.install_panel_batch(crate::surface::runtime::InteractivePanelBatch {
+                generation: 1,
+                panels: vec![crate::surface::runtime::InteractivePanelSnapshot {
+                    id: "demo".to_owned(),
+                    model: crate::PanelModel::new(
+                        "status",
+                        vec!["state".to_owned()],
+                        vec![vec!["ready".to_owned()]],
+                        "empty",
+                    )
+                    .unwrap(),
+                }],
+            })
+        );
+        let mut terminal = Terminal::new(TestBackend::new(78, 12)).unwrap();
+
+        draw_runtime_model(&mut terminal, &editor, &completion, &runtime);
+        let cursor_at_rest = terminal.get_cursor_position().unwrap();
+        assert!(row(&terminal, 1).contains("❯ git st"));
+        assert!(row(&terminal, 2).contains("demo · status"));
+
+        completion.open_manual(
+            vec![CompletionItem {
+                value: "git status".to_owned(),
+                display: "status".to_owned(),
+                summary: "working tree".to_owned(),
+                detail: "git status".to_owned(),
+                replace_start: 4,
+                replace_end: 6,
+                match_indices: vec![0, 1],
+                kind: CompletionKind::Command,
+                source: "catalog",
+                trust: "builtin",
+            }],
+            "catalog",
+        );
+        draw_runtime_model(&mut terminal, &editor, &completion, &runtime);
+        assert_eq!(terminal.get_cursor_position().unwrap(), cursor_at_rest);
+        assert!(row(&terminal, 1).contains("❯ git st"));
+        assert!(row(&terminal, 2).contains("completions"));
+
+        completion.dismiss();
+        draw_runtime_model(&mut terminal, &editor, &completion, &runtime);
+        assert_eq!(terminal.get_cursor_position().unwrap(), cursor_at_rest);
+        assert!(row(&terminal, 1).contains("❯ git st"));
+        assert!(row(&terminal, 2).contains("demo · status"));
+        assert!(row(&terminal, 11).contains("command"));
+    }
+
+    #[test]
     fn tiny_terminal_suppresses_the_optional_panel_region() {
         let editor = EditorState::new("emacs", Vec::new());
         let completion = CompletionState::new(Catalog::builtin(), None);
@@ -928,6 +1039,49 @@ mod tests {
     }
 
     #[test]
+    fn tiny_layout_prioritizes_status_then_editor_without_out_of_bounds_regions() {
+        let one_row = frame_layout(Rect::new(0, 0, 1, 1), 1, true);
+        assert_eq!(one_row.status, Rect::new(0, 0, 1, 1));
+        assert_eq!(one_row.input.height, 0);
+        assert_eq!(one_row.information.height, 0);
+        assert!(one_row.context.is_none());
+        assert!(one_row.diagnostic.is_none());
+
+        let two_rows = frame_layout(Rect::new(0, 0, 1, 2), u16::MAX, true);
+        assert_eq!(two_rows.input, Rect::new(0, 0, 1, 1));
+        assert_eq!(two_rows.status, Rect::new(0, 1, 1, 1));
+        assert!(two_rows.context.is_none());
+        assert!(two_rows.diagnostic.is_none());
+
+        let editor = EditorState::new("emacs", Vec::new());
+        let completion = CompletionState::new(Catalog::builtin(), None);
+        let runtime = RuntimeSurfaceState::new();
+        let mut terminal = Terminal::new(TestBackend::new(1, 2)).unwrap();
+        draw_runtime_model(&mut terminal, &editor, &completion, &runtime);
+        assert_eq!(terminal.get_cursor_position().unwrap(), Position::new(0, 0));
+    }
+
+    #[test]
+    fn resized_multiline_editor_keeps_the_cursor_on_a_visible_input_row() {
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("one\ntwo\nthree\nfour");
+        let completion = CompletionState::new(Catalog::builtin(), None);
+        let runtime = RuntimeSurfaceState::new();
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
+
+        draw_runtime_model(&mut terminal, &editor, &completion, &runtime);
+        assert!(row(&terminal, 2).contains("four"));
+        assert_eq!(terminal.get_cursor_position().unwrap().y, 2);
+        assert!(row(&terminal, 3).contains("command"));
+
+        terminal.backend_mut().resize(12, 3);
+        draw_runtime_model(&mut terminal, &editor, &completion, &runtime);
+        assert!(row(&terminal, 1).contains("four"));
+        assert_eq!(terminal.get_cursor_position().unwrap().y, 1);
+        assert!(row(&terminal, 2).contains("command"));
+    }
+
+    #[test]
     fn fullscreen_status_stays_on_the_actual_bottom_row_after_resize() {
         let editor = EditorState::new("emacs", Vec::new());
         let completion = CompletionState::new(Catalog::builtin(), None);
@@ -955,14 +1109,18 @@ mod tests {
         };
         let mut terminal = Terminal::new(TestBackend::new(78, 12)).unwrap();
         terminal.draw(|frame| model.render(frame)).unwrap();
+        assert!(row(&terminal, 0).contains("~/project"));
+        assert!(row(&terminal, 1).contains('❯'));
         assert!(row(&terminal, 11).contains("command"));
         assert!(row(&terminal, 3).trim().is_empty());
-        assert!(row(&terminal, 10).contains('❯'));
+        assert!(row(&terminal, 10).trim().is_empty());
 
         terminal.backend_mut().resize(52, 6);
         terminal.draw(|frame| model.render(frame)).unwrap();
+        assert!(row(&terminal, 0).contains("~/project"));
+        assert!(row(&terminal, 1).contains('❯'));
         assert!(row(&terminal, 5).contains("command"));
-        assert!(row(&terminal, 4).contains('❯'));
+        assert!(row(&terminal, 4).trim().is_empty());
     }
 
     #[test]
@@ -1055,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_command_palette_uses_a_terminal_height_viewport_at_the_bottom() {
+    fn adaptive_command_palette_uses_the_stable_top_information_region() {
         let editor = EditorState::new("emacs", Vec::new());
         let mut completion = CompletionState::new(Catalog::builtin(), None);
         completion.show_picker_results(
@@ -1102,9 +1260,10 @@ mod tests {
             })
             .unwrap();
 
+        assert!(row(&terminal, 0).contains("~/project"));
+        assert!(row(&terminal, 1).contains('❯'));
+        assert!(row(&terminal, 2).contains("picker"));
         assert!(row(&terminal, 19).trim().is_empty());
-        assert!(row(&terminal, 20).contains("~/project"));
-        assert!(row(&terminal, 22).contains("picker"));
         assert!(row(&terminal, 29).contains("command"));
     }
 
