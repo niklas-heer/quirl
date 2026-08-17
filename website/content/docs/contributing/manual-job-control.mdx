@@ -30,10 +30,20 @@ real-PTY check must preserve:
 - **Cancellation and deadline:** each bounded polling turn observes the request
   state. Cancellation or expiry terminates the whole contained process tree,
   reaps direct children, drains or closes capture streams, and returns the
-  cancellation error rather than a cleanup error.
+  cancellation error rather than a cleanup error. Public hosted execution uses
+  `NativeExecutor::execute_interactive_request` or `execute_capture_request`;
+  the frozen `ProcessBackend` string methods are trusted-local conveniences
+  with no host cancellation flag or deadline.
 - **Drains:** capture readers continuously drain child output while retaining
   only the configured byte budget. Here-string writers remain owned by the job
-  while stopped and are joined after completion or termination.
+  while stopped and are joined after completion or termination. When direct
+  children finish first, refresh best-effort terminates surviving group members
+  before joining either kind of task, so inherited pipe ends cannot hang the
+  shell.
+- **Expansion:** one pipeline retains at most 1 MiB of expanded command words
+  and redirect targets. The budget is cumulative across fragments, words, and
+  stages; the first byte beyond it fails with `ResourceLimit` before that byte
+  is appended. NUL bytes are rejected as invalid command data before spawn.
 - **Cleanup failure:** cleanup is best-effort across every owned resource; one
   failed group operation does not skip direct-child cleanup. When an operating
   error already exists, cleanup cannot replace it. A standalone explicit

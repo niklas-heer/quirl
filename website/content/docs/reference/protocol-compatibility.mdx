@@ -29,6 +29,14 @@ historical descriptor and job-state fixture, but fails closed because its
 descriptor named grammar v1 and methods that did not match the public trait;
 there is no safe semantic migration from that false contract.
 
+Common ABI v2 describes the actual tagged `StructuredValue` variants and uses
+fixed-width `u64` diagnostic offsets on the wire. Extension protocol v2 uses a
+fixed-width output byte count and freezes bounded iterative annotation scans
+plus terminal-safe progress text. Agent schema v2 uses fixed-width `u64`
+context budgets and estimates. Their version-1 descriptors remain pinned for
+identity evidence, and version-1 documents fail closed rather than receiving a
+lossy migration.
+
 ## Persisted migrations
 
 | Document | Current | Oldest readable | Migration guarantee |

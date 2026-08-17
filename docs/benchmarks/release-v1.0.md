@@ -1,20 +1,22 @@
 # 0.1.0 exact-candidate performance record
 
 <!-- quirl-release-evidence:v1
-status: current
+status: historical
 measured-candidate-commit: 23fd5d36907fc816bdafd9aa3c2dcb3afb69feb5
-evidence-documentation-commit: none
+evidence-documentation-commit: 14e70939d039d96c195f57452a0e1ec3928194af
 artifact-sha256: 9a893a5f1a0b49d62712f331c88966113d910d94efa9651dc4feffe9fd55b637
 measured-at: 2026-08-16T23:27:15Z
 measurement-platform-scope: macos-15.7.9-24g830-apple-m2-pro-aarch64-apple-darwin-automated-pty
 -->
 
-> **Current exact-candidate evidence.** This automated measurement record
+> **Historical artifact evidence.** This automated measurement record
 > applies only to candidate
 > `23fd5d36907fc816bdafd9aa3c2dcb3afb69feb5` and its named artifact. Evidence
-> commit B records candidate A's results; it is not the measured binary source.
-> Every automated merge-relevant gate passed. This is not a claim that human
-> terminal, Linux, remote-PTY, or candidate-demo review occurred.
+> commit `14e70939d039d96c195f57452a0e1ec3928194af` documented the run. Runtime
+> code now postdates that candidate, so none of these measurements is evidence
+> for the current tree. Every automated merge-relevant gate measured then
+> passed. This is not a claim that human terminal, Linux, remote-PTY, or
+> candidate-demo review occurred.
 
 **Measured:** 16 August 2026 at 23:27:15 UTC
 

@@ -23,9 +23,9 @@ not a release gate. The exact boundary is recorded in
 
 Install [Rustup](https://rustup.rs). The repository's `rust-toolchain.toml`
 selects Rust 1.88; Cargo builds the repository-local `xtask`, and no separate
-task runner or system Lua installation is needed. The Unix quality gate also
-uses Python 3's standard library for its real-PTY torture harness; it installs
-no Python packages.
+task runner or system Lua installation is needed. On Unix, that Rust-owned
+`xtask` also runs the bounded real-PTY harness in `xtask/src/pty.rs` and
+`xtask/src/rich_pty.rs`; no separate scripting-language toolchain is required.
 
 ```sh
 git clone git@github.com:niklas-heer/quirl.git
