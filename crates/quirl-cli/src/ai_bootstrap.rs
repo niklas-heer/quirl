@@ -36,6 +36,8 @@ const DOWNLOAD_BUFFER_BYTES: usize = 64 * 1024;
 const DOWNLOAD_CHANNEL_CHUNKS_MAX: usize = 2;
 const DOWNLOAD_CHANNEL_POLL: Duration = Duration::from_millis(25);
 const TEMPORARY_ATTEMPTS_MAX: u64 = 64;
+const ACTIVITY_ERROR_MESSAGE_BYTES_MAX: usize = 256;
+const ACTIVITY_ERROR_CONTEXT_BYTES_MAX: usize = 192;
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
@@ -366,9 +368,27 @@ impl index::CatalogRefreshObserver for CatalogObserver {
         }
     }
 
-    fn refresh_failed(&self, _error: &ShellError) {
+    fn refresh_failed(&self, error: &ShellError) {
         if let Some(shared) = self.shared.upgrade() {
-            shared.clear_discovery();
+            let message = truncate_utf8(
+                &escape_terminal_line(&error.message),
+                ACTIVITY_ERROR_MESSAGE_BYTES_MAX,
+            );
+            let context = error
+                .details
+                .context
+                .first()
+                .map(|context| {
+                    format!(
+                        " ({})",
+                        truncate_utf8(
+                            &escape_terminal_line(context),
+                            ACTIVITY_ERROR_CONTEXT_BYTES_MAX,
+                        )
+                    )
+                })
+                .unwrap_or_default();
+            shared.publish_discovery(format!("AI discovery failed: {message}{context}"));
         }
     }
 }
@@ -1213,6 +1233,27 @@ mod tests {
         index::CatalogRefreshObserver::refresh_published(&observer);
         assert_eq!(shared.requested_generation.load(Ordering::Acquire), 1);
         assert_eq!(shared.snapshot().unwrap().message, None);
+    }
+
+    #[test]
+    fn discovery_failure_activity_retains_bounded_escaped_cause_and_context() {
+        let shared = Arc::new(Shared::new());
+        let observer = CatalogObserver {
+            shared: Arc::downgrade(&shared),
+        };
+        let error = ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!("source limit\u{1b}[31m{}", "x".repeat(700)),
+        )
+        .with_context("limit: 4096; observed: 4097");
+
+        index::CatalogRefreshObserver::refresh_failed(&observer, &error);
+
+        let message = shared.snapshot().unwrap().message.unwrap();
+        assert!(message.starts_with("AI discovery failed: source limit"));
+        assert!(message.contains("limit: 4096; observed: 4097"));
+        assert!(!message.contains('\u{1b}'));
+        assert!(message.len() <= ACTIVITY_MESSAGE_BYTES_MAX);
     }
 
     #[test]

@@ -197,7 +197,12 @@ return quirl.config {{
                 OsString::from("1"),
             );
         }
-        if options.catalog_force_timeout {
+        // PTYs that do not exercise discovery must not inherit the host's PATH
+        // catalog. Dedicated discovery sessions enable the one background
+        // worker and retain the real bounded admission path.
+        if options.catalog_force_timeout
+            || (!options.catalog_refresh_enabled && options.path.is_none())
+        {
             environment.insert(
                 OsString::from("QUIRL_TEST_CATALOG_FORCE_TIMEOUT"),
                 OsString::from("1"),
