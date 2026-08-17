@@ -451,6 +451,9 @@ fn load_composed_catalog() -> Result<Catalog, ShellError> {
 fn load_rich_catalog() -> Result<Arc<Catalog>, ShellError> {
     #[cfg(debug_assertions)]
     catalog_admission_test_hook()?;
+    // The rich surface has already flushed its first frame before invoking this
+    // loader, so bounded discovery cannot delay terminal acquisition or paint.
+    index::initialize_interactive_catalog();
     load_composed_catalog().map(Arc::new)
 }
 
@@ -1645,6 +1648,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     // `QuirlPrompt::new`. Start Git/filesystem refresh after that prompt has
     // returned so an idle worker thread is not on the cold-paint boundary.
     let mut prompt_context: Option<PromptContextScheduler> = None;
+    let mut catalog_refresh = None;
     let mut first_prompt = true;
 
     loop {
@@ -1712,6 +1716,23 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                 )?;
             }
         }
+        if catalog_refresh
+            .as_ref()
+            .is_some_and(index::CatalogRefresh::take_changed)
+        {
+            // Cache publication is complete before this flag is set. Adopt it
+            // only between editor turns, when no terminal handoff, callback,
+            // or input buffer is partially committed.
+            sync_history(&mut line_editor, &history_path)?;
+            let refreshed_catalog = Arc::new(load_composed_catalog()?);
+            line_editor = configured_editor(
+                &refreshed_catalog,
+                &extensions,
+                active_config.clone(),
+                &history_path,
+            )?;
+            catalog = Some(refreshed_catalog);
+        }
         print_extension_errors(&extensions);
         let job_states = executor.jobs();
         let active_jobs = job_states
@@ -1751,6 +1772,12 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             catalog = line_editor.published_catalog();
         }
         first_prompt = false;
+        if catalog_refresh.is_none() {
+            // Initial discovery completed during editor admission. Periodic
+            // refresh begins only after terminal startup and never runs on the
+            // editor's per-keystroke path.
+            catalog_refresh = index::start_interactive_catalog_refresh();
+        }
         if prompt_context.is_none() {
             let scheduler = PromptContextScheduler::default();
             // Start the bounded refresh after the first input so command execution can
@@ -2414,6 +2441,7 @@ fn configured_initial_editor(
 
     // The simple/degraded editor requires its catalog during construction and
     // remains intentionally eager; only the rich first-frame path is deferred.
+    index::initialize_interactive_catalog();
     let catalog = Arc::new(load_composed_catalog()?);
     let editor = configured_editor(&catalog, extensions, config, history_path)?;
     Ok((editor, Some(catalog)))

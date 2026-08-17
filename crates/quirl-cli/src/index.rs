@@ -1,20 +1,26 @@
 use clap::{ArgAction, Subcommand, ValueEnum};
 use quirl_catalog::{
-    import_bash, import_fish, import_help, import_man, import_zsh, Catalog, ImportDiagnostic,
-    ImportReport, Provenance,
+    import_bash, import_fish, import_help, import_man, import_zsh, Catalog, CommandSpec,
+    Confidence, Effect, ImportDiagnostic, ImportReport, IoContract, Provenance, ProvenanceInfo,
 };
 use quirl_core::{
     escape_json_terminal_controls, escape_terminal_controls, replace_file_atomically,
     AtomicReplaceOptions, ErrorCode, ShellError,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -32,7 +38,96 @@ const INDEX_RECORDS_MAX: usize = 65_536;
 const INDEX_RETAINED_BYTES_MAX: usize = 16 * 1024 * 1024;
 const INDEX_DIAGNOSTICS_MAX: usize = 4_096;
 const INDEX_TEMPORARY_ATTEMPTS_MAX: usize = 64;
+const DISCOVERY_STATE_VERSION: u32 = 1;
+const DISCOVERY_STATE_READ_LIMIT: usize = 2 * 1024 * 1024;
+const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const DISCOVERY_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
+const DISCOVERY_DEADLINE: Duration = Duration::from_millis(750);
 static NEXT_INDEX_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
+/// A cancellable, bounded background refresh owned by one interactive session.
+/// Dropping the guard wakes and joins its single worker before terminal shutdown
+/// can finish, so no cache task survives the shell that created it.
+pub struct CatalogRefresh {
+    cancelled: Arc<AtomicBool>,
+    changed: Arc<AtomicBool>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl CatalogRefresh {
+    /// Report one completed cache replacement to the prompt-boundary owner.
+    /// Multiple replacements coalesce because only the newest atomic catalog
+    /// matters to the next editor generation.
+    pub fn take_changed(&self) -> bool {
+        self.changed.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl Drop for CatalogRefresh {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.wake.1.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveryConfig {
+    index_path: PathBuf,
+    path_roots: Vec<PathBuf>,
+    fish_roots: Vec<PathBuf>,
+    bash_roots: Vec<PathBuf>,
+    zsh_roots: Vec<PathBuf>,
+    help_roots: Vec<PathBuf>,
+    man_roots: Vec<PathBuf>,
+    stale_after: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum DiscoverySourceKind {
+    PathExecutable,
+    Fish,
+    Bash,
+    Zsh,
+    Help,
+    Man,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct DiscoverySource {
+    kind: DiscoverySourceKind,
+    path: PathBuf,
+    bytes: u64,
+    modified_unix_nanos: u64,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryState {
+    version: u32,
+    catalog_schema_version: u32,
+    refreshed_unix_ms: u64,
+    source_fingerprint: String,
+    catalog_fingerprint: String,
+    sources: Vec<DiscoverySource>,
+}
+
+struct DiscoverySnapshot {
+    sources: Vec<DiscoverySource>,
+    executables: Vec<PathBuf>,
+    fish_files: Vec<PathBuf>,
+    bash_files: Vec<PathBuf>,
+    zsh_files: Vec<PathBuf>,
+    help_files: Vec<PathBuf>,
+    man_files: Vec<PathBuf>,
+    fingerprint: String,
+}
 
 // Failure cleanup preserves every armed name because identity validation plus
 // pathname unlink is racy. Only the bounded post-commit path removes the hidden
@@ -305,6 +400,189 @@ pub fn load_default_catalog() -> Catalog {
     load_catalog_at(&path)
 }
 
+/// Start periodic catalog discovery without delaying construction or first
+/// paint of the interactive editor. Failures are cache misses: the worker never
+/// owns terminal state and builtins remain immediately available.
+pub fn start_interactive_catalog_refresh() -> Option<CatalogRefresh> {
+    let config = DiscoveryConfig::from_environment()?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let changed = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new((Mutex::new(()), Condvar::new()));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let worker_changed = Arc::clone(&changed);
+    let worker_wake = Arc::clone(&wake);
+    let worker = thread::Builder::new()
+        .name("quirl-catalog-refresh".to_owned())
+        .spawn(move || refresh_loop(config, &worker_cancelled, &worker_changed, &worker_wake))
+        .ok()?;
+    Some(CatalogRefresh {
+        cancelled,
+        changed,
+        wake,
+        worker: Some(worker),
+    })
+}
+
+/// Initialize or repair the default cache within the interactive discovery
+/// deadline. The caller intentionally ignores failures and loads builtins, so
+/// cache permissions or malformed declarations cannot prevent terminal setup.
+pub fn initialize_interactive_catalog() {
+    let Some(config) = DiscoveryConfig::from_environment() else {
+        return;
+    };
+    let cancelled = AtomicBool::new(false);
+    let _ = refresh_catalog_cache(&config, Instant::now() + DISCOVERY_DEADLINE, &cancelled);
+}
+
+impl DiscoveryConfig {
+    fn from_environment() -> Option<Self> {
+        Some(Self {
+            index_path: default_index_path()?,
+            path_roots: env::var_os("PATH")
+                .as_deref()
+                .map(env::split_paths)
+                .into_iter()
+                .flatten()
+                .collect(),
+            fish_roots: default_fish_roots(),
+            bash_roots: default_bash_roots(),
+            zsh_roots: default_zsh_roots(),
+            help_roots: default_documentation_roots("QUIRL_HELP_PATH", "help"),
+            man_roots: default_documentation_roots("QUIRL_MAN_PATH", "man"),
+            stale_after: DISCOVERY_STALE_AFTER,
+        })
+    }
+}
+
+fn refresh_loop(
+    config: DiscoveryConfig,
+    cancelled: &AtomicBool,
+    changed: &AtomicBool,
+    wake: &(Mutex<()>, Condvar),
+) {
+    loop {
+        let current = DiscoveryConfig::from_environment().unwrap_or_else(|| config.clone());
+        if refresh_catalog_cache(&current, Instant::now() + DISCOVERY_DEADLINE, cancelled)
+            .is_ok_and(|refreshed| refreshed)
+        {
+            changed.store(true, Ordering::Release);
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(guard) = wake.0.lock() else {
+            return;
+        };
+        let Ok((_guard, wait)) = wake.1.wait_timeout(guard, DISCOVERY_REFRESH_INTERVAL) else {
+            return;
+        };
+        if cancelled.load(Ordering::Acquire) || !wait.timed_out() {
+            return;
+        }
+    }
+}
+
+fn refresh_catalog_cache(
+    config: &DiscoveryConfig,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<bool, ShellError> {
+    let mut budget = IndexBuildBudget::new(IndexBounds::PRODUCTION);
+    budget.roots = config
+        .path_roots
+        .len()
+        .saturating_add(config.fish_roots.len())
+        .saturating_add(config.bash_roots.len())
+        .saturating_add(config.zsh_roots.len())
+        .saturating_add(config.help_roots.len())
+        .saturating_add(config.man_roots.len());
+    ensure_index_limit("roots", budget.bounds.roots_max, budget.roots)?;
+    let snapshot = discover_sources(config, &mut budget, deadline, cancelled)?;
+    if discovery_cache_is_current(config, &snapshot)? {
+        return Ok(false);
+    }
+    ensure_refresh_active(deadline, cancelled, "before source import")?;
+    let (mut catalog, _diagnostics) = catalog_from_files_checked(
+        &snapshot.fish_files,
+        &snapshot.bash_files,
+        &snapshot.zsh_files,
+        &snapshot.help_files,
+        &snapshot.man_files,
+        &mut budget,
+        || ensure_refresh_active(deadline, cancelled, "while importing sources"),
+    )?;
+    catalog.merge(external_commands(&snapshot.executables, &snapshot.sources));
+    ensure_refresh_active(deadline, cancelled, "before cache commit")?;
+    let encoded = encode_catalog(&catalog)?;
+    let catalog_fingerprint = fingerprint_bytes(&encoded);
+    write_catalog_atomically(&config.index_path, &catalog)?;
+    let state = DiscoveryState {
+        version: DISCOVERY_STATE_VERSION,
+        catalog_schema_version: catalog.schema_version,
+        refreshed_unix_ms: unix_time_ms(),
+        source_fingerprint: snapshot.fingerprint,
+        catalog_fingerprint,
+        sources: snapshot.sources,
+    };
+    write_discovery_state(&discovery_state_path(&config.index_path), &state)?;
+    Ok(true)
+}
+
+fn discovery_cache_is_current(
+    config: &DiscoveryConfig,
+    snapshot: &DiscoverySnapshot,
+) -> Result<bool, ShellError> {
+    let state_path = discovery_state_path(&config.index_path);
+    let Ok(state) = read_discovery_state(&state_path) else {
+        return Ok(false);
+    };
+    let age_ms = unix_time_ms().saturating_sub(state.refreshed_unix_ms);
+    let stale_ms = u64::try_from(config.stale_after.as_millis()).unwrap_or(u64::MAX);
+    if state.version != DISCOVERY_STATE_VERSION
+        || state.catalog_schema_version != Catalog::builtin().schema_version
+        || state.source_fingerprint != snapshot.fingerprint
+        || state.sources != snapshot.sources
+        || age_ms >= stale_ms
+    {
+        return Ok(false);
+    }
+    let source = match read_index(&config.index_path) {
+        Ok(source) => source,
+        Err(_) => return Ok(false),
+    };
+    if fingerprint_bytes(source.as_bytes()) != state.catalog_fingerprint {
+        return Ok(false);
+    }
+    Ok(decode_catalog(&source, &config.index_path).is_ok())
+}
+
+fn ensure_refresh_active(
+    deadline: Instant,
+    cancelled: &AtomicBool,
+    stage: &str,
+) -> Result<(), ShellError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(
+            ShellError::new(ErrorCode::ResourceLimit, "catalog discovery was cancelled")
+                .with_context(stage.to_owned())
+                .with_help("Retry discovery in a running interactive session"),
+        );
+    }
+    if Instant::now() >= deadline {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "catalog discovery exceeded its refresh deadline",
+        )
+        .with_context(format!(
+            "limit: {} ms; observed: at least {} ms; stage: {stage}",
+            DISCOVERY_DEADLINE.as_millis(),
+            DISCOVERY_DEADLINE.as_millis(),
+        ))
+        .with_help("Reduce PATH or declarative completion sources and retry"));
+    }
+    Ok(())
+}
+
 fn load_catalog_at(path: &Path) -> Catalog {
     match read_index(path) {
         Ok(source) => decode_catalog(&source, path)
@@ -474,9 +752,30 @@ fn catalog_from_files(
     man_files: &[PathBuf],
     budget: &mut IndexBuildBudget,
 ) -> Result<(Catalog, Vec<ImportDiagnostic>), ShellError> {
+    catalog_from_files_checked(
+        fish_files,
+        bash_files,
+        zsh_files,
+        help_files,
+        man_files,
+        budget,
+        || Ok(()),
+    )
+}
+
+fn catalog_from_files_checked(
+    fish_files: &[PathBuf],
+    bash_files: &[PathBuf],
+    zsh_files: &[PathBuf],
+    help_files: &[PathBuf],
+    man_files: &[PathBuf],
+    budget: &mut IndexBuildBudget,
+    mut check_active: impl FnMut() -> Result<(), ShellError>,
+) -> Result<(Catalog, Vec<ImportDiagnostic>), ShellError> {
     let mut catalog = Catalog::builtin();
     let mut diagnostics = Vec::new();
     for path in fish_files {
+        check_active()?;
         let source = read_completion(path, budget)?;
         merge_bounded_report(
             &mut catalog,
@@ -486,6 +785,7 @@ fn catalog_from_files(
         )?;
     }
     for path in bash_files {
+        check_active()?;
         let source = read_completion(path, budget)?;
         merge_bounded_report(
             &mut catalog,
@@ -495,6 +795,7 @@ fn catalog_from_files(
         )?;
     }
     for path in zsh_files {
+        check_active()?;
         let source = read_completion(path, budget)?;
         merge_bounded_report(
             &mut catalog,
@@ -504,6 +805,7 @@ fn catalog_from_files(
         )?;
     }
     for path in help_files {
+        check_active()?;
         let source = read_documentation(path, budget)?;
         merge_bounded_report(
             &mut catalog,
@@ -513,6 +815,7 @@ fn catalog_from_files(
         )?;
     }
     for path in man_files {
+        check_active()?;
         let source = read_documentation(path, budget)?;
         merge_bounded_report(
             &mut catalog,
@@ -661,17 +964,39 @@ fn completion_files(
     required_extension: Option<&str>,
     budget: &mut IndexBuildBudget,
 ) -> Result<Vec<PathBuf>, ShellError> {
+    completion_files_checked(roots, required_extension, budget, false, || Ok(()))
+}
+
+fn completion_files_checked(
+    roots: &[PathBuf],
+    required_extension: Option<&str>,
+    budget: &mut IndexBuildBudget,
+    follow_source_symlinks: bool,
+    mut check_active: impl FnMut() -> Result<(), ShellError>,
+) -> Result<Vec<PathBuf>, ShellError> {
     let mut files = Vec::new();
     for root in roots {
+        check_active()?;
+        let resolved_root;
+        let root = if follow_source_symlinks
+            && fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            resolved_root =
+                fs::canonicalize(root).map_err(|error| index_io_error("resolve", root, error))?;
+            resolved_root.as_path()
+        } else {
+            root.as_path()
+        };
         match fs::symlink_metadata(root) {
             Ok(metadata) if metadata.file_type().is_file() => {
                 admit_index_path(root, budget)?;
-                files.push(root.clone());
+                files.push(root.to_path_buf());
             }
             Ok(metadata) if metadata.file_type().is_dir() => {
                 let entries =
                     fs::read_dir(root).map_err(|error| index_io_error("enumerate", root, error))?;
                 for entry in entries {
+                    check_active()?;
                     budget.entries = budget.entries.saturating_add(1);
                     ensure_index_limit(
                         "directory entries",
@@ -685,6 +1010,22 @@ fn completion_files(
                         .map_err(|error| index_io_error("inspect", &path, error))?;
                     if !kind.is_file() {
                         if kind.is_symlink() {
+                            if follow_source_symlinks {
+                                let target = fs::canonicalize(&path)
+                                    .map_err(|error| index_io_error("resolve", &path, error))?;
+                                let target_metadata = fs::symlink_metadata(&target)
+                                    .map_err(|error| index_io_error("inspect", &target, error))?;
+                                if target_metadata.file_type().is_file()
+                                    && required_extension.is_none_or(|extension| {
+                                        path.extension()
+                                            .is_some_and(|candidate| candidate == extension)
+                                    })
+                                {
+                                    admit_index_path(&target, budget)?;
+                                    files.push(target);
+                                }
+                                continue;
+                            }
                             return Err(nonregular_index_input(&path));
                         }
                         continue;
@@ -706,6 +1047,225 @@ fn completion_files(
     files.sort();
     files.dedup();
     Ok(files)
+}
+
+fn discover_sources(
+    config: &DiscoveryConfig,
+    budget: &mut IndexBuildBudget,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<DiscoverySnapshot, ShellError> {
+    let fish_files =
+        completion_files_checked(&config.fish_roots, Some("fish"), budget, true, || {
+            ensure_refresh_active(deadline, cancelled, "while scanning fish sources")
+        })?;
+    ensure_refresh_active(deadline, cancelled, "after fish discovery")?;
+    let bash_files = completion_files_checked(&config.bash_roots, None, budget, true, || {
+        ensure_refresh_active(deadline, cancelled, "while scanning Bash sources")
+    })?;
+    ensure_refresh_active(deadline, cancelled, "after Bash discovery")?;
+    let zsh_files = completion_files_checked(&config.zsh_roots, None, budget, true, || {
+        ensure_refresh_active(deadline, cancelled, "while scanning Zsh sources")
+    })?;
+    ensure_refresh_active(deadline, cancelled, "after Zsh discovery")?;
+    let help_files = completion_files_checked(&config.help_roots, None, budget, true, || {
+        ensure_refresh_active(deadline, cancelled, "while scanning help sources")
+    })?;
+    let man_files = completion_files_checked(&config.man_roots, None, budget, true, || {
+        ensure_refresh_active(deadline, cancelled, "while scanning man sources")
+    })?;
+    let executables = discover_path_executables(&config.path_roots, budget, deadline, cancelled)?;
+
+    let mut sources = Vec::with_capacity(
+        fish_files
+            .len()
+            .saturating_add(bash_files.len())
+            .saturating_add(zsh_files.len())
+            .saturating_add(help_files.len())
+            .saturating_add(man_files.len())
+            .saturating_add(executables.len()),
+    );
+    for (kind, files) in [
+        (DiscoverySourceKind::Fish, fish_files.as_slice()),
+        (DiscoverySourceKind::Bash, bash_files.as_slice()),
+        (DiscoverySourceKind::Zsh, zsh_files.as_slice()),
+        (DiscoverySourceKind::Help, help_files.as_slice()),
+        (DiscoverySourceKind::Man, man_files.as_slice()),
+        (DiscoverySourceKind::PathExecutable, executables.as_slice()),
+    ] {
+        for path in files {
+            ensure_refresh_active(deadline, cancelled, "while fingerprinting sources")?;
+            sources.push(observe_source(kind, path, budget)?);
+        }
+    }
+    sources.sort();
+    let fingerprint = fingerprint_sources(&sources);
+    Ok(DiscoverySnapshot {
+        sources,
+        executables,
+        fish_files,
+        bash_files,
+        zsh_files,
+        help_files,
+        man_files,
+        fingerprint,
+    })
+}
+
+fn discover_path_executables(
+    roots: &[PathBuf],
+    budget: &mut IndexBuildBudget,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> Result<Vec<PathBuf>, ShellError> {
+    let mut commands = Vec::new();
+    let mut names = BTreeSet::new();
+    for root in roots {
+        ensure_refresh_active(deadline, cancelled, "while scanning PATH")?;
+        match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Err(nonregular_index_input(root)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(index_io_error("inspect", root, error)),
+        }
+        for entry in fs::read_dir(root).map_err(|error| index_io_error("enumerate", root, error))? {
+            budget.entries = budget.entries.saturating_add(1);
+            ensure_index_limit(
+                "directory entries",
+                budget.bounds.entries_max,
+                budget.entries,
+            )?;
+            ensure_refresh_active(deadline, cancelled, "while scanning PATH entries")?;
+            let entry = entry.map_err(|error| index_io_error("enumerate", root, error))?;
+            let path = entry.path();
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() => metadata,
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(index_io_error("inspect", &path, error)),
+            };
+            if !is_executable(&metadata) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name.is_empty() || name.chars().any(char::is_whitespace) {
+                continue;
+            }
+            if names.insert(name.to_owned()) {
+                admit_index_path(&path, budget)?;
+                commands.push(path);
+            }
+        }
+    }
+    commands.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    Ok(commands)
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    metadata.mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+fn observe_source(
+    kind: DiscoverySourceKind,
+    path: &Path,
+    budget: &mut IndexBuildBudget,
+) -> Result<DiscoverySource, ShellError> {
+    let metadata = fs::metadata(path).map_err(|error| index_io_error("inspect", path, error))?;
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0);
+    let content_fingerprint = match kind {
+        DiscoverySourceKind::PathExecutable => None,
+        DiscoverySourceKind::Fish | DiscoverySourceKind::Bash | DiscoverySourceKind::Zsh => {
+            Some(fingerprint_bytes(read_completion(path, budget)?.as_bytes()))
+        }
+        DiscoverySourceKind::Help | DiscoverySourceKind::Man => Some(fingerprint_bytes(
+            read_documentation(path, budget)?.as_bytes(),
+        )),
+    };
+    let mut identity = Vec::new();
+    identity.extend_from_slice(path.as_os_str().as_encoded_bytes());
+    identity.extend_from_slice(&metadata.len().to_le_bytes());
+    identity.extend_from_slice(&modified_unix_nanos.to_le_bytes());
+    if let Some(content_fingerprint) = content_fingerprint {
+        identity.extend_from_slice(content_fingerprint.as_bytes());
+    }
+    Ok(DiscoverySource {
+        kind,
+        path: path.to_path_buf(),
+        bytes: metadata.len(),
+        modified_unix_nanos,
+        fingerprint: fingerprint_bytes(&identity),
+    })
+}
+
+fn external_commands(executables: &[PathBuf], sources: &[DiscoverySource]) -> Vec<CommandSpec> {
+    executables
+        .iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?.to_owned();
+            let source_fingerprint = sources
+                .iter()
+                .find(|source| {
+                    source.kind == DiscoverySourceKind::PathExecutable && source.path == *path
+                })?
+                .fingerprint
+                .clone();
+            Some(CommandSpec {
+                id: format!("external:{name}"),
+                version: None,
+                path: name.clone(),
+                aliases: Vec::new(),
+                parent: None,
+                signature: name,
+                summary: "Installed command discovered on PATH".to_owned(),
+                details: "Executable presence was observed without running the command or loading shell startup files.".to_owned(),
+                options: Vec::new(),
+                examples: Vec::new(),
+                io: IoContract::default(),
+                effects: vec![Effect::SpawnProcess],
+                exit_codes: Default::default(),
+                provenance: ProvenanceInfo::imported(
+                    Provenance::External,
+                    Confidence::Medium,
+                    path.display().to_string(),
+                    source_fingerprint,
+                ),
+            })
+        })
+        .collect()
+}
+
+fn fingerprint_sources(sources: &[DiscoverySource]) -> String {
+    let mut bytes = Vec::new();
+    for source in sources {
+        bytes.extend_from_slice(format!("{:?}\0", source.kind).as_bytes());
+        bytes.extend_from_slice(source.path.as_os_str().as_encoded_bytes());
+        bytes.extend_from_slice(&source.bytes.to_le_bytes());
+        bytes.extend_from_slice(&source.modified_unix_nanos.to_le_bytes());
+        bytes.extend_from_slice(source.fingerprint.as_bytes());
+    }
+    fingerprint_bytes(&bytes)
+}
+
+fn fingerprint_bytes(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 fn default_fish_roots() -> Vec<PathBuf> {
@@ -740,6 +1300,23 @@ fn default_zsh_roots() -> Vec<PathBuf> {
     ]
 }
 
+fn default_documentation_roots(variable: &str, kind: &str) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = env::var_os(variable)
+        .as_deref()
+        .map(env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect();
+    if let Some(data) = env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+        roots.push(data.join("quirl").join(kind));
+    } else if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home.join(".local/share/quirl").join(kind));
+    }
+    roots.push(PathBuf::from("/usr/local/share/quirl").join(kind));
+    roots.push(PathBuf::from("/usr/share/quirl").join(kind));
+    roots
+}
+
 fn default_index_path() -> Option<PathBuf> {
     if let Some(path) = env::var_os("QUIRL_INDEX_PATH") {
         return Some(PathBuf::from(path));
@@ -748,6 +1325,52 @@ fn default_index_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .map(|cache| cache.join("quirl/catalog.json"))
+}
+
+fn discovery_state_path(index_path: &Path) -> PathBuf {
+    let mut name = index_path
+        .file_name()
+        .map(OsString::from)
+        .unwrap_or_else(|| OsString::from("catalog.json"));
+    name.push(".discovery.json");
+    index_path.with_file_name(name)
+}
+
+fn read_discovery_state(path: &Path) -> Result<DiscoveryState, ShellError> {
+    let source = read_index_utf8(
+        path,
+        DISCOVERY_STATE_READ_LIMIT,
+        "catalog discovery state",
+        "Remove the discovery sidecar and let Quirl rebuild it",
+    )?;
+    serde_json::from_str(&source).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            format!("{} is not valid catalog discovery state", path.display()),
+        )
+        .with_context(error.to_string())
+        .with_help("Remove the discovery sidecar and let Quirl rebuild it")
+    })
+}
+
+fn write_discovery_state(path: &Path, state: &DiscoveryState) -> Result<(), ShellError> {
+    let encoded = serde_json::to_vec_pretty(state).map_err(json_error)?;
+    if encoded.len() > DISCOVERY_STATE_READ_LIMIT {
+        return Err(index_limit_error(
+            "discovery-state bytes",
+            DISCOVERY_STATE_READ_LIMIT,
+            encoded.len(),
+        ));
+    }
+    write_index_bytes_atomically(path, &encoded, DISCOVERY_STATE_READ_LIMIT)
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 fn read_completion(path: &Path, budget: &mut IndexBuildBudget) -> Result<String, ShellError> {
@@ -939,12 +1562,11 @@ fn decode_catalog(source: &str, path: &Path) -> Result<Catalog, ShellError> {
 }
 
 fn write_catalog_atomically(path: &Path, catalog: &Catalog) -> Result<(), ShellError> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    if let Some(parent) = parent {
-        create_index_directories(parent)?;
-    }
+    let encoded = encode_catalog(catalog)?;
+    write_index_bytes_atomically(path, &encoded, INDEX_READ_LIMIT)
+}
+
+fn encode_catalog(catalog: &Catalog) -> Result<Vec<u8>, ShellError> {
     let mut writer = BoundedBytesWriter::new(INDEX_READ_LIMIT);
     if let Err(error) = serde_json::to_writer_pretty(&mut writer, catalog) {
         if writer.exceeded {
@@ -964,6 +1586,20 @@ fn write_catalog_atomically(path: &Path, catalog: &Catalog) -> Result<(), ShellE
             encoded.len(),
         ));
     }
+    Ok(encoded)
+}
+
+fn write_index_bytes_atomically(
+    path: &Path,
+    encoded: &[u8],
+    bytes_max: usize,
+) -> Result<(), ShellError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        create_index_directories(parent)?;
+    }
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             validate_index_reader_metadata(
@@ -973,21 +1609,19 @@ fn write_catalog_atomically(path: &Path, catalog: &Catalog) -> Result<(), ShellE
             )?;
             let expected = read_index_utf8(
                 path,
-                INDEX_READ_LIMIT,
+                bytes_max,
                 "completion index",
                 "Use an unlinked regular index file at or below 4 MiB",
             )?;
             replace_file_atomically(
                 path,
                 expected.as_bytes(),
-                &encoded,
-                AtomicReplaceOptions {
-                    bytes_max: INDEX_READ_LIMIT,
-                },
+                encoded,
+                AtomicReplaceOptions { bytes_max },
             )
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            install_new_index(path, &encoded, parent.unwrap_or_else(|| Path::new(".")))
+            install_new_index(path, encoded, parent.unwrap_or_else(|| Path::new(".")))
         }
         Err(error) => Err(index_io_error("inspect", path, error)),
     }
@@ -1170,7 +1804,26 @@ fn create_index_directories(directory: &Path) -> Result<(), ShellError> {
     let mut cursor = directory;
     loop {
         match fs::symlink_metadata(cursor) {
-            Ok(metadata) if metadata.file_type().is_dir() => break,
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                #[cfg(unix)]
+                if metadata.mode() & 0o022 != 0 {
+                    return Err(ShellError::new(
+                        ErrorCode::Validation,
+                        format!(
+                            "index directory {} has unsafe writable permissions",
+                            cursor.display()
+                        ),
+                    )
+                    .with_context(format!(
+                        "mode: {:#o}; forbidden write bits: 0o022",
+                        metadata.mode() & 0o777
+                    ))
+                    .with_help(
+                        "Use a cache directory that is not writable by group or other users",
+                    ));
+                }
+                break;
+            }
             Ok(_) => return Err(nonregular_index_input(cursor)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if missing.len() >= DEPTH_MAX {
@@ -1200,6 +1853,13 @@ fn create_index_directories(directory: &Path) -> Result<(), ShellError> {
                 ));
             }
             return Err(shell_error);
+        }
+        #[cfg(unix)]
+        if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o700)) {
+            return Err(index_io_error("secure", &path, error).with_context(format!(
+                "index directory {} was preserved because cleanup cannot atomically prove path ownership",
+                path.display()
+            )));
         }
         created.push(path);
     }
@@ -1243,7 +1903,10 @@ mod tests {
     use super::*;
     use clap::Parser;
     use quirl_catalog::Provenance;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    };
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -1265,6 +1928,37 @@ mod tests {
 
     fn test_budget() -> IndexBuildBudget {
         IndexBuildBudget::new(IndexBounds::PRODUCTION)
+    }
+
+    fn discovery_config(directory: &Path) -> DiscoveryConfig {
+        let binaries = directory.join("bin");
+        let fish = directory.join("fish");
+        fs::create_dir_all(&binaries).unwrap();
+        fs::create_dir_all(&fish).unwrap();
+        DiscoveryConfig {
+            index_path: directory.join("cache/catalog.json"),
+            path_roots: vec![binaries],
+            fish_roots: vec![fish],
+            bash_roots: Vec::new(),
+            zsh_roots: Vec::new(),
+            help_roots: Vec::new(),
+            man_roots: Vec::new(),
+            stale_after: Duration::from_secs(60),
+        }
+    }
+
+    fn write_executable(path: &Path) {
+        fs::write(path, b"not executed").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn refresh(config: &DiscoveryConfig) -> Result<bool, ShellError> {
+        refresh_catalog_cache(
+            config,
+            Instant::now() + Duration::from_secs(5),
+            &AtomicBool::new(false),
+        )
     }
 
     #[test]
@@ -1366,6 +2060,218 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn first_discovery_creates_durable_catalog_and_structured_state() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        write_executable(&config.path_roots[0].join("demo"));
+
+        assert!(refresh(&config).unwrap());
+
+        let catalog = load_catalog_at(&config.index_path);
+        let command = catalog.find("demo").unwrap();
+        assert_eq!(command.provenance.source, Provenance::External);
+        assert!(command.provenance.fingerprint.is_some());
+        let state = read_discovery_state(&discovery_state_path(&config.index_path)).unwrap();
+        assert_eq!(state.version, DISCOVERY_STATE_VERSION);
+        assert!(!state.sources.is_empty());
+        assert!(state.source_fingerprint.starts_with("fnv1a64:"));
+        assert!(state.catalog_fingerprint.starts_with("fnv1a64:"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn warm_discovery_reuses_matching_catalog_without_writing() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        write_executable(&config.path_roots[0].join("warm"));
+        assert!(refresh(&config).unwrap());
+        let before = fs::read(&config.index_path).unwrap();
+
+        assert!(!refresh(&config).unwrap());
+
+        assert_eq!(fs::read(&config.index_path).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stale_discovery_refreshes_even_when_sources_are_unchanged() {
+        let directory = temporary_directory();
+        let mut config = discovery_config(&directory);
+        write_executable(&config.path_roots[0].join("stale"));
+        assert!(refresh(&config).unwrap());
+        config.stale_after = Duration::ZERO;
+
+        assert!(refresh(&config).unwrap());
+
+        assert!(load_catalog_at(&config.index_path).find("stale").is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn changed_path_and_declarative_sources_refresh_the_catalog() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        write_executable(&config.path_roots[0].join("first"));
+        assert!(refresh(&config).unwrap());
+        write_executable(&config.path_roots[0].join("second"));
+        fs::write(
+            config.fish_roots[0].join("ship.fish"),
+            "complete -c ship -l port",
+        )
+        .unwrap();
+
+        assert!(refresh(&config).unwrap());
+
+        let catalog = load_catalog_at(&config.index_path);
+        assert!(catalog.find("second").is_some());
+        assert!(catalog.find("ship").is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn corrupt_catalog_is_rebuilt_from_valid_discovery_state() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        write_executable(&config.path_roots[0].join("recover"));
+        assert!(refresh(&config).unwrap());
+        fs::write(&config.index_path, b"corrupt").unwrap();
+
+        assert!(refresh(&config).unwrap());
+
+        assert!(load_catalog_at(&config.index_path)
+            .find("recover")
+            .is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_discovery_writers_publish_only_complete_documents() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        write_executable(&config.path_roots[0].join("parallel"));
+        let barrier = Arc::new(Barrier::new(2));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let config = config.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                refresh(&config)
+            }));
+        }
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+
+        assert!(results.iter().any(Result::is_ok));
+        assert!(load_catalog_at(&config.index_path)
+            .find("parallel")
+            .is_some());
+        let state = read_discovery_state(&discovery_state_path(&config.index_path)).unwrap();
+        assert_eq!(
+            state.catalog_schema_version,
+            Catalog::builtin().schema_version
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn path_discovery_limit_returns_resource_limit() {
+        let directory = temporary_directory();
+        write_executable(&directory.join("one"));
+        write_executable(&directory.join("two"));
+        let bounds = IndexBounds {
+            entries_max: 1,
+            ..IndexBounds::PRODUCTION
+        };
+        let mut budget = IndexBuildBudget::new(bounds);
+
+        let error = discover_path_executables(
+            std::slice::from_ref(&directory),
+            &mut budget,
+            Instant::now() + Duration::from_secs(5),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("limit: 1"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn declarative_discovery_never_executes_startup_source() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        let marker = directory.join("startup-executed");
+        fs::write(
+            config.fish_roots[0].join("unsafe.fish"),
+            format!(
+                "touch {}\ncomplete -c safe-command -l value",
+                marker.display()
+            ),
+        )
+        .unwrap();
+
+        refresh(&config).unwrap();
+
+        assert!(!marker.exists());
+        assert!(load_catalog_at(&config.index_path)
+            .find("safe-command")
+            .is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_failure_leaves_terminal_catalog_fallback_and_no_worker() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let mut config = discovery_config(&directory);
+        let foreign = directory.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        let linked = directory.join("linked-cache");
+        symlink(&foreign, &linked).unwrap();
+        config.index_path = linked.join("catalog.json");
+
+        assert!(refresh(&config).is_err());
+        assert!(load_catalog_at(&config.index_path)
+            .find("quirl run")
+            .is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn refresh_guard_cancels_and_joins_worker_on_shutdown() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let changed = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(()), Condvar::new()));
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_wake = Arc::clone(&wake);
+        let worker_finished = Arc::clone(&finished);
+        let worker = thread::spawn(move || {
+            let guard = worker_wake.0.lock().unwrap();
+            let _guard = worker_wake
+                .1
+                .wait_while(guard, |_| !worker_cancelled.load(Ordering::Acquire))
+                .unwrap();
+            worker_finished.store(true, Ordering::Release);
+        });
+
+        drop(CatalogRefresh {
+            cancelled,
+            changed,
+            wake,
+            worker: Some(worker),
+        });
+
+        assert!(finished.load(Ordering::Acquire));
     }
 
     #[test]
