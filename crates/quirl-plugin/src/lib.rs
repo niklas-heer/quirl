@@ -38,6 +38,16 @@ pub const ADAPTER_SCHEMA_VERSION: u32 = 1;
 pub const MAX_ADAPTER_MESSAGE_BYTES: u64 = 4 * 1024 * 1024;
 /// Hard upper bound, in milliseconds, for an isolated adapter callback.
 pub const MAX_ADAPTER_CALLBACK_TIMEOUT_MS: u64 = 60_000;
+/// Hard upper bound for arguments passed to an isolated adapter process.
+pub const MAX_ADAPTER_ARGUMENTS: usize = 32;
+/// Hard upper bound for the aggregate UTF-8 bytes in adapter arguments.
+pub const MAX_ADAPTER_ARGUMENT_BYTES: usize = 64 * 1024;
+/// Hard host ceiling for a future WebAssembly component memory policy.
+pub const MAX_WASM_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+/// Hard host ceiling for a future WebAssembly component fuel policy.
+pub const MAX_WASM_FUEL: u64 = 100_000_000;
+/// Hard host ceiling, in milliseconds, for a WebAssembly callback policy.
+pub const MAX_WASM_CALLBACK_TIMEOUT_MS: u64 = 60_000;
 /// Checked-in WIT world. WIT cannot express recursive `Value` or the full
 /// `ShellError` shape, so this is a narrower projection of
 /// `quirl_core::COMMON_ABI_SCHEMA_DESCRIPTOR`: wasm `value` drops nested
@@ -189,11 +199,11 @@ pub struct PluginContributions {
 pub struct WasmComponentBoundary {
     /// WIT world identity; validation requires exact equality with [`WASM_WORLD`].
     pub world: String,
-    /// Non-zero runtime memory ceiling in bytes.
+    /// Runtime memory ceiling in bytes, bounded by [`MAX_WASM_MEMORY_BYTES`].
     pub max_memory_bytes: u64,
-    /// Non-zero instruction/fuel budget enforced per runtime policy.
+    /// Instruction/fuel budget bounded by [`MAX_WASM_FUEL`].
     pub fuel: u64,
-    /// Non-zero callback wall-time deadline in milliseconds.
+    /// Callback deadline bounded by [`MAX_WASM_CALLBACK_TIMEOUT_MS`].
     pub callback_timeout_ms: u64,
 }
 
@@ -206,7 +216,8 @@ pub struct OutOfProcessBoundary {
     /// Relative executable path, required to equal the plugin entry point.
     pub executable: String,
     #[serde(default)]
-    /// Fixed arguments passed by the CLI when starting the executable.
+    /// Fixed arguments bounded by [`MAX_ADAPTER_ARGUMENTS`] and
+    /// [`MAX_ADAPTER_ARGUMENT_BYTES`].
     pub arguments: Vec<String>,
     /// Callback deadline bounded by [`MAX_ADAPTER_CALLBACK_TIMEOUT_MS`].
     pub callback_timeout_ms: u64,
@@ -1167,12 +1178,17 @@ fn validate_wasm_component(
         || !manifest.plugin.entry.ends_with(".wasm")
         || boundary.world != WASM_WORLD
         || boundary.max_memory_bytes == 0
+        || boundary.max_memory_bytes > MAX_WASM_MEMORY_BYTES
         || boundary.fuel == 0
+        || boundary.fuel > MAX_WASM_FUEL
         || boundary.callback_timeout_ms == 0
+        || boundary.callback_timeout_ms > MAX_WASM_CALLBACK_TIMEOUT_MS
     {
         return Err(validation_error(
             "invalid or unbounded WebAssembly component boundary",
-            "Use a component-model binary for world `quirl:plugin/api@0.1.0` and declare non-zero budgets",
+            format!(
+                "Use world `{WASM_WORLD}` with memory <= {MAX_WASM_MEMORY_BYTES} bytes, fuel <= {MAX_WASM_FUEL}, and callback_timeout_ms <= {MAX_WASM_CALLBACK_TIMEOUT_MS}"
+            ),
         ));
     }
     validate_component_contract(entry_bytes)?;
@@ -1271,9 +1287,19 @@ fn validate_out_of_process(manifest: &PluginManifest) -> Result<(), ShellError> 
         )
     })?;
     validate_relative_path(&adapter.executable)?;
+    let argument_bytes = adapter.arguments.iter().try_fold(0_usize, |total, argument| {
+        total.checked_add(argument.len()).ok_or_else(|| {
+            validation_error(
+                "out-of-process adapter argument bytes overflow the host range",
+                format!("Keep aggregate argument text at or below {MAX_ADAPTER_ARGUMENT_BYTES} bytes"),
+            )
+        })
+    })?;
     if manifest.wasm.is_some()
         || manifest.plugin.entry != adapter.executable
         || adapter.protocol != ADAPTER_PROTOCOL
+        || adapter.arguments.len() > MAX_ADAPTER_ARGUMENTS
+        || argument_bytes > MAX_ADAPTER_ARGUMENT_BYTES
         || adapter.callback_timeout_ms == 0
         || adapter.callback_timeout_ms > MAX_ADAPTER_CALLBACK_TIMEOUT_MS
         || adapter.max_message_bytes == 0
@@ -1281,7 +1307,7 @@ fn validate_out_of_process(manifest: &PluginManifest) -> Result<(), ShellError> 
     {
         return Err(validation_error(
             "invalid or unbounded out-of-process adapter boundary",
-            format!("Use the entry itself as the relative executable, protocol `quirl.plugin.v1`, a callback deadline at most {MAX_ADAPTER_CALLBACK_TIMEOUT_MS} ms, and a message limit at most {MAX_ADAPTER_MESSAGE_BYTES} bytes"),
+            format!("Use the entry itself as the relative executable, protocol `quirl.plugin.v1`, at most {MAX_ADAPTER_ARGUMENTS} arguments and {MAX_ADAPTER_ARGUMENT_BYTES} argument bytes, a callback deadline at most {MAX_ADAPTER_CALLBACK_TIMEOUT_MS} ms, and a message limit at most {MAX_ADAPTER_MESSAGE_BYTES} bytes"),
         ));
     }
     let launch_grant = format!("process.spawn:{}", adapter.executable);
@@ -1778,6 +1804,40 @@ callback_timeout_ms = 25
         ))
         .unwrap();
         assert!(validate_plugin_manifest(&manifest, &component, "0.1.0").is_ok());
+        let mut exact_limits = manifest.clone();
+        let exact_boundary = exact_limits.wasm.as_mut().unwrap();
+        exact_boundary.max_memory_bytes = MAX_WASM_MEMORY_BYTES;
+        exact_boundary.fuel = MAX_WASM_FUEL;
+        exact_boundary.callback_timeout_ms = MAX_WASM_CALLBACK_TIMEOUT_MS;
+        assert!(validate_plugin_manifest(&exact_limits, &component, "0.1.0").is_ok());
+
+        for (memory_bytes, fuel, callback_timeout_ms) in [
+            (0, MAX_WASM_FUEL, MAX_WASM_CALLBACK_TIMEOUT_MS),
+            (
+                MAX_WASM_MEMORY_BYTES + 1,
+                MAX_WASM_FUEL,
+                MAX_WASM_CALLBACK_TIMEOUT_MS,
+            ),
+            (MAX_WASM_MEMORY_BYTES, 0, MAX_WASM_CALLBACK_TIMEOUT_MS),
+            (
+                MAX_WASM_MEMORY_BYTES,
+                MAX_WASM_FUEL + 1,
+                MAX_WASM_CALLBACK_TIMEOUT_MS,
+            ),
+            (MAX_WASM_MEMORY_BYTES, MAX_WASM_FUEL, 0),
+            (
+                MAX_WASM_MEMORY_BYTES,
+                MAX_WASM_FUEL,
+                MAX_WASM_CALLBACK_TIMEOUT_MS + 1,
+            ),
+        ] {
+            let mut invalid = manifest.clone();
+            let boundary = invalid.wasm.as_mut().unwrap();
+            boundary.max_memory_bytes = memory_bytes;
+            boundary.fuel = fuel;
+            boundary.callback_timeout_ms = callback_timeout_ms;
+            assert!(validate_plugin_manifest(&invalid, &component, "0.1.0").is_err());
+        }
         let (locked, _) = resolve_plugin(
             &manifest,
             source.as_bytes(),
@@ -1837,6 +1897,43 @@ max_message_bytes = 1024
 "#;
         let manifest = parse_plugin_manifest(manifest, "plugin.toml").unwrap();
         assert!(validate_plugin_manifest(&manifest, b"adapter", "0.1.0").is_ok());
+
+        let mut exact_limits = manifest.clone();
+        let adapter = exact_limits.adapter.as_mut().unwrap();
+        adapter.arguments = vec![
+            "x".repeat(MAX_ADAPTER_ARGUMENT_BYTES / MAX_ADAPTER_ARGUMENTS);
+            MAX_ADAPTER_ARGUMENTS
+        ];
+        adapter.callback_timeout_ms = MAX_ADAPTER_CALLBACK_TIMEOUT_MS;
+        adapter.max_message_bytes = MAX_ADAPTER_MESSAGE_BYTES;
+        assert!(validate_plugin_manifest(&exact_limits, b"adapter", "0.1.0").is_ok());
+
+        let mut too_many_arguments = manifest.clone();
+        too_many_arguments.adapter.as_mut().unwrap().arguments =
+            vec![String::new(); MAX_ADAPTER_ARGUMENTS + 1];
+        assert!(validate_plugin_manifest(&too_many_arguments, b"adapter", "0.1.0").is_err());
+        let mut oversized_arguments = manifest.clone();
+        oversized_arguments.adapter.as_mut().unwrap().arguments =
+            vec!["x".repeat(MAX_ADAPTER_ARGUMENT_BYTES + 1)];
+        assert!(validate_plugin_manifest(&oversized_arguments, b"adapter", "0.1.0").is_err());
+        for (callback_timeout_ms, max_message_bytes) in [
+            (0, MAX_ADAPTER_MESSAGE_BYTES),
+            (
+                MAX_ADAPTER_CALLBACK_TIMEOUT_MS + 1,
+                MAX_ADAPTER_MESSAGE_BYTES,
+            ),
+            (MAX_ADAPTER_CALLBACK_TIMEOUT_MS, 0),
+            (
+                MAX_ADAPTER_CALLBACK_TIMEOUT_MS,
+                MAX_ADAPTER_MESSAGE_BYTES + 1,
+            ),
+        ] {
+            let mut invalid = manifest.clone();
+            let adapter = invalid.adapter.as_mut().unwrap();
+            adapter.callback_timeout_ms = callback_timeout_ms;
+            adapter.max_message_bytes = max_message_bytes;
+            assert!(validate_plugin_manifest(&invalid, b"adapter", "0.1.0").is_err());
+        }
 
         let extra_capability = r#"schema_version = 2
 [plugin]

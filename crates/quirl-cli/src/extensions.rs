@@ -24,7 +24,7 @@ use quirl_lua::{
 };
 use quirl_plugin::{
     doctor_plugin, normalize_plugin_commands, parse_plugin_manifest, validate_plugin_manifest,
-    LockedPlugin, PluginLockfile, PluginRuntime, PLUGIN_LOCK_FILE,
+    LockedPlugin, PluginLockfile, PluginManifest, PluginRuntime, PLUGIN_LOCK_FILE,
 };
 use quirl_syntax::{parse_command_list, Mode};
 use quirl_ui::{
@@ -380,6 +380,13 @@ struct PluginCandidate {
     runtime: PluginRuntime,
     grants: Vec<String>,
     catalog_commands: Vec<CommandSpec>,
+    adapter_activation: Option<AdapterActivation>,
+}
+
+#[derive(Debug, Clone)]
+struct AdapterActivation {
+    manifest: PluginManifest,
+    entry_bytes: Vec<u8>,
 }
 
 type BuiltExtensionGeneration = (
@@ -490,11 +497,12 @@ impl LuaExtensionHost {
         if self.observed_fingerprint.as_ref() == Some(&snapshot.fingerprint) {
             return ExtensionReloadState::Unchanged;
         }
-        self.observed_fingerprint = Some(snapshot.fingerprint.clone());
+        let candidate_fingerprint = snapshot.fingerprint.clone();
 
         let next_revision = match self.revision.checked_add(1) {
             Some(revision) => revision,
             None => {
+                self.observed_fingerprint = Some(candidate_fingerprint);
                 self.record_error(
                     ShellError::new(
                         ErrorCode::ResourceLimit,
@@ -505,11 +513,12 @@ impl LuaExtensionHost {
                 return ExtensionReloadState::Rejected;
             }
         };
-        match self.build_candidate(snapshot) {
+        match self.build_candidate(snapshot, cancellation) {
             Ok((config, plugin_paths, plugin_runtimes, managed_commands, command_bindings)) => {
                 let next_panel_generation = match self.panel_cache_generation.checked_add(1) {
                     Some(generation) => generation,
                     None => {
+                        self.observed_fingerprint = Some(candidate_fingerprint);
                         self.record_error(
                             ShellError::new(
                                 ErrorCode::ResourceLimit,
@@ -528,6 +537,7 @@ impl LuaExtensionHost {
                     .as_mut()
                     .and_then(ExtensionScheduler::take_startup_error)
                 {
+                    self.observed_fingerprint = Some(candidate_fingerprint);
                     self.record_error(error.with_context(
                         "extension reload rejected; retaining the last known-good generation",
                     ));
@@ -535,6 +545,7 @@ impl LuaExtensionHost {
                 }
                 if let Some(scheduler) = &self.scheduler {
                     if let Err(error) = scheduler.activate_generation(next_revision) {
+                        self.observed_fingerprint = Some(candidate_fingerprint);
                         self.record_error(error.with_context(
                             "extension reload rejected; retaining the last known-good generation",
                         ));
@@ -553,11 +564,15 @@ impl LuaExtensionHost {
                 self.panel_cache_generation = next_panel_generation;
                 self.panel_last_refresh = None;
                 self.revision = next_revision;
+                self.observed_fingerprint = Some(candidate_fingerprint);
                 ExtensionReloadState::Reloaded {
                     revision: self.revision,
                 }
             }
             Err(error) => {
+                if !cancellation.load(Ordering::Relaxed) {
+                    self.observed_fingerprint = Some(candidate_fingerprint);
+                }
                 self.record_error(
                     error.with_context("extension reload rejected; retaining the last known-good configuration and plugins"),
                 );
@@ -1863,6 +1878,7 @@ impl LuaExtensionHost {
     fn build_candidate(
         &self,
         snapshot: SourceSnapshot,
+        cancellation: &AtomicBool,
     ) -> Result<BuiltExtensionGeneration, ShellError> {
         if let Some(error) = snapshot.errors.into_iter().next() {
             return Err(error);
@@ -1916,6 +1932,15 @@ impl LuaExtensionHost {
         let mut prompt_segments = 0_usize;
         let mut event_handlers = 0_usize;
         for plugin in &snapshot.plugins {
+            if let Some(adapter) = &plugin.adapter_activation {
+                crate::plugin::execute_out_of_process_adapter(
+                    &adapter.manifest,
+                    &plugin.path,
+                    &adapter.entry_bytes,
+                    &plugin.grants,
+                    Some(cancellation),
+                )?;
+            }
             managed_commands.extend(plugin.catalog_commands.clone());
             if managed_commands.len() > MAX_HOST_MANAGED_COMMANDS {
                 return Err(host_count_limit_error(
@@ -2760,6 +2785,7 @@ fn snapshot_legacy_plugin_paths(
                 runtime: PluginRuntime::TrustedLua,
                 grants: grants.clone(),
                 catalog_commands: Vec::new(),
+                adapter_activation: None,
             })
             .collect(),
         PluginFingerprint::Files(fingerprints),
@@ -2829,12 +2855,8 @@ fn snapshot_managed_plugins(
             );
             break;
         }
-        match managed_plugin_candidate_with_cancellation(
-            locked,
-            &mut fingerprints,
-            cancellation,
-            activate_adapters,
-        ) {
+        match managed_plugin_candidate_with_activation(locked, &mut fingerprints, activate_adapters)
+        {
             Ok(candidate) => candidates.push(candidate),
             Err(error) => errors.push(error),
         }
@@ -2848,13 +2870,12 @@ fn managed_plugin_candidate(
     locked: &LockedPlugin,
     fingerprints: &mut Vec<(PathBuf, FileFingerprint)>,
 ) -> Result<PluginCandidate, ShellError> {
-    managed_plugin_candidate_with_cancellation(locked, fingerprints, &AtomicBool::new(false), true)
+    managed_plugin_candidate_with_activation(locked, fingerprints, true)
 }
 
-fn managed_plugin_candidate_with_cancellation(
+fn managed_plugin_candidate_with_activation(
     locked: &LockedPlugin,
     fingerprints: &mut Vec<(PathBuf, FileFingerprint)>,
-    cancellation: &AtomicBool,
     activate_adapter: bool,
 ) -> Result<PluginCandidate, ShellError> {
     if locked.runtime == PluginRuntime::WasmComponent {
@@ -2958,24 +2979,22 @@ fn managed_plugin_candidate_with_cancellation(
     } else {
         None
     };
-    if locked.runtime == PluginRuntime::OutOfProcess && activate_adapter {
-        crate::plugin::execute_out_of_process_adapter(
-            &manifest,
-            &entry_path,
-            &entry_bytes,
-            &locked.granted_capabilities,
-            Some(cancellation),
-        )?;
-    }
     let catalog_commands =
         normalize_plugin_commands(&manifest, &locked.source, &locked.source_checksum)?;
+    let source_bytes = entry_bytes.len();
+    let adapter_activation = (locked.runtime == PluginRuntime::OutOfProcess && activate_adapter)
+        .then_some(AdapterActivation {
+            manifest,
+            entry_bytes,
+        });
     Ok(PluginCandidate {
         path: entry_path,
         verified_source,
-        source_bytes: entry_bytes.len(),
+        source_bytes,
         runtime: locked.runtime,
         grants: locked.granted_capabilities.clone(),
         catalog_commands,
+        adapter_activation,
     })
 }
 
@@ -3574,6 +3593,58 @@ error_codes = { "0" = "success" }
             serde_json::to_vec_pretty(lock).unwrap(),
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_managed_adapter(directory: &Path, spawn_log: &Path) -> (PathBuf, PluginLockfile) {
+        let package = directory.join("managed-adapter");
+        fs::create_dir_all(&package).unwrap();
+        let entry = package.join("adapter");
+        let entry_source = format!(
+            "#!/bin/sh\nprintf 'spawn\\n' >> '{}'\nread request\nprintf '%s\\n' '{{\"protocol\":\"quirl.plugin.v1\",\"schema_version\":1,\"api_version\":\"0.1.0\",\"operation\":\"initialize\",\"status\":\"ready\"}}'\n",
+            spawn_log.display()
+        );
+        fs::write(&entry, &entry_source).unwrap();
+        let manifest_path = package.join("plugin.toml");
+        let manifest_source = r#"schema_version = 2
+
+[plugin]
+name = "adapter"
+version = "0.1.0"
+entry = "adapter"
+quirl = ">=0.1, <0.2"
+api = "0.1.0"
+runtime = "out_of_process"
+summary = "Managed adapter lifecycle test"
+
+[capabilities]
+request = ["process.spawn:adapter"]
+
+[adapter]
+protocol = "quirl.plugin.v1"
+executable = "adapter"
+arguments = []
+callback_timeout_ms = 1000
+max_message_bytes = 65536
+"#;
+        fs::write(&manifest_path, manifest_source).unwrap();
+        let manifest = parse_plugin_manifest(manifest_source, "plugin.toml").unwrap();
+        let source = format!("file:{}", manifest_path.display());
+        let (locked, _) = resolve_plugin(
+            &manifest,
+            manifest_source.as_bytes(),
+            entry_source.as_bytes(),
+            &source,
+            &["process.spawn:adapter".to_owned()],
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap();
+        let lock = PluginLockfile::empty()
+            .install(locked)
+            .unwrap()
+            .set_enabled("adapter", true)
+            .unwrap();
+        (entry, lock)
     }
 
     #[test]
@@ -4192,6 +4263,36 @@ error_codes = { "0" = "success" }
         assert!(host.take_errors().iter().any(|error| error
             .message
             .contains("managed plugin reload was cancelled")));
+        assert_eq!(
+            host.reload_if_changed(),
+            ExtensionReloadState::Reloaded { revision: 1 }
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_adapter_is_not_respawned_during_hot_path_reload_polls() {
+        let directory = temporary_extension_directory();
+        let root = directory.join("managed-state");
+        let spawn_log = directory.join("adapter-spawns");
+        let (entry, lock) = write_managed_adapter(&directory, &spawn_log);
+        write_managed_lock(&root, &lock);
+        let mut host = LuaExtensionHost::from_managed_root(None, root);
+
+        assert_eq!(
+            host.reload_if_changed(),
+            ExtensionReloadState::Reloaded { revision: 1 }
+        );
+        for _ in 0..4 {
+            assert_eq!(host.reload_if_changed(), ExtensionReloadState::Unchanged);
+        }
+        assert_eq!(fs::read_to_string(&spawn_log).unwrap(), "spawn\n");
+
+        fs::write(&entry, "#!/bin/sh\nexit 97\n").unwrap();
+        assert_eq!(host.reload_if_changed(), ExtensionReloadState::Rejected);
+        assert_eq!(host.config_revision(), 1);
+        assert_eq!(fs::read_to_string(&spawn_log).unwrap(), "spawn\n");
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4215,7 +4316,7 @@ error_codes = { "0" = "success" }
         )
         .unwrap();
 
-        let built = host.build_candidate(snapshot);
+        let built = host.build_candidate(snapshot, &AtomicBool::new(false));
         assert!(built.is_ok(), "{:?}", built.as_ref().err());
         fs::remove_dir_all(directory).unwrap();
     }
@@ -4592,6 +4693,36 @@ quirl.extension.contribute {
         assert!(scheduler.wait_generation_idle(host.revision, Duration::from_secs(1)));
         host.poll_prompt_refresh();
         assert_eq!(host.prompt_cache[0][0].value, "four");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn unchanged_reload_preserves_the_persistent_lua_worker_state() {
+        let directory = temporary_extension_directory();
+        let plugin = directory.join("persistent.lua");
+        fs::write(
+            &plugin,
+            r#"local renders = 0
+quirl.prompt.add_segment {
+  name = "persistent", deadline_ms = 20,
+  render = function(_)
+    renders = renders + 1
+    return tostring(renders)
+  end,
+}"#,
+        )
+        .unwrap();
+        let mut host = LuaExtensionHost::from_paths(None, vec![plugin]);
+
+        assert_eq!(
+            refreshed_prompt_segments(&mut host, Mode::Command, 0)[0].value,
+            "1"
+        );
+        assert_eq!(host.reload_if_changed(), ExtensionReloadState::Unchanged);
+        assert_eq!(
+            refreshed_prompt_segments(&mut host, Mode::Command, 0)[0].value,
+            "2"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

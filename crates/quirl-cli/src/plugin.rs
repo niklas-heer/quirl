@@ -705,6 +705,7 @@ pub(crate) fn execute_out_of_process_adapter(
     grants: &[String],
     cancellation: Option<&AtomicBool>,
 ) -> Result<(), ShellError> {
+    validate_plugin_manifest(manifest, entry_bytes, env!("CARGO_PKG_VERSION"))?;
     let adapter = manifest.adapter.as_ref().ok_or_else(|| {
         ShellError::new(
             ErrorCode::Validation,
@@ -1611,6 +1612,22 @@ max_message_bytes = {max_bytes}
         let grant_error = validate_runtime(&manifest, &entry, &entry_bytes, &[], true).unwrap_err();
         assert_eq!(grant_error.code, ErrorCode::Validation);
         assert!(grant_error.message.contains("exact locked launch grant"));
+        let mut expanded_policy = manifest.clone();
+        expanded_policy
+            .adapter
+            .as_mut()
+            .unwrap()
+            .callback_timeout_ms = quirl_plugin::MAX_ADAPTER_CALLBACK_TIMEOUT_MS + 1;
+        let policy_error = execute_out_of_process_adapter(
+            &expanded_policy,
+            &entry,
+            &entry_bytes,
+            &["process.spawn:adapter".to_owned()],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(policy_error.code, ErrorCode::Validation);
+        assert!(policy_error.message.contains("unbounded"));
         let response_error = validate_runtime(
             &manifest,
             &entry,

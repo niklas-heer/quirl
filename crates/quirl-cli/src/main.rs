@@ -2076,7 +2076,9 @@ fn apply_plan_actions(
 ) -> Result<(), ShellError> {
     for action in actions {
         match action {
-            ExtensionAction::Diagnose { message } => eprintln!("extension: {message}"),
+            ExtensionAction::Diagnose { message } => {
+                eprintln!("extension: {}", terminal_safe_extension_text(&message));
+            }
             ExtensionAction::RewritePlan { source } => planned.source = source,
             ExtensionAction::SetEnvironment { name, value } => std::env::set_var(name, value),
             ExtensionAction::BlockExecution { reason } => {
@@ -2101,7 +2103,9 @@ fn apply_observation_actions(
 ) {
     for action in actions {
         match action {
-            ExtensionAction::Diagnose { message } => eprintln!("extension: {message}"),
+            ExtensionAction::Diagnose { message } => {
+                eprintln!("extension: {}", terminal_safe_extension_text(&message));
+            }
             ExtensionAction::SetEnvironment { name, value } => std::env::set_var(name, value),
             ExtensionAction::AnnotateResult { key, value } => {
                 annotations.insert(key, value);
@@ -2215,6 +2219,10 @@ fn safe_extension_output_text(text: &str) -> Option<String> {
     (text.len() <= extensions::MAX_EXTENSION_EVENT_BYTES
         && reject_terminal_controls("extension output", text).is_ok())
     .then(|| text.to_owned())
+}
+
+fn terminal_safe_extension_text(text: &str) -> String {
+    escape_terminal_controls(text)
 }
 
 fn print_extension_annotations(annotations: &BTreeMap<String, serde_json::Value>) {
@@ -3779,6 +3787,10 @@ mod tests {
         .unwrap_err();
         assert!(error.message.contains("blocked"));
         assert!(safe_extension_output_text("\u{1b}[31mraw").is_none());
+        assert_eq!(
+            terminal_safe_extension_text("raw\u{1b}[31m\rtext"),
+            "raw\\u{1b}[31m\\rtext"
+        );
     }
 
     #[test]
