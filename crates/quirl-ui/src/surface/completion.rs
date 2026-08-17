@@ -2,8 +2,9 @@ use super::super::{
     extension_replacement_is_valid, CompletionWorker, ExtensionCompleter, ExtensionSuggestion,
 };
 use quirl_catalog::{
-    Catalog, Completion, CompletionCancellation, CompletionOutcome, CompletionRequest, Provenance,
-    Trust, COMPLETION_PROTOCOL_VERSION, MAX_COMPLETION_DEADLINE_MS, MAX_COMPLETION_RESULTS,
+    Catalog, CommandSpec, Completion, CompletionCancellation, CompletionOutcome, CompletionRequest,
+    Effect, Provenance, Trust, COMPLETION_PROTOCOL_VERSION, MAX_COMPLETION_DEADLINE_MS,
+    MAX_COMPLETION_RESULTS,
 };
 use quirl_core::ShellError;
 use std::{
@@ -222,6 +223,7 @@ pub struct CompletionState {
     pub selected: usize,
     pub open: bool,
     pub streaming: bool,
+    pub automatic: bool,
     pub source_label: &'static str,
     resource_notice: Option<String>,
 }
@@ -244,6 +246,7 @@ impl CompletionState {
             selected: 0,
             open: false,
             streaming: false,
+            automatic: false,
             source_label: "catalog",
             resource_notice: None,
         }
@@ -263,6 +266,7 @@ impl CompletionState {
             selected: 0,
             open: false,
             streaming: false,
+            automatic: false,
             source_label: "catalog",
             resource_notice: None,
         }
@@ -286,6 +290,19 @@ impl CompletionState {
     }
 
     pub fn request(&mut self, line: &str, cursor: usize) -> Result<(), ShellError> {
+        self.request_with_presentation(line, cursor, false)
+    }
+
+    pub fn request_automatic(&mut self, line: &str, cursor: usize) -> Result<(), ShellError> {
+        self.request_with_presentation(line, cursor, true)
+    }
+
+    fn request_with_presentation(
+        &mut self,
+        line: &str,
+        cursor: usize,
+        automatic: bool,
+    ) -> Result<(), ShellError> {
         if line.len() > quirl_catalog::MAX_COMPLETION_QUERY_BYTES {
             self.cancel_for_edit();
             self.resource_notice = Some(format!(
@@ -312,6 +329,7 @@ impl CompletionState {
         self.selected = 0;
         self.open = true;
         self.streaming = true;
+        self.automatic = automatic;
         self.source_label = "catalog";
         if let Some(worker) = &mut self.worker {
             worker.submit(CompletionRequest {
@@ -434,12 +452,14 @@ impl CompletionState {
     }
 
     pub fn next(&mut self) {
+        self.automatic = false;
         if !self.items.is_empty() {
             self.selected = (self.selected + 1) % self.items.len();
         }
     }
 
     pub fn previous(&mut self) {
+        self.automatic = false;
         if !self.items.is_empty() {
             self.selected = self
                 .selected
@@ -452,11 +472,16 @@ impl CompletionState {
         self.items.get(self.selected)
     }
 
+    pub fn accepts_enter(&self) -> bool {
+        self.open && !self.automatic
+    }
+
     pub fn dismiss(&mut self) {
         self.items.clear();
         self.selected = 0;
         self.open = false;
         self.streaming = false;
+        self.automatic = false;
     }
 
     #[cfg(test)]
@@ -465,6 +490,7 @@ impl CompletionState {
         self.selected = 0;
         self.open = !self.items.is_empty();
         self.streaming = false;
+        self.automatic = false;
         self.source_label = source_label;
     }
 
@@ -475,18 +501,37 @@ impl CompletionState {
         // editable and the user can recover without dismissing it.
         self.open = true;
         self.streaming = false;
+        self.automatic = false;
         self.source_label = source_label;
     }
 }
 
 fn catalog_item(catalog: &Catalog, item: Completion) -> CompletionItem {
-    let kind = infer_kind(&item.value);
-    let (source, trust) = catalog_provenance(catalog, &item);
+    let command = catalog_command(catalog, &item);
+    let is_command = command.is_some_and(|command| {
+        command.path == item.value || command.aliases.iter().any(|alias| alias == &item.value)
+    });
+    let kind = if is_command {
+        CompletionKind::Command
+    } else {
+        infer_kind(&item.value)
+    };
+    let (source, trust) = command.map_or(("catalog", "validated"), |command| {
+        (
+            provenance_label(command.provenance.source),
+            trust_label(command.provenance.trust),
+        )
+    });
+    let detail = if is_command {
+        command.map_or(item.detail.clone(), command_capability_detail)
+    } else {
+        item.detail.clone()
+    };
     CompletionItem {
         value: item.value,
         display: item.display,
         summary: item.summary,
-        detail: item.detail,
+        detail,
         replace_start: item.replace_start,
         replace_end: item.replace_end,
         match_indices: item.match_indices,
@@ -553,8 +598,11 @@ fn completion_item_bytes(item: &CompletionItem) -> usize {
         .saturating_add(item.detail.len())
 }
 
-fn catalog_provenance(catalog: &Catalog, item: &Completion) -> (&'static str, &'static str) {
-    let command = catalog.commands.iter().find(|command| {
+fn catalog_command<'catalog>(
+    catalog: &'catalog Catalog,
+    item: &Completion,
+) -> Option<&'catalog CommandSpec> {
+    catalog.commands.iter().find(|command| {
         command.path == item.value
             || command.aliases.iter().any(|alias| alias == &item.value)
             || command.signature == item.display
@@ -563,13 +611,34 @@ fn catalog_provenance(catalog: &Catalog, item: &Completion) -> (&'static str, &'
                 .detail
                 .strip_prefix(&command.signature)
                 .is_some_and(|suffix| suffix.starts_with(" · "))
-    });
-    command.map_or(("catalog", "validated"), |command| {
-        (
-            provenance_label(command.provenance.source),
-            trust_label(command.provenance.trust),
-        )
     })
+}
+
+fn command_capability_detail(command: &CommandSpec) -> String {
+    let effects = if command.effects.is_empty() {
+        "none".to_owned()
+    } else {
+        command
+            .effects
+            .iter()
+            .map(|effect| match effect {
+                Effect::ReadFilesystem => "read filesystem",
+                Effect::WriteFilesystem => "write filesystem",
+                Effect::SpawnProcess => "spawn process",
+                Effect::ChangeDirectory => "change directory",
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let streaming = if command.io.streaming {
+        "streaming"
+    } else {
+        "bounded result"
+    };
+    format!(
+        "{} Capabilities: {} input -> {} output ({streaming}); effects: {effects}.",
+        command.details, command.io.input, command.io.output
+    )
 }
 
 const fn provenance_label(source: Provenance) -> &'static str {
@@ -740,6 +809,34 @@ mod tests {
         let item = catalog_item(&catalog, item);
         assert_eq!(item.source, "external");
         assert_eq!(item.trust, "imported");
+    }
+
+    #[test]
+    fn exact_command_completion_explains_catalog_capabilities() {
+        let catalog = Catalog::builtin();
+        let item = catalog
+            .complete("ls", 2)
+            .into_iter()
+            .find(|item| item.value == "ls")
+            .unwrap();
+        let item = catalog_item(&catalog, item);
+
+        assert_eq!(item.kind, CompletionKind::Command);
+        assert!(item.summary.contains("directory"));
+        assert!(item.detail.contains("Capabilities:"));
+        assert!(item.detail.contains("read filesystem"));
+        assert_eq!(item.source, "builtin");
+    }
+
+    #[test]
+    fn automatic_information_preserves_enter_until_the_user_navigates() {
+        let mut state = CompletionState::new(Catalog::builtin(), None);
+        state.request_automatic("ls", 2).unwrap();
+        assert!(state.open);
+        assert!(!state.accepts_enter());
+
+        state.next();
+        assert!(state.accepts_enter());
     }
 
     #[test]

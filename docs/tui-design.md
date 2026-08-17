@@ -18,12 +18,12 @@ completion protocol, `QuirlConfig`, and the existing prompt scheduler.
 
 ## 1. Summary
 
-Quirl's default capable-terminal shell is a **Ratatui-rendered inline frame**:
-a small, dirty-tracked UI region anchored at the bottom of the normal terminal flow. It
+Quirl's default capable-terminal shell is a **Ratatui-rendered full-screen editor**:
+a dirty-tracked UI on the alternate screen. It
 owns the prompt, a syntax-highlighted editor line, a completion popup with a
 documentation pane, a diagnostics row, and a persistent bottom status bar.
-Everything above the frame is ordinary terminal scrollback — command output is
-never trapped inside a TUI.
+The normal screen and its scrollback are restored before command execution, so
+command output is never trapped inside the TUI.
 
 What is **kept** from today's implementation:
 
@@ -69,9 +69,9 @@ Goals:
 
 Non-goals:
 
-- No alternate-screen full-app mode for the shell itself. `picker.layout =
-  "full"` expands the picker to the terminal-height inline viewport; it does
-  not trade native scrollback and lifecycle safety for an alternate screen.
+- No persistent full-app shell mode. The alternate screen exists only while the
+  editor owns the terminal and is released before execution, suspension, EOF,
+  or error return.
 - No mouse requirement. Mouse support is an enhancement, never a dependency.
 - No plugin-drawn raw widgets in v1. Plugins contribute styled values and
   panel models; Quirl owns layout, focus, theme, and cleanup (§11 of
@@ -114,23 +114,22 @@ Everything stays behind `#[cfg(test)] mod tests` in the same files, per
 project convention. `ratatui::backend::TestBackend` is the snapshot-test
 backend (§11).
 
-### 3.2 Terminal lifecycle: inline viewport per prompt
+### 3.2 Terminal lifecycle: full-screen alternate viewport per prompt
 
-The frame uses `Viewport::Inline(h)` — anchored to the cursor row, full width,
-scrollback preserved above. Height is fixed at terminal construction, so the
-surface wraps it:
+The frame uses a `Viewport::Fixed` rectangle covering the complete validated
+terminal after entering its alternate screen. Quirl re-measures and manually
+resizes that rectangle before each draw, so Ratatui never allocates from an
+unvalidated dimension and layout always uses the current terminal rectangle:
 
 ```rust
-/// Owns the ratatui Terminal. Recreates it when the frame needs to grow or
-/// shrink (popup opened/closed), keeping the frame's top row visually stable.
+/// Owns the ratatui Terminal and its alternate-screen lifecycle.
 struct SurfaceTerminal {
     terminal: Option<ratatui::Terminal<CrosstermBackend<Stderr>>>,
-    height: u16,
+    alternate_screen: bool,
 }
 impl SurfaceTerminal {
-    fn ensure_height(&mut self, rows: u16) -> Result<(), ShellError>;
     fn draw(&mut self, frame: &FrameModel) -> Result<(), ShellError>;
-    /// Restore cooked mode + leave the frame as plain text; used before exec.
+    /// Restore normal screen, cooked mode, and input features before exec.
     fn release(&mut self) -> Result<(), ShellError>;
 }
 ```
@@ -142,18 +141,17 @@ Rules:
 
 - Draw to **stderr**, not stdout. Non-interactive stdout stays stable,
   undecorated, and control-sequence-free (§12).
-- Base frame height is 3 rows (context, input, status bar). It grows for the
-  diagnostics row (+1), multi-line input (+n), and the completion popup /
-  picker overlay (up to `picker` layout limits, default max 10 popup rows).
-  Growth re-initializes the inline viewport at the new height; ratatui appends
-  lines (scrolling if at screen bottom). The `scrolling-regions` feature is
-  enabled for the future `insert_before` path, but no editing-time scrollback
-  notice insertion is currently performed. If re-init proves visually unstable on a
-  Tier 1 terminal, the recorded fallback is fzf-style: reserve the maximum
-  frame height up front while a popup-capable state is possible. Decide with
-  evidence, note the result in the ADR.
+- The bounded active region (context, editor, diagnostics, completion, and
+  panels) is aligned immediately above the status bar, keeping the editing locus
+  stable as overlays open and close. It is clipped to the current screen, while
+  the status bar is always rendered at `height - 1`. Tiny dimensions use saturating layout and the
+  capability probe keeps terminals shorter than five rows on the simple path.
+- Width is bounded to 512 columns and height to 256 rows (131,072 cells) at
+  initial selection and again before every resized draw. An oversized runtime
+  resize returns `ResourceLimit` only after restoring the terminal guard.
 - Raw mode is enabled only while the frame is live. Bracketed paste is enabled
-  through crossterm and restored by the terminal guard. Kitty keyboard and
+  through crossterm; raw mode, alternate screen, bracketed paste, cursor shape,
+  and cursor visibility are restored by the same terminal guard. Kitty keyboard and
   synchronized-output negotiation remain future progressive enhancements;
   `Shift-Tab` works today through crossterm's Shift-Tab/BackTab events.
 
@@ -161,11 +159,11 @@ Rules:
 
 ```
 ┌──────────────────────────── one REPL iteration ────────────────────────────┐
-│ 1. build FrameModel; create inline viewport; enter raw mode                │
+│ 1. enter raw mode + alternate screen; build the full-screen FrameModel     │
 │ 2. edit loop: keys → EditorState; async events → completion/segments;      │
 │    redraw only when dirty                                                  │
-│ 3. on Accept: collapse frame to one transient prompt line (§5.5), release  │
-│    the terminal entirely (cooked mode, viewport dropped)                   │
+│ 3. on Accept: release alternate screen and raw mode, then append one safe  │
+│    transient prompt line to normal scrollback (§5.5)                       │
 │ 4. classify() → execute through the existing native executor with          │
 │    inherited stdio/PTY; job control, Ctrl-Z, vim, less all work untouched  │
 │ 5. output lands in normal scrollback; errors via quirl_ui::render_error    │
@@ -284,7 +282,8 @@ the highlighted buffer, hardware cursor at the edit position
 (`Frame::set_cursor_position`). Inline history autosuggestion renders dim
 after the cursor.
 
-Row 3 — **status bar** (§8).
+Physical bottom row — **status bar** (§8). Rows above the bounded active content
+remain clear so resize cannot leave stale geometry behind.
 
 ### 5.2 Completion popup open
 
@@ -307,11 +306,16 @@ Row 3 — **status bar** (§8).
   color, then summary text. Kind glyph column (command `λ`, flag `–`, path
   `/`, value `≡`, history `↺`; ASCII fallbacks `c f p v h`). Max 10 rows,
   virtualized scrolling with a 1-cell scrollbar when overflowing.
-- Right pane (docs): `detail`, documentation, and a provenance footer
+- Right pane (docs): `detail`, catalog-derived I/O/effect capabilities, and a provenance footer
   (`source · trust`, derived from matching catalog provenance). Hidden for a
-  normal popup when terminal width < 100. Narrow mode retains the list and
+  normal popup when terminal width < 72. Narrow mode retains the list and
   count/source status; showing the selected summary in the status bar remains
   future polish.
+- Always-on context: typing an exact catalog command opens its explanation;
+  typing a flag prefix after a known command opens that command's options. This
+  happens even when broad `completion.auto` fuzzy matching is disabled. An
+  untouched informational popup leaves Enter bound to command execution; Tab
+  or arrow navigation converts it to a selectable completion menu.
 - Streaming: catalog and extension completion run on separate workers. Catalog
   results normally paint first; later extension results merge without moving a
   still-present selected value. `streaming…` shows while either source remains
@@ -346,8 +350,8 @@ until then data mode renders with the plain style rather than wrong guesses.
 
 ### 5.5 Transient prompt (after Accept)
 
-On Accept the frame collapses to a single scrollback line and the viewport is
-released before execution:
+On Accept the alternate screen is released, then a single transient line is
+committed to normal scrollback before execution:
 
 ```
 ❯ cargo build --release                                            ✔ 2.31s
@@ -366,19 +370,14 @@ only if they can be proven not to reflow scrollback. Controlled by
 picker (query row + virtualized result list + optional preview pane),
 honoring `picker.layout`:
 
-- `adaptive` / `bottom`: inside the inline frame, max 10 result rows.
-- `full`: terminal-height inline picker with the same RAII lifecycle. A true
-  alternate-screen picker is deliberately unsupported because it would weaken
-  the shell's native-scrollback invariant and require a separate lifecycle.
+- `adaptive` / `bottom`: inside the shared full-screen frame, max 10 result rows.
+- `full`: terminal-height picker using the same full-screen frame and RAII
+  lifecycle as ordinary editing.
 
-The shipped `Ctrl-K` command palette always requests a terminal-height inline
-viewport and positions its bounded adaptive content against the bottom edge.
-This is not an alternate-screen transition: Ratatui may scroll visible content
-upward to reserve the viewport, but that content remains in native scrollback,
-and the same inline terminal guard releases the viewport before execution,
-suspension, or error return. Closing the palette recreates the compact viewport
-against the prior bottom edge so ordinary prompt rendering does not remain near
-the top of the terminal.
+The shipped `Ctrl-K` command palette always requests a terminal-height
+region and positions its bounded adaptive content against the bottom edge. It
+does not perform another screen transition; the existing terminal guard releases
+the shared alternate screen before execution, suspension, or error return.
 
 The picker engine, ranking, and typed-value return stay in `quirl-picker`;
 the surface uses it through the `PickerRanker` composition adapter. Source
@@ -549,7 +548,7 @@ Budgets (restating §12 as per-component obligations):
 | Memory | virtualized/bounded popup and picker; one revision-cached span vector; 64 KiB editor; bounded undo/history | |
 
 The first-paint budget is a P95 wall-clock bound over fresh PTY processes. It
-includes the inline viewport's cursor-position handshake and process scheduling,
+includes alternate-screen entry and process scheduling,
 so 21 ms is the smallest stable boundary demonstrated by the rich surface on
 the release reference machine. Lazy bounded workers keep the median near one
 60 Hz frame without hiding tail behavior or weakening the full welcome default.
@@ -592,8 +591,7 @@ In-crate `#[cfg(test)]` modules, behavior-sentence names, run by `cargo xtask ch
   test harness.
 - **Degradation**: each row of the §9 table has a test fixing the decision.
 - **Lifecycle**: release/re-init around execution — after a simulated command,
-  the frame reconstructs and prior scrollback lines are untouched
-  (TestBackend cursor-position setup as in ratatui's inline docs).
+  the full-screen frame reconstructs and prior normal-screen scrollback is untouched.
 
 Sandbox/budget claims need adversarial proof per AGENTS.md; any new Lua-facing
 surface (status items) gets deny-unknown-fields structs at the boundary.
@@ -658,13 +656,13 @@ distinguishes landed behavior from remaining parity and release-evidence work.
 
 | Milestone | Current status | Remaining acceptance work |
 | --- | --- | --- |
-| **M1 — Frame + editor** | Landed: inline viewport lifecycle, Quirl-owned 64 KiB grapheme editor, bounded undo/history, Emacs/Helix/Vim states, context/input/status rows, prefix history, autosuggestion, transient prompt, and execution/suspend handoff | Complete named real-terminal lifecycle and latency evidence on Linux/macOS; decide terminal protocol negotiation |
+| **M1 — Frame + editor** | Landed: full-screen alternate-viewport lifecycle, bottom-anchored status, Quirl-owned 64 KiB grapheme editor, bounded undo/history, Emacs/Helix/Vim states, context/input/status rows, prefix history, autosuggestion, safe transient prompt, and execution/suspend handoff | Complete named real-terminal lifecycle and latency evidence on Linux/macOS; decide terminal protocol negotiation |
 | **M2 — Highlighting + diagnostics** | Landed baseline: revision-cached `quirl_syntax::highlight`, bounded asynchronous executable-PATH snapshot, parse/unknown-command/unknown-flag diagnostics, severity styling, draw/highlight P95, and Ratatui/adversarial 4 KiB tests | Expand generated totality coverage and record evidence that the 4 KiB/first-paint budgets pass on release terminals |
-| **M3 — Completion popup** | Landed: bounded catalog and extension workers/results, catalog-first asynchronous merge, selection stability, stale suppression, docs/provenance pane, token anchoring, match styling, virtualization, and narrow list-only rendering | Record named ≤8 ms first-result evidence and broader provider fault/terminal snapshots |
-| **M4 — Overlays + keymaps** | Landed: history/files/directories/palette overlays use the shared `quirl-picker` ranker through a composition-root adapter; queries are bounded and editable; Shift-Tab expands completion; adaptive/bottom and terminal-height inline full layouts honor preview config; Emacs/Helix/Vim editor modes remain available | Decide kitty/synchronized-output negotiation and gather named real-terminal layout evidence |
+| **M3 — Completion popup** | Landed: always-on exact-command information and flag-prefix options, bounded catalog and extension workers/results, catalog-first asynchronous merge, selection stability, stale suppression, docs/provenance pane, token anchoring, match styling, virtualization, and narrow list-only rendering | Record named ≤8 ms first-result evidence and broader provider fault/terminal snapshots |
+| **M4 — Overlays + keymaps** | Landed: history/files/directories/palette overlays use the shared `quirl-picker` ranker through a composition-root adapter; queries are bounded and editable; Shift-Tab expands completion; adaptive/bottom and terminal-height full layouts honor preview config; Emacs/Helix/Vim editor modes remain available | Decide kitty/synchronized-output negotiation and gather named real-terminal layout evidence |
 | **M5 — Fallback retirement** | **Not accepted or implemented.** ADR 0012 flips `auto` to rich but deliberately retains Reedline for `simple` | Separate decision, full conformance and accessibility evidence, minimal fallback replacement, and removal of Reedline from `Cargo.lock` |
 
-Bounded extension panels are now pinned into the inline frame below the editor
+Bounded extension panels are now pinned into the full-screen frame below the editor
 when no completion/picker overlay is active. `F6` cycles focus, at most six
 rows are visible, and `LiveBuffer` retains four completed generations per
 panel. Typed command output remains ordinary scrollback rather than becoming a
@@ -674,9 +672,10 @@ full-screen watch application.
 
 ## 14. Open questions and recorded decisions
 
-1. **Viewport growth**: the baseline reinitializes the inline viewport when
-   height changes. Record evidence on Ghostty, Terminal.app, iTerm2, and a Linux
-   VTE terminal before calling the behavior release-proven.
+1. **Full-screen lifecycle**: record alternate-screen enter/leave, resize,
+   suspend/resume, EOF, foreground handoff, and failure cleanup evidence on
+   Ghostty, Terminal.app, iTerm2, and a Linux VTE terminal before calling the
+   behavior release-proven.
 2. **Transient result glyph** (§5.5): the baseline commits only the indicator
    and accepted buffer. Retrofitting a result into prior scrollback is deferred.
 3. **Data-mode lexer spans**: extend `highlight()` when the data grammar
@@ -713,7 +712,7 @@ The integration maintains these invariants:
 - **Resize or suspension during a frame.** Resize invalidates the prepared
   layout before the next draw. Terminals below five rows hide panels, previews,
   and diagnostics in that order and keep the editor/status fallback usable.
-  Suspension releases the inline viewport, bracketed paste, cursor shape, and
+  Suspension releases the alternate screen, bracketed paste, cursor shape, and
   raw mode before the process receives `SIGTSTP`; resume reacquires a newly
   measured viewport. A frame prepared for an older size is never deliberately
   written after a resize event has been observed.
@@ -728,7 +727,7 @@ The integration maintains these invariants:
   a generation counter is `ErrorCode::ResourceLimit`, never wraparound.
 - **Terminal write failure or partial frame.** Ratatui/crossterm write errors
   keep the terminal restoration guard armed. Cleanup restores cooked mode,
-  cursor visibility, bracketed-paste state, and the inline viewport on explicit
+  cursor visibility, bracketed-paste state, and the alternate screen on explicit
   return and again best-effort from `Drop`. The original write error wins over
   cleanup errors.
 - **Post-flush catalog admission.** Extension discovery, active configuration,
@@ -739,8 +738,8 @@ The integration maintains these invariants:
   analysis, completion, picker/help, and the REPL only after every consumer is
   ready. Input arriving meanwhile remains queued by the terminal. Loader
   failure preserves the catalog error while the existing drop guards restore
-  cooked mode, cursor visibility and shape, bracketed paste, and the inline
-  viewport. Simple/degraded mode keeps eager catalog construction.
+  cooked mode, cursor visibility and shape, bracketed paste, and the alternate
+  screen. Simple/degraded mode keeps eager catalog construction.
 - **Queue or output flood.** One UI turn polls at most one provider snapshot,
   applies at most eight panel updates, and performs at most sixteen data pulls
   before checking cancellation and scheduler state again. The panel queue holds

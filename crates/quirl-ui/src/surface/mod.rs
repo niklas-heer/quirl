@@ -43,16 +43,13 @@ use crossterm::{
         KeyModifiers,
     },
     execute,
-    terminal::{self, ClearType},
+    terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use quirl_catalog::Catalog;
 use quirl_core::{replace_file_atomically, AtomicReplaceOptions, ErrorCode, ShellError};
 use quirl_lua::QuirlConfig;
 use quirl_syntax::{parse_command_list, Mode};
-use ratatui::{
-    backend::CrosstermBackend, layout::Position, text::Line, widgets::Paragraph, Terminal,
-    TerminalOptions, Viewport,
-};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal, TerminalOptions, Viewport};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
@@ -71,6 +68,8 @@ const TIMING_WINDOW: usize = 128;
 const HISTORY_NEWLINE_ESCAPE: &str = "<\\n>";
 const MAX_HISTORY_FILE_BYTES: usize = MAX_HISTORY_RETAINED_BYTES * 4 + 50_000;
 const HELP_DETAIL_SCROLL_MAX: u16 = 4_096;
+const RICH_TERMINAL_COLUMNS_MAX: u16 = 512;
+const RICH_TERMINAL_ROWS_MAX: u16 = 256;
 const HISTORY_REPLACEMENT_BYTES_MAX: usize = MAX_HISTORY_FILE_BYTES * 2;
 #[cfg(test)]
 static HISTORY_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -90,10 +89,10 @@ pub enum InteractiveSignal {
     Suspend,
 }
 
-/// Stateful inline terminal editor with completion, pickers, history, and diagnostics.
+/// Stateful full-screen terminal editor with completion, pickers, history, and diagnostics.
 ///
 /// The surface owns raw mode, bracketed paste, cursor shape, and its ratatui
-/// viewport only while [`Self::read_line`] is active. Normal returns restore all
+/// alternate screen only while [`Self::read_line`] is active. Normal returns restore all
 /// terminal state; error unwinding and drop make a final best-effort restoration.
 /// Completion and prompt-analysis queues retain at most one pending generation,
 /// preventing stale work from repainting newer input.
@@ -226,7 +225,7 @@ impl RichSurface {
         })?;
         let catalog = loader()?;
 
-        // Failure model: the terminal is already raw and owns an inline
+        // Failure model: the terminal is already raw and owns the alternate
         // viewport. No input observer runs during this transaction. Publish
         // clones to every consumer first, then expose the catalog slot last so
         // no reachable state can observe a partial generation.
@@ -252,7 +251,7 @@ impl RichSurface {
     /// observed without blocking keyboard handling. Accepted non-empty input is
     /// appended and flushed to bounded history before returning. Ctrl-C, empty-buffer
     /// Ctrl-D and suspension return explicit signals only after cooked mode,
-    /// cursor visibility, bracketed paste, and the inline viewport have been
+    /// cursor visibility, bracketed paste, and the alternate screen have been
     /// restored. Grammar-mode toggles redraw within this session and preserve
     /// the edit buffer. Terminal/history I/O and invalid completion requests
     /// return [`ShellError`]; the drop guard retries terminal cleanup on error.
@@ -281,6 +280,10 @@ impl RichSurface {
                 let analysis = self.input_analysis.current();
                 let context_left = prompt.surface_context_left();
                 let context_right = prompt.surface_context_right();
+                debug_assert!(
+                    !self.picker.bottom_anchored() || self.picker.active(),
+                    "bottom anchoring cannot outlive its picker overlay"
+                );
                 let model = FrameModel {
                     context_left: &context_left,
                     context_right: &context_right,
@@ -309,13 +312,10 @@ impl RichSurface {
                     } else {
                         self.picker_layout
                     },
-                    picker_bottom_anchored: self.picker.bottom_anchored(),
                     picker_preview: self.picker_preview,
                     detail_scroll: self.help_detail_scroll,
                     runtime: &self.runtime,
                 };
-                let height = model.height(terminal_height);
-                self.terminal.ensure_height(height)?;
                 let started = Instant::now();
                 self.terminal.draw(&model)?;
                 let draw_elapsed = started.elapsed();
@@ -364,7 +364,7 @@ impl RichSurface {
                     }
                     self.expand_completion_pending = false;
                     editor.insert_paste(&text);
-                    self.completion.cancel_for_edit();
+                    self.refresh_completion_after_edit(&editor, prompt.mode)?;
                 }
                 Event::Resize(_, _) => continue,
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -456,7 +456,7 @@ impl RichSurface {
                                 self.completion.next();
                                 continue;
                             }
-                            KeyCode::Enter => {
+                            KeyCode::Enter if self.completion.accepts_enter() => {
                                 if let Some(item) = self.completion.selected_item().cloned() {
                                     editor.replace(
                                         item.replace_start,
@@ -542,13 +542,7 @@ impl RichSurface {
                         action => {
                             if editor.apply(action) {
                                 self.expand_completion_pending = false;
-                                self.completion.cancel_for_edit();
-                                if self.completion_auto
-                                    && current_token_len(editor.buffer(), editor.cursor())
-                                        >= self.completion_min_chars
-                                {
-                                    self.completion.request(editor.buffer(), editor.cursor())?;
-                                }
+                                self.refresh_completion_after_edit(&editor, prompt.mode)?;
                             }
                         }
                     }
@@ -559,7 +553,7 @@ impl RichSurface {
     }
 
     fn toggle_grammar_mode(&mut self, prompt: &mut QuirlPrompt) {
-        // Failure model: releasing the inline viewport here destroys the
+        // Failure model: releasing the alternate screen here destroys the
         // editor state, while host feedback commits an unbounded line per
         // toggle to scrollback. A mode switch transfers no terminal or process
         // ownership, so it must remain an in-frame state transition. Preserve
@@ -571,6 +565,29 @@ impl RichSurface {
         self.picker.dismiss();
         self.help_active = false;
         self.help_detail_scroll = 0;
+    }
+
+    fn refresh_completion_after_edit(
+        &mut self,
+        editor: &EditorState,
+        mode: Mode,
+    ) -> Result<(), ShellError> {
+        self.completion.cancel_for_edit();
+        let should_open = self.catalog.as_deref().is_some_and(|catalog| {
+            should_open_automatic_completion(
+                catalog,
+                editor.buffer(),
+                editor.cursor(),
+                mode,
+                self.completion_auto,
+                self.completion_min_chars,
+            )
+        });
+        if should_open {
+            self.completion
+                .request_automatic(editor.buffer(), editor.cursor())?;
+        }
+        Ok(())
     }
 
     fn open_picker(
@@ -746,76 +763,43 @@ impl Drop for RichSurface {
 #[derive(Default)]
 struct SurfaceTerminal {
     terminal: Option<Terminal<CrosstermBackend<io::Stderr>>>,
-    height: u16,
+    alternate_screen: bool,
     active: bool,
 }
 
 impl SurfaceTerminal {
     fn enter(&mut self) -> Result<(), ShellError> {
+        let size = terminal::size().map_err(terminal_error("measure the interactive terminal"))?;
+        validate_rich_terminal_size(size)?;
         terminal::enable_raw_mode().map_err(terminal_error("enable terminal raw mode"))?;
         self.active = true;
-        let result = execute!(
+        if let Err(error) = execute!(io::stderr(), EnterAlternateScreen) {
+            self.reset_best_effort();
+            return Err(terminal_error("enter the alternate terminal screen")(error));
+        }
+        self.alternate_screen = true;
+        if let Err(error) = execute!(
             io::stderr(),
             EnableBracketedPaste,
             SetCursorStyle::SteadyBar
-        );
-        if let Err(error) = result {
+        ) {
             self.reset_best_effort();
             return Err(terminal_error("enable terminal input features")(error));
-        }
-        Ok(())
-    }
-
-    fn ensure_height(&mut self, height: u16) -> Result<(), ShellError> {
-        let height = height.max(1);
-        if self.terminal.is_some() && self.height == height {
-            return Ok(());
-        }
-        if let Some(mut terminal) = self.terminal.take() {
-            // Failure model: viewport recreation happens only while the raw-mode
-            // guard is armed and no foreground child owns the terminal. Growing
-            // starts at the prior viewport top so Ratatui scrolls earlier output
-            // into native scrollback; shrinking preserves the prior bottom edge.
-            // Every failed step restores the cursor and disarms terminal features.
-            let previous_area = terminal.get_frame().area();
-            let terminal_height = match terminal.size() {
-                Ok(size) => size.height,
-                Err(error) => {
-                    let _ = terminal.clear();
-                    let _ = terminal.show_cursor();
-                    self.reset_best_effort();
-                    return Err(terminal_error("measure the interactive terminal")(error));
-                }
-            };
-            if let Err(error) = terminal.clear() {
-                let _ = terminal.show_cursor();
-                self.reset_best_effort();
-                return Err(terminal_error("clear the prior interactive frame")(error));
-            }
-            if let Err(error) = terminal.show_cursor() {
-                self.reset_best_effort();
-                return Err(terminal_error("restore the terminal cursor")(error));
-            }
-            let anchor_row = resized_viewport_anchor_row(previous_area, terminal_height, height);
-            if let Err(error) = terminal.set_cursor_position(Position::new(0, anchor_row)) {
-                self.reset_best_effort();
-                return Err(terminal_error("anchor the resized interactive frame")(
-                    error,
-                ));
-            }
         }
         let backend = CrosstermBackend::new(io::stderr());
         let terminal_result = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(height),
+                viewport: Viewport::Fixed(Rect::new(0, 0, size.0, size.1)),
             },
         );
         let mut terminal = match terminal_result {
             Ok(terminal) => terminal,
             Err(error) => {
                 self.reset_best_effort();
-                return Err(terminal_error("create the inline terminal viewport")(error));
+                return Err(terminal_error("create the full-screen terminal viewport")(
+                    error,
+                ));
             }
         };
         if let Err(error) = terminal.hide_cursor() {
@@ -823,15 +807,34 @@ impl SurfaceTerminal {
             return Err(terminal_error("hide the software cursor")(error));
         }
         self.terminal = Some(terminal);
-        self.height = height;
         Ok(())
     }
 
     fn draw(&mut self, model: &FrameModel<'_>) -> Result<(), ShellError> {
+        let size = match terminal::size() {
+            Ok(size) => size,
+            Err(error) => {
+                self.reset_best_effort();
+                return Err(terminal_error("measure the resized interactive terminal")(
+                    error,
+                ));
+            }
+        };
+        if let Err(error) = validate_rich_terminal_size(size) {
+            self.reset_best_effort();
+            return Err(error);
+        }
         let terminal = self.terminal.as_mut().ok_or_else(|| {
-            ShellError::new(ErrorCode::Io, "the inline terminal is unavailable")
+            ShellError::new(ErrorCode::Io, "the full-screen terminal is unavailable")
                 .with_help("Retry with ui.surface = \"simple\"")
         })?;
+        let area = Rect::new(0, 0, size.0, size.1);
+        if terminal.get_frame().area() != area {
+            if let Err(error) = terminal.resize(area) {
+                self.reset_best_effort();
+                return Err(terminal_error("resize the interactive frame")(error));
+            }
+        }
         let result = terminal.draw(|frame| model.render(frame)).map(|_| ());
         if let Err(error) = result {
             self.reset_best_effort();
@@ -841,35 +844,8 @@ impl SurfaceTerminal {
     }
 
     fn release(&mut self, transient: Option<String>) -> Result<(), ShellError> {
-        let has_transient = transient.is_some();
         let mut failure = None;
-        if let Some(line) = transient {
-            if let Err(error) = self.ensure_height(1) {
-                failure = Some(error);
-            } else if let Some(terminal) = self.terminal.as_mut() {
-                if let Err(error) = terminal.draw(|frame| {
-                    frame.render_widget(Paragraph::new(Line::raw(line)), frame.area());
-                    frame.set_cursor_position(Position::new(
-                        0,
-                        frame.area().bottom().saturating_sub(1),
-                    ));
-                }) {
-                    retain_error(
-                        &mut failure,
-                        terminal_error("draw the transient prompt")(error),
-                    );
-                }
-            }
-        }
         if let Some(mut terminal) = self.terminal.take() {
-            if !has_transient {
-                if let Err(error) = terminal.clear() {
-                    retain_error(
-                        &mut failure,
-                        terminal_error("clear the interactive frame")(error),
-                    );
-                }
-            }
             if let Err(error) = terminal.show_cursor() {
                 retain_error(
                     &mut failure,
@@ -888,15 +864,28 @@ impl SurfaceTerminal {
                 terminal_error("restore terminal input features")(error),
             );
         }
+        if self.alternate_screen {
+            match execute!(io::stderr(), LeaveAlternateScreen) {
+                Ok(()) => self.alternate_screen = false,
+                Err(error) => retain_error(
+                    &mut failure,
+                    terminal_error("leave the alternate terminal screen")(error),
+                ),
+            }
+        }
         if let Err(error) = terminal::disable_raw_mode() {
             retain_error(
                 &mut failure,
                 terminal_error("restore cooked terminal mode")(error),
             );
         }
-        if has_transient {
+        if let Some(line) = transient.filter(|_| !self.alternate_screen) {
             let mut stderr = io::stderr();
-            if let Err(error) = stderr.write_all(b"\r\n").and_then(|()| stderr.flush()) {
+            if let Err(error) = stderr
+                .write_all(line.as_bytes())
+                .and_then(|()| stderr.write_all(b"\r\n"))
+                .and_then(|()| stderr.flush())
+            {
                 retain_error(
                     &mut failure,
                     terminal_error("commit the transient prompt to scrollback")(error),
@@ -907,7 +896,6 @@ impl SurfaceTerminal {
     }
 
     fn finish_release(&mut self, failure: Option<ShellError>) -> Result<(), ShellError> {
-        self.height = 0;
         // Keep the guard armed after any cleanup failure. The caller may
         // unwind immediately, and Drop must make one more best-effort attempt
         // to restore cooked mode, cursor visibility, and input features.
@@ -926,8 +914,11 @@ impl SurfaceTerminal {
             DisableBracketedPaste,
             SetCursorStyle::DefaultUserShape
         );
+        if self.alternate_screen {
+            let _ = execute!(io::stderr(), LeaveAlternateScreen);
+        }
         let _ = terminal::disable_raw_mode();
-        self.height = 0;
+        self.alternate_screen = false;
         self.active = false;
     }
 }
@@ -946,18 +937,22 @@ fn retain_error(slot: &mut Option<ShellError>, error: ShellError) {
     }
 }
 
-fn resized_viewport_anchor_row(
-    previous_area: ratatui::layout::Rect,
-    terminal_height: u16,
-    next_height: u16,
-) -> u16 {
-    let visible_bottom = previous_area.bottom().min(terminal_height);
-    let next_height = next_height.max(1).min(terminal_height.max(1));
-    let previous_height = previous_area.height.min(terminal_height);
-    if next_height > previous_height {
-        return previous_area.top().min(terminal_height.saturating_sub(1));
+fn validate_rich_terminal_size((columns, rows): (u16, u16)) -> Result<(), ShellError> {
+    if columns > 0
+        && rows > 0
+        && columns <= RICH_TERMINAL_COLUMNS_MAX
+        && rows <= RICH_TERMINAL_ROWS_MAX
+    {
+        return Ok(());
     }
-    visible_bottom.saturating_sub(next_height)
+    Err(ShellError::new(
+        ErrorCode::ResourceLimit,
+        "interactive terminal dimensions exceed the rich-surface bounds",
+    )
+    .with_context(format!(
+        "limit {RICH_TERMINAL_COLUMNS_MAX} columns by {RICH_TERMINAL_ROWS_MAX} rows; observed {columns} columns by {rows} rows"
+    ))
+    .with_help("Resize the terminal or retry with ui.surface = \"simple\""))
 }
 
 fn trim_history(history: &mut Vec<String>) {
@@ -1242,12 +1237,18 @@ fn terminal_error(action: &'static str) -> impl Fn(io::Error) -> ShellError {
     move |error| {
         ShellError::new(ErrorCode::Io, format!("could not {action}"))
             .with_context(error.to_string())
-            .with_help("Retry with ui.surface = \"simple\" if the terminal lacks inline UI support")
+            .with_help(
+                "Retry with ui.surface = \"simple\" if the terminal lacks full-screen UI support",
+            )
     }
 }
 
 fn transient_line(mode: Mode, buffer: &str, symbols: SurfaceSymbols) -> String {
-    format!("{}{buffer}", symbols.input_indicator(mode))
+    format!(
+        "{}{}",
+        symbols.input_indicator(mode),
+        quirl_core::escape_terminal_line(buffer)
+    )
 }
 
 fn input_is_incomplete(buffer: &str, mode: Mode) -> bool {
@@ -1271,6 +1272,46 @@ fn current_token_len(buffer: &str, cursor: usize) -> usize {
         )
 }
 
+fn should_open_automatic_completion(
+    catalog: &Catalog,
+    buffer: &str,
+    cursor: usize,
+    mode: Mode,
+    configured_auto: bool,
+    configured_min_chars: usize,
+) -> bool {
+    let cursor = cursor.min(buffer.len());
+    let before = &buffer[..cursor];
+    let token_len = current_token_len(buffer, cursor);
+    if configured_auto && token_len >= configured_min_chars {
+        return true;
+    }
+    if mode != Mode::Command || before.trim().is_empty() {
+        return false;
+    }
+
+    let trimmed = before.trim_start();
+    let exact_command = before.trim_end().len() == before.len()
+        && catalog.commands.iter().any(|command| {
+            trimmed == command.path || command.aliases.iter().any(|alias| alias == trimmed)
+        });
+    if exact_command {
+        return true;
+    }
+
+    let token_start = trimmed.rfind(char::is_whitespace).map_or(0, |index| {
+        index + trimmed[index..].chars().next().map_or(0, char::len_utf8)
+    });
+    let token = &trimmed[token_start..];
+    if !token.starts_with('-') {
+        return false;
+    }
+    let command_text = trimmed[..token_start].trim_end();
+    catalog.commands.iter().any(|command| {
+        command_text == command.path || command_text.starts_with(&format!("{} ", command.path))
+    })
+}
+
 fn timing_p95(samples: &VecDeque<Duration>) -> Option<Duration> {
     if samples.is_empty() {
         return None;
@@ -1290,6 +1331,93 @@ mod tests {
     fn incomplete_quotes_continue_instead_of_executing() {
         assert!(input_is_incomplete("printf 'hello", Mode::Command));
         assert!(!input_is_incomplete("printf hello", Mode::Command));
+    }
+
+    #[test]
+    fn rich_terminal_dimensions_accept_the_exact_bound_and_reject_overflow() {
+        assert!(
+            validate_rich_terminal_size((RICH_TERMINAL_COLUMNS_MAX, RICH_TERMINAL_ROWS_MAX))
+                .is_ok()
+        );
+        for size in [
+            (0, 24),
+            (80, 0),
+            (RICH_TERMINAL_COLUMNS_MAX + 1, 24),
+            (80, RICH_TERMINAL_ROWS_MAX + 1),
+        ] {
+            let error = validate_rich_terminal_size(size).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.details.context[0].contains("observed"));
+        }
+    }
+
+    #[test]
+    fn exact_command_information_opens_automatically_and_dismisses_after_space() {
+        let config = QuirlConfig::default();
+        assert!(!config.completion.auto);
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("ls");
+
+        surface
+            .refresh_completion_after_edit(&editor, Mode::Command)
+            .unwrap();
+        assert!(surface.completion.open);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline && surface.completion.streaming {
+            surface.completion.poll(editor.buffer(), editor.cursor());
+            std::thread::yield_now();
+        }
+        let item = surface
+            .completion
+            .items
+            .iter()
+            .find(|item| item.value == "ls")
+            .unwrap();
+        assert!(item.detail.contains("Capabilities:"));
+
+        assert!(editor.apply(EditAction::Insert(' ')));
+        surface
+            .refresh_completion_after_edit(&editor, Mode::Command)
+            .unwrap();
+        assert!(!surface.completion.open);
+        assert!(!surface.completion.streaming);
+    }
+
+    #[test]
+    fn flag_prefix_opens_catalog_options_without_tab() {
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("ls -");
+
+        surface
+            .refresh_completion_after_edit(&editor, Mode::Command)
+            .unwrap();
+        assert!(surface.completion.open);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline && surface.completion.streaming {
+            surface.completion.poll(editor.buffer(), editor.cursor());
+            std::thread::yield_now();
+        }
+        assert!(surface
+            .completion
+            .items
+            .iter()
+            .any(|item| item.value == "--all" && item.kind == completion::CompletionKind::Flag));
     }
 
     #[test]
@@ -1460,7 +1588,7 @@ mod tests {
     fn failed_explicit_release_keeps_drop_cleanup_armed() {
         let mut terminal = SurfaceTerminal {
             terminal: None,
-            height: 4,
+            alternate_screen: true,
             active: true,
         };
         let failure = ShellError::new(ErrorCode::Io, "injected terminal cleanup failure")
@@ -1468,32 +1596,11 @@ mod tests {
 
         assert!(terminal.finish_release(Some(failure)).is_err());
         assert!(terminal.active);
-        assert_eq!(terminal.height, 0);
+        assert!(terminal.alternate_screen);
 
+        terminal.alternate_screen = false;
         assert!(terminal.finish_release(None).is_ok());
         assert!(!terminal.active);
-    }
-
-    #[test]
-    fn viewport_contraction_preserves_the_visible_bottom_edge() {
-        let full = ratatui::layout::Rect::new(0, 0, 120, 30);
-        assert_eq!(resized_viewport_anchor_row(full, 30, 3), 27);
-
-        let compact = ratatui::layout::Rect::new(0, 17, 120, 13);
-        assert_eq!(resized_viewport_anchor_row(compact, 30, 3), 27);
-    }
-
-    #[test]
-    fn viewport_growth_starts_at_the_prior_top_to_preserve_scrollback() {
-        let compact = ratatui::layout::Rect::new(0, 17, 120, 13);
-        assert_eq!(resized_viewport_anchor_row(compact, 30, 30), 17);
-    }
-
-    #[test]
-    fn viewport_recreation_clamps_a_stale_area_after_terminal_shrink() {
-        let stale = ratatui::layout::Rect::new(0, 17, 120, 13);
-        assert_eq!(resized_viewport_anchor_row(stale, 8, 3), 5);
-        assert_eq!(resized_viewport_anchor_row(stale, 8, 30), 0);
     }
 
     #[test]
