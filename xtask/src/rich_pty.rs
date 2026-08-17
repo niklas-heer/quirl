@@ -3,7 +3,11 @@
 use crate::pty::{key, PtySession, SpawnOptions, VirtualScreen, DEFAULT_TIMEOUT};
 use nix::{
     errno::Errno,
-    sys::{signal::kill, stat::Mode, termios::LocalFlags},
+    sys::{
+        signal::{kill, Signal},
+        stat::Mode,
+        termios::LocalFlags,
+    },
     unistd::{mkfifo, Pid},
 };
 use std::{
@@ -231,6 +235,61 @@ fn create_private_directory(path: &Path) -> io::Result<()> {
 impl Drop for TempDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Best-effort cleanup for the deliberately blocked construction child.
+///
+/// The child belongs to Quirl rather than xtask and may be in a process group
+/// that is neither the PTY foreground group nor the PTY session leader. Reading
+/// its fixture-recorded group on drop contains regressions without replacing
+/// the originating harness error.
+struct ObservedProcessGroupCleanup {
+    pid_path: PathBuf,
+    armed: bool,
+}
+
+impl ObservedProcessGroupCleanup {
+    fn new(pid_path: PathBuf) -> Self {
+        Self {
+            pid_path,
+            armed: true,
+        }
+    }
+
+    fn observed_pid(&self) -> io::Result<Pid> {
+        let contents = fs::read_to_string(&self.pid_path)?;
+        let process_id = contents.trim().parse::<i32>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "construction child identifier in {} was invalid: {error}",
+                    self.pid_path.display()
+                ),
+            )
+        })?;
+        if process_id <= 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("refusing to clean up unsafe process group {process_id}"),
+            ));
+        }
+        Ok(Pid::from_raw(process_id))
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ObservedProcessGroupCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(process) = self.observed_pid() {
+            let _ = kill(Pid::from_raw(-process.as_raw()), Signal::SIGKILL);
+        }
     }
 }
 
@@ -826,6 +885,7 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
     )?;
     wait_for_prompt(&mut session)?;
     let pid_path = session.private.path.join("construction.pid");
+    let mut construction_cleanup = ObservedProcessGroupCleanup::new(pid_path.clone());
     let gate_path = session.private.path.join("construction.gate");
     mkfifo(&gate_path, Mode::S_IRUSR | Mode::S_IWUSR)?;
     let script = format!(
@@ -842,13 +902,14 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.send(key::ENTER)?;
     session.pty.wait_for(b"cannot write redirected output")?;
     wait_for_prompt(&mut session)?;
-    let observed_child: i32 = fs::read_to_string(&pid_path)?.trim().parse()?;
-    match kill(Pid::from_raw(observed_child), None) {
-        Err(Errno::ESRCH) => {}
+    let observed_child = construction_cleanup.observed_pid()?;
+    match kill(observed_child, None) {
+        Err(Errno::ESRCH) => construction_cleanup.disarm(),
         Err(error) => return Err(error.into()),
         Ok(()) => {
             return Err(io::Error::other(format!(
-                "partial construction leaked child {observed_child}"
+                "partial construction leaked child {}",
+                observed_child.as_raw()
             ))
             .into())
         }
@@ -1052,12 +1113,48 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::{
+        os::unix::{fs::PermissionsExt, process::CommandExt},
+        process::{Command, Stdio},
+        thread,
+    };
 
     #[test]
     fn temporary_session_directory_is_private() {
         let directory = TempDirectory::new("quirl-private-test").unwrap();
         let mode = fs::metadata(&directory.path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn construction_failure_cleanup_kills_the_observed_process_group() {
+        let directory = TempDirectory::new("quirl-construction-cleanup-test").unwrap();
+        let pid_path = directory.path.join("child.pid");
+        let cleanup = ObservedProcessGroupCleanup::new(pid_path.clone());
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "printf '%s' $$ > \"$1\"; sleep 30", "fixture"])
+            .arg(&pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_path.is_file() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !pid_path.is_file() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("construction fixture did not record its process group");
+        }
+        let observed = cleanup.observed_pid().unwrap();
+
+        drop(cleanup);
+        let status = child.wait().unwrap();
+
+        assert!(!status.success());
+        assert!(matches!(kill(observed, None), Err(Errno::ESRCH)));
     }
 }

@@ -236,7 +236,6 @@ fn task_simulate(
     cmd!(sh, "cargo build -p quirl-cli").run()?;
     let quirl = debug_quirl_binary(root);
     let summary = simulation::run(simulation::SimulationOptions {
-        workspace_root: root.to_path_buf(),
         quirl,
         seed,
         session_count: sessions,

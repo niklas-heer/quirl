@@ -6,6 +6,8 @@
 //! - Each runner receives an identical fresh filesystem and explicit minimal
 //!   environment, and runs in its own process group so timeout cleanup cannot
 //!   leave a generated child behind.
+//! - Interpreter probes and generated sessions share one RAII-owned temporary
+//!   root outside the workspace, which is removed on success and every error.
 //! - Bash and Zsh must agree before their result can be treated as an oracle.
 //! - `summary.json` is installed atomically and last; its presence means every
 //!   trace and mismatch artifact needed by the scheduled reporter is durable.
@@ -33,7 +35,6 @@ const SESSION_PATH_DEPTH_MAX: usize = 8;
 const SESSION_DEADLINE: Duration = Duration::from_secs(5);
 
 pub struct SimulationOptions {
-    pub workspace_root: PathBuf,
     pub quirl: PathBuf,
     pub seed: u64,
     pub session_count: usize,
@@ -197,6 +198,10 @@ struct TemporaryRoot {
 impl TemporaryRoot {
     fn create(seed: u64) -> io::Result<Self> {
         let parent = env::temp_dir();
+        Self::create_in(&parent, seed)
+    }
+
+    fn create_in(parent: &Path, seed: u64) -> io::Result<Self> {
         for attempt in 0..64_u8 {
             let path = parent.join(format!(
                 "quirl-simulation-{}-{seed}-{attempt}",
@@ -243,8 +248,11 @@ pub fn run(options: SimulationOptions) -> Result<SimulationResult, Box<dyn Error
     validate_options(&options)?;
     let search_path = env::var_os("PATH")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "PATH is not configured"))?;
-    let bash = interpreter_identity("bash", &search_path, &options.workspace_root)?;
-    let zsh = interpreter_identity("zsh", &search_path, &options.workspace_root)?;
+    // Identity probes use the same isolated root as generated sessions. Passing
+    // the repository here would let configure_command create a repo-root tmp/.
+    let temporary = TemporaryRoot::create(options.seed)?;
+    let bash = interpreter_identity("bash", &search_path, &temporary.path)?;
+    let zsh = interpreter_identity("zsh", &search_path, &temporary.path)?;
     let quirl = options.quirl.canonicalize().map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -255,7 +263,6 @@ pub fn run(options: SimulationOptions) -> Result<SimulationResult, Box<dyn Error
         )
     })?;
     let run_directory = create_run_directory(&options)?;
-    let temporary = TemporaryRoot::create(options.seed)?;
     let report_path = run_directory.join("report.jsonl");
     let report_file = OpenOptions::new()
         .write(true)
@@ -1047,6 +1054,20 @@ fn exit_status_code(status: ExitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEED: AtomicU64 = AtomicU64::new(10_000);
+
+    fn test_seed() -> u64 {
+        TEST_SEED.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn fail_with_temporary_root(parent: &Path, observed_path: &mut PathBuf) -> io::Result<()> {
+        let temporary = TemporaryRoot::create_in(parent, test_seed())?;
+        observed_path.clone_from(&temporary.path);
+        fs::write(temporary.path.join("partial"), "created before failure")?;
+        Err(io::Error::other("induced simulation failure"))
+    }
 
     #[cfg(unix)]
     fn adversarial_shell(script: &str) -> Command {
@@ -1084,6 +1105,29 @@ mod tests {
             assert!(session.source.contains("cd workspace"));
             assert!(session.source.contains("export QUIRL_SIM_VALUE="));
         }
+    }
+
+    #[test]
+    fn temporary_root_removes_artifacts_after_success() {
+        let parent = TemporaryRoot::create(test_seed()).unwrap();
+        let temporary_path = {
+            let temporary = TemporaryRoot::create_in(&parent.path, test_seed()).unwrap();
+            fs::write(temporary.path.join("complete"), "complete").unwrap();
+            temporary.path.clone()
+        };
+
+        assert!(!temporary_path.exists());
+    }
+
+    #[test]
+    fn temporary_root_removes_artifacts_after_failure() {
+        let parent = TemporaryRoot::create(test_seed()).unwrap();
+        let mut temporary_path = PathBuf::new();
+
+        let error = fail_with_temporary_root(&parent.path, &mut temporary_path).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(!temporary_path.exists());
     }
 
     #[test]
