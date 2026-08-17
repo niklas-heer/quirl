@@ -158,6 +158,9 @@ fn task_test(root: &Path, seed: u64, cases: usize) -> Result<(), Box<dyn Error>>
         .run()?;
     #[cfg(unix)]
     {
+        cmd!(sh, "python3 scripts/test_pty_harness.py")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .run()?;
         cmd!(sh, "cargo build -p quirl-cli")
             .env("QUIRL_TEST_SEED", &seed)
             .env("QUIRL_TEST_CASES", &cases)

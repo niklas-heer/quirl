@@ -4,26 +4,22 @@
 from __future__ import annotations
 
 import argparse
-import errno
-import fcntl
 import os
 from pathlib import Path
-import pty
-import select
-import signal
 import shutil
-import struct
 import sys
 import tempfile
 import termios
 import time
 
+from pty_harness import DEFAULT_TIMEOUT_SECONDS, Key, PtySession
+
 
 STARTUP_MARKER = b"Tab complete"
-TIMEOUT = 5.0
+TIMEOUT = DEFAULT_TIMEOUT_SECONDS
 
 
-class Session:
+class Session(PtySession):
     def __init__(
         self,
         binary: Path,
@@ -37,6 +33,8 @@ class Session:
         no_color: bool = False,
         catalog_gate: bool = False,
         catalog_failure: bool = False,
+        rows: int = 30,
+        columns: int = 120,
     ) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="quirl-pty-")
         private = Path(self.temp.name)
@@ -91,139 +89,34 @@ return quirl.config {{
         if no_color:
             environment["NO_COLOR"] = "1"
 
-        pid, master = pty.fork()
-        if pid == 0:
-            os.chdir(private)
-            os.environ.clear()
-            os.environ.update(environment)
-            if stderr_path is not None:
-                error_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                os.dup2(error_fd, 2)
-                os.close(error_fd)
-            if shell is not None:
-                arguments = (
-                    [shell.name, "-f"]
-                    if shell.name == "zsh"
-                    else [shell.name, "--noprofile", "--norc", "-i"]
-                )
-                os.execv(str(shell), arguments)
-            os.execv(str(binary), [str(binary)])
-            raise AssertionError("exec returned")
-
-        self.pid = pid
-        self.master = master
         self.private = private
         self.binary = binary
         self.root = root
-        self.output = bytearray()
         self.shell = shell is not None
-        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
-        flags = fcntl.fcntl(master, fcntl.F_GETFL)
-        fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        if shell is None:
+            arguments = [str(binary)]
+        elif shell.name == "zsh":
+            arguments = [str(shell), "-f"]
+        else:
+            arguments = [str(shell), "--noprofile", "--norc", "-i"]
+        try:
+            super().__init__(
+                arguments,
+                cwd=private,
+                environment=environment,
+                rows=rows,
+                columns=columns,
+                stderr_path=stderr_path,
+            )
+        except BaseException:
+            self.temp.cleanup()
+            raise
 
     def close(self) -> None:
         try:
-            foreground_group = os.tcgetpgrp(self.master)
-        except OSError:
-            foreground_group = -1
-        if foreground_group > 0 and foreground_group != os.getpgrp():
-            try:
-                os.killpg(foreground_group, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        if self.pid > 0:
-            try:
-                os.killpg(self.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        try:
-            os.close(self.master)
-        except OSError:
-            pass
-        if self.pid > 0:
-            try:
-                os.kill(self.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(self.pid, 0)
-            except ChildProcessError:
-                pass
-        self.temp.cleanup()
-
-    def send(self, data: bytes) -> None:
-        offset = 0
-        deadline = time.monotonic() + TIMEOUT
-        while offset < len(data):
-            try:
-                written = os.write(self.master, data[offset:])
-            except OSError as error:
-                if error.errno != errno.EAGAIN:
-                    raise
-                if time.monotonic() >= deadline:
-                    raise AssertionError("timed out writing PTY input") from error
-                select.select([], [self.master], [], 0.05)
-                continue
-            if written == 0:
-                raise AssertionError("PTY input closed during write")
-            offset += written
-
-    def type(self, text: str) -> None:
-        self.send(text.encode("utf-8"))
-
-    def resize(self, rows: int, columns: int) -> None:
-        fcntl.ioctl(
-            self.master,
-            termios.TIOCSWINSZ,
-            struct.pack("HHHH", rows, columns, 0, 0),
-        )
-
-    def read(self, duration: float = 0.15) -> bytes:
-        deadline = time.monotonic() + duration
-        chunk = bytearray()
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([self.master], [], [], min(0.05, deadline - time.monotonic()))
-            if not ready:
-                continue
-            try:
-                data = os.read(self.master, 65536)
-            except OSError as error:
-                if error.errno in (errno.EAGAIN, errno.EIO):
-                    continue
-                raise
-            if not data:
-                break
-            # Ratatui's inline viewport asks the terminal for its current cursor
-            # position during initialization. A bare PTY has no emulator to
-            # answer the CPR query, so provide the same response a terminal at
-            # the first row and column would send.
-            for _ in range(data.count(b"\x1b[6n")):
-                os.write(self.master, b"\x1b[1;1R")
-            chunk.extend(data)
-            self.output.extend(data)
-        return bytes(chunk)
-
-    def wait_for(self, marker: bytes, timeout: float = TIMEOUT) -> bytes:
-        start = len(self.output)
-        deadline = time.monotonic() + timeout
-        while marker not in self.output[start:] and time.monotonic() < deadline:
-            self.read(0.1)
-        observed = bytes(self.output[start:])
-        if marker not in observed:
-            raise AssertionError(
-                f"timed out waiting for {marker!r}; tail={observed[-1000:]!r}"
-            )
-        return observed
-
-    def wait_exit(self, timeout: float = TIMEOUT) -> int:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            self.read(0.05)
-            pid, status = os.waitpid(self.pid, os.WNOHANG)
-            if pid == self.pid:
-                self.pid = -1
-                return os.waitstatus_to_exitcode(status)
-        raise AssertionError("Quirl did not exit")
+            super().close()
+        finally:
+            self.temp.cleanup()
 
 
 def enter_and_wait(session: Session, command: str, marker: bytes) -> bytes:
@@ -272,23 +165,22 @@ def check_rich_editing(binary: Path, root: Path) -> None:
         enter_and_wait(session, "/usr/bin/printf AFTER_CTRLC", b"AFTER_CTRLC")
 
         # Alt-M is encoded as Escape followed by `m` in a legacy PTY. The rich
-        # surface must repaint in place, preserve the active edit buffer, and
-        # avoid committing one feedback line to scrollback per toggle.
-        session.type("/usr/bin/printf MODE_BUFFER_OK")
-        session.send(b"\x1bm")
-        toggled_to_data = session.wait_for(b"data")
-        if b"Alt-M mode" not in toggled_to_data or b"data" not in toggled_to_data:
-            raise AssertionError("Alt-M did not repaint the rich data-mode status")
-        if b"typed values and data pipelines" in toggled_to_data:
-            raise AssertionError("Alt-M committed rich mode feedback to scrollback")
-        session.send(b"\x1bm")
-        toggled_to_command = session.wait_for(b"command")
-        if b"Alt-M mode" not in toggled_to_command or b"command" not in toggled_to_command:
-            raise AssertionError("Alt-M did not repaint the rich command-mode status")
-        if b"processes and byte pipelines" in toggled_to_command:
-            raise AssertionError("Alt-M committed rich mode feedback to scrollback")
-        session.send(b"\r")
-        session.wait_for(b"MODE_BUFFER_OK")
+        # surface changes mode inside its owned frame, so observe visible state
+        # rather than waiting for a feedback line in scrollback.
+        session.send(Key.ALT_M)
+        session.wait_for_screen(
+            lambda screen: any(
+                line.startswith("data | Alt-M mode") for line in screen.lines()
+            ),
+            "rich data-mode status",
+        )
+        session.send(Key.ALT_M)
+        session.wait_for_screen(
+            lambda screen: any(
+                line.startswith("command | Alt-M mode") for line in screen.lines()
+            ),
+            "rich command-mode status",
+        )
 
         session.type("/usr/bin/printf 'MULTI_ONE")
         session.send(b"\r")
@@ -309,6 +201,89 @@ def check_rich_editing(binary: Path, root: Path) -> None:
         status = session.wait_exit()
         if status != 0:
             raise AssertionError(f"Ctrl-D exited with status {status}")
+    finally:
+        session.close()
+
+
+def check_mode_switch_and_palette_screen(binary: Path, root: Path) -> None:
+    """Prove Alt-M and Ctrl-K through the modeled visible terminal state.
+
+    Failure model and invariants: every wait is deadline-bounded by ``Session``;
+    the raw transcript is byte-bounded; and ``finally`` always kills and reaps
+    the foreground/session process groups. Alt-M must retain the editor buffer
+    and redraw inside the owned frame without feedback scrollback. Ctrl-K must
+    place its status on the physical bottom row, and dismissal must erase every
+    expanded palette cell while restoring the three-row prompt at the bottom.
+    """
+    session = Session(binary, root, rows=18, columns=78)
+    try:
+        session.wait_for(STARTUP_MARKER)
+        if not session.screen.bottom_line().startswith("command | Alt-M mode"):
+            raise AssertionError(
+                "initial rich status was not anchored at the terminal bottom; "
+                f"screen=\n{session.screen.text()}"
+            )
+
+        session.type("echo MODE_BUFFER_RETAINED")
+        session.wait_for_screen_text("MODE_BUFFER_RETAINED")
+        for expected_mode, expected_indicator in [
+            ("data", "D echo MODE_BUFFER_RETAINED"),
+            ("command", "> echo MODE_BUFFER_RETAINED"),
+            ("data", "D echo MODE_BUFFER_RETAINED"),
+        ]:
+            output_start = len(session.output)
+            session.send(Key.ALT_M)
+            session.wait_for_screen(
+                lambda screen, mode=expected_mode: screen.bottom_line().startswith(
+                    f"{mode} | Alt-M mode"
+                ),
+                f"bottom-anchored {expected_mode} mode frame",
+            )
+            emitted = bytes(session.output[output_start:])
+            if b"mode:" in emitted or b"mode ->" in emitted:
+                raise AssertionError(
+                    "Alt-M emitted mode feedback into scrollback instead of repainting "
+                    f"the owned frame; output={emitted!r}"
+                )
+            if expected_indicator not in session.screen.text():
+                raise AssertionError(
+                    "Alt-M discarded or failed to repaint the active editor buffer; "
+                    f"expected={expected_indicator!r} screen=\n{session.screen.text()}"
+                )
+
+        session.send(Key.CTRL_K)
+        session.wait_for_screen(
+            lambda screen: screen.bottom_line().startswith("data |")
+            and "results (picker)" in screen.bottom_line()
+            and "picker" in screen.text(),
+            "bottom-anchored Ctrl-K palette",
+        )
+        if "git status" not in session.screen.text():
+            raise AssertionError(
+                "Ctrl-K palette did not render catalog commands; "
+                f"screen=\n{session.screen.text()}"
+            )
+
+        session.send(Key.ESCAPE)
+        session.wait_for_screen(
+            lambda screen: screen.bottom_line().startswith("data | Alt-M mode")
+            and "picker" not in screen.text()
+            and "results (picker)" not in screen.text(),
+            "compact prompt after palette dismissal",
+        )
+        compact_rows = session.screen.lines()[-3:]
+        if "MODE_BUFFER_RETAINED" not in compact_rows[1]:
+            raise AssertionError(
+                "palette dismissal did not restore the editor on the bottom three rows; "
+                f"bottom_rows={compact_rows!r}"
+            )
+
+        session.send(Key.CTRL_U)
+        session.read(0.1)
+        session.send(Key.CTRL_D)
+        status = session.wait_exit()
+        if status != 0:
+            raise AssertionError(f"screen-state session exited with status {status}")
     finally:
         session.close()
 
@@ -451,8 +426,13 @@ def check_interactive_runtime(binary: Path, root: Path) -> None:
 
         # A successful typed stream becomes a bounded cached data source without
         # rerunning the expression when Alt-D opens the data picker.
-        session.send(b"\x1bm")
-        session.wait_for(b"data")
+        session.send(Key.ALT_M)
+        session.wait_for_screen(
+            lambda screen: any(
+                line.startswith("data | Alt-M mode") for line in screen.lines()
+            ),
+            "data mode before typed runtime checks",
+        )
         enter_and_wait(session, "[1,2]", STARTUP_MARKER)
         session.send(b"\x1bd")
         session.wait_for(b"cached typed result")
@@ -476,8 +456,13 @@ def check_interactive_runtime(binary: Path, root: Path) -> None:
         session.wait_for(b"cancelled")
         wait_for_prompt(session)
 
-        session.send(b"\x1bm")
-        session.wait_for(b"command")
+        session.send(Key.ALT_M)
+        session.wait_for_screen(
+            lambda screen: any(
+                line.startswith("command | Alt-M mode") for line in screen.lines()
+            ),
+            "command mode after typed runtime checks",
+        )
 
         # A Lua process callback narrows the shared plan deadline to the VM's
         # security budget. Expiry must reap the child and restore the real PTY
@@ -765,16 +750,9 @@ def check_no_color_preserves_semantic_hints(binary: Path, root: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("binary", nargs="?", default="target/debug/quirl")
-    args = parser.parse_args()
-    root = Path(__file__).resolve().parent.parent
-    binary = (root / args.binary).resolve() if not Path(args.binary).is_absolute() else Path(args.binary)
-    if not binary.is_file():
-        raise SystemExit(f"missing Quirl binary: {binary}; run cargo build -p quirl-cli")
-
     checks = [
         check_rich_editing,
+        check_mode_switch_and_palette_screen,
         check_deferred_catalog_admission,
         check_catalog_failure_restores_terminal,
         check_completion,
@@ -786,7 +764,32 @@ def main() -> None:
         check_fallbacks,
         check_no_color_preserves_semantic_hints,
     ]
-    for check in checks:
+    checks_by_name = {
+        check.__name__.removeprefix("check_").replace("_", "-"): check for check in checks
+    }
+    parser = argparse.ArgumentParser(
+        description="Run bounded end-to-end Quirl checks through a modeled Unix PTY"
+    )
+    parser.add_argument("binary", nargs="?", default="target/debug/quirl")
+    parser.add_argument(
+        "--check",
+        action="append",
+        choices=sorted(checks_by_name),
+        help="run only this named check; repeat to select more than one",
+    )
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent.parent
+    binary_argument = Path(args.binary)
+    binary = (
+        (root / binary_argument).resolve()
+        if not binary_argument.is_absolute()
+        else binary_argument
+    )
+    if not binary.is_file():
+        raise SystemExit(f"missing Quirl binary: {binary}; run cargo build -p quirl-cli")
+
+    selected = checks if args.check is None else [checks_by_name[name] for name in args.check]
+    for check in selected:
         check(binary, root)
         print(f"ok: {check.__name__}")
 

@@ -115,6 +115,27 @@ construction cleanup, foreground ownership, stopped-job and prompt termios
 restoration, dialect-island noninteraction, and rendering against the operating
 system.
 
+The PTY checks use `scripts/pty_harness.py`, a standard-library-only driver with
+a small VT screen model. It answers cursor-position queries from modeled screen
+state, so assertions can distinguish visible cells from stale bytes in the raw
+transcript. Each session limits retained output to 16 MiB, each read/write/wait
+to five seconds by default, the screen to 262,144 cells, and forced child
+cleanup to two seconds. Session teardown kills both the foreground process
+group and the PTY session group before reaping the leader.
+
+Run the harness model tests and one focused end-to-end interaction with:
+
+```console
+python3 scripts/test_pty_harness.py
+cargo build -p quirl-cli
+python3 scripts/check-rich-pty.py target/debug/quirl --check mode-switch-and-palette-screen
+```
+
+The focused interaction sends the legacy-terminal encodings for Alt-M and
+Ctrl-K exactly. It asserts that repeated mode switches retain the edit buffer
+without feedback scrollback, the palette status is on the physical bottom row,
+and dismissal erases the expanded viewport before restoring the compact prompt.
+
 ## Adding coverage
 
 - Add a frozen fixture for a discovered regression before fixing it.
