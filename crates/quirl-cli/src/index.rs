@@ -1,4 +1,7 @@
-use crate::intelligence;
+use crate::{
+    coordination::{self, CoordinationGuard, CoordinationKind, CoordinationWait},
+    intelligence,
+};
 use clap::{ArgAction, Subcommand, ValueEnum};
 use quirl_catalog::{
     Catalog, CommandSpec, Confidence, Effect, ImportDiagnostic, ImportReport, IoContract,
@@ -50,7 +53,6 @@ const DISCOVERY_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const DISCOVERY_DEADLINE: Duration = Duration::from_millis(750);
 const BACKGROUND_DISCOVERY_DEADLINE: Duration = Duration::from_secs(30);
 static NEXT_INDEX_TEMPORARY: AtomicU64 = AtomicU64::new(0);
-static DATABASE_PUBLICATION: Mutex<()> = Mutex::new(());
 
 /// A cancellable, bounded background refresh owned by one interactive session.
 /// Dropping the guard wakes and joins its single worker before terminal shutdown
@@ -515,6 +517,7 @@ pub(crate) fn open_default_search_session() -> Result<intelligence::SearchSessio
 /// replace the database only after every vector passes validation.
 pub(crate) fn build_default_embeddings() -> Result<intelligence::EmbeddingReport, ShellError> {
     let path = default_database_path()?;
+    let _coordination = acquire_catalog_explicit(&path)?;
     let model_path = intelligence::default_model_path().ok_or_else(|| {
         ShellError::new(
             ErrorCode::InvalidArgument,
@@ -525,8 +528,18 @@ pub(crate) fn build_default_embeddings() -> Result<intelligence::EmbeddingReport
     let bytes = read_index(&path)
         .map_err(|error| error.with_help("Run `quirl index build` before indexing embeddings"))?;
     let (encoded, report) = intelligence::build_embeddings(&bytes, &path, &model_path)?;
-    write_index_bytes_atomically(&path, &encoded, intelligence::DATABASE_BYTES_MAX)?;
+    write_index_bytes_atomically_unlocked(&path, &encoded, intelligence::DATABASE_BYTES_MAX)?;
     Ok(report)
+}
+
+/// Result of one nonblocking automatic embedding attempt.
+pub(crate) enum AutomaticEmbeddingOutcome {
+    /// A complete embedding image replaced the matching catalog generation.
+    Published(intelligence::EmbeddingReport),
+    /// The database became current before this worker entered its critical section.
+    Current,
+    /// Another owner or a superseding request made this generation unnecessary.
+    Deferred,
 }
 
 /// Build embeddings for one requested catalog generation and publish them only
@@ -535,8 +548,12 @@ pub(crate) fn build_default_embeddings_if_current(
     cancelled: &AtomicBool,
     requested_generation: &AtomicU64,
     generation: u64,
-) -> Result<Option<intelligence::EmbeddingReport>, ShellError> {
+) -> Result<AutomaticEmbeddingOutcome, ShellError> {
     let path = default_database_path()?;
+    let Some(_coordination) = acquire_catalog_coordination(&path, CoordinationWait::Background)?
+    else {
+        return Ok(AutomaticEmbeddingOutcome::Deferred);
+    };
     let model_path = intelligence::default_model_path().ok_or_else(|| {
         ShellError::new(
             ErrorCode::InvalidArgument,
@@ -547,6 +564,9 @@ pub(crate) fn build_default_embeddings_if_current(
     let source = read_index(&path).map_err(|error| {
         error.with_help("Wait for command discovery before indexing embeddings")
     })?;
+    if intelligence::embeddings_are_current(&source, &path)? {
+        return Ok(AutomaticEmbeddingOutcome::Current);
+    }
     let (encoded, report) = intelligence::build_embeddings_cancellable(
         &source,
         &path,
@@ -573,9 +593,9 @@ pub(crate) fn build_default_embeddings_if_current(
         requested_generation,
         generation,
     )? {
-        return Ok(None);
+        return Ok(AutomaticEmbeddingOutcome::Deferred);
     }
-    Ok(Some(report))
+    Ok(AutomaticEmbeddingOutcome::Published(report))
 }
 
 fn publish_embeddings_if_current(
@@ -591,13 +611,6 @@ fn publish_embeddings_if_current(
     {
         return Ok(false);
     }
-    let _publication = DATABASE_PUBLICATION.lock().map_err(|_| {
-        ShellError::new(
-            ErrorCode::Io,
-            "the command-database publication lock was poisoned",
-        )
-        .with_help("Restart Quirl before rebuilding local command intelligence")
-    })?;
     let current = read_index(path)?;
     if current != source
         || cancelled.load(Ordering::Acquire)
@@ -625,13 +638,7 @@ pub(crate) fn default_embeddings_are_current() -> Result<bool, ShellError> {
 #[cfg(debug_assertions)]
 pub(crate) fn mark_default_embeddings_current_for_test() -> Result<(), ShellError> {
     let path = default_database_path()?;
-    let _publication = DATABASE_PUBLICATION.lock().map_err(|_| {
-        ShellError::new(
-            ErrorCode::Io,
-            "the command-database publication lock was poisoned",
-        )
-        .with_help("Restart Quirl before updating the test command database")
-    })?;
+    let _coordination = acquire_catalog_explicit(&path)?;
     let source = read_index(&path)?;
     let encoded = intelligence::mark_embeddings_current_for_test(&source, &path)?;
     write_index_bytes_atomically_unlocked(&path, &encoded, intelligence::DATABASE_BYTES_MAX)
@@ -732,20 +739,12 @@ fn initialize_interactive_catalog_with_deadline(
 }
 
 fn ensure_builtin_database(path: &Path) -> Result<bool, ShellError> {
+    let Some(_coordination) = acquire_catalog_coordination(path, CoordinationWait::Background)?
+    else {
+        return Ok(false);
+    };
     let encoded = intelligence::encode_database(&Catalog::builtin(), None)?;
-    let _publication = DATABASE_PUBLICATION.lock().map_err(|_| {
-        ShellError::new(
-            ErrorCode::Io,
-            "the command-database publication lock was poisoned",
-        )
-        .with_help("Restart Quirl before repairing the local command database")
-    })?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    if let Some(parent) = parent {
-        create_index_directories(parent)?;
-    }
+    let parent = index_parent(path);
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             validate_index_reader_metadata(
@@ -888,6 +887,11 @@ fn refresh_catalog_cache(
     deadline: RefreshDeadline,
     cancelled: &AtomicBool,
 ) -> Result<bool, ShellError> {
+    let Some(_coordination) =
+        acquire_catalog_coordination(&config.index_path, CoordinationWait::Background)?
+    else {
+        return Ok(false);
+    };
     let mut budget = IndexBuildBudget::new(IndexBounds::PRODUCTION);
     budget.roots = config
         .path_roots
@@ -926,7 +930,7 @@ fn refresh_catalog_cache(
         sources: snapshot.sources,
         diagnostics,
     };
-    write_catalog_atomically(&config.index_path, &catalog, Some(&state))?;
+    write_catalog_atomically_unlocked(&config.index_path, &catalog, Some(&state))?;
     Ok(true)
 }
 
@@ -1030,6 +1034,14 @@ fn build_index(
     output: Option<PathBuf>,
     format: IndexOutputFormat,
 ) -> Result<i32, ShellError> {
+    let output = output.or_else(default_index_path).ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::InvalidArgument,
+            "cannot determine a completion-index path",
+        )
+        .with_help("Pass an explicit destination with `quirl index build --output <path>`")
+    })?;
+    let _coordination = acquire_catalog_explicit(&output)?;
     let fish_roots = if fish_roots.is_empty() {
         default_fish_roots()
     } else {
@@ -1066,14 +1078,7 @@ fn build_index(
         &man_files,
         &mut budget,
     )?;
-    let output = output.or_else(default_index_path).ok_or_else(|| {
-        ShellError::new(
-            ErrorCode::InvalidArgument,
-            "cannot determine a completion-index path",
-        )
-        .with_help("Pass an explicit destination with `quirl index build --output <path>`")
-    })?;
-    write_catalog_atomically(&output, &catalog, None)?;
+    write_catalog_atomically_unlocked(&output, &catalog, None)?;
     let report = BuildReport {
         index: output,
         source_files: fish_files.len()
@@ -2326,7 +2331,17 @@ fn decode_catalog(source: &[u8], path: &Path) -> Result<Catalog, ShellError> {
     intelligence::decode_database(source, path).map(|(catalog, _)| catalog)
 }
 
+#[cfg(test)]
 fn write_catalog_atomically(
+    path: &Path,
+    catalog: &Catalog,
+    discovery_state: Option<&DiscoveryState>,
+) -> Result<(), ShellError> {
+    let _coordination = acquire_catalog_explicit(path)?;
+    write_catalog_atomically_unlocked(path, catalog, discovery_state)
+}
+
+fn write_catalog_atomically_unlocked(
     path: &Path,
     catalog: &Catalog,
     discovery_state: Option<&DiscoveryState>,
@@ -2336,7 +2351,7 @@ fn write_catalog_atomically(
         .transpose()
         .map_err(json_error)?;
     let encoded = intelligence::encode_database(catalog, state_json.as_deref())?;
-    write_index_bytes_atomically(path, &encoded, intelligence::DATABASE_BYTES_MAX)
+    write_index_bytes_atomically_unlocked(path, &encoded, intelligence::DATABASE_BYTES_MAX)
 }
 
 fn encode_catalog(catalog: &Catalog) -> Result<Vec<u8>, ShellError> {
@@ -2362,19 +2377,28 @@ fn encode_catalog(catalog: &Catalog) -> Result<Vec<u8>, ShellError> {
     Ok(encoded)
 }
 
-fn write_index_bytes_atomically(
-    path: &Path,
-    encoded: &[u8],
-    bytes_max: usize,
-) -> Result<(), ShellError> {
-    let _publication = DATABASE_PUBLICATION.lock().map_err(|_| {
+fn acquire_catalog_explicit(path: &Path) -> Result<CoordinationGuard, ShellError> {
+    let acquired = acquire_catalog_coordination(path, CoordinationWait::Explicit)?;
+    acquired.ok_or_else(|| {
         ShellError::new(
-            ErrorCode::Io,
-            "the command-database publication lock was poisoned",
+            ErrorCode::ResourceLimit,
+            "the command-database coordination lock remained busy",
         )
-        .with_help("Restart Quirl before updating the local command database")
-    })?;
-    write_index_bytes_atomically_unlocked(path, encoded, bytes_max)
+        .with_help("Wait for the other Quirl instance to finish and retry")
+    })
+}
+
+fn acquire_catalog_coordination(
+    path: &Path,
+    wait: CoordinationWait,
+) -> Result<Option<CoordinationGuard>, ShellError> {
+    create_index_directories(index_parent(path).unwrap_or_else(|| Path::new(".")))?;
+    coordination::acquire(path, CoordinationKind::Catalog, wait)
+}
+
+fn index_parent(path: &Path) -> Option<&Path> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
 }
 
 fn write_index_bytes_atomically_unlocked(
@@ -2802,6 +2826,26 @@ mod tests {
     }
 
     #[test]
+    fn contended_background_refresh_defers_without_work_then_progresses() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        write_executable(&config.path_roots[0].join("demo"));
+        let guard = acquire_catalog_coordination(&config.index_path, CoordinationWait::Background)
+            .unwrap()
+            .unwrap();
+        let started = Instant::now();
+
+        assert!(!refresh(&config).unwrap());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(!config.index_path.exists());
+
+        drop(guard);
+        assert!(refresh(&config).unwrap());
+        assert!(load_catalog_at(&config.index_path).find("demo").is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn file_imports_merge_fish_and_bash_into_one_catalog() {
         let directory = temporary_directory();
         let fish = directory.join("demo.fish");
@@ -2902,7 +2946,10 @@ mod tests {
         write_catalog_atomically(&path, &catalog, None).unwrap();
         let source = fs::read(&path).unwrap();
         assert_eq!(decode_catalog(&source, &path).unwrap(), catalog);
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        // The stable sibling lock is intentionally retained so future writers
+        // keep coordinating on the same file identity after data replacement.
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        assert!(directory.join(".catalog.sqlite3.quirl-lock").is_file());
         #[cfg(unix)]
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         fs::remove_dir_all(directory).unwrap();

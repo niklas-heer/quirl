@@ -6,6 +6,7 @@ mod ai_bootstrap;
 mod author;
 mod bounded_file;
 mod config;
+mod coordination;
 mod extension_scheduler;
 mod extensions;
 mod history;

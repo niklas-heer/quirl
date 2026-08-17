@@ -1,6 +1,9 @@
 //! Bounded background installation and indexing for local command intelligence.
 
-use crate::{index, intelligence};
+use crate::{
+    coordination::{self, CoordinationKind, CoordinationWait},
+    index, intelligence,
+};
 use quirl_core::{ErrorCode, ShellError, escape_terminal_line};
 use quirl_ui::{
     ACTIVITY_MESSAGE_BYTES_MAX, InteractiveActivityProvider, InteractiveActivitySnapshot,
@@ -46,6 +49,15 @@ struct AssetSpec {
     name: &'static str,
     bytes: u64,
     sha256: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct ModelInstallOptions<'a> {
+    assets: &'a [AssetSpec],
+    base_url: &'a str,
+    revision: &'a str,
+    recover_corrupt: bool,
+    wait: CoordinationWait,
 }
 
 const ASSETS: [AssetSpec; 3] = [
@@ -467,9 +479,16 @@ fn run_generation(shared: &Shared, fetcher: &UreqFetcher, generation: u64) -> bo
     };
     if validate_pinned_model(&model_path).is_err() {
         shared.publish("AI: downloading potion-base-8M (0%)".to_owned());
-        if let Err(error) = install_model(fetcher, &model_path, shared) {
-            shared.publish(format!("AI download failed: {}", error.message));
-            return true;
+        match install_model(fetcher, &model_path, shared) {
+            Ok(true) => {}
+            Ok(false) => {
+                shared.publish("AI setup deferred: another Quirl instance is active".to_owned());
+                return true;
+            }
+            Err(error) => {
+                shared.publish(format!("AI download failed: {}", error.message));
+                return true;
+            }
         }
     }
     if shared.cancelled.load(Ordering::Acquire) {
@@ -485,7 +504,7 @@ fn run_generation(shared: &Shared, fetcher: &UreqFetcher, generation: u64) -> bo
         &shared.requested_generation,
         generation,
     ) {
-        Ok(Some(report)) => {
+        Ok(index::AutomaticEmbeddingOutcome::Published(report)) => {
             shared.publish(format!(
                 "AI ready: {} commands and options",
                 report.documents
@@ -493,7 +512,16 @@ fn run_generation(shared: &Shared, fetcher: &UreqFetcher, generation: u64) -> bo
             shared.clear();
             true
         }
-        Ok(None) => generation_was_superseded_or_cancelled(shared, generation),
+        Ok(index::AutomaticEmbeddingOutcome::Current) => {
+            shared.clear();
+            true
+        }
+        Ok(index::AutomaticEmbeddingOutcome::Deferred) => {
+            if !generation_was_superseded_or_cancelled(shared, generation) {
+                shared.publish("AI index deferred: another Quirl instance is active".to_owned());
+            }
+            true
+        }
         Err(_) if generation_was_superseded_or_cancelled(shared, generation) => true,
         Err(error) => {
             shared.publish(format!("AI index failed: {}", error.message));
@@ -582,15 +610,18 @@ fn install_model(
     fetcher: &dyn Fetcher,
     destination: &Path,
     shared: &Shared,
-) -> Result<(), ShellError> {
+) -> Result<bool, ShellError> {
     install_model_with_assets(
         fetcher,
         destination,
         shared,
-        &ASSETS,
-        MODEL_BASE_URL,
-        MODEL_REVISION,
-        std::env::var_os("QUIRL_MODEL_PATH").is_none(),
+        ModelInstallOptions {
+            assets: &ASSETS,
+            base_url: MODEL_BASE_URL,
+            revision: MODEL_REVISION,
+            recover_corrupt: std::env::var_os("QUIRL_MODEL_PATH").is_none(),
+            wait: CoordinationWait::Background,
+        },
     )
 }
 
@@ -598,18 +629,8 @@ fn install_model_with_assets(
     fetcher: &dyn Fetcher,
     destination: &Path,
     shared: &Shared,
-    assets: &[AssetSpec],
-    base_url: &str,
-    revision: &str,
-    recover_corrupt: bool,
-) -> Result<(), ShellError> {
-    if path_entry_exists(destination)? {
-        match validate_model_assets(destination, assets) {
-            Ok(()) => return Ok(()),
-            Err(error) if !recover_corrupt => return Err(error),
-            Err(_) => {}
-        }
-    }
+    options: ModelInstallOptions<'_>,
+) -> Result<bool, ShellError> {
     let parent = destination.parent().ok_or_else(|| {
         ShellError::new(
             ErrorCode::InvalidArgument,
@@ -618,14 +639,26 @@ fn install_model_with_assets(
         .with_help("Set QUIRL_MODEL_PATH to a nested directory")
     })?;
     create_private_directories(parent)?;
+    let Some(_coordination) =
+        coordination::acquire(destination, CoordinationKind::Model, options.wait)?
+    else {
+        return Ok(false);
+    };
+    if path_entry_exists(destination)? {
+        match validate_model_assets(destination, options.assets) {
+            Ok(()) => return Ok(true),
+            Err(error) if !options.recover_corrupt => return Err(error),
+            Err(_) => {}
+        }
+    }
     if path_entry_exists(destination)? {
         quarantine_corrupt_model(destination, parent)?;
     }
-    let mut temporary = ModelTemporary::create(parent, assets)?;
-    let total_bytes = assets.iter().map(|asset| asset.bytes).sum::<u64>();
+    let mut temporary = ModelTemporary::create(parent, options.assets)?;
+    let total_bytes = options.assets.iter().map(|asset| asset.bytes).sum::<u64>();
     let mut completed_bytes = 0_u64;
-    for &asset in assets {
-        let url = format!("{base_url}/{revision}/{}", asset.name);
+    for &asset in options.assets {
+        let url = format!("{}/{}/{}", options.base_url, options.revision, asset.name);
         let mut reader = fetcher.open(&url, Arc::clone(&shared.cancelled))?;
         let path = temporary.path.join(asset.name);
         download_asset(reader.as_mut(), &path, asset, &shared.cancelled, |bytes| {
@@ -635,12 +668,12 @@ fn install_model_with_assets(
         })?;
         completed_bytes = completed_bytes.saturating_add(asset.bytes);
     }
-    validate_model_assets(&temporary.path, assets)?;
+    validate_model_assets(&temporary.path, options.assets)?;
     fs::rename(&temporary.path, destination)
         .map_err(|error| model_io_error("install", destination, error))?;
     temporary.installed = true;
     index::sync_index_directory(parent)?;
-    Ok(())
+    Ok(true)
 }
 
 fn download_asset(
@@ -1000,7 +1033,10 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::{
         collections::VecDeque,
-        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
         time::Instant,
     };
 
@@ -1025,6 +1061,7 @@ mod tests {
     struct MockFetcher {
         bodies: Mutex<VecDeque<Vec<u8>>>,
         opens: AtomicUsize,
+        delay: Duration,
     }
 
     impl MockFetcher {
@@ -1032,6 +1069,15 @@ mod tests {
             Self {
                 bodies: Mutex::new(bodies.into_iter().collect()),
                 opens: AtomicUsize::new(0),
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn slow(bodies: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                bodies: Mutex::new(bodies.into_iter().collect()),
+                opens: AtomicUsize::new(0),
+                delay: Duration::from_millis(100),
             }
         }
     }
@@ -1043,6 +1089,7 @@ mod tests {
             _cancelled: Arc<AtomicBool>,
         ) -> Result<Box<dyn Read + Send>, ShellError> {
             self.opens.fetch_add(1, AtomicOrdering::Relaxed);
+            thread::sleep(self.delay);
             let body = self
                 .bodies
                 .lock()
@@ -1093,11 +1140,15 @@ mod tests {
             fetcher,
             destination,
             &shared,
-            &TEST_ASSETS,
-            "http://127.0.0.1",
-            "fixture",
-            recover_corrupt,
+            ModelInstallOptions {
+                assets: &TEST_ASSETS,
+                base_url: "http://127.0.0.1",
+                revision: "fixture",
+                recover_corrupt,
+                wait: CoordinationWait::Explicit,
+            },
         )
+        .map(|_| ())
     }
 
     fn valid_fetcher() -> MockFetcher {
@@ -1152,6 +1203,53 @@ mod tests {
         let error = install_fixture(&valid_fetcher(), &destination, true).unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert!(!destination.exists());
+        assert!(staging_entries(&directory.0).is_empty());
+        install_fixture(&valid_fetcher(), &destination, false).unwrap();
+        validate_model_assets(&destination, &TEST_ASSETS).unwrap();
+    }
+
+    #[test]
+    fn concurrent_installers_download_once_and_admit_the_published_model() {
+        let directory = TestDirectory::new("concurrent");
+        let destination = directory.0.join("model");
+        let fetcher = Arc::new(MockFetcher::slow([
+            b"abc".to_vec(),
+            b"defg".to_vec(),
+            b"hijkl".to_vec(),
+        ]));
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let destination = destination.clone();
+                let fetcher = Arc::clone(&fetcher);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let shared = Shared::new();
+                    barrier.wait();
+                    install_model_with_assets(
+                        fetcher.as_ref(),
+                        &destination,
+                        &shared,
+                        ModelInstallOptions {
+                            assets: &TEST_ASSETS,
+                            base_url: "http://127.0.0.1",
+                            revision: "fixture",
+                            recover_corrupt: false,
+                            wait: CoordinationWait::Background,
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(outcomes.contains(&true));
+        assert_eq!(fetcher.opens.load(AtomicOrdering::Relaxed), 3);
+        validate_model_assets(&destination, &TEST_ASSETS).unwrap();
         assert!(staging_entries(&directory.0).is_empty());
     }
 

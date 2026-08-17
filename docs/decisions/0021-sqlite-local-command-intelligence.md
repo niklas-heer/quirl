@@ -107,6 +107,38 @@ neither path executes one directly.
 
 ## Failure model and invariants
 
+- Catalog publication and model installation use separate, dedicated sibling
+  lock files whose names do not change when the SQLite file or model directory
+  is atomically replaced. Locking the replaceable data path is insufficient:
+  after rename, a future opener would name a different file identity and could
+  enter the same critical section.
+- A lock file is admitted as an unlinked regular file in an already admitted
+  private directory. Symlinks, hard links, special files, unsafe Unix write
+  permissions, and open or metadata failures are operating errors. Admission
+  validates both the pathname and opened handle, and validates again after the
+  lock is acquired. Unix uses no-follow opening and device/inode comparison;
+  Windows uses the portable `std::fs` checks inside the private namespace.
+- Lock acquisition only uses nonblocking `std::fs::File` attempts. Explicit
+  `quirl index build` and `quirl ai index` operations retry for a fixed count
+  with a fixed delay and then return `ResourceLimit`; interactive discovery,
+  download, and embedding workers make one attempt and defer immediately so a
+  second shell never adds lock latency to prompt or shutdown work.
+- Acquiring a lock after any possible contention grants permission to inspect,
+  not permission to act on an earlier observation. The winner rereads and
+  validates the catalog/model state under the lock. Automatic work skips a
+  now-current generation, while explicit work applies its requested rebuild to
+  the newly admitted state.
+- One process-local registry and the OS file lock cover same-process threads and
+  separately opened processes respectively. The critical section includes
+  SQLite encoding/embedding and publication, or model validation, quarantine,
+  download, verification, and installation, so at most one writer or downloader
+  performs that bounded work for a target at a time.
+- The lock is owned by an RAII guard. Every return, cancellation error, unwind,
+  and ordinary drop unlocks and closes it; process exit or crash closes the
+  descriptor and the operating system releases the lock. Lock files are kept,
+  not deleted, because unlinking would split future contenders across file
+  identities. Unix and Windows use the same standard-library API and never rely
+  on advisory locking of the replaceable data file.
 - A failed discovery or embedding build cannot replace the last complete
   database; transaction rollback and atomic replacement preserve it. When no
   complete database exists, failed discovery publishes an indexable builtin
@@ -122,7 +154,12 @@ neither path executes one directly.
   snapshots and rejects stale generations.
 - Partial, short, oversized, or hash-mismatched assets remain staging files and
   never become model input. Failure preserves lexical search and the last
-  complete database.
+  complete database. Normal errors and cancellation remove the current
+  process's authenticated staging directory through its RAII owner. A crash can
+  leave a uniquely named, bounded staging directory, but never publishes it;
+  later instances use a new bounded name and can progress. An invalid
+  auto-owned model is quarantined only while holding the model lock, and a
+  valid installed model is never quarantined or overwritten.
 - Initial indexing starts only after catalog admission. Refresh indexing is
   requested only after refreshed database publication; database publication is
   serialized and an embedding result revalidates its exact source bytes. Full
@@ -132,6 +169,10 @@ neither path executes one directly.
   bounded worker join.
 - No SQLite connection or model is shared across threads. Each bounded
   operation owns its connection and model lifetime.
+- SQLite catalog publication and embedding publication share the catalog lock.
+  Embedding writers reread the exact source bytes under that lock and recheck
+  cancellation plus request generation before atomic replacement, preventing a
+  stale embedding image from overwriting a newer catalog generation.
 - No AI output crosses into the execution planner without a separate explicit
   user action.
 
