@@ -112,29 +112,6 @@ Shows Quirl job ids, running/stopped/done state, and the original command.
 - Output: `Bytes`
 - Live streaming: `false`
 
-## `ls [path] [options]`
-
-List a directory as structured entries
-
-Quirl's bounded native ls renders terminal-safe plain rows for humans and preserves exact entry values in stable JSON. Sorting is deterministic; symlink targets are lazy and opt-in. `--max-entries` is a positive, explicit resource bound.
-
-- Input: `Nothing`
-- Output: `Stream<Entry>`
-- Live streaming: `true`
-
-Options:
-
-- `path` — Positional `path` declared by the builtin command signature.
-- `--format` — Choose terminal-safe plain output or stable JSON
-- `--max-entries` — Limit the listing to a positive number of entries
-- `--sort` — Choose the deterministic entry ordering
-- `--directories-first`, `--dirs-first` — Keep directories before other entry kinds
-- `--json` — Emit stable structured JSON
-- `--resolve-links` — Read symlink targets as an explicit metadata enrichment
-- `-a`, `--all` — Include hidden entries
-- `-l`, `--long` — Show size, kind, and modified time
-- `-r`, `--reverse` — Reverse the selected sort within directory/file groups
-
 ## `lua <expression>`
 
 Evaluate Lua without leaving command mode
@@ -495,6 +472,20 @@ Options:
 
 - `source` — Positional `source` declared by the builtin command signature.
 - `--format` — Choose a human table/plain renderer or the stable typed JSON envelope
+
+## `quirl data ls [path]`
+
+List a directory as typed entries in Data mode
+
+`ls` is a Data-mode source alias for `files`. It produces typed filesystem entries for structured transforms. Normal mode does not use this contract: an unqualified `ls` there resolves through PATH and uses the installed system command's contract.
+
+- Input: `Nothing`
+- Output: `Stream<Entry>`
+- Live streaming: `true`
+
+Options:
+
+- `path` — Positional `path` declared by the builtin command signature.
 
 ## `quirl describe <command> [--format text|json|markdown|html]`
 

@@ -114,7 +114,7 @@ Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unl
 
 | Mode | Contract | Examples | Explicit entry |
 | --- | --- | --- | --- |
-| Normal `❯` | Bytes and processes; compatibility grammar; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `cargo test --workspace`, `false \|\| echo recovered` | `mode normal` (legacy: `mode command`); force external with `^ls` |
+| Normal `❯` | Bytes and processes; commands resolve through the session `PATH`; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `ls -al`, `false \|\| echo recovered` | `mode normal` (legacy: `mode command`) |
 | Data `▦` | Unambiguous Quirl grammar; typed, lazy values; external programs require an adapter or `^command`; failures are `Result` values | `ps \| where cpu > 20 \| sort cpu desc`, `open users.json \| get users \| select name email` | `mode data`; one-shot `data { ... }` |
 | AI `✧` | Live command and option discovery over the SQLite catalog; the pinned potion-base-8M model downloads and indexes automatically after first paint. Enter inserts the selected suggestion into normal mode for review and never executes it directly. | `copy a directory while preserving permissions`, `find the option that follows symlinks` | `mode ai`; `Alt-Q i` selects it. `mode natural`, `mode nl`, and `mode human` remain aliases. |
 
@@ -354,28 +354,32 @@ match (http get "https://service.test/health") {
 
 ### The directory is data, not terminal paint
 
-Quirl’s `ls` is a built-in producer of `Entry` records. Rendering occurs only at the terminal boundary, so the same command can power a grid, table, JSON, filter, or interactive browser.
+Data mode’s `ls` is an alias for the built-in `files` producer of `Entry`
+records. Rendering occurs only at the terminal boundary, so the same typed
+source can power a grid, table, JSON, filter, or interactive browser. Normal
+mode never intercepts the name: `ls` there is the executable discovered through
+the session `PATH`, with that executable's flags and byte output.
 
 ```text
 type Entry = {
   name: String, path: Path,
-  type: file | dir | symlink | other,
+  kind: file | directory | symlink | other,
   size: Size, modified: DateTime?,
   hidden: Bool, readonly: Bool,
   target: Path?,
 }
 
 ▦ ls                         # adaptive human view
-▦ ls | where type == dir     # structured filter
-▦ ls --all --long            # familiar flags remain
+▦ ls | where kind == directory # structured filter
+▦ ls src | sort size desc    # typed path argument and transform
 ▦ ls | view tree             # renderer chosen explicitly
 ❯ ls | grep Cargo            # command mode emits compatible text
-❯ ^ls -la                    # bypass built-in; run system ls
+❯ ls -la                     # system flags pass through unchanged
 ```
 
 - **Bounded fast path:** names, kind, size, modified time, hidden state, and
   readonly state are collected non-recursively under an explicit entry limit;
-  symlink targets are read only with `--resolve-links`.
+  the data runtime owns that bound rather than presenting system `ls` flags.
 - **Stable values:** JSON and typed pipelines receive undecorated entry values;
   human output escapes terminal controls and stays one row per entry. The 0.1
   string ABI lossily represents non-UTF-8 Unix names and records that limit
@@ -781,7 +785,7 @@ completed human checklist, or fresh exact-artifact evidence.
 
 | Phase | Status | Deliverable |
 | --- | --- | --- |
-| 0 | **Complete** | Lua runtime and generated SDK views; config validation; atomic live config/plugin reload; applied editor/prompt/picker settings; live prompt/completion callbacks; resource budgets; command graph; mode switch; focused native data grammar; C0 execution; byte pipes; built-in `ls`; error spans. |
+| 0 | **Complete** | Lua runtime and generated SDK views; config validation; atomic live config/plugin reload; applied editor/prompt/picker settings; live prompt/completion callbacks; resource budgets; command graph; mode switch; focused native data grammar; C0 execution; byte pipes; Data-mode `ls`/`files` source; error spans. |
 | 1 | **Accepted · Preview** | Job control, redirects, indexed completions, Zsh/Bash/Fish and help/man ingestion, history/file/action picker, adaptive prompt, typed config forms with web/TUI views, C1 subset, structured core commands, plain fallbacks, Linux/macOS. |
 | 2 | **Complete · Scriptable** | Lua scripts and computed config, `quirl run`, formatter, annotation-aware checker, linter, tests, docs, language service, agent catalog/validation formats, package manifests, generated host API, deterministic tests. |
 | 3 | **Accepted · Platform** | Trusted-language and isolated-plugin contracts, permissions/lockfile, catalog/completion/UI/event extension points, Bash/Zsh runners, directory/process panels, bounded live sampling, portable process contracts, recovery. |
