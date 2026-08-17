@@ -4,6 +4,14 @@
 //! and isolated runtime boundaries. Filesystem mutation and process execution
 //! remain in `quirl-cli`; trusted Lua execution remains in `quirl-lua`.
 
+#![cfg_attr(
+    test,
+    allow(
+        dead_code_pub_in_binary,
+        reason = "the libtest harness is an executable, but these public items remain library API"
+    )
+)]
+
 use quirl_catalog::{
     ArgumentKind as CatalogArgumentKind, ArgumentSpec, Catalog, CommandSpec, Effect, IoContract,
     Provenance, ProvenanceInfo,

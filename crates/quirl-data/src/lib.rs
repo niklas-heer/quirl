@@ -5,6 +5,14 @@
 //! JSON, YAML, TOML, and bytes are explicit conversion boundaries; CSV, POSIX
 //! tar headers, and filesystem rows enter the evaluator as typed values.
 
+#![cfg_attr(
+    test,
+    allow(
+        dead_code_pub_in_binary,
+        reason = "the libtest harness is an executable, but these public items remain library API"
+    )
+)]
+
 pub mod syntax;
 mod value_boundary;
 

@@ -1,5 +1,13 @@
 //! Restricted Lua 5.4 runtime for Quirl configuration, scripts, and trusted plugins.
 
+#![cfg_attr(
+    test,
+    allow(
+        dead_code_pub_in_binary,
+        reason = "the libtest harness is an executable, but these public items remain library API"
+    )
+)]
+
 use mlua::{
     Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, MultiValue, RegistryKey, StdLib, Table,
     Value, VmState,

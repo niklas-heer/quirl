@@ -1,5 +1,13 @@
 //! Terminal interaction that treats completion and diagnostics as core behavior.
 
+#![cfg_attr(
+    test,
+    allow(
+        dead_code_pub_in_binary,
+        reason = "the libtest harness is an executable, but these public items remain library API"
+    )
+)]
+
 mod panel;
 mod surface;
 mod theme;

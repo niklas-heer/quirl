@@ -54,6 +54,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 
 [workspace.lints.rust]
+dead_code_pub_in_binary = "deny"
 missing_docs = "deny"
 
 [workspace.lints.rustdoc]

@@ -5,6 +5,14 @@
 //! catalog as the CLI. It speaks the LSP JSON-RPC subset over standard
 //! `Content-Length` framing and never evaluates document text.
 
+#![cfg_attr(
+    test,
+    allow(
+        dead_code_pub_in_binary,
+        reason = "the libtest harness is an executable, but these public items remain library API"
+    )
+)]
+
 use quirl_catalog::{Catalog, CommandSpec};
 use quirl_core::{ErrorCode, ShellError};
 use quirl_lua::{HOST_API, LuaRuntime};

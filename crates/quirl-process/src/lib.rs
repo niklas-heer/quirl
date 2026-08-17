@@ -1,5 +1,13 @@
 //! Native command graph execution and background-job lifecycle.
 
+#![cfg_attr(
+    test,
+    allow(
+        dead_code_pub_in_binary,
+        reason = "the libtest harness is an executable, but these public items remain library API"
+    )
+)]
+
 mod builtin;
 
 use std::{
@@ -6474,8 +6482,18 @@ mod backend_contract_tests {
             transition_job_state(JobStatus::Running, JobLifecycleEvent::Exit(7)).unwrap(),
             (JobStatus::Done, Some(7))
         );
-        assert!(transition_job_state(JobStatus::Done, JobLifecycleEvent::Continue).is_err());
-        assert!(transition_job_state(JobStatus::Stopped, JobLifecycleEvent::Stop).is_err());
+        std::assert_matches!(
+            transition_job_state(JobStatus::Done, JobLifecycleEvent::Continue),
+            Err(error) if error.code == ErrorCode::InvalidArgument
+                && error.message.contains("Done")
+                && !error.details.help.is_empty()
+        );
+        std::assert_matches!(
+            transition_job_state(JobStatus::Stopped, JobLifecycleEvent::Stop),
+            Err(error) if error.code == ErrorCode::InvalidArgument
+                && error.message.contains("Stopped")
+                && !error.details.help.is_empty()
+        );
     }
 
     #[test]

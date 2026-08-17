@@ -1890,16 +1890,15 @@ mod tests {
     fn parses_current_sources_bridges_transforms_and_spans() {
         let source = r#"^external printf "{\"ok\":true}" | from json | where ok == true | select ok | sort ok desc | take 1 | to json"#;
         let expression = parse(source).unwrap();
-        assert!(matches!(
-            expression.source.value,
-            DataSource::External { .. }
-        ));
+        std::assert_matches!(
+            &expression.source.value,
+            DataSource::External { command }
+                if command.value == r#"printf "{\"ok\":true}""#
+        );
         assert_eq!(expression.transforms.len(), 6);
         assert_eq!(expression.span, 0..source.len());
-        assert!(matches!(
-            expression.transforms[1].value,
-            DataTransform::Where(_)
-        ));
+        std::assert_matches!(&expression.transforms[1].value, DataTransform::Where(predicate)
+            if predicate.conditions.len() == 1);
     }
 
     #[test]

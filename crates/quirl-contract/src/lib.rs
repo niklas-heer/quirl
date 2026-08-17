@@ -4,6 +4,14 @@
 //! remains responsible for adapting the installed Lua `HOST_API` and for any
 //! filesystem writes requested by a command.
 
+#![cfg_attr(
+    test,
+    allow(
+        dead_code_pub_in_binary,
+        reason = "the libtest harness is an executable, but these public items remain library API"
+    )
+)]
+
 mod agent;
 mod package;
 
