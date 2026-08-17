@@ -17,6 +17,8 @@ pub const NATIVE_PIPELINES_MAX: usize = 256;
 pub const NATIVE_PIPELINE_STAGES_MAX: usize = 64;
 /// Maximum bytes written for one here-string, including its trailing newline.
 pub const HERE_STRING_BYTES_MAX: usize = 256 * 1024;
+/// Maximum bytes retained by expansion for one native pipeline.
+pub const EXPANSION_BYTES_MAX: usize = NATIVE_COMMAND_BYTES_MAX;
 /// Maximum bytes parsed by one arithmetic expansion.
 pub const ARITHMETIC_SOURCE_BYTES_MAX: usize = 16 * 1024;
 /// Maximum nested unary/parenthesized arithmetic expressions.
@@ -79,6 +81,9 @@ fn allocate_job_id(next_job_id: &mut u32, visible_ids: &[u32]) -> u32 {
 }
 
 fn validate_native_source(input: &str) -> Result<(), quirl_core::ShellError> {
+    if input.contains('\0') {
+        return Err(interior_nul_error("native command source"));
+    }
     if input.len() <= NATIVE_COMMAND_BYTES_MAX {
         return Ok(());
     }
@@ -91,6 +96,15 @@ fn validate_native_source(input: &str) -> Result<(), quirl_core::ShellError> {
         input.len()
     ))
     .with_help("Split the command list into smaller commands or move large input to a file"))
+}
+
+fn interior_nul_error(context: &str) -> quirl_core::ShellError {
+    quirl_core::ShellError::new(
+        quirl_core::ErrorCode::InvalidCommand,
+        "native command expansion contains an interior NUL byte",
+    )
+    .with_context(context)
+    .with_help("Remove the NUL byte; operating-system arguments and paths cannot contain NUL")
 }
 
 fn validate_native_plan(graph: &quirl_syntax::CommandList) -> Result<(), quirl_core::ShellError> {
@@ -196,7 +210,7 @@ mod platform {
     use super::{
         allocate_job_id, builtin, validate_native_plan, validate_native_source,
         ARITHMETIC_DEPTH_MAX, ARITHMETIC_SOURCE_BYTES_MAX, DEFAULT_CAPTURE_BYTES,
-        HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
+        EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
     };
 
     use nix::{
@@ -229,7 +243,7 @@ mod platform {
     };
 
     #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::{ffi::OsStrExt, process::CommandExt};
 
     /// Aggregate lifecycle state for a native job.
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -310,6 +324,44 @@ mod platform {
         }
     }
 
+    struct ExpansionBudget {
+        retained_bytes: usize,
+    }
+
+    impl ExpansionBudget {
+        fn new() -> Self {
+            Self { retained_bytes: 0 }
+        }
+
+        fn claim(&mut self, next: &str) -> Result<(), ShellError> {
+            if next.contains('\0') {
+                return Err(super::interior_nul_error(
+                    "expanded command word or redirect target",
+                ));
+            }
+            let observed_bytes = self.retained_bytes.saturating_add(next.len());
+            if observed_bytes > EXPANSION_BYTES_MAX {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "native pipeline expansion exceeds its retained-byte limit",
+                )
+                .with_context(format!(
+                    "limit {EXPANSION_BYTES_MAX} bytes; retained {} bytes; observed {observed_bytes} bytes",
+                    self.retained_bytes
+                ))
+                .with_help("Use fewer expansions, shorten environment values, or move data to a file"));
+            }
+            self.retained_bytes = observed_bytes;
+            Ok(())
+        }
+
+        fn append(&mut self, output: &mut String, next: &str) -> Result<(), ShellError> {
+            self.claim(next)?;
+            output.push_str(next);
+            Ok(())
+        }
+    }
+
     type ReaderTask = JoinHandle<std::io::Result<ReaderCapture>>;
     type WriterTask = JoinHandle<std::io::Result<()>>;
     type PendingWriter = (PipeWriter, Vec<u8>);
@@ -362,6 +414,8 @@ mod platform {
         jobs: Vec<Job>,
         next_job_id: u32,
         substitution_depth: u8,
+        #[cfg(test)]
+        fail_stopped_terminal_mode_read: bool,
     }
 
     /// Cross-platform containment hook for a directly spawned child process.
@@ -443,6 +497,8 @@ mod platform {
                 jobs: Vec::new(),
                 next_job_id: 1,
                 substitution_depth: 0,
+                #[cfg(test)]
+                fail_stopped_terminal_mode_read: false,
             }
         }
     }
@@ -461,17 +517,25 @@ mod platform {
     impl NativeExecutor {
         /// Execute an ordinary foreground command with terminal streams
         /// inherited. Unlike capture APIs, interactive output is not retained
-        /// or rejected at the programmatic capture ceiling.
+        /// or rejected at the programmatic capture ceiling. This trusted-local
+        /// convenience path has no host cancellation flag or deadline; hosted
+        /// callers use [`Self::execute_interactive_request`].
         pub fn execute_interactive(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute(input)
         }
 
         /// Execute `input` in the foreground with inherited terminal streams.
+        ///
+        /// This trusted-local convenience path has no host cancellation flag
+        /// or deadline; hosted callers use [`Self::execute_interactive_request`].
         pub fn execute(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, false)
         }
 
         /// Execute `input` while retaining bounded stdout and stderr.
+        ///
+        /// This trusted-local convenience path has no host cancellation flag
+        /// or deadline; hosted callers use [`Self::execute_capture_request`].
         pub fn execute_capture(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, true)
         }
@@ -552,6 +616,7 @@ mod platform {
 
         /// Stop every live process in job `id` and return its snapshot.
         pub fn suspend_job(&mut self, id: u32) -> Result<JobState, ShellError> {
+            self.refresh_jobs();
             let job = self
                 .jobs
                 .iter_mut()
@@ -570,29 +635,7 @@ mod platform {
                 )
                 .with_help("Start the command again to create a new job"));
             }
-            if let Some(group) = job.state.process_group {
-                killpg(Pid::from_raw(group), Signal::SIGSTOP).map_err(|error| {
-                    ShellError::new(ErrorCode::Io, format!("could not suspend job %{id}"))
-                        .with_context(error.to_string())
-                        .with_help("Run `jobs` to refresh the job before retrying")
-                })?;
-            } else {
-                for child in &job.children {
-                    let pid = i32::try_from(child.child.id()).map_err(|_| {
-                        ShellError::new(ErrorCode::Io, "child process id exceeds platform limits")
-                            .with_help("Cancel the job and start it again")
-                    })?;
-                    kill(Pid::from_raw(pid), Signal::SIGSTOP).map_err(|error| {
-                        ShellError::new(ErrorCode::Io, format!("could not suspend job %{id}"))
-                            .with_context(error.to_string())
-                            .with_help("Run `jobs` to refresh the job before retrying")
-                    })?;
-                }
-            }
-            for child in &mut job.children {
-                child.status = JobStatus::Stopped;
-            }
-            job.state.status = JobStatus::Stopped;
+            suspend_running_children(job, id)?;
             Ok(job.state.clone())
         }
 
@@ -712,23 +755,38 @@ mod platform {
                 request.ensure_active()?;
             }
             let mut expanded = pipeline.clone();
+            let mut budget = ExpansionBudget::new();
             for command in &mut expanded.commands {
                 let forms = command.word_ir.clone();
                 if forms.is_empty() {
+                    for word in &command.words {
+                        budget.claim(word)?;
+                    }
+                    for redirect in &command.redirects {
+                        budget.claim(&redirect.path)?;
+                    }
                     continue;
                 }
                 let mut words = Vec::new();
                 for word in &forms {
-                    let (value, glob) =
-                        self.expand_word(word, MAX_SUBSTITUTION_BYTES, request, previous_status)?;
+                    let (value, glob) = self.expand_word(
+                        word,
+                        MAX_SUBSTITUTION_BYTES,
+                        request,
+                        previous_status,
+                        &mut budget,
+                    )?;
                     let matches = if glob {
-                        pathname_expand(&value)?
+                        pathname_expand(&value, budget.retained_bytes)?
                     } else {
                         Vec::new()
                     };
                     if matches.is_empty() {
                         words.push(value);
                     } else {
+                        for value in &matches {
+                            budget.claim(value)?;
+                        }
                         words.extend(matches);
                     }
                 }
@@ -739,6 +797,7 @@ mod platform {
                         MAX_SUBSTITUTION_BYTES,
                         request,
                         previous_status,
+                        &mut budget,
                     )?;
                     redirect.path = path;
                 }
@@ -752,12 +811,13 @@ mod platform {
             limit: usize,
             request: Option<RequestContext<'_>>,
             previous_status: i32,
+            budget: &mut ExpansionBudget,
         ) -> Result<(String, bool), ShellError> {
             let mut value = String::new();
             let mut pathname = false;
             for part in &word.parts {
                 if matches!(part.quoting, Quoting::Single | Quoting::Escaped) {
-                    value.push_str(&part.text);
+                    budget.append(&mut value, &part.text)?;
                     continue;
                 }
                 pathname |= part.quoting == Quoting::Unquoted
@@ -765,12 +825,14 @@ mod platform {
                         .text
                         .chars()
                         .any(|character| matches!(character, '*' | '?' | '['));
-                value.push_str(&self.expand_fragment(
+                self.expand_fragment(
                     &part.text,
                     limit,
                     request,
                     previous_status,
-                )?);
+                    &mut value,
+                    budget,
+                )?;
             }
             Ok((value, pathname))
         }
@@ -781,8 +843,9 @@ mod platform {
             limit: usize,
             request: Option<RequestContext<'_>>,
             previous_status: i32,
-        ) -> Result<String, ShellError> {
-            let mut output = String::new();
+            output: &mut String,
+            budget: &mut ExpansionBudget,
+        ) -> Result<(), ShellError> {
             let mut index = 0;
             while index < text.len() {
                 let rest = &text[index..];
@@ -793,7 +856,8 @@ mod platform {
                             "Close the `))` in `$((...))`",
                         ));
                     };
-                    output.push_str(&evaluate_arithmetic(&arithmetic[..close])?.to_string());
+                    let value = evaluate_arithmetic(&arithmetic[..close])?.to_string();
+                    budget.append(output, &value)?;
                     index += 3 + close + 2;
                     continue;
                 }
@@ -829,7 +893,7 @@ mod platform {
                             "Write large output to a file before substituting it",
                         ));
                     }
-                    output.push_str(stdout.trim_end_matches('\n'));
+                    budget.append(output, stdout.trim_end_matches('\n'))?;
                     index += 2 + close + 1;
                     continue;
                 }
@@ -840,22 +904,25 @@ mod platform {
                             "Close the `}` in `${...}`",
                         ));
                     };
-                    output.push_str(&parameter_value(&after[..close]));
+                    let value = parameter_value(&after[..close]);
+                    budget.append(output, &value)?;
                     index += 3 + close;
                     continue;
                 }
                 if let Some(after) = rest.strip_prefix('$') {
                     let Some(character) = after.chars().next() else {
-                        output.push('$');
+                        budget.append(output, "$")?;
                         break;
                     };
                     if character == '?' {
-                        output.push_str(&previous_status.to_string());
+                        let value = previous_status.to_string();
+                        budget.append(output, &value)?;
                         index += 2;
                         continue;
                     }
                     if character == '$' {
-                        output.push_str(&std::process::id().to_string());
+                        let value = std::process::id().to_string();
+                        budget.append(output, &value)?;
                         index += 2;
                         continue;
                     }
@@ -865,16 +932,17 @@ mod platform {
                             .take_while(|value| *value == '_' || value.is_ascii_alphanumeric())
                             .map(char::len_utf8)
                             .sum();
-                        output.push_str(&parameter_value(&after[..length]));
+                        let value = parameter_value(&after[..length]);
+                        budget.append(output, &value)?;
                         index += 1 + length;
                         continue;
                     }
                 }
                 let character = rest.chars().next().unwrap_or_default();
-                output.push(character);
+                budget.append(output, &rest[..character.len_utf8()])?;
                 index += character.len_utf8();
             }
-            Ok(output)
+            Ok(())
         }
 
         fn execute_control_builtin(
@@ -1220,6 +1288,10 @@ mod platform {
                 job.state.status = status;
                 job.state.exit_status = exit_status;
                 if status == JobStatus::Done {
+                    // Direct children can exit before descendants close capture
+                    // and input pipes. Contain the group before joining tasks so
+                    // refresh remains bounded even when cleanup itself fails.
+                    let _ = terminate_group_descendants(job.state.process_group);
                     finish_job_tasks_silently(job);
                 }
             }
@@ -1232,7 +1304,15 @@ mod platform {
             let mut terminal =
                 ForegroundTerminal::give_to(self.jobs[index].state.process_group, terminal_lease)?;
             terminal.apply_modes(self.jobs[index].terminal_modes.as_ref())?;
-            resume_job(&self.jobs[index])?;
+            if let Err(error) = resume_job(&self.jobs[index]) {
+                let process_group = self.jobs[index].state.process_group;
+                terminate_children(&mut self.jobs[index].children, process_group);
+                finish_job_tasks_silently(&mut self.jobs[index]);
+                self.jobs[index].state.status = JobStatus::Done;
+                self.jobs[index].state.exit_status = Some(130);
+                let _ = terminal.restore();
+                return Err(error);
+            }
             let mut job = self.jobs.remove(index);
             for child in &mut job.children {
                 if child.status == JobStatus::Done {
@@ -1241,48 +1321,72 @@ mod platform {
                 child.status = JobStatus::Running;
                 child.exit_status = None;
             }
-            if let Err(error) =
-                wait_for_foreground_children(&mut job.children, job.state.process_group, None)
-            {
-                terminate_children(&mut job.children, job.state.process_group);
-                let _ = terminal.restore();
-                finish_job_tasks_silently(&mut job);
-                return Err(error);
-            }
-            let status = job
-                .children
-                .last()
-                .and_then(|child| child.exit_status)
-                .unwrap_or(0);
-            if job
-                .children
-                .iter()
-                .any(|child| child.status == JobStatus::Stopped)
-            {
-                job.terminal_modes = terminal.current_modes()?;
+            let result = (|| {
+                wait_for_foreground_children(&mut job.children, job.state.process_group, None)?;
+                let status = job
+                    .children
+                    .last()
+                    .and_then(|child| child.exit_status)
+                    .unwrap_or(0);
+                if job
+                    .children
+                    .iter()
+                    .any(|child| child.status == JobStatus::Stopped)
+                {
+                    job.terminal_modes = self.stopped_terminal_modes(&terminal)?;
+                    terminal.restore()?;
+                    job.state.status = JobStatus::Stopped;
+                    return Ok(None);
+                }
+                terminate_group_descendants(job.state.process_group)?;
                 terminal.restore()?;
-                job.state.status = JobStatus::Stopped;
-                self.jobs.push(job);
-                return Ok(outcome(status, None, None));
+                job.state.status = JobStatus::Done;
+                job.state.exit_status = Some(status);
+                let stdout = join_reader(job.stdout_reader.take(), "pipeline output")?;
+                let stderr = join_readers(
+                    std::mem::take(&mut job.stderr_readers),
+                    "command error output",
+                )?;
+                join_writers(std::mem::take(&mut job.writers))?;
+                Ok(Some(outcome(
+                    status,
+                    job.capture.then_some(stdout),
+                    job.capture.then_some(stderr),
+                )))
+            })();
+            match result {
+                Ok(Some(result)) => Ok(result),
+                Ok(None) => {
+                    let status = job
+                        .children
+                        .last()
+                        .and_then(|child| child.exit_status)
+                        .unwrap_or(0);
+                    self.jobs.push(job);
+                    Ok(outcome(status, None, None))
+                }
+                Err(error) => {
+                    terminate_children(&mut job.children, job.state.process_group);
+                    let _ = terminal.restore();
+                    finish_job_tasks_silently(&mut job);
+                    Err(error)
+                }
             }
-            terminate_group_descendants(job.state.process_group)?;
-            terminal.restore()?;
-            job.state.status = JobStatus::Done;
-            job.state.exit_status = Some(status);
-            let stdout = join_reader(job.stdout_reader.take(), "pipeline output");
-            let stderr = join_readers(
-                std::mem::take(&mut job.stderr_readers),
-                "command error output",
-            );
-            let writers = join_writers(std::mem::take(&mut job.writers));
-            let stdout = stdout?;
-            let stderr = stderr?;
-            writers?;
-            Ok(outcome(
-                status,
-                job.capture.then_some(stdout),
-                job.capture.then_some(stderr),
-            ))
+        }
+
+        fn stopped_terminal_modes(
+            &self,
+            terminal: &ForegroundTerminal,
+        ) -> Result<Option<Termios>, ShellError> {
+            #[cfg(test)]
+            if self.fail_stopped_terminal_mode_read {
+                return Err(ShellError::new(
+                    ErrorCode::Io,
+                    "injected stopped-job terminal mode failure",
+                )
+                .with_help("Test-only foreground cleanup fault"));
+            }
+            terminal.current_modes()
         }
 
         fn background(&mut self, id: Option<u32>) -> Result<CommandOutcome, ShellError> {
@@ -1532,7 +1636,10 @@ mod platform {
         Ok(value)
     }
 
-    fn pathname_expand(pattern: &str) -> Result<Vec<String>, ShellError> {
+    fn pathname_expand(
+        pattern: &str,
+        retained_before_paths: usize,
+    ) -> Result<Vec<String>, ShellError> {
         const MAX_GLOB_MATCHES: usize = 10_000;
         let absolute = pattern.starts_with('/');
         let mut paths = vec![if absolute {
@@ -1545,9 +1652,23 @@ mod platform {
                 .chars()
                 .any(|character| matches!(character, '*' | '?' | '['));
             let mut next = Vec::new();
+            let previous_path_bytes = paths
+                .iter()
+                .map(|path| path.as_os_str().as_bytes().len())
+                .sum::<usize>();
+            let mut next_path_bytes = 0_usize;
             for prefix in &paths {
                 if !has_pattern {
-                    next.push(prefix.join(component));
+                    let path = prefix.join(component);
+                    claim_path_expansion_bytes(
+                        retained_before_paths,
+                        previous_path_bytes,
+                        next_path_bytes,
+                        path.as_os_str().as_bytes().len(),
+                    )?;
+                    next_path_bytes =
+                        next_path_bytes.saturating_add(path.as_os_str().as_bytes().len());
+                    next.push(path);
                     continue;
                 }
                 let directory = if prefix.as_os_str().is_empty() {
@@ -1563,7 +1684,16 @@ mod platform {
                         continue;
                     };
                     if glob_matches(component, &name) {
-                        next.push(prefix.join(name));
+                        let path = prefix.join(name);
+                        claim_path_expansion_bytes(
+                            retained_before_paths,
+                            previous_path_bytes,
+                            next_path_bytes,
+                            path.as_os_str().as_bytes().len(),
+                        )?;
+                        next_path_bytes =
+                            next_path_bytes.saturating_add(path.as_os_str().as_bytes().len());
+                        next.push(path);
                         if next.len() > MAX_GLOB_MATCHES {
                             return Err(ShellError::new(
                                 ErrorCode::ResourceLimit,
@@ -1587,6 +1717,29 @@ mod platform {
             .collect::<Vec<_>>();
         matches.sort();
         Ok(matches)
+    }
+
+    fn claim_path_expansion_bytes(
+        retained_before_paths: usize,
+        previous_path_bytes: usize,
+        next_path_bytes: usize,
+        additional_path_bytes: usize,
+    ) -> Result<(), ShellError> {
+        let observed_bytes = retained_before_paths
+            .saturating_add(previous_path_bytes)
+            .saturating_add(next_path_bytes)
+            .saturating_add(additional_path_bytes);
+        if observed_bytes <= EXPANSION_BYTES_MAX {
+            return Ok(());
+        }
+        Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "pathname expansion exceeds the retained-byte limit",
+        )
+        .with_context(format!(
+            "limit {EXPANSION_BYTES_MAX} bytes; retained {retained_before_paths} bytes before pathname expansion; observed at least {observed_bytes} bytes"
+        ))
+        .with_help("Narrow the pathname pattern or move the file list into a data pipeline"))
     }
 
     fn glob_matches(pattern: &str, candidate: &str) -> bool {
@@ -1947,6 +2100,52 @@ mod platform {
                 ShellError::new(ErrorCode::InvalidArgument, "no matching active job")
                     .with_help("Run `jobs` to list active jobs")
             })
+    }
+
+    fn suspend_running_children(job: &mut Job, id: u32) -> Result<(), ShellError> {
+        let group_stopped = match job.state.process_group {
+            Some(group) => match killpg(Pid::from_raw(group), Signal::SIGSTOP) {
+                Ok(()) => true,
+                Err(Errno::ESRCH) => false,
+                Err(error) => return Err(suspend_error(id, error)),
+            },
+            None => false,
+        };
+        for child in &mut job.children {
+            if child.status != JobStatus::Running {
+                continue;
+            }
+            if group_stopped {
+                child.status = JobStatus::Stopped;
+                continue;
+            }
+            let process_id = i32::try_from(child.child.id()).map_err(|error| {
+                ShellError::new(ErrorCode::Io, "child process id exceeds platform limits")
+                    .with_context(error.to_string())
+                    .with_help("Cancel the job and start it again")
+            })?;
+            match kill(Pid::from_raw(process_id), Signal::SIGSTOP) {
+                Ok(()) => child.status = JobStatus::Stopped,
+                Err(Errno::ESRCH) => {
+                    poll_child_checked(child)?;
+                }
+                Err(error) => return Err(suspend_error(id, error)),
+            }
+        }
+        let (status, exit_status) = super::summarize_job_lifecycle(
+            job.children
+                .iter()
+                .map(|child| (child.status, child.exit_status)),
+        );
+        job.state.status = status;
+        job.state.exit_status = exit_status;
+        Ok(())
+    }
+
+    fn suspend_error(id: u32, error: Errno) -> ShellError {
+        ShellError::new(ErrorCode::Io, format!("could not suspend job %{id}"))
+            .with_context(error.to_string())
+            .with_help("Run `jobs` to refresh the job before retrying")
     }
 
     fn resume_job(job: &Job) -> Result<(), ShellError> {
@@ -2783,6 +2982,73 @@ mod platform {
         }
 
         #[test]
+        fn expansion_budget_accepts_the_exact_boundary_and_rejects_the_next_byte() {
+            let variable = format!(
+                "QUIRL_EXPANSION_BOUNDARY_{}",
+                NEXT_TEMP_PATH.fetch_add(1, Ordering::Relaxed)
+            );
+            let command_bytes = "printf".len();
+            let value = "x".repeat((EXPANSION_BYTES_MAX - command_bytes) / 2);
+            env::set_var(&variable, &value);
+            let exact_source = format!("printf ${{{variable}}}${{{variable}}}");
+            let exact = parse_command_list(&exact_source).unwrap();
+            let expanded = NativeExecutor::default()
+                .expand_pipeline(&exact.pipelines[0], None, 0)
+                .unwrap();
+            assert_eq!(
+                expanded.commands[0]
+                    .words
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+                EXPANSION_BYTES_MAX
+            );
+
+            let oversized_source = format!("printf ${{{variable}}}${{{variable}}}x");
+            let oversized = parse_command_list(&oversized_source).unwrap();
+            let error = NativeExecutor::default()
+                .expand_pipeline(&oversized.pipelines[0], None, 0)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.details.context.iter().any(|context| {
+                context.contains(&format!("limit {EXPANSION_BYTES_MAX} bytes"))
+                    && context.contains(&format!("retained {EXPANSION_BYTES_MAX} bytes"))
+                    && context.contains(&format!("observed {} bytes", EXPANSION_BYTES_MAX + 1))
+            }));
+            env::remove_var(variable);
+        }
+
+        #[test]
+        fn repeated_status_expansion_cannot_amplify_past_the_pipeline_budget() {
+            let repetitions = EXPANSION_BYTES_MAX / i32::MIN.to_string().len() + 1;
+            let source = format!("printf {}", "$?".repeat(repetitions));
+            let graph = parse_command_list(&source).unwrap();
+            let error = NativeExecutor::default()
+                .expand_pipeline(&graph.pipelines[0], None, i32::MIN)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("expansion"));
+        }
+
+        #[test]
+        fn pathname_expansion_counts_bytes_while_building_candidate_paths() {
+            let directory = temporary_path("pathname-byte-budget");
+            fs::create_dir_all(&directory).unwrap();
+            for index in 0..300 {
+                fs::write(directory.join(format!("entry-{index}")), "x").unwrap();
+            }
+            let suffix = "x".repeat(4_000);
+            let source = format!("printf {}/*/{suffix}", directory.display());
+            let graph = parse_command_list(&source).unwrap();
+            let error = NativeExecutor::default()
+                .expand_pipeline(&graph.pipelines[0], None, 0)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("pathname expansion"));
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
         fn redirects_and_boolean_connectors_use_the_native_graph() {
             let path = temporary_path("redirect");
             let command = format!(
@@ -3221,6 +3487,131 @@ mod platform {
             assert!(executor.jobs().is_empty());
         }
 
+        #[test]
+        fn refresh_controls_contain_orphans_before_joining_capture_readers() {
+            for control in ["jobs", "fg %1", "bg %1"] {
+                let process_id_path = temporary_path("refresh-orphan");
+                let command = format!(
+                    "sh -c 'kill -STOP $$; sleep 5 & printf %s $! > {}; exit 0'",
+                    process_id_path.display()
+                );
+                let mut executor = NativeExecutor::default();
+                executor.execute_capture(&command).unwrap();
+                executor.execute_capture("bg %1").unwrap();
+                for _ in 0..100 {
+                    if process_id_path.exists() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(process_id_path.exists());
+                thread::sleep(Duration::from_millis(20));
+
+                let started = Instant::now();
+                if control == "jobs" {
+                    executor.execute_capture(control).unwrap();
+                } else {
+                    let error = executor.execute_capture(control).unwrap_err();
+                    assert_eq!(error.code, ErrorCode::InvalidArgument);
+                }
+                assert!(started.elapsed() < Duration::from_secs(1));
+
+                let process_id = fs::read_to_string(&process_id_path)
+                    .unwrap()
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap();
+                for _ in 0..100 {
+                    if kill(Pid::from_raw(process_id), None).is_err() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert!(kill(Pid::from_raw(process_id), None).is_err());
+                fs::remove_file(process_id_path).unwrap();
+            }
+        }
+
+        #[test]
+        fn refresh_contains_orphans_before_joining_blocked_here_string_writers() {
+            let process_id_path = temporary_path("refresh-writer-orphan");
+            let payload = "x".repeat(128 * 1024);
+            let command = format!(
+                "sh -c 'kill -STOP $$; sleep 5 & printf %s $! > {}; exit 0' <<< {payload}",
+                process_id_path.display()
+            );
+            let mut executor = NativeExecutor::default();
+            executor.execute(&command).unwrap();
+            executor.execute("bg %1").unwrap();
+            for _ in 0..100 {
+                if process_id_path.exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(process_id_path.exists());
+            thread::sleep(Duration::from_millis(20));
+
+            let started = Instant::now();
+            assert_eq!(executor.jobs()[0].status, JobStatus::Done);
+            assert!(started.elapsed() < Duration::from_secs(1));
+            let process_id = fs::read_to_string(&process_id_path)
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            for _ in 0..100 {
+                if kill(Pid::from_raw(process_id), None).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(kill(Pid::from_raw(process_id), None).is_err());
+            fs::remove_file(process_id_path).unwrap();
+        }
+
+        #[test]
+        fn foreground_terminal_mode_failure_reaps_children_and_finishes_tasks() {
+            let payload = "x".repeat(128 * 1024);
+            let mut executor = NativeExecutor::default();
+            executor
+                .execute_capture(&format!(
+                    "sh -c 'kill -STOP $$; kill -STOP $$; sleep 5' <<< {payload}"
+                ))
+                .unwrap();
+            let process_id =
+                Pid::from_raw(i32::try_from(executor.jobs[0].children[0].child.id()).unwrap());
+            executor.fail_stopped_terminal_mode_read = true;
+
+            let started = Instant::now();
+            let error = executor.foreground(Some(1)).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Io);
+            assert!(error.message.contains("injected"));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(executor.jobs.is_empty());
+            assert!(kill(process_id, None).is_err());
+        }
+
+        #[test]
+        fn suspend_refreshes_mixed_stages_and_stops_only_running_children() {
+            let mut executor = NativeExecutor::default();
+            executor.execute_capture("true | sleep 5 &").unwrap();
+            for _ in 0..100 {
+                executor.refresh_jobs();
+                if executor.jobs[0].children[0].status == JobStatus::Done {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(executor.jobs[0].children[0].status, JobStatus::Done);
+
+            let state = executor.suspend_job(1).unwrap();
+            assert_eq!(state.status, JobStatus::Stopped);
+            assert_eq!(executor.jobs[0].children[0].status, JobStatus::Done);
+            assert_eq!(executor.jobs[0].children[1].status, JobStatus::Stopped);
+            executor.cancel_job(1).unwrap();
+        }
+
         #[cfg(any(target_os = "linux", target_os = "android"))]
         #[test]
         fn ptrace_wait_states_remain_live_and_stopped() {
@@ -3619,17 +4010,25 @@ mod platform {
     impl NativeExecutor {
         /// Execute an ordinary foreground command with terminal streams
         /// inherited. Unlike capture APIs, interactive output is not retained
-        /// or rejected at the programmatic capture ceiling.
+        /// or rejected at the programmatic capture ceiling. This trusted-local
+        /// convenience path has no host cancellation flag or deadline; hosted
+        /// callers use [`Self::execute_interactive_request`].
         pub fn execute_interactive(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute(input)
         }
 
         /// Execute `input` in the foreground with inherited terminal streams.
+        ///
+        /// This trusted-local convenience path has no host cancellation flag
+        /// or deadline; hosted callers use [`Self::execute_interactive_request`].
         pub fn execute(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, false)
         }
 
         /// Execute `input` while retaining bounded stdout and stderr.
+        ///
+        /// This trusted-local convenience path has no host cancellation flag
+        /// or deadline; hosted callers use [`Self::execute_capture_request`].
         pub fn execute_capture(&mut self, input: &str) -> Result<CommandOutcome, ShellError> {
             self.execute_inner(input, true)
         }
@@ -4550,12 +4949,20 @@ pub fn transition_job_state(
 
 /// Stable process backend contract used by the CLI independently of the host platform.
 pub trait ProcessBackend {
-    /// Execute a foreground command with inherited terminal streams.
+    /// Execute a trusted foreground command with inherited terminal streams.
+    ///
+    /// This convenience method has no host cancellation or deadline input;
+    /// interactive callers rely on terminal signals. Use
+    /// [`NativeExecutor::execute_interactive_request`] whenever a host
+    /// cancellation flag or deadline must remain observable.
     fn execute(
         &mut self,
         input: &str,
     ) -> Result<quirl_core::CommandOutcome, quirl_core::ShellError>;
-    /// Execute a command and retain output within [`DEFAULT_CAPTURE_BYTES`].
+    /// Execute a trusted command and retain output within [`DEFAULT_CAPTURE_BYTES`].
+    ///
+    /// This convenience method has no host cancellation or deadline input. Use
+    /// [`NativeExecutor::execute_capture_request`] for untrusted or hosted work.
     fn execute_capture(
         &mut self,
         input: &str,
@@ -4672,6 +5079,38 @@ mod backend_contract_tests {
         assert_eq!(error.code, ErrorCode::InvalidCommand);
         assert!(error.message.contains("descriptor duplication"));
         assert!(!error.details.help.is_empty());
+    }
+
+    #[test]
+    fn interior_nul_is_rejected_before_spawn_with_actionable_help() {
+        let error = NativeExecutor::default()
+            .execute_capture("prin\0tf hi")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert!(error.message.contains("NUL"));
+        assert!(error.details.help.iter().any(|help| help.contains("NUL")));
+        assert!(!error.details.help.iter().any(|help| help.contains("PATH")));
+    }
+
+    #[test]
+    fn public_request_execution_paths_observe_cancellation_before_spawn() {
+        for capture in [false, true] {
+            let cancelled = Arc::new(AtomicBool::new(true));
+            let request = quirl_core::ProcessRequest {
+                command: "this-command-must-not-run".to_owned(),
+                deadline: Duration::from_secs(1),
+                cancelled,
+                max_output_bytes: 1024,
+            };
+            let mut backend = NativeExecutor::default();
+            let error = if capture {
+                backend.execute_capture_request(request).unwrap_err()
+            } else {
+                backend.execute_interactive_request(request).unwrap_err()
+            };
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.message.contains("cancelled"));
+        }
     }
 
     #[test]
