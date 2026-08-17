@@ -904,6 +904,7 @@ fn parse_documentation_option(line: &str, provenance: &ProvenanceInfo) -> Option
                 );
             }
         } else if !names.is_empty()
+            && !word.is_empty()
             && (word.starts_with('<')
                 || word.chars().all(|character| {
                     character.is_ascii_uppercase() || matches!(character, '_' | '-')
@@ -1478,6 +1479,7 @@ fn shell_words(source: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ArgumentKind;
 
     #[test]
     fn fish_declarations_preserve_options_descriptions_values_and_conditions() {
@@ -1840,6 +1842,62 @@ _values 'environment' staging production
             .options
             .iter()
             .any(|option| option.names == ["--format"]));
+    }
+
+    #[test]
+    fn real_world_sources_preserve_short_flags_and_value_consumption() {
+        let reports = [
+            import_fish(
+                "complete -c sample -s a -d All\ncomplete -c sample -s l -d Long\ncomplete -c sample -s o -l output -r",
+                "sample.fish",
+            ),
+            import_bash(
+                "complete -o filenames -W '-a -l --all --long -o= --output=' sample",
+                "sample.bash",
+            ),
+            import_zsh(
+                "#compdef sample\n_arguments '-a[All]' '-l[Long]' '*-o[Output]:file:_files'",
+                "_sample",
+            ),
+            import_help(
+                "Usage: sample [OPTIONS]\n  -a, --all          All entries\n  -l, --long         Long rows\n  -o, --output FILE  Output file",
+                "sample.help",
+            ),
+            import_man(
+                ".TH SAMPLE 1\n.SH SYNOPSIS\nsample [OPTIONS]\n.SH OPTIONS\n.BR \\-a , \\--all\n.BR \\-l , \\--long\n.BR \\-o , \\--output=FILE",
+                "sample.man",
+            ),
+        ];
+
+        for report in reports {
+            assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
+            let command = report
+                .commands
+                .iter()
+                .find(|command| command.path == "sample")
+                .unwrap();
+            for short in ["-a", "-l"] {
+                let argument = command
+                    .options
+                    .iter()
+                    .find(|argument| argument.names.iter().any(|name| name == short))
+                    .unwrap();
+                assert_eq!(
+                    argument.kind,
+                    ArgumentKind::Flag,
+                    "source: {:?}",
+                    command.provenance.source
+                );
+                assert_eq!(argument.provenance.source, command.provenance.source);
+            }
+            let output = command
+                .options
+                .iter()
+                .find(|argument| argument.names.iter().any(|name| name == "-o"))
+                .unwrap();
+            assert_eq!(output.kind, ArgumentKind::Option);
+            assert_eq!(output.provenance.source, command.provenance.source);
+        }
     }
 
     #[test]
