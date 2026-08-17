@@ -75,7 +75,9 @@ impl HistoryDatabase {
                     mode TEXT NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS history_directory_id
-                    ON history(directory, id DESC);",
+                    ON history(directory, id DESC);
+                 CREATE INDEX IF NOT EXISTS history_mode_id
+                    ON history(mode, id DESC);",
             )
             .map_err(|error| database_error(&path, error))?;
         set_private_permissions(&path)?;
@@ -126,26 +128,30 @@ impl HistoryDatabase {
         transaction.commit().map_err(history_sql_error)
     }
 
-    /// Return a recent deduplicated snapshot with a strong same-directory preference.
+    /// Return recent commands for one grammar with a strong same-directory preference.
     pub(crate) fn snapshot(
         &self,
         current_directory: &Path,
+        mode: Mode,
     ) -> Result<Vec<InteractiveHistoryEntry>, ShellError> {
         let current_directory = current_directory.to_string_lossy();
         let mut statement = self
             .connection
             .prepare(
                 "SELECT command_line, directory, exit_status
-                 FROM history ORDER BY id DESC LIMIT ?1",
+                 FROM history WHERE mode = ?2 ORDER BY id DESC LIMIT ?1",
             )
             .map_err(history_sql_error)?;
         let rows = statement
-            .query_map([HISTORY_SNAPSHOT_MAX as i64], |row| {
-                let command_line: String = row.get(0)?;
-                let directory: String = row.get(1)?;
-                let status: Option<i32> = row.get(2)?;
-                Ok((command_line, directory, status))
-            })
+            .query_map(
+                params![HISTORY_SNAPSHOT_MAX as i64, mode.to_string()],
+                |row| {
+                    let command_line: String = row.get(0)?;
+                    let directory: String = row.get(1)?;
+                    let status: Option<i32> = row.get(2)?;
+                    Ok((command_line, directory, status))
+                },
+            )
             .map_err(history_sql_error)?;
         let mut seen = HashSet::with_capacity(HISTORY_SNAPSHOT_MAX);
         let mut history = Vec::with_capacity(HISTORY_SNAPSHOT_MAX);
@@ -314,7 +320,9 @@ mod tests {
         database
             .record("cargo test", Path::new("/other"), Mode::Command, 0, None)
             .unwrap();
-        let snapshot = database.snapshot(Path::new("/work")).unwrap();
+        let snapshot = database
+            .snapshot(Path::new("/work"), Mode::Command)
+            .unwrap();
         assert_eq!(snapshot.len(), 2);
         let local = snapshot
             .iter()
@@ -322,6 +330,35 @@ mod tests {
             .unwrap();
         assert_eq!(local.rank_bias, 4_000);
         assert_eq!(local.status, Some(1));
+    }
+
+    #[test]
+    fn snapshot_excludes_commands_from_other_interactive_grammars() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE history (
+                id INTEGER PRIMARY KEY,
+                command_line TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                started_unix_ms INTEGER NOT NULL,
+                duration_ms INTEGER,
+                exit_status INTEGER,
+                mode TEXT NOT NULL
+             );",
+            )
+            .unwrap();
+        let mut database = HistoryDatabase { connection };
+        database
+            .record("ls -al", Path::new("/work"), Mode::Command, 0, None)
+            .unwrap();
+        database
+            .record("ls | take 3", Path::new("/work"), Mode::Data, 0, None)
+            .unwrap();
+
+        let data = database.snapshot(Path::new("/work"), Mode::Data).unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].command_line, "ls | take 3");
     }
 
     #[test]

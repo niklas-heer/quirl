@@ -1898,6 +1898,22 @@ mod tests {
     }
 
     #[test]
+    fn bare_ls_is_a_typed_files_source_inside_the_data_grammar() {
+        let expression = parse("ls ./src | take 2").unwrap();
+        let DataSource::Files { path } = expression.source.value else {
+            panic!("expected the Data-mode ls alias to produce a files source");
+        };
+        assert_eq!(path.map(|path| path.value), Some("./src".to_owned()));
+        let [transform] = expression.transforms.as_slice() else {
+            panic!("expected one bounded transform after Data-mode ls");
+        };
+        let DataTransform::Take { count } = &transform.value else {
+            panic!("expected the take transform");
+        };
+        assert_eq!(count.value, 2);
+    }
+
+    #[test]
     fn literal_parser_is_iterative_bounded_and_preserves_utf8_spans() {
         let source = r#"{"naïve": [1, 2, {"ok": true}]} | get naïve"#;
         let expression = parse(source).unwrap();

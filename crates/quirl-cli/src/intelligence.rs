@@ -1262,9 +1262,13 @@ mod tests {
         let bytes = encode_database(&Catalog::builtin(), None).unwrap();
         let session = SearchSession::open(&bytes, Path::new("catalog.sqlite3"), None).unwrap();
         let directory = session.search("change directory", 8).unwrap();
-        let listing = session.search("show hidden files", 8).unwrap();
+        let listing = session
+            .search("list a directory as typed entries", 8)
+            .unwrap();
         assert!(directory.iter().any(|result| result.command == "cd"));
-        assert!(listing.iter().any(|result| result.command == "ls"));
+        assert!(listing
+            .iter()
+            .any(|result| result.command == "quirl data ls"));
     }
 
     #[test]

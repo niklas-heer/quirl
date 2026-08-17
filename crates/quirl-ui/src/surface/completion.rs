@@ -7,6 +7,7 @@ use quirl_catalog::{
     MAX_COMPLETION_RESULTS,
 };
 use quirl_core::ShellError;
+use quirl_syntax::Mode;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -292,6 +293,10 @@ pub struct CompletionState {
     pub automatic: bool,
     pub source_label: &'static str,
     resource_notice: Option<String>,
+    request_mode: Mode,
+    catalog_position_delta: usize,
+    data_ls_alias_request: bool,
+    explicit_quirl_request: bool,
 }
 
 impl CompletionState {
@@ -315,6 +320,10 @@ impl CompletionState {
             automatic: false,
             source_label: "catalog",
             resource_notice: None,
+            request_mode: Mode::Command,
+            catalog_position_delta: 0,
+            data_ls_alias_request: false,
+            explicit_quirl_request: false,
         }
     }
 
@@ -335,6 +344,10 @@ impl CompletionState {
             automatic: false,
             source_label: "catalog",
             resource_notice: None,
+            request_mode: Mode::Command,
+            catalog_position_delta: 0,
+            data_ls_alias_request: false,
+            explicit_quirl_request: false,
         }
     }
 
@@ -361,18 +374,24 @@ impl CompletionState {
         self.catalog.as_ref()
     }
 
-    pub fn request(&mut self, line: &str, cursor: usize) -> Result<(), ShellError> {
-        self.request_with_presentation(line, cursor, false)
+    pub fn request(&mut self, line: &str, cursor: usize, mode: Mode) -> Result<(), ShellError> {
+        self.request_with_presentation(line, cursor, mode, false)
     }
 
-    pub fn request_automatic(&mut self, line: &str, cursor: usize) -> Result<(), ShellError> {
-        self.request_with_presentation(line, cursor, true)
+    pub fn request_automatic(
+        &mut self,
+        line: &str,
+        cursor: usize,
+        mode: Mode,
+    ) -> Result<(), ShellError> {
+        self.request_with_presentation(line, cursor, mode, true)
     }
 
     fn request_with_presentation(
         &mut self,
         line: &str,
         cursor: usize,
+        mode: Mode,
         automatic: bool,
     ) -> Result<(), ShellError> {
         if line.len() > quirl_catalog::MAX_COMPLETION_QUERY_BYTES {
@@ -403,12 +422,17 @@ impl CompletionState {
         self.streaming = true;
         self.automatic = automatic;
         self.source_label = "catalog";
+        let catalog_request = catalog_request(line, cursor, mode);
+        self.request_mode = mode;
+        self.catalog_position_delta = catalog_request.position_delta;
+        self.data_ls_alias_request = catalog_request.data_ls_alias;
+        self.explicit_quirl_request = line.trim_start().starts_with("quirl");
         if let Some(worker) = &mut self.worker {
             worker.submit(CompletionRequest {
                 protocol_version: COMPLETION_PROTOCOL_VERSION,
                 request_id: self.request_id,
-                line: line.to_owned(),
-                cursor,
+                line: catalog_request.line,
+                cursor: catalog_request.cursor,
                 limit: MAX_COMPLETION_RESULTS,
                 deadline_ms: MAX_COMPLETION_DEADLINE_MS,
             })?;
@@ -457,10 +481,30 @@ impl CompletionState {
             self.items = bounded_items(match response.outcome {
                 CompletionOutcome::Ready { items } => items
                     .into_iter()
+                    .filter(|item| {
+                        (!self.data_ls_alias_request || item.value == "quirl data ls")
+                            && (self.request_mode != Mode::Command
+                                || self.explicit_quirl_request
+                                || item.value != "quirl data ls")
+                    })
                     .filter_map(|item| {
                         self.catalog
                             .as_deref()
                             .map(|catalog| catalog_item(catalog, item))
+                    })
+                    .map(|mut item| {
+                        if self.data_ls_alias_request {
+                            if let Some(value) = item.value.strip_prefix("quirl data ") {
+                                item.value = value.to_owned();
+                            }
+                            item.replace_start = item
+                                .replace_start
+                                .saturating_sub(self.catalog_position_delta);
+                            item.replace_end =
+                                item.replace_end.saturating_sub(self.catalog_position_delta);
+                            item.match_indices.clear();
+                        }
+                        item
                     })
                     .collect(),
                 CompletionOutcome::Cancelled | CompletionOutcome::DeadlineExceeded => Vec::new(),
@@ -575,6 +619,50 @@ impl CompletionState {
         self.streaming = false;
         self.automatic = false;
         self.source_label = source_label;
+    }
+}
+
+struct CatalogRequest {
+    line: String,
+    cursor: usize,
+    position_delta: usize,
+    data_ls_alias: bool,
+}
+
+fn catalog_request(line: &str, cursor: usize, mode: Mode) -> CatalogRequest {
+    let mut cursor = cursor.min(line.len());
+    while cursor > 0 && !line.is_char_boundary(cursor) {
+        cursor = cursor.saturating_sub(1);
+    }
+    let leading_bytes = line[..cursor].len() - line[..cursor].trim_start().len();
+    let trimmed_before_cursor = line[leading_bytes..cursor].trim_end();
+    let data_ls_alias = mode == Mode::Data
+        && (trimmed_before_cursor == "ls"
+            || trimmed_before_cursor
+                .strip_prefix("ls")
+                .and_then(|suffix| suffix.chars().next())
+                .is_some_and(char::is_whitespace))
+        && line.len().saturating_add("quirl data ".len())
+            <= quirl_catalog::MAX_COMPLETION_QUERY_BYTES;
+    if !data_ls_alias {
+        return CatalogRequest {
+            line: line.to_owned(),
+            cursor,
+            position_delta: 0,
+            data_ls_alias: false,
+        };
+    }
+
+    let prefix = "quirl data ";
+    let mut catalog_line = String::with_capacity(line.len().saturating_add(prefix.len()));
+    catalog_line.push_str(&line[..leading_bytes]);
+    catalog_line.push_str(prefix);
+    catalog_line.push_str(&line[leading_bytes..]);
+    CatalogRequest {
+        line: catalog_line,
+        cursor: cursor.saturating_add(prefix.len()),
+        position_delta: prefix.len(),
+        data_ls_alias: true,
     }
 }
 
@@ -832,7 +920,7 @@ mod tests {
         let catalog = Catalog::builtin();
         let mut state = CompletionState::new(catalog, None);
         assert!(state.worker.is_none());
-        state.request("git st", 6).unwrap();
+        state.request("git st", 6, Mode::Command).unwrap();
         assert!(state.worker.is_some());
         for _ in 0..100 {
             if state.poll("git st", 6) {
@@ -848,7 +936,7 @@ mod tests {
         let catalog = Catalog::builtin();
         let mut state = CompletionState::new(catalog, None);
         let line = "x".repeat(quirl_catalog::MAX_COMPLETION_QUERY_BYTES + 1);
-        state.request(&line, line.len()).unwrap();
+        state.request(&line, line.len(), Mode::Command).unwrap();
         assert!(!state.open);
         assert!(!state.streaming);
         assert!(state
@@ -860,7 +948,7 @@ mod tests {
     fn rich_extension_worker_discards_invalid_utf8_replacement_boundaries() {
         let mut state =
             CompletionState::new(Catalog::builtin(), Some(Box::new(InvalidSpanCompleter)));
-        state.request("é", "é".len()).unwrap();
+        state.request("é", "é".len(), Mode::Command).unwrap();
         let deadline = Instant::now() + Duration::from_millis(200);
         while Instant::now() < deadline && state.streaming {
             state.poll("é", "é".len());
@@ -887,9 +975,9 @@ mod tests {
     fn exact_command_completion_explains_catalog_capabilities() {
         let catalog = Catalog::builtin();
         let item = catalog
-            .complete("ls", 2)
+            .complete("quirl data ls", "quirl data ls".len())
             .into_iter()
-            .find(|item| item.value == "ls")
+            .find(|item| item.value == "quirl data ls")
             .unwrap();
         let item = catalog_item(&catalog, item);
 
@@ -901,9 +989,44 @@ mod tests {
     }
 
     #[test]
+    fn data_ls_uses_typed_contract_without_leaking_into_normal_completion() {
+        let mut data = CompletionState::new(Catalog::builtin(), None);
+        data.request("ls", 2, Mode::Data).unwrap();
+        for _ in 0..100 {
+            if data.poll("ls", 2) && !data.streaming {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let typed_ls = data.items.iter().find(|item| item.value == "ls").unwrap();
+        assert_eq!(typed_ls.kind, CompletionKind::Command);
+        assert!(typed_ls.summary.contains("typed"));
+        assert!(typed_ls.detail.contains("Capabilities:"));
+        assert_eq!(typed_ls.replace_start, 0);
+        assert_eq!(typed_ls.replace_end, 2);
+
+        let mut normal = CompletionState::new(Catalog::builtin(), None);
+        normal.request("ls", 2, Mode::Command).unwrap();
+        for _ in 0..100 {
+            if normal.poll("ls", 2) && !normal.streaming {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(normal
+            .items
+            .iter()
+            .all(|item| item.value != "quirl data ls"));
+        assert!(normal
+            .items
+            .iter()
+            .all(|item| !item.summary.contains("typed entries in Data mode")));
+    }
+
+    #[test]
     fn automatic_information_preserves_enter_until_the_user_navigates() {
         let mut state = CompletionState::new(Catalog::builtin(), None);
-        state.request_automatic("ls", 2).unwrap();
+        state.request_automatic("ls", 2, Mode::Command).unwrap();
         assert!(state.open);
         assert!(!state.accepts_enter());
 
@@ -945,7 +1068,7 @@ mod tests {
                 delay: Duration::from_millis(80),
             })),
         );
-        state.request("git st", 6).unwrap();
+        state.request("git st", 6, Mode::Command).unwrap();
         let started = Instant::now();
         while started.elapsed() < Duration::from_millis(60) && !state.poll("git st", 6) {
             std::thread::sleep(Duration::from_millis(1));
@@ -971,10 +1094,10 @@ mod tests {
                 delay: Duration::from_millis(30),
             })),
         );
-        state.request("old", 3).unwrap();
+        state.request("old", 3, Mode::Command).unwrap();
         std::thread::sleep(Duration::from_millis(5));
         state.cancel_for_edit();
-        state.request("new", 3).unwrap();
+        state.request("new", 3, Mode::Command).unwrap();
 
         let deadline = Instant::now() + Duration::from_millis(150);
         while Instant::now() < deadline && state.streaming {

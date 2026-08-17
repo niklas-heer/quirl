@@ -567,36 +567,16 @@ impl Catalog {
                     Provenance::Builtin,
                 ),
                 command(
-                    "ls",
-                    "ls [path] [options]",
-                    "List a directory as structured entries",
-                    "Quirl's bounded native ls renders terminal-safe plain rows for humans and preserves exact entry values in stable JSON. Sorting is deterministic; symlink targets are lazy and opt-in. `--max-entries` is a positive, explicit resource bound.",
-                    vec![
-                        option(&["-a", "--all"], None, "Include hidden entries"),
-                        option(&["-l", "--long"], None, "Show size, kind, and modified time"),
-                        option(&["-r", "--reverse"], None, "Reverse the selected sort within directory/file groups"),
-                        option(&["--directories-first", "--dirs-first"], None, "Keep directories before other entry kinds"),
-                        option(&["--resolve-links"], None, "Read symlink targets as an explicit metadata enrichment"),
-                        option(
-                            &["--max-entries"],
-                            Some("positive-integer"),
-                            "Limit the listing to a positive number of entries",
-                        ),
-                        option(&["--json"], None, "Emit stable structured JSON"),
-                        option_with_static_values(
-                            &["--format"],
-                            "plain|json",
-                            &["plain", "json"],
-                            "Choose terminal-safe plain output or stable JSON",
-                        ),
-                        option_with_static_values(
-                            &["--sort"],
-                            "name|size|modified|kind",
-                            &["name", "size", "modified", "kind"],
-                            "Choose the deterministic entry ordering",
-                        ),
+                    "quirl data ls",
+                    "quirl data ls [path]",
+                    "List a directory as typed entries in Data mode",
+                    "`ls` is a Data-mode source alias for `files`. It produces typed filesystem entries for structured transforms. Normal mode does not use this contract: an unqualified `ls` there resolves through PATH and uses the installed system command's contract.",
+                    vec![],
+                    &[
+                        "mode data",
+                        "ls . | where kind == file | sort size desc | take 10",
+                        "quirl data 'ls . | select name kind size'",
                     ],
-                    &["ls", "ls -la src", "ls --max-entries=1000 --sort size --reverse", "ls --format json | jq"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
@@ -2283,7 +2263,7 @@ fn builtin_io(path: &str) -> IoContract {
             output: "Value".to_owned(),
             streaming: true,
         },
-        "ls" => IoContract {
+        "quirl data ls" => IoContract {
             input: "Nothing".to_owned(),
             output: "Stream<Entry>".to_owned(),
             streaming: true,
@@ -2512,23 +2492,19 @@ mod tests {
     }
 
     #[test]
-    fn builtin_ls_is_the_canonical_source_for_cluster_members() {
+    fn typed_ls_is_qualified_to_data_mode_and_does_not_shadow_path_ls() {
         let catalog = Catalog::builtin();
-        let command = catalog.find("ls").unwrap();
-        for (short, long) in [("-a", "--all"), ("-l", "--long")] {
-            let argument = command
-                .options
-                .iter()
-                .find(|argument| argument.names.iter().any(|name| name == short))
-                .unwrap();
-            assert_eq!(argument.kind, ArgumentKind::Flag);
-            assert!(argument.names.iter().any(|name| name == long));
-            assert_eq!(argument.provenance.confidence, Confidence::Exact);
-        }
+        assert!(catalog.find("ls").is_none());
+        let command = catalog.find("quirl data ls").unwrap();
+        assert_eq!(command.parent.as_deref(), Some("command:quirl/data"));
+        assert_eq!(command.io.output, "Stream<Entry>");
+        assert_eq!(command.options.len(), 1);
+        assert_eq!(command.options[0].names, ["path"]);
+        assert_eq!(command.options[0].kind, ArgumentKind::Positional);
         assert!(command
             .examples
             .iter()
-            .any(|example| example == "ls -la src"));
+            .any(|example| example.starts_with("ls . |")));
     }
 
     #[test]
@@ -2687,7 +2663,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_options_merge_without_overwriting_exact_builtin_facts() {
+    fn imported_system_ls_owns_the_unqualified_normal_mode_contract() {
         let mut catalog = Catalog::builtin();
         let diagnostics = catalog.merge_report(import_fish(
             "complete -c ls -l color -d 'Colorize output'",
@@ -2695,13 +2671,14 @@ mod tests {
         ));
         assert!(diagnostics.is_empty());
         let command = catalog.find("ls").unwrap();
-        assert_eq!(command.provenance.source, Provenance::Builtin);
+        assert_eq!(command.provenance.source, Provenance::Fish);
         let color = command
             .options
             .iter()
             .find(|option| option.names.contains(&"--color".to_owned()))
             .unwrap();
         assert_eq!(color.provenance.source, Provenance::Fish);
+        assert!(catalog.find("quirl data ls").is_some());
     }
 
     #[test]

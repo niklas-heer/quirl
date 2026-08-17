@@ -1331,7 +1331,7 @@ mod tests {
     #[test]
     fn validated_plugin_catalog_entries_reach_docs_and_completion_without_execution() {
         let mut catalog = Catalog::builtin();
-        let mut plugin = catalog.find("ls").unwrap().clone();
+        let mut plugin = catalog.find("quirl data ls").unwrap().clone();
         plugin.id = "plugin:demo/demo/run".to_owned();
         plugin.path = "demo run".to_owned();
         plugin.signature = "demo run".to_owned();
@@ -1764,17 +1764,23 @@ mod tests {
     fn command_recognition_requires_an_exact_token_boundary() {
         let catalog = Catalog::builtin();
         assert_eq!(
-            command_at(&catalog, "ls").map(|command| command.path.as_str()),
-            Some("ls")
+            command_at(&catalog, "quirl check").map(|command| command.path.as_str()),
+            Some("quirl check")
         );
         assert_eq!(
-            command_at(&catalog, "  ls --format json").map(|command| command.path.as_str()),
-            Some("ls")
+            command_at(&catalog, "  quirl check --format json")
+                .map(|command| command.path.as_str()),
+            Some("quirl check")
         );
-        for line in ["lsfoo", "ls-foo", "ls.foo", "quirl checker"] {
+        for line in [
+            "quirl checkmate",
+            "quirl check-more",
+            "quirl check.more",
+            "quirl checker",
+        ] {
             assert_ne!(
                 command_at(&catalog, line).map(|command| command.path.as_str()),
-                Some("ls")
+                Some("quirl check")
             );
         }
     }

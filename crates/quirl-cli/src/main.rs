@@ -1875,7 +1875,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             data: data_cache.snapshot(),
         });
         let history_directory = std::env::current_dir().unwrap_or_default();
-        line_editor.install_history_snapshot(history_database.snapshot(&history_directory)?);
+        line_editor.install_history_snapshot(history_database.snapshot(&history_directory, mode)?);
         let signal = line_editor.read_line(&mut prompt);
         // Rich Alt-Q transitions happen while the surface retains terminal
         // ownership. Adopt the mode rendered by that session before classifying

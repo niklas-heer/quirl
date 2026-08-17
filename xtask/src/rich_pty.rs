@@ -761,6 +761,10 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
         &binary_dir.join("handoff-tool"),
         "#!/bin/sh\nprintf 'HANDOFF_STARTED\\n'\n/bin/sleep 2\nprintf 'HANDOFF_DONE\\n'\n",
     )?;
+    write_executable(
+        &binary_dir.join("ls"),
+        "#!/bin/sh\nprintf 'SYSTEM_LS:%s\\n' \"$*\"\n",
+    )?;
 
     let mut session = Session::new(
         binary,
@@ -798,15 +802,17 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
             screen.bottom_line().contains("NORMAL")
         })?;
 
-    wait_for_command_information(
-        &mut session,
-        "ls",
-        &[
-            "List a directory as structured",
-            "Capabilities:",
-            "Enter run",
-        ],
-    )?;
+    wait_for_command_information(&mut session, "ls", &["Enter run"])?;
+    let normal_ls_information = session.pty.screen().text();
+    if normal_ls_information.contains("List a directory as typed entries in Data mode")
+        || normal_ls_information.contains("source: quirl · built-in")
+        || !normal_ls_information.contains("source:")
+    {
+        return Err(screen_error(
+            "Normal mode exposed Quirl's typed ls instead of the PATH command",
+            session.pty.screen(),
+        ));
+    }
     session.pty.send(b"\x1b[B")?;
     session
         .pty
@@ -852,58 +858,109 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
             screen.bottom_line().contains("NORMAL")
         })?;
 
-    session.pty.type_text("ls -")?;
+    session.pty.type_text("ls -al")?;
+    let normal_ls_start = session.pty.output().len();
+    session.pty.send(key::ENTER)?;
     session
         .pty
-        .wait_for_screen("automatic flag options", |screen| {
-            let text = screen.text();
-            text.contains("--all") && text.contains("Include hidden entries")
+        .wait_for_screen("Normal ls dispatched to PATH", |screen| {
+            transcript_tail_flows_into_prompt(screen, "ls -al", "SYSTEM_LS:-al")
+                && screen.bottom_line().contains("NORMAL")
         })?;
-    clear_editor(&mut session)?;
-    session.pty.type_text("ls -al")?;
-    session.pty.wait_for_screen_text("ls -al")?;
-    session.pty.drain_for(Duration::from_millis(300))?;
-    if session.pty.screen().text().contains("unknown flag") {
+    session
+        .pty
+        .wait_for_since(b"\x1b[?1000h", normal_ls_start, DEFAULT_TIMEOUT)?;
+    if session.pty.screen().text().contains("unknown flag")
+        || session
+            .pty
+            .screen()
+            .text()
+            .contains("List a directory as typed entries in Data mode")
+    {
         return Err(screen_error(
-            "valid clustered ls flags produced an unknown-flag diagnostic",
+            "Normal ls was parsed as Quirl's typed-data override",
             session.pty.screen(),
         ));
     }
-    clear_editor(&mut session)?;
-    session.pty.type_text("ls -alz")?;
+    session.pty.drain_for(Duration::from_millis(100))?;
+    session.pty.send(key::CTRL_U)?;
     session
         .pty
-        .wait_for_screen_text("unknown flag `-alz` for `ls`")?;
-    session.pty.send(key::CTRL_C)?;
-    wait_for_standard_status(&mut session)?;
-
+        .wait_for_screen("fresh blank Normal prompt after ls", |screen| {
+            screen.lines().iter().any(|line| line.trim() == ">")
+                && !screen
+                    .lines()
+                    .iter()
+                    .any(|line| line.trim_start().starts_with("> ls -al"))
+                && screen.bottom_line().contains("NORMAL")
+        })?;
+    write_fixture(
+        &session.private.path.join("DATA_MODE_LS_SENTINEL"),
+        "visible to typed ls\n",
+    )?;
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"d")?;
+    session
+        .pty
+        .wait_for_screen("Data mode before typed ls checks", |screen| {
+            screen.bottom_line().contains("DATA")
+        })?;
+    session.pty.resize(18, 400)?;
     wait_for_command_information(
         &mut session,
         "ls",
-        &["List a directory as structured", "Enter run"],
+        &[
+            "List a directory as typed entries in Data mode",
+            "Enter run",
+        ],
     )?;
-    write_fixture(
-        &session.private.path.join("FIRST_ENTER_EXECUTED"),
-        "visible to native ls\n",
-    )?;
+    let data_ls_information = session.pty.screen().text();
+    if data_ls_information.contains("Installed command discovered")
+        || data_ls_information.contains("--all")
+        || data_ls_information.contains("--long")
+    {
+        return Err(screen_error(
+            "Data mode selected the PATH ls instead of its typed override",
+            session.pty.screen(),
+        ));
+    }
+    session.pty.send(key::ESCAPE)?;
+    wait_for_mode_status(&mut session, "DATA")?;
+    clear_editor_in_mode(&mut session, "DATA")?;
+    session.pty.resize(18, 120)?;
+    session
+        .pty
+        .wait_for_screen("normal-width typed ls frame", |screen| {
+            screen.bottom_line().contains("DATA")
+        })?;
+    session.pty.type_text("ls")?;
     let execution_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session
         .pty
-        .wait_for_screen("first command output in persistent viewport", |screen| {
-            screen.text().contains("FIRST_ENTER_EXECUTED")
-                && screen.bottom_line().contains("NORMAL")
+        .wait_for_screen("Data ls used Quirl's typed override", |screen| {
+            screen
+                .lines()
+                .iter()
+                .any(|line| line.contains("file") && line.contains("DATA_MODE_LS_SENTINEL"))
+                && screen.bottom_line().contains("DATA")
         })?;
     let execution = &session.pty.output()[execution_start..];
-    if !contains(execution, b"FIRST_ENTER_EXECUTED")
+    if !contains(execution, b"DATA_MODE_LS_SENTINEL")
         || contains(execution, ALTERNATE_SCREEN_LEAVE)
         || contains(execution, ALTERNATE_SCREEN_ENTER)
     {
         return Err(io::Error::other(
-            "ordinary command output did not remain inside the persistent viewport",
+            "typed ls output did not remain inside the persistent viewport",
         )
         .into());
     }
+    session
+        .pty
+        .wait_for_since(b"\x1b[?1000h", execution_start, DEFAULT_TIMEOUT)?;
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"n")?;
+    wait_for_standard_status(&mut session)?;
     session.pty.type_text("x")?;
     session.pty.wait_for_screen_text("x")?;
     clear_editor(&mut session)?;
@@ -1176,10 +1233,20 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
         .wait_for_screen("corrupt-cache fallback frame", |screen| {
             screen.bottom_line().contains("NORMAL")
         })?;
+    degraded.pty.send(key::ALT_Q)?;
+    degraded.pty.send(b"d")?;
+    degraded
+        .pty
+        .wait_for_screen("corrupt-cache Data fallback frame", |screen| {
+            screen.bottom_line().contains("DATA")
+        })?;
     wait_for_command_information(
         &mut degraded,
         "ls",
-        &["List a directory as structured", "Capabilities:"],
+        &[
+            "List a directory as typed entries in Data mode",
+            "Capabilities:",
+        ],
     )?;
     write_fixture(
         &degraded.private.path.join("FALLBACK_BUILTIN_VISIBLE"),
@@ -1190,7 +1257,7 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     degraded
         .pty
         .wait_for_screen("corrupt-cache fallback returned", |screen| {
-            screen.bottom_line().contains("NORMAL")
+            screen.bottom_line().contains("DATA")
         })?;
     let cleanup_start = degraded.pty.output().len();
     degraded.pty.send(key::CTRL_D)?;
@@ -1399,8 +1466,8 @@ fn check_retained_output_cycles(binary: &Path) -> Result<(), Box<dyn Error>> {
         session.pty.wait_for_screen(
             &format!("persistent viewport command cycle {cycle}"),
             |screen| {
-                screen.text().contains(&marker)
-                    && screen.lines().get(1).is_some_and(|line| line.trim() == ">")
+                transcript_tail_flows_into_prompt(screen, &command, &marker)
+                    && screen.bottom_line().contains("NORMAL")
             },
         )?;
         let emitted = &session.pty.output()[output_start..];
@@ -1425,11 +1492,48 @@ fn check_retained_output_cycles(binary: &Path) -> Result<(), Box<dyn Error>> {
         }
         ensure_bottom_status(&session, "persistent command viewport")?;
     }
+    let tail_snapshot = session.pty.screen().text();
     session.pty.send(b"\x1b[5~")?;
-    session.pty.wait_for_screen_text("RETAINED_CYCLE_00")?;
+    session
+        .pty
+        .wait_for_screen("PageUp changed the transcript viewport", |screen| {
+            let text = screen.text();
+            text != tail_snapshot
+                && text.contains("RETAINED_CYCLE_00")
+                && !text.contains("RETAINED_CYCLE_11")
+                && screen.bottom_line().contains("NORMAL")
+        })?;
     ensure_bottom_status(&session, "scrolled persistent viewport")?;
-    session.pty.send(b"\x1b[6~\x1b[6~")?;
-    session.pty.wait_for_screen_text("RETAINED_CYCLE_11")?;
+    session.pty.send(b"\x1b[6~")?;
+    session
+        .pty
+        .wait_for_screen("PageDown returned to transcript tail", |screen| {
+            transcript_tail_flows_into_prompt(
+                screen,
+                "/usr/bin/printf RETAINED_CYCLE_11",
+                "RETAINED_CYCLE_11",
+            ) && screen.bottom_line().contains("NORMAL")
+        })?;
+
+    session.pty.send(b"\x1b[<64;1;1M")?;
+    session
+        .pty
+        .wait_for_screen("mouse wheel up changed the transcript viewport", |screen| {
+            let text = screen.text();
+            text != tail_snapshot
+                && screen.bottom_line().contains("SCROLL")
+                && screen.bottom_line().contains("NORMAL")
+        })?;
+    session.pty.send(b"\x1b[<65;1;1M")?;
+    session
+        .pty
+        .wait_for_screen("mouse wheel down returned to transcript tail", |screen| {
+            transcript_tail_flows_into_prompt(
+                screen,
+                "/usr/bin/printf RETAINED_CYCLE_11",
+                "RETAINED_CYCLE_11",
+            ) && screen.bottom_line().contains("NORMAL")
+        })?;
 
     let copy_start = session.pty.output().len();
     session.pty.send(key::ALT_Q)?;
@@ -1444,6 +1548,24 @@ fn check_retained_output_cycles(binary: &Path) -> Result<(), Box<dyn Error>> {
     }
     session.pty.send(key::CTRL_D)?;
     ensure_status(session.pty.wait_exit()?, 0, "retained-output cycles")
+}
+
+fn transcript_tail_flows_into_prompt(screen: &VirtualScreen, command: &str, output: &str) -> bool {
+    let command_record = format!("❯ {command}");
+    let lines = screen.lines();
+    let command_row = lines
+        .iter()
+        .rposition(|line| line.contains(&command_record));
+    let output_row = lines
+        .iter()
+        .rposition(|line| line.trim_start().starts_with(output));
+    let exit_row = lines.iter().rposition(|line| line.contains("── exit "));
+    let prompt_row = lines.iter().rposition(|line| line.trim() == ">");
+    matches!(
+        (command_row, output_row, exit_row, prompt_row),
+        (Some(command_row), Some(output_row), Some(exit_row), Some(prompt_row))
+            if command_row < output_row && output_row < exit_row && exit_row < prompt_row
+    )
 }
 
 fn check_interactive_runtime(binary: &Path) -> Result<(), Box<dyn Error>> {
@@ -1927,18 +2049,26 @@ fn ensure_bottom_status(session: &Session, stage: &str) -> Result<(), Box<dyn Er
 }
 
 fn wait_for_standard_status(session: &mut Session) -> Result<(), Box<dyn Error>> {
+    wait_for_mode_status(session, "NORMAL")
+}
+
+fn wait_for_mode_status(session: &mut Session, mode: &str) -> Result<(), Box<dyn Error>> {
     session
         .pty
-        .wait_for_screen("standard bottom status", |screen| {
+        .wait_for_screen(&format!("standard {mode} bottom status"), |screen| {
             let bottom = screen.bottom_line();
-            bottom.contains("NORMAL") && bottom.contains("Tab complete")
+            bottom.contains(mode) && bottom.contains("Tab complete")
         })?;
     Ok(())
 }
 
 fn clear_editor(session: &mut Session) -> Result<(), Box<dyn Error>> {
+    clear_editor_in_mode(session, "NORMAL")
+}
+
+fn clear_editor_in_mode(session: &mut Session, mode: &str) -> Result<(), Box<dyn Error>> {
     session.pty.send(key::CTRL_U)?;
-    wait_for_standard_status(session)
+    wait_for_mode_status(session, mode)
 }
 
 fn ensure_terminal_restored(

@@ -1657,7 +1657,7 @@ mod tests {
     #[test]
     fn manifest_lists_builtin_tools_and_validated_plugin_commands() {
         let mut source = Catalog::builtin();
-        let mut plugin = source.find("ls").unwrap().clone();
+        let mut plugin = source.find("quirl data ls").unwrap().clone();
         plugin.id = "plugin:demo/demo/run".to_owned();
         plugin.path = "demo run".to_owned();
         plugin.signature = "demo run".to_owned();

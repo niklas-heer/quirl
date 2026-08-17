@@ -1342,7 +1342,7 @@ mod platform {
                 }
                 if pipeline.background
                     && pipeline.commands[0].words.first().is_some_and(|name| {
-                        matches!(name.as_str(), "cd" | "ls" | "export" | "jobs" | "fg" | "bg")
+                        matches!(name.as_str(), "cd" | "export" | "jobs" | "fg" | "bg")
                     })
                 {
                     return Err(ShellError::new(
@@ -1570,13 +1570,12 @@ mod platform {
             let Some(name) = command.words.first().map(String::as_str) else {
                 return Ok(None);
             };
-            if !matches!(name, "cd" | "ls" | "export" | "jobs" | "fg" | "bg") {
+            if !matches!(name, "cd" | "export" | "jobs" | "fg" | "bg") {
                 return Ok(None);
             }
             validate_control_redirects(command)?;
             let result = match name {
                 "cd" => Some(builtin::execute_cd(&command.words)?),
-                "ls" => Some(builtin::execute_ls(&command.words)?),
                 "export" => {
                     if command.words.len() == 1 {
                         return Err(ShellError::new(
@@ -1657,14 +1656,6 @@ mod platform {
 
             for (index, command) in pipeline.commands.iter().enumerate() {
                 let last = index + 1 == pipeline.commands.len();
-                if command.words.first().is_some_and(|word| word == "ls") && index != 0 {
-                    return Err(ShellError::new(
-                        ErrorCode::InvalidCommand,
-                        "native `ls` can only be the first stage of a Preview pipeline",
-                    )
-                    .with_command(source)
-                    .with_help("Move `ls` to the start of the pipeline or use `^ls`"));
-                }
                 if stderr_duplication_precedes_stdout_redirect(command) {
                     return Err(ShellError::new(
                         ErrorCode::InvalidCommand,
@@ -1687,22 +1678,6 @@ mod platform {
                     capture_reader = next_reader;
                 } else {
                     previous_reader = next_reader;
-                }
-
-                if command.words.first().is_some_and(|word| word == "ls") {
-                    let result = builtin::execute_ls(&command.words)?;
-                    let bytes = result.stdout.unwrap_or_default().into_bytes();
-                    if command.redirects.iter().any(|redirect| {
-                        matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
-                    }) {
-                        write_redirected_output(command, &bytes)?;
-                    } else if let Some(writer) = writer {
-                        pending_writers.push((writer, bytes));
-                    } else if !capture_streams {
-                        io_write_all(std::io::stdout(), &bytes, "standard output")?;
-                    }
-                    drop(input);
-                    continue;
                 }
 
                 let executable = command
@@ -3749,11 +3724,34 @@ mod platform {
         }
 
         #[test]
-        fn native_ls_and_external_commands_share_a_byte_pipeline() {
+        fn path_ls_and_external_commands_share_a_byte_pipeline() {
             let mut executor = NativeExecutor::default();
             let result = executor.execute_capture("ls | grep Cargo.toml").unwrap();
             assert_eq!(result.status, 0);
             assert_eq!(result.stdout.as_deref(), Some("Cargo.toml\n"));
+        }
+
+        #[test]
+        fn ls_resolves_from_the_session_path_without_builtin_interception() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = temporary_path("path-ls");
+            let executable = directory.join("ls");
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(&executable, "#!/bin/sh\nprintf 'system-ls:%s\\n' \"$*\"\n").unwrap();
+            let mut permissions = fs::metadata(&executable).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&executable, permissions).unwrap();
+
+            let mut executor = NativeExecutor::default();
+            let result = executor
+                .execute_capture(&format!("export PATH={}; ls -al", directory.display()))
+                .unwrap();
+            assert_eq!(result.status, 0);
+            assert_eq!(result.stdout.as_deref(), Some("system-ls:-al\n"));
+            assert_eq!(result.stderr.as_deref(), Some(""));
+
+            fs::remove_dir_all(directory).unwrap();
         }
 
         #[test]
@@ -4365,7 +4363,7 @@ mod platform {
         }
 
         #[test]
-        fn builtin_redirection_and_quoted_paths_preserve_words() {
+        fn command_redirection_and_quoted_paths_preserve_words() {
             let directory = temporary_path("directory with spaces");
             let output = temporary_path("builtin-output");
             fs::create_dir_all(&directory).unwrap();
@@ -5379,7 +5377,7 @@ mod platform {
                 }
                 if pipeline.background
                     && pipeline.commands[0].words.first().is_some_and(|name| {
-                        matches!(name.as_str(), "cd" | "ls" | "export" | "jobs" | "fg" | "bg")
+                        matches!(name.as_str(), "cd" | "export" | "jobs" | "fg" | "bg")
                     })
                 {
                     return Err(ShellError::new(
@@ -5416,7 +5414,6 @@ mod platform {
             };
             match name {
                 "cd" => Ok(Some(builtin::execute_cd(&command.words)?)),
-                "ls" => Ok(Some(builtin::execute_ls(&command.words)?)),
                 "export" => {
                     let mut assignments = Vec::with_capacity(command.words.len().saturating_sub(1));
                     for assignment in command.words.iter().skip(1) {

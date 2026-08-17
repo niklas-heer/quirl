@@ -59,7 +59,12 @@ impl FrameModel<'_> {
             area,
             u16::try_from(input.lines.len()).unwrap_or(u16::MAX),
             self.diagnostic.is_some() && !self.compact,
+            self.transcript.map_or(0, Transcript::line_count),
+            self.transcript.is_none_or(Transcript::follows_tail),
         );
+        if let Some(transcript) = self.transcript {
+            self.render_transcript(frame, layout.transcript, transcript);
+        }
         if let Some(context_area) = layout.context {
             self.render_context(frame, context_area);
         }
@@ -91,7 +96,29 @@ impl FrameModel<'_> {
                 diagnostic_area,
             );
         }
-        self.render_information(frame, layout.information);
+        let information_requested = self.completion.open || self.runtime.focused_panel().is_some();
+        let information_area = if layout.information.height >= 3 || !information_requested {
+            layout.information
+        } else {
+            // Once a session reaches the bottom row there is no space below the
+            // live prompt. Reuse a bounded tail slice of scrollback as an
+            // overlay so opening completion never moves the prompt.
+            let height = if self.picker_layout == PickerLayout::Full {
+                layout.transcript.height
+            } else {
+                layout.transcript.height.min(12)
+            };
+            Rect::new(
+                layout.transcript.x,
+                layout.transcript.bottom().saturating_sub(height),
+                layout.transcript.width,
+                height,
+            )
+        };
+        if information_requested && layout.information.height < 3 {
+            frame.render_widget(Clear, information_area);
+        }
+        self.render_information(frame, information_area);
 
         let status = StatusBarModel {
             editor: self.editor,
@@ -103,6 +130,11 @@ impl FrameModel<'_> {
                 .diagnostic
                 .filter(|_| self.compact)
                 .map(|diagnostic| diagnostic.message.as_str())
+                .or_else(|| {
+                    self.transcript
+                        .is_some_and(|transcript| !transcript.follows_tail())
+                        .then_some("SCROLL · PageUp/PageDown or wheel · Ctrl-End return")
+                })
                 .or(self.output_notice)
                 .or_else(|| {
                     self.output_focus
@@ -185,8 +217,6 @@ impl FrameModel<'_> {
                     id,
                     panel,
                 );
-            } else if let Some(transcript) = self.transcript {
-                self.render_transcript(frame, area, transcript);
             }
         }
     }
@@ -542,6 +572,7 @@ impl FrameModel<'_> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FrameLayout {
+    transcript: Rect,
     context: Option<Rect>,
     input: Rect,
     diagnostic: Option<Rect>,
@@ -549,18 +580,44 @@ struct FrameLayout {
     status: Rect,
 }
 
-fn frame_layout(area: Rect, input_rows: u16, diagnostic_visible: bool) -> FrameLayout {
+fn frame_layout(
+    area: Rect,
+    input_rows: u16,
+    diagnostic_visible: bool,
+    transcript_line_count: usize,
+    follows_tail: bool,
+) -> FrameLayout {
     // Completion and panel state deliberately do not participate in this partition. Both reuse
     // the remaining bounded rectangle, so asynchronous completion transitions cannot move input.
     let status_y = area.bottom().saturating_sub(1);
     let status = Rect::new(area.x, status_y, area.width, 1);
     let rows_above_status = status_y.saturating_sub(area.y);
+    if transcript_line_count > 0 && !follows_tail {
+        let transcript = Rect::new(area.x, area.y, area.width, rows_above_status);
+        return FrameLayout {
+            transcript,
+            context: None,
+            input: Rect::new(area.x, status_y, area.width, 0),
+            diagnostic: None,
+            information: Rect::new(area.x, status_y, area.width, 0),
+            status,
+        };
+    }
+
     let context_height = u16::from(rows_above_status >= 2);
-    let context = (context_height == 1).then_some(Rect::new(area.x, area.y, area.width, 1));
-    let input_y = area.y.saturating_add(context_height);
-    let available_after_context = status_y.saturating_sub(input_y);
+    let available_after_context = rows_above_status.saturating_sub(context_height);
     let diagnostic_height = u16::from(diagnostic_visible && available_after_context >= 2);
     let input_height = input_rows.min(available_after_context.saturating_sub(diagnostic_height));
+    let current_height = context_height
+        .saturating_add(input_height)
+        .saturating_add(diagnostic_height);
+    let transcript_height = u16::try_from(transcript_line_count)
+        .unwrap_or(u16::MAX)
+        .min(rows_above_status.saturating_sub(current_height));
+    let transcript = Rect::new(area.x, area.y, area.width, transcript_height);
+    let context_y = transcript.bottom();
+    let context = (context_height == 1).then_some(Rect::new(area.x, context_y, area.width, 1));
+    let input_y = context_y.saturating_add(context_height);
     let input = Rect::new(area.x, input_y, area.width, input_height);
     let diagnostic_y = input.bottom();
     let diagnostic = (diagnostic_height == 1).then_some(Rect::new(
@@ -577,6 +634,7 @@ fn frame_layout(area: Rect, input_rows: u16, diagnostic_visible: bool) -> FrameL
         status_y.saturating_sub(information_y),
     );
     FrameLayout {
+        transcript,
         context,
         input,
         diagnostic,
@@ -1118,14 +1176,14 @@ mod tests {
 
     #[test]
     fn tiny_layout_prioritizes_status_then_editor_without_out_of_bounds_regions() {
-        let one_row = frame_layout(Rect::new(0, 0, 1, 1), 1, true);
+        let one_row = frame_layout(Rect::new(0, 0, 1, 1), 1, true, 0, true);
         assert_eq!(one_row.status, Rect::new(0, 0, 1, 1));
         assert_eq!(one_row.input.height, 0);
         assert_eq!(one_row.information.height, 0);
         assert!(one_row.context.is_none());
         assert!(one_row.diagnostic.is_none());
 
-        let two_rows = frame_layout(Rect::new(0, 0, 1, 2), u16::MAX, true);
+        let two_rows = frame_layout(Rect::new(0, 0, 1, 2), u16::MAX, true, 0, true);
         assert_eq!(two_rows.input, Rect::new(0, 0, 1, 1));
         assert_eq!(two_rows.status, Rect::new(0, 1, 1, 1));
         assert!(two_rows.context.is_none());
@@ -1203,6 +1261,148 @@ mod tests {
         assert!(row(&terminal, 1).contains('❯'));
         assert!(row(&terminal, 5).contains("NORMAL"));
         assert!(row(&terminal, 4).trim().is_empty());
+    }
+
+    #[test]
+    fn transcript_pushes_the_live_prompt_down_then_scrolls_under_the_fixed_status() {
+        let editor = EditorState::new("emacs", Vec::new());
+        let completion = CompletionState::new(Catalog::builtin(), None);
+        let runtime = RuntimeSurfaceState::new();
+        let mut transcript = Transcript::new(crate::surface::transcript::TranscriptLimits {
+            line_count_max: 64,
+            retained_bytes_max: 4_096,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+
+        for line in ["❯ pwd", "/workspace"] {
+            transcript.append_line(line);
+        }
+        let draw = |terminal: &mut Terminal<TestBackend>, transcript: &Transcript| {
+            terminal
+                .draw(|frame| {
+                    FrameModel {
+                        context_left: "~/workspace",
+                        context_right: "2ms",
+                        editor: &editor,
+                        completion: &completion,
+                        mode: Mode::Command,
+                        diagnostic: None,
+                        highlight_spans: &[],
+                        theme: Theme::new(true),
+                        unicode: true,
+                        symbols: SurfaceSymbols::Unicode,
+                        semantic_hints: true,
+                        hints: true,
+                        timings: None,
+                        compact: false,
+                        picker_query: None,
+                        picker_layout: PickerLayout::Adaptive,
+                        picker_preview: true,
+                        detail_scroll: 0,
+                        runtime: &runtime,
+                        transcript: Some(transcript),
+                        transcript_truncated: false,
+                        output_focus: false,
+                        output_notice: None,
+                    }
+                    .render(frame);
+                })
+                .unwrap();
+        };
+
+        draw(&mut terminal, &transcript);
+        assert!(row(&terminal, 0).contains("❯ pwd"));
+        assert!(row(&terminal, 2).contains("~/workspace"));
+        assert!(row(&terminal, 3).contains('❯'));
+        assert!(row(&terminal, 7).contains("NORMAL"));
+
+        for index in 0..10 {
+            transcript.append_line(&format!("output-{index}"));
+        }
+        draw(&mut terminal, &transcript);
+        assert!(row(&terminal, 4).contains("output-9"));
+        assert!(row(&terminal, 5).contains("~/workspace"));
+        assert!(row(&terminal, 6).contains('❯'));
+        assert!(row(&terminal, 7).contains("NORMAL"));
+
+        assert!(transcript.page_up(7));
+        draw(&mut terminal, &transcript);
+        assert!(!row(&terminal, 5).contains("~/workspace"));
+        assert!(!row(&terminal, 6).contains('❯'));
+        assert!(row(&terminal, 7).contains("SCROLL"));
+    }
+
+    #[test]
+    fn full_transcript_completion_overlays_output_without_moving_the_prompt() {
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("git st");
+        let mut completion = CompletionState::new(Catalog::builtin(), None);
+        let runtime = RuntimeSurfaceState::new();
+        let mut transcript = Transcript::new(crate::surface::transcript::TranscriptLimits {
+            line_count_max: 64,
+            retained_bytes_max: 4_096,
+        });
+        for index in 0..20 {
+            transcript.append_line(&format!("output-{index}"));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(78, 12)).unwrap();
+        let draw = |terminal: &mut Terminal<TestBackend>, completion: &CompletionState| {
+            terminal
+                .draw(|frame| {
+                    FrameModel {
+                        context_left: "~/workspace",
+                        context_right: "",
+                        editor: &editor,
+                        completion,
+                        mode: Mode::Command,
+                        diagnostic: None,
+                        highlight_spans: &[],
+                        theme: Theme::new(true),
+                        unicode: true,
+                        symbols: SurfaceSymbols::Unicode,
+                        semantic_hints: true,
+                        hints: true,
+                        timings: None,
+                        compact: false,
+                        picker_query: None,
+                        picker_layout: PickerLayout::Adaptive,
+                        picker_preview: true,
+                        detail_scroll: 0,
+                        runtime: &runtime,
+                        transcript: Some(&transcript),
+                        transcript_truncated: false,
+                        output_focus: false,
+                        output_notice: None,
+                    }
+                    .render(frame);
+                })
+                .unwrap();
+        };
+
+        draw(&mut terminal, &completion);
+        let cursor_at_rest = terminal.get_cursor_position().unwrap();
+        assert_eq!(cursor_at_rest.y, 10);
+        completion.open_manual(
+            vec![CompletionItem {
+                value: "git status".to_owned(),
+                display: "status".to_owned(),
+                summary: "Show working tree status".to_owned(),
+                detail: "git status [--short]".to_owned(),
+                replace_start: 4,
+                replace_end: 6,
+                match_indices: vec![0, 1],
+                kind: CompletionKind::Command,
+                source: "catalog",
+                trust: "builtin",
+            }],
+            "catalog",
+        );
+        draw(&mut terminal, &completion);
+        assert_eq!(terminal.get_cursor_position().unwrap(), cursor_at_rest);
+        let rendered = (0..12).map(|y| row(&terminal, y)).collect::<String>();
+        assert!(rendered.contains("completions"));
+        assert!(row(&terminal, 10).contains("❯ git st"));
+        assert!(row(&terminal, 11).contains("NORMAL"));
     }
 
     #[test]

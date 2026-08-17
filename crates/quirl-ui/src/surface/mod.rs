@@ -55,8 +55,8 @@ use crate::theme::Theme;
 use crossterm::{
     cursor::{SetCursorStyle, Show},
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     style::Print,
@@ -91,6 +91,7 @@ const HISTORY_REPLACEMENT_BYTES_MAX: usize = MAX_HISTORY_FILE_BYTES * 2;
 const TRANSCRIPT_LINES_MAX: usize = 50_000;
 const TRANSCRIPT_BYTES_MAX: usize = 16 * 1024 * 1024;
 const TRANSCRIPT_COPY_BYTES_MAX: usize = 1024 * 1024;
+const TRANSCRIPT_MOUSE_SCROLL_LINES: usize = 3;
 #[cfg(test)]
 static HISTORY_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -513,6 +514,7 @@ impl RichSurface {
             match input_event {
                 Event::Paste(text) => {
                     self.output_notice = None;
+                    self.return_to_tail_for_input();
                     if self.picker.active() {
                         self.update_picker_query(|picker| picker.insert_query(&text));
                         continue;
@@ -522,6 +524,21 @@ impl RichSurface {
                     self.refresh_completion_after_edit(&editor, prompt.mode)?;
                 }
                 Event::Resize(_, _) => continue,
+                Event::Mouse(mouse) => {
+                    let visible_rows = self.transcript_visible_rows();
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            self.transcript
+                                .scroll_up(TRANSCRIPT_MOUSE_SCROLL_LINES, visible_rows);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            self.transcript
+                                .scroll_down(TRANSCRIPT_MOUSE_SCROLL_LINES, visible_rows);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if self.output_focus {
                         self.handle_output_key(key.code)?;
@@ -529,6 +546,7 @@ impl RichSurface {
                     }
                     self.output_notice = None;
                     if self.leader_active {
+                        self.return_to_tail_for_input();
                         self.handle_leader_key(key.code, prompt, editor.buffer(), editor.cursor())?;
                         continue;
                     }
@@ -563,6 +581,7 @@ impl RichSurface {
                         }
                         _ => {}
                     }
+                    self.return_to_tail_for_input();
                     if self.picker.active() {
                         match key.code {
                             KeyCode::Up | KeyCode::BackTab => {
@@ -719,7 +738,11 @@ impl RichSurface {
                             if self.completion.open {
                                 self.completion.next();
                             } else {
-                                self.completion.request(editor.buffer(), editor.cursor())?;
+                                self.completion.request(
+                                    editor.buffer(),
+                                    editor.cursor(),
+                                    prompt.mode,
+                                )?;
                             }
                         }
                         EditAction::ExpandCompletionPicker => {
@@ -729,7 +752,11 @@ impl RichSurface {
                                 let items = self.completion.items.clone();
                                 self.open_picker_items(items, "completions", true);
                             } else {
-                                self.completion.request(editor.buffer(), editor.cursor())?;
+                                self.completion.request(
+                                    editor.buffer(),
+                                    editor.cursor(),
+                                    prompt.mode,
+                                )?;
                                 self.expand_completion_pending = true;
                             }
                         }
@@ -857,7 +884,11 @@ impl RichSurface {
 
     fn transcript_visible_rows(&self) -> usize {
         let rows = terminal::size().map_or(24, |(_, rows)| rows);
-        usize::from(rows.saturating_sub(4).max(1))
+        transcript_visible_rows_for_terminal(rows, self.transcript.follows_tail())
+    }
+
+    fn return_to_tail_for_input(&mut self) {
+        self.transcript.scroll_to_end();
     }
 
     fn open_output_focus(&mut self) {
@@ -999,7 +1030,7 @@ impl RichSurface {
             self.completion_auto,
             self.completion_min_chars,
         ) {
-            self.completion.request_automatic(line, cursor)?;
+            self.completion.request_automatic(line, cursor, mode)?;
         }
         Ok(())
     }
@@ -1237,6 +1268,7 @@ impl SurfaceTerminal {
         if let Err(error) = execute!(
             io::stderr(),
             EnableBracketedPaste,
+            EnableMouseCapture,
             SetCursorStyle::SteadyBar
         ) {
             self.reset_best_effort();
@@ -1277,6 +1309,7 @@ impl SurfaceTerminal {
         if let Err(error) = execute!(
             io::stderr(),
             EnableBracketedPaste,
+            EnableMouseCapture,
             SetCursorStyle::SteadyBar
         ) {
             self.reset_best_effort();
@@ -1296,6 +1329,7 @@ impl SurfaceTerminal {
             io::stderr(),
             Show,
             DisableBracketedPaste,
+            DisableMouseCapture,
             SetCursorStyle::DefaultUserShape
         ) {
             retain_error(
@@ -1377,6 +1411,7 @@ impl SurfaceTerminal {
             io::stderr(),
             Show,
             DisableBracketedPaste,
+            DisableMouseCapture,
             SetCursorStyle::DefaultUserShape
         ) {
             retain_error(
@@ -1420,6 +1455,7 @@ impl SurfaceTerminal {
             io::stderr(),
             Show,
             DisableBracketedPaste,
+            DisableMouseCapture,
             SetCursorStyle::DefaultUserShape
         );
         if self.alternate_screen {
@@ -1791,6 +1827,13 @@ fn input_is_incomplete(buffer: &str, mode: Mode) -> bool {
     })
 }
 
+fn transcript_visible_rows_for_terminal(rows: u16, follows_tail: bool) -> usize {
+    // At the tail, context and the live input consume two additional rows
+    // above the fixed status. Once scrolled, the transcript owns that space.
+    let reserved_rows = if follows_tail { 3 } else { 1 };
+    usize::from(rows.saturating_sub(reserved_rows).max(1))
+}
+
 fn current_token_len(buffer: &str, cursor: usize) -> usize {
     buffer[..cursor.min(buffer.len())]
         .rsplit_once(char::is_whitespace)
@@ -1813,6 +1856,10 @@ fn should_open_automatic_completion(
     let token_len = current_token_len(buffer, cursor);
     if mode == Mode::Natural {
         return false;
+    }
+    if mode == Mode::Data && before.trim_end().len() == before.len() && before.trim_start() == "ls"
+    {
+        return true;
     }
     if configured_auto && token_len >= configured_min_chars {
         return true;
@@ -1865,6 +1912,13 @@ mod tests {
     }
 
     #[test]
+    fn tail_navigation_accounts_for_context_and_live_prompt_rows() {
+        assert_eq!(transcript_visible_rows_for_terminal(24, true), 21);
+        assert_eq!(transcript_visible_rows_for_terminal(24, false), 23);
+        assert_eq!(transcript_visible_rows_for_terminal(2, true), 1);
+    }
+
+    #[test]
     fn rich_terminal_dimensions_accept_the_exact_bound_and_reject_overflow() {
         assert!(
             validate_rich_terminal_size((RICH_TERMINAL_COLUMNS_MAX, RICH_TERMINAL_ROWS_MAX))
@@ -1883,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_command_information_opens_automatically_and_dismisses_after_space() {
+    fn data_ls_information_opens_automatically_without_enabling_global_auto_completion() {
         let config = QuirlConfig::default();
         assert!(!config.completion.auto);
         let mut surface = RichSurface::new(
@@ -1898,7 +1952,7 @@ mod tests {
         editor.insert_paste("ls");
 
         surface
-            .refresh_completion_after_edit(&editor, Mode::Command)
+            .refresh_completion_after_edit(&editor, Mode::Data)
             .unwrap();
         assert!(surface.completion.open);
         let deadline = Instant::now() + Duration::from_millis(200);
@@ -1916,16 +1970,22 @@ mod tests {
 
         assert!(editor.apply(EditAction::Insert(' ')));
         surface
-            .refresh_completion_after_edit(&editor, Mode::Command)
+            .refresh_completion_after_edit(&editor, Mode::Data)
             .unwrap();
         assert!(!surface.completion.open);
         assert!(!surface.completion.streaming);
     }
 
     #[test]
-    fn flag_prefix_opens_catalog_options_without_tab() {
+    fn normal_imported_flag_prefix_opens_catalog_options_without_tab() {
+        let mut catalog = Catalog::builtin();
+        let diagnostics = catalog.merge_report(quirl_catalog::import_fish(
+            "complete -c ls -s a -l all -d 'Show all entries'",
+            "ls.fish",
+        ));
+        assert!(diagnostics.is_empty());
         let mut surface = RichSurface::new(
-            Arc::new(Catalog::builtin()),
+            Arc::new(catalog),
             None,
             Arc::new(crate::StablePickerRanker),
             &QuirlConfig::default(),
@@ -2161,6 +2221,27 @@ mod tests {
         assert_eq!(lines[3], "last\\u{1b}[2J");
         assert_eq!(lines[4], "warning");
         assert_eq!(lines[5], "── exit 7 · 12ms ──");
+    }
+
+    #[test]
+    fn editing_after_scrollback_returns_to_the_live_prompt_tail() {
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        for index in 0..30 {
+            surface.append_transcript_line(&format!("output-{index}"));
+        }
+        assert!(surface.transcript.page_up(10));
+        assert!(!surface.transcript.follows_tail());
+
+        surface.return_to_tail_for_input();
+
+        assert!(surface.transcript.follows_tail());
     }
 
     #[test]

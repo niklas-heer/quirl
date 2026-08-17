@@ -803,6 +803,18 @@ mod tests {
 
     static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
+    fn catalog_with_declared_system_ls() -> Catalog {
+        let mut catalog = Catalog::builtin();
+        let diagnostics = catalog.merge_report(import_fish(
+            "complete -c ls -s a -l all -d 'Show all entries'\n\
+             complete -c ls -s l -l long -d 'Use long format'\n\
+             complete -c ls -l format -r -d 'Choose output format'",
+            "ls.fish",
+        ));
+        assert!(diagnostics.is_empty());
+        catalog
+    }
+
     #[test]
     fn revision_cache_analyzes_a_four_kib_line_once() {
         let catalog = Catalog::builtin();
@@ -858,8 +870,8 @@ mod tests {
     }
 
     #[test]
-    fn builtin_option_validation_handles_clusters_long_options_and_terminators() {
-        let catalog = Catalog::builtin();
+    fn imported_system_option_validation_handles_clusters_long_options_and_terminators() {
+        let catalog = catalog_with_declared_system_ls();
         for input in [
             "ls -al",
             "ls -la",
@@ -885,7 +897,7 @@ mod tests {
 
     #[test]
     fn short_option_with_a_value_ends_cluster_decomposition() {
-        let mut catalog = Catalog::builtin();
+        let mut catalog = catalog_with_declared_system_ls();
         let command = catalog.find("ls").unwrap().clone();
         let mut output = command
             .options
@@ -916,7 +928,7 @@ mod tests {
 
     #[test]
     fn subcommands_multiword_aliases_and_utf8_short_names_resolve_exactly() {
-        let mut catalog = Catalog::builtin();
+        let mut catalog = catalog_with_declared_system_ls();
         catalog
             .commands
             .iter_mut()

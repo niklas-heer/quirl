@@ -150,12 +150,22 @@ impl Transcript {
     ///
     /// Returns `true` only when the visible range changes.
     pub(super) fn page_up(&mut self, visible_line_count: usize) -> bool {
-        if visible_line_count == 0 || self.lines.is_empty() {
+        self.scroll_up(
+            visible_line_count.saturating_sub(1).max(1),
+            visible_line_count,
+        )
+    }
+
+    /// Move toward older output by at most `line_count` logical lines.
+    ///
+    /// This is the bounded primitive used for terminal mouse-wheel events.
+    /// Page navigation delegates to it with one line of overlap.
+    pub(super) fn scroll_up(&mut self, line_count: usize, visible_line_count: usize) -> bool {
+        if line_count == 0 || visible_line_count == 0 || self.lines.is_empty() {
             return false;
         }
         let current_start = self.visible_range(visible_line_count).start;
-        let page_lines = visible_line_count.saturating_sub(1).max(1);
-        let next_start = current_start.saturating_sub(page_lines);
+        let next_start = current_start.saturating_sub(line_count);
         if next_start == current_start {
             return false;
         }
@@ -167,13 +177,22 @@ impl Transcript {
     ///
     /// Reaching the newest complete page resumes automatic tail following.
     pub(super) fn page_down(&mut self, visible_line_count: usize) -> bool {
-        if visible_line_count == 0 || self.lines.is_empty() {
+        self.scroll_down(
+            visible_line_count.saturating_sub(1).max(1),
+            visible_line_count,
+        )
+    }
+
+    /// Move toward newer output by at most `line_count` logical lines.
+    ///
+    /// Reaching the newest complete page resumes automatic tail following.
+    pub(super) fn scroll_down(&mut self, line_count: usize, visible_line_count: usize) -> bool {
+        if line_count == 0 || visible_line_count == 0 || self.lines.is_empty() {
             return false;
         }
         let current_start = self.visible_range(visible_line_count).start;
         let maximum_start = self.lines.len().saturating_sub(visible_line_count);
-        let page_lines = visible_line_count.saturating_sub(1).max(1);
-        let next_start = current_start.saturating_add(page_lines).min(maximum_start);
+        let next_start = current_start.saturating_add(line_count).min(maximum_start);
         if next_start == current_start && self.follows_tail() {
             return false;
         }
@@ -430,6 +449,33 @@ mod tests {
         assert!(transcript.page_up(4));
         assert!(transcript.scroll_to_end());
         assert!(transcript.follows_tail());
+    }
+
+    #[test]
+    fn line_navigation_supports_bounded_mouse_wheel_steps() {
+        let mut transcript = transcript(20, 1_024);
+        for line in 0..10 {
+            transcript.append_line(&format!("line-{line}"));
+        }
+
+        assert!(transcript.scroll_up(3, 4));
+        assert_eq!(
+            visible_lines(&transcript, 4),
+            ["line-3", "line-4", "line-5", "line-6"]
+        );
+        assert!(transcript.scroll_down(2, 4));
+        assert_eq!(
+            visible_lines(&transcript, 4),
+            ["line-5", "line-6", "line-7", "line-8"]
+        );
+        assert!(transcript.scroll_down(3, 4));
+        assert!(transcript.follows_tail());
+        assert_eq!(
+            visible_lines(&transcript, 4),
+            ["line-6", "line-7", "line-8", "line-9"]
+        );
+        assert!(!transcript.scroll_up(0, 4));
+        assert!(!transcript.scroll_down(1, 0));
     }
 
     #[test]
