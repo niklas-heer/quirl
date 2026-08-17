@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 /// Project-wide major version at which the initial machine contracts were frozen.
 pub const PROTOCOL_FREEZE_VERSION: u32 = 1;
 /// Current version of the value, stream, result, and error ABI shared by crates.
-pub const COMMON_ABI_SCHEMA_VERSION: u32 = 1;
+pub const COMMON_ABI_SCHEMA_VERSION: u32 = 2;
 /// Canonical structural description used to fingerprint the common ABI.
 ///
 /// Any serialized-shape or semantic change must update this descriptor and the
 /// corresponding schema version; [`schema_fingerprint`] derives its identity.
-pub const COMMON_ABI_SCHEMA_DESCRIPTOR: &str = "quirl.abi@1{Value:null|bool|i64|f64|string|list<Value>|record<string,Value>;Stream:bounded ordered Value sequence with cancellation;Result:ok(Value)|error(ShellError);ShellError{unknown_fields:currently-accepted;code:enum[invalid_command,invalid_argument,data,io,process_spawn,script_read,lua,validation,resource_limit];message:string;labels:array<{source:null|string,start:usize,end:usize,message:string}>;context:array<string>;help:array<string>;command:null|string;exit_status:null|i32}}";
+pub const COMMON_ABI_SCHEMA_DESCRIPTOR: &str = "quirl.abi@2{StructuredValue:adjacent-tag(type,value)[nothing|bool(bool)|int(i64)|uint(u64)|decimal(string)|string(string)|list(array<StructuredValue>)|record(map<string,StructuredValue>)|path(string)|duration{nanoseconds:u64}|size{bytes:u64}|date_time(string)|pattern(string)];Stream:bounded ordered StructuredValue sequence with cancellation;Result:ok(StructuredValue)|error(ShellError);ShellError{unknown_fields:currently-accepted;code:enum[invalid_command,invalid_argument,data,io,process_spawn,script_read,lua,validation,resource_limit];message:string;labels:array<{source:null|string,start:u64,end:u64,message:string}>;context:array<string>;help:array<string>;command:null|string;exit_status:null|i32}}";
+/// Historical common ABI descriptor retained for version-1 identity checks.
+pub const COMMON_ABI_SCHEMA_V1_DESCRIPTOR: &str = "quirl.abi@1{Value:null|bool|i64|f64|string|list<Value>|record<string,Value>;Stream:bounded ordered Value sequence with cancellation;Result:ok(Value)|error(ShellError);ShellError{unknown_fields:currently-accepted;code:enum[invalid_command,invalid_argument,data,io,process_spawn,script_read,lua,validation,resource_limit];message:string;labels:array<{source:null|string,start:usize,end:usize,message:string}>;context:array<string>;help:array<string>;command:null|string;exit_status:null|i32}}";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -113,8 +115,27 @@ mod tests {
     #[test]
     fn common_abi_descriptor_has_a_frozen_identity() {
         assert_eq!(
-            schema_fingerprint(COMMON_ABI_SCHEMA_DESCRIPTOR),
+            schema_fingerprint(COMMON_ABI_SCHEMA_V1_DESCRIPTOR),
             "fnv1a64:e46e0983e50da1af"
+        );
+        assert_eq!(
+            schema_fingerprint(COMMON_ABI_SCHEMA_DESCRIPTOR),
+            "fnv1a64:254f7565de75d691"
+        );
+    }
+
+    #[test]
+    fn common_abi_v1_fails_closed_and_current_value_shape_is_typed() {
+        assert!(VersionPolicy::frozen(COMMON_ABI_SCHEMA_VERSION)
+            .validate("common ABI", 1)
+            .is_err());
+        let value = crate::StructuredValue::Duration { nanoseconds: 42 };
+        assert_eq!(
+            serde_json::to_value(value).unwrap(),
+            serde_json::json!({
+                "type": "duration",
+                "value": {"nanoseconds": 42},
+            })
         );
     }
 }

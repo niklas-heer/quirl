@@ -10,12 +10,16 @@ The crate provides:
 - deterministic installed-content hashes and comprehensive structural schema
   fingerprints;
 - relevance-ranked context selection under a documented token estimate;
+- 4 MiB agent-document and 256 KiB `plugin.toml` admission limits enforced
+  before parsing;
 - deny-unknown `plugin.toml` parsing and Quirl-version/capability checks; and
 - package public-command, Phase 2 contribution, source-audit reconciliation,
   and network-free publish-plan gates.
 
 The CLI is responsible for adapting the generated Lua `HOST_API` into these
 contracts, supplying trusted installed catalog/HOST_API hash anchors, reading
-package files, and using `quirl-lua` for non-executing parse/lint checks. This
-preserves the one-way dependency graph: `quirl-contract` does not depend on the
-Lua layer. Validation never executes Lua.
+package files under equal or tighter limits, and using `quirl-lua` for
+non-executing parse/lint checks. The owning crate rechecks contract byte limits
+and portable package-entry syntax. This preserves the one-way dependency
+graph: `quirl-contract` does not depend on the Lua layer. Validation never
+executes Lua.

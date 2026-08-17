@@ -14,15 +14,15 @@ pub use agent::{
     AgentContext, AgentDocumentKind, AgentManifest, AgentProvenance, AgentValidationAnchors,
     DiagnosticSeverity, HostCapability, HostParameter, InstalledCapability, ValidationDiagnostic,
     ValidationReport, AGENT_CATALOG_SCHEMA_DESCRIPTOR, AGENT_CONTEXT_SCHEMA_DESCRIPTOR,
-    AGENT_MANIFEST_SCHEMA_DESCRIPTOR, AGENT_SCHEMA_VERSION, DEFAULT_TOKEN_BUDGET,
-    MINIMUM_TOKEN_BUDGET,
+    AGENT_CONTEXT_SCHEMA_V1_DESCRIPTOR, AGENT_DOCUMENT_BYTES_MAX, AGENT_MANIFEST_SCHEMA_DESCRIPTOR,
+    AGENT_SCHEMA_VERSION, DEFAULT_TOKEN_BUDGET, MINIMUM_TOKEN_BUDGET,
 };
 pub use package::{
     build_package, package_build_schema_hash, package_manifest_schema_hash, parse_package_manifest,
     validate_package_manifest, ArgumentKind, PackageArgument, PackageBuild, PackageBuildOutcome,
     PackageCapabilitySection, PackageCommand, PackageContributions, PackageManifest,
     PackageMetadata, PackagePublishPlan, PackageSourceAudit, PACKAGE_BUILD_SCHEMA_DESCRIPTOR,
-    PACKAGE_SCHEMA_DESCRIPTOR, PACKAGE_SCHEMA_VERSION,
+    PACKAGE_MANIFEST_BYTES_MAX, PACKAGE_SCHEMA_DESCRIPTOR, PACKAGE_SCHEMA_VERSION,
 };
 
 /// Stable, dependency-free hash used in versioned schema identifiers.
