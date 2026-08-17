@@ -1500,11 +1500,13 @@ impl Catalog {
     pub fn complete(&self, input: &str, cursor: usize) -> Vec<Completion> {
         let cursor = clamped_cursor(input, cursor);
         let before = &input[..cursor];
-        let trimmed_start = before.len() - before.trim_start().len();
-        let query = before.trim_start();
+        let (segment_start, segment) = current_command_segment(before);
+        let leading_whitespace = segment.len() - segment.trim_start().len();
+        let query_start = segment_start + leading_whitespace;
+        let query = segment.trim_start();
 
         if let Some((command, option, token_start, token, values)) =
-            self.static_value_context(query, trimmed_start)
+            self.static_value_context(query, query_start)
         {
             let mut choices = values
                 .iter()
@@ -1534,7 +1536,7 @@ impl Catalog {
             return choices.into_iter().map(|(_, item)| item).collect();
         }
 
-        if let Some((command, token_start, token)) = self.option_context(query, trimmed_start) {
+        if let Some((command, token_start, token)) = self.option_context(query, query_start) {
             let mut choices = command
                 .options
                 .iter()
@@ -1586,7 +1588,7 @@ impl Catalog {
                                         "{} · {:?}",
                                         command.details, command.provenance
                                     ),
-                                    replace_start: trimmed_start,
+                                    replace_start: query_start,
                                     replace_end: cursor,
                                     match_indices: indices,
                                 },
@@ -2026,6 +2028,48 @@ fn clamped_cursor(input: &str, cursor: usize) -> usize {
     cursor
 }
 
+fn current_command_segment(input: &str) -> (usize, &str) {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut segment_start = 0;
+
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+
+        match quote {
+            Quote::Single => {
+                if character == '\'' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::Double => match character {
+                '\\' => escaped = true,
+                '"' => quote = Quote::None,
+                _ => {}
+            },
+            Quote::None => match character {
+                '\\' => escaped = true,
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '|' | '&' | ';' | '\n' => segment_start = index + character.len_utf8(),
+                _ => {}
+            },
+        }
+    }
+
+    (segment_start, &input[segment_start..])
+}
+
 fn whitespace_width_at(input: &str, index: usize) -> usize {
     input[index..].chars().next().map_or(0, char::len_utf8)
 }
@@ -2386,6 +2430,85 @@ mod tests {
         let completions = Catalog::builtin().complete("git commit --am", 15);
         assert_eq!(completions[0].value, "--amend");
         assert_eq!(completions[0].replace_start, 11);
+    }
+
+    #[test]
+    fn command_and_option_completion_use_the_current_command_segment() {
+        for separator in ["|", "||", "&&", ";", "&", "\n"] {
+            let command_line = format!("echo prior {separator} git c");
+            let commands = Catalog::builtin().complete(&command_line, command_line.len());
+            assert_eq!(commands[0].value, "git commit", "separator {separator:?}");
+            assert_eq!(
+                commands[0].replace_start,
+                command_line.len() - "git c".len(),
+                "separator {separator:?}"
+            );
+
+            let option_line = format!("echo prior {separator} git commit --am");
+            let options = Catalog::builtin().complete(&option_line, option_line.len());
+            assert_eq!(options[0].value, "--amend", "separator {separator:?}");
+            assert_eq!(
+                options[0].replace_start,
+                option_line.len() - "--am".len(),
+                "separator {separator:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_separators_do_not_start_a_command_segment() {
+        for separator in ["|", "||", "&&", ";", "&", "\n"] {
+            for quote in ['\'', '"'] {
+                let line = format!("git commit {quote}left{separator}right{quote} --am");
+                let completions = Catalog::builtin().complete(&line, line.len());
+                assert_eq!(
+                    completions[0].value, "--amend",
+                    "separator {separator:?} in {quote:?} quotes"
+                );
+                assert_eq!(completions[0].replace_start, line.len() - "--am".len());
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_separator_bytes_do_not_start_a_command_segment() {
+        for separator in ["|", "||", "&&", ";", "&", "\n"] {
+            let escaped_separator = separator
+                .chars()
+                .map(|character| format!("\\{character}"))
+                .collect::<String>();
+            let line = format!("git commit left{escaped_separator}right --am");
+            let completions = Catalog::builtin().complete(&line, line.len());
+            assert_eq!(
+                completions[0].value, "--amend",
+                "escaped separator {separator:?}"
+            );
+            assert_eq!(completions[0].replace_start, line.len() - "--am".len());
+        }
+    }
+
+    #[test]
+    fn chained_completion_spans_remain_absolute_utf8_byte_offsets() {
+        let command_line = "echo café | git c";
+        let commands = Catalog::builtin().complete(command_line, command_line.len());
+        assert_eq!(commands[0].value, "git commit");
+        assert_eq!(commands[0].replace_start, "echo café | ".len());
+        assert_eq!(commands[0].replace_end, command_line.len());
+
+        let option_line = "echo 東京 && git commit --am";
+        let options = Catalog::builtin().complete(option_line, option_line.len());
+        assert_eq!(options[0].value, "--amend");
+        assert_eq!(options[0].replace_start, "echo 東京 && git commit ".len());
+        assert_eq!(options[0].replace_end, option_line.len());
+
+        let value_line = "echo 🌀; quirl index build --format j";
+        let values = Catalog::builtin().complete(value_line, value_line.len());
+        assert_eq!(values[0].value, "json");
+        assert_eq!(
+            values[0].replace_start,
+            "echo 🌀; quirl index build --format ".len()
+        );
+        assert_eq!(values[0].replace_end, value_line.len());
     }
 
     #[test]
