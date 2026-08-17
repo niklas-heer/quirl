@@ -41,6 +41,9 @@ use std::{
 };
 
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+#[cfg(unix)]
 use nix::{
     fcntl::{open, OFlag},
     sys::stat::Mode,
@@ -93,6 +96,7 @@ enum TransactionStage {
     ContentSynced,
     PermissionsUpdated,
     MetadataSynced,
+    CandidateValidated,
     OriginalRetained,
     CandidateRenamed,
     ParentSynced,
@@ -107,6 +111,7 @@ impl TransactionStage {
             Self::ContentSynced => "synchronizing temporary file contents",
             Self::PermissionsUpdated => "preserving target permissions",
             Self::MetadataSynced => "synchronizing temporary file metadata",
+            Self::CandidateValidated => "validating the temporary file",
             Self::OriginalRetained => "retaining the original source",
             Self::CandidateRenamed => "replacing the source",
             Self::ParentSynced => "synchronizing the source directory",
@@ -245,14 +250,24 @@ fn replace_file_atomically_with_hook(
     let recovery_path = recovery_path(&candidate_path);
     let mut files = TransactionFiles::new(candidate_path, recovery_path);
 
+    let candidate_permissions = snapshot.permissions.clone();
     let prepared = prepare_candidate(
         files.candidate(),
         candidate_file,
         replacement,
-        snapshot.permissions.clone(),
+        candidate_permissions.clone(),
         &mut after_stage,
     );
-    if let Err(error) = prepared {
+    let candidate_file = match prepared {
+        Ok(file) => file,
+        Err(error) => return Err(files.cleanup(error)),
+    };
+    if let Err(error) = validate_candidate(
+        files.candidate(),
+        &candidate_file,
+        &candidate_permissions,
+        &mut after_stage,
+    ) {
         return Err(files.cleanup(error));
     }
 
@@ -311,7 +326,7 @@ fn prepare_candidate(
     replacement: &[u8],
     permissions: Permissions,
     after_stage: &mut impl FnMut(TransactionStage) -> io::Result<()>,
-) -> Result<(), ShellError> {
+) -> Result<File, ShellError> {
     observe_stage(
         candidate_path,
         TransactionStage::TemporaryCreated,
@@ -348,7 +363,28 @@ fn prepare_candidate(
         candidate_path,
         TransactionStage::MetadataSynced,
         after_stage,
-    )
+    )?;
+    Ok(candidate)
+}
+
+fn validate_candidate(
+    path: &Path,
+    file: &File,
+    expected_permissions: &Permissions,
+    after_stage: &mut impl FnMut(TransactionStage) -> io::Result<()>,
+) -> Result<(), ShellError> {
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|error| transaction_io_error("inspect candidate", path, error))?;
+    validate_regular_metadata(path, &path_metadata, Some(1))?;
+    let file_metadata = file
+        .metadata()
+        .map_err(|error| transaction_io_error("inspect open candidate", path, error))?;
+    validate_regular_metadata(path, &file_metadata, Some(1))?;
+    if file_identity(path, &path_metadata)? != file_identity(path, &file_metadata)? {
+        return Err(concurrent_change_error(path));
+    }
+    validate_permissions(path, &file_metadata, expected_permissions)?;
+    observe_stage(path, TransactionStage::CandidateValidated, after_stage)
 }
 
 fn commit_candidate(
@@ -550,6 +586,39 @@ fn validate_regular_metadata(
             ));
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_permissions(
+    path: &Path,
+    metadata: &Metadata,
+    expected: &Permissions,
+) -> Result<(), ShellError> {
+    let observed_mode = metadata.permissions().mode() & 0o777;
+    let expected_mode = expected.mode() & 0o777;
+    if observed_mode == expected_mode {
+        return Ok(());
+    }
+    Err(ShellError::new(
+        ErrorCode::Validation,
+        format!(
+            "permissions changed during atomic write for {}",
+            path.display()
+        ),
+    )
+    .with_context(format!(
+        "expected mode: {expected_mode:#o}; observed mode: {observed_mode:#o}"
+    ))
+    .with_help("Remove the conflicting entry and retry the write"))
+}
+
+#[cfg(not(unix))]
+fn validate_permissions(
+    _path: &Path,
+    _metadata: &Metadata,
+    _expected: &Permissions,
+) -> Result<(), ShellError> {
     Ok(())
 }
 
@@ -779,6 +848,7 @@ mod tests {
             TransactionStage::ContentSynced,
             TransactionStage::PermissionsUpdated,
             TransactionStage::MetadataSynced,
+            TransactionStage::CandidateValidated,
             TransactionStage::OriginalRetained,
             TransactionStage::CandidateRenamed,
             TransactionStage::ParentSynced,
@@ -830,6 +900,71 @@ mod tests {
         assert_eq!(error.code, ErrorCode::Validation);
         assert_eq!(fs::read(&source).unwrap(), b"changed elsewhere\n");
         assert_only_source_remains(&directory.0, &source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_permissions_are_revalidated_before_installation() {
+        let directory = TestDirectory::new("candidate-mode");
+        let source = directory.0.join("script.qrl");
+        fs::write(&source, b"old source\n").unwrap();
+
+        let error = replace_file_atomically_with_hook(
+            &source,
+            b"old source\n",
+            b"new source\n",
+            options(),
+            |stage| {
+                if stage == TransactionStage::MetadataSynced {
+                    let candidate = fs::read_dir(&directory.0)?
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| path != &source)
+                        .ok_or_else(|| io::Error::other("candidate was not visible"))?;
+                    fs::set_permissions(&candidate, Permissions::from_mode(0o777))?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("permissions changed"));
+        assert_eq!(fs::read(&source).unwrap(), b"old source\n");
+        assert_only_source_remains(&directory.0, &source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_hard_link_is_rejected_without_removing_the_foreign_alias() {
+        let directory = TestDirectory::new("candidate-hardlink");
+        let source = directory.0.join("script.qrl");
+        let alias = directory.0.join("foreign-alias");
+        fs::write(&source, b"old source\n").unwrap();
+
+        let error = replace_file_atomically_with_hook(
+            &source,
+            b"old source\n",
+            b"new source\n",
+            options(),
+            |stage| {
+                if stage == TransactionStage::MetadataSynced {
+                    let candidate = fs::read_dir(&directory.0)?
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| path != &source && path != &alias)
+                        .ok_or_else(|| io::Error::other("candidate was not visible"))?;
+                    fs::hard_link(candidate, &alias)?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(fs::read(&source).unwrap(), b"old source\n");
+        assert_eq!(fs::read(&alias).unwrap(), b"new source\n");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 2);
     }
 
     #[test]
@@ -916,5 +1051,22 @@ mod tests {
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert!(error.details.context[0].contains("limit: 4; observed: 11"));
         assert_eq!(fs::read(&source).unwrap(), b"old\n");
+    }
+
+    #[test]
+    fn replacement_accepts_expected_and_output_at_the_exact_byte_limit() {
+        let directory = TestDirectory::new("exact-limit");
+        let source = directory.0.join("script.lua");
+        fs::write(&source, b"old\n").unwrap();
+
+        replace_file_atomically(
+            &source,
+            b"old\n",
+            b"new\n",
+            AtomicReplaceOptions { bytes_max: 4 },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&source).unwrap(), b"new\n");
     }
 }

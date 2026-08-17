@@ -1,19 +1,127 @@
-use crate::bounded_file::{read_regular_file, ReadFileOptions};
 use clap::{ArgAction, Subcommand, ValueEnum};
 use quirl_catalog::{
     import_bash, import_fish, import_help, import_man, import_zsh, Catalog, ImportDiagnostic,
-    Provenance,
+    ImportReport, Provenance,
 };
-use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
+use quirl_core::{
+    escape_json_terminal_controls, escape_terminal_controls, replace_file_atomically,
+    AtomicReplaceOptions, ErrorCode, ShellError,
+};
 use serde::Serialize;
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 const INDEX_READ_LIMIT: usize = 4 * 1024 * 1024;
 const COMPLETION_READ_LIMIT: usize = 4 * 1024 * 1024;
 const DOCUMENTATION_READ_LIMIT: usize = 1024 * 1024;
+const INDEX_ROOTS_MAX: usize = 128;
+const INDEX_DIRECTORY_ENTRIES_MAX: usize = 8_192;
+const INDEX_FILES_MAX: usize = 2_048;
+const INDEX_PATH_BYTES_MAX: usize = 1024 * 1024;
+const INDEX_SOURCE_BYTES_TOTAL_MAX: usize = 16 * 1024 * 1024;
+const INDEX_RECORDS_MAX: usize = 65_536;
+const INDEX_RETAINED_BYTES_MAX: usize = 16 * 1024 * 1024;
+const INDEX_DIAGNOSTICS_MAX: usize = 4_096;
+const INDEX_TEMPORARY_ATTEMPTS_MAX: usize = 64;
+static NEXT_INDEX_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
+struct IndexTemporary(Option<PathBuf>);
+
+impl IndexTemporary {
+    fn path(&self) -> &Path {
+        self.0
+            .as_deref()
+            .unwrap_or_else(|| Path::new("<removed-index-temporary>"))
+    }
+
+    fn cleanup(&mut self, mut error: ShellError) -> ShellError {
+        if let Some(path) = self.0.take() {
+            if let Err(cleanup_error) = fs::remove_file(&path) {
+                if cleanup_error.kind() != io::ErrorKind::NotFound {
+                    error = error.with_context(format!(
+                        "index temporary cleanup failed for {}: {cleanup_error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        error
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for IndexTemporary {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IndexBounds {
+    roots_max: usize,
+    entries_max: usize,
+    files_max: usize,
+    path_bytes_max: usize,
+    source_bytes_max: usize,
+    records_max: usize,
+    retained_bytes_max: usize,
+    diagnostics_max: usize,
+}
+
+impl IndexBounds {
+    const PRODUCTION: Self = Self {
+        roots_max: INDEX_ROOTS_MAX,
+        entries_max: INDEX_DIRECTORY_ENTRIES_MAX,
+        files_max: INDEX_FILES_MAX,
+        path_bytes_max: INDEX_PATH_BYTES_MAX,
+        source_bytes_max: INDEX_SOURCE_BYTES_TOTAL_MAX,
+        records_max: INDEX_RECORDS_MAX,
+        retained_bytes_max: INDEX_RETAINED_BYTES_MAX,
+        diagnostics_max: INDEX_DIAGNOSTICS_MAX,
+    };
+}
+
+struct IndexBuildBudget {
+    bounds: IndexBounds,
+    roots: usize,
+    entries: usize,
+    files: usize,
+    path_bytes: usize,
+    source_bytes: usize,
+    records: usize,
+    retained_bytes: usize,
+    diagnostics: usize,
+}
+
+impl IndexBuildBudget {
+    fn new(bounds: IndexBounds) -> Self {
+        Self {
+            bounds,
+            roots: 0,
+            entries: 0,
+            files: 0,
+            path_bytes: 0,
+            source_bytes: 0,
+            records: 0,
+            retained_bytes: 0,
+            diagnostics: 0,
+        }
+    }
+}
 
 #[derive(Debug, Subcommand)]
 pub enum IndexCommand {
@@ -163,17 +271,26 @@ fn build_index(
     } else {
         zsh_roots
     };
-    let fish_files = completion_files(&fish_roots, Some("fish"))?;
-    let bash_files = completion_files(&bash_roots, None)?;
-    let zsh_files = completion_files(&zsh_roots, None)?;
-    let help_files = completion_files(&help_roots, None)?;
-    let man_files = completion_files(&man_roots, None)?;
+    let mut budget = IndexBuildBudget::new(IndexBounds::PRODUCTION);
+    budget.roots = fish_roots
+        .len()
+        .saturating_add(bash_roots.len())
+        .saturating_add(zsh_roots.len())
+        .saturating_add(help_roots.len())
+        .saturating_add(man_roots.len());
+    ensure_index_limit("roots", budget.bounds.roots_max, budget.roots)?;
+    let fish_files = completion_files(&fish_roots, Some("fish"), &mut budget)?;
+    let bash_files = completion_files(&bash_roots, None, &mut budget)?;
+    let zsh_files = completion_files(&zsh_roots, None, &mut budget)?;
+    let help_files = completion_files(&help_roots, None, &mut budget)?;
+    let man_files = completion_files(&man_roots, None, &mut budget)?;
     let (catalog, diagnostics) = catalog_from_files(
         &fish_files,
         &bash_files,
         &zsh_files,
         &help_files,
         &man_files,
+        &mut budget,
     )?;
     let output = output.or_else(default_index_path).ok_or_else(|| {
         ShellError::new(
@@ -276,58 +393,233 @@ fn catalog_from_files(
     zsh_files: &[PathBuf],
     help_files: &[PathBuf],
     man_files: &[PathBuf],
+    budget: &mut IndexBuildBudget,
 ) -> Result<(Catalog, Vec<ImportDiagnostic>), ShellError> {
     let mut catalog = Catalog::builtin();
     let mut diagnostics = Vec::new();
     for path in fish_files {
-        let source = read_completion(path)?;
-        diagnostics.extend(catalog.merge_report(import_fish(&source, &path.display().to_string())));
+        let source = read_completion(path, budget)?;
+        merge_bounded_report(
+            &mut catalog,
+            &mut diagnostics,
+            import_fish(&source, &path.display().to_string()),
+            budget,
+        )?;
     }
     for path in bash_files {
-        let source = read_completion(path)?;
-        diagnostics.extend(catalog.merge_report(import_bash(&source, &path.display().to_string())));
+        let source = read_completion(path, budget)?;
+        merge_bounded_report(
+            &mut catalog,
+            &mut diagnostics,
+            import_bash(&source, &path.display().to_string()),
+            budget,
+        )?;
     }
     for path in zsh_files {
-        let source = read_completion(path)?;
-        diagnostics.extend(catalog.merge_report(import_zsh(&source, &path.display().to_string())));
+        let source = read_completion(path, budget)?;
+        merge_bounded_report(
+            &mut catalog,
+            &mut diagnostics,
+            import_zsh(&source, &path.display().to_string()),
+            budget,
+        )?;
     }
     for path in help_files {
-        let source = read_documentation(path)?;
-        diagnostics.extend(catalog.merge_report(import_help(&source, &path.display().to_string())));
+        let source = read_documentation(path, budget)?;
+        merge_bounded_report(
+            &mut catalog,
+            &mut diagnostics,
+            import_help(&source, &path.display().to_string()),
+            budget,
+        )?;
     }
     for path in man_files {
-        let source = read_documentation(path)?;
-        diagnostics.extend(catalog.merge_report(import_man(&source, &path.display().to_string())));
+        let source = read_documentation(path, budget)?;
+        merge_bounded_report(
+            &mut catalog,
+            &mut diagnostics,
+            import_man(&source, &path.display().to_string()),
+            budget,
+        )?;
     }
     Ok((catalog, diagnostics))
+}
+
+fn merge_bounded_report(
+    catalog: &mut Catalog,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    report: ImportReport,
+    budget: &mut IndexBuildBudget,
+) -> Result<(), ShellError> {
+    let report_records = report.commands.iter().fold(0_usize, |count, command| {
+        count
+            .saturating_add(1)
+            .saturating_add(command.options.len())
+    });
+    let records = budget.records.saturating_add(report_records);
+    ensure_index_limit("catalog records", budget.bounds.records_max, records)?;
+    let diagnostic_count = budget.diagnostics.saturating_add(report.diagnostics.len());
+    ensure_index_limit(
+        "import diagnostics",
+        budget.bounds.diagnostics_max,
+        diagnostic_count,
+    )?;
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, &report).map_err(json_error)?;
+    let retained_bytes = budget.retained_bytes.saturating_add(counter.0);
+    ensure_index_limit(
+        "retained index text",
+        budget.bounds.retained_bytes_max,
+        retained_bytes,
+    )?;
+
+    budget.records = records;
+    budget.diagnostics = diagnostic_count;
+    budget.retained_bytes = retained_bytes;
+    diagnostics.extend(catalog.merge_report(report));
+    Ok(())
+}
+
+struct ByteCounter(usize);
+
+impl Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct BoundedBytesWriter {
+    bytes: Vec<u8>,
+    bytes_max: usize,
+    exceeded: bool,
+}
+
+impl BoundedBytesWriter {
+    fn new(bytes_max: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            bytes_max,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedBytesWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let remaining = self.bytes_max.saturating_sub(self.bytes.len());
+        if bytes.len() > remaining {
+            self.bytes.extend_from_slice(&bytes[..remaining]);
+            self.exceeded = true;
+            return Err(io::Error::other("bounded index output exceeded"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn admit_index_path(path: &Path, budget: &mut IndexBuildBudget) -> Result<(), ShellError> {
+    let files = budget.files.saturating_add(1);
+    ensure_index_limit("source files", budget.bounds.files_max, files)?;
+    let path_bytes = budget
+        .path_bytes
+        .saturating_add(path.as_os_str().as_encoded_bytes().len());
+    ensure_index_limit(
+        "retained path bytes",
+        budget.bounds.path_bytes_max,
+        path_bytes,
+    )?;
+    budget.files = files;
+    budget.path_bytes = path_bytes;
+    Ok(())
+}
+
+fn admit_source_bytes(bytes: usize, budget: &mut IndexBuildBudget) -> Result<(), ShellError> {
+    let source_bytes = budget.source_bytes.saturating_add(bytes);
+    ensure_index_limit("source bytes", budget.bounds.source_bytes_max, source_bytes)?;
+    budget.source_bytes = source_bytes;
+    Ok(())
+}
+
+fn ensure_index_limit(kind: &str, limit: usize, observed: usize) -> Result<(), ShellError> {
+    if observed <= limit {
+        Ok(())
+    } else {
+        Err(index_limit_error(kind, limit, observed))
+    }
+}
+
+fn index_limit_error(kind: &str, limit: usize, observed: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("completion index exceeds its {kind} limit"),
+    )
+    .with_context(format!("limit: {limit}; observed: {observed}"))
+    .with_help("Reduce the number or size of index sources and retry")
+}
+
+fn nonregular_index_input(path: &Path) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        format!(
+            "completion index input {} is not a regular file or directory",
+            path.display()
+        ),
+    )
+    .with_help("Remove symlinks and special files from index input roots")
 }
 
 fn completion_files(
     roots: &[PathBuf],
     required_extension: Option<&str>,
+    budget: &mut IndexBuildBudget,
 ) -> Result<Vec<PathBuf>, ShellError> {
     let mut files = Vec::new();
     for root in roots {
-        match fs::metadata(root) {
-            Ok(metadata) if metadata.is_file() => files.push(root.clone()),
-            Ok(metadata) if metadata.is_dir() => {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                admit_index_path(root, budget)?;
+                files.push(root.clone());
+            }
+            Ok(metadata) if metadata.file_type().is_dir() => {
                 let entries =
                     fs::read_dir(root).map_err(|error| index_io_error("enumerate", root, error))?;
                 for entry in entries {
+                    budget.entries = budget.entries.saturating_add(1);
+                    ensure_index_limit(
+                        "directory entries",
+                        budget.bounds.entries_max,
+                        budget.entries,
+                    )?;
                     let entry = entry.map_err(|error| index_io_error("enumerate", root, error))?;
                     let path = entry.path();
-                    if !path.is_file() {
+                    let kind = entry
+                        .file_type()
+                        .map_err(|error| index_io_error("inspect", &path, error))?;
+                    if !kind.is_file() {
+                        if kind.is_symlink() {
+                            return Err(nonregular_index_input(&path));
+                        }
                         continue;
                     }
                     if required_extension.is_none_or(|extension| {
                         path.extension()
                             .is_some_and(|candidate| candidate == extension)
                     }) {
+                        admit_index_path(&path, budget)?;
                         files.push(path);
                     }
                 }
             }
-            Ok(_) => {}
+            Ok(_) => return Err(nonregular_index_input(root)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(index_io_error("inspect", root, error)),
         }
@@ -379,22 +671,26 @@ fn default_index_path() -> Option<PathBuf> {
         .map(|cache| cache.join("quirl/catalog.json"))
 }
 
-fn read_completion(path: &Path) -> Result<String, ShellError> {
-    read_index_utf8(
+fn read_completion(path: &Path, budget: &mut IndexBuildBudget) -> Result<String, ShellError> {
+    let source = read_index_utf8(
         path,
         COMPLETION_READ_LIMIT,
         "completion source",
         "Supply completion declarations in a readable UTF-8 regular file at or below 4 MiB",
-    )
+    )?;
+    admit_source_bytes(source.len(), budget)?;
+    Ok(source)
 }
 
-fn read_documentation(path: &Path) -> Result<String, ShellError> {
-    read_index_utf8(
+fn read_documentation(path: &Path, budget: &mut IndexBuildBudget) -> Result<String, ShellError> {
+    let source = read_index_utf8(
         path,
         DOCUMENTATION_READ_LIMIT,
         "documentation source",
         "Supply help or man text in a readable UTF-8 regular file at or below 1 MiB",
-    )
+    )?;
+    admit_source_bytes(source.len(), budget)?;
+    Ok(source)
 }
 
 fn read_index(path: &Path) -> Result<String, ShellError> {
@@ -412,13 +708,74 @@ fn read_index_utf8(
     context: &str,
     help: &str,
 ) -> Result<String, ShellError> {
-    let bytes = read_regular_file(ReadFileOptions {
-        path,
-        bytes_max,
-        context,
-        help,
-        io_error_code: ErrorCode::Io,
+    let path_metadata = fs::symlink_metadata(path).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Io,
+            format!("could not inspect {context} {}", path.display()),
+        )
+        .with_context(error.to_string())
+        .with_help(help)
     })?;
+    validate_index_reader_metadata(path, &path_metadata, help)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    let file = options.open(path).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Io,
+            format!("could not open {context} {}", path.display()),
+        )
+        .with_context(error.to_string())
+        .with_help(help)
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        ShellError::new(
+            ErrorCode::Io,
+            format!("could not inspect {context} {}", path.display()),
+        )
+        .with_context(error.to_string())
+        .with_help(help)
+    })?;
+    validate_index_reader_metadata(path, &metadata, help)?;
+    #[cfg(unix)]
+    if path_metadata.dev() != metadata.dev() || path_metadata.ino() != metadata.ino() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "completion index {} changed during admission",
+                path.display()
+            ),
+        )
+        .with_help(help));
+    }
+    let bytes_max_u64 = u64::try_from(bytes_max).unwrap_or(u64::MAX);
+    if metadata.len() > bytes_max_u64 {
+        return Err(index_read_limit_error(
+            path,
+            context,
+            help,
+            bytes_max,
+            metadata.len(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(bytes_max)
+            .min(bytes_max),
+    );
+    file.take(bytes_max_u64.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| index_io_error("read", path, error))?;
+    if bytes.len() > bytes_max {
+        return Err(index_read_limit_error(
+            path,
+            context,
+            help,
+            bytes_max,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        ));
+    }
     String::from_utf8(bytes).map_err(|error| {
         ShellError::new(
             ErrorCode::Validation,
@@ -427,6 +784,55 @@ fn read_index_utf8(
         .with_context(error.to_string())
         .with_help(help)
     })
+}
+
+fn validate_index_reader_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    help: &str,
+) -> Result<(), ShellError> {
+    if !metadata.file_type().is_file() {
+        return Err(nonregular_index_input(path).with_help(help));
+    }
+    #[cfg(unix)]
+    {
+        if metadata.nlink() != 1 {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!("completion index {} has hard-link aliases", path.display()),
+            )
+            .with_context(format!("expected links: 1; observed: {}", metadata.nlink()))
+            .with_help(help));
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!(
+                    "completion index {} has unsafe writable permissions",
+                    path.display()
+                ),
+            )
+            .with_context(format!("mode: {mode:#o}; forbidden write bits: 0o022"))
+            .with_help(help));
+        }
+    }
+    Ok(())
+}
+
+fn index_read_limit_error(
+    path: &Path,
+    context: &str,
+    help: &str,
+    limit: usize,
+    observed: u64,
+) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{context} {} exceeds its read limit", path.display()),
+    )
+    .with_context(format!("limit: {limit}; observed: {observed}"))
+    .with_help(help)
 }
 
 fn decode_catalog(source: &str, path: &Path) -> Result<Catalog, ShellError> {
@@ -458,16 +864,282 @@ fn write_catalog_atomically(path: &Path, catalog: &Catalog) -> Result<(), ShellE
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
     if let Some(parent) = parent {
-        fs::create_dir_all(parent).map_err(|error| index_io_error("create", parent, error))?;
+        create_index_directories(parent)?;
     }
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("catalog.json");
-    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-    let encoded = serde_json::to_string_pretty(catalog).map_err(json_error)?;
-    fs::write(&temporary, encoded).map_err(|error| index_io_error("write", &temporary, error))?;
-    fs::rename(&temporary, path).map_err(|error| index_io_error("install", path, error))
+    let mut writer = BoundedBytesWriter::new(INDEX_READ_LIMIT);
+    if let Err(error) = serde_json::to_writer_pretty(&mut writer, catalog) {
+        if writer.exceeded {
+            return Err(index_limit_error(
+                "serialized bytes",
+                INDEX_READ_LIMIT,
+                INDEX_READ_LIMIT.saturating_add(1),
+            ));
+        }
+        return Err(json_error(error));
+    }
+    let encoded = writer.bytes;
+    if encoded.len() > INDEX_READ_LIMIT {
+        return Err(index_limit_error(
+            "serialized bytes",
+            INDEX_READ_LIMIT,
+            encoded.len(),
+        ));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            validate_index_reader_metadata(
+                path,
+                &metadata,
+                "Use an unlinked regular index file with no group/other write access",
+            )?;
+            let expected = read_index_utf8(
+                path,
+                INDEX_READ_LIMIT,
+                "completion index",
+                "Use an unlinked regular index file at or below 4 MiB",
+            )?;
+            replace_file_atomically(
+                path,
+                expected.as_bytes(),
+                &encoded,
+                AtomicReplaceOptions {
+                    bytes_max: INDEX_READ_LIMIT,
+                },
+            )
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            install_new_index(path, &encoded, parent.unwrap_or_else(|| Path::new(".")))
+        }
+        Err(error) => Err(index_io_error("inspect", path, error)),
+    }
+}
+
+fn install_new_index(path: &Path, encoded: &[u8], parent: &Path) -> Result<(), ShellError> {
+    let (temporary, mut file) = create_index_temporary(path)?;
+    let mut guard = IndexTemporary(Some(temporary));
+    let split = encoded.len().div_ceil(2);
+    file.write_all(&encoded[..split])
+        .and_then(|()| file.write_all(&encoded[split..]))
+        .and_then(|()| file.sync_all())
+        .map_err(|error| guard.cleanup(index_io_error("write", guard.path(), error)))?;
+    validate_index_temporary(guard.path(), &file).map_err(|error| guard.cleanup(error))?;
+    drop(file);
+    fs::hard_link(guard.path(), path)
+        .map_err(|error| guard.cleanup(index_io_error("install", path, error)))?;
+    if !same_index_file(guard.path(), path) {
+        let error = ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "index destination {} changed during installation",
+                path.display()
+            ),
+        )
+        .with_help("Remove the conflicting index entry and retry");
+        return Err(guard.cleanup(error));
+    }
+    validate_index_installed(path).map_err(|error| guard.cleanup(error))?;
+    if let Err(error) = sync_index_directory(parent) {
+        if same_index_file(guard.path(), path) {
+            let _ = fs::remove_file(path);
+        }
+        return Err(guard.cleanup(error));
+    }
+    fs::remove_file(guard.path())
+        .map_err(|error| guard.cleanup(index_io_error("clean", guard.path(), error)))?;
+    guard.disarm();
+    let _ = sync_index_directory(parent);
+    Ok(())
+}
+
+fn create_index_temporary(path: &Path) -> Result<(PathBuf, File), ShellError> {
+    let name = path.file_name().ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::InvalidArgument,
+            "completion index has no file name",
+        )
+        .with_help("Choose a regular index destination file")
+    })?;
+    for _ in 0..INDEX_TEMPORARY_ATTEMPTS_MAX {
+        let sequence = NEXT_INDEX_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(name);
+        temporary_name.push(format!(".quirl-{}-{sequence}.tmp", std::process::id()));
+        let temporary = path.with_file_name(temporary_name);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&temporary) {
+            Ok(file) => {
+                #[cfg(unix)]
+                if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    let mut shell_error = index_io_error("secure", &temporary, error);
+                    if let Err(cleanup_error) = fs::remove_file(&temporary) {
+                        shell_error = shell_error.with_context(format!(
+                            "index temporary cleanup failed for {}: {cleanup_error}",
+                            temporary.display()
+                        ));
+                    }
+                    return Err(shell_error);
+                }
+                return Ok((temporary, file));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(index_io_error("create", &temporary, error)),
+        }
+    }
+    Err(index_limit_error(
+        "temporary-name attempts",
+        INDEX_TEMPORARY_ATTEMPTS_MAX,
+        INDEX_TEMPORARY_ATTEMPTS_MAX,
+    ))
+}
+
+fn validate_index_temporary(path: &Path, file: &File) -> Result<(), ShellError> {
+    let path_metadata =
+        fs::symlink_metadata(path).map_err(|error| index_io_error("inspect", path, error))?;
+    let file_metadata = file
+        .metadata()
+        .map_err(|error| index_io_error("inspect", path, error))?;
+    validate_index_reader_metadata(
+        path,
+        &path_metadata,
+        "Remove the conflicting index temporary and retry",
+    )?;
+    #[cfg(unix)]
+    {
+        if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino()
+        {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!(
+                    "index temporary {} changed before installation",
+                    path.display()
+                ),
+            )
+            .with_help("Remove the conflicting index temporary and retry"));
+        }
+        let mode = file_metadata.mode() & 0o777;
+        if mode != 0o600 {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!("index temporary {} has unsafe permissions", path.display()),
+            )
+            .with_context(format!("expected mode: 0o600; observed mode: {mode:#o}"))
+            .with_help("Remove the conflicting index temporary and retry"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_index_installed(path: &Path) -> Result<(), ShellError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| index_io_error("inspect", path, error))?;
+    if !metadata.file_type().is_file() {
+        return Err(nonregular_index_input(path));
+    }
+    #[cfg(unix)]
+    {
+        if metadata.nlink() != 2 {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!(
+                    "index destination {} changed during installation",
+                    path.display()
+                ),
+            )
+            .with_context(format!("expected links: 2; observed: {}", metadata.nlink()))
+            .with_help("Remove the conflicting index entry and retry"));
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode != 0o600 {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!(
+                    "index destination {} has unsafe permissions",
+                    path.display()
+                ),
+            )
+            .with_context(format!("expected mode: 0o600; observed mode: {mode:#o}"))
+            .with_help("Remove the conflicting index entry and retry"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_index_file(left: &Path, right: &Path) -> bool {
+    let Ok(left) = fs::symlink_metadata(left) else {
+        return false;
+    };
+    let Ok(right) = fs::symlink_metadata(right) else {
+        return false;
+    };
+    left.file_type().is_file()
+        && right.file_type().is_file()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_index_file(_left: &Path, _right: &Path) -> bool {
+    false
+}
+
+fn create_index_directories(directory: &Path) -> Result<(), ShellError> {
+    const DEPTH_MAX: usize = 64;
+    let mut missing = Vec::new();
+    let mut cursor = directory;
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(metadata) if metadata.file_type().is_dir() => break,
+            Ok(_) => return Err(nonregular_index_input(cursor)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if missing.len() >= DEPTH_MAX {
+                    return Err(index_limit_error(
+                        "output directory depth",
+                        DEPTH_MAX,
+                        missing.len() + 1,
+                    ));
+                }
+                missing.push(cursor.to_path_buf());
+                cursor = cursor
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+            }
+            Err(error) => return Err(index_io_error("inspect", cursor, error)),
+        }
+    }
+    let mut created = Vec::<PathBuf>::new();
+    for path in missing.into_iter().rev() {
+        if let Err(error) = fs::create_dir(&path) {
+            let mut shell_error = index_io_error("create", &path, error);
+            while let Some(created_path) = created.pop() {
+                if let Err(cleanup_error) = fs::remove_dir(&created_path) {
+                    shell_error = shell_error.with_context(format!(
+                        "index directory rollback failed for {}: {cleanup_error}",
+                        created_path.display()
+                    ));
+                }
+            }
+            return Err(shell_error);
+        }
+        created.push(path);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_index_directory(path: &Path) -> Result<(), ShellError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| index_io_error("synchronize", path, error))
+}
+
+#[cfg(not(unix))]
+fn sync_index_directory(_path: &Path) -> Result<(), ShellError> {
+    Ok(())
 }
 
 fn index_io_error(action: &str, path: &Path, error: std::io::Error) -> ShellError {
@@ -515,6 +1187,10 @@ mod tests {
         path
     }
 
+    fn test_budget() -> IndexBuildBudget {
+        IndexBuildBudget::new(IndexBounds::PRODUCTION)
+    }
+
     #[test]
     fn file_imports_merge_fish_and_bash_into_one_catalog() {
         let directory = temporary_directory();
@@ -528,6 +1204,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &mut test_budget(),
         )
         .unwrap();
         assert!(diagnostics.is_empty());
@@ -558,6 +1235,7 @@ mod tests {
             std::slice::from_ref(&zsh),
             std::slice::from_ref(&help),
             std::slice::from_ref(&man),
+            &mut test_budget(),
         )
         .unwrap();
         assert!(diagnostics.is_empty());
@@ -608,9 +1286,109 @@ mod tests {
         write_catalog_atomically(&path, &catalog).unwrap();
         let source = fs::read_to_string(&path).unwrap();
         assert_eq!(decode_catalog(&source, &path).unwrap(), catalog);
-        assert!(!directory
-            .join(format!(".catalog.json.{}.tmp", std::process::id()))
-            .exists());
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn index_budget_accepts_exact_limits_and_rejects_limit_plus_one() {
+        let bounds = IndexBounds {
+            roots_max: 2,
+            entries_max: 2,
+            files_max: 2,
+            path_bytes_max: 8,
+            source_bytes_max: 4,
+            records_max: 2,
+            retained_bytes_max: 128,
+            diagnostics_max: 2,
+        };
+        let mut budget = IndexBuildBudget::new(bounds);
+        budget.roots = 2;
+        ensure_index_limit("roots", bounds.roots_max, budget.roots).unwrap();
+        admit_index_path(Path::new("one"), &mut budget).unwrap();
+        admit_index_path(Path::new("two"), &mut budget).unwrap();
+        admit_source_bytes(4, &mut budget).unwrap();
+
+        assert_eq!(
+            admit_index_path(Path::new("x"), &mut budget)
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceLimit
+        );
+        assert_eq!(
+            admit_source_bytes(1, &mut budget).unwrap_err().code,
+            ErrorCode::ResourceLimit
+        );
+        assert_eq!(
+            ensure_index_limit("roots", bounds.roots_max, 3)
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn failed_index_install_preserves_collision_and_cleans_temporary() {
+        let directory = temporary_directory();
+        let path = directory.join("catalog.json");
+        fs::write(&path, b"foreign").unwrap();
+
+        let error = install_new_index(&path, b"new", &directory).unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Io);
+        assert_eq!(fs::read(&path).unwrap(), b"foreign");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_reader_rejects_symlinks_hardlinks_and_special_files() {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let source = directory.join("source");
+        fs::write(&source, b"{}").unwrap();
+        let link = directory.join("link");
+        symlink(&source, &link).unwrap();
+        assert_eq!(read_index(&link).unwrap_err().code, ErrorCode::Validation);
+
+        let alias = directory.join("alias");
+        fs::hard_link(&source, &alias).unwrap();
+        assert_eq!(read_index(&source).unwrap_err().code, ErrorCode::Validation);
+
+        let socket = directory.join("socket");
+        mkfifo(&socket, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        assert_eq!(read_index(&socket).unwrap_err().code, ErrorCode::Validation);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_cleanup_failure_retains_the_originating_error() {
+        let directory = temporary_directory();
+        let path = directory.join("temporary");
+        fs::create_dir(&path).unwrap();
+        let mut guard = IndexTemporary(Some(path));
+        let error = guard.cleanup(
+            ShellError::new(ErrorCode::Io, "originating index failure")
+                .with_context("injected primary failure"),
+        );
+
+        assert_eq!(error.message, "originating index failure");
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("injected primary failure")));
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("cleanup failed")));
         fs::remove_dir_all(directory).unwrap();
     }
 
