@@ -46,20 +46,21 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use quirl_catalog::Catalog;
-use quirl_core::{ErrorCode, ShellError};
+use quirl_core::{replace_file_atomically, AtomicReplaceOptions, ErrorCode, ShellError};
 use quirl_lua::QuirlConfig;
 use quirl_syntax::{parse_command_list, Mode};
 use ratatui::{
     backend::CrosstermBackend, layout::Position, text::Line, widgets::Paragraph, Terminal,
     TerminalOptions, Viewport,
 };
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::VecDeque,
     env, fs,
     fs::OpenOptions,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -70,7 +71,9 @@ const TIMING_WINDOW: usize = 128;
 const HISTORY_NEWLINE_ESCAPE: &str = "<\\n>";
 const MAX_HISTORY_FILE_BYTES: usize = MAX_HISTORY_RETAINED_BYTES * 4 + 50_000;
 const HELP_DETAIL_SCROLL_MAX: u16 = 4_096;
-static HISTORY_COMPACTION_ID: AtomicU64 = AtomicU64::new(0);
+const HISTORY_REPLACEMENT_BYTES_MAX: usize = MAX_HISTORY_FILE_BYTES * 2;
+#[cfg(test)]
+static HISTORY_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Result of one rich-surface input session after terminal ownership is released.
@@ -656,14 +659,12 @@ impl RichSurface {
 
     /// Compact an oversized on-disk history file to the bounded in-memory tail.
     ///
-    /// Files at or below the encoded limit are left untouched. Compaction writes
-    /// a create-new sibling, flushes and syncs it, then atomically renames it over
-    /// the history path; temporary data is removed on failure. Returns
-    /// [`ErrorCode::Io`] when durable replacement fails.
+    /// Files at or below the encoded limit are left untouched. Existing regular
+    /// files are replaced through a bounded, identity-validated transaction;
+    /// links and special files fail closed. Errors preserve the originating
+    /// failure and may be I/O, validation, invalid-argument, or resource errors.
     pub fn sync_history(&mut self) -> Result<(), ShellError> {
-        if fs::metadata(&self.history_path)
-            .is_ok_and(|metadata| metadata.len() > MAX_HISTORY_FILE_BYTES as u64)
-        {
+        if history_file_needs_compaction(&self.history_path)? {
             self.compact_history()?;
         }
         Ok(())
@@ -676,57 +677,36 @@ impl RichSurface {
         if let Some(parent) = self.history_path.parent() {
             fs::create_dir_all(parent).map_err(history_error(&self.history_path))?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.history_path)
-            .map_err(history_error(&self.history_path))?;
-        writeln!(file, "{}", encode_history_entry(value))
-            .map_err(history_error(&self.history_path))?;
-        file.flush().map_err(history_error(&self.history_path))?;
-        drop(file);
-        self.history.push(value.to_owned());
-        trim_history(&mut self.history);
-        if fs::metadata(&self.history_path)
-            .is_ok_and(|metadata| metadata.len() > MAX_HISTORY_FILE_BYTES as u64)
-        {
-            self.compact_history()?;
-        }
+        let mut staged_history = self.history.clone();
+        staged_history.push(value.to_owned());
+        trim_history(&mut staged_history);
+        let encoded = format!("{}\n", encode_history_entry(value));
+        let existing = read_history_file_for_update(&self.history_path)?;
+        let replacement = match existing.as_deref() {
+            Some(bytes) if bytes.len().saturating_add(encoded.len()) <= MAX_HISTORY_FILE_BYTES => {
+                let mut replacement = Vec::with_capacity(bytes.len() + encoded.len());
+                replacement.extend_from_slice(bytes);
+                replacement.extend_from_slice(encoded.as_bytes());
+                replacement
+            }
+            Some(_) => encode_history(&staged_history),
+            None => encoded.into_bytes(),
+        };
+        replace_or_create_history(&self.history_path, existing.as_deref(), &replacement)?;
+        self.history = staged_history;
         Ok(())
     }
 
     fn compact_history(&self) -> Result<(), ShellError> {
-        let file_name = self
-            .history_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("history");
-        let temporary = self.history_path.with_file_name(format!(
-            ".{file_name}.compact-{}-{}.tmp",
-            std::process::id(),
-            HISTORY_COMPACTION_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(history_error(&temporary))?;
-            for entry in &self.history {
-                let encoded = encode_history_entry(entry);
-                if encoded.len() > MAX_HISTORY_ENCODED_ENTRY_BYTES {
-                    continue;
-                }
-                writeln!(file, "{encoded}").map_err(history_error(&temporary))?;
-            }
-            file.flush().map_err(history_error(&temporary))?;
-            file.sync_all().map_err(history_error(&temporary))?;
-            fs::rename(&temporary, &self.history_path).map_err(history_error(&self.history_path))
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        let existing = read_history_file_for_update(&self.history_path)?;
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        replace_or_create_history(
+            &self.history_path,
+            Some(&existing),
+            &encode_history(&self.history),
+        )
     }
 
     fn record_draw(&mut self, elapsed: Duration) {
@@ -999,6 +979,250 @@ fn trim_history(history: &mut Vec<String>) {
     }
 }
 
+fn history_file_needs_compaction(path: &Path) -> Result<bool, ShellError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            validate_history_file_type(path, &metadata)?;
+            Ok(metadata.len() > MAX_HISTORY_FILE_BYTES as u64)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(history_error(path)(error)),
+    }
+}
+
+fn read_history_file_for_update(path: &Path) -> Result<Option<Vec<u8>>, ShellError> {
+    read_history_file_for_update_with_hook(path, || {})
+}
+
+fn read_history_file_for_update_with_hook(
+    path: &Path,
+    after_metadata: impl FnOnce(),
+) -> Result<Option<Vec<u8>>, ShellError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(history_error(path)(error)),
+    };
+    validate_history_file_type(path, &metadata)?;
+    let expected_identity = history_file_identity(&metadata);
+    after_metadata();
+    let mut file = open_history_file_no_follow(path).map_err(history_error(path))?;
+    let opened_metadata = file.metadata().map_err(history_error(path))?;
+    validate_history_file_type(path, &opened_metadata)?;
+    let current_metadata = fs::symlink_metadata(path).map_err(history_error(path))?;
+    validate_history_file_type(path, &current_metadata)?;
+    if history_file_identity(&opened_metadata) != expected_identity
+        || history_file_identity(&current_metadata) != expected_identity
+    {
+        return Err(concurrent_history_change_error(path));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(HISTORY_REPLACEMENT_BYTES_MAX)
+            .min(HISTORY_REPLACEMENT_BYTES_MAX),
+    );
+    Read::by_ref(&mut file)
+        .take(HISTORY_REPLACEMENT_BYTES_MAX.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(history_error(path))?;
+    if bytes.len() > HISTORY_REPLACEMENT_BYTES_MAX {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "rich history file exceeds its synchronization limit",
+        )
+        .with_context(format!(
+            "limit {HISTORY_REPLACEMENT_BYTES_MAX} bytes; observed at least {} bytes",
+            bytes.len()
+        ))
+        .with_help("Move the oversized history file aside before restarting the rich shell"));
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+// These BSD-family platforms define `O_NOFOLLOW` as 0x100. Keeping the
+// platform value local avoids adding a dependency for one guarded open.
+const HISTORY_OPEN_NOFOLLOW: i32 = 0x100;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "solaris",
+    target_os = "illumos"
+))]
+// Linux-family and Solaris-family platforms define `O_NOFOLLOW` as 0x20000.
+const HISTORY_OPEN_NOFOLLOW: i32 = 0x20_000;
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "solaris",
+    target_os = "illumos"
+))]
+fn open_history_file_no_follow(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(HISTORY_OPEN_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "solaris",
+    target_os = "illumos"
+)))]
+fn open_history_file_no_follow(path: &Path) -> io::Result<fs::File> {
+    fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn history_file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn history_file_identity(metadata: &fs::Metadata) -> (u64, Option<std::time::SystemTime>, bool) {
+    (
+        metadata.len(),
+        metadata.modified().ok(),
+        metadata.permissions().readonly(),
+    )
+}
+
+fn validate_history_file_type(path: &Path, metadata: &fs::Metadata) -> Result<(), ShellError> {
+    if metadata.file_type().is_file() {
+        return Ok(());
+    }
+    Err(ShellError::new(
+        ErrorCode::InvalidArgument,
+        format!("history path {} is not a regular file", path.display()),
+    )
+    .with_help("Replace the history link or special file with a private regular file"))
+}
+
+fn concurrent_history_change_error(path: &Path) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        "rich history file changed during synchronization",
+    )
+    .with_context(format!("history path: {}", path.display()))
+    .with_help("Retry after stopping concurrent history-file replacement")
+}
+
+fn encode_history(history: &[String]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for entry in history {
+        let encoded = encode_history_entry(entry);
+        if encoded.len() > MAX_HISTORY_ENCODED_ENTRY_BYTES {
+            continue;
+        }
+        bytes.extend_from_slice(encoded.as_bytes());
+        bytes.push(b'\n');
+    }
+    bytes
+}
+
+fn replace_or_create_history(
+    path: &Path,
+    existing: Option<&[u8]>,
+    replacement: &[u8],
+) -> Result<(), ShellError> {
+    if replacement.len() > MAX_HISTORY_FILE_BYTES {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "rich history replacement exceeds its file limit",
+        )
+        .with_context(format!(
+            "limit {MAX_HISTORY_FILE_BYTES} bytes; observed {} bytes",
+            replacement.len()
+        ))
+        .with_help("Remove oversized history entries before retrying synchronization"));
+    }
+    if let Some(existing) = existing {
+        return replace_file_atomically(
+            path,
+            existing,
+            replacement,
+            AtomicReplaceOptions {
+                bytes_max: HISTORY_REPLACEMENT_BYTES_MAX,
+            },
+        )
+        .map_err(|error| {
+            error.with_context(format!(
+                "while synchronizing rich history at {}",
+                path.display()
+            ))
+        });
+    }
+
+    let mut created = false;
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(history_error(path))?;
+        created = true;
+        file.write_all(replacement).map_err(history_error(path))?;
+        file.flush().map_err(history_error(path))?;
+        file.sync_all().map_err(history_error(path))?;
+        let opened_metadata = file.metadata().map_err(history_error(path))?;
+        let current_metadata = fs::symlink_metadata(path).map_err(history_error(path))?;
+        validate_history_file_type(path, &current_metadata)?;
+        if history_file_identity(&opened_metadata) != history_file_identity(&current_metadata) {
+            return Err(concurrent_history_change_error(path));
+        }
+        sync_history_parent(path)
+    })();
+    if let Err(mut error) = result {
+        if created {
+            error = error.with_context(format!(
+                "a newly created partial history file may remain at {}; it was preserved because path-based cleanup cannot prove stable file identity",
+                path.display()
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_history_parent(path: &Path) -> Result<(), ShellError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(history_error(parent))
+}
+
+#[cfg(not(unix))]
+fn sync_history_parent(_path: &Path) -> Result<(), ShellError> {
+    Ok(())
+}
+
 fn encode_history_entry(value: &str) -> String {
     value.replace('\n', HISTORY_NEWLINE_ESCAPE)
 }
@@ -1126,7 +1350,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "quirl-history-bound-{}-{}",
             std::process::id(),
-            HISTORY_COMPACTION_ID.fetch_add(1, Ordering::Relaxed)
+            HISTORY_TEST_ID.fetch_add(1, Ordering::Relaxed)
         ));
         let mut file = fs::File::create(&path).unwrap();
         file.write_all(&vec![b'x'; MAX_HISTORY_ENCODED_ENTRY_BYTES + 1])
@@ -1135,6 +1359,93 @@ mod tests {
         drop(file);
         assert_eq!(read_history(&path).unwrap(), vec!["safe tail"]);
         fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rich_history_sync_rejects_symlinks_without_touching_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!(
+            "quirl-rich-history-link-{}-{}",
+            std::process::id(),
+            HISTORY_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("target");
+        let history_path = directory.join("history");
+        fs::write(&target, "protected\n").unwrap();
+        symlink(&target, &history_path).unwrap();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            history_path,
+        )
+        .unwrap();
+
+        let error = surface.append_history("new entry").unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "protected\n");
+        let names = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2);
+        fs::remove_file(directory.join("history")).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rich_history_reader_rejects_metadata_to_open_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!(
+            "quirl-rich-history-open-race-{}-{}",
+            std::process::id(),
+            HISTORY_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("target");
+        let history_path = directory.join("history");
+        fs::write(&target, "foreign\n").unwrap();
+        fs::write(&history_path, "original\n").unwrap();
+
+        let error = read_history_file_for_update_with_hook(&history_path, || {
+            fs::remove_file(&history_path).unwrap();
+            symlink(&target, &history_path).unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error.code,
+            ErrorCode::Io | ErrorCode::InvalidArgument | ErrorCode::Validation
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "foreign\n");
+        fs::remove_file(&history_path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rich_history_create_failure_preserves_the_original_error_and_foreign_entry() {
+        let directory = std::env::temp_dir().join(format!(
+            "quirl-rich-history-race-{}-{}",
+            std::process::id(),
+            HISTORY_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let history_path = directory.join("history");
+        fs::create_dir(&history_path).unwrap();
+
+        let error = replace_or_create_history(&history_path, None, b"entry\n").unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Io);
+        assert!(history_path.is_dir());
+        assert!(error.message.contains("history"));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

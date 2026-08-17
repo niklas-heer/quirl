@@ -2,6 +2,166 @@
 
 mod builtin;
 
+use std::{
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
+    process::Command,
+};
+
+/// Maximum variables retained by one native executor's environment snapshot.
+pub const SESSION_ENVIRONMENT_VARIABLES_MAX: usize = 65_536;
+/// Maximum key and value bytes retained by one native executor's environment snapshot.
+pub const SESSION_ENVIRONMENT_BYTES_MAX: usize = 16 * 1024 * 1024;
+
+pub(crate) struct SessionEnvironment {
+    variables: BTreeMap<OsString, OsString>,
+    initialization_error: Option<quirl_core::ShellError>,
+}
+
+impl Default for SessionEnvironment {
+    fn default() -> Self {
+        Self::capture(std::env::vars_os())
+    }
+}
+
+impl SessionEnvironment {
+    fn capture(variables: impl IntoIterator<Item = (OsString, OsString)>) -> Self {
+        Self::capture_with_limits(
+            variables,
+            SESSION_ENVIRONMENT_VARIABLES_MAX,
+            SESSION_ENVIRONMENT_BYTES_MAX,
+        )
+    }
+
+    fn capture_with_limits(
+        variables: impl IntoIterator<Item = (OsString, OsString)>,
+        variables_max: usize,
+        bytes_max: usize,
+    ) -> Self {
+        match Self::from_iter_with_limits(variables, variables_max, bytes_max) {
+            Ok(variables) => Self {
+                variables,
+                initialization_error: None,
+            },
+            Err(error) => Self {
+                variables: BTreeMap::new(),
+                initialization_error: Some(error),
+            },
+        }
+    }
+
+    fn from_iter_with_limits(
+        variables: impl IntoIterator<Item = (OsString, OsString)>,
+        variables_max: usize,
+        bytes_max: usize,
+    ) -> Result<BTreeMap<OsString, OsString>, quirl_core::ShellError> {
+        let mut captured = BTreeMap::new();
+        let mut retained_bytes = 0_usize;
+        for (name, value) in variables {
+            retained_bytes = retained_bytes
+                .saturating_add(name.len())
+                .saturating_add(value.len());
+            let observed_variables = captured.len().saturating_add(1);
+            if observed_variables > variables_max {
+                return Err(environment_variable_limit_error(
+                    variables_max,
+                    observed_variables,
+                ));
+            }
+            if retained_bytes > bytes_max {
+                return Err(environment_byte_limit_error(bytes_max, retained_bytes));
+            }
+            captured.insert(name, value);
+        }
+        Ok(captured)
+    }
+
+    fn ensure_valid(&self) -> Result<(), quirl_core::ShellError> {
+        self.initialization_error.clone().map_or(Ok(()), Err)
+    }
+
+    fn configure(&self, command: &mut Command) -> Result<(), quirl_core::ShellError> {
+        self.ensure_valid()?;
+        command.env_clear().envs(&self.variables);
+        Ok(())
+    }
+
+    fn value(&self, name: &str) -> String {
+        self.variables
+            .get(OsStr::new(name))
+            .and_then(|value| value.to_str().map(str::to_owned))
+            .unwrap_or_default()
+    }
+
+    fn set_variables(
+        &mut self,
+        assignments: &[(String, String)],
+    ) -> Result<(), quirl_core::ShellError> {
+        self.ensure_valid()?;
+        let mut staged = self.variables.clone();
+        for (name, value) in assignments {
+            validate_environment_assignment(name, value)?;
+            staged.insert(OsString::from(name), OsString::from(value));
+        }
+        let retained_bytes = staged.iter().fold(0_usize, |retained, (name, value)| {
+            retained
+                .saturating_add(name.len())
+                .saturating_add(value.len())
+        });
+        if staged.len() > SESSION_ENVIRONMENT_VARIABLES_MAX {
+            return Err(environment_variable_limit_error(
+                SESSION_ENVIRONMENT_VARIABLES_MAX,
+                staged.len(),
+            ));
+        }
+        if retained_bytes > SESSION_ENVIRONMENT_BYTES_MAX {
+            return Err(environment_byte_limit_error(
+                SESSION_ENVIRONMENT_BYTES_MAX,
+                retained_bytes,
+            ));
+        }
+        self.variables = staged;
+        Ok(())
+    }
+}
+
+fn environment_variable_limit_error(limit: usize, observed: usize) -> quirl_core::ShellError {
+    quirl_core::ShellError::new(
+        quirl_core::ErrorCode::ResourceLimit,
+        "session environment exceeds its variable limit",
+    )
+    .with_context(format!("limit {limit} variables; observed {observed}"))
+    .with_help("Remove unused variables or restart the session with a smaller environment")
+}
+
+fn environment_byte_limit_error(limit: usize, observed: usize) -> quirl_core::ShellError {
+    quirl_core::ShellError::new(
+        quirl_core::ErrorCode::ResourceLimit,
+        "session environment exceeds its retained-byte limit",
+    )
+    .with_context(format!("limit {limit} bytes; observed {observed}"))
+    .with_help("Shorten exported values or restart the session with a smaller environment")
+}
+
+fn validate_environment_assignment(name: &str, value: &str) -> Result<(), quirl_core::ShellError> {
+    let mut characters = name.chars();
+    let valid_name = characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric());
+    if !valid_name {
+        return Err(quirl_core::ShellError::new(
+            quirl_core::ErrorCode::InvalidArgument,
+            format!("invalid environment name `{name}`"),
+        )
+        .with_help("Environment names use ASCII letters, digits, and underscores"));
+    }
+    if value.contains('\0') {
+        return Err(interior_nul_error("environment value"));
+    }
+    Ok(())
+}
+
 fn noninteractive_process_error(source: &str, message: &str) -> quirl_core::ShellError {
     quirl_core::ShellError::new(quirl_core::ErrorCode::InvalidArgument, message)
         .with_command(source)
@@ -214,7 +374,7 @@ mod simulation_support {
 #[cfg(unix)]
 mod platform {
     use super::{
-        allocate_job_id, builtin, validate_native_plan, validate_native_source,
+        allocate_job_id, builtin, validate_native_plan, validate_native_source, SessionEnvironment,
         ARITHMETIC_DEPTH_MAX, ARITHMETIC_SOURCE_BYTES_MAX, DEFAULT_CAPTURE_BYTES,
         EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
     };
@@ -234,8 +394,9 @@ mod platform {
         parse_command_list, ListConnector, Pipeline, Quoting, RedirectKind, SimpleCommand, Word,
     };
     use serde::{Deserialize, Serialize};
+    #[cfg(test)]
+    use std::env;
     use std::{
-        env,
         fs::{File, OpenOptions},
         io::{ErrorKind, IsTerminal, Read, Write},
         path::{Path, PathBuf},
@@ -424,6 +585,7 @@ mod platform {
         next_job_id: u32,
         substitution_depth: u8,
         noninteractive_host: bool,
+        environment: SessionEnvironment,
         #[cfg(test)]
         fail_stopped_terminal_mode_read: bool,
     }
@@ -530,6 +692,7 @@ mod platform {
                 next_job_id: 1,
                 substitution_depth: 0,
                 noninteractive_host: false,
+                environment: SessionEnvironment::default(),
                 #[cfg(test)]
                 fail_stopped_terminal_mode_read: false,
             }
@@ -552,6 +715,36 @@ mod platform {
             let mut executor = Self::default();
             executor.noninteractive_host = true;
             executor
+        }
+
+        /// Replace one variable in this executor's private environment snapshot.
+        ///
+        /// Future parameter expansions and child processes observe the update;
+        /// the host process and independent executors remain unchanged.
+        pub fn set_environment_variable(
+            &mut self,
+            name: String,
+            value: String,
+        ) -> Result<(), ShellError> {
+            self.set_environment_variables(&[(name, value)])
+        }
+
+        /// Validate and atomically apply several private environment updates.
+        pub fn set_environment_variables(
+            &mut self,
+            assignments: &[(String, String)],
+        ) -> Result<(), ShellError> {
+            self.environment.set_variables(assignments)
+        }
+
+        /// Apply this executor's complete environment snapshot to a child command.
+        pub fn configure_child(&self, command: &mut Command) -> Result<(), ShellError> {
+            self.environment.configure(command)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn replace_environment_for_test(&mut self, environment: SessionEnvironment) {
+            self.environment = environment;
         }
 
         /// Execute an ordinary foreground command with terminal streams
@@ -692,6 +885,7 @@ mod platform {
             capture: bool,
             request: Option<RequestContext<'_>>,
         ) -> Result<CommandOutcome, ShellError> {
+            self.environment.ensure_valid()?;
             if let Some(request) = request {
                 request.ensure_active()?;
             }
@@ -959,7 +1153,7 @@ mod platform {
                             "Close the `}` in `${...}`",
                         ));
                     };
-                    let value = parameter_value(&after[..close]);
+                    let value = self.environment.value(&after[..close]);
                     budget.append(output, &value)?;
                     index += 3 + close;
                     continue;
@@ -987,7 +1181,7 @@ mod platform {
                             .take_while(|value| *value == '_' || value.is_ascii_alphanumeric())
                             .map(char::len_utf8)
                             .sum();
-                        let value = parameter_value(&after[..length]);
+                        let value = self.environment.value(&after[..length]);
                         budget.append(output, &value)?;
                         index += 1 + length;
                         continue;
@@ -1023,6 +1217,7 @@ mod platform {
                         )
                         .with_help("Use `export NAME=value`"));
                     }
+                    let mut assignments = Vec::with_capacity(command.words.len() - 1);
                     for assignment in command.words.iter().skip(1) {
                         let Some((name, value)) = assignment.split_once('=') else {
                             return Err(ShellError::new(
@@ -1031,22 +1226,9 @@ mod platform {
                             )
                             .with_help("Use `export NAME=value`"));
                         };
-                        let mut characters = name.chars();
-                        if !characters.next().is_some_and(|character| {
-                            character == '_' || character.is_ascii_alphabetic()
-                        }) || !characters
-                            .all(|character| character == '_' || character.is_ascii_alphanumeric())
-                        {
-                            return Err(ShellError::new(
-                                ErrorCode::InvalidArgument,
-                                format!("invalid environment name `{name}`"),
-                            )
-                            .with_help(
-                                "Environment names use ASCII letters, digits, and underscores",
-                            ));
-                        }
-                        env::set_var(name, value);
+                        assignments.push((name.to_owned(), value.to_owned()));
                     }
+                    self.environment.set_variables(&assignments)?;
                     Some(outcome(0, Some(String::new()), Some(String::new())))
                 }
                 "jobs" => {
@@ -1163,6 +1345,7 @@ mod platform {
                         ShellError::new(ErrorCode::InvalidCommand, "empty command stage")
                     })?;
                 let mut process = Command::new(executable);
+                self.configure_child(&mut process)?;
                 process.args(command.words.iter().skip(1));
                 let stderr = if command.redirects.iter().any(duplicates_stderr_to_stdout) {
                     if let Some(writer) = writer.as_ref() {
@@ -1471,10 +1654,6 @@ mod platform {
 
     fn expansion_error(message: &str, help: &str) -> ShellError {
         ShellError::new(ErrorCode::InvalidCommand, message).with_help(help)
-    }
-
-    fn parameter_value(name: &str) -> String {
-        std::env::var(name).unwrap_or_default()
     }
 
     fn matching_paren(source: &str) -> Option<usize> {
@@ -3110,10 +3289,13 @@ mod platform {
             );
             let command_bytes = "printf".len();
             let value = "x".repeat((EXPANSION_BYTES_MAX - command_bytes) / 2);
-            env::set_var(&variable, &value);
+            let mut executor = NativeExecutor::default();
+            executor
+                .set_environment_variable(variable.clone(), value)
+                .unwrap();
             let exact_source = format!("printf ${{{variable}}}${{{variable}}}");
             let exact = parse_command_list(&exact_source).unwrap();
-            let expanded = NativeExecutor::default()
+            let expanded = executor
                 .expand_pipeline(&exact.pipelines[0], None, 0)
                 .unwrap();
             assert_eq!(
@@ -3127,7 +3309,7 @@ mod platform {
 
             let oversized_source = format!("printf ${{{variable}}}${{{variable}}}x");
             let oversized = parse_command_list(&oversized_source).unwrap();
-            let error = NativeExecutor::default()
+            let error = executor
                 .expand_pipeline(&oversized.pipelines[0], None, 0)
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
@@ -3136,7 +3318,6 @@ mod platform {
                     && context.contains(&format!("retained {EXPANSION_BYTES_MAX} bytes"))
                     && context.contains(&format!("observed {} bytes", EXPANSION_BYTES_MAX + 1))
             }));
-            env::remove_var(variable);
         }
 
         #[test]
@@ -3997,14 +4178,13 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::{
-        allocate_job_id, builtin, validate_native_plan, validate_native_source,
+        allocate_job_id, builtin, validate_native_plan, validate_native_source, SessionEnvironment,
         DEFAULT_CAPTURE_BYTES, HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
     };
     use quirl_core::{CommandOutcome, ErrorCode, ProcessRequest, ShellError};
     use quirl_syntax::{parse_command_list, ListConnector, Pipeline, RedirectKind, SimpleCommand};
     use serde::{Deserialize, Serialize};
     use std::{
-        env,
         fs::{File, OpenOptions},
         io::{self, Read, Write},
         os::windows::io::AsRawHandle,
@@ -4140,6 +4320,7 @@ mod platform {
         jobs: Vec<Job>,
         next_job_id: u32,
         noninteractive_host: bool,
+        environment: SessionEnvironment,
     }
 
     /// A kill-on-close Job Object used by non-shell process adapters.
@@ -4172,6 +4353,7 @@ mod platform {
                 jobs: Vec::new(),
                 next_job_id: 1,
                 noninteractive_host: false,
+                environment: SessionEnvironment::default(),
             }
         }
     }
@@ -4193,6 +4375,36 @@ mod platform {
             let mut executor = Self::default();
             executor.noninteractive_host = true;
             executor
+        }
+
+        /// Replace one variable in this executor's private environment snapshot.
+        ///
+        /// Future child processes observe the update; the host process and
+        /// independent executors remain unchanged.
+        pub fn set_environment_variable(
+            &mut self,
+            name: String,
+            value: String,
+        ) -> Result<(), ShellError> {
+            self.set_environment_variables(&[(name, value)])
+        }
+
+        /// Validate and atomically apply several private environment updates.
+        pub fn set_environment_variables(
+            &mut self,
+            assignments: &[(String, String)],
+        ) -> Result<(), ShellError> {
+            self.environment.set_variables(assignments)
+        }
+
+        /// Apply this executor's complete environment snapshot to a child command.
+        pub fn configure_child(&self, command: &mut Command) -> Result<(), ShellError> {
+            self.environment.configure(command)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn replace_environment_for_test(&mut self, environment: SessionEnvironment) {
+            self.environment = environment;
         }
 
         /// Execute an ordinary foreground command with terminal streams
@@ -4323,6 +4535,7 @@ mod platform {
             capture: bool,
             request: Option<RequestContext<'_>>,
         ) -> Result<CommandOutcome, ShellError> {
+            self.environment.ensure_valid()?;
             if let Some(request) = request {
                 request.ensure_active()?;
             }
@@ -4447,6 +4660,7 @@ mod platform {
                 "cd" => Ok(Some(builtin::execute_cd(&command.words)?)),
                 "ls" => Ok(Some(builtin::execute_ls(&command.words)?)),
                 "export" => {
+                    let mut assignments = Vec::with_capacity(command.words.len().saturating_sub(1));
                     for assignment in command.words.iter().skip(1) {
                         let Some((name, value)) = assignment.split_once('=') else {
                             return Err(ShellError::new(
@@ -4455,8 +4669,9 @@ mod platform {
                             )
                             .with_help("Use `export NAME=value`"));
                         };
-                        env::set_var(name, value);
+                        assignments.push((name.to_owned(), value.to_owned()));
                     }
+                    self.environment.set_variables(&assignments)?;
                     Ok(Some(CommandOutcome {
                         status: 0,
                         stdout: None,
@@ -4543,6 +4758,7 @@ mod platform {
                     matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append)
                 });
                 let mut process = Command::new(program);
+                self.configure_child(&mut process)?;
                 process.args(command.words.iter().skip(1));
                 let here_string = match input {
                     Some(WindowsInput::File(file)) => {
@@ -5316,6 +5532,7 @@ mod backend_contract_tests {
         fs,
         path::PathBuf,
         sync::{atomic::AtomicBool, Arc},
+        thread,
         time::{Duration, Instant},
     };
 
@@ -5417,6 +5634,146 @@ mod backend_contract_tests {
         }
     }
 
+    #[cfg(unix)]
+    fn read_test_environment(executor: &mut NativeExecutor, name: &str) -> String {
+        executor
+            .execute_capture(&format!("sh -c 'printf %s \"${name}\"'"))
+            .unwrap()
+            .stdout
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_is_inherited_without_mutating_the_host_environment() {
+        let name = "QUIRL_SESSION_EXPORT_ISOLATION";
+        assert!(std::env::var_os(name).is_none());
+        let mut executor = NativeExecutor::default();
+
+        executor
+            .execute_capture(&format!("export {name}=owned"))
+            .unwrap();
+
+        assert_eq!(read_test_environment(&mut executor, name), "owned");
+        assert!(std::env::var_os(name).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_executors_keep_environment_updates_isolated() {
+        let name = "QUIRL_CONCURRENT_SESSION_ENVIRONMENT";
+        assert!(std::env::var_os(name).is_none());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = ["first", "second"].map(|expected| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut executor = NativeExecutor::default();
+                executor
+                    .set_environment_variable(name.to_owned(), expected.to_owned())
+                    .unwrap();
+                barrier.wait();
+                (expected, read_test_environment(&mut executor, name))
+            })
+        });
+
+        for worker in workers {
+            let (expected, observed) = worker.join().unwrap();
+            assert_eq!(observed, expected);
+        }
+        assert!(std::env::var_os(name).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_process_request_uses_the_executor_environment_snapshot() {
+        let name = "QUIRL_EXPLICIT_REQUEST_ENVIRONMENT";
+        let mut executor = NativeExecutor::default();
+        executor
+            .set_environment_variable(name.to_owned(), "request-owned".to_owned())
+            .unwrap();
+        let request = quirl_core::ProcessRequest {
+            command: format!("sh -c 'printf %s \"${name}\"'"),
+            deadline: Duration::from_secs(1),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            max_output_bytes: 1024,
+        };
+
+        let outcome = executor.execute_capture_request(request).unwrap();
+
+        assert_eq!(outcome.stdout.as_deref(), Some("request-owned"));
+        assert!(std::env::var_os(name).is_none());
+    }
+
+    #[test]
+    fn environment_updates_validate_all_assignments_before_commit() {
+        let mut environment = SessionEnvironment::default();
+        let valid_name = "QUIRL_TRANSACTIONAL_ENVIRONMENT";
+        assert!(std::env::var_os(valid_name).is_none());
+
+        let error = environment
+            .set_variables(&[
+                (valid_name.to_owned(), "must-not-commit".to_owned()),
+                ("INVALID-NAME".to_owned(), "value".to_owned()),
+            ])
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(environment.value(valid_name), "");
+    }
+
+    #[test]
+    fn initial_environment_capture_accepts_exact_limits_and_rejects_limit_plus_one() {
+        let exact = SessionEnvironment::capture_with_limits(
+            [
+                (OsString::from("A"), OsString::from("1")),
+                (OsString::from("B"), OsString::from("2")),
+            ],
+            2,
+            4,
+        );
+        assert!(exact.ensure_valid().is_ok());
+
+        let variable_error = SessionEnvironment::capture_with_limits(
+            [
+                (OsString::from("A"), OsString::new()),
+                (OsString::from("B"), OsString::new()),
+                (OsString::from("C"), OsString::new()),
+            ],
+            2,
+            3,
+        )
+        .ensure_valid()
+        .unwrap_err();
+        assert_eq!(variable_error.code, ErrorCode::ResourceLimit);
+        assert!(variable_error.details.context[0].contains("observed 3"));
+
+        let byte_error = SessionEnvironment::capture_with_limits(
+            [(OsString::from("A"), OsString::from("1234"))],
+            1,
+            4,
+        )
+        .ensure_valid()
+        .unwrap_err();
+        assert_eq!(byte_error.code, ErrorCode::ResourceLimit);
+        assert!(byte_error.details.context[0].contains("observed 5"));
+    }
+
+    #[test]
+    fn invalid_initial_environment_fails_before_executor_spawn() {
+        let environment = SessionEnvironment::capture_with_limits(
+            [(OsString::from("A"), OsString::from("12"))],
+            1,
+            2,
+        );
+        let mut executor = NativeExecutor::default();
+        executor.replace_environment_for_test(environment);
+
+        let error = executor.execute_capture("must-not-spawn").unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.message.contains("environment"));
+    }
+
     #[test]
     fn job_id_allocation_wraps_and_skips_every_visible_id() {
         let mut next = u32::MAX;
@@ -5446,8 +5803,10 @@ mod backend_contract_tests {
     #[cfg(unix)]
     #[test]
     fn native_c1_expands_parameters_arithmetic_substitutions_and_here_strings() {
-        std::env::set_var("QUIRL_C1_WORD", "expanded");
         let mut backend = NativeExecutor::default();
+        backend
+            .set_environment_variable("QUIRL_C1_WORD".to_owned(), "expanded".to_owned())
+            .unwrap();
         let output = backend
             .execute_capture(
                 "printf '%s|%s|%s|%s\\n' $QUIRL_C1_WORD $((1 + 2)) $((1 + ((2)))) $(printf nested); cat <<< value",
@@ -5458,7 +5817,6 @@ mod backend_contract_tests {
             output.stdout.as_deref(),
             Some("expanded|3|3|nested\nvalue\n")
         );
-        std::env::remove_var("QUIRL_C1_WORD");
     }
 
     #[cfg(unix)]

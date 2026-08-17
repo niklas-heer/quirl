@@ -197,6 +197,16 @@ pub fn execute_view(command: ViewCommand) -> Result<i32, ShellError> {
     Ok(0)
 }
 
+struct WatchSignalRegistration(Option<signal_hook::SigId>);
+
+impl Drop for WatchSignalRegistration {
+    fn drop(&mut self) {
+        if let Some(signal_id) = self.0.take() {
+            signal_hook::low_level::unregister(signal_id);
+        }
+    }
+}
+
 pub fn execute_watch(command: WatchCommand) -> Result<i32, ShellError> {
     if !(1..=1_000).contains(&command.samples) {
         return Err(platform_error("--samples must be between 1 and 1000"));
@@ -206,15 +216,18 @@ pub fn execute_watch(command: WatchCommand) -> Result<i32, ShellError> {
     }
     let mut buffer = LiveBuffer::new(command.capacity)?;
     let cancelled = Arc::new(AtomicBool::new(false));
-    let signal = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&cancelled))
-        .map_err(|error| {
-        ShellError::new(
-            ErrorCode::Io,
-            "could not install watch cancellation handler",
-        )
-        .with_context(error.to_string())
-        .with_help("Retry the watch from an interactive terminal")
-    })?;
+    let signal = WatchSignalRegistration(Some(
+        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&cancelled)).map_err(
+            |error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not install watch cancellation handler",
+                )
+                .with_context(error.to_string())
+                .with_help("Retry the watch from an interactive terminal")
+            },
+        )?,
+    ));
     let result = (|| {
         let runtime = DataRuntime::new();
         for sequence in 1..=command.samples as u64 {
@@ -255,7 +268,7 @@ pub fn execute_watch(command: WatchCommand) -> Result<i32, ShellError> {
         }
         Ok(0)
     })();
-    signal_hook::low_level::unregister(signal);
+    drop(signal);
     result
 }
 
