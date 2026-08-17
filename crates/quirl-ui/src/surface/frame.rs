@@ -49,6 +49,19 @@ pub struct FrameModel<'a> {
 }
 
 impl FrameModel<'_> {
+    /// Return the transcript rectangle produced by the same partition used for drawing.
+    pub(super) fn transcript_area(&self, area: Rect) -> Rect {
+        let input = self.input_render(usize::from(area.width));
+        frame_layout(
+            area,
+            u16::try_from(input.lines.len()).unwrap_or(u16::MAX),
+            self.diagnostic.is_some() && !self.compact,
+            self.transcript.map_or(0, Transcript::line_count),
+            self.transcript.is_none_or(Transcript::follows_tail),
+        )
+        .transcript
+    }
+
     pub fn render(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
         if area.height == 0 || area.width == 0 {
@@ -130,15 +143,15 @@ impl FrameModel<'_> {
                 .diagnostic
                 .filter(|_| self.compact)
                 .map(|diagnostic| diagnostic.message.as_str())
+                .or(self.output_notice)
+                .or_else(|| {
+                    self.output_focus
+                        .then_some("OUTPUT · drag/↑↓ select · y or Ctrl-C copy · Esc return")
+                })
                 .or_else(|| {
                     self.transcript
                         .is_some_and(|transcript| !transcript.follows_tail())
                         .then_some("SCROLL · PageUp/PageDown or wheel · Ctrl-End return")
-                })
-                .or(self.output_notice)
-                .or_else(|| {
-                    self.output_focus
-                        .then_some("OUTPUT · ↑↓ select · y copy · Esc return")
                 })
                 .or_else(|| {
                     self.transcript_truncated
@@ -232,32 +245,33 @@ impl FrameModel<'_> {
             .clone()
             .filter_map(|line_index| {
                 let text = transcript.line(line_index)?;
-                let selected = selection.is_some_and(|(start, end)| {
-                    line_index >= start.line_index && line_index <= end.line_index
-                });
-                let style = if selected {
-                    self.theme.selected(self.mode)
-                } else if text.starts_with('❯') {
+                let style = if text.starts_with('❯') {
                     self.theme.accent(self.mode)
                 } else if text.starts_with("── exit ") {
                     self.theme.dim()
                 } else {
                     Default::default()
                 };
-                Some(Line::styled(escape_terminal_line(text), style))
+                Some(transcript_line(
+                    text,
+                    line_index,
+                    selection,
+                    style,
+                    self.theme.selected(self.mode),
+                ))
             })
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(lines), area);
-        if transcript.line_count() > visible_count {
+        if let Some(metrics) = scrollbar_metrics(transcript.line_count(), visible.clone()) {
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None)
                 .track_symbol(Some(if self.unicode { "│" } else { "|" }))
                 .thumb_symbol(if self.unicode { "█" } else { "#" })
                 .thumb_style(self.theme.accent(self.mode));
-            let mut state = ScrollbarState::new(transcript.line_count())
-                .position(visible.start)
-                .viewport_content_length(visible_count);
+            let mut state = ScrollbarState::new(metrics.position_count)
+                .position(metrics.position)
+                .viewport_content_length(metrics.viewport_line_count);
             frame.render_stateful_widget(scrollbar, area, &mut state);
         }
     }
@@ -568,6 +582,77 @@ impl FrameModel<'_> {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollbarMetrics {
+    position_count: usize,
+    position: usize,
+    viewport_line_count: usize,
+}
+
+fn scrollbar_metrics(
+    total_line_count: usize,
+    visible: std::ops::Range<usize>,
+) -> Option<ScrollbarMetrics> {
+    let viewport_line_count = visible.end.saturating_sub(visible.start);
+    if viewport_line_count == 0 || total_line_count <= viewport_line_count {
+        return None;
+    }
+    // Ratatui adds the viewport length to `content_length - 1` when it computes
+    // the thumb ratio. Supplying the number of possible viewport starts makes
+    // that denominator equal the actual retained transcript length.
+    Some(ScrollbarMetrics {
+        position_count: total_line_count
+            .saturating_sub(viewport_line_count)
+            .saturating_add(1),
+        position: visible.start,
+        viewport_line_count,
+    })
+}
+
+fn transcript_line(
+    text: &str,
+    line_index: usize,
+    selection: Option<(
+        super::transcript::TextPosition,
+        super::transcript::TextPosition,
+    )>,
+    base_style: Style,
+    selected_style: Style,
+) -> Line<'static> {
+    let Some((start, end)) = selection
+        .filter(|(start, end)| line_index >= start.line_index && line_index <= end.line_index)
+    else {
+        return Line::styled(escape_terminal_line(text), base_style);
+    };
+    let selected_start = if line_index == start.line_index {
+        start.byte_offset
+    } else {
+        0
+    };
+    let selected_end = if line_index == end.line_index {
+        end.byte_offset
+    } else {
+        text.len()
+    };
+    if selected_start >= selected_end {
+        return Line::styled(escape_terminal_line(text), base_style);
+    }
+    Line::from(vec![
+        Span::styled(
+            escape_terminal_line(text.get(..selected_start).unwrap_or_default()),
+            base_style,
+        ),
+        Span::styled(
+            escape_terminal_line(text.get(selected_start..selected_end).unwrap_or_default()),
+            selected_style,
+        ),
+        Span::styled(
+            escape_terminal_line(text.get(selected_end..).unwrap_or_default()),
+            base_style,
+        ),
+    ])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1330,6 +1415,99 @@ mod tests {
         assert!(!row(&terminal, 5).contains("~/workspace"));
         assert!(!row(&terminal, 6).contains('❯'));
         assert!(row(&terminal, 7).contains("SCROLL"));
+    }
+
+    #[test]
+    fn transcript_scrollbar_uses_exact_viewport_geometry() {
+        assert_eq!(
+            scrollbar_metrics(100, 40..60),
+            Some(ScrollbarMetrics {
+                position_count: 81,
+                position: 40,
+                viewport_line_count: 20,
+            })
+        );
+        assert_eq!(
+            scrollbar_metrics(100, 80..100),
+            Some(ScrollbarMetrics {
+                position_count: 81,
+                position: 80,
+                viewport_line_count: 20,
+            })
+        );
+        assert_eq!(scrollbar_metrics(20, 0..20), None);
+    }
+
+    #[test]
+    fn transcript_selection_highlights_only_the_selected_byte_range() {
+        let mut transcript = Transcript::new(crate::surface::transcript::TranscriptLimits {
+            line_count_max: 8,
+            retained_bytes_max: 1_024,
+        });
+        transcript.append_line("zero selected tail");
+        transcript.begin_selection(crate::surface::transcript::TextPosition {
+            line_index: 0,
+            byte_offset: 5,
+        });
+        transcript.update_selection(crate::surface::transcript::TextPosition {
+            line_index: 0,
+            byte_offset: 13,
+        });
+        let editor = EditorState::new("emacs", Vec::new());
+        let completion = CompletionState::new(Catalog::builtin(), None);
+        let runtime = RuntimeSurfaceState::new();
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                FrameModel {
+                    context_left: "~",
+                    context_right: "",
+                    editor: &editor,
+                    completion: &completion,
+                    mode: Mode::Command,
+                    diagnostic: None,
+                    highlight_spans: &[],
+                    theme: Theme::new(true),
+                    unicode: true,
+                    symbols: SurfaceSymbols::Unicode,
+                    semantic_hints: true,
+                    hints: true,
+                    timings: None,
+                    compact: false,
+                    picker_query: None,
+                    picker_layout: PickerLayout::Adaptive,
+                    picker_preview: true,
+                    detail_scroll: 0,
+                    runtime: &runtime,
+                    transcript: Some(&transcript),
+                    transcript_truncated: false,
+                    output_focus: true,
+                    output_notice: None,
+                }
+                .render(frame);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(!buffer
+            .cell((4, 0))
+            .unwrap()
+            .modifier
+            .contains(Modifier::REVERSED));
+        assert!(buffer
+            .cell((5, 0))
+            .unwrap()
+            .modifier
+            .contains(Modifier::REVERSED));
+        assert!(buffer
+            .cell((12, 0))
+            .unwrap()
+            .modifier
+            .contains(Modifier::REVERSED));
+        assert!(!buffer
+            .cell((13, 0))
+            .unwrap()
+            .modifier
+            .contains(Modifier::REVERSED));
     }
 
     #[test]

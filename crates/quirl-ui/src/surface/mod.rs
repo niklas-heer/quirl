@@ -56,7 +56,7 @@ use crossterm::{
     cursor::{SetCursorStyle, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     style::Print,
@@ -94,6 +94,12 @@ const TRANSCRIPT_COPY_BYTES_MAX: usize = 1024 * 1024;
 const TRANSCRIPT_MOUSE_SCROLL_LINES: usize = 3;
 #[cfg(test)]
 static HISTORY_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseDrag {
+    Selection { anchor: TextPosition, dragged: bool },
+    Scrollbar,
+}
 
 fn legacy_history(path: &Path) -> Vec<InteractiveHistoryEntry> {
     read_history(path)
@@ -160,6 +166,8 @@ pub struct RichSurface {
     output_cursor_line: usize,
     output_anchor_line: Option<usize>,
     output_notice: Option<String>,
+    transcript_area: Rect,
+    mouse_drag: Option<MouseDrag>,
     intent_completion: IntentCompletionState,
 }
 
@@ -214,6 +222,8 @@ impl RichSurface {
             output_cursor_line: 0,
             output_anchor_line: None,
             output_notice: None,
+            transcript_area: Rect::default(),
+            mouse_drag: None,
             intent_completion: IntentCompletionState::default(),
         })
     }
@@ -267,6 +277,8 @@ impl RichSurface {
             output_cursor_line: 0,
             output_anchor_line: None,
             output_notice: None,
+            transcript_area: Rect::default(),
+            mouse_drag: None,
             intent_completion: IntentCompletionState::default(),
         })
     }
@@ -414,7 +426,7 @@ impl RichSurface {
 
         loop {
             if dirty {
-                let (_, terminal_height) = terminal::size().unwrap_or((80, 24));
+                let (terminal_width, terminal_height) = terminal::size().unwrap_or((80, 24));
                 if self.catalog.is_some() {
                     self.input_analysis
                         .ensure(editor.revision(), editor.buffer(), prompt.mode);
@@ -459,8 +471,11 @@ impl RichSurface {
                     output_focus: self.output_focus,
                     output_notice: self.output_notice.as_deref(),
                 };
+                let transcript_area =
+                    model.transcript_area(Rect::new(0, 0, terminal_width, terminal_height));
                 let started = Instant::now();
                 self.terminal.draw(&model)?;
+                self.transcript_area = transcript_area;
                 let draw_elapsed = started.elapsed();
                 // Ratatui flushes the backend before `draw` returns. Catalog
                 // admission is deliberately the next effect: terminal input
@@ -525,23 +540,12 @@ impl RichSurface {
                 }
                 Event::Resize(_, _) => continue,
                 Event::Mouse(mouse) => {
-                    let visible_rows = self.transcript_visible_rows();
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => {
-                            self.transcript
-                                .scroll_up(TRANSCRIPT_MOUSE_SCROLL_LINES, visible_rows);
-                        }
-                        MouseEventKind::ScrollDown => {
-                            self.transcript
-                                .scroll_down(TRANSCRIPT_MOUSE_SCROLL_LINES, visible_rows);
-                        }
-                        _ => {}
-                    }
+                    self.handle_mouse(mouse);
                     continue;
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if self.output_focus {
-                        self.handle_output_key(key.code)?;
+                        self.handle_output_key(key.code, key.modifiers)?;
                         continue;
                     }
                     self.output_notice = None;
@@ -889,6 +893,7 @@ impl RichSurface {
 
     fn return_to_tail_for_input(&mut self) {
         self.transcript.scroll_to_end();
+        self.dismiss_output_selection();
     }
 
     fn open_output_focus(&mut self) {
@@ -896,16 +901,19 @@ impl RichSurface {
         self.output_notice = None;
         self.output_cursor_line = self.transcript.line_count().saturating_sub(1);
         self.output_anchor_line = Some(self.output_cursor_line);
+        self.mouse_drag = None;
         self.select_output_range();
     }
 
-    fn handle_output_key(&mut self, key: KeyCode) -> Result<(), ShellError> {
+    fn handle_output_key(
+        &mut self,
+        key: KeyCode,
+        modifiers: KeyModifiers,
+    ) -> Result<(), ShellError> {
         let visible_rows = self.transcript_visible_rows();
         match key {
             KeyCode::Esc => {
-                self.output_focus = false;
-                self.output_anchor_line = None;
-                self.transcript.clear_selection();
+                self.dismiss_output_selection();
             }
             KeyCode::Up => {
                 self.output_cursor_line = self.output_cursor_line.saturating_sub(1);
@@ -947,9 +955,144 @@ impl RichSurface {
                 self.select_output_range();
             }
             KeyCode::Char('y') => self.copy_output_selection()?,
+            KeyCode::Char('c')
+                if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                self.copy_output_selection()?;
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let visible_rows = usize::from(self.transcript_area.height);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.transcript
+                    .scroll_up(TRANSCRIPT_MOUSE_SCROLL_LINES, visible_rows);
+            }
+            MouseEventKind::ScrollDown => {
+                self.transcript
+                    .scroll_down(TRANSCRIPT_MOUSE_SCROLL_LINES, visible_rows);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.mouse_is_on_scrollbar(mouse.column, mouse.row) {
+                    self.mouse_drag = Some(MouseDrag::Scrollbar);
+                    self.scrollbar_to_row(mouse.row);
+                } else if let Some((before, after)) = self.transcript_hit(mouse.column, mouse.row) {
+                    self.output_focus = true;
+                    self.output_notice = None;
+                    self.output_anchor_line = None;
+                    self.output_cursor_line = before.line_index;
+                    self.transcript.begin_selection(before);
+                    self.transcript.update_selection(after);
+                    self.mouse_drag = Some(MouseDrag::Selection {
+                        anchor: before,
+                        dragged: false,
+                    });
+                } else {
+                    self.dismiss_output_selection();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => match self.mouse_drag {
+                Some(MouseDrag::Selection { anchor, .. }) => {
+                    self.autoscroll_mouse_selection(mouse.row);
+                    self.update_mouse_selection(anchor, mouse.column, mouse.row);
+                    self.mouse_drag = Some(MouseDrag::Selection {
+                        anchor,
+                        dragged: true,
+                    });
+                }
+                Some(MouseDrag::Scrollbar) => self.scrollbar_to_row(mouse.row),
+                None => {}
+            },
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(MouseDrag::Selection { anchor, dragged }) = self.mouse_drag {
+                    self.update_mouse_selection(anchor, mouse.column, mouse.row);
+                    self.mouse_drag = None;
+                    if dragged && self.terminal.input_active {
+                        let _ = self.copy_output_selection();
+                    }
+                } else if self.mouse_drag == Some(MouseDrag::Scrollbar) {
+                    self.scrollbar_to_row(mouse.row);
+                    self.mouse_drag = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn transcript_hit(&self, column: u16, row: u16) -> Option<(TextPosition, TextPosition)> {
+        let area = self.transcript_area;
+        if column < area.x || column >= area.right() || row < area.y || row >= area.bottom() {
+            return None;
+        }
+        let visible = self.transcript.visible_range(usize::from(area.height));
+        let line_index = visible
+            .start
+            .saturating_add(usize::from(row.saturating_sub(area.y)));
+        self.transcript
+            .hit_test(line_index, usize::from(column.saturating_sub(area.x)))
+    }
+
+    fn mouse_is_on_scrollbar(&self, column: u16, row: u16) -> bool {
+        let area = self.transcript_area;
+        area.height > 0
+            && self.transcript.line_count() > usize::from(area.height)
+            && column == area.right().saturating_sub(1)
+            && row >= area.y
+            && row < area.bottom()
+    }
+
+    fn scrollbar_to_row(&mut self, row: u16) {
+        let area = self.transcript_area;
+        let visible_rows = usize::from(area.height);
+        if visible_rows == 0 || self.transcript.line_count() <= visible_rows {
+            return;
+        }
+        let track_max = usize::from(area.height.saturating_sub(1));
+        let track_position = usize::from(
+            row.saturating_sub(area.y)
+                .min(area.height.saturating_sub(1)),
+        );
+        let maximum_start = self.transcript.line_count().saturating_sub(visible_rows);
+        let start = if track_max == 0 {
+            0
+        } else {
+            track_position
+                .saturating_mul(maximum_start)
+                .saturating_add(track_max / 2)
+                / track_max
+        };
+        self.transcript.scroll_to(start, visible_rows);
+    }
+
+    fn autoscroll_mouse_selection(&mut self, row: u16) {
+        let area = self.transcript_area;
+        let visible_rows = usize::from(area.height);
+        if row <= area.y {
+            self.transcript.scroll_up(1, visible_rows);
+        } else if row >= area.bottom().saturating_sub(1) {
+            self.transcript.scroll_down(1, visible_rows);
+        }
+    }
+
+    fn update_mouse_selection(&mut self, anchor: TextPosition, column: u16, row: u16) {
+        let Some((before, after)) = self.transcript_hit(column, row) else {
+            return;
+        };
+        let head = if before < anchor { before } else { after };
+        self.output_cursor_line = head.line_index;
+        self.transcript.update_selection(head);
+    }
+
+    fn dismiss_output_selection(&mut self) {
+        self.output_focus = false;
+        self.output_anchor_line = None;
+        self.output_notice = None;
+        self.mouse_drag = None;
+        self.transcript.clear_selection();
     }
 
     fn select_output_range(&mut self) {
@@ -984,8 +1127,11 @@ impl RichSurface {
             .transcript
             .selected_text_bounded(TRANSCRIPT_COPY_BYTES_MAX)
         {
-            Ok(Some(text)) => text,
-            Ok(None) => return Ok(()),
+            Ok(Some(text)) if !text.is_empty() => text,
+            Ok(Some(_)) | Ok(None) => {
+                self.output_notice = Some("nothing selected to copy".to_owned());
+                return Ok(());
+            }
             Err(observed_bytes) => {
                 self.output_notice = Some(format!(
                     "selection is {observed_bytes} bytes; copy limit is {TRANSCRIPT_COPY_BYTES_MAX}"
@@ -1001,9 +1147,6 @@ impl RichSurface {
             "copied {} bytes via terminal clipboard",
             text.len()
         ));
-        self.output_focus = false;
-        self.output_anchor_line = None;
-        self.transcript.clear_selection();
         Ok(())
     }
 
@@ -2241,6 +2384,86 @@ mod tests {
 
         surface.return_to_tail_for_input();
 
+        assert!(surface.transcript.follows_tail());
+    }
+
+    #[test]
+    fn mouse_drag_selects_exact_visible_utf8_text() {
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface.append_transcript_line("alpha βeta omega");
+        surface.transcript_area = Rect::new(0, 0, 40, 1);
+
+        surface.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 6,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        surface.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 9,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        surface.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 9,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(surface.output_focus);
+        assert_eq!(
+            surface
+                .transcript
+                .selected_text_bounded(TRANSCRIPT_COPY_BYTES_MAX),
+            Ok(Some("βeta".to_owned()))
+        );
+        assert_eq!(surface.mouse_drag, None);
+    }
+
+    #[test]
+    fn scrollbar_pointer_maps_track_endpoints_to_transcript_endpoints() {
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        for line in 0..100 {
+            surface.append_transcript_line(&format!("line-{line}"));
+        }
+        surface.transcript_area = Rect::new(0, 0, 40, 20);
+
+        surface.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 39,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(surface.transcript.visible_range(20), 0..20);
+        surface.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 39,
+            row: 19,
+            modifiers: KeyModifiers::NONE,
+        });
+        surface.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 39,
+            row: 19,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(surface.transcript.visible_range(20), 80..100);
         assert!(surface.transcript.follows_tail());
     }
 

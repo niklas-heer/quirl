@@ -1535,17 +1535,61 @@ fn check_retained_output_cycles(binary: &Path) -> Result<(), Box<dyn Error>> {
             ) && screen.bottom_line().contains("NORMAL")
         })?;
 
+    let (selection_row, selection_column) = session
+        .pty
+        .screen()
+        .lines()
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(row, line)| {
+            line.find("RETAINED_CYCLE_11")
+                .filter(|_| line.trim_start().starts_with("RETAINED_CYCLE_11"))
+                .map(|column| (row, column))
+        })
+        .ok_or_else(|| io::Error::other("retained output marker was not visible for selection"))?;
+    let selection_end = selection_column.saturating_add("RETAINED_CYCLE_11".len() - 1);
+    let mouse_down = format!(
+        "\x1b[<0;{};{}M",
+        selection_column.saturating_add(1),
+        selection_row.saturating_add(1)
+    );
+    let mouse_drag = format!(
+        "\x1b[<32;{};{}M",
+        selection_end.saturating_add(1),
+        selection_row.saturating_add(1)
+    );
+    let mouse_up = format!(
+        "\x1b[<0;{};{}m",
+        selection_end.saturating_add(1),
+        selection_row.saturating_add(1)
+    );
     let copy_start = session.pty.output().len();
-    session.pty.send(key::ALT_Q)?;
-    session.pty.send(b"o")?;
-    session.pty.wait_for_screen("output copy mode", |screen| {
-        screen.bottom_line().contains("OUTPUT")
-    })?;
-    session.pty.send(b"y")?;
-    session.pty.wait_for_screen_text("copied")?;
-    if !contains(&session.pty.output()[copy_start..], b"\x1b]52;c;") {
-        return Err(io::Error::other("output copy mode did not emit bounded OSC 52").into());
+    session.pty.send(mouse_down.as_bytes())?;
+    session.pty.send(mouse_drag.as_bytes())?;
+    session.pty.send(mouse_up.as_bytes())?;
+    session
+        .pty
+        .wait_for_screen("mouse output selection copied", |screen| {
+            screen.bottom_line().contains("copied 17 bytes")
+        })?;
+    if !contains(
+        &session.pty.output()[copy_start..],
+        b"\x1b]52;c;UkVUQUlORURfQ1lDTEVfMTE=\x07",
+    ) {
+        return Err(io::Error::other(
+            "mouse-selected output did not emit the exact bounded OSC 52 payload",
+        )
+        .into());
     }
+    session.pty.send(key::ESCAPE)?;
+    session
+        .pty
+        .wait_for_screen("mouse selection dismissed", |screen| {
+            screen.bottom_line().contains("NORMAL")
+                && !screen.bottom_line().contains("OUTPUT")
+                && !screen.bottom_line().contains("copied")
+        })?;
     session.pty.send(key::CTRL_D)?;
     ensure_status(session.pty.wait_exit()?, 0, "retained-output cycles")
 }

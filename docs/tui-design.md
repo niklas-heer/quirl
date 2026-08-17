@@ -206,10 +206,12 @@ scrollback.
 
 ### 3.4 Transcript, scrolling, selection, and copy
 
-The editor/context region remains at the top and the status bar remains on the
-physical bottom row. The transcript viewport owns the flexible body between
-them. Completion, documentation, and picker overlays reserve their existing
-bounded region without changing the transcript's logical scroll anchor.
+The transcript begins at the top and pushes the context/editor downward like a
+normal shell session. Once the viewport fills, the live context/editor remains
+immediately above the status bar on the physical bottom row and the transcript
+scrolls behind it. A scrolled-away viewport gives the transcript the full body.
+Completion, documentation, and picker overlays reuse a bounded transcript
+region without changing the logical scroll anchor or moving the live prompt.
 
 One completion-atomic transcript entry contains terminal-safe values
 equivalent to:
@@ -237,8 +239,9 @@ line does not fit, oldest complete logical lines are evicted and one bounded
 omission marker reports that fact. Eviction never removes the active editor,
 splits a UTF-8 sequence, or duplicates discarded bytes in metadata.
 
-Scrolling is application-owned. The shipped keyboard path provides page
-up/down and return-to-tail navigation:
+Scrolling is application-owned. The shipped paths provide page up/down,
+mouse-wheel steps, a proportional draggable scrollbar, and return-to-tail
+navigation:
 
 - `scroll_line`, `scroll_page`, `scroll_to_start`, and `scroll_to_end` operate
   on logical transcript positions, not the host terminal's scrollback;
@@ -252,15 +255,18 @@ up/down and return-to-tail navigation:
 
 Selection endpoints are logical transcript positions. Repaint, wrapping, and
 scrolling may change their cells but not the selected text while its source
-entry remains retained. The shipped output-focus mode provides keyboard line
-selection and copy; mouse selection and drag auto-scroll remain enhancements.
-Evicting selected source text clamps the selection to retained content.
+entry remains retained. Output-focus mode provides keyboard line selection;
+mouse dragging selects exact grapheme-safe character ranges and scrolls by one
+bounded logical line when held at a viewport edge. Releasing a completed mouse
+drag copies immediately while retaining the visible selection. Evicting source
+text clamps the selection to retained content.
 
-Copy serializes plain semantic text without color or layout padding. One copy
-is capped at 1 MiB and fails before an oversized allocation. OSC 52 and native
-clipboard helpers are transport choices behind this model; a clipboard error
-keeps the selection and never changes command status. Paste remains governed
-by the 64 KiB editor bound in §4 and is not a PTY input stream.
+Copy serializes plain semantic text without color, scrollbar cells, or layout
+padding. One copy is capped at 1 MiB and fails before an oversized allocation.
+Mouse release, `y`, and delivered Ctrl/Cmd-C events use the same OSC 52
+transport; a clipboard error keeps the selection and never changes command
+status. Paste remains governed by the 64 KiB editor bound in §4 and is not a
+PTY input stream.
 
 ### 3.5 Event loop
 
@@ -693,9 +699,10 @@ In-crate `#[cfg(test)]` modules, behavior-sentence names, run by `cargo xtask ch
   eviction, omission-marker accounting, UTF-8 boundaries, and atomic failure
   paths at 16 MiB/50,000 lines.
 - **Scroll/selection**: follow mode disengages on manual scroll, resize preserves
-  a logical anchor, keyboard selection survives repaint, and a 1 MiB copy
-  succeeds while the next byte fails before allocation. Mouse drag/auto-scroll
-  remains future work.
+  a logical anchor, the proportional scrollbar uses the actual retained and
+  visible line counts, keyboard and mouse selection survive repaint, exact
+  UTF-8 mouse ranges copy through a real PTY, and a 1 MiB copy succeeds while
+  the next byte fails before allocation.
 - **Lifecycle**: repeated ordinary foreground commands never emit
   alternate-screen exit;
   suspension, EOF, fatal render failure, and normal exit each restore the main
@@ -770,7 +777,7 @@ distinguishes landed behavior from remaining parity and release-evidence work.
 
 | Milestone | Current status | Remaining acceptance work |
 | --- | --- | --- |
-| **M1 — Frame + transcript** | Landed editor baseline: full-screen alternate viewport, bottom status, Quirl-owned 64 KiB grapheme editor, bounded undo/history, Emacs/Helix/Vim states, context/input/status rows, prefix history, autosuggestion, completion-atomic captured foreground commands, and bounded keyboard scroll/selection/copy | Add optional mouse selection and keep interactive PTY/VT support outside this milestone |
+| **M1 — Frame + transcript** | Landed editor baseline: full-screen alternate viewport, bottom status, Quirl-owned 64 KiB grapheme editor, bounded undo/history, Emacs/Helix/Vim states, flowing transcript/context/input rows, prefix history, autosuggestion, completion-atomic captured foreground commands, proportional keyboard/mouse scrolling, exact mouse/keyboard selection, and bounded copy | Keep interactive PTY/VT support outside this milestone |
 | **M2 — Highlighting + diagnostics** | Landed baseline: revision-cached `quirl_syntax::highlight`, bounded asynchronous executable-PATH snapshot, parse/unknown-command/unknown-flag diagnostics, severity styling, draw/highlight P95, and Ratatui/adversarial 4 KiB tests | Expand generated totality coverage and record evidence that the 4 KiB/first-paint budgets pass on release terminals |
 | **M3 — Completion popup** | Landed: always-on exact-command information and flag-prefix options, bounded catalog and extension workers/results, catalog-first asynchronous merge, selection stability, stale suppression, docs/provenance pane, token anchoring, match styling, virtualization, and narrow list-only rendering | Record named ≤8 ms first-result evidence and broader provider fault/terminal snapshots |
 | **M4 — Overlays + keymaps** | Landed: history/files/directories/palette overlays use the shared `quirl-picker` ranker through a composition-root adapter; queries are bounded and editable; Shift-Tab expands completion; adaptive/bottom and terminal-height full layouts honor preview config; Emacs/Helix/Vim editor modes remain available | Decide kitty/synchronized-output negotiation and gather named real-terminal layout evidence |

@@ -1,6 +1,8 @@
 //! Bounded logical output retained by the full-screen terminal surface.
 
 use std::{collections::VecDeque, ops::Range};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Explicit memory and collection limits for one transcript.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +207,57 @@ impl Transcript {
     /// Returns `true` when an explicit scroll position was cleared.
     pub(super) fn scroll_to_end(&mut self) -> bool {
         self.scroll_top.take().is_some()
+    }
+
+    /// Move to an exact retained-line viewport start.
+    ///
+    /// Starts at or beyond the newest complete viewport resume tail following.
+    /// This is the bounded target used by scrollbar pointer interaction.
+    pub(super) fn scroll_to(&mut self, start: usize, visible_line_count: usize) -> bool {
+        if visible_line_count == 0 || self.lines.is_empty() {
+            return false;
+        }
+        let previous = self.visible_range(visible_line_count).start;
+        let maximum_start = self.lines.len().saturating_sub(visible_line_count);
+        let next = start.min(maximum_start);
+        self.scroll_top = (next < maximum_start).then_some(next);
+        previous != next
+    }
+
+    /// Map one terminal cell to the UTF-8 boundaries around its grapheme.
+    ///
+    /// The first position is immediately before the hit grapheme and the second
+    /// is immediately after it. Wide graphemes map every occupied cell to the
+    /// same pair. Columns at or beyond line end map to the final byte boundary.
+    pub(super) fn hit_test(
+        &self,
+        line_index: usize,
+        display_column: usize,
+    ) -> Option<(TextPosition, TextPosition)> {
+        let line = self.lines.get(line_index)?;
+        let mut occupied_columns = 0_usize;
+        for (byte_offset, grapheme) in line.grapheme_indices(true) {
+            let grapheme_columns = UnicodeWidthStr::width(grapheme);
+            let next_columns = occupied_columns.saturating_add(grapheme_columns);
+            if grapheme_columns > 0 && display_column < next_columns {
+                return Some((
+                    TextPosition {
+                        line_index,
+                        byte_offset,
+                    },
+                    TextPosition {
+                        line_index,
+                        byte_offset: byte_offset.saturating_add(grapheme.len()),
+                    },
+                ));
+            }
+            occupied_columns = next_columns;
+        }
+        let end = TextPosition {
+            line_index,
+            byte_offset: line.len(),
+        };
+        Some((end, end))
     }
 
     /// Start a selection at the nearest valid retained text position.
@@ -476,6 +529,50 @@ mod tests {
         );
         assert!(!transcript.scroll_up(0, 4));
         assert!(!transcript.scroll_down(1, 0));
+    }
+
+    #[test]
+    fn exact_scroll_targets_clamp_and_resume_tail_following() {
+        let mut transcript = transcript(20, 1_024);
+        for line in 0..10 {
+            transcript.append_line(&format!("line-{line}"));
+        }
+
+        assert!(transcript.scroll_to(2, 4));
+        assert_eq!(transcript.visible_range(4), 2..6);
+        assert!(!transcript.follows_tail());
+        assert!(transcript.scroll_to(usize::MAX, 4));
+        assert_eq!(transcript.visible_range(4), 6..10);
+        assert!(transcript.follows_tail());
+        assert!(!transcript.scroll_to(6, 4));
+    }
+
+    #[test]
+    fn terminal_hit_testing_preserves_grapheme_and_utf8_boundaries() {
+        let mut transcript = transcript(4, 1_024);
+        transcript.append_line("a界e\u{301}");
+
+        assert_eq!(
+            transcript.hit_test(0, 0),
+            Some((position(0, 0), position(0, 1)))
+        );
+        assert_eq!(
+            transcript.hit_test(0, 1),
+            Some((position(0, 1), position(0, 4)))
+        );
+        assert_eq!(
+            transcript.hit_test(0, 2),
+            Some((position(0, 1), position(0, 4)))
+        );
+        assert_eq!(
+            transcript.hit_test(0, 3),
+            Some((position(0, 4), position(0, 7)))
+        );
+        assert_eq!(
+            transcript.hit_test(0, 20),
+            Some((position(0, 7), position(0, 7)))
+        );
+        assert_eq!(transcript.hit_test(1, 0), None);
     }
 
     #[test]
