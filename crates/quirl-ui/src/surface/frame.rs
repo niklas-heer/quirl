@@ -38,6 +38,8 @@ pub struct FrameModel<'a> {
     pub compact: bool,
     pub picker_query: Option<&'a str>,
     pub picker_layout: PickerLayout,
+    /// A temporary terminal-height inline viewport places this picker at the screen bottom.
+    pub picker_bottom_anchored: bool,
     pub picker_preview: bool,
     pub detail_scroll: u16,
     pub runtime: &'a RuntimeSurfaceState,
@@ -45,6 +47,13 @@ pub struct FrameModel<'a> {
 
 impl FrameModel<'_> {
     pub fn height(&self, terminal_height: u16) -> u16 {
+        if self.picker_bottom_anchored && self.picker_query.is_some() {
+            return terminal_height.max(1);
+        }
+        self.content_height(terminal_height)
+    }
+
+    fn content_height(&self, terminal_height: u16) -> u16 {
         let input_rows =
             u16::try_from(self.editor.buffer().lines().count().max(1)).unwrap_or(u16::MAX);
         let diagnostics = u16::from(self.diagnostic.is_some() && !self.compact);
@@ -89,7 +98,18 @@ impl FrameModel<'_> {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
-        let area = frame.area();
+        let viewport_area = frame.area();
+        let content_height = self.content_height(viewport_area.height);
+        let area = if self.picker_bottom_anchored && self.picker_query.is_some() {
+            Rect::new(
+                viewport_area.x,
+                viewport_area.bottom().saturating_sub(content_height),
+                viewport_area.width,
+                content_height,
+            )
+        } else {
+            viewport_area
+        };
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -650,6 +670,7 @@ mod tests {
                     compact,
                     picker_query: None,
                     picker_layout: PickerLayout::Adaptive,
+                    picker_bottom_anchored: false,
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
@@ -731,6 +752,7 @@ mod tests {
                     compact: false,
                     picker_query: None,
                     picker_layout: PickerLayout::Adaptive,
+                    picker_bottom_anchored: false,
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
@@ -787,6 +809,7 @@ mod tests {
                     compact: false,
                     picker_query: None,
                     picker_layout: PickerLayout::Adaptive,
+                    picker_bottom_anchored: false,
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
@@ -859,6 +882,7 @@ mod tests {
                     compact: false,
                     picker_query: None,
                     picker_layout: PickerLayout::Adaptive,
+                    picker_bottom_anchored: false,
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
@@ -909,6 +933,7 @@ mod tests {
             compact: true,
             picker_query: None,
             picker_layout: PickerLayout::Adaptive,
+            picker_bottom_anchored: false,
             picker_preview: true,
             detail_scroll: 0,
             runtime: &runtime,
@@ -991,6 +1016,7 @@ mod tests {
                     compact: false,
                     picker_query: Some("sta"),
                     picker_layout: PickerLayout::Full,
+                    picker_bottom_anchored: false,
                     picker_preview: false,
                     detail_scroll: 0,
                     runtime: &runtime,
@@ -1004,6 +1030,62 @@ mod tests {
         assert!(rendered.contains("⌕ sta"));
         assert!(!rendered.contains("documentation"));
         assert!(!rendered.contains("preview detail"));
+    }
+
+    #[test]
+    fn adaptive_command_palette_uses_a_terminal_height_viewport_at_the_bottom() {
+        let editor = EditorState::new("emacs", Vec::new());
+        let mut completion = CompletionState::new(Catalog::builtin(), None);
+        completion.show_picker_results(
+            vec![CompletionItem {
+                value: "git status".to_owned(),
+                display: "git status".to_owned(),
+                summary: "working tree".to_owned(),
+                detail: "preview detail".to_owned(),
+                replace_start: 0,
+                replace_end: 0,
+                match_indices: Vec::new(),
+                kind: CompletionKind::Command,
+                source: "catalog",
+                trust: "validated",
+            }],
+            "picker",
+        );
+        let runtime = RuntimeSurfaceState::new();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                let model = FrameModel {
+                    context_left: "~/project",
+                    context_right: "",
+                    editor: &editor,
+                    completion: &completion,
+                    mode: Mode::Command,
+                    diagnostic: None,
+                    highlight_spans: &[],
+                    theme: Theme::new(true),
+                    unicode: true,
+                    symbols: SurfaceSymbols::Unicode,
+                    semantic_hints: true,
+                    hints: true,
+                    timings: None,
+                    compact: false,
+                    picker_query: Some(""),
+                    picker_layout: PickerLayout::Adaptive,
+                    picker_bottom_anchored: true,
+                    picker_preview: true,
+                    detail_scroll: 0,
+                    runtime: &runtime,
+                };
+                assert_eq!(model.height(30), 30);
+                model.render(frame);
+            })
+            .unwrap();
+
+        assert!(row(&terminal, 19).trim().is_empty());
+        assert!(row(&terminal, 20).contains("~/project"));
+        assert!(row(&terminal, 22).contains("picker"));
+        assert!(row(&terminal, 29).contains("command"));
     }
 
     #[test]
@@ -1111,6 +1193,7 @@ mod tests {
                     compact: false,
                     picker_query: None,
                     picker_layout: PickerLayout::Adaptive,
+                    picker_bottom_anchored: false,
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
