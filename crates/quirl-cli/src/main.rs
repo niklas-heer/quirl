@@ -8,6 +8,7 @@ mod bounded_file;
 mod config;
 mod extension_scheduler;
 mod extensions;
+mod history;
 mod index;
 mod intelligence;
 mod lsp;
@@ -53,11 +54,12 @@ use quirl_process::{sandboxed_process_host, JobStatus, NativeExecutor, DEFAULT_C
 use quirl_syntax::{classify, InteractiveLine, Mode};
 use quirl_ui::{
     editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
-    terminal_supports_unicode, terminal_width, CatalogLoader, InteractiveDataSnapshot,
-    InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch,
-    InteractivePanelProvider, InteractiveRuntimeSnapshot, InteractiveSignal, PickerItem,
-    PickerItemKind, PickerMatch, PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface,
-    SurfaceKind, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, MODE_TOGGLE_HOST_COMMAND,
+    terminal_supports_unicode, terminal_width, CatalogLoader, ExtensionCompleter,
+    ExtensionSuggestion, InteractiveDataSnapshot, InteractiveHistoryEntry, InteractiveJobAction,
+    InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
+    InteractiveRuntimeSnapshot, InteractiveSignal, PickerItem, PickerItemKind, PickerMatch,
+    PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind, DATA_ITEMS_MAX,
+    DATA_RETAINED_BYTES_MAX, MODE_TOGGLE_HOST_COMMAND,
 };
 use recovery::RecoveryCommand;
 use script::ScriptLanguage;
@@ -1641,6 +1643,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         (config, host.config_revision())
     };
     let history_path = history_path()?;
+    let mut history_database = history::HistoryDatabase::open_default(&history_path)?;
     let ai_bootstrap = InteractiveAiBootstrap::new();
     let (mut line_editor, mut catalog) = configured_initial_editor(
         &extensions,
@@ -1666,6 +1669,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     // returned so an idle worker thread is not on the cold-paint boundary.
     let mut prompt_context: Option<PromptContextScheduler> = None;
     let mut first_prompt = true;
+    let mut preserve_output_pending = false;
 
     loop {
         if !first_prompt {
@@ -1778,8 +1782,13 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             jobs: interactive_job_snapshots(&job_states),
             data: data_cache.snapshot(),
         });
+        let history_directory = std::env::current_dir().unwrap_or_default();
+        line_editor.install_history_snapshot(history_database.snapshot(&history_directory)?);
+        if std::mem::take(&mut preserve_output_pending) {
+            line_editor.preserve_output_once();
+        }
         let signal = line_editor.read_line(&mut prompt);
-        // Rich Alt-M transitions happen while the surface retains terminal
+        // Rich Alt-Q transitions happen while the surface retains terminal
         // ownership. Adopt the mode rendered by that session before classifying
         // accepted input; degraded editors leave the prompt mode unchanged and
         // continue to report their host command below.
@@ -1803,7 +1812,14 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             Ok(InteractiveSignal::Success(buffer)) => {
                 sync_history(&mut line_editor, &history_path)?;
                 quiesce_extension_callbacks(&extensions)?;
-                match classify(mode, &buffer) {
+                let interactive_line = classify(mode, &buffer);
+                if !matches!(
+                    interactive_line,
+                    InteractiveLine::Empty | InteractiveLine::Exit
+                ) {
+                    preserve_output_pending = true;
+                }
+                match interactive_line {
                     InteractiveLine::Empty => {}
                     InteractiveLine::Exit => return Ok(last_status),
                     InteractiveLine::ChangeMode(next) => {
@@ -1842,7 +1858,15 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 eprintln!("{}", render_stderr_error(&error));
                             }
                         }
-                        last_duration = Some(started.elapsed());
+                        let elapsed = started.elapsed();
+                        last_duration = Some(elapsed);
+                        history_database.record(
+                            command,
+                            &history_directory,
+                            mode,
+                            last_status,
+                            Some(elapsed),
+                        )?;
                     }
                     InteractiveLine::Data(source) => {
                         let planned = match prepare_extension_plan(
@@ -1855,6 +1879,13 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                             Err(error) => {
                                 last_status = 1;
                                 eprintln!("{}", render_stderr_error(&error));
+                                history_database.record(
+                                    source,
+                                    &history_directory,
+                                    mode,
+                                    last_status,
+                                    None,
+                                )?;
                                 continue;
                             }
                         };
@@ -1926,7 +1957,15 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 eprintln!("{}", render_stderr_error(&error));
                             }
                         }
-                        last_duration = Some(started.elapsed());
+                        let elapsed = started.elapsed();
+                        last_duration = Some(elapsed);
+                        history_database.record(
+                            source,
+                            &history_directory,
+                            mode,
+                            last_status,
+                            Some(elapsed),
+                        )?;
                     }
                     InteractiveLine::Natural(query) => {
                         let started = Instant::now();
@@ -1945,7 +1984,15 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 eprintln!("{}", render_stderr_error(&error));
                             }
                         }
-                        last_duration = Some(started.elapsed());
+                        let elapsed = started.elapsed();
+                        last_duration = Some(elapsed);
+                        history_database.record(
+                            query,
+                            &history_directory,
+                            mode,
+                            last_status,
+                            Some(elapsed),
+                        )?;
                     }
                     InteractiveLine::Lua(source) => {
                         let planned = match prepare_extension_plan(
@@ -1958,6 +2005,13 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                             Err(error) => {
                                 last_status = 1;
                                 eprintln!("{}", render_stderr_error(&error));
+                                history_database.record(
+                                    source,
+                                    &history_directory,
+                                    mode,
+                                    last_status,
+                                    None,
+                                )?;
                                 continue;
                             }
                         };
@@ -2026,7 +2080,15 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 eprintln!("{}", render_stderr_error(&error));
                             }
                         }
-                        last_duration = Some(started.elapsed());
+                        let elapsed = started.elapsed();
+                        last_duration = Some(elapsed);
+                        history_database.record(
+                            source,
+                            &history_directory,
+                            mode,
+                            last_status,
+                            Some(elapsed),
+                        )?;
                     }
                 }
             }
@@ -2444,6 +2506,18 @@ impl SessionEditor {
         }
     }
 
+    fn install_history_snapshot(&mut self, history: Vec<InteractiveHistoryEntry>) {
+        if let Self::Rich(editor) = self {
+            editor.install_history_snapshot(history);
+        }
+    }
+
+    fn preserve_output_once(&mut self) {
+        if let Self::Rich(editor) = self {
+            editor.preserve_output_once();
+        }
+    }
+
     fn published_catalog(&self) -> Option<Arc<Catalog>> {
         match self {
             Self::Rich(editor) => editor.published_catalog(),
@@ -2471,6 +2545,7 @@ fn configured_initial_editor(
         )?;
         editor.set_panel_provider(Box::new(CachedPanelAdapter::new(Arc::clone(extensions))));
         editor.set_activity_provider(Box::new(ai_bootstrap.activity_provider()));
+        editor.set_intent_completer(Box::new(AiIntentCompleter::default()));
         return Ok((SessionEditor::Rich(Box::new(editor)), None));
     }
 
@@ -2503,6 +2578,7 @@ fn configured_editor(
         .map(|mut editor| {
             editor.set_panel_provider(Box::new(CachedPanelAdapter::new(Arc::clone(extensions))));
             editor.set_activity_provider(Box::new(ai_bootstrap.activity_provider()));
+            editor.set_intent_completer(Box::new(AiIntentCompleter::default()));
             SessionEditor::Rich(Box::new(editor))
         });
     }
@@ -2519,6 +2595,55 @@ fn configured_editor(
 #[derive(Debug)]
 struct SharedPickerRanker;
 
+#[derive(Default)]
+struct AiIntentCompleter {
+    search: Option<intelligence::SearchSession>,
+}
+
+impl ExtensionCompleter for AiIntentCompleter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
+        let Some(query) = line
+            .get(..pos)
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+        else {
+            return Vec::new();
+        };
+        if self.search.is_none() {
+            let Ok(search) = index::open_default_search_session() else {
+                return Vec::new();
+            };
+            self.search = Some(search);
+        }
+        let Some(search) = &self.search else {
+            return Vec::new();
+        };
+        search
+            .search(query, 8)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|result| ExtensionSuggestion {
+                value: result.target.clone(),
+                display: result.target,
+                summary: result.summary.clone(),
+                detail: format!(
+                    "{} · {} · score {:.3}: {}",
+                    if result.semantic {
+                        "semantic"
+                    } else {
+                        "lexical"
+                    },
+                    result.kind,
+                    result.score,
+                    result.summary
+                ),
+                replace_start: 0,
+                replace_end: pos,
+            })
+            .collect()
+    }
+}
+
 impl PickerRanker for SharedPickerRanker {
     fn rank(&self, items: &[PickerItem], query: &str, limit: usize) -> Vec<PickerMatch> {
         let shared = items
@@ -2533,8 +2658,19 @@ impl PickerRanker for SharedPickerRanker {
                 value: serde_json::Value::String(item.value.clone()),
             })
             .collect::<Vec<_>>();
-        Picker
-            .rank(&shared, query)
+        let mut ranked = Picker.rank(&shared, query);
+        ranked.sort_by(|left, right| {
+            let left_score = left
+                .score
+                .saturating_add(items.get(left.index).map_or(0, |item| item.rank_bias));
+            let right_score = right
+                .score
+                .saturating_add(items.get(right.index).map_or(0, |item| item.rank_bias));
+            right_score
+                .cmp(&left_score)
+                .then_with(|| left.index.cmp(&right.index))
+        });
+        ranked
             .into_iter()
             .take(limit.min(MAX_PICKER_ITEMS))
             .map(|matched| PickerMatch {
@@ -2658,9 +2794,9 @@ fn onboarding_banner(width: u16, unicode: bool) -> String {
     if width >= 96 {
         lines.push(
             [
-                "COMMAND: processes/bytes",
+                "NORMAL: processes/bytes",
                 "DATA: typed values/tables",
-                "Alt-M mode",
+                "Alt-Q Quirl",
             ]
             .join(separator),
         );
@@ -2668,8 +2804,8 @@ fn onboarding_banner(width: u16, unicode: bool) -> String {
             [
                 "Tab semantic completion",
                 "Ctrl-R history",
-                "Ctrl-T files",
-                "Ctrl-K actions",
+                "Alt-Q f files",
+                "Alt-Q p actions",
                 "F1 help",
             ]
             .join(separator),
@@ -2677,15 +2813,22 @@ fn onboarding_banner(width: u16, unicode: bool) -> String {
         lines.push("Nerd Font prompt: set prompt.symbols = \"nerd_font\" in config.lua".to_owned());
         lines.push("Type help to explore commands.".to_owned());
     } else if width >= 64 {
-        lines.push(["COMMAND: processes/bytes", "DATA: typed values"].join(separator));
-        lines.push(["Alt-M mode", "Tab semantic completion", "Ctrl-R history"].join(separator));
-        lines.push(["Ctrl-T files", "Ctrl-K actions", "F1 help"].join(separator));
+        lines.push(["NORMAL: processes/bytes", "DATA: typed values"].join(separator));
+        lines.push(
+            [
+                "Alt-Q Quirl",
+                "Tab semantic completion",
+                "Up/Ctrl-R history",
+            ]
+            .join(separator),
+        );
+        lines.push(["Alt-Q f files", "Alt-Q p actions", "F1 help"].join(separator));
         lines.push("Nerd Font prompt: prompt.symbols = \"nerd_font\"".to_owned());
     } else {
         lines.push("Processes + typed data".to_owned());
-        lines.push(["Alt-M mode", "Tab complete"].join(separator));
-        lines.push(["Ctrl-R history", "Ctrl-T files"].join(separator));
-        lines.push(["Ctrl-K actions", "F1 help"].join(separator));
+        lines.push(["Alt-Q Quirl", "Tab complete"].join(separator));
+        lines.push(["Ctrl-R history", "Alt-Q f files"].join(separator));
+        lines.push(["Alt-Q p actions", "F1 help"].join(separator));
         lines.push("Nerd Font prompt:".to_owned());
         lines.push("  prompt.symbols = \"nerd_font\"".to_owned());
     }
@@ -2698,7 +2841,7 @@ fn compact_welcome(width: u16, unicode: bool) -> String {
         format!("Quirl {}", env!("CARGO_PKG_VERSION")),
         "COMMAND/DATA".to_owned(),
         "Tab complete".to_owned(),
-        "Alt-M mode".to_owned(),
+        "Alt-Q Quirl".to_owned(),
         "help".to_owned(),
     ]
     .join(separator);
@@ -2711,7 +2854,7 @@ fn minimal_onboarding(width: usize) -> String {
     } else {
         truncate_display_width("Quirl", width)
     }];
-    for hint in ["Alt-M mode", "Tab complete", "Ctrl-R/T/K pickers", "help"] {
+    for hint in ["Alt-Q Quirl", "Tab complete", "Up/Ctrl-R history", "help"] {
         if UnicodeWidthStr::width(hint) <= width {
             lines.push(hint.to_owned());
         }
@@ -3035,6 +3178,21 @@ mod tests {
     const DEFAULT_DIFFERENTIAL_CASES: usize = 128;
     const DEFAULT_DIFFERENTIAL_SEED: u64 = 7_640_891_576_956_012_809;
 
+    #[test]
+    fn shared_picker_prefers_same_directory_history() {
+        let item = |id: &str, rank_bias| PickerItem {
+            id: id.to_owned(),
+            kind: PickerItemKind::History,
+            label: "git status".to_owned(),
+            description: "history".to_owned(),
+            preview: None,
+            value: id.to_owned(),
+            rank_bias,
+        };
+        let matches = SharedPickerRanker.rank(&[item("remote", 0), item("local", 4_000)], "git", 2);
+        assert_eq!(matches[0].index, 1);
+    }
+
     struct DifferentialGenerator {
         state: u64,
     }
@@ -3117,11 +3275,11 @@ mod tests {
     fn onboarding_adapts_without_hiding_daily_driver_shortcuts() {
         for (width, unicode) in [(32, false), (64, true), (96, true)] {
             let banner = onboarding_banner(width, unicode);
-            assert!(banner.contains("Alt-M mode"));
+            assert!(banner.contains("Alt-Q Quirl"));
             assert!(banner.contains("semantic completion") || banner.contains("Tab complete"));
             assert!(banner.contains("Ctrl-R history"));
-            assert!(banner.contains("Ctrl-T files"));
-            assert!(banner.contains("Ctrl-K actions"));
+            assert!(banner.contains("Alt-Q f files"));
+            assert!(banner.contains("Alt-Q p actions"));
             assert!(banner.contains("prompt.symbols = \"nerd_font\""));
             assert!(!banner.contains('\u{1b}'));
             assert!(banner
@@ -3168,11 +3326,15 @@ mod tests {
     fn mode_feedback_names_the_active_execution_model() {
         assert_eq!(
             mode_feedback(Mode::Command, false),
-            "mode: command - processes and byte pipelines"
+            "mode: normal - processes and byte pipelines"
         );
         assert_eq!(
             mode_feedback(Mode::Data, true),
             "mode → data · typed values and data pipelines"
+        );
+        assert_eq!(
+            mode_feedback(Mode::Natural, true),
+            "mode → ai · local command and option suggestions"
         );
     }
 

@@ -24,8 +24,21 @@ pub use runtime::{
 /// the surface's existing RAII guard and is returned unchanged.
 pub type CatalogLoader = Box<dyn FnOnce() -> Result<Arc<Catalog>, ShellError>>;
 
+/// Bounded history metadata installed by the product's durable history store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveHistoryEntry {
+    /// Exact command line restored when the entry is accepted.
+    pub command_line: String,
+    /// Working directory in which the command was started, when known.
+    pub directory: Option<String>,
+    /// Exit status recorded after execution, when known.
+    pub status: Option<i32>,
+    /// Ranking preference applied before deterministic picker tie-breaking.
+    pub rank_bias: i32,
+}
+
 use self::{
-    completion::CompletionState,
+    completion::{CompletionState, IntentCompletionState},
     editor::{EditAction, EditorState},
     frame::FrameModel,
     highlight::InputAnalyzer,
@@ -38,12 +51,13 @@ use super::{
 };
 use crate::theme::Theme;
 use crossterm::{
-    cursor::{SetCursorStyle, Show},
+    cursor::{MoveToColumn, SetCursorStyle, Show},
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
         KeyModifiers,
     },
     execute,
+    style::Print,
     terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use quirl_catalog::Catalog;
@@ -74,6 +88,19 @@ const RICH_TERMINAL_ROWS_MAX: u16 = 256;
 const HISTORY_REPLACEMENT_BYTES_MAX: usize = MAX_HISTORY_FILE_BYTES * 2;
 #[cfg(test)]
 static HISTORY_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+fn legacy_history(path: &Path) -> Vec<InteractiveHistoryEntry> {
+    read_history(path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|command_line| InteractiveHistoryEntry {
+            command_line,
+            directory: None,
+            status: None,
+            rank_bias: 0,
+        })
+        .collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Result of one rich-surface input session after terminal ownership is released.
@@ -107,7 +134,7 @@ pub struct RichSurface {
     expand_completion_pending: bool,
     keymap: String,
     history_path: PathBuf,
-    history: Vec<String>,
+    history: Vec<InteractiveHistoryEntry>,
     terminal: SurfaceTerminal,
     draw_times: VecDeque<Duration>,
     input_analysis: InputAnalyzer,
@@ -119,8 +146,11 @@ pub struct RichSurface {
     semantic_hints: bool,
     help_active: bool,
     help_detail_scroll: u16,
+    leader_active: bool,
     theme: Theme,
     runtime: RuntimeSurfaceState,
+    preserve_output_once: bool,
+    intent_completion: IntentCompletionState,
 }
 
 impl RichSurface {
@@ -138,7 +168,7 @@ impl RichSurface {
         config: &QuirlConfig,
         history_path: PathBuf,
     ) -> Result<Self, ShellError> {
-        let history = read_history(&history_path).unwrap_or_default();
+        let history = legacy_history(&history_path);
         let input_analysis = InputAnalyzer::new(Arc::clone(&catalog));
         let theme = Theme::from_config(config, true)?;
         Ok(Self {
@@ -163,8 +193,11 @@ impl RichSurface {
             semantic_hints: config.editor.semantic_hints,
             help_active: false,
             help_detail_scroll: 0,
+            leader_active: false,
             theme,
             runtime: RuntimeSurfaceState::new(),
+            preserve_output_once: false,
+            intent_completion: IntentCompletionState::default(),
         })
     }
 
@@ -182,7 +215,7 @@ impl RichSurface {
         config: &QuirlConfig,
         history_path: PathBuf,
     ) -> Result<Self, ShellError> {
-        let history = read_history(&history_path).unwrap_or_default();
+        let history = legacy_history(&history_path);
         let theme = Theme::from_config(config, true)?;
         Ok(Self {
             catalog: None,
@@ -206,8 +239,11 @@ impl RichSurface {
             semantic_hints: config.editor.semantic_hints,
             help_active: false,
             help_detail_scroll: 0,
+            leader_active: false,
             theme,
             runtime: RuntimeSurfaceState::new(),
+            preserve_output_once: false,
+            intent_completion: IntentCompletionState::default(),
         })
     }
 
@@ -242,6 +278,21 @@ impl RichSurface {
         self.runtime.install_snapshot(snapshot);
     }
 
+    /// Replace the next editor and fuzzy picker history with a bounded snapshot.
+    pub fn install_history_snapshot(&mut self, history: Vec<InteractiveHistoryEntry>) {
+        self.history = history;
+    }
+
+    /// Keep the main-screen command output visible until the user's next input event.
+    pub fn preserve_output_once(&mut self) {
+        self.preserve_output_once = true;
+    }
+
+    /// Install the bounded local intent-search provider used by AI mode.
+    pub fn set_intent_completer(&mut self, completer: Box<dyn ExtensionCompleter + Send>) {
+        self.intent_completion.install(completer);
+    }
+
     /// Attach a nonblocking provider of completed asynchronous panel snapshots.
     pub fn set_panel_provider(&mut self, provider: Box<dyn InteractivePanelProvider>) {
         self.runtime.set_provider(provider);
@@ -267,10 +318,25 @@ impl RichSurface {
     /// return [`ShellError`]; the drop guard retries terminal cleanup on error.
     pub fn read_line(&mut self, prompt: &mut QuirlPrompt) -> Result<InteractiveSignal, ShellError> {
         self.dismiss_picker();
+        self.intent_completion.cancel();
         self.expand_completion_pending = false;
-        let mut editor = EditorState::new(&self.keymap, self.history.clone());
-        self.terminal.enter()?;
+        let mut editor = EditorState::new(
+            &self.keymap,
+            self.history
+                .iter()
+                .map(|entry| entry.command_line.clone())
+                .collect(),
+        );
         let symbols = prompt.surface_symbols();
+        let mut prefetched_event = if std::mem::take(&mut self.preserve_output_once) {
+            Some(
+                self.terminal
+                    .wait_for_resume_event(symbols.uses_unicode())?,
+            )
+        } else {
+            None
+        };
+        self.terminal.enter()?;
         let unicode = symbols.uses_unicode();
         let color = std::io::stderr().is_terminal()
             && env::var_os("NO_COLOR").is_none()
@@ -282,7 +348,7 @@ impl RichSurface {
         loop {
             if dirty {
                 let (_, terminal_height) = terminal::size().unwrap_or((80, 24));
-                if self.semantic_hints && self.catalog.is_some() {
+                if self.catalog.is_some() {
                     self.input_analysis
                         .ensure(editor.revision(), editor.buffer(), prompt.mode);
                 }
@@ -304,11 +370,7 @@ impl RichSurface {
                         .semantic_hints
                         .then_some(analysis.diagnostic.as_ref())
                         .flatten(),
-                    highlight_spans: if self.semantic_hints {
-                        &analysis.spans
-                    } else {
-                        &[]
-                    },
+                    highlight_spans: &analysis.spans,
                     theme,
                     unicode,
                     symbols,
@@ -350,6 +412,14 @@ impl RichSurface {
                 dirty = true;
                 continue;
             }
+            if let Some(items) = self
+                .intent_completion
+                .poll(editor.buffer(), editor.cursor())
+            {
+                self.completion.show_picker_results(items, "AI intent");
+                dirty = true;
+                continue;
+            }
             if self.runtime.poll_panels() {
                 dirty = true;
                 continue;
@@ -358,10 +428,14 @@ impl RichSurface {
                 dirty = true;
                 continue;
             }
-            if !event::poll(EVENT_POLL).map_err(terminal_error("poll terminal input"))? {
-                continue;
-            }
-            let input_event = event::read().map_err(terminal_error("read terminal input"))?;
+            let input_event = if let Some(input_event) = prefetched_event.take() {
+                input_event
+            } else {
+                if !event::poll(EVENT_POLL).map_err(terminal_error("poll terminal input"))? {
+                    continue;
+                }
+                event::read().map_err(terminal_error("read terminal input"))?
+            };
             if self.semantic_hints && !prompt_prepared {
                 // The empty first frame cannot use PATH discovery. Start the
                 // bounded worker when input first arrives, then publish only a
@@ -382,6 +456,10 @@ impl RichSurface {
                 }
                 Event::Resize(_, _) => continue,
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if self.leader_active {
+                        self.handle_leader_key(key.code, prompt, editor.buffer(), editor.cursor())?;
+                        continue;
+                    }
                     if key.code == KeyCode::F(6) {
                         let _ = self.runtime.cycle_panel_focus();
                         continue;
@@ -462,12 +540,32 @@ impl RichSurface {
                     }
                     if self.completion.open && !self.picker.active() {
                         match key.code {
-                            KeyCode::Up => {
+                            KeyCode::Up if prompt.mode == Mode::Natural => {
                                 self.completion.previous();
+                                continue;
+                            }
+                            KeyCode::Up => {
+                                self.completion.dismiss();
+                                self.open_picker(
+                                    editor::PickerKind::History,
+                                    editor.buffer(),
+                                    editor.cursor(),
+                                    "history",
+                                );
                                 continue;
                             }
                             KeyCode::Down => {
                                 self.completion.next();
+                                continue;
+                            }
+                            KeyCode::Enter if prompt.mode == Mode::Natural => {
+                                if let Some(item) = self.completion.selected_item().cloned() {
+                                    editor.replace(0, editor.buffer().len(), &item.value);
+                                    prompt.set_mode(Mode::Command);
+                                    self.intent_completion.cancel();
+                                    self.completion.dismiss();
+                                    self.refresh_completion_after_edit(&editor, prompt.mode)?;
+                                }
                                 continue;
                             }
                             KeyCode::Enter if self.completion.accepts_enter() => {
@@ -493,6 +591,13 @@ impl RichSurface {
                     let action = editor.apply_key(key, self.completion.open);
                     match action {
                         EditAction::Accept => {
+                            if prompt.mode == Mode::Natural {
+                                // AI mode is an intent-to-command editor, not an
+                                // execution grammar. Search happens as the user
+                                // types; Enter either accepts the highlighted
+                                // safe suggestion above or keeps the query live.
+                                continue;
+                            }
                             if input_is_incomplete(editor.buffer(), prompt.mode) {
                                 editor.apply(EditAction::ForceNewline);
                                 continue;
@@ -523,6 +628,7 @@ impl RichSurface {
                         EditAction::ToggleGrammarMode => {
                             self.toggle_grammar_mode(prompt);
                         }
+                        EditAction::OpenLeader => self.open_leader(editor.buffer().len()),
                         EditAction::Complete => {
                             if self.completion.open {
                                 self.completion.next();
@@ -541,7 +647,12 @@ impl RichSurface {
                                 self.expand_completion_pending = true;
                             }
                         }
-                        EditAction::Dismiss => self.dismiss_picker(),
+                        EditAction::Dismiss => {
+                            self.dismiss_picker();
+                            if prompt.mode == Mode::Natural {
+                                self.intent_completion.cancel();
+                            }
+                        }
                         EditAction::OpenPicker(kind) => {
                             self.open_picker(kind, editor.buffer(), editor.cursor(), "picker");
                         }
@@ -581,27 +692,115 @@ impl RichSurface {
         self.help_detail_scroll = 0;
     }
 
+    fn open_leader(&mut self, replace_end: usize) {
+        self.leader_active = true;
+        let entries = [
+            ("n", "Normal mode", "Native commands and pipelines"),
+            ("d", "Data mode", "Typed data expressions and pipelines"),
+            ("i", "AI mode", "Describe your intent in everyday language"),
+            ("h", "History", "Search commands from every directory"),
+            ("p", "Command palette", "Browse Quirl commands and help"),
+            ("f", "Files", "Find a file in this directory"),
+            ("c", "Directories", "Find a directory"),
+            ("j", "Jobs", "Inspect background jobs"),
+            ("r", "Results", "Inspect recent typed data"),
+        ];
+        let items = entries
+            .into_iter()
+            .map(|(key, name, detail)| completion::CompletionItem {
+                value: key.to_owned(),
+                display: format!("{key}  {name}"),
+                summary: detail.to_owned(),
+                detail: detail.to_owned(),
+                replace_start: 0,
+                replace_end,
+                match_indices: Vec::new(),
+                kind: completion::CompletionKind::Command,
+                source: "quirl",
+                trust: "built-in",
+            })
+            .collect();
+        self.open_picker_items(items, "Alt-Q · Quirl", false);
+        self.leader_active = true;
+    }
+
+    fn handle_leader_key(
+        &mut self,
+        key: KeyCode,
+        prompt: &mut QuirlPrompt,
+        line: &str,
+        cursor: usize,
+    ) -> Result<(), ShellError> {
+        self.leader_active = false;
+        self.dismiss_picker();
+        match key {
+            KeyCode::Char('n') => {
+                prompt.set_mode(Mode::Command);
+                self.refresh_completion_after_text(line, cursor, prompt.mode)?;
+            }
+            KeyCode::Char('d') => {
+                prompt.set_mode(Mode::Data);
+                self.refresh_completion_after_text(line, cursor, prompt.mode)?;
+            }
+            KeyCode::Char('i') => {
+                prompt.set_mode(Mode::Natural);
+                self.refresh_completion_after_text(line, cursor, prompt.mode)?;
+            }
+            KeyCode::Char('h') => {
+                self.open_picker(editor::PickerKind::History, line, cursor, "history")
+            }
+            KeyCode::Char('p') => {
+                self.open_picker(editor::PickerKind::Palette, line, cursor, "commands")
+            }
+            KeyCode::Char('f') => {
+                self.open_picker(editor::PickerKind::Files, line, cursor, "files")
+            }
+            KeyCode::Char('c') => {
+                self.open_picker(editor::PickerKind::Directories, line, cursor, "directories")
+            }
+            KeyCode::Char('j') => self.open_picker(editor::PickerKind::Jobs, line, cursor, "jobs"),
+            KeyCode::Char('r') => {
+                self.open_picker(editor::PickerKind::Data, line, cursor, "results")
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn refresh_completion_after_text(
+        &mut self,
+        line: &str,
+        cursor: usize,
+        mode: Mode,
+    ) -> Result<(), ShellError> {
+        self.completion.cancel_for_edit();
+        if mode == Mode::Natural {
+            self.intent_completion.request(line, cursor);
+            return Ok(());
+        }
+        self.intent_completion.cancel();
+        let Some(catalog) = self.catalog.as_deref() else {
+            return Ok(());
+        };
+        if should_open_automatic_completion(
+            catalog,
+            line,
+            cursor,
+            mode,
+            self.completion_auto,
+            self.completion_min_chars,
+        ) {
+            self.completion.request_automatic(line, cursor)?;
+        }
+        Ok(())
+    }
+
     fn refresh_completion_after_edit(
         &mut self,
         editor: &EditorState,
         mode: Mode,
     ) -> Result<(), ShellError> {
-        self.completion.cancel_for_edit();
-        let should_open = self.catalog.as_deref().is_some_and(|catalog| {
-            should_open_automatic_completion(
-                catalog,
-                editor.buffer(),
-                editor.cursor(),
-                mode,
-                self.completion_auto,
-                self.completion_min_chars,
-            )
-        });
-        if should_open {
-            self.completion
-                .request_automatic(editor.buffer(), editor.cursor())?;
-        }
-        Ok(())
+        self.refresh_completion_after_text(editor.buffer(), editor.cursor(), mode)
     }
 
     fn open_picker(
@@ -620,7 +819,10 @@ impl RichSurface {
                 overlay::items(kind, catalog, &self.history, line, cursor)
             }),
         };
-        if kind.bottom_anchored() {
+        if kind == editor::PickerKind::History {
+            let visible = self.picker.open_with_query(items, label, true, line);
+            self.completion.show_picker_results(visible, label);
+        } else if kind.bottom_anchored() {
             self.open_bottom_anchored_picker(items, label);
         } else {
             self.open_picker_items(items, label, false);
@@ -702,13 +904,21 @@ impl RichSurface {
     }
 
     fn append_history(&mut self, value: &str) -> Result<(), ShellError> {
-        if self.history.last().is_some_and(|last| last == value) {
+        if self
+            .history
+            .last()
+            .is_some_and(|last| last.command_line == value)
+        {
             return Ok(());
         }
         if let Some(parent) = self.history_path.parent() {
             fs::create_dir_all(parent).map_err(history_error(&self.history_path))?;
         }
-        let mut staged_history = self.history.clone();
+        let mut staged_history = self
+            .history
+            .iter()
+            .map(|entry| entry.command_line.clone())
+            .collect::<Vec<_>>();
         staged_history.push(value.to_owned());
         trim_history(&mut staged_history);
         let encoded = format!("{}\n", encode_history_entry(value));
@@ -724,7 +934,15 @@ impl RichSurface {
             None => encoded.into_bytes(),
         };
         replace_or_create_history(&self.history_path, existing.as_deref(), &replacement)?;
-        self.history = staged_history;
+        self.history = staged_history
+            .into_iter()
+            .map(|command_line| InteractiveHistoryEntry {
+                command_line,
+                directory: None,
+                status: None,
+                rank_bias: 0,
+            })
+            .collect();
         Ok(())
     }
 
@@ -736,7 +954,13 @@ impl RichSurface {
         replace_or_create_history(
             &self.history_path,
             Some(&existing),
-            &encode_history(&self.history),
+            &encode_history(
+                &self
+                    .history
+                    .iter()
+                    .map(|entry| entry.command_line.clone())
+                    .collect::<Vec<_>>(),
+            ),
         )
     }
 
@@ -782,6 +1006,63 @@ struct SurfaceTerminal {
 }
 
 impl SurfaceTerminal {
+    fn wait_for_resume_event(&mut self, unicode: bool) -> Result<Event, ShellError> {
+        let size = terminal::size().map_err(terminal_error("measure the interactive terminal"))?;
+        validate_rich_terminal_size(size)?;
+        terminal::enable_raw_mode().map_err(terminal_error("enable terminal raw mode"))?;
+        self.active = true;
+        let message = match (unicode, size.0) {
+            (true, 72..) => "  ── result kept ──  type to continue  │  ↑ history  │  Alt-Q Quirl",
+            (false, 72..) => "  -- result kept --  type to continue  |  Up history  |  Alt-Q Quirl",
+            (true, 36..) => "  ── result kept ──  type to continue",
+            (false, 36..) => "  -- result kept --  type to continue",
+            (true, _) => "  ── result kept ──",
+            (false, _) => "  -- result kept --",
+        };
+        if let Err(error) = execute!(
+            io::stderr(),
+            EnableBracketedPaste,
+            SetCursorStyle::SteadyBar,
+            Print("\r\n"),
+            terminal::Clear(ClearType::CurrentLine),
+            Print(message)
+        ) {
+            self.reset_best_effort();
+            return Err(terminal_error("draw the retained-output bar")(error));
+        }
+        let input_event = loop {
+            match event::read().map_err(terminal_error("read terminal input")) {
+                Ok(Event::Resize(_, _)) => continue,
+                Ok(input_event) => break input_event,
+                Err(error) => {
+                    self.reset_best_effort();
+                    return Err(error);
+                }
+            }
+        };
+        let mut failure = None;
+        if let Err(error) = execute!(
+            io::stderr(),
+            MoveToColumn(0),
+            terminal::Clear(ClearType::CurrentLine),
+            DisableBracketedPaste,
+            SetCursorStyle::DefaultUserShape
+        ) {
+            retain_error(
+                &mut failure,
+                terminal_error("clear the retained-output bar")(error),
+            );
+        }
+        if let Err(error) = terminal::disable_raw_mode() {
+            retain_error(
+                &mut failure,
+                terminal_error("restore cooked terminal mode")(error),
+            );
+        }
+        self.finish_release(failure)?;
+        Ok(input_event)
+    }
+
     fn enter(&mut self) -> Result<(), ShellError> {
         let size = terminal::size().map_err(terminal_error("measure the interactive terminal"))?;
         validate_rich_terminal_size(size)?;
@@ -1438,7 +1719,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_mode_keys_redraw_state_without_discarding_the_edit_buffer() {
+    fn repeated_mode_transitions_redraw_without_discarding_the_edit_buffer() {
         let mut config = QuirlConfig::default();
         config.prompt.left = vec!["mode".to_owned()];
         let mut surface = RichSurface::new(
@@ -1457,11 +1738,6 @@ mod tests {
         let cursor = editor.cursor();
 
         for expected_mode in [Mode::Data, Mode::Natural, Mode::Command] {
-            let action = editor.apply_key(
-                crossterm::event::KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
-                false,
-            );
-            assert_eq!(action, EditAction::ToggleGrammarMode);
             surface.expand_completion_pending = true;
             surface.completion.open = true;
             surface.help_active = true;

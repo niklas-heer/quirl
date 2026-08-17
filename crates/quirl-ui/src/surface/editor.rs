@@ -70,6 +70,7 @@ pub enum EditAction {
     MoveWordLeft,
     MoveWordRight,
     KillToStart,
+    KillToEnd,
     KillWord,
     Yank,
     HistoryPrev,
@@ -80,6 +81,7 @@ pub enum EditAction {
     ExpandCompletionPicker,
     Dismiss,
     ToggleGrammarMode,
+    OpenLeader,
     OpenPicker(PickerKind),
     Cancel,
     ClearScreen,
@@ -171,9 +173,7 @@ impl EditorState {
                 KeyCode::Char('c') => EditAction::Cancel,
                 KeyCode::Char(' ') => EditAction::ToggleGrammarMode,
                 KeyCode::Char('r') => EditAction::OpenPicker(PickerKind::History),
-                KeyCode::Char('t') => EditAction::OpenPicker(PickerKind::Files),
-                KeyCode::Char('k') => EditAction::OpenPicker(PickerKind::Palette),
-                KeyCode::Char('g') => EditAction::OpenPicker(PickerKind::Jobs),
+                KeyCode::Char('k') => EditAction::KillToEnd,
                 KeyCode::Char('l') => EditAction::ClearScreen,
                 KeyCode::Char('z') => EditAction::Suspend,
                 KeyCode::Char('a') => EditAction::MoveHome,
@@ -187,10 +187,8 @@ impl EditorState {
         }
         if modifiers.contains(KeyModifiers::ALT) {
             return match key.code {
-                KeyCode::Char('m') => EditAction::ToggleGrammarMode,
+                KeyCode::Char('q') => EditAction::OpenLeader,
                 KeyCode::Enter => EditAction::ForceNewline,
-                KeyCode::Char('c') => EditAction::OpenPicker(PickerKind::Directories),
-                KeyCode::Char('d') => EditAction::OpenPicker(PickerKind::Data),
                 KeyCode::Char('b') => EditAction::MoveWordLeft,
                 KeyCode::Char('f') => EditAction::MoveWordRight,
                 KeyCode::Char('u') => EditAction::Undo,
@@ -240,8 +238,10 @@ impl EditorState {
             KeyCode::Right => EditAction::MoveRight,
             KeyCode::Home => EditAction::MoveHome,
             KeyCode::End => EditAction::MoveEnd,
-            KeyCode::Up => EditAction::HistoryPrev,
+            KeyCode::Up => EditAction::OpenPicker(PickerKind::History),
             KeyCode::Down => EditAction::HistoryNext,
+            KeyCode::PageUp => EditAction::HistoryPrev,
+            KeyCode::PageDown => EditAction::HistoryNext,
             KeyCode::Enter => EditAction::Accept,
             KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => {
                 EditAction::ExpandCompletionPicker
@@ -319,6 +319,20 @@ impl EditorState {
                 self.kill_ring = Some(self.buffer[start..self.cursor].to_owned());
                 self.buffer.drain(start..self.cursor);
                 self.cursor = start;
+                true
+            }
+            EditAction::KillToEnd => {
+                let line_end = self.buffer[self.cursor..]
+                    .find('\n')
+                    .map_or(self.buffer.len(), |offset| {
+                        self.cursor.saturating_add(offset)
+                    });
+                if line_end == self.cursor {
+                    return false;
+                }
+                self.record_edit();
+                self.kill_ring = Some(self.buffer[self.cursor..line_end].to_owned());
+                self.buffer.drain(self.cursor..line_end);
                 true
             }
             EditAction::KillWord => {
@@ -689,15 +703,26 @@ mod tests {
     }
 
     #[test]
-    fn alt_m_toggles_grammar_mode_in_every_keymap() {
+    fn alt_q_opens_the_quirl_leader_in_every_keymap() {
         for keymap in ["emacs", "helix", "vim"] {
             let mut editor = EditorState::new(keymap, Vec::new());
             assert_eq!(
-                editor.apply_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT), false,),
-                EditAction::ToggleGrammarMode,
-                "Alt-M mode toggle in {keymap} keymap"
+                editor.apply_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT), false,),
+                EditAction::OpenLeader,
+                "Alt-Q leader in {keymap} keymap"
             );
         }
+    }
+
+    #[test]
+    fn up_opens_fuzzy_history_instead_of_replacing_the_buffer_directly() {
+        let mut editor = EditorState::new("emacs", vec!["git status".to_owned()]);
+        editor.insert_paste("git");
+        assert_eq!(
+            editor.apply_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), false),
+            EditAction::OpenPicker(PickerKind::History)
+        );
+        assert_eq!(editor.buffer(), "git");
     }
 
     #[test]
@@ -713,14 +738,14 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_k_selects_the_only_bottom_anchored_picker() {
+    fn ctrl_k_keeps_the_conventional_kill_to_end_binding() {
         let mut editor = EditorState::new("emacs", Vec::new());
         let action = editor.apply_key(
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
             false,
         );
 
-        assert_eq!(action, EditAction::OpenPicker(PickerKind::Palette));
+        assert_eq!(action, EditAction::KillToEnd);
         assert!(PickerKind::Palette.bottom_anchored());
         assert!(!PickerKind::History.bottom_anchored());
     }

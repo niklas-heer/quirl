@@ -536,11 +536,11 @@ impl Catalog {
                 ),
                 command(
                     "mode",
-                    "mode <command|data|natural|toggle>",
+                    "mode <normal|data|ai|toggle>",
                     "Switch the visible interactive grammar",
-                    "Command mode carries bytes and process status. Data mode evaluates Quirl's native structured values and pipelines. Natural mode searches the local command database and never executes a suggestion.",
+                    "Normal mode carries bytes and process status. Data mode evaluates Quirl's native structured values and pipelines. AI mode searches the local command database and inserts suggestions for review without executing them.",
                     vec![],
-                    &["mode data", "mode natural", "mode command", "mode toggle"],
+                    &["mode data", "mode ai", "mode normal", "mode toggle"],
                     &[],
                     Provenance::Builtin,
                 ),
@@ -1074,7 +1074,7 @@ impl Catalog {
                     "quirl ai related",
                     "quirl ai related <command...> [--limit count] [--format text|json]",
                     "Suggest related commands and options",
-                    "Uses the same local semantic index as natural-language mode, excludes the requested command, and returns bounded suggestions without execution.",
+                    "Uses the same local semantic index as AI mode, excludes the requested command, and returns bounded suggestions without execution.",
                     vec![
                         option(&["--limit"], Some("count"), "Bound returned suggestions to at most 100"),
                         option(&["--format"], Some("text|json"), "Choose accessible text or stable machine JSON"),

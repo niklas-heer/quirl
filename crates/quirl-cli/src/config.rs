@@ -1041,7 +1041,7 @@ fn render_theme_card(name: &str, colors: &ThemeColors, selected_theme: &str) -> 
         ""
     };
     format!(
-        "<label class=\"theme-card\" style=\"--bg:{background};--command:{command};--data:{data};--context:{context};--secondary:{secondary};--string:{string};--dim:{dim};--error:{error};--warning:{warning}\"><input type=\"radio\" name=\"ui_theme\" value=\"{id}\"{checked}><span class=\"theme-name\">{display_name}</span><span class=\"terminal\"><span class=\"term-context\">~/src/quirl</span> <span class=\"term-secondary\">on main dirty</span><br><span class=\"term-command\">$ git</span> <span class=\"term-context\">status</span> <span class=\"term-string\">--short</span><br><span class=\"term-dim\">Alt-M mode | Ctrl-R history</span> <span class=\"term-error\">status:1</span></span></label>",
+        "<label class=\"theme-card\" style=\"--bg:{background};--command:{command};--data:{data};--context:{context};--secondary:{secondary};--string:{string};--dim:{dim};--error:{error};--warning:{warning}\"><input type=\"radio\" name=\"ui_theme\" value=\"{id}\"{checked}><span class=\"theme-name\">{display_name}</span><span class=\"terminal\"><span class=\"term-context\">~/src/quirl</span> <span class=\"term-secondary\">on main dirty</span><br><span class=\"term-command\">$ git</span> <span class=\"term-context\">status</span> <span class=\"term-string\">--short</span><br><span class=\"term-dim\">Alt-Q Quirl | Ctrl-R history</span> <span class=\"term-error\">status:1</span></span></label>",
         background = html_escape(&colors.status_background),
         command = html_escape(&colors.accent_command),
         data = html_escape(&colors.accent_data),

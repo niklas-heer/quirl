@@ -170,6 +170,108 @@ struct StoredEmbedding {
     vector: Vec<f32>,
 }
 
+/// In-memory, bounded search state reused across interactive AI-mode edits.
+///
+/// Database rows and the optional local model are validated once when the
+/// session is opened. Each query performs bounded CPU work without rereading
+/// SQLite or reloading the roughly 30 MB model.
+pub(crate) struct SearchSession {
+    documents: Vec<SemanticDocument>,
+    embeddings: Vec<StoredEmbedding>,
+    model: Option<StaticModel>,
+}
+
+impl SearchSession {
+    /// Validate and materialize one immutable database generation.
+    pub(crate) fn open(
+        bytes: &[u8],
+        path: &Path,
+        model_path: Option<&Path>,
+    ) -> Result<Self, ShellError> {
+        let connection = deserialize_database(bytes, path)?;
+        validate_schema(&connection, path)?;
+        let documents = read_documents(&connection, path)?;
+        let embeddings = read_embeddings(&connection, path)?;
+        let model = if embeddings.is_empty() {
+            None
+        } else if let Some(model_path) = model_path.filter(|path| model_is_installed(path)) {
+            Some(load_model(model_path)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            documents,
+            embeddings,
+            model,
+        })
+    }
+
+    /// Rank commands and options for one bounded natural-language query.
+    pub(crate) fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>, ShellError> {
+        validate_query(query, limit)?;
+        if let Some(model) = &self.model {
+            let query_vector = catch_unwind(AssertUnwindSafe(|| model.encode_single(query)))
+                .map_err(|_| {
+                    ShellError::new(
+                        ErrorCode::Validation,
+                        "the local Model2Vec tokenizer failed",
+                    )
+                    .with_help("Replace the model files with an intact potion-base-8M release")
+                })?;
+            validate_dimensions(query_vector.len())?;
+            let mut ranked = self
+                .embeddings
+                .iter()
+                .filter(|embedding| embedding.vector.len() == query_vector.len())
+                .map(|embedding| SearchResult {
+                    command: embedding.document.command.clone(),
+                    target: embedding.document.target.clone(),
+                    kind: embedding.document.kind.clone(),
+                    summary: embedding.document.title.clone(),
+                    score: cosine_similarity(&query_vector, &embedding.vector),
+                    semantic: true,
+                })
+                .collect::<Vec<_>>();
+            sort_and_limit(&mut ranked, limit);
+            if !ranked.is_empty() {
+                return Ok(ranked);
+            }
+        }
+
+        let query_terms = query
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|term| !term.is_empty())
+            .map(str::to_lowercase)
+            .take(64)
+            .collect::<Vec<_>>();
+        let mut results = self
+            .documents
+            .iter()
+            .filter_map(|document| {
+                let haystack = document.body.to_lowercase();
+                let matched = query_terms
+                    .iter()
+                    .filter(|term| haystack.contains(term.as_str()))
+                    .count();
+                (matched > 0).then(|| SearchResult {
+                    command: document.command.clone(),
+                    target: document.target.clone(),
+                    kind: document.kind.clone(),
+                    summary: document.title.clone(),
+                    score: matched as f32 / query_terms.len().max(1) as f32,
+                    semantic: false,
+                })
+            })
+            .collect::<Vec<_>>();
+        sort_and_limit(&mut results, limit);
+        Ok(results)
+    }
+}
+
 pub(crate) fn default_model_path() -> Option<PathBuf> {
     if let Some(path) = env::var_os("QUIRL_MODEL_PATH") {
         return Some(PathBuf::from(path));
@@ -1153,6 +1255,16 @@ mod tests {
         )
         .unwrap();
         assert!(results.iter().any(|result| result.command == "cd"));
+    }
+
+    #[test]
+    fn interactive_search_session_reuses_one_validated_database_generation() {
+        let bytes = encode_database(&Catalog::builtin(), None).unwrap();
+        let session = SearchSession::open(&bytes, Path::new("catalog.sqlite3"), None).unwrap();
+        let directory = session.search("change directory", 8).unwrap();
+        let listing = session.search("show hidden files", 8).unwrap();
+        assert!(directory.iter().any(|result| result.command == "cd"));
+        assert!(listing.iter().any(|result| result.command == "ls"));
     }
 
     #[test]

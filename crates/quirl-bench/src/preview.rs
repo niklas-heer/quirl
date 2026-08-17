@@ -560,7 +560,7 @@ fn measure_pty_sample(
         // textual status row is the accessibility contract for an editable
         // command frame and cannot be confused with terminal echo.
         session.wait_for_screen(
-            "command · Alt-M mode",
+            "❯ NORMAL · Alt-Q Quirl",
             timeout,
             "first editable command frame",
         )?;

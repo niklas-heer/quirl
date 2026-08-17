@@ -35,10 +35,9 @@ const CONTROL_SEQUENCE_CHARS_MAX: usize = 128;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) mod key {
-    pub const ALT_M: &[u8] = b"\x1bm";
+    pub const ALT_Q: &[u8] = b"\x1bq";
     pub const CTRL_C: &[u8] = b"\x03";
     pub const CTRL_D: &[u8] = b"\x04";
-    pub const CTRL_K: &[u8] = b"\x0b";
     pub const CTRL_U: &[u8] = b"\x15";
     pub const ESCAPE: &[u8] = b"\x1b";
     pub const ENTER: &[u8] = b"\r";

@@ -3,7 +3,8 @@ use super::{
     editor::PickerKind,
 };
 use crate::{
-    PickerItem, PickerItemKind, PickerRanker, PICKER_QUERY_BYTES_MAX, PICKER_RANKING_TEXT_BYTES_MAX,
+    InteractiveHistoryEntry, PickerItem, PickerItemKind, PickerRanker, PICKER_QUERY_BYTES_MAX,
+    PICKER_RANKING_TEXT_BYTES_MAX,
 };
 use quirl_catalog::Catalog;
 use std::{fs, path::Path, sync::Arc};
@@ -105,6 +106,11 @@ impl PickerOverlay {
                 description: truncate_utf8(&item.summary, PICKER_RANKING_TEXT_BYTES_MAX),
                 preview: None,
                 value: item.value.clone(),
+                rank_bias: if item.source == "history-local" {
+                    4_000
+                } else {
+                    0
+                },
             });
             self.source.push(item);
         }
@@ -217,7 +223,7 @@ pub fn contextual_help_query(catalog: &Catalog, line: &str, cursor: usize) -> St
 pub fn items(
     kind: PickerKind,
     catalog: &Catalog,
-    history: &[String],
+    history: &[InteractiveHistoryEntry],
     line: &str,
     cursor: usize,
 ) -> Vec<CompletionItem> {
@@ -226,16 +232,26 @@ pub fn items(
             .iter()
             .rev()
             .take(OVERLAY_ITEMS_MAX)
-            .map(|value| CompletionItem {
-                value: value.clone(),
-                display: value.clone(),
-                summary: "history".to_owned(),
-                detail: "Previously accepted command".to_owned(),
+            .map(|entry| CompletionItem {
+                value: entry.command_line.clone(),
+                display: entry.command_line.clone(),
+                summary: entry.directory.as_ref().map_or_else(
+                    || "history".to_owned(),
+                    |directory| format!("history · {directory}"),
+                ),
+                detail: entry.status.map_or_else(
+                    || "Previously accepted command".to_owned(),
+                    |status| format!("Previously accepted command · status {status}"),
+                ),
                 replace_start: 0,
                 replace_end: line.len(),
                 match_indices: Vec::new(),
                 kind: CompletionKind::History,
-                source: "history",
+                source: if entry.rank_bias > 0 {
+                    "history-local"
+                } else {
+                    "history"
+                },
                 trust: "session",
             })
             .collect(),

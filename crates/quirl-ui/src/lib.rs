@@ -10,12 +10,12 @@ pub use panel::{
 };
 pub use surface::{
     select_surface, CatalogLoader, InteractiveActivityProvider, InteractiveActivitySnapshot,
-    InteractiveDataSnapshot, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
-    InteractivePanelBatch, InteractivePanelProvider, InteractivePanelSnapshot,
-    InteractiveRuntimeSnapshot, InteractiveSignal, RichSurface, SurfaceKind,
-    ACTIVITY_MESSAGE_BYTES_MAX, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, JOB_ACTION_ITEMS_MAX,
-    JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
-    PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+    InteractiveDataSnapshot, InteractiveHistoryEntry, InteractiveJobAction, InteractiveJobSnapshot,
+    InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
+    InteractivePanelSnapshot, InteractiveRuntimeSnapshot, InteractiveSignal, RichSurface,
+    SurfaceKind, ACTIVITY_MESSAGE_BYTES_MAX, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX,
+    JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX,
+    PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
 };
 
 use crossterm::{
@@ -297,6 +297,8 @@ pub struct PickerItem {
     pub preview: Option<String>,
     /// Exact value returned when the item is accepted.
     pub value: String,
+    /// Domain-specific preference added to fuzzy ranking, such as same-directory history.
+    pub rank_bias: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -876,7 +878,7 @@ fn basic_edit_fallback(event: &Event) -> Option<ReedlineEvent> {
 fn is_mode_toggle(event: &Event) -> bool {
     match event {
         Event::Key(KeyEvent {
-            code: KeyCode::Char('m'),
+            code: KeyCode::Char('q'),
             modifiers: KeyModifiers::ALT,
             ..
         }) => true,
@@ -903,6 +905,10 @@ fn is_history_search(event: &Event) -> bool {
         Event::Key(KeyEvent {
             code: KeyCode::Char('r'),
             modifiers: KeyModifiers::CONTROL,
+            ..
+        }) | Event::Key(KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
             ..
         })
     )
@@ -1533,8 +1539,8 @@ impl SurfaceSymbols {
             (Self::Plain, Mode::Data) => "D ",
             (Self::Plain, Mode::Natural) => "AI ",
             (Self::Unicode, Mode::Command) => "❯ ",
-            (Self::Unicode, Mode::Data) => "◆ ",
-            (Self::Unicode, Mode::Natural) => "✦ ",
+            (Self::Unicode, Mode::Data) => "▦ ",
+            (Self::Unicode, Mode::Natural) => "✧ ",
             // These private-use glyphs are restricted to the explicit patched-font profile.
             (Self::NerdFont, Mode::Command) => "\u{f105} ",
             (Self::NerdFont, Mode::Data) => "\u{f1b2} ",
@@ -1681,6 +1687,10 @@ impl QuirlPrompt {
 
     pub(crate) fn toggle_mode(&mut self) {
         self.mode = self.mode.toggled();
+    }
+
+    pub(crate) fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
     }
 
     /// Append legacy positional extension segments after neutralizing terminal controls.
@@ -1928,15 +1938,15 @@ impl Prompt for QuirlPrompt {
         };
         let indicator = if self.symbols() == PromptSymbols::Plain {
             match self.mode {
-                Mode::Command => "command >",
+                Mode::Command => "normal >",
                 Mode::Data => "data >",
-                Mode::Natural => "natural >",
+                Mode::Natural => "AI >",
             }
         } else {
             match self.mode {
-                Mode::Command => "command ❯",
-                Mode::Data => "data ◆",
-                Mode::Natural => "natural ✦",
+                Mode::Command => "normal ❯",
+                Mode::Data => "data ▦",
+                Mode::Natural => "AI ✧",
             }
         };
         Cow::Owned(match edit_mode {
@@ -1961,7 +1971,7 @@ impl Prompt for QuirlPrompt {
             match self.mode {
                 Mode::Command => ">",
                 Mode::Data => "data>",
-                Mode::Natural => "natural>",
+                Mode::Natural => "AI>",
             }
         } else {
             self.mode.prompt()
@@ -2690,6 +2700,7 @@ fn history_picker_items(history: &[String]) -> Vec<PickerItem> {
             description: "history".to_owned(),
             preview: None,
             value: entry.clone(),
+            rank_bias: 0,
         })
         .collect()
 }
@@ -2830,6 +2841,7 @@ fn picker_sources(catalog: &Catalog, mut items: Vec<PickerItem>) -> Vec<PickerIt
                     truncate_utf8_ref(&command.details, PICKER_RANKING_TEXT_BYTES_MAX).to_owned(),
                 ),
                 value: command.path.clone(),
+                rank_bias: 0,
             }),
     );
     let next_id = items.len();
@@ -2858,6 +2870,7 @@ fn picker_sources(catalog: &Catalog, mut items: Vec<PickerItem>) -> Vec<PickerIt
                         },
                         preview: None,
                         value: path.to_string_lossy().into_owned(),
+                        rank_bias: 0,
                     }
                 }),
         );
@@ -2874,6 +2887,7 @@ fn picker_item(index: usize, kind: PickerItemKind, value: &str, description: &st
         description: description.to_owned(),
         preview: None,
         value: value.to_owned(),
+        rank_bias: 0,
     }
 }
 
@@ -3075,6 +3089,7 @@ mod tests {
                 description: hostile.to_owned(),
                 preview: Some(hostile.to_owned()),
                 value: hostile.to_owned(),
+                rank_bias: 0,
             };
             let suggestion = rank_picker_suggestions(&StablePickerRanker, &[item], "", 0, 0)
                 .pop()
@@ -3111,6 +3126,7 @@ mod tests {
             description: "z".repeat(PICKER_RANKING_TEXT_BYTES_MAX + 1),
             preview: None,
             value: "original".to_owned(),
+            rank_bias: 0,
         };
         let maximum_query = "a".repeat(PICKER_QUERY_BYTES_MAX);
         let matches = StablePickerRanker.rank(
@@ -3131,6 +3147,7 @@ mod tests {
             description: String::new(),
             preview: None,
             value: "outside".to_owned(),
+            rank_bias: 0,
         });
         assert!(StablePickerRanker
             .rank(&items, "unique", PICKER_RESULTS_MAX)
@@ -3497,23 +3514,23 @@ mod tests {
         let prompt = QuirlPrompt::with_config(Mode::Command, &config);
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Default),
-            "command > "
+            "normal > "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Emacs),
-            "command > "
+            "normal > "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Normal)),
-            "normal command > "
+            "normal normal > "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Insert)),
-            "insert command > "
+            "insert normal > "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Visual)),
-            "visual command > "
+            "visual normal > "
         );
         let cursors = editor_cursor_config();
         assert_eq!(cursors.vi_insert, Some(SetCursorStyle::SteadyBar));
@@ -3679,7 +3696,7 @@ mod tests {
 
         let left = prompt.render_prompt_left();
         let separator = " | ";
-        assert!(left.starts_with(&format!("command{separator}quirl{separator}")));
+        assert!(left.starts_with(&format!("normal{separator}quirl{separator}")));
         assert_eq!(
             prompt.render_prompt_right(),
             format!("status:7{separator}eu-central")
@@ -4288,7 +4305,7 @@ mod tests {
             let mut edit_mode =
                 configured_edit_mode_with_picker(keymap, Arc::clone(&picker_invocation));
             let toggle = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
-                KeyCode::Char('m'),
+                KeyCode::Char('q'),
                 KeyModifiers::ALT,
             )))
             .unwrap();

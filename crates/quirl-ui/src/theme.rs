@@ -201,7 +201,9 @@ impl Theme {
             HighlightKind::Command => self
                 .ratatui_foreground(self.palette.accent_command)
                 .add_modifier(Modifier::BOLD),
-            HighlightKind::Flag => self.ratatui_foreground(self.palette.context_primary),
+            HighlightKind::Flag => self
+                .ratatui_foreground(self.palette.context_primary)
+                .add_modifier(Modifier::BOLD),
             HighlightKind::StringSingle | HighlightKind::StringDouble => {
                 self.ratatui_foreground(self.palette.string)
             }
@@ -213,9 +215,9 @@ impl Theme {
                 .ratatui_foreground(self.palette.error)
                 .add_modifier(Modifier::UNDERLINED),
             HighlightKind::Number => self.ratatui_foreground(self.palette.number),
-            HighlightKind::Argument | HighlightKind::PathLike | HighlightKind::Escaped => {
-                RatatuiStyle::default()
-            }
+            HighlightKind::PathLike => self.ratatui_foreground(self.palette.context_secondary),
+            HighlightKind::Escaped => self.ratatui_foreground(self.palette.expansion),
+            HighlightKind::Argument => RatatuiStyle::default(),
         }
     }
 
@@ -246,7 +248,7 @@ impl Theme {
     pub(crate) fn ansi_highlight(self, kind: HighlightKind) -> AnsiStyle {
         match kind {
             HighlightKind::Command => self.ansi_foreground(self.palette.accent_command).bold(),
-            HighlightKind::Flag => self.ansi_foreground(self.palette.context_primary),
+            HighlightKind::Flag => self.ansi_foreground(self.palette.context_primary).bold(),
             HighlightKind::StringSingle | HighlightKind::StringDouble => {
                 self.ansi_foreground(self.palette.string)
             }
@@ -256,9 +258,9 @@ impl Theme {
             HighlightKind::Expansion => self.ansi_foreground(self.palette.expansion),
             HighlightKind::Error => self.ansi_foreground(self.palette.error).underline(),
             HighlightKind::Number => self.ansi_foreground(self.palette.number),
-            HighlightKind::Argument | HighlightKind::PathLike | HighlightKind::Escaped => {
-                AnsiStyle::new()
-            }
+            HighlightKind::PathLike => self.ansi_foreground(self.palette.context_secondary),
+            HighlightKind::Escaped => self.ansi_foreground(self.palette.expansion),
+            HighlightKind::Argument => AnsiStyle::new(),
         }
     }
 
@@ -266,7 +268,7 @@ impl Theme {
         match mode {
             Mode::Command => self.palette.accent_command,
             Mode::Data => self.palette.accent_data,
-            Mode::Natural => self.palette.accent_command,
+            Mode::Natural => self.palette.hint,
         }
     }
 

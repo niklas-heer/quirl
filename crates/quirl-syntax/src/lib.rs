@@ -1162,7 +1162,7 @@ pub enum Mode {
     Command,
     /// Native typed-data expressions and value pipelines.
     Data,
-    /// Natural-language command and option discovery. Suggestions are never executed.
+    /// AI-assisted command and option discovery. Suggestions are never executed directly.
     Natural,
 }
 
@@ -1183,8 +1183,8 @@ impl Mode {
     pub const fn prompt(self) -> &'static str {
         match self {
             Self::Command => "❯",
-            Self::Data => "◆",
-            Self::Natural => "✦",
+            Self::Data => "▦",
+            Self::Natural => "✧",
         }
     }
 }
@@ -1192,9 +1192,9 @@ impl Mode {
 impl fmt::Display for Mode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Command => "command",
+            Self::Command => "normal",
             Self::Data => "data",
-            Self::Natural => "natural",
+            Self::Natural => "ai",
         })
     }
 }
@@ -1204,11 +1204,11 @@ impl FromStr for Mode {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "command" | "cmd" => Ok(Self::Command),
+            "normal" | "command" | "cmd" => Ok(Self::Command),
             "data" => Ok(Self::Data),
-            "natural" | "nl" => Ok(Self::Natural),
+            "ai" | "natural" | "nl" | "human" => Ok(Self::Natural),
             _ => Err(format!(
-                "unknown mode `{value}`; expected `command`, `data`, or `natural`"
+                "unknown mode `{value}`; expected `normal`, `data`, or `ai`"
             )),
         }
     }
@@ -1221,7 +1221,7 @@ pub enum InteractiveLine<'a> {
     Empty,
     /// The mode-independent `exit` or `quit` command.
     Exit,
-    /// A valid explicit `mode command`, `mode cmd`, or `mode data` request.
+    /// A valid explicit `mode normal`, `mode data`, or `mode ai` request.
     ChangeMode(Mode),
     /// The explicit `mode toggle` request.
     ToggleMode,
@@ -1231,7 +1231,7 @@ pub enum InteractiveLine<'a> {
     Command(&'a str),
     /// Trimmed source to evaluate with the native typed-data grammar.
     Data(&'a str),
-    /// Natural-language task description to search without execution.
+    /// AI-mode task description to search without direct execution.
     Natural(&'a str),
     /// Expression following the mode-independent `lua ` prefix.
     Lua(&'a str),
@@ -1241,7 +1241,7 @@ pub enum InteractiveLine<'a> {
 ///
 /// Leading and trailing whitespace is removed before classification. Exit,
 /// mode, help, and Lua bridge forms take precedence over the active grammar;
-/// all other input is returned for command, data, or natural-language handling.
+/// all other input is returned for normal, data, or AI-mode handling.
 /// An invalid `mode <value>` is deliberately left to
 /// the active grammar instead of being silently accepted. Returned string
 /// slices borrow `input`, and this function performs no allocation on success.
@@ -1389,6 +1389,10 @@ mod tests {
         assert_eq!(Mode::Command.toggled(), Mode::Data);
         assert_eq!(Mode::Data.toggled(), Mode::Natural);
         assert_eq!(Mode::Natural.toggled(), Mode::Command);
+        assert_eq!(Mode::Natural.to_string(), "ai");
+        for alias in ["ai", "natural", "nl", "human"] {
+            assert_eq!(alias.parse(), Ok(Mode::Natural));
+        }
     }
 
     #[test]

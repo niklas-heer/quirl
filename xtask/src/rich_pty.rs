@@ -39,6 +39,8 @@ const CHECK_NAMES: &[&str] = &[
     "catalog-failure-restores-terminal",
     "completion",
     "interactive-runtime",
+    "cwd-history",
+    "retained-output-cycles",
     "rich-review-regressions",
     "native-job-control",
     "noninteractive-dialect-islands",
@@ -407,7 +409,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 15] {
+fn checks() -> [CheckCase; 17] {
     [
         CheckCase {
             name: "rich-editing",
@@ -446,6 +448,14 @@ fn checks() -> [CheckCase; 15] {
             run: check_interactive_runtime,
         },
         CheckCase {
+            name: "cwd-history",
+            run: check_cwd_history,
+        },
+        CheckCase {
+            name: "retained-output-cycles",
+            run: check_retained_output_cycles,
+        },
+        CheckCase {
             name: "rich-review-regressions",
             run: check_rich_review_regressions,
         },
@@ -480,6 +490,33 @@ fn enter_and_wait(
     session.pty.type_text(command)?;
     session.pty.send(key::ENTER)?;
     session.pty.wait_for(marker)
+}
+
+fn execute_and_resume(session: &mut Session, command: &str) -> Result<(), Box<dyn Error>> {
+    session.pty.type_text(command)?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"result kept")?;
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(session)
+}
+
+fn execute_and_resume_with_marker(
+    session: &mut Session,
+    command: &str,
+    marker: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let output_start = session.pty.output().len();
+    session.pty.type_text(command)?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"result kept")?;
+    if !contains(&session.pty.output()[output_start..], marker) {
+        return Err(io::Error::other(format!(
+            "command {command:?} did not emit marker {marker:?}"
+        ))
+        .into());
+    }
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(session)
 }
 
 fn wait_for_prompt(session: &mut Session) -> Result<(), Box<dyn Error>> {
@@ -528,32 +565,35 @@ fn check_rich_editing(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"^C")?;
     enter_and_wait(&mut session, "/usr/bin/printf AFTER_CTRLC", b"AFTER_CTRLC")?;
-    session.pty.send(key::ALT_M)?;
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"d")?;
     session
         .pty
         .wait_for_screen("rich data-mode status", |screen| {
             screen
                 .lines()
                 .iter()
-                .any(|line| line.starts_with("data | Alt-M mode"))
+                .any(|line| line.contains("DATA") && line.contains("Alt-Q Quirl"))
         })?;
-    session.pty.send(key::ALT_M)?;
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"i")?;
     session
         .pty
-        .wait_for_screen("rich natural-mode status", |screen| {
+        .wait_for_screen("rich AI-mode status", |screen| {
             screen
                 .lines()
                 .iter()
-                .any(|line| line.starts_with("natural | Alt-M mode"))
+                .any(|line| line.contains("AI") && line.contains("Alt-Q Quirl"))
         })?;
-    session.pty.send(key::ALT_M)?;
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"n")?;
     session
         .pty
         .wait_for_screen("rich command-mode status", |screen| {
             screen
                 .lines()
                 .iter()
-                .any(|line| line.starts_with("command | Alt-M mode"))
+                .any(|line| line.contains("NORMAL") && line.contains("Alt-Q Quirl"))
         })?;
     session.pty.type_text("/usr/bin/printf 'MULTI_ONE")?;
     session.pty.send(key::ENTER)?;
@@ -585,12 +625,7 @@ fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Err
         },
     )?;
     session.pty.wait_for(STARTUP_MARKER)?;
-    if !session
-        .pty
-        .screen()
-        .bottom_line()
-        .starts_with("command | Alt-M mode")
-    {
+    if !session.pty.screen().bottom_line().contains("NORMAL") {
         return Err(screen_error(
             "initial rich status was not anchored at the terminal bottom",
             session.pty.screen(),
@@ -598,59 +633,63 @@ fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Err
     }
     session.pty.type_text("echo MODE_BUFFER_RETAINED")?;
     session.pty.wait_for_screen_text("MODE_BUFFER_RETAINED")?;
-    for (expected_mode, expected_indicator) in [
-        ("data", "D echo MODE_BUFFER_RETAINED"),
-        ("natural", "AI echo MODE_BUFFER_RETAINED"),
-        ("command", "> echo MODE_BUFFER_RETAINED"),
-        ("data", "D echo MODE_BUFFER_RETAINED"),
+    for (leader_key, expected_mode, expected_indicator) in [
+        (b"d", "DATA", "D echo MODE_BUFFER_RETAINED"),
+        (b"i", "AI", "AI echo MODE_BUFFER_RETAINED"),
+        (b"n", "NORMAL", "> echo MODE_BUFFER_RETAINED"),
+        (b"d", "DATA", "D echo MODE_BUFFER_RETAINED"),
     ] {
         let output_start = session.pty.output().len();
-        session.pty.send(key::ALT_M)?;
+        session.pty.send(key::ALT_Q)?;
+        session.pty.send(leader_key)?;
         session.pty.wait_for_screen(
             &format!("bottom-status {expected_mode} mode frame"),
             |screen| {
                 screen
                     .bottom_line()
-                    .starts_with(&format!("{expected_mode} | Alt-M mode"))
+                    .split('|')
+                    .next()
+                    .is_some_and(|mode_segment| mode_segment.contains(expected_mode))
             },
         )?;
         let emitted = &session.pty.output()[output_start..];
         if contains(emitted, b"mode:") || contains(emitted, b"mode ->") {
             return Err(io::Error::other(format!(
-                "Alt-M emitted feedback into scrollback; output={emitted:?}"
+                "Alt-Q mode selection emitted feedback into scrollback; output={emitted:?}"
             ))
             .into());
         }
         if !session.pty.screen().text().contains(expected_indicator) {
             return Err(screen_error(
-                &format!("Alt-M discarded active editor buffer; expected {expected_indicator:?}"),
+                &format!("Alt-Q discarded active editor buffer; expected {expected_indicator:?}"),
                 session.pty.screen(),
             ));
         }
     }
-    session.pty.send(key::CTRL_K)?;
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"p")?;
     session
         .pty
-        .wait_for_screen("top-anchored Ctrl-K palette", |screen| {
+        .wait_for_screen("top-anchored Alt-Q palette", |screen| {
             let bottom = screen.bottom_line();
-            bottom.starts_with("data |")
-                && bottom.contains("results (picker)")
+            bottom.contains("DATA")
+                && bottom.contains("results (commands)")
                 && screen.text().contains("picker")
         })?;
-    if !session.pty.screen().text().contains("git status") {
-        return Err(screen_error(
-            "Ctrl-K palette did not render catalog commands",
-            session.pty.screen(),
-        ));
-    }
+    session.pty.type_text("git status")?;
+    session
+        .pty
+        .wait_for_screen("filtered Alt-Q palette", |screen| {
+            screen.text().contains("git status")
+        })?;
     session.pty.send(key::ESCAPE)?;
     session
         .pty
         .wait_for_screen("top editor after palette dismissal", |screen| {
             let text = screen.text();
-            screen.bottom_line().starts_with("data | Alt-M mode")
+            screen.bottom_line().contains("DATA")
                 && !text.contains("picker")
-                && !text.contains("results (picker)")
+                && !text.contains("results (commands)")
         })?;
     let lines = session.pty.screen().lines();
     let top = &lines[..lines.len().min(3)];
@@ -709,7 +748,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session
         .pty
         .wait_for_screen("bottom status after resize", |screen| {
-            screen.bottom_line().starts_with("command | Alt-M mode")
+            screen.bottom_line().contains("NORMAL")
         })?;
     if contains(
         &session.pty.output()[resize_start..],
@@ -721,7 +760,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session
         .pty
         .wait_for_screen("bottom status after resize restoration", |screen| {
-            screen.bottom_line().starts_with("command | Alt-M mode")
+            screen.bottom_line().contains("NORMAL")
         })?;
 
     wait_for_command_information(
@@ -746,7 +785,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session
         .pty
         .wait_for_screen("wide provenance frame", |screen| {
-            screen.bottom_line().starts_with("command | Alt-M mode")
+            screen.bottom_line().contains("NORMAL")
         })?;
 
     for (command, summary, provenance) in [
@@ -775,7 +814,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session
         .pty
         .wait_for_screen("normal-width flag frame", |screen| {
-            screen.bottom_line().starts_with("command | Alt-M mode")
+            screen.bottom_line().contains("NORMAL")
         })?;
 
     session.pty.type_text("ls -")?;
@@ -814,16 +853,20 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     )?;
     let execution_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
-    session.pty.wait_for(b"FIRST_ENTER_EXECUTED")?;
-    wait_for_prompt(&mut session)?;
+    session.pty.wait_for(b"result kept")?;
     let execution = &session.pty.output()[execution_start..];
-    if !contains(execution, ALTERNATE_SCREEN_LEAVE) || !contains(execution, ALTERNATE_SCREEN_ENTER)
+    if !contains(execution, b"FIRST_ENTER_EXECUTED")
+        || !contains(execution, ALTERNATE_SCREEN_LEAVE)
+        || contains(execution, ALTERNATE_SCREEN_ENTER)
     {
         return Err(io::Error::other(
-            "command execution did not release and safely reacquire the alternate screen",
+            "command output was not retained on the main screen until the next input",
         )
         .into());
     }
+    session.pty.type_text("x")?;
+    session.pty.wait_for_screen_text("x")?;
+    clear_editor(&mut session)?;
     ensure_bottom_status(&session, "after first-Enter execution")?;
 
     wait_for_command_information(
@@ -842,25 +885,29 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
             io::Error::other("foreground command did not receive terminal ownership").into(),
         );
     }
-    session.pty.wait_for(b"HANDOFF_DONE")?;
-    wait_for_prompt(&mut session)?;
+    session.pty.wait_for(b"result kept")?;
+    if !contains(session.pty.output(), b"HANDOFF_DONE") {
+        return Err(io::Error::other("foreground command did not finish").into());
+    }
     if session.pty.foreground_group()? != quirl_process {
         return Err(
             io::Error::other("Quirl did not recover terminal ownership after handoff").into(),
         );
     }
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(&mut session)?;
 
     session.pty.resize(4, 48)?;
     session
         .pty
         .wait_for_screen("compact bottom status", |screen| {
-            screen.bottom_line().starts_with("command")
+            screen.bottom_line().contains("NORMAL")
         })?;
     session.pty.resize(18, 120)?;
     session
         .pty
         .wait_for_screen("restored bottom status", |screen| {
-            screen.bottom_line().starts_with("command | Alt-M mode")
+            screen.bottom_line().contains("NORMAL")
         })?;
     let cleanup_start = session.pty.output().len();
     session.pty.send(key::CTRL_D)?;
@@ -970,32 +1017,46 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     cold.pty.send(key::ESCAPE)?;
     wait_for_standard_status(&mut cold)?;
     clear_editor(&mut cold)?;
-    cold.pty.send(key::ALT_M)?;
+    cold.pty.send(key::ALT_Q)?;
+    cold.pty.send(b"d")?;
     cold.pty
         .wait_for_screen("data mode before natural search", |screen| {
-            screen.bottom_line().starts_with("data | Alt-M mode")
+            screen.bottom_line().contains("DATA")
         })?;
-    cold.pty.send(key::ALT_M)?;
+    cold.pty.send(key::ALT_Q)?;
+    cold.pty.send(b"i")?;
     cold.pty
-        .wait_for_screen("natural mode before command search", |screen| {
-            screen.bottom_line().starts_with("natural | Alt-M mode")
+        .wait_for_screen("AI mode before command search", |screen| {
+            screen.bottom_line().contains("AI")
         })?;
     let natural_output_start = cold.pty.output().len();
     cold.pty.type_text("installed command discovered")?;
-    cold.pty.send(key::ENTER)?;
-    cold.pty.wait_for(b"lexical")?;
-    if !contains(&cold.pty.output()[natural_output_start..], b"cold-tool") {
+    cold.pty
+        .wait_for_screen("live AI command suggestions", |screen| {
+            screen.text().contains("cold-tool") && screen.bottom_line().contains("AI intent")
+        })?;
+    let natural_output = &cold.pty.output()[natural_output_start..];
+    if contains(natural_output, ALTERNATE_SCREEN_LEAVE) || contains(natural_output, b"result kept")
+    {
         return Err(io::Error::other(
-            "natural mode did not return the command discovered in SQLite",
+            "AI search released the rich session instead of updating it in place",
         )
         .into());
     }
+    cold.pty.send(key::ENTER)?;
     cold.pty
-        .wait_for_screen("natural mode after command search", |screen| {
-            screen.bottom_line().starts_with("natural | Alt-M mode")
+        .wait_for_screen("accepted AI suggestion", |screen| {
+            screen.bottom_line().contains("NORMAL") && screen.text().contains("cold-tool")
         })?;
-    cold.pty.send(key::ALT_M)?;
-    wait_for_standard_status(&mut cold)?;
+    if contains(
+        &cold.pty.output()[natural_output_start..],
+        ALTERNATE_SCREEN_LEAVE,
+    ) {
+        return Err(
+            io::Error::other("accepting an AI suggestion released the rich session").into(),
+        );
+    }
+    clear_editor(&mut cold)?;
     cold.pty.send(key::CTRL_D)?;
     ensure_status(cold.pty.wait_exit()?, 0, "cold discovery session")?;
     let cold_catalog = read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX)?;
@@ -1027,13 +1088,11 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
             shell_quote(&hostile_marker)
         ),
     )?;
-    enter_and_wait(&mut warm, "cd .", STARTUP_MARKER)?;
-    wait_for_prompt(&mut warm)?;
+    execute_and_resume(&mut warm, "cd .")?;
     wait_for_file_contents(&mut warm, &catalog_path, b"changed-path-tool")?;
     wait_for_file_contents(&mut warm, &catalog_path, b"changed-declaration")?;
     wait_for_file_contents(&mut warm, &catalog_path, b"changed-declaration.help")?;
-    enter_and_wait(&mut warm, "cd .", STARTUP_MARKER)?;
-    wait_for_prompt(&mut warm)?;
+    execute_and_resume(&mut warm, "cd .")?;
     wait_for_command_information(
         &mut warm,
         "changed-path-tool",
@@ -1072,7 +1131,7 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     degraded
         .pty
         .wait_for_screen("corrupt-cache fallback frame", |screen| {
-            screen.bottom_line().starts_with("command")
+            screen.bottom_line().contains("NORMAL")
         })?;
     wait_for_command_information(
         &mut degraded,
@@ -1088,7 +1147,7 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     degraded
         .pty
         .wait_for_screen("corrupt-cache fallback returned", |screen| {
-            screen.bottom_line().starts_with("command")
+            screen.bottom_line().contains("NORMAL")
         })?;
     let cleanup_start = degraded.pty.output().len();
     degraded.pty.send(key::CTRL_D)?;
@@ -1160,7 +1219,13 @@ fn check_deferred_catalog_admission(binary: &Path) -> Result<(), Box<dyn Error>>
         );
     }
     fs::write(&session.catalog_gate, b"release\n")?;
-    session.pty.wait_for(b"QUEUED_AFTER_ADMISSION")?;
+    session.pty.wait_for(b"result kept")?;
+    if !contains(session.pty.output(), b"QUEUED_AFTER_ADMISSION") {
+        return Err(
+            io::Error::other("queued input was not executed after catalog admission").into(),
+        );
+    }
+    session.pty.send(key::ESCAPE)?;
     session.pty.resize(30, 120)?;
     wait_for_standard_status(&mut session)?;
     session.pty.type_text("git st")?;
@@ -1217,6 +1282,116 @@ fn check_catalog_failure_restores_terminal(binary: &Path) -> Result<(), Box<dyn 
     Ok(())
 }
 
+fn check_cwd_history(binary: &Path) -> Result<(), Box<dyn Error>> {
+    let mut session = Session::new(binary, SessionOptions::default())?;
+    let local_directory = session.private.path.join("local-project");
+    let other_directory = session.private.path.join("other-project");
+    create_private_directory(&local_directory)?;
+    create_private_directory(&other_directory)?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+
+    session
+        .pty
+        .type_text(&format!("cd {}", shell_quote(&local_directory)))?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"result kept")?;
+    session
+        .pty
+        .type_text("/usr/bin/printf LOCAL_HISTORY_CHOICE")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"result kept")?;
+    if !contains(session.pty.output(), b"LOCAL_HISTORY_CHOICE") {
+        return Err(io::Error::other("local history fixture did not execute").into());
+    }
+
+    session
+        .pty
+        .type_text(&format!("cd {}", shell_quote(&other_directory)))?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"result kept")?;
+    session
+        .pty
+        .type_text("/usr/bin/printf OTHER_HISTORY_CHOICE")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"result kept")?;
+    if !contains(session.pty.output(), b"OTHER_HISTORY_CHOICE") {
+        return Err(io::Error::other("other history fixture did not execute").into());
+    }
+
+    session
+        .pty
+        .type_text(&format!("cd {}", shell_quote(&local_directory)))?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"result kept")?;
+    session.pty.send(b"\x1b[A")?;
+    session
+        .pty
+        .wait_for_screen("cwd-aware fuzzy history", |screen| {
+            let text = screen.text();
+            text.contains("history")
+                && text.contains("LOCAL_HISTORY_CHOICE")
+                && text.contains("OTHER_HISTORY_CHOICE")
+        })?;
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen_text("/usr/bin/printf LOCAL_HISTORY_CHOICE")?;
+    clear_editor(&mut session)?;
+    session.pty.send(key::CTRL_D)?;
+    ensure_status(session.pty.wait_exit()?, 0, "cwd history")?;
+    if !session.private.path.join("history.sqlite3").is_file() {
+        return Err(io::Error::other("cwd-aware SQLite history was not created").into());
+    }
+    Ok(())
+}
+
+fn check_retained_output_cycles(binary: &Path) -> Result<(), Box<dyn Error>> {
+    let mut session = Session::new(
+        binary,
+        SessionOptions {
+            rows: Some(30),
+            columns: Some(120),
+            ..SessionOptions::default()
+        },
+    )?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    for cycle in 0..12 {
+        let command = format!("/usr/bin/printf RETAINED_CYCLE_{cycle:02}");
+        session.pty.type_text(&command)?;
+        session.pty.send(key::ENTER)?;
+        session.pty.wait_for(b"result kept")?;
+        let expected_prompt = format!("> {command}");
+        if !session
+            .pty
+            .screen()
+            .lines()
+            .iter()
+            .any(|line| line.starts_with(&expected_prompt))
+        {
+            return Err(screen_error(
+                &format!("retained-output cycle {cycle} restored the prompt at a stale column"),
+                session.pty.screen(),
+            ));
+        }
+        if !session
+            .pty
+            .screen()
+            .text()
+            .contains(&format!("RETAINED_CYCLE_{cycle:02}"))
+        {
+            return Err(screen_error(
+                &format!("retained-output cycle {cycle} lost command output"),
+                session.pty.screen(),
+            ));
+        }
+        session.pty.type_text("x")?;
+        session.pty.wait_for_screen_text("x")?;
+        clear_editor(&mut session)?;
+    }
+    session.pty.send(key::CTRL_D)?;
+    ensure_status(session.pty.wait_exit()?, 0, "retained-output cycles")
+}
+
 fn check_interactive_runtime(binary: &Path) -> Result<(), Box<dyn Error>> {
     let mut session = Session::new(binary, SessionOptions::default())?;
     session.pty.wait_for(STARTUP_MARKER)?;
@@ -1228,24 +1403,31 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.wait_for(b"^C")?;
     session.pty.resize(30, 120)?;
     session.pty.wait_for(STARTUP_MARKER)?;
-    enter_and_wait(&mut session, "/bin/sleep 30 &", STARTUP_MARKER)?;
-    session.pty.send(b"\x07")?;
+    session.pty.type_text("/bin/sleep 30 &")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"result kept")?;
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"j")?;
     session.pty.wait_for(b"fg job 1")?;
     session.pty.send(key::ENTER)?;
     session.pty.drain_for(Duration::from_millis(100))?;
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"^C")?;
-    session.pty.send(key::ALT_M)?;
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"d")?;
     session
         .pty
         .wait_for_screen("data mode before typed runtime checks", |screen| {
             screen
                 .lines()
                 .iter()
-                .any(|line| line.starts_with("data | Alt-M mode"))
+                .any(|line| line.contains("DATA") && line.contains("Alt-Q Quirl"))
         })?;
-    enter_and_wait(&mut session, "[1,2]", STARTUP_MARKER)?;
-    session.pty.send(b"\x1bd")?;
+    session.pty.type_text("[1,2]")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"result kept")?;
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"r")?;
     session.pty.wait_for(b"cached typed result")?;
     session.pty.send(key::ESCAPE)?;
     session.pty.drain_for(Duration::from_millis(100))?;
@@ -1264,38 +1446,42 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.send(key::ENTER)?;
     session.pty.wait_for(b"row-00000")?;
     session.pty.send(key::CTRL_C)?;
-    session.pty.wait_for(b"cancelled")?;
-    wait_for_prompt(&mut session)?;
-    session.pty.send(key::ALT_M)?;
+    session.pty.wait_for(b"result kept")?;
+    if !contains(session.pty.output(), b"cancelled") {
+        return Err(io::Error::other("stream cancellation was not reported").into());
+    }
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"i")?;
     session
         .pty
-        .wait_for_screen("natural mode after typed runtime checks", |screen| {
+        .wait_for_screen("AI mode after typed runtime checks", |screen| {
             screen
                 .lines()
                 .iter()
-                .any(|line| line.starts_with("natural | Alt-M mode"))
+                .any(|line| line.contains("AI") && line.contains("Alt-Q Quirl"))
         })?;
-    session.pty.send(key::ALT_M)?;
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"n")?;
     session
         .pty
         .wait_for_screen("command mode after typed runtime checks", |screen| {
             screen
                 .lines()
                 .iter()
-                .any(|line| line.starts_with("command | Alt-M mode"))
+                .any(|line| line.contains("NORMAL") && line.contains("Alt-Q Quirl"))
         })?;
     session
         .pty
         .type_text("lua return quirl.process.run('/bin/sleep 30')")?;
     session.pty.send(key::ENTER)?;
-    session.pty.wait_for(b"exceeded its deadline")?;
-    wait_for_prompt(&mut session)?;
-    enter_and_wait(
+    session.pty.wait_for(b"result kept")?;
+    if !contains(session.pty.output(), b"exceeded its deadline") {
+        return Err(io::Error::other("Lua process deadline was not reported").into());
+    }
+    execute_and_resume(
         &mut session,
         "/usr/bin/printf AFTER_%s DATA_CANCEL_RESTORED",
-        b"AFTER_DATA_CANCEL_RESTORED",
     )?;
-    wait_for_prompt(&mut session)?;
     session.pty.send(key::CTRL_D)?;
     session.pty.wait_exit()?;
     Ok(())
@@ -1407,21 +1593,19 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
     if session.pty.foreground_group()? != child {
         return Err(io::Error::other("Quirl did not own terminal").into());
     }
-    enter_and_wait(
+    execute_and_resume_with_marker(
         &mut session,
         "/bin/sh -c 'test \"$(ps -o tpgid= -p $$)\" -eq $$ && printf TTY_%s OWNED'",
         b"TTY_OWNED",
     )?;
-    wait_for_prompt(&mut session)?;
     let race = std::iter::repeat_n("/usr/bin/true | /bin/cat", 8)
         .collect::<Vec<_>>()
         .join("; ");
-    enter_and_wait(
+    execute_and_resume_with_marker(
         &mut session,
         &format!("{race}; /usr/bin/printf LEADER_%s RACE_OK"),
         b"LEADER_RACE_OK",
     )?;
-    wait_for_prompt(&mut session)?;
     let pid_path = session.private.path.join("construction.pid");
     let mut construction_cleanup = ObservedProcessGroupCleanup::new(pid_path.clone());
     let gate_path = session.private.path.join("construction.gate");
@@ -1438,8 +1622,12 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
     );
     session.pty.type_text(&construction)?;
     session.pty.send(key::ENTER)?;
-    session.pty.wait_for(b"cannot write redirected output")?;
-    wait_for_prompt(&mut session)?;
+    session.pty.wait_for(b"result kept")?;
+    if !contains(session.pty.output(), b"cannot write redirected output") {
+        return Err(io::Error::other("construction error was not reported").into());
+    }
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(&mut session)?;
     let observed_child = construction_cleanup.observed_pid()?;
     match kill(observed_child, None) {
         Err(Errno::ESRCH) => construction_cleanup.disarm(),
@@ -1452,12 +1640,11 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
             .into())
         }
     }
-    enter_and_wait(
+    execute_and_resume_with_marker(
         &mut session,
         "/usr/bin/printf AFTER_%s CONSTRUCTION_CLEANUP",
         b"AFTER_CONSTRUCTION_CLEANUP",
     )?;
-    wait_for_prompt(&mut session)?;
     session.pty.type_text("/bin/sleep 30")?;
     session.pty.send(key::ENTER)?;
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1470,17 +1657,15 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("foreground child did not receive terminal").into());
     }
     session.pty.send(b"\x1a")?;
-    wait_for_prompt(&mut session)?;
+    session.pty.wait_for(b"result kept")?;
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(&mut session)?;
     if session.pty.foreground_group()? != child {
         return Err(io::Error::other("Quirl did not recover terminal after Ctrl-Z").into());
     }
-    enter_and_wait(&mut session, "jobs", b"stopped")?;
-    wait_for_prompt(&mut session)?;
-    session.pty.type_text("bg %1")?;
-    session.pty.send(key::ENTER)?;
-    wait_for_prompt(&mut session)?;
-    enter_and_wait(&mut session, "jobs", b"running")?;
-    wait_for_prompt(&mut session)?;
+    execute_and_resume_with_marker(&mut session, "jobs", b"stopped")?;
+    execute_and_resume(&mut session, "bg %1")?;
+    execute_and_resume_with_marker(&mut session, "jobs", b"running")?;
     session.pty.type_text("fg %1")?;
     session.pty.send(key::ENTER)?;
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1491,23 +1676,30 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("fg did not return terminal to job").into());
     }
     session.pty.send(key::CTRL_C)?;
-    wait_for_prompt(&mut session)?;
-    enter_and_wait(
+    session.pty.wait_for(b"result kept")?;
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(&mut session)?;
+    execute_and_resume_with_marker(
         &mut session,
         "/usr/bin/printf AFTER_%s JOB_CTRLC",
         b"AFTER_JOB_CTRLC",
     )?;
-    wait_for_prompt(&mut session)?;
     session.pty.type_text("/bin/sh -c 'stty -echo; kill -STOP $$; stty -a | grep -q -- \"-echo\" && printf JOB_%s MODES_OK'")?;
     session.pty.send(key::ENTER)?;
-    wait_for_prompt(&mut session)?;
+    session.pty.wait_for(b"result kept")?;
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(&mut session)?;
     if session.pty.terminal_modes()? != prompt_modes {
         return Err(io::Error::other("stopped child modes leaked").into());
     }
     session.pty.type_text("fg %2")?;
     session.pty.send(key::ENTER)?;
-    session.pty.wait_for(b"JOB_MODES_OK")?;
-    wait_for_prompt(&mut session)?;
+    session.pty.wait_for(b"result kept")?;
+    if !contains(session.pty.output(), b"JOB_MODES_OK") {
+        return Err(io::Error::other("resumed job did not preserve terminal modes").into());
+    }
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(&mut session)?;
     if session.pty.terminal_modes()? != prompt_modes {
         return Err(io::Error::other("termios not restored after fg").into());
     }
@@ -1519,24 +1711,26 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
 fn check_noninteractive_dialect_islands(binary: &Path) -> Result<(), Box<dyn Error>> {
     let mut session = Session::new(binary, SessionOptions::default())?;
     session.pty.wait_for(STARTUP_MARKER)?;
-    enter_and_wait(
+    execute_and_resume_with_marker(
         &mut session,
         "bash { read value || printf ISLAND_%s STDIN_CLOSED; }",
         b"ISLAND_STDIN_CLOSED",
     )?;
-    wait_for_prompt(&mut session)?;
     session.pty.type_text("bash { sleep 30; }")?;
     session.pty.send(key::ENTER)?;
     session.pty.drain_for(Duration::from_millis(200))?;
     session.pty.send(b"\x1a")?;
-    session.pty.wait_for(b"cancelled")?;
-    wait_for_prompt(&mut session)?;
-    enter_and_wait(
+    session.pty.wait_for(b"result kept")?;
+    if !contains(session.pty.output(), b"cancelled") {
+        return Err(io::Error::other("dialect island cancellation was not reported").into());
+    }
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(&mut session)?;
+    execute_and_resume_with_marker(
         &mut session,
         "/usr/bin/printf AFTER_%s ISLAND_CTRLZ",
         b"AFTER_ISLAND_CTRLZ",
     )?;
-    wait_for_prompt(&mut session)?;
     session.pty.send(key::CTRL_D)?;
     session.pty.wait_exit()?;
     Ok(())
@@ -1649,12 +1843,7 @@ fn wait_for_command_information(
 }
 
 fn ensure_bottom_status(session: &Session, stage: &str) -> Result<(), Box<dyn Error>> {
-    if !session
-        .pty
-        .screen()
-        .bottom_line()
-        .starts_with("command | Alt-M mode")
-    {
+    if !session.pty.screen().bottom_line().contains("NORMAL") {
         return Err(screen_error(
             &format!("rich status was not on the physical bottom at {stage}"),
             session.pty.screen(),
@@ -1668,7 +1857,7 @@ fn wait_for_standard_status(session: &mut Session) -> Result<(), Box<dyn Error>>
         .pty
         .wait_for_screen("standard bottom status", |screen| {
             let bottom = screen.bottom_line();
-            bottom.starts_with("command | Alt-M mode") && bottom.contains("Tab complete")
+            bottom.contains("NORMAL") && bottom.contains("Tab complete")
         })?;
     Ok(())
 }

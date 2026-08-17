@@ -91,6 +91,72 @@ struct ExtensionWorker {
     worker: Option<JoinHandle<()>>,
 }
 
+/// Latest-query-only adapter from the local AI intent provider to rich
+/// completion items. The worker is created lazily and owns at most one queued
+/// query plus one completed response.
+#[derive(Default)]
+pub(super) struct IntentCompletionState {
+    source: Option<Box<dyn ExtensionCompleter + Send>>,
+    worker: Option<ExtensionWorker>,
+    request_id: u64,
+}
+
+impl IntentCompletionState {
+    pub fn install(&mut self, source: Box<dyn ExtensionCompleter + Send>) {
+        self.cancel();
+        self.worker = None;
+        self.source = Some(source);
+    }
+
+    pub fn request(&mut self, line: &str, cursor: usize) {
+        self.cancel();
+        if line.trim().len() < 3 || line.len() > quirl_catalog::MAX_COMPLETION_QUERY_BYTES {
+            return;
+        }
+        if self.worker.is_none() {
+            self.worker = self.source.take().map(ExtensionWorker::new);
+        }
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        self.request_id = self.request_id.saturating_add(1);
+        worker.submit(ExtensionRequest {
+            request_id: self.request_id,
+            line: line.to_owned(),
+            cursor,
+        });
+    }
+
+    pub fn cancel(&mut self) {
+        if self.request_id > 0 {
+            if let Some(worker) = &self.worker {
+                worker.cancel(self.request_id);
+            }
+        }
+    }
+
+    pub fn poll(&self, line: &str, _cursor: usize) -> Option<Vec<CompletionItem>> {
+        let suggestions = self.worker.as_ref()?.try_recv_latest(self.request_id)?;
+        let items = suggestions
+            .into_iter()
+            .filter(|item| extension_replacement_is_valid(line, item))
+            .map(|item| CompletionItem {
+                kind: infer_kind(&item.value),
+                value: item.value,
+                display: item.display,
+                summary: item.summary,
+                detail: item.detail,
+                replace_start: item.replace_start,
+                replace_end: item.replace_end,
+                match_indices: Vec::new(),
+                source: "ai",
+                trust: "local",
+            })
+            .collect();
+        Some(bounded_items(items))
+    }
+}
+
 impl ExtensionWorker {
     fn new(mut completer: Box<dyn ExtensionCompleter + Send>) -> Self {
         let queue = Arc::new((Mutex::new(ExtensionQueue::default()), Condvar::new()));

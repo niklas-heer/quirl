@@ -277,12 +277,8 @@ impl FrameModel<'_> {
             let visible_start = offset.saturating_add(viewport.start);
             let visible_end = offset.saturating_add(viewport.end);
             let mut rendered_until = visible_start;
-            let highlight_spans = if self.semantic_hints {
-                self.highlight_spans
-            } else {
-                &[]
-            };
-            for span in highlight_spans
+            for span in self
+                .highlight_spans
                 .iter()
                 .filter(|span| span.range.start < visible_end && span.range.end > visible_start)
             {
@@ -754,7 +750,7 @@ mod tests {
         let terminal = rendered_model(78, 3, "git status", None, |_| {});
         assert!(row(&terminal, 0).contains("~/P/q  on main"));
         assert!(row(&terminal, 1).contains("❯ git status"));
-        assert!(row(&terminal, 2).contains("command"));
+        assert!(row(&terminal, 2).contains("NORMAL"));
         assert_eq!(
             terminal.backend().buffer().cell((2, 1)).unwrap().fg,
             Color::Rgb(158, 206, 106)
@@ -861,7 +857,7 @@ mod tests {
         assert!(!row(&terminal, 1).contains("status"));
         assert_eq!(
             terminal.backend().buffer().cell((2, 1)).unwrap().fg,
-            Color::Reset
+            Color::Rgb(158, 206, 106)
         );
     }
 
@@ -877,9 +873,9 @@ mod tests {
     #[test]
     fn data_mode_repaints_indicator_and_status_without_relying_on_color() {
         let terminal = rendered_model_in_mode(78, 3, "files", None, Mode::Data, false, |_| {});
-        assert!(row(&terminal, 1).contains("◆ files"));
-        assert!(row(&terminal, 2).contains("data"));
-        assert!(!row(&terminal, 2).contains("command"));
+        assert!(row(&terminal, 1).contains("▦ files"));
+        assert!(row(&terminal, 2).contains("DATA"));
+        assert!(!row(&terminal, 2).contains("NORMAL"));
     }
 
     #[test]
@@ -932,7 +928,7 @@ mod tests {
         let rendered = (0..7).map(|y| row(&terminal, y)).collect::<String>();
         assert!(rendered.contains("demo · status"));
         assert!(rendered.contains("worker │ ready"));
-        assert!(row(&terminal, 6).contains("command"));
+        assert!(row(&terminal, 6).contains("NORMAL"));
     }
 
     #[test]
@@ -988,7 +984,7 @@ mod tests {
         assert_eq!(terminal.get_cursor_position().unwrap(), cursor_at_rest);
         assert!(row(&terminal, 1).contains("❯ git st"));
         assert!(row(&terminal, 2).contains("demo · status"));
-        assert!(row(&terminal, 11).contains("command"));
+        assert!(row(&terminal, 11).contains("NORMAL"));
     }
 
     #[test]
@@ -1036,7 +1032,7 @@ mod tests {
         terminal.draw(|frame| model.render(frame)).unwrap();
         let rendered = (0..4).map(|y| row(&terminal, y)).collect::<String>();
         assert!(!rendered.contains("demo"));
-        assert!(row(&terminal, 3).contains("command"));
+        assert!(row(&terminal, 3).contains("NORMAL"));
     }
 
     #[test]
@@ -1073,13 +1069,13 @@ mod tests {
         draw_runtime_model(&mut terminal, &editor, &completion, &runtime);
         assert!(row(&terminal, 2).contains("four"));
         assert_eq!(terminal.get_cursor_position().unwrap().y, 2);
-        assert!(row(&terminal, 3).contains("command"));
+        assert!(row(&terminal, 3).contains("NORMAL"));
 
         terminal.backend_mut().resize(12, 3);
         draw_runtime_model(&mut terminal, &editor, &completion, &runtime);
         assert!(row(&terminal, 1).contains("four"));
         assert_eq!(terminal.get_cursor_position().unwrap().y, 1);
-        assert!(row(&terminal, 2).contains("command"));
+        assert!(row(&terminal, 2).contains("NORMAL"));
     }
 
     #[test]
@@ -1112,7 +1108,7 @@ mod tests {
         terminal.draw(|frame| model.render(frame)).unwrap();
         assert!(row(&terminal, 0).contains("~/project"));
         assert!(row(&terminal, 1).contains('❯'));
-        assert!(row(&terminal, 11).contains("command"));
+        assert!(row(&terminal, 11).contains("NORMAL"));
         assert!(row(&terminal, 3).trim().is_empty());
         assert!(row(&terminal, 10).trim().is_empty());
 
@@ -1120,7 +1116,7 @@ mod tests {
         terminal.draw(|frame| model.render(frame)).unwrap();
         assert!(row(&terminal, 0).contains("~/project"));
         assert!(row(&terminal, 1).contains('❯'));
-        assert!(row(&terminal, 5).contains("command"));
+        assert!(row(&terminal, 5).contains("NORMAL"));
         assert!(row(&terminal, 4).trim().is_empty());
     }
 
@@ -1128,7 +1124,7 @@ mod tests {
     fn diagnostics_render_as_a_separate_advisory_row() {
         let terminal = rendered_model(78, 4, "gti status", Some("unknown command `gti`"), |_| {});
         assert!(row(&terminal, 2).contains("unknown command `gti`"));
-        assert!(row(&terminal, 3).contains("command"));
+        assert!(row(&terminal, 3).contains("NORMAL"));
     }
 
     #[test]
@@ -1265,7 +1261,7 @@ mod tests {
         assert!(row(&terminal, 1).contains('❯'));
         assert!(row(&terminal, 2).contains("picker"));
         assert!(row(&terminal, 19).trim().is_empty());
-        assert!(row(&terminal, 29).contains("command"));
+        assert!(row(&terminal, 29).contains("NORMAL"));
     }
 
     #[test]

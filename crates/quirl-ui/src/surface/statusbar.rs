@@ -17,12 +17,23 @@ pub struct StatusBarModel<'a> {
 
 impl StatusBarModel<'_> {
     pub fn line(&self, theme: Theme) -> Line<'static> {
-        let separator = if self.unicode { " · " } else { " | " };
+        let separator = if self.unicode { " │ " } else { " | " };
         let mut left = Vec::new();
         if let Some(label) = self.editor.mode().label() {
             left.push(label.to_owned());
         }
-        left.push(self.mode.to_string());
+        let mode_icon = match (self.unicode, self.mode) {
+            (true, Mode::Command) => "❯",
+            (true, Mode::Data) => "▦",
+            (true, Mode::Natural) => "✧",
+            (false, Mode::Command) => ">",
+            (false, Mode::Data) => "D",
+            (false, Mode::Natural) => "AI",
+        };
+        left.push(format!(
+            " {mode_icon} {} ",
+            self.mode.to_string().to_uppercase()
+        ));
 
         let center = if let Some(notice) = self.notice {
             notice.to_owned()
@@ -50,12 +61,10 @@ impl StatusBarModel<'_> {
         } else if self.hints {
             if self.width >= 96 {
                 format!(
-                    "Alt-M mode{separator}Tab complete{separator}^K palette{separator}^R history{separator}F1 help"
+                    "Alt-Q Quirl{separator}Tab complete{separator}↑ / Ctrl-R history{separator}F1 help"
                 )
             } else {
-                format!(
-                    "Alt-M mode{separator}Tab complete{separator}^K palette{separator}^R history"
-                )
+                format!("Alt-Q Quirl{separator}Tab complete{separator}Ctrl-R history")
             }
         } else {
             String::new()
@@ -76,7 +85,7 @@ impl StatusBarModel<'_> {
         } else if let Some(timings) = self.timings {
             timings.to_owned()
         } else {
-            "quirl".to_owned()
+            "◉ quirl".to_owned()
         };
         let left_text = left.join(separator);
         let fixed = UnicodeWidthStr::width(left_text.as_str())

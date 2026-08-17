@@ -501,6 +501,16 @@ pub(crate) fn search_default_database(
     intelligence::search(&bytes, &path, query, limit, model_path.as_deref())
 }
 
+/// Open one validated, reusable search generation for interactive AI mode.
+pub(crate) fn open_default_search_session() -> Result<intelligence::SearchSession, ShellError> {
+    let path = default_database_path()?;
+    let bytes = read_index(&path).map_err(|error| {
+        error.with_help("Run `quirl index build` to create the command database")
+    })?;
+    let model_path = intelligence::default_model_path();
+    intelligence::SearchSession::open(&bytes, &path, model_path.as_deref())
+}
+
 /// Rebuild potion-base-8M embeddings in one in-memory transaction and atomically
 /// replace the database only after every vector passes validation.
 pub(crate) fn build_default_embeddings() -> Result<intelligence::EmbeddingReport, ShellError> {
@@ -992,11 +1002,21 @@ fn load_catalog_at(path: &Path) -> Catalog {
 fn merge_cached_catalog(mut cached: Catalog) -> Catalog {
     // The index cache contains imported discovery facts, not authenticated
     // installation state. Only the validated plugin lock snapshot may confer
-    // plugin provenance and make a command eligible for agent execution.
-    cached
-        .commands
-        .retain(|command| command.provenance.source != Provenance::Plugin);
+    // plugin provenance and make a command eligible for agent execution. A
+    // cached builtin is also an obsolete copy of the running binary's contract:
+    // discard it whole so removed flags and renamed mode values cannot merge
+    // back into the current authoritative record.
     let mut current = Catalog::builtin();
+    let builtin_ids = current
+        .commands
+        .iter()
+        .map(|command| command.id.clone())
+        .collect::<BTreeSet<_>>();
+    cached.commands.retain(|command| {
+        command.provenance.source != Provenance::Plugin
+            && !(command.provenance.source == Provenance::Builtin
+                && builtin_ids.contains(&command.id))
+    });
     current.merge(cached.commands);
     current
 }
@@ -3665,12 +3685,16 @@ mod tests {
     fn compatible_stale_cache_cannot_remove_or_overwrite_current_builtins() {
         let mut stale = Catalog::builtin();
         stale.commands.retain(|command| command.path != "quirl lsp");
-        stale
+        let stale_run = stale
             .commands
             .iter_mut()
             .find(|command| command.path == "quirl run")
-            .unwrap()
-            .summary = "stale cached summary".to_owned();
+            .unwrap();
+        stale_run.summary = "stale cached summary".to_owned();
+        stale_run.options.push(quirl_catalog::ArgumentSpec {
+            names: vec!["--removed-stale-flag".to_owned()],
+            ..stale_run.options[0].clone()
+        });
 
         let merged = merge_cached_catalog(stale);
         assert!(merged.find("quirl lsp").is_some());
@@ -3678,6 +3702,15 @@ mod tests {
             merged.find("quirl run").unwrap().summary,
             "stale cached summary"
         );
+        assert!(merged
+            .find("quirl run")
+            .unwrap()
+            .options
+            .iter()
+            .all(|argument| !argument
+                .names
+                .iter()
+                .any(|name| name == "--removed-stale-flag")));
     }
 
     #[test]
