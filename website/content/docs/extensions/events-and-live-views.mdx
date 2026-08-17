@@ -19,8 +19,11 @@ Every record carries `protocol_version`, a strictly increasing `sequence`, and
 one typed payload. The current event kinds cover session start/restore,
 directory changes, command plans, execution progress, output, cancellation,
 result, and error. `QUIRL_SESSION_ID` opts an invocation into an explicit
-session-restore record. `quirl events validate trace.json` validates a complete trace without
-loading an extension. Output text containing terminal control bytes is rejected.
+session-restore record. `quirl events validate trace.json` validates a complete
+trace without loading an extension. Progress messages, output text, and
+cancellation reasons containing terminal control bytes are rejected. Nested
+annotation values are scanned iteratively under explicit node, depth, and text
+budgets.
 
 Lua handlers register through `quirl.events.subscribe` with a stable name,
 event kinds, a 1–250 ms deadline, and explicit capabilities. Observation is the

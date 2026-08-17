@@ -543,7 +543,7 @@ Options:
 
 Build the attributed completion index
 
-Imports declarative Fish, Bash, and Zsh completions from admitted regular files up to 4 MiB each, plus admitted help/man text up to 1 MiB each. It never sources or executes providers, commands, or man, then atomically writes a versioned catalog.
+Imports declarative Fish, Bash, and Zsh completions from admitted regular files up to 4 MiB each, retaining at most 256 commands per declaration, 2,048 commands, 4,096 candidates, and 4 MiB of normalized catalog text per file. Help/man text is limited to 1 MiB each. It never sources or executes providers, commands, or man, then atomically writes a versioned catalog.
 
 - Input: `Nothing`
 - Output: `Bytes`

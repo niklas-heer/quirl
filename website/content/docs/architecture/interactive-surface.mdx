@@ -376,6 +376,15 @@ honoring `picker.layout`:
   alternate-screen picker is deliberately unsupported because it would weaken
   the shell's native-scrollback invariant and require a separate lifecycle.
 
+The shipped `Ctrl-K` command palette always requests a terminal-height inline
+viewport and positions its bounded adaptive content against the bottom edge.
+This is not an alternate-screen transition: Ratatui may scroll visible content
+upward to reserve the viewport, but that content remains in native scrollback,
+and the same inline terminal guard releases the viewport before execution,
+suspension, or error return. Closing the palette recreates the compact viewport
+against the prior bottom edge so ordinary prompt rendering does not remain near
+the top of the terminal.
+
 The picker engine, ranking, and typed-value return stay in `quirl-picker`;
 the surface uses it through the `PickerRanker` composition adapter. Source
 items are capped at 4 096 and 2 MiB retained data, queries at 1 024 bytes, and
