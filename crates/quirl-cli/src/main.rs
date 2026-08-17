@@ -1724,7 +1724,12 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             jobs: interactive_job_snapshots(&job_states),
             data: data_cache.snapshot(),
         });
-        let signal = line_editor.read_line(&prompt);
+        let signal = line_editor.read_line(&mut prompt);
+        // Rich Alt-M transitions happen while the surface retains terminal
+        // ownership. Adopt the mode rendered by that session before classifying
+        // accepted input; degraded editors leave the prompt mode unchanged and
+        // continue to report their host command below.
+        mode = prompt.mode();
         if signal.is_ok() && catalog.is_none() {
             catalog = line_editor.published_catalog();
         }
@@ -2259,7 +2264,7 @@ enum SessionEditor {
 }
 
 impl SessionEditor {
-    fn read_line(&mut self, prompt: &QuirlPrompt) -> Result<InteractiveSignal, ShellError> {
+    fn read_line(&mut self, prompt: &mut QuirlPrompt) -> Result<InteractiveSignal, ShellError> {
         match self {
             Self::Rich(editor) => editor.read_line(prompt),
             Self::Simple(editor) => editor

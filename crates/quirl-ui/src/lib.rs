@@ -1611,6 +1611,19 @@ impl QuirlPrompt {
         prompt
     }
 
+    /// Return the grammar mode currently rendered by this prompt.
+    ///
+    /// Rich editing may change the mode without releasing terminal ownership;
+    /// the composition root reads this value when the edit session eventually
+    /// returns so execution uses the same mode the user last saw.
+    pub const fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub(crate) fn toggle_mode(&mut self) {
+        self.mode = self.mode.toggled();
+    }
+
     /// Append legacy positional extension segments after neutralizing terminal controls.
     ///
     /// Prefer [`Self::with_named_extension_segments`] when configuration must
