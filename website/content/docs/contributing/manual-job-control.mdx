@@ -11,6 +11,28 @@ The native executor treats pipeline construction as a transaction and terminal
 ownership as a lease. These are the failure cases that every implementation and
 real-PTY check must preserve:
 
+- **Process-group identity:** every Unix group has a dedicated direct-child
+  anchor member before guest code can run. The anchor stays unreaped while any
+  group signal is possible, so the live owned group prevents its PGID from
+  being reused for an unrelated group. Cleanup signals the group once while the
+  anchor is owned, then kills and reaps the anchor and never addresses that PGID
+  again.
+- **Native leader staging:** the first native guest starts as absolute
+  `/bin/sh` running a fixed staging script in a fresh group. It validates the
+  executable, stops before `exec`, and is continued only after the separate
+  anchor has joined and reported ready. The same PID then executes the guest,
+  preserving the first stage as process-group leader and the foreground TTY
+  contract without allowing guest instructions before anchored ownership.
+- **Anchor construction:** Quirl starts absolute `/bin/sh` with a fixed script,
+  an empty environment, piped standard input, and null terminal-facing output.
+  The script ignores interrupt, termination, and background-terminal signals,
+  but retains the default `SIGTSTP` disposition before its one-byte readiness
+  handshake. The foreground wait polls that owned anchor as a stop sentinel;
+  observing it stopped causes one anchored group `SIGSTOP`, covering a Darwin
+  PTY delivery where the anchor stops but a guest misses the terminal
+  `SIGTSTP`. Spawn, process-group verification, early exit, malformed
+  readiness, and each two-second setup wait all unwind by killing and reaping
+  the anchor before an error is returned.
 - **Partial spawn:** every child and descriptor is owned immediately. Failure
   after any spawn kills the process group, kills each direct child as a
   fallback, reaps every direct child, closes pending pipe ends, and returns the
@@ -48,6 +70,8 @@ real-PTY check must preserve:
   failed group operation does not skip direct-child cleanup. When an operating
   error already exists, cleanup cannot replace it. A standalone explicit
   lifecycle operation reports its own cleanup failure with actionable context.
+  Even when group signaling fails, the direct-child anchor is killed and reaped
+  last; no retry or probe may use the released PGID.
 - **Retained jobs:** a `NativeExecutor` retains at most 1,024 job records. At
   capacity it refreshes state and removes completed records before accepting a
   new job; 1,024 still-live records fail early with `ResourceLimit`.
@@ -65,6 +89,16 @@ real-PTY check must preserve:
 Every wait above is either request-bounded or advances in bounded polling turns.
 Foreground interactive commands may intentionally run until they exit, stop,
 or receive a terminal signal; they do not retain output in memory.
+
+Each live Unix process group adds exactly one anchor process, two bounded pipes,
+one retained readiness byte, and one reader thread for at most the two-second
+anchor handshake. Native groups also have a preceding two-second leader-stop
+wait, for at most four seconds of total setup; the trusted staging shell becomes
+the first guest rather than adding another live process. The reader is joined on
+every startup outcome. Native stage and retained-job limits therefore also
+bound anchors; established groups retain no anchor reader thread or output
+buffer. Foreground waits poll at most 16 queued anchor status transitions per
+turn before yielding to child polling and cancellation.
 
 The canonical Unix PTY harness automates foreground-group ownership, native
 `Ctrl-Z`/`Ctrl-C`, `jobs`/`bg`/`fg`, fast-leader and construction-failure
