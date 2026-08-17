@@ -9,6 +9,8 @@ use quirl_catalog::{
 use quirl_core::ShellError;
 use quirl_syntax::Mode;
 use std::{
+    env, fs,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex,
@@ -19,6 +21,7 @@ use std::{
 const COMPLETION_ITEMS_MAX: usize = MAX_COMPLETION_RESULTS;
 const COMPLETION_ITEM_BYTES_MAX: usize = 16 * 1_024;
 const COMPLETION_RETAINED_BYTES_MAX: usize = 2 * 1_024 * 1_024;
+const PATH_COMPLETION_ENTRIES_MAX: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionKind {
@@ -283,6 +286,7 @@ pub struct CompletionState {
     extension_source: Option<Box<dyn ExtensionCompleter + Send>>,
     extension_worker: Option<ExtensionWorker>,
     extension_pending: Option<Vec<ExtensionSuggestion>>,
+    filesystem_pending: Vec<CompletionItem>,
     catalog_ready: bool,
     extension_ready: bool,
     request_id: u64,
@@ -310,6 +314,7 @@ impl CompletionState {
             extension_source: extensions,
             extension_worker: None,
             extension_pending: None,
+            filesystem_pending: Vec::new(),
             catalog_ready: false,
             extension_ready: false,
             request_id: 0,
@@ -334,6 +339,7 @@ impl CompletionState {
             extension_source: extensions,
             extension_worker: None,
             extension_pending: None,
+            filesystem_pending: Vec::new(),
             catalog_ready: false,
             extension_ready: false,
             request_id: 0,
@@ -415,13 +421,19 @@ impl CompletionState {
         self.request_id = self.request_id.saturating_add(1);
         self.items.clear();
         self.extension_pending = None;
+        self.filesystem_pending = if automatic {
+            Vec::new()
+        } else {
+            filesystem_completion_items(self.catalog.as_deref(), line, cursor, mode)
+        };
+        self.items.clone_from(&self.filesystem_pending);
         self.catalog_ready = false;
         self.extension_ready = self.extension_worker.is_none();
         self.selected = 0;
         self.open = true;
         self.streaming = true;
         self.automatic = automatic;
-        self.source_label = "catalog";
+        self.refresh_source_label();
         let catalog_request = catalog_request(line, cursor, mode);
         self.request_mode = mode;
         self.catalog_position_delta = catalog_request.position_delta;
@@ -460,6 +472,7 @@ impl CompletionState {
             }
         }
         self.extension_pending = None;
+        self.filesystem_pending.clear();
         self.catalog_ready = false;
         self.extension_ready = self.extension_worker.is_none();
         self.resource_notice = None;
@@ -478,7 +491,7 @@ impl CompletionState {
             .as_ref()
             .and_then(CompletionWorker::try_recv_latest)
         {
-            self.items = bounded_items(match response.outcome {
+            let catalog_items = match response.outcome {
                 CompletionOutcome::Ready { items } => items
                     .into_iter()
                     .filter(|item| {
@@ -508,11 +521,13 @@ impl CompletionState {
                     })
                     .collect(),
                 CompletionOutcome::Cancelled | CompletionOutcome::DeadlineExceeded => Vec::new(),
-            });
+            };
+            let mut items = std::mem::take(&mut self.filesystem_pending);
+            items.extend(catalog_items);
+            self.items = bounded_items(items);
             self.catalog_ready = true;
             if let Some(extension_items) = self.extension_pending.take() {
                 if !extension_items.is_empty() {
-                    self.source_label = "catalog + plugins";
                     merge_extension_items(&mut self.items, extension_items);
                 }
             }
@@ -526,7 +541,6 @@ impl CompletionState {
             self.extension_ready = true;
             if self.catalog_ready {
                 if !extension_items.is_empty() {
-                    self.source_label = "catalog + plugins";
                     merge_extension_items(&mut self.items, extension_items);
                 }
             } else {
@@ -543,6 +557,7 @@ impl CompletionState {
             .min(self.items.len().saturating_sub(1));
         self.streaming = !self.catalog_ready || !self.extension_ready;
         self.open = !self.items.is_empty() || self.streaming;
+        self.refresh_source_label();
         true
     }
 
@@ -594,6 +609,7 @@ impl CompletionState {
 
     pub fn dismiss(&mut self) {
         self.items.clear();
+        self.filesystem_pending.clear();
         self.selected = 0;
         self.open = false;
         self.streaming = false;
@@ -619,6 +635,378 @@ impl CompletionState {
         self.streaming = false;
         self.automatic = false;
         self.source_label = source_label;
+    }
+
+    fn refresh_source_label(&mut self) {
+        let filesystem = self.items.iter().any(|item| item.source == "filesystem");
+        let plugins = self.items.iter().any(|item| item.source == "plugin");
+        let catalog = self
+            .items
+            .iter()
+            .any(|item| !matches!(item.source, "filesystem" | "plugin"));
+        self.source_label = match (catalog, filesystem, plugins) {
+            (true, true, true) => "catalog + files + plugins",
+            (true, true, false) => "catalog + files",
+            (true, false, true) => "catalog + plugins",
+            (true, false, false) => "catalog",
+            (false, true, true) => "files + plugins",
+            (false, true, false) => "files",
+            (false, false, true) => "plugins",
+            (false, false, false) => "catalog",
+        };
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PathWordStyle {
+    Unquoted,
+    SingleQuoted { closed: bool },
+    DoubleQuoted { closed: bool },
+}
+
+struct ShellWord<'a> {
+    start: usize,
+    raw: &'a str,
+}
+
+fn filesystem_completion_items(
+    catalog: Option<&Catalog>,
+    line: &str,
+    cursor: usize,
+    mode: Mode,
+) -> Vec<CompletionItem> {
+    if mode == Mode::Natural {
+        return Vec::new();
+    }
+    let cursor = clamped_utf8_cursor(line, cursor);
+    let before = &line[..cursor];
+    let segment_start = shell_segment_start(before);
+    let segment = &before[segment_start..];
+    let words = shell_words(segment, segment_start);
+    let trailing_space = segment.chars().next_back().is_some_and(char::is_whitespace);
+    let Some(command) = words.first().map(|word| decode_shell_word(word.raw)) else {
+        return Vec::new();
+    };
+    let (replace_start, raw_token, is_argument) = if trailing_space {
+        (cursor, "", !words.is_empty())
+    } else {
+        let Some(current) = words.last() else {
+            return Vec::new();
+        };
+        (
+            current.start,
+            current.raw,
+            words.len() > 1 || shell_path_is_explicit(&decode_shell_word(current.raw)),
+        )
+    };
+    if !is_argument {
+        return Vec::new();
+    }
+
+    let decoded = decode_shell_word(raw_token);
+    let explicit_path = shell_path_is_explicit(&decoded);
+    if decoded.starts_with('-') && !explicit_path {
+        return Vec::new();
+    }
+    if !explicit_path && catalog_has_subcommand_prefix(catalog, segment, raw_token) {
+        return Vec::new();
+    }
+
+    let directories_only = command == "cd";
+    let style = path_word_style(raw_token);
+    let Some((scan_directory, shown_directory, name_prefix)) = path_scan_parts(&decoded) else {
+        return Vec::new();
+    };
+    let entries = match fs::read_dir(&scan_directory) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let show_hidden = name_prefix.starts_with('.');
+    let mut items = Vec::new();
+    for entry in entries
+        .take(PATH_COMPLETION_ENTRIES_MAX)
+        .filter_map(Result::ok)
+    {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(&name_prefix) || (!show_hidden && name.starts_with('.')) {
+            continue;
+        }
+        let entry_path = entry.path();
+        let is_directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+            || fs::metadata(&entry_path)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false);
+        if directories_only && !is_directory {
+            continue;
+        }
+        let mut display = name.clone();
+        if is_directory {
+            display.push('/');
+        }
+        let shown = format!("{shown_directory}{display}");
+        let value = encode_shell_path(&shown, style);
+        let summary = if is_directory { "Directory" } else { "File" };
+        items.push(CompletionItem {
+            display,
+            value,
+            summary: summary.to_owned(),
+            detail: format!("{summary}\n\n{}", entry_path.display()),
+            replace_start,
+            replace_end: cursor,
+            match_indices: Vec::new(),
+            kind: CompletionKind::Path,
+            source: "filesystem",
+            trust: "local",
+        });
+    }
+    items.sort_by(|left, right| left.display.cmp(&right.display));
+    bounded_items(items)
+}
+
+fn clamped_utf8_cursor(line: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(line.len());
+    while cursor > 0 && !line.is_char_boundary(cursor) {
+        cursor = cursor.saturating_sub(1);
+    }
+    cursor
+}
+
+fn shell_segment_start(input: &str) -> usize {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut start = 0;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Single if character == '\'' => quote = Quote::None,
+            Quote::Single => {}
+            Quote::Double if character == '\\' => escaped = true,
+            Quote::Double if character == '"' => quote = Quote::None,
+            Quote::Double => {}
+            Quote::None if character == '\\' => escaped = true,
+            Quote::None if character == '\'' => quote = Quote::Single,
+            Quote::None if character == '"' => quote = Quote::Double,
+            Quote::None if matches!(character, '|' | '&' | ';' | '\n') => {
+                start = index.saturating_add(character.len_utf8());
+            }
+            Quote::None => {}
+        }
+    }
+    start
+}
+
+fn shell_words(segment: &str, absolute_start: usize) -> Vec<ShellWord<'_>> {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut words = Vec::new();
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut word_start = None;
+    for (index, character) in segment.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Single if character == '\'' => quote = Quote::None,
+            Quote::Single => {}
+            Quote::Double if character == '\\' => escaped = true,
+            Quote::Double if character == '"' => quote = Quote::None,
+            Quote::Double => {}
+            Quote::None if character == '\\' => {
+                word_start.get_or_insert(index);
+                escaped = true;
+            }
+            Quote::None if character == '\'' => {
+                word_start.get_or_insert(index);
+                quote = Quote::Single;
+            }
+            Quote::None if character == '"' => {
+                word_start.get_or_insert(index);
+                quote = Quote::Double;
+            }
+            Quote::None if character.is_whitespace() => {
+                if let Some(start) = word_start.take() {
+                    words.push(ShellWord {
+                        start: absolute_start.saturating_add(start),
+                        raw: &segment[start..index],
+                    });
+                }
+            }
+            Quote::None => {
+                word_start.get_or_insert(index);
+            }
+        }
+    }
+    if let Some(start) = word_start {
+        words.push(ShellWord {
+            start: absolute_start.saturating_add(start),
+            raw: &segment[start..],
+        });
+    }
+    words
+}
+
+fn decode_shell_word(raw: &str) -> String {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut decoded = String::with_capacity(raw.len());
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    for character in raw.chars() {
+        if escaped {
+            decoded.push(character);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Quote::Single if character == '\'' => quote = Quote::None,
+            Quote::Single => decoded.push(character),
+            Quote::Double if character == '\\' => escaped = true,
+            Quote::Double if character == '"' => quote = Quote::None,
+            Quote::Double => decoded.push(character),
+            Quote::None if character == '\\' => escaped = true,
+            Quote::None if character == '\'' => quote = Quote::Single,
+            Quote::None if character == '"' => quote = Quote::Double,
+            Quote::None => decoded.push(character),
+        }
+    }
+    if escaped {
+        decoded.push('\\');
+    }
+    decoded
+}
+
+fn shell_path_is_explicit(value: &str) -> bool {
+    value.starts_with(['/', '.', '~']) || value.contains('/')
+}
+
+fn catalog_has_subcommand_prefix(
+    catalog: Option<&Catalog>,
+    segment: &str,
+    raw_token: &str,
+) -> bool {
+    let Some(catalog) = catalog else {
+        return false;
+    };
+    let query = segment
+        .strip_suffix(raw_token)
+        .map_or(segment, str::trim_end);
+    let token = decode_shell_word(raw_token);
+    let prefix = if query.is_empty() {
+        token
+    } else {
+        format!("{} {token}", decode_shell_word(query))
+    };
+    catalog.commands.iter().any(|command| {
+        std::iter::once(command.path.as_str())
+            .chain(command.aliases.iter().map(String::as_str))
+            .any(|path| path.starts_with(&prefix) && path.len() > prefix.len())
+    })
+}
+
+fn path_word_style(raw: &str) -> PathWordStyle {
+    if raw.starts_with('\'') {
+        PathWordStyle::SingleQuoted {
+            closed: raw.len() > 1 && raw.ends_with('\''),
+        }
+    } else if raw.starts_with('"') {
+        PathWordStyle::DoubleQuoted {
+            closed: raw.len() > 1 && raw.ends_with('"'),
+        }
+    } else {
+        PathWordStyle::Unquoted
+    }
+}
+
+fn path_scan_parts(value: &str) -> Option<(PathBuf, String, String)> {
+    let value = if value == "~" { "~/" } else { value };
+    let separator = value.rfind('/');
+    let (shown_directory, name_prefix) = separator.map_or(("", value), |index| {
+        (&value[..=index], &value[index.saturating_add(1)..])
+    });
+    let scan_directory = if shown_directory == "~/" || shown_directory.starts_with("~/") {
+        let home = env::var_os("HOME").map(PathBuf::from)?;
+        home.join(shown_directory.trim_start_matches("~/"))
+    } else if shown_directory.is_empty() {
+        PathBuf::from(".")
+    } else {
+        Path::new(shown_directory).to_path_buf()
+    };
+    Some((
+        scan_directory,
+        shown_directory.to_owned(),
+        name_prefix.to_owned(),
+    ))
+}
+
+fn encode_shell_path(path: &str, style: PathWordStyle) -> String {
+    match style {
+        PathWordStyle::Unquoted => {
+            let mut escaped = String::with_capacity(path.len());
+            for character in path.chars() {
+                if character.is_whitespace()
+                    || matches!(
+                        character,
+                        '\\' | '\''
+                            | '"'
+                            | '$'
+                            | '`'
+                            | '!'
+                            | '&'
+                            | '|'
+                            | ';'
+                            | '('
+                            | ')'
+                            | '<'
+                            | '>'
+                            | '*'
+                            | '?'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                    )
+                {
+                    escaped.push('\\');
+                }
+                escaped.push(character);
+            }
+            escaped
+        }
+        PathWordStyle::SingleQuoted { closed } => {
+            let escaped = path.replace('\'', "'\\''");
+            format!("'{escaped}{}", if closed { "'" } else { "" })
+        }
+        PathWordStyle::DoubleQuoted { closed } => {
+            let mut escaped = String::with_capacity(path.len());
+            for character in path.chars() {
+                if matches!(character, '\\' | '"' | '$' | '`') {
+                    escaped.push('\\');
+                }
+                escaped.push(character);
+            }
+            format!("\"{escaped}{}", if closed { "\"" } else { "" })
+        }
     }
 }
 
@@ -1040,6 +1428,66 @@ mod tests {
 
         state.next();
         assert!(state.accepts_enter());
+    }
+
+    #[test]
+    fn path_completion_filters_cd_to_directories_and_escapes_spaces() {
+        let root = std::env::temp_dir().join(format!(
+            "quirl-path-completion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("homebrew-tap")).unwrap();
+        std::fs::create_dir(root.join("home brew")).unwrap();
+        std::fs::write(root.join("homebrew.txt"), b"file").unwrap();
+
+        let line = format!("cd {}/home", root.display());
+        let directories = filesystem_completion_items(
+            Some(&Catalog::builtin()),
+            &line,
+            line.len(),
+            Mode::Command,
+        );
+        assert!(directories
+            .iter()
+            .any(|item| item.display.ends_with("homebrew-tap/")));
+        assert!(directories
+            .iter()
+            .all(|item| !item.display.ends_with("homebrew.txt")));
+
+        let line = format!("cd {}/home\\ b", root.display());
+        let escaped = filesystem_completion_items(
+            Some(&Catalog::builtin()),
+            &line,
+            line.len(),
+            Mode::Command,
+        );
+        assert!(escaped
+            .iter()
+            .any(|item| item.value.ends_with("home\\ brew/")));
+
+        let line = format!("cat {}/home", root.display());
+        let files = filesystem_completion_items(
+            Some(&Catalog::builtin()),
+            &line,
+            line.len(),
+            Mode::Command,
+        );
+        assert!(files
+            .iter()
+            .any(|item| item.display.ends_with("homebrew.txt")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn known_subcommand_prefix_does_not_mix_in_filesystem_fallbacks() {
+        let catalog = Catalog::builtin();
+        let items =
+            filesystem_completion_items(Some(&catalog), "git c", "git c".len(), Mode::Command);
+        assert!(items.is_empty());
     }
 
     #[test]

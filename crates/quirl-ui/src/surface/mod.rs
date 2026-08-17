@@ -338,7 +338,6 @@ pub struct RichSurface {
     intent_completion: IntentCompletionState,
     stream_stdout: StreamingText,
     stream_stderr: StreamingText,
-    stream_had_output: bool,
 }
 
 impl RichSurface {
@@ -397,7 +396,6 @@ impl RichSurface {
             intent_completion: IntentCompletionState::default(),
             stream_stdout: StreamingText::default(),
             stream_stderr: StreamingText::default(),
-            stream_had_output: false,
         })
     }
 
@@ -455,7 +453,6 @@ impl RichSurface {
             intent_completion: IntentCompletionState::default(),
             stream_stdout: StreamingText::default(),
             stream_stderr: StreamingText::default(),
-            stream_had_output: false,
         })
     }
 
@@ -475,9 +472,6 @@ impl RichSurface {
         self.append_transcript_line(&format!("❯ {}", quirl_core::escape_terminal_line(command)));
         self.append_transcript_bytes(stdout);
         self.append_transcript_bytes(stderr);
-        if stdout.is_empty() && stderr.is_empty() {
-            self.append_transcript_line("(no output)");
-        }
         self.append_transcript_line(&format!("── exit {status} · {}ms ──", duration.as_millis()));
         self.output_cursor_line = self.transcript.line_count().saturating_sub(1);
         self.output_notice =
@@ -494,7 +488,6 @@ impl RichSurface {
         self.dismiss_picker();
         self.stream_stdout.reset();
         self.stream_stderr.reset();
-        self.stream_had_output = false;
         self.append_transcript_line(&format!("❯ {command}"));
         self.output_notice = Some("running · output streams into this viewport".to_owned());
         self.draw_execution(prompt)
@@ -537,9 +530,6 @@ impl RichSurface {
         self.append_stream_lines(stdout);
         let stderr = self.stream_stderr.finish();
         self.append_stream_lines(stderr);
-        if !self.stream_had_output {
-            self.append_transcript_line("(no output)");
-        }
         self.append_transcript_line(&format!("── exit {status} · {}ms ──", duration.as_millis()));
         self.output_cursor_line = self.transcript.line_count().saturating_sub(1);
         self.output_notice =
@@ -549,7 +539,6 @@ impl RichSurface {
 
     fn append_stream_lines(&mut self, lines: Vec<String>) {
         for line in lines {
-            self.stream_had_output = true;
             self.append_transcript_line(&line);
         }
     }
@@ -1025,7 +1014,7 @@ impl RichSurface {
                         }
                         EditAction::OpenLeader => self.open_leader(editor.buffer().len()),
                         EditAction::Complete => {
-                            if self.completion.open {
+                            if self.completion.open && !self.completion.automatic {
                                 self.completion.next();
                             } else {
                                 self.completion.request(
@@ -2650,6 +2639,27 @@ mod tests {
         assert_eq!(lines[3], "last\\u{1b}[2J");
         assert_eq!(lines[4], "warning");
         assert_eq!(lines[5], "── exit 7 · 12ms ──");
+    }
+
+    #[test]
+    fn silent_success_keeps_command_and_status_without_placeholder_output() {
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+
+        surface
+            .append_transcript("cd project", b"", b"", 0, Duration::from_millis(1))
+            .unwrap();
+
+        let lines = (0..surface.transcript.line_count())
+            .map(|index| surface.transcript.line(index).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(lines, ["❯ cd project", "── exit 0 · 1ms ──"]);
     }
 
     #[test]

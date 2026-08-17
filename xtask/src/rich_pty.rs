@@ -596,8 +596,11 @@ fn check_rich_editing(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.send(b"\x7f\x7f\x7f")?;
     enter_and_wait(&mut session, "OK", b"BACKSPACE_OK")?;
     session.pty.type_text("/usr/bin/printf DELETE_XOK")?;
-    session.pty.send(b"\x1b[D\x1b[D\x1b[D\x1b[3~\r")?;
-    session.pty.wait_for(b"DELETE_OK")?;
+    session.pty.send(b"\x1b[D\x1b[D\x1b[D\x1b[3~")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.drain_for(Duration::from_millis(100))?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for_screen_text("DELETE_OK")?;
     session.pty.type_text("/usr/bin/printf UNICODE_e\u{301}")?;
     session.pty.send(b"\x7f")?;
     enter_and_wait(&mut session, "OK", b"UNICODE_OK")?;
@@ -1280,7 +1283,45 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
 
 fn check_completion(binary: &Path) -> Result<(), Box<dyn Error>> {
     let mut session = Session::new(binary, SessionOptions::default())?;
+    let path_target = session.private.path.join("path-target");
+    create_private_directory(&path_target)?;
+    create_private_directory(&session.private.path.join("path with space"))?;
+    fs::write(
+        session.private.path.join("path-target.txt"),
+        b"not a directory\n",
+    )?;
+    fs::write(path_target.join("notes.txt"), b"PATH_FILE_OK\n")?;
     session.pty.wait_for(STARTUP_MARKER)?;
+
+    session
+        .pty
+        .type_text(&format!("cd {}/path-t", session.private.path.display()))?;
+    session.pty.send(b"\t")?;
+    session
+        .pty
+        .wait_for_screen("absolute directory completion", |screen| {
+            let text = screen.text();
+            text.contains("path-target/") && !text.contains("path-target.txt")
+        })?;
+    session.pty.send(key::ENTER)?;
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("silent cd transcript", |screen| {
+            let text = screen.text();
+            text.contains("❯ cd ")
+                && text.contains("path-target/")
+                && text.contains("── exit 0")
+                && !text.contains("(no output)")
+        })?;
+
+    session.pty.type_text("cat no")?;
+    session.pty.send(b"\t")?;
+    session.pty.wait_for_screen_text("notes.txt")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for_screen_text("PATH_FILE_OK")?;
+
     session.pty.type_text("git st")?;
     session.pty.send(b"\t")?;
     session.pty.wait_for(b"git status [--short]")?;
@@ -1297,7 +1338,7 @@ fn check_completion(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.wait_for_screen_text("not a git repository")?;
     session.pty.type_text("git")?;
     session.pty.send(b"\x1b[Z")?;
-    session.pty.wait_for(b"picker")?;
+    session.pty.wait_for_screen_text("picker")?;
     session.pty.send(b"\x1b[200~zzzz-no-match\x1b[201~")?;
     session.pty.wait_for(b"zzzz-no-match")?;
     session.pty.send(key::ESCAPE)?;
