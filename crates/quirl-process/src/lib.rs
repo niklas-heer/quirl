@@ -540,10 +540,11 @@ mod platform {
     type OutputStdio = (Stdio, Option<PipeReader>, Option<PipeWriter>, Option<File>);
     const FOREGROUND_TERMINAL_LEASE_WAIT_MAX: Duration = Duration::from_secs(30);
     const PROCESS_GROUP_ANCHOR_STARTUP_WAIT_MAX: Duration = Duration::from_secs(2);
+    const PROCESS_GROUP_ANCHOR_STATUS_EVENTS_PER_TURN_MAX: usize = 16;
     const PROCESS_GROUP_ANCHOR_PATH: &str = "/bin/sh";
     const PROCESS_GROUP_ANCHOR_READY: u8 = b'R';
     const PROCESS_GROUP_ANCHOR_SCRIPT: &str =
-        "trap '' HUP INT QUIT TERM TSTP TTIN TTOU; printf R; IFS= read -r _";
+        "trap '' HUP INT QUIT TERM TTIN TTOU; trap - TSTP; printf R; IFS= read -r _";
     const PROCESS_GROUP_LEADER_STAGE_SCRIPT: &str =
         "command -v \"$1\" >/dev/null 2>&1 || exit 127; kill -STOP $$; exec \"$@\"";
 
@@ -716,6 +717,7 @@ mod platform {
         keepalive: Option<ChildStdin>,
         process_group: i32,
         termination_signaled: bool,
+        stopped: bool,
         released: bool,
     }
 
@@ -759,6 +761,7 @@ mod platform {
                 keepalive: Some(keepalive),
                 process_group,
                 termination_signaled: false,
+                stopped: false,
                 released: false,
             };
             anchor.await_readiness(readiness, request)?;
@@ -806,6 +809,72 @@ mod platform {
             killpg(Pid::from_raw(self.process_group), signal)
         }
 
+        fn poll_stopped(&mut self) -> Result<bool, ShellError> {
+            if self.released {
+                return Err(ShellError::new(
+                    ErrorCode::Io,
+                    "process-group anchor exited before foreground cleanup",
+                )
+                .with_help("Retry the command; report repeated anchor lifecycle failures"));
+            }
+            let process_id = Pid::from_raw(i32::try_from(self.child.id()).map_err(|error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "process-group anchor id is outside the platform range",
+                )
+                .with_context(error.to_string())
+                .with_help("Report this platform-specific process error")
+            })?);
+            for _ in 0..PROCESS_GROUP_ANCHOR_STATUS_EVENTS_PER_TURN_MAX {
+                let status = waitpid(
+                    process_id,
+                    Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED | WaitPidFlag::WNOHANG),
+                )
+                .map_err(|error| {
+                    ShellError::new(
+                        ErrorCode::Io,
+                        "could not observe process-group anchor state",
+                    )
+                    .with_context(error.to_string())
+                    .with_help("Retry the command; report repeated anchor lifecycle failures")
+                })?;
+                match status {
+                    WaitStatus::Stopped(_, _) => self.stopped = true,
+                    WaitStatus::Continued(_) => self.stopped = false,
+                    WaitStatus::Exited(_, code) => {
+                        self.released = true;
+                        self.keepalive.take();
+                        return Err(ShellError::new(
+                            ErrorCode::Io,
+                            "process-group anchor exited before foreground cleanup",
+                        )
+                        .with_context(format!("exit status {code}"))
+                        .with_help(
+                            "Retry the command; report repeated anchor lifecycle failures",
+                        ));
+                    }
+                    WaitStatus::Signaled(_, signal, _) => {
+                        self.released = true;
+                        self.keepalive.take();
+                        return Err(ShellError::new(
+                            ErrorCode::Io,
+                            "process-group anchor exited before foreground cleanup",
+                        )
+                        .with_context(format!("signal {signal}"))
+                        .with_help(
+                            "Retry the command; report repeated anchor lifecycle failures",
+                        ));
+                    }
+                    WaitStatus::StillAlive => return Ok(self.stopped),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    WaitStatus::PtraceEvent(_, _, _) | WaitStatus::PtraceSyscall(_) => {
+                        self.stopped = true;
+                    }
+                }
+            }
+            Ok(self.stopped)
+        }
+
         fn terminate_owned_group(mut self) -> Result<(), ShellError> {
             let group_result = self.begin_termination();
             self.finish_termination(group_result)
@@ -820,6 +889,9 @@ mod platform {
         }
 
         fn begin_termination(&mut self) -> Result<(), Errno> {
+            if self.released {
+                return Err(Errno::ESRCH);
+            }
             debug_assert!(
                 !self.termination_signaled,
                 "process group was signaled twice"
@@ -1740,11 +1812,11 @@ mod platform {
                     stderr_readers: Vec::new(),
                     writers,
                 });
-                return Ok(outcome(
+                return notification_outcome(
                     0,
-                    Some(format!("[{id}] {}", process_group.unwrap_or_default())),
-                    capture.then(String::new),
-                ));
+                    format!("[{id}] {}", process_group.unwrap_or_default()),
+                    capture,
+                );
             }
 
             let process_group = spawned.process_group;
@@ -1753,7 +1825,7 @@ mod platform {
             let stdout_reader = capture_reader.map(|reader| spawn_reader(reader, output_limit));
             let child_count = children.len();
             let wait_error =
-                wait_for_foreground_children(&mut children, process_group_anchor.as_ref(), request)
+                wait_for_foreground_children(&mut children, &mut process_group_anchor, request)
                     .err();
             if let Some(error) = wait_error {
                 terminate_children(&mut children, &mut process_group_anchor);
@@ -1816,11 +1888,7 @@ mod platform {
                     stderr_readers,
                     writers,
                 });
-                return Ok(outcome(
-                    status,
-                    Some(format!("[{id}] stopped {source}")),
-                    capture.then(String::new),
-                ));
+                return notification_outcome(status, format!("[{id}] stopped {source}"), capture);
             }
             let stdout = join_reader(stdout_reader, "pipeline output");
             let stderr = join_readers(stderr_readers, "command error output");
@@ -1890,7 +1958,7 @@ mod platform {
             let result = (|| {
                 wait_for_foreground_children(
                     &mut job.children,
-                    job.process_group_anchor.as_ref(),
+                    &mut job.process_group_anchor,
                     None,
                 )?;
                 let status = job
@@ -3451,7 +3519,7 @@ mod platform {
 
     fn wait_for_foreground_children(
         children: &mut [JobChild],
-        process_group_anchor: Option<&ProcessGroupAnchor>,
+        process_group_anchor: &mut Option<ProcessGroupAnchor>,
         request: Option<RequestContext<'_>>,
     ) -> Result<(), ShellError> {
         // A pipeline is one job: if any member stops, stop every remaining
@@ -3469,11 +3537,17 @@ mod platform {
                 poll_child_checked(child)?;
             }
 
-            let any_stopped = children
-                .iter()
-                .any(|child| child.status == JobStatus::Stopped);
+            let anchor_stopped = process_group_anchor
+                .as_mut()
+                .map(ProcessGroupAnchor::poll_stopped)
+                .transpose()?
+                .unwrap_or(false);
+            let any_stopped = anchor_stopped
+                || children
+                    .iter()
+                    .any(|child| child.status == JobStatus::Stopped);
             if any_stopped && !stop_propagated {
-                stop_live_children(children, process_group_anchor)?;
+                stop_live_children(children, process_group_anchor.as_ref())?;
                 stop_propagated = true;
             }
 
@@ -3541,6 +3615,18 @@ mod platform {
             stdout,
             stderr,
         }
+    }
+
+    fn notification_outcome(
+        status: i32,
+        message: String,
+        capture: bool,
+    ) -> Result<CommandOutcome, ShellError> {
+        if capture {
+            return Ok(outcome(status, Some(message), Some(String::new())));
+        }
+        io_write_all(std::io::stdout(), message.as_bytes(), "job notification")?;
+        Ok(outcome(status, None, None))
     }
 
     fn append_captured_output(
@@ -3886,6 +3972,15 @@ mod platform {
                 jobs = executor.jobs();
             }
             assert_eq!(jobs[0].status, JobStatus::Done);
+        }
+
+        #[test]
+        fn inherited_background_notification_is_not_retained() {
+            let mut executor = NativeExecutor::default();
+            let outcome = executor.execute("sleep 30 &").unwrap();
+            assert_eq!(outcome.stdout, None);
+            assert_eq!(outcome.stderr, None);
+            executor.cancel_job(1).unwrap();
         }
 
         #[test]
@@ -4272,6 +4367,8 @@ mod platform {
             let mut executor = NativeExecutor::default();
             let stopped = executor.execute("sh -c 'kill -STOP $$; exit 7'").unwrap();
             assert_ne!(stopped.status, 0);
+            assert_eq!(stopped.stdout, None);
+            assert_eq!(stopped.stderr, None);
             let jobs = executor.jobs();
             assert_eq!(jobs.len(), 1);
             assert_eq!(jobs[0].status, JobStatus::Stopped);
@@ -4486,8 +4583,12 @@ mod platform {
         fn pipeline_construction_guard_kills_and_reaps_children_on_early_errors() {
             let mut guard = PipelineConstructionGuard::new();
             let pid = spawn_test_pipeline_stage(&mut guard, "sleep 10");
+            let anchor_pid = Pid::from_raw(
+                i32::try_from(guard.process_group_anchor.as_ref().unwrap().child.id()).unwrap(),
+            );
             drop(guard);
             assert!(kill(pid, None).is_err());
+            assert!(kill(anchor_pid, None).is_err());
         }
 
         #[test]
@@ -4549,14 +4650,67 @@ mod platform {
         }
 
         #[test]
-        fn anchor_ignores_foreground_terminal_signals_after_readiness() {
-            let anchor = ProcessGroupAnchor::spawn().unwrap();
+        fn anchor_ignores_interrupt_and_reports_terminal_stop() {
+            let mut anchor = ProcessGroupAnchor::spawn().unwrap();
             let process_group = Pid::from_raw(anchor.process_group());
             anchor.signal(Signal::SIGINT).unwrap();
+            assert!(!anchor.poll_stopped().unwrap());
             anchor.signal(Signal::SIGTSTP).unwrap();
-            thread::sleep(Duration::from_millis(10));
+            for _ in 0..1_000 {
+                if anchor.poll_stopped().unwrap() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(anchor.stopped);
             assert_eq!(getpgid(Some(process_group)), Ok(process_group));
+            anchor.signal(Signal::SIGCONT).unwrap();
+            for _ in 0..1_000 {
+                if !anchor.poll_stopped().unwrap() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!anchor.stopped);
             anchor.terminate_owned_group().unwrap();
+        }
+
+        #[test]
+        fn anchor_stop_sentinel_stops_guest_that_misses_ctrl_z() {
+            let ready_path = temporary_path("anchor-stop-sentinel");
+            let mut guard = PipelineConstructionGuard::new();
+            spawn_test_pipeline_stage(
+                &mut guard,
+                &format!(
+                    "trap '' TSTP; printf ready > {}; sleep 30",
+                    ready_path.display()
+                ),
+            );
+            for _ in 0..1_000 {
+                if ready_path.exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(ready_path.exists());
+
+            guard
+                .process_group_anchor
+                .as_ref()
+                .unwrap()
+                .signal(Signal::SIGTSTP)
+                .unwrap();
+            wait_for_foreground_children(
+                &mut guard.children,
+                &mut guard.process_group_anchor,
+                None,
+            )
+            .unwrap();
+            assert_eq!(guard.children[0].status, JobStatus::Stopped);
+            assert!(guard.process_group_anchor.as_ref().unwrap().stopped);
+
+            drop(guard);
+            fs::remove_file(ready_path).unwrap();
         }
 
         #[test]

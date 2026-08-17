@@ -666,14 +666,15 @@ impl PtySession {
                 }
                 Ok(written) => offset = offset.saturating_add(written),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "timed out writing PTY input",
                         )
                         .into());
                     }
-                    self.poll_master(PollFlags::POLLOUT, Duration::from_millis(50))?;
+                    self.poll_master(PollFlags::POLLOUT, remaining.min(Duration::from_millis(50)))?;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -748,9 +749,10 @@ impl PtySession {
             }
             chunk.extend_from_slice(&buffer[..read]);
             self.output.extend_from_slice(&buffer[..read]);
-            for reply in self.screen.feed(&buffer[..read]) {
-                self.send_until(&reply, deadline)?;
-            }
+            let replies = self.screen.feed(&buffer[..read]);
+            send_terminal_replies(replies, self.timeout, Instant::now, |reply, deadline| {
+                self.send_until(reply, deadline)
+            })?;
         }
         Ok(chunk)
     }
@@ -968,6 +970,19 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+fn send_terminal_replies<E>(
+    replies: impl IntoIterator<Item = Vec<u8>>,
+    send_timeout: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut send_until: impl FnMut(&[u8], Instant) -> Result<(), E>,
+) -> Result<(), E> {
+    for reply in replies {
+        let deadline = now() + send_timeout;
+        send_until(&reply, deadline)?;
+    }
+    Ok(())
+}
+
 fn wait_status_code(status: WaitStatus) -> i32 {
     match status {
         WaitStatus::Exited(_, code) => code,
@@ -1092,10 +1107,35 @@ mod tests {
     }
 
     #[test]
-    fn expired_reply_deadline_does_not_restart_the_session_timeout() {
+    fn cursor_reply_discovered_at_drain_deadline_gets_an_independent_send_deadline() {
+        let mut screen = VirtualScreen::new(8, 40, 7).unwrap();
+        let replies = screen.feed(b"\x1b[6n");
+        let drain_deadline = Instant::now();
+        let send_timeout = Duration::from_millis(250);
+        let mut observed = Vec::new();
+
+        send_terminal_replies(
+            replies,
+            send_timeout,
+            || drain_deadline,
+            |reply, deadline| {
+                observed.push((reply.to_vec(), deadline));
+                Ok::<(), io::Error>(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].0, b"\x1b[8;1R");
+        assert_eq!(observed[0].1.duration_since(drain_deadline), send_timeout);
+    }
+
+    #[test]
+    fn blocked_terminal_reply_times_out_at_the_configured_send_bound() {
         let directory = test_directory("pty-reply-deadline");
+        let send_timeout = Duration::from_millis(100);
         let mut options = SpawnOptions::new(
-            ["/bin/sh", "-c", "sleep 30"]
+            ["/bin/sh", "-c", "stty raw -echo; printf READY; sleep 30"]
                 .into_iter()
                 .map(OsString::from)
                 .collect(),
@@ -1104,14 +1144,33 @@ mod tests {
         options
             .environment
             .insert("PATH".into(), "/usr/bin:/bin".into());
+        options.timeout = send_timeout;
         let mut session = PtySession::spawn(options).unwrap();
+        session.wait_for(b"READY").unwrap();
+        let input = [b'x'; 4_096];
+        let mut written = 0_usize;
+        loop {
+            assert!(
+                written < 16 * 1024 * 1024,
+                "PTY input did not become blocked"
+            );
+            let master = session.master.as_mut().unwrap();
+            match master.write(&input) {
+                Ok(count) => written = written.saturating_add(count),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed while filling PTY input: {error}"),
+            }
+        }
+
         let started = Instant::now();
-        let error = session.send_until(b"reply", Instant::now()).unwrap_err();
+        let error = session.send(b"reply").unwrap_err();
+        let elapsed = started.elapsed();
         assert_eq!(
             error.downcast_ref::<io::Error>().map(io::Error::kind),
             Some(io::ErrorKind::TimedOut)
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(elapsed >= send_timeout);
+        assert!(elapsed < send_timeout + Duration::from_millis(250));
         session.close().unwrap();
         std::fs::remove_dir_all(directory).unwrap();
     }
