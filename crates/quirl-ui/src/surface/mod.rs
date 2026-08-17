@@ -6,6 +6,7 @@ pub(crate) mod highlight;
 mod overlay;
 mod runtime;
 mod statusbar;
+mod transcript;
 
 pub use degrade::{select_surface, SurfaceKind};
 pub use runtime::{
@@ -44,14 +45,15 @@ use self::{
     highlight::InputAnalyzer,
     overlay::{contextual_help_query, PickerLayout, PickerOverlay},
     runtime::RuntimeSurfaceState,
+    transcript::{TextPosition, Transcript, TranscriptLimits},
 };
 use super::{
-    read_history, ExtensionCompleter, PickerRanker, QuirlPrompt, SurfaceSymbols,
-    MAX_HISTORY_ENCODED_ENTRY_BYTES, MAX_HISTORY_ENTRY_BYTES, MAX_HISTORY_RETAINED_BYTES,
+    read_history, ExtensionCompleter, PickerRanker, QuirlPrompt, MAX_HISTORY_ENCODED_ENTRY_BYTES,
+    MAX_HISTORY_ENTRY_BYTES, MAX_HISTORY_RETAINED_BYTES,
 };
 use crate::theme::Theme;
 use crossterm::{
-    cursor::{MoveToColumn, SetCursorStyle, Show},
+    cursor::{SetCursorStyle, Show},
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
         KeyModifiers,
@@ -86,6 +88,9 @@ const HELP_DETAIL_SCROLL_MAX: u16 = 4_096;
 const RICH_TERMINAL_COLUMNS_MAX: u16 = 512;
 const RICH_TERMINAL_ROWS_MAX: u16 = 256;
 const HISTORY_REPLACEMENT_BYTES_MAX: usize = MAX_HISTORY_FILE_BYTES * 2;
+const TRANSCRIPT_LINES_MAX: usize = 50_000;
+const TRANSCRIPT_BYTES_MAX: usize = 16 * 1024 * 1024;
+const TRANSCRIPT_COPY_BYTES_MAX: usize = 1024 * 1024;
 #[cfg(test)]
 static HISTORY_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -140,7 +145,6 @@ pub struct RichSurface {
     input_analysis: InputAnalyzer,
     show_timings: bool,
     hints: bool,
-    transient: bool,
     completion_auto: bool,
     completion_min_chars: usize,
     semantic_hints: bool,
@@ -149,7 +153,12 @@ pub struct RichSurface {
     leader_active: bool,
     theme: Theme,
     runtime: RuntimeSurfaceState,
-    preserve_output_once: bool,
+    transcript: Transcript,
+    transcript_truncated: bool,
+    output_focus: bool,
+    output_cursor_line: usize,
+    output_anchor_line: Option<usize>,
+    output_notice: Option<String>,
     intent_completion: IntentCompletionState,
 }
 
@@ -187,7 +196,6 @@ impl RichSurface {
             input_analysis,
             show_timings: env::var("QUIRL_UI_TIMINGS").is_ok_and(|value| value == "1"),
             hints: config.ui.statusline.hints,
-            transient: config.prompt.transient,
             completion_auto: config.completion.auto,
             completion_min_chars: usize::from(config.completion.min_chars),
             semantic_hints: config.editor.semantic_hints,
@@ -196,7 +204,15 @@ impl RichSurface {
             leader_active: false,
             theme,
             runtime: RuntimeSurfaceState::new(),
-            preserve_output_once: false,
+            transcript: Transcript::new(TranscriptLimits {
+                line_count_max: TRANSCRIPT_LINES_MAX,
+                retained_bytes_max: TRANSCRIPT_BYTES_MAX,
+            }),
+            transcript_truncated: false,
+            output_focus: false,
+            output_cursor_line: 0,
+            output_anchor_line: None,
+            output_notice: None,
             intent_completion: IntentCompletionState::default(),
         })
     }
@@ -233,7 +249,6 @@ impl RichSurface {
             input_analysis: InputAnalyzer::unpublished(),
             show_timings: env::var("QUIRL_UI_TIMINGS").is_ok_and(|value| value == "1"),
             hints: config.ui.statusline.hints,
-            transient: config.prompt.transient,
             completion_auto: config.completion.auto,
             completion_min_chars: usize::from(config.completion.min_chars),
             semantic_hints: config.editor.semantic_hints,
@@ -242,14 +257,78 @@ impl RichSurface {
             leader_active: false,
             theme,
             runtime: RuntimeSurfaceState::new(),
-            preserve_output_once: false,
+            transcript: Transcript::new(TranscriptLimits {
+                line_count_max: TRANSCRIPT_LINES_MAX,
+                retained_bytes_max: TRANSCRIPT_BYTES_MAX,
+            }),
+            transcript_truncated: false,
+            output_focus: false,
+            output_cursor_line: 0,
+            output_anchor_line: None,
+            output_notice: None,
             intent_completion: IntentCompletionState::default(),
         })
+    }
+
+    /// Append one completed command and its bounded captured output to the session viewport.
+    ///
+    /// Invalid UTF-8 is replaced, terminal controls are rendered visibly, and retention is
+    /// limited to 50,000 logical lines and 16 MiB. The viewport follows new output unless the
+    /// user has explicitly scrolled away from the tail.
+    pub fn append_transcript(
+        &mut self,
+        command: &str,
+        stdout: &[u8],
+        stderr: &[u8],
+        status: i32,
+        duration: Duration,
+    ) -> Result<(), ShellError> {
+        self.append_transcript_line(&format!("❯ {}", quirl_core::escape_terminal_line(command)));
+        self.append_transcript_bytes(stdout);
+        self.append_transcript_bytes(stderr);
+        if stdout.is_empty() && stderr.is_empty() {
+            self.append_transcript_line("(no output)");
+        }
+        self.append_transcript_line(&format!("── exit {status} · {}ms ──", duration.as_millis()));
+        self.output_cursor_line = self.transcript.line_count().saturating_sub(1);
+        self.output_notice =
+            Some("result kept in viewport · PageUp/PageDown scroll · Alt-Q O copy".to_owned());
+        Ok(())
+    }
+
+    fn append_transcript_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        let mut lines = text.split('\n').peekable();
+        while let Some(line) = lines.next() {
+            if line.is_empty() && lines.peek().is_none() && text.ends_with('\n') {
+                break;
+            }
+            self.append_transcript_line(line.trim_end_matches('\r'));
+        }
+    }
+
+    fn append_transcript_line(&mut self, line: &str) {
+        let safe = quirl_core::escape_terminal_line(line);
+        let outcome = self.transcript.append_line(&safe);
+        self.transcript_truncated |= outcome.evicted_line_count > 0
+            || outcome.evicted_bytes > 0
+            || outcome.truncated_prefix_bytes > 0;
     }
 
     /// Return the complete catalog after deferred admission has succeeded.
     pub fn published_catalog(&self) -> Option<Arc<Catalog>> {
         self.catalog.as_ref().map(Arc::clone)
+    }
+
+    /// Replace catalog-backed analysis and completion without restarting the rich session.
+    pub fn replace_catalog(&mut self, catalog: Arc<Catalog>) {
+        self.completion.replace_catalog(Arc::clone(&catalog));
+        self.input_analysis.replace_catalog(Arc::clone(&catalog));
+        self.catalog = Some(catalog);
+        self.dismiss_picker();
     }
 
     fn admit_catalog(&mut self) -> Result<(), ShellError> {
@@ -281,11 +360,6 @@ impl RichSurface {
     /// Replace the next editor and fuzzy picker history with a bounded snapshot.
     pub fn install_history_snapshot(&mut self, history: Vec<InteractiveHistoryEntry>) {
         self.history = history;
-    }
-
-    /// Keep the main-screen command output visible until the user's next input event.
-    pub fn preserve_output_once(&mut self) {
-        self.preserve_output_once = true;
     }
 
     /// Install the bounded local intent-search provider used by AI mode.
@@ -328,14 +402,6 @@ impl RichSurface {
                 .collect(),
         );
         let symbols = prompt.surface_symbols();
-        let mut prefetched_event = if std::mem::take(&mut self.preserve_output_once) {
-            Some(
-                self.terminal
-                    .wait_for_resume_event(symbols.uses_unicode())?,
-            )
-        } else {
-            None
-        };
         self.terminal.enter()?;
         let unicode = symbols.uses_unicode();
         let color = std::io::stderr().is_terminal()
@@ -387,6 +453,10 @@ impl RichSurface {
                     picker_preview: self.picker_preview,
                     detail_scroll: self.help_detail_scroll,
                     runtime: &self.runtime,
+                    transcript: Some(&self.transcript),
+                    transcript_truncated: self.transcript_truncated,
+                    output_focus: self.output_focus,
+                    output_notice: self.output_notice.as_deref(),
                 };
                 let started = Instant::now();
                 self.terminal.draw(&model)?;
@@ -428,14 +498,10 @@ impl RichSurface {
                 dirty = true;
                 continue;
             }
-            let input_event = if let Some(input_event) = prefetched_event.take() {
-                input_event
-            } else {
-                if !event::poll(EVENT_POLL).map_err(terminal_error("poll terminal input"))? {
-                    continue;
-                }
-                event::read().map_err(terminal_error("read terminal input"))?
-            };
+            if !event::poll(EVENT_POLL).map_err(terminal_error("poll terminal input"))? {
+                continue;
+            }
+            let input_event = event::read().map_err(terminal_error("read terminal input"))?;
             if self.semantic_hints && !prompt_prepared {
                 // The empty first frame cannot use PATH discovery. Start the
                 // bounded worker when input first arrives, then publish only a
@@ -446,6 +512,7 @@ impl RichSurface {
             dirty = true;
             match input_event {
                 Event::Paste(text) => {
+                    self.output_notice = None;
                     if self.picker.active() {
                         self.update_picker_query(|picker| picker.insert_query(&text));
                         continue;
@@ -456,6 +523,11 @@ impl RichSurface {
                 }
                 Event::Resize(_, _) => continue,
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if self.output_focus {
+                        self.handle_output_key(key.code)?;
+                        continue;
+                    }
+                    self.output_notice = None;
                     if self.leader_active {
                         self.handle_leader_key(key.code, prompt, editor.buffer(), editor.cursor())?;
                         continue;
@@ -472,6 +544,24 @@ impl RichSurface {
                             self.open_context_help(editor.buffer(), editor.cursor());
                         }
                         continue;
+                    }
+                    match key.code {
+                        KeyCode::PageUp if self.transcript.line_count() > 0 => {
+                            self.transcript.page_up(self.transcript_visible_rows());
+                            continue;
+                        }
+                        KeyCode::PageDown if self.transcript.line_count() > 0 => {
+                            self.transcript.page_down(self.transcript_visible_rows());
+                            continue;
+                        }
+                        KeyCode::End
+                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                && self.transcript.line_count() > 0 =>
+                        {
+                            self.transcript.scroll_to_end();
+                            continue;
+                        }
+                        _ => {}
                     }
                     if self.picker.active() {
                         match key.code {
@@ -606,14 +696,11 @@ impl RichSurface {
                             if !buffer.trim().is_empty() {
                                 self.append_history(&buffer)?;
                             }
-                            let transient = self
-                                .transient
-                                .then(|| transient_line(prompt.mode, &buffer, symbols));
-                            self.terminal.release(transient)?;
+                            self.terminal.pause_for_execution()?;
                             return Ok(InteractiveSignal::Success(buffer));
                         }
                         EditAction::Eof if editor.buffer().is_empty() => {
-                            self.terminal.release(None)?;
+                            self.terminal.release()?;
                             return Ok(InteractiveSignal::CtrlD);
                         }
                         EditAction::Eof => {
@@ -622,7 +709,6 @@ impl RichSurface {
                         EditAction::Cancel => {
                             editor.clear();
                             self.dismiss_picker();
-                            self.terminal.release(None)?;
                             return Ok(InteractiveSignal::CtrlC);
                         }
                         EditAction::ToggleGrammarMode => {
@@ -661,7 +747,7 @@ impl RichSurface {
                                 .map_err(terminal_error("clear the terminal"))?;
                         }
                         EditAction::Suspend => {
-                            self.terminal.release(None)?;
+                            self.terminal.release()?;
                             return Ok(InteractiveSignal::Suspend);
                         }
                         action => {
@@ -704,6 +790,7 @@ impl RichSurface {
             ("c", "Directories", "Find a directory"),
             ("j", "Jobs", "Inspect background jobs"),
             ("r", "Results", "Inspect recent typed data"),
+            ("o", "Output", "Scroll and copy retained command output"),
         ];
         let items = entries
             .into_iter()
@@ -762,8 +849,130 @@ impl RichSurface {
             KeyCode::Char('r') => {
                 self.open_picker(editor::PickerKind::Data, line, cursor, "results")
             }
+            KeyCode::Char('o') if self.transcript.line_count() > 0 => self.open_output_focus(),
             _ => {}
         }
+        Ok(())
+    }
+
+    fn transcript_visible_rows(&self) -> usize {
+        let rows = terminal::size().map_or(24, |(_, rows)| rows);
+        usize::from(rows.saturating_sub(4).max(1))
+    }
+
+    fn open_output_focus(&mut self) {
+        self.output_focus = true;
+        self.output_notice = None;
+        self.output_cursor_line = self.transcript.line_count().saturating_sub(1);
+        self.output_anchor_line = Some(self.output_cursor_line);
+        self.select_output_range();
+    }
+
+    fn handle_output_key(&mut self, key: KeyCode) -> Result<(), ShellError> {
+        let visible_rows = self.transcript_visible_rows();
+        match key {
+            KeyCode::Esc => {
+                self.output_focus = false;
+                self.output_anchor_line = None;
+                self.transcript.clear_selection();
+            }
+            KeyCode::Up => {
+                self.output_cursor_line = self.output_cursor_line.saturating_sub(1);
+                self.select_output_range();
+            }
+            KeyCode::Down => {
+                self.output_cursor_line = self
+                    .output_cursor_line
+                    .saturating_add(1)
+                    .min(self.transcript.line_count().saturating_sub(1));
+                self.select_output_range();
+            }
+            KeyCode::PageUp => {
+                self.transcript.page_up(visible_rows);
+                self.output_cursor_line = self.transcript.visible_range(visible_rows).start;
+                self.select_output_range();
+            }
+            KeyCode::PageDown => {
+                self.transcript.page_down(visible_rows);
+                self.output_cursor_line = self
+                    .transcript
+                    .visible_range(visible_rows)
+                    .end
+                    .saturating_sub(1);
+                self.select_output_range();
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                while self.transcript.page_up(visible_rows) {}
+                self.output_cursor_line = 0;
+                self.select_output_range();
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.transcript.scroll_to_end();
+                self.output_cursor_line = self.transcript.line_count().saturating_sub(1);
+                self.select_output_range();
+            }
+            KeyCode::Char('v') => {
+                self.output_anchor_line = Some(self.output_cursor_line);
+                self.select_output_range();
+            }
+            KeyCode::Char('y') => self.copy_output_selection()?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn select_output_range(&mut self) {
+        let Some(anchor_line) = self.output_anchor_line else {
+            return;
+        };
+        let anchor_offset = self.transcript.line(anchor_line).map_or(0, str::len);
+        let cursor_offset = self
+            .transcript
+            .line(self.output_cursor_line)
+            .map_or(0, str::len);
+        self.transcript.begin_selection(TextPosition {
+            line_index: anchor_line,
+            byte_offset: if anchor_line <= self.output_cursor_line {
+                0
+            } else {
+                anchor_offset
+            },
+        });
+        self.transcript.update_selection(TextPosition {
+            line_index: self.output_cursor_line,
+            byte_offset: if self.output_cursor_line >= anchor_line {
+                cursor_offset
+            } else {
+                0
+            },
+        });
+    }
+
+    fn copy_output_selection(&mut self) -> Result<(), ShellError> {
+        let text = match self
+            .transcript
+            .selected_text_bounded(TRANSCRIPT_COPY_BYTES_MAX)
+        {
+            Ok(Some(text)) => text,
+            Ok(None) => return Ok(()),
+            Err(observed_bytes) => {
+                self.output_notice = Some(format!(
+                    "selection is {observed_bytes} bytes; copy limit is {TRANSCRIPT_COPY_BYTES_MAX}"
+                ));
+                return Ok(());
+            }
+        };
+        if let Err(error) = self.terminal.copy_to_clipboard(&text) {
+            self.output_notice = Some(format!("copy failed: {}", error.message));
+            return Ok(());
+        }
+        self.output_notice = Some(format!(
+            "copied {} bytes via terminal clipboard",
+            text.len()
+        ));
+        self.output_focus = false;
+        self.output_anchor_line = None;
+        self.transcript.clear_selection();
         Ok(())
     }
 
@@ -1001,73 +1210,25 @@ impl Drop for RichSurface {
 #[derive(Default)]
 struct SurfaceTerminal {
     terminal: Option<Terminal<CrosstermBackend<io::Stderr>>>,
+    last_size: Option<(u16, u16)>,
     alternate_screen: bool,
+    input_active: bool,
     active: bool,
 }
 
 impl SurfaceTerminal {
-    fn wait_for_resume_event(&mut self, unicode: bool) -> Result<Event, ShellError> {
-        let size = terminal::size().map_err(terminal_error("measure the interactive terminal"))?;
-        validate_rich_terminal_size(size)?;
-        terminal::enable_raw_mode().map_err(terminal_error("enable terminal raw mode"))?;
-        self.active = true;
-        let message = match (unicode, size.0) {
-            (true, 72..) => "  ── result kept ──  type to continue  │  ↑ history  │  Alt-Q Quirl",
-            (false, 72..) => "  -- result kept --  type to continue  |  Up history  |  Alt-Q Quirl",
-            (true, 36..) => "  ── result kept ──  type to continue",
-            (false, 36..) => "  -- result kept --  type to continue",
-            (true, _) => "  ── result kept ──",
-            (false, _) => "  -- result kept --",
-        };
-        if let Err(error) = execute!(
-            io::stderr(),
-            EnableBracketedPaste,
-            SetCursorStyle::SteadyBar,
-            Print("\r\n"),
-            terminal::Clear(ClearType::CurrentLine),
-            Print(message)
-        ) {
-            self.reset_best_effort();
-            return Err(terminal_error("draw the retained-output bar")(error));
-        }
-        let input_event = loop {
-            match event::read().map_err(terminal_error("read terminal input")) {
-                Ok(Event::Resize(_, _)) => continue,
-                Ok(input_event) => break input_event,
-                Err(error) => {
-                    self.reset_best_effort();
-                    return Err(error);
-                }
-            }
-        };
-        let mut failure = None;
-        if let Err(error) = execute!(
-            io::stderr(),
-            MoveToColumn(0),
-            terminal::Clear(ClearType::CurrentLine),
-            DisableBracketedPaste,
-            SetCursorStyle::DefaultUserShape
-        ) {
-            retain_error(
-                &mut failure,
-                terminal_error("clear the retained-output bar")(error),
-            );
-        }
-        if let Err(error) = terminal::disable_raw_mode() {
-            retain_error(
-                &mut failure,
-                terminal_error("restore cooked terminal mode")(error),
-            );
-        }
-        self.finish_release(failure)?;
-        Ok(input_event)
-    }
-
     fn enter(&mut self) -> Result<(), ShellError> {
+        if self.active {
+            if !self.input_active {
+                self.resume_input()?;
+            }
+            return Ok(());
+        }
         let size = terminal::size().map_err(terminal_error("measure the interactive terminal"))?;
         validate_rich_terminal_size(size)?;
         terminal::enable_raw_mode().map_err(terminal_error("enable terminal raw mode"))?;
         self.active = true;
+        self.input_active = true;
         if let Err(error) = execute!(io::stderr(), EnterAlternateScreen) {
             self.reset_best_effort();
             return Err(terminal_error("enter the alternate terminal screen")(error));
@@ -1102,6 +1263,57 @@ impl SurfaceTerminal {
             return Err(terminal_error("hide the software cursor")(error));
         }
         self.terminal = Some(terminal);
+        self.last_size = Some(size);
+        Ok(())
+    }
+
+    fn resume_input(&mut self) -> Result<(), ShellError> {
+        debug_assert!(self.active, "only an owned rich terminal can resume input");
+        debug_assert!(
+            self.alternate_screen,
+            "rich input requires the alternate screen"
+        );
+        terminal::enable_raw_mode().map_err(terminal_error("enable terminal raw mode"))?;
+        if let Err(error) = execute!(
+            io::stderr(),
+            EnableBracketedPaste,
+            SetCursorStyle::SteadyBar
+        ) {
+            self.reset_best_effort();
+            return Err(terminal_error("restore terminal input features")(error));
+        }
+        self.input_active = true;
+        Ok(())
+    }
+
+    fn pause_for_execution(&mut self) -> Result<(), ShellError> {
+        debug_assert!(
+            self.active,
+            "accepted input requires an owned rich terminal"
+        );
+        let mut failure = None;
+        if let Err(error) = execute!(
+            io::stderr(),
+            Show,
+            DisableBracketedPaste,
+            SetCursorStyle::DefaultUserShape
+        ) {
+            retain_error(
+                &mut failure,
+                terminal_error("pause terminal input features")(error),
+            );
+        }
+        if let Err(error) = terminal::disable_raw_mode() {
+            retain_error(
+                &mut failure,
+                terminal_error("restore cooked terminal mode for command execution")(error),
+            );
+        }
+        if failure.is_some() {
+            self.reset_best_effort();
+            return failure.map_or(Ok(()), Err);
+        }
+        self.input_active = false;
         Ok(())
     }
 
@@ -1124,11 +1336,17 @@ impl SurfaceTerminal {
                 .with_help("Retry with ui.surface = \"simple\"")
         })?;
         let area = Rect::new(0, 0, size.0, size.1);
-        if terminal.get_frame().area() != area {
-            if let Err(error) = terminal.resize(area) {
-                self.reset_best_effort();
-                return Err(terminal_error("resize the interactive frame")(error));
-            }
+        if self.last_size != Some(size) {
+            let backend = CrosstermBackend::new(io::stderr());
+            let replacement = Terminal::with_options(
+                backend,
+                TerminalOptions {
+                    viewport: Viewport::Fixed(area),
+                },
+            )
+            .map_err(terminal_error("recreate the resized interactive frame"))?;
+            *terminal = replacement;
+            self.last_size = Some(size);
         }
         let result = terminal.draw(|frame| model.render(frame)).map(|_| ());
         if let Err(error) = result {
@@ -1138,7 +1356,14 @@ impl SurfaceTerminal {
         Ok(())
     }
 
-    fn release(&mut self, transient: Option<String>) -> Result<(), ShellError> {
+    fn copy_to_clipboard(&mut self, text: &str) -> Result<(), ShellError> {
+        debug_assert!(text.len() <= TRANSCRIPT_COPY_BYTES_MAX);
+        let payload = encode_base64(text.as_bytes());
+        execute!(io::stderr(), Print(format!("\u{1b}]52;c;{payload}\u{7}")))
+            .map_err(terminal_error("copy the output selection through OSC 52"))
+    }
+
+    fn release(&mut self) -> Result<(), ShellError> {
         let mut failure = None;
         if let Some(mut terminal) = self.terminal.take() {
             if let Err(error) = terminal.show_cursor() {
@@ -1174,19 +1399,7 @@ impl SurfaceTerminal {
                 terminal_error("restore cooked terminal mode")(error),
             );
         }
-        if let Some(line) = transient.filter(|_| !self.alternate_screen) {
-            let mut stderr = io::stderr();
-            if let Err(error) = stderr
-                .write_all(line.as_bytes())
-                .and_then(|()| stderr.write_all(b"\r\n"))
-                .and_then(|()| stderr.flush())
-            {
-                retain_error(
-                    &mut failure,
-                    terminal_error("commit the transient prompt to scrollback")(error),
-                );
-            }
-        }
+        self.input_active = false;
         self.finish_release(failure)
     }
 
@@ -1214,6 +1427,8 @@ impl SurfaceTerminal {
         }
         let _ = terminal::disable_raw_mode();
         self.alternate_screen = false;
+        self.last_size = None;
+        self.input_active = false;
         self.active = false;
     }
 }
@@ -1230,6 +1445,32 @@ fn retain_error(slot: &mut Option<ShellError>, error: ShellError) {
     if slot.is_none() {
         *slot = Some(error);
     }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let output_len = bytes.len().saturating_add(2) / 3 * 4;
+    let mut encoded = String::with_capacity(output_len);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
+        encoded.push(char::from(
+            ALPHABET[usize::from(((first & 0x03) << 4) | (second >> 4))],
+        ));
+        encoded.push(if chunk.len() >= 2 {
+            char::from(ALPHABET[usize::from(((second & 0x0f) << 2) | (third >> 6))])
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() == 3 {
+            char::from(ALPHABET[usize::from(third & 0x3f)])
+        } else {
+            '='
+        });
+    }
+    encoded
 }
 
 fn validate_rich_terminal_size((columns, rows): (u16, u16)) -> Result<(), ShellError> {
@@ -1536,14 +1777,6 @@ fn terminal_error(action: &'static str) -> impl Fn(io::Error) -> ShellError {
                 "Retry with ui.surface = \"simple\" if the terminal lacks full-screen UI support",
             )
     }
-}
-
-fn transient_line(mode: Mode, buffer: &str, symbols: SurfaceSymbols) -> String {
-    format!(
-        "{}{}",
-        symbols.input_indicator(mode),
-        quirl_core::escape_terminal_line(buffer)
-    )
 }
 
 fn input_is_incomplete(buffer: &str, mode: Mode) -> bool {
@@ -1881,7 +2114,9 @@ mod tests {
     fn failed_explicit_release_keeps_drop_cleanup_armed() {
         let mut terminal = SurfaceTerminal {
             terminal: None,
+            last_size: None,
             alternate_screen: true,
+            input_active: false,
             active: true,
         };
         let failure = ShellError::new(ErrorCode::Io, "injected terminal cleanup failure")
@@ -1894,6 +2129,47 @@ mod tests {
         terminal.alternate_screen = false;
         assert!(terminal.finish_release(None).is_ok());
         assert!(!terminal.active);
+    }
+
+    #[test]
+    fn transcript_append_preserves_blank_lines_and_escapes_controls() {
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+
+        surface
+            .append_transcript(
+                "printf test",
+                b"first\n\nlast\x1b[2J\n",
+                b"warning\n",
+                7,
+                Duration::from_millis(12),
+            )
+            .unwrap();
+
+        let lines = (0..surface.transcript.line_count())
+            .map(|index| surface.transcript.line(index).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(lines[0], "❯ printf test");
+        assert_eq!(lines[1], "first");
+        assert_eq!(lines[2], "");
+        assert_eq!(lines[3], "last\\u{1b}[2J");
+        assert_eq!(lines[4], "warning");
+        assert_eq!(lines[5], "── exit 7 · 12ms ──");
+    }
+
+    #[test]
+    fn osc52_payload_encoder_matches_standard_base64_vectors() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64("💚".as_bytes()), "8J+Smg==");
     }
 
     #[test]

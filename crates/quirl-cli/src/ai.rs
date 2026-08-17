@@ -217,22 +217,30 @@ pub(crate) fn present_results(
     match format {
         AiOutputFormat::Json => print_json(results),
         AiOutputFormat::Text => {
-            for result in results {
-                println!(
-                    "{:<36} {:>6.3}  {}{}",
-                    escape_terminal_controls(&result.target),
-                    result.score,
-                    if result.semantic {
-                        "semantic · "
-                    } else {
-                        "lexical · "
-                    },
-                    escape_terminal_controls(&result.kind)
-                );
-            }
+            print!("{}", render_results_text(results));
             Ok(())
         }
     }
+}
+
+pub(crate) fn render_results_text(results: &[intelligence::SearchResult]) -> String {
+    let mut rendered = String::new();
+    for result in results {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            rendered,
+            "{:<36} {:>6.3}  {}{}",
+            escape_terminal_controls(&result.target),
+            result.score,
+            if result.semantic {
+                "semantic · "
+            } else {
+                "lexical · "
+            },
+            escape_terminal_controls(&result.kind)
+        );
+    }
+    rendered
 }
 
 fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<(), ShellError> {

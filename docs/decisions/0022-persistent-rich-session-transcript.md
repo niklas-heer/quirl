@@ -1,0 +1,184 @@
+# ADR 0022: The rich surface owns a persistent session transcript
+
+- Status: Accepted
+- Date: 2026-08-17
+- Supersedes in part: [ADR 0012](0012-ratatui-interactive-surface.md)
+- Extends: [ADR 0016](0016-runtime-layering-contract.md), [ADR 0017](0017-shared-execution-contract.md), [ADR 0020](0020-owned-unix-process-group-anchor.md)
+
+## Context
+
+ADR 0012 made Ratatui the capable-TTY default, but coupled that decision to a
+per-command terminal lifecycle: accept input, leave the alternate screen, let
+the child write to the normal screen, then reconstruct the rich editor. That
+preserves native terminal scrollback, but it also makes the shell visibly
+switch between a full-screen IDE and a line-oriented terminal after every
+command. A status bar cannot remain on the physical bottom row, and completion,
+history, and result inspection do not feel like one continuous session.
+
+A persistent full-screen surface cannot rely on the host terminal's normal
+scrollback. Quirl must instead own a bounded transcript viewport, scrolling,
+selection, and copying. It must also distinguish three execution domains that a
+classic shell normally presents through the same terminal:
+
+1. ordinary foreground commands that can run without interactive terminal
+   input and whose stdout and stderr can be captured;
+2. background jobs whose lifetime extends beyond the accepted-command turn
+   and whose inherited output could corrupt a later rich frame; and
+3. interactive terminal applications such as `vim`, `less`, `top`, and REPLs,
+   which require a PTY, terminal-mode negotiation, resize propagation, signal
+   routing, and a VT screen model.
+
+Treating the third domain as ordinary captured text would be incorrect. It
+would break terminal queries, cursor addressing, job-control input, and
+alternate-screen semantics. Implementing an embedded terminal is a separate
+security, lifecycle, and resource-management project.
+
+Research into OpenCode informed this separation: its persistent
+[TUI renderer](https://github.com/anomalyco/opencode/blob/65c35977bd564e23c0e9cf124b3e3e3b9308e9e8/packages/tui/src/app.tsx#L186-L213)
+receives ordinary
+[captured shell results](https://github.com/anomalyco/opencode/blob/65c35977bd564e23c0e9cf124b3e3e3b9308e9e8/packages/opencode/src/session/prompt.ts#L451-L589),
+while terminal selection is retained as
+[application-owned state](https://github.com/anomalyco/opentui/blob/4067477dd89b554641753dcfbc5e506f61bdd52f/packages/core/src/lib/selection.ts#L5-L135).
+Quirl adopts the architectural boundary, not OpenCode's runtime or
+implementation.
+
+## Decision
+
+The capable-TTY rich surface is one persistent alternate-screen session. It
+owns the prompt, overlays, status bar, and an in-memory transcript for the life
+of the interactive Quirl process. Accepting an ordinary foreground command
+does not leave the alternate screen and does not allow the child to inherit
+the rich surface's stdout or stderr. Commands that require an interactive
+terminal remain outside this stage and should use the simple surface.
+
+ADR 0012 remains authoritative for rich/simple capability selection, editor
+behavior, configuration migration, accessibility fallback, and terminal
+restoration. This ADR supersedes only ADR 0012's per-command alternate-screen
+release, transient normal-screen prompt, and native-scrollback contracts.
+
+### Stage 1: completion-atomic ordinary foreground commands
+
+Stage 1 reuses the existing process owner and capture contract:
+
+- the rich surface selects `ExecutionOutputTarget::Capture` with
+  `DEFAULT_CAPTURE_BYTES`, currently 1 MiB for stdout and 1 MiB for stderr;
+- validation rejects a command graph containing a background pipeline before
+  it is spawned. The current background path deliberately does not capture its
+  streams, so allowing it while the rich renderer owns the alternate screen
+  would permit asynchronous child bytes to corrupt later frames;
+- `quirl-process` continues to own process groups, deadlines, cancellation,
+  exit status, draining, and reaping;
+- the CLI converts one completed outcome into one terminal-safe transcript
+  entry containing the accepted command, status, duration, stdout, stderr, or
+  a rendered structured error; and
+- the UI commits that entry atomically after execution completes. Stage 1 does
+  not claim live streaming, command input while a child runs, or preserved
+  stdout/stderr interleaving.
+
+Capture overflow remains `ErrorCode::ResourceLimit`. The process owner drains
+and reaps the child, and the transcript renders an actionable error with the
+configured and observed limits. Partial captured bytes are never presented as
+a complete successful result.
+
+Captured output crosses a terminal-text boundary before entering the
+transcript. The boundary accepts UTF-8 text plus the supported line controls,
+filters unsupported control sequences, and records truncation or decoding
+loss explicitly. Stage 1 does not interpret arbitrary VT, OSC, or DCS streams.
+
+The simple/Reedline surface keeps inherited terminal execution, native
+scrollback, and background-job behavior. It remains the explicit compatibility
+path for workflows that need classic terminal ownership while rich background
+output and the embedded PTY design are incomplete.
+
+### Transcript and viewport invariants
+
+The transcript is UI-owned presentation state, not a second process log or a
+replacement for SQLite command history. It is not persisted across Quirl
+restarts. Its source records are immutable after commit, except for bounded
+eviction metadata.
+
+The following limits apply at the `quirl-ui` ownership boundary:
+
+- at most 16 MiB of terminal-safe transcript text;
+- at most 50,000 logical transcript lines; and
+- at most 1 MiB of text produced by one selection/copy operation.
+
+When either transcript limit would be exceeded, the UI evicts oldest complete
+logical lines first and exposes one bounded omission marker. It does not
+silently split UTF-8, relabel a partial result as complete, or evict the active
+prompt. Metadata retained for evicted lines remains bounded and must not
+contain the discarded output again.
+
+The viewport maintains a logical line offset independent of terminal-native
+scrollback. It follows the newest entry only while the user is at the bottom.
+Manual keyboard scrolling disables follow mode; new results do not
+move the viewport until the user returns to the bottom. Resize recomputes visual
+wrapping from retained logical text while preserving the nearest logical
+anchor. Only visible rows and bounded surrounding layout may be built for a
+frame.
+
+Selection is expressed in logical transcript coordinates and converted to
+screen cells during rendering. It survives repaint and scrolling while its
+retained source text exists. Dragging beyond the viewport may auto-scroll at a
+bounded rate. Copy emits plain semantic text without Ratatui styling and fails
+with an actionable resource-limit notice before allocating more than 1 MiB.
+Clipboard integration may use OSC 52 and platform fallbacks, but clipboard
+failure never destroys the selection or changes command status.
+
+### Interactive PTY applications are future work
+
+This ADR does not accept embedded interactive PTY support. A later ADR must
+define at least:
+
+- PTY creation, controlling-terminal ownership, session/process-group routing,
+  foreground signals, cancellation, and guaranteed reaping;
+- a bounded VT parser and cell/scrollback model, including OSC/DCS policy and
+  terminal-query replies;
+- input arbitration between Quirl leader commands and child terminal input;
+- resize ordering, replay/live-output ordering, selection, copy/paste, and
+  restoration after child exit or renderer failure; and
+- explicit byte, row, queue, event-turn, and wall-time limits with adversarial
+  tests.
+
+Until that decision lands, documentation and status text must not imply that
+the rich surface can faithfully embed arbitrary interactive applications.
+
+## Failure model and cleanup
+
+- **Child spawn or capture failure.** The process owner kills and reaps any
+  partially initialized process graph. The rich terminal guard stays active,
+  and the UI commits only the bounded rendered error.
+- **Background request.** Rich-mode validation returns an actionable error
+  before spawning or retaining a background process. The error points to the
+  simple surface; no child remains able to write across later rich frames.
+- **Capture overflow.** Both streams continue through the existing bounded
+  drain/cleanup path. The result is a resource-limit entry, never a successful
+  partial transcript entry.
+- **Transcript admission failure.** The UI prepares the bounded entry before
+  mutating visible state. Eviction and admission form one state transition; a
+  failure leaves the previous transcript intact and reports the admission
+  error in bounded status text.
+- **Resize during execution.** The observed resize invalidates the prepared
+  layout. Stage 1 applies it before drawing the completed result; it never
+  paints a frame prepared for an obsolete validated size.
+- **Copy or clipboard failure.** The selection remains available. Status text
+  reports the bounded failure without writing untrusted control sequences.
+- **Suspend, EOF, fatal render error, or normal exit.** The existing terminal
+  guard restores cooked mode, cursor state, bracketed paste,
+  and the main screen. Persistent session ownership does not weaken ADR 0012's
+  cleanup transaction.
+
+## Consequences
+
+- Ordinary command execution, results, IDE overlays, and the bottom status bar
+  remain in one full-screen visual session.
+- Quirl owns scroll, selection, and copy behavior on the rich path and must
+  test them as correctness features rather than terminal conveniences.
+- Stage 1 is deliberately less terminal-compatible than the simple surface:
+  it captures bounded noninteractive foreground output, rejects background
+  jobs, and does not claim embedded PTY behavior.
+- The transcript adds bounded memory and rendering work, but removes repeated
+  alternate-screen teardown/reconstruction from the ordinary foreground
+  command cycle.
+- Full interactive PTY support remains independently reviewable and cannot
+  enter by accidentally forwarding raw child bytes into Ratatui.

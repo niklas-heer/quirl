@@ -109,6 +109,12 @@ impl InputAnalyzer {
         self.cached_revision = None;
     }
 
+    pub fn replace_catalog(&mut self, catalog: Arc<Catalog>) {
+        self.catalog = Some(catalog);
+        self.cached_revision = None;
+        self.current = InputAnalysis::default();
+    }
+
     #[cfg(test)]
     pub(super) fn published_catalog(&self) -> Option<&Arc<Catalog>> {
         self.catalog.as_ref()

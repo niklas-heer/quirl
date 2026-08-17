@@ -5,6 +5,7 @@ use super::{
     overlay::PickerLayout,
     runtime::{RuntimeSurfaceState, PANEL_VISIBLE_ROWS_MAX},
     statusbar::StatusBarModel,
+    transcript::Transcript,
 };
 use crate::theme::Theme;
 use crate::SurfaceSymbols;
@@ -41,6 +42,10 @@ pub struct FrameModel<'a> {
     pub picker_preview: bool,
     pub detail_scroll: u16,
     pub runtime: &'a RuntimeSurfaceState,
+    pub transcript: Option<&'a Transcript>,
+    pub transcript_truncated: bool,
+    pub output_focus: bool,
+    pub output_notice: Option<&'a str>,
 }
 
 impl FrameModel<'_> {
@@ -98,6 +103,15 @@ impl FrameModel<'_> {
                 .diagnostic
                 .filter(|_| self.compact)
                 .map(|diagnostic| diagnostic.message.as_str())
+                .or(self.output_notice)
+                .or_else(|| {
+                    self.output_focus
+                        .then_some("OUTPUT · ↑↓ select · y copy · Esc return")
+                })
+                .or_else(|| {
+                    self.transcript_truncated
+                        .then_some("older output evicted · PageUp/PageDown scroll")
+                })
                 .or_else(|| self.runtime.notice())
                 .or_else(|| self.runtime.activity()),
             timings: self.timings,
@@ -171,7 +185,50 @@ impl FrameModel<'_> {
                     id,
                     panel,
                 );
+            } else if let Some(transcript) = self.transcript {
+                self.render_transcript(frame, area, transcript);
             }
+        }
+    }
+
+    fn render_transcript(&self, frame: &mut Frame<'_>, area: Rect, transcript: &Transcript) {
+        if area.height == 0 || transcript.line_count() == 0 {
+            return;
+        }
+        let visible_count = usize::from(area.height);
+        let visible = transcript.visible_range(visible_count);
+        let selection = transcript.selection_range();
+        let lines = visible
+            .clone()
+            .filter_map(|line_index| {
+                let text = transcript.line(line_index)?;
+                let selected = selection.is_some_and(|(start, end)| {
+                    line_index >= start.line_index && line_index <= end.line_index
+                });
+                let style = if selected {
+                    self.theme.selected(self.mode)
+                } else if text.starts_with('❯') {
+                    self.theme.accent(self.mode)
+                } else if text.starts_with("── exit ") {
+                    self.theme.dim()
+                } else {
+                    Default::default()
+                };
+                Some(Line::styled(escape_terminal_line(text), style))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(lines), area);
+        if transcript.line_count() > visible_count {
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some(if self.unicode { "│" } else { "|" }))
+                .thumb_symbol(if self.unicode { "█" } else { "#" })
+                .thumb_style(self.theme.accent(self.mode));
+            let mut state = ScrollbarState::new(transcript.line_count())
+                .position(visible.start)
+                .viewport_content_length(visible_count);
+            frame.render_stateful_widget(scrollbar, area, &mut state);
         }
     }
 
@@ -678,6 +735,10 @@ mod tests {
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
+                    transcript: None,
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: None,
                 }
                 .render(frame);
             })
@@ -739,6 +800,10 @@ mod tests {
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime,
+                    transcript: None,
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: None,
                 }
                 .render(frame);
             })
@@ -793,6 +858,10 @@ mod tests {
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
+                    transcript: None,
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: None,
                 }
                 .render(frame);
             })
@@ -849,6 +918,10 @@ mod tests {
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
+                    transcript: None,
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: None,
                 }
                 .render(frame);
             })
@@ -921,6 +994,10 @@ mod tests {
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
+                    transcript: None,
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: None,
                 }
                 .render(frame);
             })
@@ -1027,6 +1104,10 @@ mod tests {
             picker_preview: true,
             detail_scroll: 0,
             runtime: &runtime,
+            transcript: None,
+            transcript_truncated: false,
+            output_focus: false,
+            output_notice: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(78, 4)).unwrap();
         terminal.draw(|frame| model.render(frame)).unwrap();
@@ -1103,6 +1184,10 @@ mod tests {
             picker_preview: true,
             detail_scroll: 0,
             runtime: &runtime,
+            transcript: None,
+            transcript_truncated: false,
+            output_focus: false,
+            output_notice: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(78, 12)).unwrap();
         terminal.draw(|frame| model.render(frame)).unwrap();
@@ -1198,6 +1283,10 @@ mod tests {
                     picker_preview: false,
                     detail_scroll: 0,
                     runtime: &runtime,
+                    transcript: None,
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: None,
                 };
                 model.render(frame);
             })
@@ -1252,6 +1341,10 @@ mod tests {
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
+                    transcript: None,
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: None,
                 };
                 model.render(frame);
             })
@@ -1372,6 +1465,10 @@ mod tests {
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
+                    transcript: None,
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: None,
                 }
                 .render(frame);
             })

@@ -350,6 +350,12 @@ impl CompletionState {
         self.catalog = Some(catalog);
     }
 
+    pub fn replace_catalog(&mut self, catalog: Arc<Catalog>) {
+        self.cancel_for_edit();
+        self.worker = None;
+        self.catalog = Some(catalog);
+    }
+
     #[cfg(test)]
     pub(super) fn published_catalog(&self) -> Option<&Arc<Catalog>> {
         self.catalog.as_ref()

@@ -51,7 +51,7 @@ use quirl_data::{DataEnvelope, DataOutput, DataRenderFormat, DataRuntime};
 use quirl_lua::{sdk_json, sdk_lua, sdk_markdown, LuaPolicy, QuirlConfig, MAX_LUA_SOURCE_BYTES};
 use quirl_picker::{ItemKind, PickItem, Picker, MAX_PICKER_ITEMS};
 use quirl_process::{sandboxed_process_host, JobStatus, NativeExecutor, DEFAULT_CAPTURE_BYTES};
-use quirl_syntax::{classify, InteractiveLine, Mode};
+use quirl_syntax::{classify, parse_command_list, InteractiveLine, Mode};
 use quirl_ui::{
     editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
     terminal_supports_unicode, terminal_width, CatalogLoader, ExtensionCompleter,
@@ -606,6 +606,7 @@ fn run_exec_with_recovery(source: &str) -> Result<i32, ShellError> {
         Some(&extensions),
         ExecutionOutputMode::Capture,
     )
+    .map(|report| report.status)
 }
 
 fn execution_request(
@@ -987,6 +988,31 @@ fn preserve_execution_source(mut error: ShellError, source: &ExecutionSource) ->
 enum ExecutionOutputMode {
     Capture,
     Interactive,
+    RichViewport,
+}
+
+#[derive(Debug)]
+struct ExecutionReport {
+    status: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl ExecutionReport {
+    fn from_outcome(outcome: ExecutionOutcome) -> Self {
+        let status = outcome.status_code();
+        let (stdout, stderr) = match outcome.output {
+            ExecutionOutput::Bytes { stdout, stderr } => (stdout, stderr),
+            ExecutionOutput::Inherited
+            | ExecutionOutput::Value { .. }
+            | ExecutionOutput::Values { .. } => (Vec::new(), Vec::new()),
+        };
+        Self {
+            status,
+            stdout,
+            stderr,
+        }
+    }
 }
 
 fn execute_with_recovery(
@@ -995,7 +1021,7 @@ fn execute_with_recovery(
     source: &str,
     extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
     output_mode: ExecutionOutputMode,
-) -> Result<i32, ShellError> {
+) -> Result<ExecutionReport, ShellError> {
     let planned = match extensions {
         Some(extensions) => {
             let plan: Result<PlannedExecution, ShellError> = (|| {
@@ -1058,7 +1084,8 @@ fn execute_with_recovery(
     }
     let started = Instant::now();
     let renders_captured_output = output_mode == ExecutionOutputMode::Capture
-        || interactive_dialect_island(&source).is_some();
+        || (output_mode == ExecutionOutputMode::Interactive
+            && interactive_dialect_island(&source).is_some());
     match execute_command_or_dialect_island_with_extensions(
         executor,
         &source,
@@ -1114,7 +1141,7 @@ fn execute_with_recovery(
                 print_execution_outcome(&outcome)?;
             }
             print_extension_annotations(&annotations);
-            Ok(outcome.status_code())
+            Ok(ExecutionReport::from_outcome(outcome))
         }
         Err(error) => {
             let duration = started.elapsed();
@@ -1193,6 +1220,22 @@ fn execute_command_or_dialect_island_with_extensions(
     extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
     installed: Option<&extensions::InstalledPluginCommand>,
 ) -> Result<ExecutionOutcome, ShellError> {
+    if output_mode == ExecutionOutputMode::RichViewport
+        && installed.is_none()
+        && interactive_dialect_island(source).is_none()
+        && parse_command_list(source)
+            .map(|list| list.pipelines.iter().any(|pipeline| pipeline.background))
+            .unwrap_or(false)
+    {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "background commands are not available in the rich viewport",
+        )
+        .with_command(source)
+        .with_help(
+            "Set ui.surface = \"simple\" for background jobs until rich PTY-backed jobs are available",
+        ));
+    }
     let request = if let Some((language, body)) = interactive_dialect_island(source) {
         let mode = match language {
             ScriptLanguage::Bash => ExecutionMode::Bash,
@@ -1232,9 +1275,11 @@ fn execute_command_or_dialect_island_with_extensions(
         extensions.plugin_execution_request(installed, source, ExecutionInput::None)?
     } else {
         let target = match output_mode {
-            ExecutionOutputMode::Capture => ExecutionOutputTarget::Capture {
-                max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
-            },
+            ExecutionOutputMode::Capture | ExecutionOutputMode::RichViewport => {
+                ExecutionOutputTarget::Capture {
+                    max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
+                }
+            }
             ExecutionOutputMode::Interactive => ExecutionOutputTarget::Inherit,
         };
         execution_request(
@@ -1453,6 +1498,7 @@ fn truncate_utf8_owned(mut value: String, bytes_max: usize) -> String {
 fn execute_interactive_data(
     source: &str,
     cache: &mut InteractiveDataCache,
+    writer: &mut impl Write,
 ) -> Result<(ExecutionOutcome, u64), ShellError> {
     let signals = InteractiveSignalCancellation::install()?;
     let request = execution_request(
@@ -1471,8 +1517,7 @@ fn execute_interactive_data(
         let output = DataRuntime::with_process_host(sandboxed_process_host())
             .eval_output_with_cancellation_handle(plan.source().text(), Arc::clone(&cancelled))?;
         let mut stage = cache.stage();
-        let mut stdout = io::stdout().lock();
-        let bytes = render_interactive_data_output(output, &cancelled, &mut stdout, &mut stage)?;
+        let bytes = render_interactive_data_output(output, &cancelled, writer, &mut stage)?;
         let outcome = ExecutionOutcome::new(
             ExecutionStatus::Exited(0),
             ExecutionOutput::Inherited,
@@ -1486,6 +1531,53 @@ fn execute_interactive_data(
     plan.ensure_active("before interactive data cache commit")?;
     cache.commit(stage);
     Ok((outcome, bytes))
+}
+
+const INTERACTIVE_TRANSCRIPT_OUTPUT_BYTES_MAX: usize = DEFAULT_CAPTURE_BYTES;
+
+struct BoundedTranscriptWriter {
+    bytes: Vec<u8>,
+    discarded_bytes: u64,
+}
+
+impl BoundedTranscriptWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::with_capacity(INTERACTIVE_TRANSCRIPT_OUTPUT_BYTES_MAX),
+            discarded_bytes: 0,
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.discarded_bytes > 0 {
+            let marker = format!(
+                "\n… output truncated after {INTERACTIVE_TRANSCRIPT_OUTPUT_BYTES_MAX} bytes; discarded {} bytes …\n",
+                self.discarded_bytes
+            );
+            let marker = marker.as_bytes();
+            let retained_bytes =
+                INTERACTIVE_TRANSCRIPT_OUTPUT_BYTES_MAX.saturating_sub(marker.len());
+            self.bytes.truncate(retained_bytes);
+            self.bytes.extend_from_slice(marker);
+        }
+        self.bytes
+    }
+}
+
+impl Write for BoundedTranscriptWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let remaining = INTERACTIVE_TRANSCRIPT_OUTPUT_BYTES_MAX.saturating_sub(self.bytes.len());
+        let retained = remaining.min(buffer.len());
+        self.bytes.extend_from_slice(&buffer[..retained]);
+        self.discarded_bytes = self.discarded_bytes.saturating_add(
+            u64::try_from(buffer.len().saturating_sub(retained)).unwrap_or(u64::MAX),
+        );
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn render_interactive_data_output(
@@ -1669,8 +1761,6 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     // returned so an idle worker thread is not on the cold-paint boundary.
     let mut prompt_context: Option<PromptContextScheduler> = None;
     let mut first_prompt = true;
-    let mut preserve_output_pending = false;
-
     loop {
         if !first_prompt {
             let current_directory = std::env::current_dir().unwrap_or_default();
@@ -1743,13 +1833,15 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             // or input buffer is partially committed.
             sync_history(&mut line_editor, &history_path)?;
             let refreshed_catalog = Arc::new(load_composed_catalog()?);
-            line_editor = configured_editor(
-                &refreshed_catalog,
-                &extensions,
-                &ai_bootstrap,
-                active_config.clone(),
-                &history_path,
-            )?;
+            if !line_editor.replace_catalog(Arc::clone(&refreshed_catalog)) {
+                line_editor = configured_editor(
+                    &refreshed_catalog,
+                    &extensions,
+                    &ai_bootstrap,
+                    active_config.clone(),
+                    &history_path,
+                )?;
+            }
             catalog = Some(refreshed_catalog);
             ai_bootstrap.request_reindex();
         }
@@ -1784,9 +1876,6 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         });
         let history_directory = std::env::current_dir().unwrap_or_default();
         line_editor.install_history_snapshot(history_database.snapshot(&history_directory)?);
-        if std::mem::take(&mut preserve_output_pending) {
-            line_editor.preserve_output_once();
-        }
         let signal = line_editor.read_line(&mut prompt);
         // Rich Alt-Q transitions happen while the surface retains terminal
         // ownership. Adopt the mode rendered by that session before classifying
@@ -1813,12 +1902,6 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                 sync_history(&mut line_editor, &history_path)?;
                 quiesce_extension_callbacks(&extensions)?;
                 let interactive_line = classify(mode, &buffer);
-                if !matches!(
-                    interactive_line,
-                    InteractiveLine::Empty | InteractiveLine::Exit
-                ) {
-                    preserve_output_pending = true;
-                }
                 match interactive_line {
                     InteractiveLine::Empty => {}
                     InteractiveLine::Exit => return Ok(last_status),
@@ -1843,21 +1926,29 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                     InteractiveLine::Command(command) => {
                         let started = Instant::now();
                         let journal = recovery_journal(&mut recovery)?;
-                        match execute_with_recovery(
+                        let output_mode = line_editor.command_output_mode();
+                        let transcript_result = match execute_with_recovery(
                             &mut executor,
                             journal,
                             command,
                             Some(&extensions),
-                            ExecutionOutputMode::Interactive,
+                            output_mode,
                         ) {
-                            Ok(status) => {
-                                last_status = status;
+                            Ok(report) => {
+                                last_status = report.status;
+                                line_editor.append_command_transcript(
+                                    command,
+                                    &report.stdout,
+                                    &report.stderr,
+                                    report.status,
+                                    started.elapsed(),
+                                )
                             }
                             Err(error) => {
                                 last_status = 1;
-                                eprintln!("{}", render_stderr_error(&error));
+                                line_editor.append_command_error(command, &error, started.elapsed())
                             }
-                        }
+                        };
                         let elapsed = started.elapsed();
                         last_duration = Some(elapsed);
                         history_database.record(
@@ -1867,6 +1958,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                             last_status,
                             Some(elapsed),
                         )?;
+                        transcript_result?;
                     }
                     InteractiveLine::Data(source) => {
                         let planned = match prepare_extension_plan(
@@ -1878,7 +1970,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                             Ok(planned) => planned,
                             Err(error) => {
                                 last_status = 1;
-                                eprintln!("{}", render_stderr_error(&error));
+                                line_editor.append_command_error(source, &error, Duration::ZERO)?;
                                 history_database.record(
                                     source,
                                     &history_directory,
@@ -1903,7 +1995,19 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                             &mut executor,
                         );
                         let started = Instant::now();
-                        match execute_interactive_data(&planned.source, &mut data_cache) {
+                        let rich_output = line_editor.is_rich();
+                        let mut captured_output = BoundedTranscriptWriter::new();
+                        let data_result = if rich_output {
+                            execute_interactive_data(
+                                &planned.source,
+                                &mut data_cache,
+                                &mut captured_output,
+                            )
+                        } else {
+                            let mut stdout = io::stdout().lock();
+                            execute_interactive_data(&planned.source, &mut data_cache, &mut stdout)
+                        };
+                        match data_result {
                             Ok((outcome, output_bytes)) => {
                                 last_status = 0;
                                 apply_observation_actions(
@@ -1944,6 +2048,15 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                     &mut executor,
                                 );
                                 print_extension_annotations(&annotations);
+                                if rich_output {
+                                    line_editor.append_command_transcript(
+                                        source,
+                                        &captured_output.finish(),
+                                        &[],
+                                        0,
+                                        started.elapsed(),
+                                    )?;
+                                }
                             }
                             Err(error) => {
                                 last_status = 1;
@@ -1954,7 +2067,11 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                     &mut executor,
                                 );
                                 print_extension_annotations(&annotations);
-                                eprintln!("{}", render_stderr_error(&error));
+                                line_editor.append_command_error(
+                                    source,
+                                    &error,
+                                    started.elapsed(),
+                                )?;
                             }
                         }
                         let elapsed = started.elapsed();
@@ -1972,16 +2089,28 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         match index::search_default_database(query, 8) {
                             Ok(results) => {
                                 last_status = i32::from(results.is_empty());
-                                ai::present_results(&results, ai::AiOutputFormat::Text)?;
+                                let stdout = ai::render_results_text(&results).into_bytes();
+                                let mut stderr = Vec::new();
                                 if results.is_empty() {
-                                    eprintln!(
-                                        "no matching commands; refresh with `quirl index build`"
+                                    stderr.extend_from_slice(
+                                        b"no matching commands; refresh with `quirl index build`\n",
                                     );
                                 }
+                                line_editor.emit_output(
+                                    query,
+                                    &stdout,
+                                    &stderr,
+                                    last_status,
+                                    started.elapsed(),
+                                )?;
                             }
                             Err(error) => {
                                 last_status = 1;
-                                eprintln!("{}", render_stderr_error(&error));
+                                line_editor.append_command_error(
+                                    query,
+                                    &error,
+                                    started.elapsed(),
+                                )?;
                             }
                         }
                         let elapsed = started.elapsed();
@@ -2004,7 +2133,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                             Ok(planned) => planned,
                             Err(error) => {
                                 last_status = 1;
-                                eprintln!("{}", render_stderr_error(&error));
+                                line_editor.append_command_error(source, &error, Duration::ZERO)?;
                                 history_database.record(
                                     source,
                                     &history_directory,
@@ -2040,9 +2169,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                         &mut executor,
                                     );
                                 }
-                                if let Err(error) = print_execution_outcome(&outcome) {
-                                    eprintln!("{}", render_stderr_error(&error));
-                                }
+                                let (stdout, stderr) = execution_outcome_bytes(&outcome)?;
                                 apply_observation_actions(
                                     notify_extensions(
                                         &extensions,
@@ -2067,6 +2194,13 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                     &mut executor,
                                 );
                                 print_extension_annotations(&annotations);
+                                line_editor.emit_output(
+                                    source,
+                                    &stdout,
+                                    &stderr,
+                                    last_status,
+                                    started.elapsed(),
+                                )?;
                             }
                             Err(error) => {
                                 last_status = 1;
@@ -2077,7 +2211,11 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                     &mut executor,
                                 );
                                 print_extension_annotations(&annotations);
-                                eprintln!("{}", render_stderr_error(&error));
+                                line_editor.append_command_error(
+                                    source,
+                                    &error,
+                                    started.elapsed(),
+                                )?;
                             }
                         }
                         let elapsed = started.elapsed();
@@ -2105,7 +2243,13 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                     &mut annotations,
                     &mut executor,
                 );
-                println!("^C");
+                line_editor.emit_output(
+                    "^C",
+                    &[],
+                    b"interactive input cancelled\n",
+                    last_status,
+                    Duration::ZERO,
+                )?;
             }
             Ok(InteractiveSignal::CtrlD) => return Ok(last_status),
             Ok(InteractiveSignal::HostCommand(command)) if command == MODE_TOGGLE_HOST_COMMAND => {
@@ -2387,6 +2531,34 @@ fn print_execution_outcome(outcome: &ExecutionOutcome) -> Result<(), ShellError>
     }
 }
 
+fn execution_outcome_bytes(outcome: &ExecutionOutcome) -> Result<(Vec<u8>, Vec<u8>), ShellError> {
+    match &outcome.output {
+        ExecutionOutput::Inherited => Ok((Vec::new(), Vec::new())),
+        ExecutionOutput::Bytes { stdout, stderr } => Ok((stdout.clone(), stderr.clone())),
+        ExecutionOutput::Value { value } => Ok((json_value_bytes(value.json_value()), Vec::new())),
+        ExecutionOutput::Values { values } => Ok((
+            json_value_bytes(serde_json::Value::Array(
+                values.iter().map(StructuredValue::json_value).collect(),
+            )),
+            Vec::new(),
+        )),
+    }
+}
+
+fn json_value_bytes(value: serde_json::Value) -> Vec<u8> {
+    let rendered = match value {
+        serde_json::Value::Null => return Vec::new(),
+        serde_json::Value::String(value) => escape_terminal_controls(&value),
+        value if value.is_object() || value.is_array() => serde_json::to_string_pretty(&value)
+            .map(|json| escape_json_terminal_controls(&json))
+            .unwrap_or_else(|_| "<unprintable Lua value>".to_owned()),
+        value => value.to_string(),
+    };
+    let mut bytes = rendered.into_bytes();
+    bytes.push(b'\n');
+    bytes
+}
+
 fn emit_value_output(
     extensions: &Arc<Mutex<LuaExtensionHost>>,
     value: &serde_json::Value,
@@ -2512,9 +2684,77 @@ impl SessionEditor {
         }
     }
 
-    fn preserve_output_once(&mut self) {
+    fn command_output_mode(&self) -> ExecutionOutputMode {
+        match self {
+            Self::Rich(_) => ExecutionOutputMode::RichViewport,
+            Self::Simple(_) => ExecutionOutputMode::Interactive,
+        }
+    }
+
+    fn is_rich(&self) -> bool {
+        matches!(self, Self::Rich(_))
+    }
+
+    fn emit_output(
+        &mut self,
+        command: &str,
+        stdout: &[u8],
+        stderr: &[u8],
+        status: i32,
+        duration: Duration,
+    ) -> Result<(), ShellError> {
+        match self {
+            Self::Rich(editor) => {
+                editor.append_transcript(command, stdout, stderr, status, duration)
+            }
+            Self::Simple(_) => {
+                io::stdout().lock().write_all(stdout).map_err(|error| {
+                    ShellError::new(ErrorCode::Io, "could not write interactive output")
+                        .with_context(error.to_string())
+                        .with_help("Check that standard output is still available")
+                })?;
+                io::stderr().lock().write_all(stderr).map_err(|error| {
+                    ShellError::new(ErrorCode::Io, "could not write interactive error output")
+                        .with_context(error.to_string())
+                        .with_help("Check that standard error is still available")
+                })?;
+                Ok(())
+            }
+        }
+    }
+
+    fn append_command_transcript(
+        &mut self,
+        command: &str,
+        stdout: &[u8],
+        stderr: &[u8],
+        status: i32,
+        duration: Duration,
+    ) -> Result<(), ShellError> {
         if let Self::Rich(editor) = self {
-            editor.preserve_output_once();
+            return editor.append_transcript(command, stdout, stderr, status, duration);
+        }
+        Ok(())
+    }
+
+    fn append_command_error(
+        &mut self,
+        command: &str,
+        error: &ShellError,
+        duration: Duration,
+    ) -> Result<(), ShellError> {
+        match self {
+            Self::Rich(editor) => editor.append_transcript(
+                command,
+                &[],
+                render_error(error, false).as_bytes(),
+                1,
+                duration,
+            ),
+            Self::Simple(_) => {
+                eprintln!("{}", render_stderr_error(error));
+                Ok(())
+            }
         }
     }
 
@@ -2523,6 +2763,14 @@ impl SessionEditor {
             Self::Rich(editor) => editor.published_catalog(),
             Self::Simple(_) => None,
         }
+    }
+
+    fn replace_catalog(&mut self, catalog: Arc<Catalog>) -> bool {
+        if let Self::Rich(editor) = self {
+            editor.replace_catalog(catalog);
+            return true;
+        }
+        false
     }
 }
 
@@ -3579,6 +3827,42 @@ mod tests {
     }
 
     #[test]
+    fn rich_viewport_execution_returns_bounded_stdout_and_stderr() {
+        let outcome = execute_command_or_dialect_island_with_extensions(
+            &mut NativeExecutor::default(),
+            "sh -c 'printf viewport-out; printf viewport-error >&2; exit 7'",
+            ExecutionOutputMode::RichViewport,
+            None,
+            None,
+        )
+        .unwrap();
+        let report = ExecutionReport::from_outcome(outcome);
+
+        assert_eq!(report.status, 7);
+        assert_eq!(report.stdout, b"viewport-out");
+        assert_eq!(report.stderr, b"viewport-error");
+    }
+
+    #[test]
+    fn inherited_execution_report_never_claims_to_have_captured_bytes() {
+        let request = execution_request(
+            "<inherit-report>",
+            "true",
+            ExecutionMode::NativeCommand,
+            ExecutionOutputTarget::Inherit,
+            ExecutionEffects::all(),
+        )
+        .unwrap();
+        let outcome =
+            execute_execution_request(&mut NativeExecutor::default(), request, None).unwrap();
+        let report = ExecutionReport::from_outcome(outcome);
+
+        assert_eq!(report.status, 0);
+        assert!(report.stdout.is_empty());
+        assert!(report.stderr.is_empty());
+    }
+
+    #[test]
     fn shared_execution_contract_preserves_mode_output_and_status() {
         let cases = [
             (
@@ -4486,6 +4770,52 @@ mod tests {
         .unwrap();
         assert_eq!(captured.stdout.as_deref(), Some(""));
         assert_eq!(captured.stderr.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn rich_viewport_rejects_background_commands_before_spawn() {
+        let error = execute_command_or_dialect_island(
+            &mut NativeExecutor::default(),
+            "sleep 30 &",
+            ExecutionOutputMode::RichViewport,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("background"));
+        assert!(error
+            .details
+            .help
+            .iter()
+            .any(|help| help.contains("simple")));
+    }
+
+    #[test]
+    fn bounded_transcript_writer_discards_excess_and_marks_output() {
+        let mut writer = BoundedTranscriptWriter::new();
+        let oversized = vec![b'x'; INTERACTIVE_TRANSCRIPT_OUTPUT_BYTES_MAX + 128];
+        writer.write_all(&oversized).unwrap();
+        let output = writer.finish();
+        assert_eq!(output.len(), INTERACTIVE_TRANSCRIPT_OUTPUT_BYTES_MAX);
+        assert!(output.ends_with("bytes …\n".as_bytes()));
+        assert!(String::from_utf8(output)
+            .unwrap()
+            .contains("discarded 128 bytes"));
+    }
+
+    #[test]
+    fn structured_outcome_bytes_are_terminal_safe_and_newline_terminated() {
+        let outcome = ExecutionOutcome::new(
+            ExecutionStatus::Exited(0),
+            ExecutionOutput::Value {
+                value: StructuredValue::String("hello\u{1b}[2J".to_owned()),
+            },
+            Vec::new(),
+            ExecutionCleanupState::Complete,
+        )
+        .unwrap();
+        let (stdout, stderr) = execution_outcome_bytes(&outcome).unwrap();
+        assert_eq!(stdout, b"hello\\u{1b}[2J\n");
+        assert!(stderr.is_empty());
     }
 
     #[test]

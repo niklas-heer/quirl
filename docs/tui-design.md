@@ -2,12 +2,13 @@
 
 Status: **Implemented baseline and forward design specification.** This
 document turns the §10/§12 vision in
-[language-design.md](language-design.md) ("Ratatui composes the active prompt
-region and opt-in panels without stealing normal terminal scrollback") into an
+[language-design.md](language-design.md) into an
 implementation contract. [ADR 0012](decisions/0012-ratatui-interactive-surface.md)
 accepts Ratatui as the capable-TTY default and retains Reedline as the simple
-fallback. Sections marked as future work remain design targets rather than
-claims about the current binary.
+fallback. [ADR 0022](decisions/0022-persistent-rich-session-transcript.md)
+supersedes ADR 0012's per-command screen release with a persistent, bounded
+rich-session transcript. Sections marked as future work remain design targets
+rather than claims about the current binary.
 
 Audience: implementers (human or LLM sessions) picking up any milestone below.
 Read [AGENTS.md](../AGENTS.md) first; every rule there applies. Do not invent
@@ -18,12 +19,14 @@ completion protocol, `QuirlConfig`, and the existing prompt scheduler.
 
 ## 1. Summary
 
-Quirl's default capable-terminal shell is a **Ratatui-rendered full-screen editor**:
-a dirty-tracked UI on the alternate screen. It
-owns the prompt, a syntax-highlighted editor line, a completion popup with a
-documentation pane, a diagnostics row, and a persistent bottom status bar.
-The normal screen and its scrollback are restored before command execution, so
-command output is never trapped inside the TUI.
+Quirl's default capable-terminal shell is a **Ratatui-rendered full-screen
+session**: a dirty-tracked UI on the alternate screen. It owns a bounded
+command transcript, scrolling and selection, the prompt, a syntax-highlighted
+editor line, a completion popup with a documentation pane, a diagnostics row,
+and a persistent bottom status bar. Ordinary foreground commands on the rich
+surface return bounded captured outcomes to that transcript without leaving
+the alternate screen. The normal screen is restored when the rich session
+suspends or exits, not between ordinary foreground commands.
 
 What is **kept** from today's implementation:
 
@@ -60,8 +63,8 @@ Goals:
    diagnostics before Enter, rich completion with docs and provenance.
 2. A persistent bottom status bar showing mode, keymap state, key hints, and
    transient notices.
-3. Scrollback stays native. Command output, `Ctrl-Z`, PTY handoff to vim/less,
-   and copy/paste behave exactly like a classic shell.
+3. The rich surface owns a bounded transcript, viewport, selection, and copy
+   model. The simple surface retains native scrollback and inherited execution.
 4. Meet the §12 budgets: keystroke-to-frame ≤8 ms P95, first prompt paint
    ≤21 ms P95, cold start ≤25 ms P50.
 5. Graceful degradation to a line-oriented experience with the same parser and
@@ -69,9 +72,14 @@ Goals:
 
 Non-goals:
 
-- No persistent full-app shell mode. The alternate screen exists only while the
-  editor owns the terminal and is released before execution, suspension, EOF,
-  or error return.
+- No embedded interactive terminal in the current stage. The rich surface
+  captures ordinary noninteractive foreground commands; faithfully embedding `vim`,
+  `less`, `top`, REPLs, or another alternate-screen child requires the future
+  PTY/VT contract in ADR 0022. The simple surface remains the classic-terminal
+  compatibility path.
+- No rich-surface background jobs in the current stage. They are rejected
+  before spawn because their uncaptured asynchronous output could race and
+  corrupt later frames. Use the simple surface for background-job workflows.
 - No mouse requirement. Mouse support is an enhancement, never a dependency.
 - No plugin-drawn raw widgets in v1. Plugins contribute styled values and
   panel models; Quirl owns layout, focus, theme, and cleanup (§11 of
@@ -104,6 +112,7 @@ surface/
   editor.rs      # EditorState: buffer, cursor, undo, kill ring, keymaps
   highlight.rs   # span cache, catalog-aware command resolution, theme mapping
   completion.rs  # CompletionState: popup model, CompletionWorker wiring
+  transcript.rs  # bounded lines, viewport anchors, selection, copy extraction
   statusbar.rs   # StatusBarModel + segments
   overlay.rs     # picker overlays (history/files/palette) on the same frame
   theme.rs       # Theme: named roles -> ratatui Style, NO_COLOR-aware
@@ -114,7 +123,7 @@ Everything stays behind `#[cfg(test)] mod tests` in the same files, per
 project convention. `ratatui::backend::TestBackend` is the snapshot-test
 backend (§11).
 
-### 3.2 Terminal lifecycle: full-screen alternate viewport per prompt
+### 3.2 Terminal lifecycle: one persistent full-screen session
 
 The frame uses a `Viewport::Fixed` rectangle covering the complete validated
 terminal after entering its alternate screen. Quirl re-measures and manually
@@ -129,18 +138,24 @@ struct SurfaceTerminal {
 }
 impl SurfaceTerminal {
     fn draw(&mut self, frame: &FrameModel) -> Result<(), ShellError>;
-    /// Restore normal screen, cooked mode, and input features before exec.
-    fn release(&mut self) -> Result<(), ShellError>;
+    /// Restore the main screen, cooked mode, and input features on handoff or exit.
+    fn release_session(&mut self) -> Result<(), ShellError>;
 }
 ```
 
-`insert_before` is a future lifecycle extension for asynchronous notices; it
-is not part of the current `SurfaceTerminal` API.
+Accepting an ordinary foreground command does not call `release_session`. The
+rich session retains terminal ownership while the CLI runs a bounded capture
+request and commits its completed outcome to the transcript. A background
+pipeline is rejected before spawn. `release_session` remains the single cleanup
+path for suspension, EOF, fatal errors, explicit compatibility handoff, and
+normal exit.
 
 Rules:
 
-- Draw to **stderr**, not stdout. Non-interactive stdout stays stable,
-  undecorated, and control-sequence-free (§12).
+- Draw to **stderr**, not stdout. A rich ordinary foreground child inherits neither
+  stream; its bounded captured stdout and stderr cross the terminal-text filter
+  before transcript admission. Non-interactive Quirl invocations keep stable,
+  undecorated, control-sequence-free stdout (§12).
 - The bounded active region (context, editor, diagnostics, completion, and
   panels) is aligned immediately above the status bar, keeping the editing locus
   stable as overlays open and close. It is clipped to the current screen, while
@@ -149,34 +164,105 @@ Rules:
 - Width is bounded to 512 columns and height to 256 rows (131,072 cells) at
   initial selection and again before every resized draw. An oversized runtime
   resize returns `ResourceLimit` only after restoring the terminal guard.
-- Raw mode is enabled only while the frame is live. Bracketed paste is enabled
-  through crossterm; raw mode, alternate screen, bracketed paste, cursor shape,
+- Raw mode is enabled while the rich input loop owns input. Stage 1 may pause
+  raw mode and input features while a captured command runs, but it does not
+  leave the alternate screen. Bracketed paste is enabled through crossterm;
+  raw mode, alternate screen, bracketed paste, cursor shape,
   and cursor visibility are restored by the same terminal guard. Kitty keyboard and
   synchronized-output negotiation remain future progressive enhancements;
   `Shift-Tab` works today through crossterm's Shift-Tab/BackTab events.
 
-### 3.3 The per-command cycle (scrollback contract)
+### 3.3 The ordinary-foreground-command cycle (transcript contract)
 
 ```
-┌──────────────────────────── one REPL iteration ────────────────────────────┐
-│ 1. enter raw mode + alternate screen; build the full-screen FrameModel     │
-│ 2. edit loop: keys → EditorState; async events → completion/segments;      │
-│    redraw only when dirty                                                  │
-│ 3. on Accept: release alternate screen and raw mode, then append one safe  │
-│    transient prompt line to normal scrollback (§5.5)                       │
-│ 4. classify() → execute through the existing native executor with          │
-│    inherited stdio/PTY; job control, Ctrl-Z, vim, less all work untouched  │
-│ 5. output lands in normal scrollback; errors via quirl_ui::render_error    │
-│ 6. loop → step 1                                                           │
+┌──────────────────────────── rich session ──────────────────────────────────┐
+│ 1. enter raw mode + alternate screen once; build the FrameModel            │
+│ 2. edit loop: keys → EditorState; async events → completion/segments       │
+│ 3. on Accept: freeze the command; pause input, not the alternate screen    │
+│ 4. classify foreground rich execution → bounded capture; reject `&`       │
+│ 5. convert the complete outcome into one terminal-safe transcript entry    │
+│ 6. admit/evict atomically, redraw, and return to step 2                     │
+│ 7. on suspend/EOF/fatal error/exit: restore the main screen and raw state   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The frame **never exists while a foreground command runs**. This single rule is
-what keeps PTY handoff, suspension, and signal semantics identical to today.
-Editing-time `insert_before` notices for background jobs, config reloads, and
-plugin diagnostics are a planned extension and are not emitted by the baseline.
+Stage 1 is completion-atomic: the child outcome appears after the command
+finishes. It does not promise live output, arbitrary input while the child
+runs, or stdout/stderr interleaving. The existing capture owner drains and
+reaps on success, failure, cancellation, and the 1 MiB-per-stream resource
+boundary before the UI admits a result.
 
-### 3.4 Event loop
+Stage 1 rejects every command graph containing a background pipeline before
+spawn. The existing process engine intentionally leaves background streams
+uncaptured; accepting such a graph would let asynchronous bytes escape the
+transcript boundary and corrupt a later frame. Background job execution remains
+available on the simple surface.
+
+Interactive PTY applications are not sent through this contract as though
+captured text were a terminal. Embedded PTY input, VT parsing, child screen
+state, replay, and resize propagation remain future work under ADR 0022. The
+simple surface continues to use inherited streams and native terminal
+scrollback.
+
+### 3.4 Transcript, scrolling, selection, and copy
+
+The editor/context region remains at the top and the status bar remains on the
+physical bottom row. The transcript viewport owns the flexible body between
+them. Completion, documentation, and picker overlays reserve their existing
+bounded region without changing the transcript's logical scroll anchor.
+
+One completion-atomic transcript entry contains terminal-safe values
+equivalent to:
+
+```rust
+struct TranscriptEntry {
+    command: String,
+    status: i32,
+    duration: Duration,
+    stdout: String,
+    stderr: String,
+    rendered_error: Option<String>,
+}
+```
+
+The concrete type may use owned bounded wrappers instead of these illustrative
+field types. It must preserve the distinction between stdout, stderr, and a
+structured shell error because stage 1 capture does not preserve cross-stream
+ordering. Control-sequence filtering and UTF-8 repair happen before retained
+byte accounting, and visible loss is marked rather than silently discarded.
+
+The transcript retains at most 16 MiB of terminal-safe text and 50,000 logical
+lines. Admission computes both costs before changing visible state. When a new
+line does not fit, oldest complete logical lines are evicted and one bounded
+omission marker reports that fact. Eviction never removes the active editor,
+splits a UTF-8 sequence, or duplicates discarded bytes in metadata.
+
+Scrolling is application-owned. The shipped keyboard path provides page
+up/down and return-to-tail navigation:
+
+- `scroll_line`, `scroll_page`, `scroll_to_start`, and `scroll_to_end` operate
+  on logical transcript positions, not the host terminal's scrollback;
+- follow mode tracks new entries only while the viewport is already at the
+  logical end;
+- manual keyboard scrolling disables follow mode until the user
+  returns to the end; and
+- resize recomputes visual wrapping from retained logical rows and preserves
+  the nearest retained logical anchor. A frame builds only visible rows and a
+  bounded layout margin.
+
+Selection endpoints are logical transcript positions. Repaint, wrapping, and
+scrolling may change their cells but not the selected text while its source
+entry remains retained. The shipped output-focus mode provides keyboard line
+selection and copy; mouse selection and drag auto-scroll remain enhancements.
+Evicting selected source text clamps the selection to retained content.
+
+Copy serializes plain semantic text without color or layout padding. One copy
+is capped at 1 MiB and fails before an oversized allocation. OSC 52 and native
+clipboard helpers are transport choices behind this model; a clipboard error
+keeps the selection and never changes command status. Paste remains governed
+by the 64 KiB editor bound in §4 and is not a PTY input stream.
+
+### 3.5 Event loop
 
 Single render thread; workers publish through bounded/latest-value state where
 possible. No async runtime is introduced: the implementation uses standard
@@ -283,8 +369,8 @@ the highlighted buffer, hardware cursor at the edit position
 (`Frame::set_cursor_position`). Inline history autosuggestion renders dim
 after the cursor.
 
-Physical bottom row — **status bar** (§8). Rows above the bounded active content
-remain clear so resize cannot leave stale geometry behind.
+Rows below the editor and any active overlay form the bounded transcript
+viewport (§3.4). The physical bottom row is always the **status bar** (§8).
 
 ### 5.2 Completion popup open
 
@@ -349,21 +435,32 @@ the data accent (one accent per mode, §7), and the status bar reads
 `· data ·`. Highlighting uses the data-expression lexer once it exposes spans;
 until then data mode renders with the plain style rather than wrong guesses.
 
-### 5.5 Transient prompt (after Accept)
+### 5.5 Completed ordinary foreground command
 
-On Accept the alternate screen is released, then a single transient line is
-committed to normal scrollback before execution:
+On Accept the alternate screen remains active. After bounded execution
+completes, the accepted command and its complete result are admitted as one
+transcript entry, and a fresh editor remains at the top:
 
 ```
-❯ cargo build --release                                            ✔ 2.31s
-   Compiling quirl-core v0.1.0 ...
+ ~/projects/quirl  main                                            2.31s
+❯ ▌
+  ┌ cargo build --release                                  ✔ 0 · 2.31s
+  │ Compiling quirl-core v0.1.0 ...
+  └ Finished `release` profile
+
+ ❯ NORMAL   Alt-Q Quirl · PgUp scroll · copy selection             quirl
 ```
 
-The shipped transient line is indicator + escaped executed buffer, committed
-before execution. It does not retain syntax styles or retrofit a result glyph.
-Final highlighting and a right-aligned `✔ duration` / `✘ code` are future work
-only if they can be proven not to reflow scrollback. Controlled by
-`prompt.transient = true` (default).
+The header records the terminal-safe accepted command, exit status, and
+duration. Stdout, stderr, and a structured error stay distinguishable even
+when the theme presents them with compact shared chrome. A capture-limit error
+replaces a success footer and states the configured and observed byte counts;
+it never shows a partial capture as successful.
+
+Stage 1 admits results only after completion. Spinners, live tailing, and
+interactive child input are future work. `prompt.transient` remains in config
+schema v2 for compatibility and still applies to the simple surface; the rich
+surface always records accepted commands in its bounded transcript.
 
 ### 5.6 Picker overlays
 
@@ -377,8 +474,9 @@ honoring `picker.layout`:
 
 The shipped `Alt-Q p` command palette always requests a terminal-height
 region and positions its bounded adaptive content against the bottom edge. It
-does not perform another screen transition; the existing terminal guard releases
-the shared alternate screen before execution, suspension, or error return.
+does not perform another screen transition. The existing terminal guard retains
+the shared alternate screen across ordinary foreground captured execution and releases it
+for suspension, explicit compatibility handoff, fatal error cleanup, or exit.
 
 The picker engine, ranking, and typed-value return stay in `quirl-picker`;
 the surface uses it through the `PickerRanker` composition adapter. Source
@@ -546,7 +644,7 @@ Budgets (restating §12 as per-component obligations):
 | First prompt paint | ≤21 ms P95 | context row paints with cached/stale segments; scheduler fills in |
 | Cold start → editable | ≤25 ms P50 | rich catalog admission follows the first flush and completes before input polling; `$PATH` warmup remains lazy |
 | Completion: local results visible | ≤8 ms | catalog worker publishes independently; extensions merge later |
-| Memory | virtualized/bounded popup and picker; one revision-cached span vector; 64 KiB editor; bounded undo/history | |
+| Memory | 16 MiB/50,000-line transcript; 1 MiB selection/copy; virtualized popup/picker; 64 KiB editor; bounded undo/history | |
 
 The first-paint budget is a P95 wall-clock bound over fresh PTY processes. It
 includes alternate-screen entry and process scheduling,
@@ -591,8 +689,22 @@ In-crate `#[cfg(test)]` modules, behavior-sentence names, run by `cargo xtask ch
   suppression, and the 250 ms deadline using the existing `CompletionWorker`
   test harness.
 - **Degradation**: each row of the §9 table has a test fixing the decision.
-- **Lifecycle**: release/re-init around execution — after a simulated command,
-  the full-screen frame reconstructs and prior normal-screen scrollback is untouched.
+- **Transcript bounds**: exact-byte and exact-line admission, oldest-complete
+  eviction, omission-marker accounting, UTF-8 boundaries, and atomic failure
+  paths at 16 MiB/50,000 lines.
+- **Scroll/selection**: follow mode disengages on manual scroll, resize preserves
+  a logical anchor, keyboard selection survives repaint, and a 1 MiB copy
+  succeeds while the next byte fails before allocation. Mouse drag/auto-scroll
+  remains future work.
+- **Lifecycle**: repeated ordinary foreground commands never emit
+  alternate-screen exit;
+  suspension, EOF, fatal render failure, and normal exit each restore the main
+  screen exactly once.
+- **Execution separation**: rich ordinary foreground commands select the 1
+  MiB-per-stream capture path and commit only complete outcomes. Rich mode
+  rejects a background pipeline before spawn. Simple mode inherits streams and
+  retains background-job compatibility. PTY-only applications are not
+  presented as supported rich captures.
 
 Sandbox/budget claims need adversarial proof per AGENTS.md; any new Lua-facing
 surface (status items) gets deny-unknown-fields structs at the boundary.
@@ -602,9 +714,10 @@ completion/picker/compact/adversarial frames; shared keymap and Shift-Tab
 conformance; stale/cancelled asynchronous completion tests; 4 KiB highlighting;
 and explicit editor, completion, picker, PATH, undo, and history bounds. The
 full permutation implied above (especially every degradation row, `NO_COLOR`,
-plain symbols, lifecycle reconstruction, and named terminal snapshots) remains
-release-evidence work. `cargo xtask rich-pty` covers deletion, wrapping,
-Alt-Q leader repaint, completion, execution handoff, and Ctrl-D on a real Unix PTY.
+plain symbols, persistent-session lifecycle, and named terminal snapshots)
+remains release-evidence work. `cargo xtask rich-pty` must cover deletion,
+wrapping, Alt-Q leader repaint, completion, repeated captured execution,
+transcript scrolling/copy, and Ctrl-D on a real Unix PTY.
 
 ---
 
@@ -623,7 +736,7 @@ local config = quirl.config {
     symbols = "auto",                                      -- existing
     left  = { "directory", "git_branch", "git_state" },
     right = { "jobs", "duration", "status" },
-    transient = true,                                      -- new (§5.5)
+    transient = true,  -- schema-v2 compatibility; simple surface only (§5.5)
   },
   ui = {                                                   -- new
     theme = "tokyo-night",        -- one of 30 built-ins, or a key in ui.themes
@@ -657,7 +770,7 @@ distinguishes landed behavior from remaining parity and release-evidence work.
 
 | Milestone | Current status | Remaining acceptance work |
 | --- | --- | --- |
-| **M1 — Frame + editor** | Landed: full-screen alternate-viewport lifecycle, bottom-anchored status, Quirl-owned 64 KiB grapheme editor, bounded undo/history, Emacs/Helix/Vim states, context/input/status rows, prefix history, autosuggestion, safe transient prompt, and execution/suspend handoff | Complete named real-terminal lifecycle and latency evidence on Linux/macOS; decide terminal protocol negotiation |
+| **M1 — Frame + transcript** | Landed editor baseline: full-screen alternate viewport, bottom status, Quirl-owned 64 KiB grapheme editor, bounded undo/history, Emacs/Helix/Vim states, context/input/status rows, prefix history, autosuggestion, completion-atomic captured foreground commands, and bounded keyboard scroll/selection/copy | Add optional mouse selection and keep interactive PTY/VT support outside this milestone |
 | **M2 — Highlighting + diagnostics** | Landed baseline: revision-cached `quirl_syntax::highlight`, bounded asynchronous executable-PATH snapshot, parse/unknown-command/unknown-flag diagnostics, severity styling, draw/highlight P95, and Ratatui/adversarial 4 KiB tests | Expand generated totality coverage and record evidence that the 4 KiB/first-paint budgets pass on release terminals |
 | **M3 — Completion popup** | Landed: always-on exact-command information and flag-prefix options, bounded catalog and extension workers/results, catalog-first asynchronous merge, selection stability, stale suppression, docs/provenance pane, token anchoring, match styling, virtualization, and narrow list-only rendering | Record named ≤8 ms first-result evidence and broader provider fault/terminal snapshots |
 | **M4 — Overlays + keymaps** | Landed: history/files/directories/palette overlays use the shared `quirl-picker` ranker through a composition-root adapter; queries are bounded and editable; Shift-Tab expands completion; adaptive/bottom and terminal-height full layouts honor preview config; Emacs/Helix/Vim editor modes remain available | Decide kitty/synchronized-output negotiation and gather named real-terminal layout evidence |
@@ -666,26 +779,28 @@ distinguishes landed behavior from remaining parity and release-evidence work.
 Bounded extension panels are now pinned into the full-screen frame below the editor
 when no completion/picker overlay is active. `F6` cycles focus, at most six
 rows are visible, and `LiveBuffer` retains four completed generations per
-panel. Typed command output remains ordinary scrollback rather than becoming a
-full-screen watch application.
+panel. Typed command output enters the same bounded transcript rather than
+turning the surface into an unbounded watch application.
 
 ---
 
 ## 14. Open questions and recorded decisions
 
-1. **Full-screen lifecycle**: record alternate-screen enter/leave, resize,
-   suspend/resume, EOF, foreground handoff, and failure cleanup evidence on
-   Ghostty, Terminal.app, iTerm2, and a Linux VTE terminal before calling the
-   behavior release-proven.
-2. **Transient result glyph** (§5.5): the baseline commits only the indicator
-   and accepted buffer. Retrofitting a result into prior scrollback is deferred.
+1. **Persistent full-screen lifecycle**: record one alternate-screen entry,
+   repeated captured ordinary foreground commands without screen exit, resize,
+   suspend/resume, EOF, and failure cleanup evidence on Ghostty, Terminal.app,
+   iTerm2, and a Linux VTE terminal before calling the behavior release-proven.
+2. **Embedded interactive PTY/VT applications**: a separate ADR must define
+   terminal emulation, input/signal ownership, bounded replay, resize ordering,
+   and cleanup before the rich surface advertises `vim`, `less`, `top`, or
+   interactive REPL compatibility.
 3. **Data-mode lexer spans**: extend `highlight()` when the data grammar
    exposes tokens; until then plain styling (§5.4).
 4. **Status items from plugins**: reuse `ContributionKind` or add a
    `StatusItem` kind — needs a protocol-compatibility check under ADR 0008
    before exposing to Lua.
-5. **Editing-time notices**: add a bounded event queue and an `insert_before`
-   lifecycle that cannot corrupt terminal state or delay cancellation.
+5. **Editing-time notices**: add a bounded event queue and transcript admission
+   path that cannot corrupt terminal state or delay cancellation.
 6. **Terminal protocols**: decide whether measured Tier 1 benefit justifies
    kitty keyboard and synchronized-output negotiation, with RAII cleanup and
    fallback tests required before enabling either.
@@ -701,7 +816,8 @@ The rich surface may present typed output, native jobs, cached data values, and
 extension panels, but it does not become an execution owner. Native jobs remain
 owned by `quirl-process`, live data readers remain owned by `quirl-data`, and
 Lua callbacks remain owned by the CLI extension scheduler. The UI receives
-only immutable snapshots and terminal-safe typed models.
+only immutable snapshots, terminal-safe typed models, and bounded completed
+capture outcomes.
 
 The integration maintains these invariants:
 
@@ -709,14 +825,31 @@ The integration maintains these invariants:
   shared execution request and cancellation identity. Plain rows are pulled and
   written one at a time, with cancellation checked before every pull and write.
   A cancellation or write failure after partial output remains a `ShellError`;
-  already-written scrollback is not reclassified as a successful value.
+  already-admitted transcript rows are not reclassified as a successful value.
+- **Ordinary native capture.** The rich surface requests at most 1 MiB for each
+  of stdout and stderr through the existing process owner. Spawn failure,
+  cancellation, or overflow kills and reaps the complete process graph before
+  transcript admission. A resource-limit entry may describe discarded bytes
+  but must not present partial capture as successful output.
+- **Background rejection.** Before process creation, the rich path rejects a
+  parsed command graph if any pipeline is marked background. This prevents an
+  uncaptured descendant from surviving the command turn and writing across a
+  later renderer frame. The rejection is recorded as a bounded command error;
+  it does not create a job entry. The simple surface retains normal background
+  execution.
+- **Transcript admission.** The UI computes terminal-safe bytes and logical
+  lines before mutating visible state. Oldest-complete eviction, the omission
+  marker, and new-entry admission form one state transition. Failure preserves
+  the prior transcript and reports bounded status text.
 - **Resize or suspension during a frame.** Resize invalidates the prepared
   layout before the next draw. Terminals below five rows hide panels, previews,
   and diagnostics in that order and keep the editor/status fallback usable.
   Suspension releases the alternate screen, bracketed paste, cursor shape, and
   raw mode before the process receives `SIGTSTP`; resume reacquires a newly
   measured viewport. A frame prepared for an older size is never deliberately
-  written after a resize event has been observed.
+  written after a resize event has been observed. If stage 1 execution delays
+  event polling, its next turn applies the queued resize before painting the
+  completed outcome.
 - **Provider failure or removal.** Panel providers execute only on the existing
   extension workers. First paint consumes the last complete cache, a failure
   preserves that last complete per-provider value, and a newer installed
@@ -745,7 +878,9 @@ The integration maintains these invariants:
   applies at most eight panel updates, and performs at most sixteen data pulls
   before checking cancellation and scheduler state again. The panel queue holds
   at most 32 updates; overflow drops the oldest pending update and records one
-  bounded notice. Repaints are coalesced to at most one per 16 ms poll turn.
+  bounded notice. Transcript admission independently enforces 16 MiB and
+  50,000 logical lines. Repaints are coalesced to at most one per 16 ms poll
+  turn.
 - **Non-TTY and tiny-terminal fallback.** Non-TTY, `TERM=dumb`, explicitly
   simple, and initially sub-five-row terminals use the bounded Reedline/simple
   path. A rich terminal resized below five rows uses the minimal editor/status
@@ -762,7 +897,7 @@ The integration maintains these invariants:
 - **Oversized typed values.** Data values are validated by the data runtime
   before rendering. Picker retention then caps labels, previews, value depth,
   field count, and encoded bytes independently. A value that is too deep, wide,
-  or large may appear in scrollback through bounded incremental rendering but
+  or large may appear in the transcript through bounded incremental rendering but
   is omitted from the picker cache with a resource notice.
 
 Concrete UI limits are eight panels, sixteen columns and 128 rows per panel,
@@ -773,3 +908,5 @@ generations per panel, 128 cached typed data items, 512 KiB cached data text,
 Job snapshots retain at most 256 action items and 512 KiB of terminal-safe
 text. All optional regions are virtualized; offscreen rows stay within the
 declared snapshot bounds and are never rebuilt from Lua during a frame.
+The session transcript separately retains at most 16 MiB and 50,000 logical
+lines, and one selection/copy operation retains at most 1 MiB of plain text.
