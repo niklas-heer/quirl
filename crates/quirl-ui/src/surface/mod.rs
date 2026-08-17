@@ -1252,7 +1252,7 @@ fn transient_line(mode: Mode, buffer: &str, symbols: SurfaceSymbols) -> String {
 }
 
 fn input_is_incomplete(buffer: &str, mode: Mode) -> bool {
-    if mode == Mode::Data {
+    if mode != Mode::Command {
         return false;
     }
     parse_command_list(buffer).is_err_and(|error| {
@@ -1283,6 +1283,9 @@ fn should_open_automatic_completion(
     let cursor = cursor.min(buffer.len());
     let before = &buffer[..cursor];
     let token_len = current_token_len(buffer, cursor);
+    if mode == Mode::Natural {
+        return false;
+    }
     if configured_auto && token_len >= configured_min_chars {
         return true;
     }
@@ -1439,7 +1442,7 @@ mod tests {
         let buffer = editor.buffer().to_owned();
         let cursor = editor.cursor();
 
-        for expected_mode in [Mode::Data, Mode::Command] {
+        for expected_mode in [Mode::Data, Mode::Natural, Mode::Command] {
             let action = editor.apply_key(
                 crossterm::event::KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
                 false,

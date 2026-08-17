@@ -111,6 +111,7 @@ Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unl
 | --- | --- | --- | --- |
 | Command `❯` | Bytes and processes; compatibility grammar; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `cargo test --workspace`, `false \|\| echo recovered` | `mode command`; force external with `^ls` |
 | Data `◆` | Unambiguous Quirl grammar; typed, lazy values; external programs require an adapter or `^command`; failures are `Result` values | `ps \| where cpu > 20 \| sort cpu desc`, `open users.json \| get users \| select name email` | `mode data`; one-shot `data { ... }` |
+| Natural `✦` | Local command and option discovery over the SQLite catalog; potion-base-8M semantic ranking when indexed; suggestions never execute | `copy a directory while preserving permissions`, `find the option that follows symlinks` | `mode natural` or `mode nl`; Alt-M cycles modes |
 
 ```quirl
 ◆ http get /health | match {
@@ -926,7 +927,7 @@ and accessible text output, per the release criterion in §10.
 
 On 15 August 2026, the following decisions were reviewed and agreed:
 
-- **Two explicit interactive modes:** command mode uses bytes and compatibility syntax; data mode uses typed value pipelines.
+- **Three explicit interactive modes:** command mode uses bytes and compatibility syntax; data mode uses typed value pipelines; natural mode searches local command knowledge without execution.
 - **C0–C4 compatibility levels:** optimize copy/paste and common interactive syntax; use reference interpreters for exact dialect behavior.
 - **Result-based errors outside command mode:** retain traditional status interactively; require explicit failure handling in data pipelines and scripts.
 - **Lua 5.4 as the extension language:** Rust implements the product; one pinned Lua runtime and generated `quirl` SDK serve config, scripts, trusted plugins; annotations improve tooling while Rust schemas enforce boundaries.

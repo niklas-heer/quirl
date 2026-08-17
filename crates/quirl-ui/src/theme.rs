@@ -266,6 +266,7 @@ impl Theme {
         match mode {
             Mode::Command => self.palette.accent_command,
             Mode::Data => self.palette.accent_data,
+            Mode::Natural => self.palette.accent_command,
         }
     }
 

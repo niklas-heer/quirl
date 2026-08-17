@@ -1,3 +1,4 @@
+use crate::intelligence;
 use clap::{ArgAction, Subcommand, ValueEnum};
 use quirl_catalog::{
     import_bash, import_fish, import_help, import_man, import_zsh, Catalog, CommandSpec,
@@ -39,7 +40,6 @@ const INDEX_RETAINED_BYTES_MAX: usize = 16 * 1024 * 1024;
 const INDEX_DIAGNOSTICS_MAX: usize = 4_096;
 const INDEX_TEMPORARY_ATTEMPTS_MAX: usize = 64;
 const DISCOVERY_STATE_VERSION: u32 = 1;
-const DISCOVERY_STATE_READ_LIMIT: usize = 2 * 1024 * 1024;
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DISCOVERY_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const DISCOVERY_DEADLINE: Duration = Duration::from_millis(750);
@@ -400,6 +400,56 @@ pub fn load_default_catalog() -> Catalog {
     load_catalog_at(&path)
 }
 
+/// Return the configured SQLite command-database path for CLI intelligence tools.
+pub(crate) fn default_database_path() -> Result<PathBuf, ShellError> {
+    default_index_path().ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::InvalidArgument,
+            "cannot determine the local command-database path",
+        )
+        .with_help("Set QUIRL_INDEX_PATH, XDG_CACHE_HOME, or HOME and retry")
+    })
+}
+
+/// Search the current database with semantic embeddings when available and a
+/// deterministic lexical fallback otherwise.
+pub(crate) fn search_default_database(
+    query: &str,
+    limit: usize,
+) -> Result<Vec<intelligence::SearchResult>, ShellError> {
+    let path = default_database_path()?;
+    let bytes = read_index(&path).map_err(|error| {
+        error.with_help("Run `quirl index build` to create the command database")
+    })?;
+    let model_path = intelligence::default_model_path();
+    intelligence::search(&bytes, &path, query, limit, model_path.as_deref())
+}
+
+/// Rebuild potion-base-8M embeddings in one in-memory transaction and atomically
+/// replace the database only after every vector passes validation.
+pub(crate) fn build_default_embeddings() -> Result<intelligence::EmbeddingReport, ShellError> {
+    let path = default_database_path()?;
+    let model_path = intelligence::default_model_path().ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::InvalidArgument,
+            "cannot determine the local model path",
+        )
+        .with_help("Set QUIRL_MODEL_PATH or HOME and retry")
+    })?;
+    let bytes = read_index(&path)
+        .map_err(|error| error.with_help("Run `quirl index build` before indexing embeddings"))?;
+    let (encoded, report) = intelligence::build_embeddings(&bytes, &path, &model_path)?;
+    write_index_bytes_atomically(&path, &encoded, intelligence::DATABASE_BYTES_MAX)?;
+    Ok(report)
+}
+
+/// Read and validate bounded row counts from the default command database.
+pub(crate) fn default_database_stats() -> Result<intelligence::DatabaseStats, ShellError> {
+    let path = default_database_path()?;
+    let bytes = read_index(&path)?;
+    intelligence::database_stats(&bytes, &path)
+}
+
 /// Start periodic catalog discovery without delaying construction or first
 /// paint of the interactive editor. Failures are cache misses: the worker never
 /// owns terminal state and builtins remain immediately available.
@@ -513,9 +563,7 @@ fn refresh_catalog_cache(
     )?;
     catalog.merge(external_commands(&snapshot.executables, &snapshot.sources));
     ensure_refresh_active(deadline, cancelled, "before cache commit")?;
-    let encoded = encode_catalog(&catalog)?;
-    let catalog_fingerprint = fingerprint_bytes(&encoded);
-    write_catalog_atomically(&config.index_path, &catalog)?;
+    let catalog_fingerprint = fingerprint_bytes(&encode_catalog(&catalog)?);
     let state = DiscoveryState {
         version: DISCOVERY_STATE_VERSION,
         catalog_schema_version: catalog.schema_version,
@@ -524,7 +572,7 @@ fn refresh_catalog_cache(
         catalog_fingerprint,
         sources: snapshot.sources,
     };
-    write_discovery_state(&discovery_state_path(&config.index_path), &state)?;
+    write_catalog_atomically(&config.index_path, &catalog, Some(&state))?;
     Ok(true)
 }
 
@@ -532,8 +580,17 @@ fn discovery_cache_is_current(
     config: &DiscoveryConfig,
     snapshot: &DiscoverySnapshot,
 ) -> Result<bool, ShellError> {
-    let state_path = discovery_state_path(&config.index_path);
-    let Ok(state) = read_discovery_state(&state_path) else {
+    let Ok(bytes) = read_index(&config.index_path) else {
+        return Ok(false);
+    };
+    let Ok((catalog, state_json)) = intelligence::decode_database(&bytes, &config.index_path)
+    else {
+        return Ok(false);
+    };
+    let Some(state_json) = state_json else {
+        return Ok(false);
+    };
+    let Ok(state) = serde_json::from_str::<DiscoveryState>(&state_json) else {
         return Ok(false);
     };
     let age_ms = unix_time_ms().saturating_sub(state.refreshed_unix_ms);
@@ -546,14 +603,10 @@ fn discovery_cache_is_current(
     {
         return Ok(false);
     }
-    let source = match read_index(&config.index_path) {
-        Ok(source) => source,
-        Err(_) => return Ok(false),
-    };
-    if fingerprint_bytes(source.as_bytes()) != state.catalog_fingerprint {
+    if fingerprint_bytes(&encode_catalog(&catalog)?) != state.catalog_fingerprint {
         return Ok(false);
     }
-    Ok(decode_catalog(&source, &config.index_path).is_ok())
+    Ok(true)
 }
 
 fn ensure_refresh_active(
@@ -585,7 +638,7 @@ fn ensure_refresh_active(
 
 fn load_catalog_at(path: &Path) -> Catalog {
     match read_index(path) {
-        Ok(source) => decode_catalog(&source, path)
+        Ok(bytes) => decode_catalog(&bytes, path)
             .map(merge_cached_catalog)
             .unwrap_or_else(|_| Catalog::builtin()),
         Err(_) => Catalog::builtin(),
@@ -656,7 +709,7 @@ fn build_index(
         )
         .with_help("Pass an explicit destination with `quirl index build --output <path>`")
     })?;
-    write_catalog_atomically(&output, &catalog)?;
+    write_catalog_atomically(&output, &catalog, None)?;
     let report = BuildReport {
         index: output,
         source_files: fish_files.len()
@@ -1324,45 +1377,7 @@ fn default_index_path() -> Option<PathBuf> {
     env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .map(|cache| cache.join("quirl/catalog.json"))
-}
-
-fn discovery_state_path(index_path: &Path) -> PathBuf {
-    let mut name = index_path
-        .file_name()
-        .map(OsString::from)
-        .unwrap_or_else(|| OsString::from("catalog.json"));
-    name.push(".discovery.json");
-    index_path.with_file_name(name)
-}
-
-fn read_discovery_state(path: &Path) -> Result<DiscoveryState, ShellError> {
-    let source = read_index_utf8(
-        path,
-        DISCOVERY_STATE_READ_LIMIT,
-        "catalog discovery state",
-        "Remove the discovery sidecar and let Quirl rebuild it",
-    )?;
-    serde_json::from_str(&source).map_err(|error| {
-        ShellError::new(
-            ErrorCode::Validation,
-            format!("{} is not valid catalog discovery state", path.display()),
-        )
-        .with_context(error.to_string())
-        .with_help("Remove the discovery sidecar and let Quirl rebuild it")
-    })
-}
-
-fn write_discovery_state(path: &Path, state: &DiscoveryState) -> Result<(), ShellError> {
-    let encoded = serde_json::to_vec_pretty(state).map_err(json_error)?;
-    if encoded.len() > DISCOVERY_STATE_READ_LIMIT {
-        return Err(index_limit_error(
-            "discovery-state bytes",
-            DISCOVERY_STATE_READ_LIMIT,
-            encoded.len(),
-        ));
-    }
-    write_index_bytes_atomically(path, &encoded, DISCOVERY_STATE_READ_LIMIT)
+        .map(|cache| cache.join("quirl/catalog.sqlite3"))
 }
 
 fn unix_time_ms() -> u64 {
@@ -1395,12 +1410,12 @@ fn read_documentation(path: &Path, budget: &mut IndexBuildBudget) -> Result<Stri
     Ok(source)
 }
 
-fn read_index(path: &Path) -> Result<String, ShellError> {
-    read_index_utf8(
+pub(crate) fn read_index(path: &Path) -> Result<Vec<u8>, ShellError> {
+    read_index_bytes(
         path,
-        INDEX_READ_LIMIT,
-        "completion index",
-        "Build a readable regular index file at or below 4 MiB with `quirl index build`",
+        intelligence::DATABASE_BYTES_MAX,
+        "command database",
+        "Build a readable regular database with `quirl index build`",
     )
 }
 
@@ -1410,6 +1425,23 @@ fn read_index_utf8(
     context: &str,
     help: &str,
 ) -> Result<String, ShellError> {
+    let bytes = read_index_bytes(path, bytes_max, context, help)?;
+    String::from_utf8(bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            format!("{} is not UTF-8 {context} text", path.display()),
+        )
+        .with_context(error.to_string())
+        .with_help(help)
+    })
+}
+
+fn read_index_bytes(
+    path: &Path,
+    bytes_max: usize,
+    context: &str,
+    help: &str,
+) -> Result<Vec<u8>, ShellError> {
     let path_metadata = fs::symlink_metadata(path).map_err(|error| {
         ShellError::new(
             ErrorCode::Io,
@@ -1478,14 +1510,7 @@ fn read_index_utf8(
             u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         ));
     }
-    String::from_utf8(bytes).map_err(|error| {
-        ShellError::new(
-            ErrorCode::Validation,
-            format!("{} is not UTF-8 {context} text", path.display()),
-        )
-        .with_context(error.to_string())
-        .with_help(help)
-    })
+    Ok(bytes)
 }
 
 fn validate_index_reader_metadata(
@@ -1537,33 +1562,44 @@ fn index_read_limit_error(
     .with_help(help)
 }
 
-fn decode_catalog(source: &str, path: &Path) -> Result<Catalog, ShellError> {
-    let catalog = Catalog::from_json(source).map_err(|error| {
-        ShellError::new(
-            ErrorCode::Validation,
-            format!("{} is not a valid Quirl completion index", path.display()),
-        )
-        .with_context(error.to_string())
-        .with_help("Rebuild it with `quirl index build`")
-    })?;
-    if catalog.schema_version != Catalog::builtin().schema_version {
-        return Err(ShellError::new(
-            ErrorCode::Validation,
-            format!(
-                "{} uses catalog schema {}, but this Quirl expects {}",
-                path.display(),
-                catalog.schema_version,
-                Catalog::builtin().schema_version
-            ),
-        )
-        .with_help("Rebuild it with `quirl index build`"));
+fn decode_catalog(source: &[u8], path: &Path) -> Result<Catalog, ShellError> {
+    if source
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'{')
+    {
+        let source = std::str::from_utf8(source).map_err(|error| {
+            ShellError::new(
+                ErrorCode::Validation,
+                format!("{} is not a valid legacy Quirl index", path.display()),
+            )
+            .with_context(error.to_string())
+            .with_help("Rebuild it with `quirl index build`")
+        })?;
+        return Catalog::from_json(source).map_err(|error| {
+            ShellError::new(
+                ErrorCode::Validation,
+                format!("{} is not a valid legacy Quirl index", path.display()),
+            )
+            .with_context(error.to_string())
+            .with_help("Rebuild it with `quirl index build`")
+        });
     }
-    Ok(catalog)
+    intelligence::decode_database(source, path).map(|(catalog, _)| catalog)
 }
 
-fn write_catalog_atomically(path: &Path, catalog: &Catalog) -> Result<(), ShellError> {
-    let encoded = encode_catalog(catalog)?;
-    write_index_bytes_atomically(path, &encoded, INDEX_READ_LIMIT)
+fn write_catalog_atomically(
+    path: &Path,
+    catalog: &Catalog,
+    discovery_state: Option<&DiscoveryState>,
+) -> Result<(), ShellError> {
+    let state_json = discovery_state
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(json_error)?;
+    let encoded = intelligence::encode_database(catalog, state_json.as_deref())?;
+    write_index_bytes_atomically(path, &encoded, intelligence::DATABASE_BYTES_MAX)
 }
 
 fn encode_catalog(catalog: &Catalog) -> Result<Vec<u8>, ShellError> {
@@ -1607,18 +1643,13 @@ fn write_index_bytes_atomically(
                 &metadata,
                 "Use an unlinked regular index file with no group/other write access",
             )?;
-            let expected = read_index_utf8(
+            let expected = read_index_bytes(
                 path,
                 bytes_max,
-                "completion index",
-                "Use an unlinked regular index file at or below 4 MiB",
+                "command database",
+                "Use an unlinked regular command database",
             )?;
-            replace_file_atomically(
-                path,
-                expected.as_bytes(),
-                encoded,
-                AtomicReplaceOptions { bytes_max },
-            )
+            replace_file_atomically(path, &expected, encoded, AtomicReplaceOptions { bytes_max })
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             install_new_index(path, encoded, parent.unwrap_or_else(|| Path::new(".")))
@@ -2051,10 +2082,10 @@ mod tests {
     #[test]
     fn atomic_index_round_trips_and_checks_the_schema() {
         let directory = temporary_directory();
-        let path = directory.join("catalog.json");
+        let path = directory.join("catalog.sqlite3");
         let catalog = Catalog::builtin();
-        write_catalog_atomically(&path, &catalog).unwrap();
-        let source = fs::read_to_string(&path).unwrap();
+        write_catalog_atomically(&path, &catalog, None).unwrap();
+        let source = fs::read(&path).unwrap();
         assert_eq!(decode_catalog(&source, &path).unwrap(), catalog);
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
         #[cfg(unix)]
@@ -2074,7 +2105,9 @@ mod tests {
         let command = catalog.find("demo").unwrap();
         assert_eq!(command.provenance.source, Provenance::External);
         assert!(command.provenance.fingerprint.is_some());
-        let state = read_discovery_state(&discovery_state_path(&config.index_path)).unwrap();
+        let bytes = read_index(&config.index_path).unwrap();
+        let (_, state_json) = intelligence::decode_database(&bytes, &config.index_path).unwrap();
+        let state: DiscoveryState = serde_json::from_str(&state_json.unwrap()).unwrap();
         assert_eq!(state.version, DISCOVERY_STATE_VERSION);
         assert!(!state.sources.is_empty());
         assert!(state.source_fingerprint.starts_with("fnv1a64:"));
@@ -2171,7 +2204,9 @@ mod tests {
         assert!(load_catalog_at(&config.index_path)
             .find("parallel")
             .is_some());
-        let state = read_discovery_state(&discovery_state_path(&config.index_path)).unwrap();
+        let bytes = read_index(&config.index_path).unwrap();
+        let (_, state_json) = intelligence::decode_database(&bytes, &config.index_path).unwrap();
+        let state: DiscoveryState = serde_json::from_str(&state_json.unwrap()).unwrap();
         assert_eq!(
             state.catalog_schema_version,
             Catalog::builtin().schema_version

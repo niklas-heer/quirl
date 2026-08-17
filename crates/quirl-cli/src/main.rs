@@ -1,12 +1,14 @@
 //! Quirl's command-line composition root and interactive shell executable.
 
 mod agent;
+mod ai;
 mod author;
 mod bounded_file;
 mod config;
 mod extension_scheduler;
 mod extensions;
 mod index;
+mod intelligence;
 mod lsp;
 mod lua_worker;
 mod mcp;
@@ -19,6 +21,7 @@ mod recovery;
 mod script;
 
 use agent::AgentCommand;
+use ai::AiCommand;
 use author::{DescribeCommand, DocCommand, NewCommand};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::ConfigCommand;
@@ -167,6 +170,11 @@ enum Command {
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
+    },
+    /// Search and index local command intelligence without network inference.
+    Ai {
+        #[command(subcommand)]
+        command: AiCommand,
     },
     /// Inspect, validate, build, or dry-run publication of a Quirl package.
     Package {
@@ -394,6 +402,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             Ok(0)
         }
         Some(Command::Agent { command }) => agent::execute(command, &load_composed_catalog()?),
+        Some(Command::Ai { command }) => ai::execute(command),
         Some(Command::Package { command }) => package::execute(command, &load_composed_catalog()?),
         Some(Command::Describe { command }) => author::describe(command, &load_composed_catalog()?),
         Some(Command::Doc { command }) => author::doc(command, &load_composed_catalog()?),
@@ -540,6 +549,7 @@ impl Command {
             Self::Config { command } => config::wants_json(command),
             Self::Plugin { command } => plugin::wants_json(command),
             Self::Agent { command } => agent::wants_json(command),
+            Self::Ai { command } => ai::wants_json(command),
             Self::Package { command } => package::wants_json(command),
             Self::Describe { command } => {
                 matches!(command.format, author::DocumentationFormat::Json)
@@ -1914,6 +1924,25 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         }
                         last_duration = Some(started.elapsed());
                     }
+                    InteractiveLine::Natural(query) => {
+                        let started = Instant::now();
+                        match index::search_default_database(query, 8) {
+                            Ok(results) => {
+                                last_status = i32::from(results.is_empty());
+                                ai::present_results(&results, ai::AiOutputFormat::Text)?;
+                                if results.is_empty() {
+                                    eprintln!(
+                                        "no matching commands; refresh with `quirl index build`"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                last_status = 1;
+                                eprintln!("{}", render_stderr_error(&error));
+                            }
+                        }
+                        last_duration = Some(started.elapsed());
+                    }
                     InteractiveLine::Lua(source) => {
                         let planned = match prepare_extension_plan(
                             &extensions,
@@ -2708,8 +2737,10 @@ fn mode_feedback(mode: Mode, unicode: bool) -> String {
     let (separator, description) = match (unicode, mode) {
         (true, Mode::Command) => (" → ", "processes and byte pipelines"),
         (true, Mode::Data) => (" → ", "typed values and data pipelines"),
+        (true, Mode::Natural) => (" → ", "local command and option suggestions"),
         (false, Mode::Command) => (": ", "processes and byte pipelines"),
         (false, Mode::Data) => (": ", "typed values and data pipelines"),
+        (false, Mode::Natural) => (": ", "local command and option suggestions"),
     };
     let detail_separator = if unicode { " · " } else { " - " };
     format!("mode{separator}{mode}{detail_separator}{description}")

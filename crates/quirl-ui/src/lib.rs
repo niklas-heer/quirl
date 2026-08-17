@@ -1530,11 +1530,14 @@ impl SurfaceSymbols {
         match (self, mode) {
             (Self::Plain, Mode::Command) => "> ",
             (Self::Plain, Mode::Data) => "D ",
+            (Self::Plain, Mode::Natural) => "AI ",
             (Self::Unicode, Mode::Command) => "❯ ",
             (Self::Unicode, Mode::Data) => "◆ ",
+            (Self::Unicode, Mode::Natural) => "✦ ",
             // These private-use glyphs are restricted to the explicit patched-font profile.
             (Self::NerdFont, Mode::Command) => "\u{f105} ",
             (Self::NerdFont, Mode::Data) => "\u{f1b2} ",
+            (Self::NerdFont, Mode::Natural) => "\u{f544} ",
         }
     }
 
@@ -1926,11 +1929,13 @@ impl Prompt for QuirlPrompt {
             match self.mode {
                 Mode::Command => "command >",
                 Mode::Data => "data >",
+                Mode::Natural => "natural >",
             }
         } else {
             match self.mode {
                 Mode::Command => "command ❯",
                 Mode::Data => "data ◆",
+                Mode::Natural => "natural ✦",
             }
         };
         Cow::Owned(match edit_mode {
@@ -1955,6 +1960,7 @@ impl Prompt for QuirlPrompt {
             match self.mode {
                 Mode::Command => ">",
                 Mode::Data => "data>",
+                Mode::Natural => "natural>",
             }
         } else {
             self.mode.prompt()

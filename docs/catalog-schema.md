@@ -1,6 +1,9 @@
 # Semantic command catalog schema v4
 
-Quirl's command intelligence is one deny-unknown, versioned JSON document.
+Quirl's runtime command contract is one deny-unknown, versioned catalog. Its
+durable representation is a normalized SQLite database; the database also
+retains an exact JSON snapshot so existing catalog consumers deserialize the
+same `CommandSpec` values rather than reconstructing them from SQL rows.
 Completion, generated documentation, the language service, agent context, and
 plugin contributions consume the same `CommandSpec` records from
 `quirl-catalog`; none of those projections maintains a parallel command list.
@@ -61,16 +64,42 @@ Declarative source symlinks are canonicalized to a regular target and then
 subjected to the same size, permission, and hard-link checks; cache destination
 and parent symlinks remain rejected.
 
-`catalog.json.discovery.json` is a deny-unknown, versioned sidecar containing a
-bounded sorted source inventory, content/metadata fingerprints, refresh time,
-and the fingerprint and schema version of `catalog.json`. A missing, stale,
-corrupt, incompatible, or mismatched sidecar is a cache miss. Quirl rebuilds a
-complete catalog from current builtins plus imported facts and atomically
-replaces the files. The catalog is committed first; interruption between the
-two commits therefore leaves a detectable mismatch rather than a falsely fresh
-cache. Concurrent shells may duplicate bounded discovery, but readers observe
-only complete atomic documents. Cache failures fall back to current builtins
-and cannot prevent terminal startup or clean shutdown.
+The default database is `$XDG_CACHE_HOME/quirl/catalog.sqlite3` (or the
+equivalent under `$HOME/.cache`) and can be overridden with
+`QUIRL_INDEX_PATH`. It contains normalized commands, aliases, arguments,
+argument names and values, conflicts, examples, effects, exit codes,
+provenance, semantic documents, and Model2Vec embeddings. Discovery state is a
+versioned JSON value inside the same transaction, containing the bounded sorted
+source inventory, content/metadata fingerprints, refresh time, and the catalog
+fingerprint and schema version. A missing, stale, corrupt, incompatible, or
+mismatched database is a cache miss. Quirl rebuilds a complete in-memory SQLite
+database from current builtins plus imported facts, validates its size, and
+atomically replaces the old file. Concurrent shells may duplicate bounded
+discovery, but readers observe only complete databases. Cache failures fall
+back to current builtins and cannot prevent terminal startup or clean shutdown.
+
+Schema `user_version` 1 and application id `QUIR` identify the database. Reads
+are limited to 128 MiB, SQL runtime limits disable attached databases and
+SQLite worker threads, and command discovery remains capped at 65,536 records.
+Legacy catalog JSON schemas 2 and 3 remain readable for migration, but every new
+write uses SQLite.
+
+## Local semantic intelligence
+
+`quirl ai index` loads `minishlab/potion-base-8M` only from local files under
+`$XDG_DATA_HOME/quirl/models/potion-base-8M` (or `QUIRL_MODEL_PATH`). Network
+model loading is compiled out. The loader admits only bounded regular
+`config.json`, `tokenizer.json`, and `model.safetensors` files. Commands and
+options become separately fingerprinted semantic documents; all vectors are
+dimension- and finiteness-checked before one transaction replaces the prior
+embedding set.
+
+`quirl ai search` supports natural-language command search and option search;
+`quirl ai related` provides related-command and related-option suggestions.
+The interactive `natural`/`nl` mode exposes the same ranking. When either the
+local model or matching embeddings are unavailable, the query uses bounded,
+deterministic lexical ranking. Suggestions are display-only and are never
+executed automatically.
 
 Plugin commands are normalized only after manifest validation. Platform v0.1
 requires the plugin name as the command namespace, preventing implicit builtin

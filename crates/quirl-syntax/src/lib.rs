@@ -252,7 +252,7 @@ pub fn highlight(line: &str, mode: Mode) -> Vec<HighlightSpan> {
     if line.is_empty() {
         return Vec::new();
     }
-    if mode == Mode::Data {
+    if mode != Mode::Command {
         return vec![HighlightSpan {
             range: 0..line.len(),
             kind: HighlightKind::Argument,
@@ -1162,14 +1162,17 @@ pub enum Mode {
     Command,
     /// Native typed-data expressions and value pipelines.
     Data,
+    /// Natural-language command and option discovery. Suggestions are never executed.
+    Natural,
 }
 
 impl Mode {
-    /// Return the other interactive grammar without mutating session state.
+    /// Return the next interactive grammar without mutating session state.
     pub const fn toggled(self) -> Self {
         match self {
             Self::Command => Self::Data,
-            Self::Data => Self::Command,
+            Self::Data => Self::Natural,
+            Self::Natural => Self::Command,
         }
     }
 
@@ -1181,6 +1184,7 @@ impl Mode {
         match self {
             Self::Command => "❯",
             Self::Data => "◆",
+            Self::Natural => "✦",
         }
     }
 }
@@ -1190,6 +1194,7 @@ impl fmt::Display for Mode {
         formatter.write_str(match self {
             Self::Command => "command",
             Self::Data => "data",
+            Self::Natural => "natural",
         })
     }
 }
@@ -1201,8 +1206,9 @@ impl FromStr for Mode {
         match value {
             "command" | "cmd" => Ok(Self::Command),
             "data" => Ok(Self::Data),
+            "natural" | "nl" => Ok(Self::Natural),
             _ => Err(format!(
-                "unknown mode `{value}`; expected `command` or `data`"
+                "unknown mode `{value}`; expected `command`, `data`, or `natural`"
             )),
         }
     }
@@ -1225,6 +1231,8 @@ pub enum InteractiveLine<'a> {
     Command(&'a str),
     /// Trimmed source to evaluate with the native typed-data grammar.
     Data(&'a str),
+    /// Natural-language task description to search without execution.
+    Natural(&'a str),
     /// Expression following the mode-independent `lua ` prefix.
     Lua(&'a str),
 }
@@ -1233,8 +1241,8 @@ pub enum InteractiveLine<'a> {
 ///
 /// Leading and trailing whitespace is removed before classification. Exit,
 /// mode, help, and Lua bridge forms take precedence over the active grammar;
-/// all other input is returned as [`InteractiveLine::Command`] or
-/// [`InteractiveLine::Data`]. An invalid `mode <value>` is deliberately left to
+/// all other input is returned for command, data, or natural-language handling.
+/// An invalid `mode <value>` is deliberately left to
 /// the active grammar instead of being silently accepted. Returned string
 /// slices borrow `input`, and this function performs no allocation on success.
 pub fn classify(mode: Mode, input: &str) -> InteractiveLine<'_> {
@@ -1266,6 +1274,7 @@ pub fn classify(mode: Mode, input: &str) -> InteractiveLine<'_> {
     match mode {
         Mode::Command => InteractiveLine::Command(input),
         Mode::Data => InteractiveLine::Data(input),
+        Mode::Natural => InteractiveLine::Natural(input),
     }
 }
 
@@ -1373,6 +1382,13 @@ mod tests {
             classify(Mode::Command, "echo hello"),
             InteractiveLine::Command("echo hello")
         );
+        assert_eq!(
+            classify(Mode::Natural, "copy a directory preserving permissions"),
+            InteractiveLine::Natural("copy a directory preserving permissions")
+        );
+        assert_eq!(Mode::Command.toggled(), Mode::Data);
+        assert_eq!(Mode::Data.toggled(), Mode::Natural);
+        assert_eq!(Mode::Natural.toggled(), Mode::Command);
     }
 
     #[test]

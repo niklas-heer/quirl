@@ -29,9 +29,12 @@ quirl-process = { path = "../quirl-process" }
 quirl-syntax = { path = "../quirl-syntax" }
 quirl-ui = { path = "../quirl-ui" }
 reedline.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 signal-hook.workspace = true
+model2vec-rs.workspace = true
 unicode-width.workspace = true
 
 [target.'cfg(unix)'.dependencies]

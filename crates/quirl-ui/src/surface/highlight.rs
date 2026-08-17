@@ -415,7 +415,7 @@ fn diagnostic_for(
     mode: Mode,
     spans: &[HighlightSpan],
 ) -> Option<SurfaceDiagnostic> {
-    if buffer.trim().is_empty() || mode == Mode::Data {
+    if buffer.trim().is_empty() || mode != Mode::Command {
         return None;
     }
     let parsed = match parse_command_list(buffer) {

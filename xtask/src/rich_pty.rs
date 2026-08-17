@@ -26,7 +26,7 @@ use std::{
 const STARTUP_MARKER: &[u8] = b"Tab complete";
 const ALTERNATE_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
 const ALTERNATE_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
-const DISCOVERY_ARTIFACT_BYTES_MAX: usize = 4 * 1024 * 1024;
+const DISCOVERY_ARTIFACT_BYTES_MAX: usize = 128 * 1024 * 1024;
 const DISCOVERY_DIRECTORY_ENTRIES_MAX: usize = 8;
 const DISCOVERY_FIXTURE_BYTES_MAX: usize = 4 * 1024;
 const CHECK_NAMES: &[&str] = &[
@@ -156,7 +156,7 @@ return quirl.config {{
             ),
             (
                 OsString::from("QUIRL_INDEX_PATH"),
-                index_dir.join("catalog.json").into_os_string(),
+                index_dir.join("catalog.sqlite3").into_os_string(),
             ),
             (
                 OsString::from("QUIRL_RECOVERY_DIR"),
@@ -505,6 +505,15 @@ fn check_rich_editing(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.send(key::ALT_M)?;
     session
         .pty
+        .wait_for_screen("rich natural-mode status", |screen| {
+            screen
+                .lines()
+                .iter()
+                .any(|line| line.starts_with("natural | Alt-M mode"))
+        })?;
+    session.pty.send(key::ALT_M)?;
+    session
+        .pty
         .wait_for_screen("rich command-mode status", |screen| {
             screen
                 .lines()
@@ -556,6 +565,7 @@ fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.wait_for_screen_text("MODE_BUFFER_RETAINED")?;
     for (expected_mode, expected_indicator) in [
         ("data", "D echo MODE_BUFFER_RETAINED"),
+        ("natural", "AI echo MODE_BUFFER_RETAINED"),
         ("command", "> echo MODE_BUFFER_RETAINED"),
         ("data", "D echo MODE_BUFFER_RETAINED"),
     ] {
@@ -850,13 +860,11 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
             shell_quote(&hostile_marker)
         ),
     )?;
-    let catalog_path = index_dir.join("catalog.json");
-    let state_path = index_dir.join("catalog.json.discovery.json");
+    let catalog_path = index_dir.join("catalog.sqlite3");
 
     let mut cold = discovery_session(binary, &binary_dir, &index_dir, &help_dir)?;
     cold.pty.wait_for(STARTUP_MARKER)?;
     wait_for_file(&mut cold, catalog_path.clone())?;
-    wait_for_file(&mut cold, state_path.clone())?;
     assert_discovery_artifacts_bounded(&index_dir)?;
     wait_for_command_information(
         &mut cold,
@@ -875,17 +883,40 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     cold.pty.send(key::ESCAPE)?;
     wait_for_standard_status(&mut cold)?;
     clear_editor(&mut cold)?;
+    cold.pty.send(key::ALT_M)?;
+    cold.pty
+        .wait_for_screen("data mode before natural search", |screen| {
+            screen.bottom_line().starts_with("data | Alt-M mode")
+        })?;
+    cold.pty.send(key::ALT_M)?;
+    cold.pty
+        .wait_for_screen("natural mode before command search", |screen| {
+            screen.bottom_line().starts_with("natural | Alt-M mode")
+        })?;
+    let natural_output_start = cold.pty.output().len();
+    cold.pty.type_text("installed command discovered")?;
+    cold.pty.send(key::ENTER)?;
+    cold.pty.wait_for(b"lexical")?;
+    if !contains(&cold.pty.output()[natural_output_start..], b"cold-tool") {
+        return Err(io::Error::other(
+            "natural mode did not return the command discovered in SQLite",
+        )
+        .into());
+    }
+    cold.pty
+        .wait_for_screen("natural mode after command search", |screen| {
+            screen.bottom_line().starts_with("natural | Alt-M mode")
+        })?;
+    cold.pty.send(key::ALT_M)?;
+    wait_for_standard_status(&mut cold)?;
     cold.pty.send(key::CTRL_D)?;
     ensure_status(cold.pty.wait_exit()?, 0, "cold discovery session")?;
     let cold_catalog = read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX)?;
-    let cold_state = read_bounded_fixture(&state_path, DISCOVERY_ARTIFACT_BYTES_MAX)?;
     drop(cold);
 
     let mut warm = discovery_session(binary, &binary_dir, &index_dir, &help_dir)?;
     warm.pty.wait_for(STARTUP_MARKER)?;
-    if read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX)? != cold_catalog
-        || read_bounded_fixture(&state_path, DISCOVERY_ARTIFACT_BYTES_MAX)? != cold_state
-    {
+    if read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX)? != cold_catalog {
         return Err(io::Error::other("warm discovery rewrote matching durable state").into());
     }
     wait_for_command_information(
@@ -913,7 +944,7 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     wait_for_prompt(&mut warm)?;
     wait_for_file_contents(&mut warm, &catalog_path, b"changed-path-tool")?;
     wait_for_file_contents(&mut warm, &catalog_path, b"changed-declaration")?;
-    wait_for_file_contents(&mut warm, &state_path, b"changed-declaration.help")?;
+    wait_for_file_contents(&mut warm, &catalog_path, b"changed-declaration.help")?;
     enter_and_wait(&mut warm, "cd .", STARTUP_MARKER)?;
     wait_for_prompt(&mut warm)?;
     wait_for_command_information(
@@ -935,9 +966,7 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     clear_editor(&mut warm)?;
     warm.pty.send(key::CTRL_D)?;
     ensure_status(warm.pty.wait_exit()?, 0, "warm discovery session")?;
-    if read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX)? == cold_catalog
-        || read_bounded_fixture(&state_path, DISCOVERY_ARTIFACT_BYTES_MAX)? == cold_state
-    {
+    if read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX)? == cold_catalog {
         return Err(
             io::Error::other("changed discovery sources did not replace durable state").into(),
         );
@@ -948,8 +977,8 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     let corrupt_index = corrupt.path.join("index");
     create_private_directory(&corrupt_index)?;
     write_fixture(
-        &corrupt_index.join("catalog.json"),
-        "{ definitely not catalog json",
+        &corrupt_index.join("catalog.sqlite3"),
+        "not a sqlite command database",
     )?;
     let _permissions = DirectoryPermissionsGuard::make_read_only(&corrupt_index)?;
     let mut degraded = discovery_session(binary, &binary_dir, &corrupt_index, &help_dir)?;
@@ -1142,6 +1171,15 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"cancelled")?;
     wait_for_prompt(&mut session)?;
+    session.pty.send(key::ALT_M)?;
+    session
+        .pty
+        .wait_for_screen("natural mode after typed runtime checks", |screen| {
+            screen
+                .lines()
+                .iter()
+                .any(|line| line.starts_with("natural | Alt-M mode"))
+        })?;
     session.pty.send(key::ALT_M)?;
     session
         .pty
