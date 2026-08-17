@@ -26,7 +26,7 @@ use std::{
     io::{self, Read},
     ops::Range,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -41,7 +41,7 @@ use quirl_core::ExecutionEffect;
 use serde_json::Value;
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 
 const QUIRL_CANONICAL_EXTENSION: &str = "qrl";
 const SCRIPT_EXECUTION_DEADLINE: Duration = Duration::from_secs(30);
@@ -95,8 +95,39 @@ impl ScriptCancellation {
 }
 
 /// Signal registrations kept alive for one planned `quirl run` invocation.
+#[derive(Debug)]
 pub(crate) struct ScriptSignalGuard {
     signal_ids: Vec<signal_hook::SigId>,
+}
+
+impl ScriptSignalGuard {
+    fn register(
+        signals: &[i32],
+        cancelled: Arc<AtomicBool>,
+        message: &'static str,
+    ) -> Result<Self, ShellError> {
+        Self::register_with(signals, cancelled, message, signal_hook::flag::register)
+    }
+
+    fn register_with(
+        signals: &[i32],
+        cancelled: Arc<AtomicBool>,
+        message: &'static str,
+        mut register: impl FnMut(i32, Arc<AtomicBool>) -> io::Result<signal_hook::SigId>,
+    ) -> Result<Self, ShellError> {
+        let mut guard = Self {
+            signal_ids: Vec::with_capacity(signals.len()),
+        };
+        for signal in signals {
+            let signal_id = register(*signal, Arc::clone(&cancelled)).map_err(|error| {
+                ShellError::new(ErrorCode::Io, message)
+                    .with_context(error.to_string())
+                    .with_help("Retry after restoring the process signal state")
+            })?;
+            guard.signal_ids.push(signal_id);
+        }
+        Ok(guard)
+    }
 }
 
 impl Drop for ScriptSignalGuard {
@@ -887,23 +918,16 @@ pub(crate) fn run(
     let path = (file != Path::new("-")).then_some(file);
     let language = detect_language(&source, path, requested_language)?;
     let cancellation = ScriptCancellation::default();
-    let signal_id = matches!(
+    let signal_guard = matches!(
         language,
         ScriptLanguage::Lua | ScriptLanguage::Bash | ScriptLanguage::Zsh
     )
     .then(|| {
-        signal_hook::flag::register(
-            signal_hook::consts::SIGINT,
+        ScriptSignalGuard::register(
+            &[signal_hook::consts::SIGINT],
             Arc::clone(&cancellation.cancelled),
+            "could not install script cancellation handler",
         )
-        .map_err(|error| {
-            ShellError::new(
-                ErrorCode::Io,
-                "could not install script cancellation handler",
-            )
-            .with_context(error.to_string())
-            .with_help("Retry the script; report repeated signal-handler failures")
-        })
     })
     .transpose()?;
     let result = run_source_with_cancellation(
@@ -914,9 +938,7 @@ pub(crate) fn run(
         arguments,
         &cancellation,
     );
-    if let Some(signal_id) = signal_id {
-        signal_hook::low_level::unregister(signal_id);
-    }
+    drop(signal_guard);
     result
 }
 
@@ -948,15 +970,11 @@ pub(crate) fn execution_request(
         ScriptLanguage::Lua | ScriptLanguage::Quirl => ExecutionOutputTarget::Value,
     };
     let cancellation = ExecutionCancellation::default();
-    let signal_id = signal_hook::flag::register(signal_hook::consts::SIGINT, cancellation.atomic())
-        .map_err(|error| {
-            ShellError::new(
-                ErrorCode::Io,
-                "could not install script cancellation handler",
-            )
-            .with_context(error.to_string())
-            .with_help("Retry the script; report repeated signal-handler failures")
-        })?;
+    let signal_guard = ScriptSignalGuard::register(
+        &[signal_hook::consts::SIGINT],
+        cancellation.atomic(),
+        "could not install script cancellation handler",
+    )?;
     let request = ExecutionRequest::new(ExecutionSource::new(source_name, source)?, mode)
         .with_cancellation(cancellation)
         .with_input(ExecutionInput::None)
@@ -964,12 +982,7 @@ pub(crate) fn execution_request(
         .with_deadline(SCRIPT_EXECUTION_DEADLINE)
         .with_output(output)
         .with_effects(ExecutionEffects::all(), ExecutionEffects::all());
-    Ok((
-        request,
-        ScriptSignalGuard {
-            signal_ids: vec![signal_id],
-        },
-    ))
+    Ok((request, signal_guard))
 }
 
 fn read_script_file(path: &Path) -> Result<String, ShellError> {
@@ -1099,6 +1112,7 @@ pub(crate) fn run_source_with_cancellation(
                 executable: language.executable(),
                 deadline: script_deadline()?,
                 max_bytes_per_stream: EXECUTION_CAPTURE_BYTES_MAX,
+                executor: None,
             })?;
             Ok(ScriptRunOutput {
                 status: outcome.status,
@@ -1118,56 +1132,41 @@ pub(crate) fn run_source_with_cancellation(
 /// Standard input is closed. `SIGINT` cancels the interpreter, and on Unix
 /// `SIGTSTP` also cancels instead of suspending Quirl without a retained job.
 /// The caller owns rendering, so this returns the common command outcome.
-pub fn run_interactive_island(
-    language: ScriptLanguage,
-    source: &str,
-    source_name: &str,
-    arguments: &[String],
-    deadline: ExecutionDeadline,
-    max_bytes_per_stream: usize,
-    cancellation: &ScriptCancellation,
+pub(crate) struct InteractiveIslandRequest<'a> {
+    pub(crate) language: ScriptLanguage,
+    pub(crate) source: &'a str,
+    pub(crate) source_name: &'a str,
+    pub(crate) arguments: &'a [String],
+    pub(crate) deadline: ExecutionDeadline,
+    pub(crate) max_bytes_per_stream: usize,
+    pub(crate) cancellation: &'a ScriptCancellation,
+    pub(crate) executor: &'a NativeExecutor,
+}
+
+pub(crate) fn run_interactive_island(
+    request: InteractiveIslandRequest<'_>,
 ) -> Result<quirl_core::CommandOutcome, ShellError> {
-    let signal_id = signal_hook::flag::register(
-        signal_hook::consts::SIGINT,
-        Arc::clone(&cancellation.cancelled),
-    )
-    .map_err(|error| {
-        ShellError::new(
-            ErrorCode::Io,
-            "could not install interactive island cancellation handler",
-        )
-        .with_context(error.to_string())
-        .with_help("Retry the island; report repeated signal-handler failures")
-    })?;
     #[cfg(unix)]
-    let stop_signal_id = signal_hook::flag::register(
-        signal_hook::consts::SIGTSTP,
-        Arc::clone(&cancellation.cancelled),
-    )
-    .map_err(|error| {
-        signal_hook::low_level::unregister(signal_id);
-        ShellError::new(
-            ErrorCode::Io,
-            "could not install dialect-island stop handler",
-        )
-        .with_context(error.to_string())
-        .with_help("Retry the island; report repeated signal-handler failures")
-    })?;
-    let executable = language.executable();
-    let result = run_reference_script(ReferenceScriptRequest {
-        source,
-        source_name,
-        language,
-        arguments,
-        cancellation,
+    let signals = [signal_hook::consts::SIGINT, signal_hook::consts::SIGTSTP];
+    #[cfg(not(unix))]
+    let signals = [signal_hook::consts::SIGINT];
+    let _signal_guard = ScriptSignalGuard::register(
+        &signals,
+        Arc::clone(&request.cancellation.cancelled),
+        "could not install interactive island cancellation handlers",
+    )?;
+    let executable = request.language.executable();
+    run_reference_script(ReferenceScriptRequest {
+        source: request.source,
+        source_name: request.source_name,
+        language: request.language,
+        arguments: request.arguments,
+        cancellation: request.cancellation,
         executable,
-        deadline: deadline.expires_at(),
-        max_bytes_per_stream,
-    });
-    signal_hook::low_level::unregister(signal_id);
-    #[cfg(unix)]
-    signal_hook::low_level::unregister(stop_signal_id);
-    result
+        deadline: request.deadline.expires_at(),
+        max_bytes_per_stream: request.max_bytes_per_stream,
+        executor: Some(request.executor),
+    })
 }
 
 /// Execute a validated script plan without introducing a script-specific
@@ -1461,6 +1460,7 @@ struct ReferenceScriptRequest<'a> {
     executable: &'a str,
     deadline: Instant,
     max_bytes_per_stream: usize,
+    executor: Option<&'a NativeExecutor>,
 }
 
 fn run_reference_script(
@@ -1475,6 +1475,7 @@ fn run_reference_script(
         executable,
         deadline,
         max_bytes_per_stream,
+        executor,
     } = request;
     if max_bytes_per_stream == 0 || max_bytes_per_stream > EXECUTION_CAPTURE_BYTES_MAX {
         return Err(ShellError::new(
@@ -1487,6 +1488,9 @@ fn run_reference_script(
         .with_help("Use the validated execution plan capture ceiling"));
     }
     let mut command = Command::new(executable);
+    if let Some(executor) = executor {
+        executor.configure_child(&mut command)?;
+    }
     match language {
         ScriptLanguage::Bash => {
             command.args(["--noprofile", "--norc", "-c", source, source_name]);
@@ -1622,7 +1626,7 @@ fn run_reference_script(
     }
     ensure_reference_capture_within_limit(executable, "stdout", &stdout, max_bytes_per_stream)?;
     ensure_reference_capture_within_limit(executable, "stderr", &stderr, max_bytes_per_stream)?;
-    let status_code = status.code().unwrap_or(1);
+    let status_code = shell_status(status);
     if status_code != 0 && is_dialect_syntax_error(&stderr.value) {
         let (start, end) = dialect_error_span(source, &stderr.value);
         return Err(ShellError::new(
@@ -1645,6 +1649,17 @@ fn run_reference_script(
         stdout: Some(stdout.value),
         stderr: Some(stderr.value),
     })
+}
+
+fn shell_status(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    if let Some(signal) = status.signal() {
+        return 128_i32.checked_add(signal).unwrap_or(1);
+    }
+    1
 }
 
 fn terminate_reference_process(
@@ -2180,6 +2195,43 @@ mod tests {
             .is_ok()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn signal_guard_unregisters_after_partial_install_failure_and_drop() {
+        let partially_registered = Arc::new(AtomicBool::new(false));
+        let mut registrations = 0_usize;
+        let error = ScriptSignalGuard::register_with(
+            &[signal_hook::consts::SIGWINCH, signal_hook::consts::SIGWINCH],
+            Arc::clone(&partially_registered),
+            "injected signal install failure",
+            |signal, cancelled| {
+                registrations += 1;
+                if registrations == 2 {
+                    return Err(io::Error::other("injected second registration failure"));
+                }
+                signal_hook::flag::register(signal, cancelled)
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("injected"));
+        signal_hook::low_level::raise(signal_hook::consts::SIGWINCH).unwrap();
+        assert!(!partially_registered.load(Ordering::Relaxed));
+
+        let dropped_registration = Arc::new(AtomicBool::new(false));
+        let guard = ScriptSignalGuard::register(
+            &[signal_hook::consts::SIGWINCH],
+            Arc::clone(&dropped_registration),
+            "could not install test signal handler",
+        )
+        .unwrap();
+        signal_hook::low_level::raise(signal_hook::consts::SIGWINCH).unwrap();
+        assert!(dropped_registration.load(Ordering::Relaxed));
+        dropped_registration.store(false, Ordering::Relaxed);
+        drop(guard);
+        signal_hook::low_level::raise(signal_hook::consts::SIGWINCH).unwrap();
+        assert!(!dropped_registration.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn explicit_language_wins_over_shebang_and_extension() {
         assert_eq!(
@@ -2350,6 +2402,7 @@ mod tests {
             executable: "bash",
             deadline: script_deadline().unwrap(),
             max_bytes_per_stream: 64 * 1024,
+            executor: None,
         })
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
@@ -2386,6 +2439,7 @@ mod tests {
             executable: "/definitely/missing/quirl-reference-interpreter",
             deadline: script_deadline().unwrap(),
             max_bytes_per_stream: EXECUTION_CAPTURE_BYTES_MAX,
+            executor: None,
         })
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::ProcessSpawn);
@@ -2439,6 +2493,73 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reference_script_preserves_normal_and_signaled_exit_status() {
+        if !reference_interpreter_available("bash") {
+            eprintln!("skipping bash: interpreter is unavailable");
+            return;
+        }
+        let normal = run_source(
+            "exit 23",
+            "normal-status.bash",
+            None,
+            Some(ScriptLanguage::Bash),
+            &[],
+        )
+        .unwrap();
+        let signaled = run_source(
+            "kill -TERM $$",
+            "signal-status.bash",
+            None,
+            Some(ScriptLanguage::Bash),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(normal.status, 23);
+        assert_eq!(signaled.status, 128 + signal_hook::consts::SIGTERM);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reference_script_inherits_explicit_executor_environment() {
+        if !reference_interpreter_available("bash") {
+            eprintln!("skipping bash: interpreter is unavailable");
+            return;
+        }
+        let name = "QUIRL_REFERENCE_SESSION_ENVIRONMENT";
+        assert!(std::env::var_os(name).is_none());
+        let mut executor = NativeExecutor::default();
+        executor
+            .set_environment_variable(name.to_owned(), "executor-owned".to_owned())
+            .unwrap();
+        let cancellation = ScriptCancellation::default();
+        let deadline = ExecutionRequest::new(
+            ExecutionSource::new("environment.bash", format!("printf %s \"${name}\"")).unwrap(),
+            ExecutionMode::Bash,
+        )
+        .plan()
+        .unwrap()
+        .deadline();
+
+        let source = format!("printf %s \"${name}\"");
+        let outcome = run_interactive_island(InteractiveIslandRequest {
+            language: ScriptLanguage::Bash,
+            source: &source,
+            source_name: "environment.bash",
+            arguments: &[],
+            deadline,
+            max_bytes_per_stream: EXECUTION_CAPTURE_BYTES_MAX,
+            cancellation: &cancellation,
+            executor: &executor,
+        })
+        .unwrap();
+
+        assert_eq!(outcome.stdout.as_deref(), Some("executor-owned"));
+        assert!(std::env::var_os(name).is_none());
+    }
+
     #[test]
     fn interactive_dialect_island_observes_cancellation() {
         if !reference_interpreter_available("bash") {
@@ -2456,15 +2577,17 @@ mod tests {
         .unwrap()
         .deadline();
         let worker = thread::spawn(move || {
-            run_interactive_island(
-                ScriptLanguage::Bash,
-                "sleep 10",
-                "island",
-                &[],
+            let executor = NativeExecutor::default();
+            run_interactive_island(InteractiveIslandRequest {
+                language: ScriptLanguage::Bash,
+                source: "sleep 10",
+                source_name: "island",
+                arguments: &[],
                 deadline,
-                EXECUTION_CAPTURE_BYTES_MAX,
-                &worker_cancellation,
-            )
+                max_bytes_per_stream: EXECUTION_CAPTURE_BYTES_MAX,
+                cancellation: &worker_cancellation,
+                executor: &executor,
+            })
         });
         thread::sleep(Duration::from_millis(20));
         cancellation.cancelled.store(true, Ordering::Relaxed);

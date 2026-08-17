@@ -579,10 +579,11 @@ impl Command {
 fn run_exec_with_recovery(source: &str) -> Result<i32, ShellError> {
     let journal = recovery::RecoveryJournal::discover()?;
     let extensions = Arc::new(Mutex::new(LuaExtensionHost::discover()));
-    begin_extension_session(&extensions);
-    emit_directory_snapshot(&extensions);
+    let mut executor = NativeExecutor::default();
+    begin_extension_session(&extensions, &mut executor);
+    emit_directory_snapshot(&extensions, &mut executor);
     execute_with_recovery(
-        &mut NativeExecutor::default(),
+        &mut executor,
         &journal,
         source,
         Some(&extensions),
@@ -733,7 +734,7 @@ fn execute_execution_request(
         }
         ExecutionMode::Data => execute_data_plan(&plan),
         ExecutionMode::Lua => execute_lua_plan(&plan),
-        ExecutionMode::Bash | ExecutionMode::Zsh => execute_reference_plan(&plan),
+        ExecutionMode::Bash | ExecutionMode::Zsh => execute_reference_plan(executor, &plan),
         ExecutionMode::Plugin => {
             let extensions = extensions.ok_or_else(|| {
                 ShellError::new(
@@ -891,6 +892,7 @@ fn execute_lua_plan(plan: &quirl_core::ExecutionPlan) -> Result<ExecutionOutcome
 }
 
 fn execute_reference_plan(
+    executor: &NativeExecutor,
     plan: &quirl_core::ExecutionPlan,
 ) -> Result<ExecutionOutcome, ShellError> {
     require_declared_effect(plan, ExecutionEffect::SpawnProcess)?;
@@ -906,13 +908,13 @@ fn execute_reference_plan(
         _ => unreachable!("reference adapter received a non-reference mode"),
     };
     let cancellation = script::ScriptCancellation::from_atomic(plan.cancellation().atomic());
-    let outcome = script::run_interactive_island(
+    let outcome = script::run_interactive_island(script::InteractiveIslandRequest {
         language,
-        plan.source().text(),
-        plan.source().name(),
-        plan.arguments(),
-        plan.deadline(),
-        match plan.output() {
+        source: plan.source().text(),
+        source_name: plan.source().name(),
+        arguments: plan.arguments(),
+        deadline: plan.deadline(),
+        max_bytes_per_stream: match plan.output() {
             ExecutionOutputTarget::Capture {
                 max_bytes_per_stream,
             } => max_bytes_per_stream,
@@ -920,8 +922,9 @@ fn execute_reference_plan(
                 unreachable!("reference representation was validated above")
             }
         },
-        &cancellation,
-    )?;
+        cancellation: &cancellation,
+        executor,
+    })?;
     ExecutionOutcome::from_command(outcome, plan.output())
 }
 
@@ -984,7 +987,7 @@ fn execute_with_recovery(
                     .as_ref()
                     .map(extensions::InstalledPluginCommand::effect_names)
                     .unwrap_or_else(|| vec!["spawn_process".to_owned()]);
-                let mut planned = prepare_extension_plan(extensions, source, effects)?;
+                let mut planned = prepare_extension_plan(extensions, source, effects, executor)?;
                 planned.plugin_command = if planned.source == source {
                     plugin_command
                 } else {
@@ -1004,6 +1007,7 @@ fn execute_with_recovery(
                             },
                         ),
                         &mut annotations,
+                        executor,
                     );
                     print_extension_annotations(&annotations);
                     return Err(error);
@@ -1032,6 +1036,7 @@ fn execute_with_recovery(
                 },
             ),
             &mut annotations,
+            executor,
         );
     }
     let started = Instant::now();
@@ -1058,7 +1063,7 @@ fn execute_with_recovery(
                 }
             }
             if let Some(extensions) = extensions {
-                emit_execution_outcome_events(extensions, &outcome, &mut annotations);
+                emit_execution_outcome_events(extensions, &outcome, &mut annotations, executor);
                 apply_observation_actions(
                     notify_extensions(
                         extensions,
@@ -1069,6 +1074,7 @@ fn execute_with_recovery(
                         },
                     ),
                     &mut annotations,
+                    executor,
                 );
                 apply_observation_actions(
                     notify_extensions(
@@ -1079,6 +1085,7 @@ fn execute_with_recovery(
                         },
                     ),
                     &mut annotations,
+                    executor,
                 );
             }
             if renders_captured_output
@@ -1100,7 +1107,7 @@ fn execute_with_recovery(
                 eprintln!("warning: {}", render_stderr_error(&journal_error));
             }
             if let Some(extensions) = extensions {
-                notify_execution_error(extensions, &error, &mut annotations);
+                notify_execution_error(extensions, &error, &mut annotations, executor);
                 print_extension_annotations(&annotations);
             }
             Err(error)
@@ -1112,6 +1119,7 @@ fn notify_execution_error(
     extensions: &Arc<Mutex<LuaExtensionHost>>,
     error: &ShellError,
     annotations: &mut BTreeMap<String, serde_json::Value>,
+    executor: &mut NativeExecutor,
 ) {
     if let Some(reason) = execution_interruption_reason(error) {
         apply_observation_actions(
@@ -1122,6 +1130,7 @@ fn notify_execution_error(
                 },
             ),
             annotations,
+            executor,
         );
     }
     apply_observation_actions(
@@ -1132,6 +1141,7 @@ fn notify_execution_error(
             },
         ),
         annotations,
+        executor,
     );
 }
 
@@ -1597,13 +1607,14 @@ fn interactive_job_snapshots(jobs: &[quirl_process::JobState]) -> Vec<Interactiv
 }
 
 fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
+    let mut executor = NativeExecutor::default();
     let runtime_extensions_present = extensions
         .lock()
         .map(|extensions| extensions.has_runtime_extensions())
         .unwrap_or(false);
     if runtime_extensions_present {
-        begin_extension_session(&extensions);
-        emit_directory_snapshot(&extensions);
+        begin_extension_session(&extensions, &mut executor);
+        emit_directory_snapshot(&extensions, &mut executor);
     }
     let mut observed_directory = std::env::current_dir().unwrap_or_default();
     let (mut active_config, mut applied_revision) = {
@@ -1619,7 +1630,6 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         configured_initial_editor(&extensions, active_config.clone(), &history_path)?;
     print_banner(&active_config);
     let mut mode = Mode::Command;
-    let mut executor = NativeExecutor::default();
     // Recovery snapshots are only needed once a native command is accepted.
     // Environment capture can be deferred past the first interactive paint.
     let mut recovery = None;
@@ -1651,6 +1661,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         },
                     ),
                     &mut annotations,
+                    &mut executor,
                 );
                 print_extension_annotations(&annotations);
                 observed_directory = current_directory;
@@ -1793,8 +1804,12 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         last_duration = Some(started.elapsed());
                     }
                     InteractiveLine::Data(source) => {
-                        let planned = match prepare_extension_plan(&extensions, source, Vec::new())
-                        {
+                        let planned = match prepare_extension_plan(
+                            &extensions,
+                            source,
+                            Vec::new(),
+                            &mut executor,
+                        ) {
                             Ok(planned) => planned,
                             Err(error) => {
                                 last_status = 1;
@@ -1813,6 +1828,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 },
                             ),
                             &mut annotations,
+                            &mut executor,
                         );
                         let started = Instant::now();
                         match execute_interactive_data(&planned.source, &mut data_cache) {
@@ -1829,6 +1845,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                         },
                                     ),
                                     &mut annotations,
+                                    &mut executor,
                                 );
                                 debug_assert_eq!(outcome.status_code(), 0);
                                 apply_observation_actions(
@@ -1841,6 +1858,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                         },
                                     ),
                                     &mut annotations,
+                                    &mut executor,
                                 );
                                 apply_observation_actions(
                                     notify_extensions(
@@ -1851,12 +1869,18 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                         },
                                     ),
                                     &mut annotations,
+                                    &mut executor,
                                 );
                                 print_extension_annotations(&annotations);
                             }
                             Err(error) => {
                                 last_status = 1;
-                                notify_execution_error(&extensions, &error, &mut annotations);
+                                notify_execution_error(
+                                    &extensions,
+                                    &error,
+                                    &mut annotations,
+                                    &mut executor,
+                                );
                                 print_extension_annotations(&annotations);
                                 eprintln!("{}", render_stderr_error(&error));
                             }
@@ -1864,8 +1888,12 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         last_duration = Some(started.elapsed());
                     }
                     InteractiveLine::Lua(source) => {
-                        let planned = match prepare_extension_plan(&extensions, source, Vec::new())
-                        {
+                        let planned = match prepare_extension_plan(
+                            &extensions,
+                            source,
+                            Vec::new(),
+                            &mut executor,
+                        ) {
                             Ok(planned) => planned,
                             Err(error) => {
                                 last_status = 1;
@@ -1884,13 +1912,19 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 },
                             ),
                             &mut annotations,
+                            &mut executor,
                         );
                         let started = Instant::now();
                         match eval_lua(&mut lua, &planned.source) {
                             Ok(outcome) => {
                                 last_status = outcome.status_code();
                                 if let Some(value) = execution_value_json(&outcome) {
-                                    emit_value_output(&extensions, &value, &mut annotations);
+                                    emit_value_output(
+                                        &extensions,
+                                        &value,
+                                        &mut annotations,
+                                        &mut executor,
+                                    );
                                 }
                                 if let Err(error) = print_execution_outcome(&outcome) {
                                     eprintln!("{}", render_stderr_error(&error));
@@ -1905,6 +1939,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                         },
                                     ),
                                     &mut annotations,
+                                    &mut executor,
                                 );
                                 apply_observation_actions(
                                     notify_extensions(
@@ -1915,12 +1950,18 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                         },
                                     ),
                                     &mut annotations,
+                                    &mut executor,
                                 );
                                 print_extension_annotations(&annotations);
                             }
                             Err(error) => {
                                 last_status = 1;
-                                notify_execution_error(&extensions, &error, &mut annotations);
+                                notify_execution_error(
+                                    &extensions,
+                                    &error,
+                                    &mut annotations,
+                                    &mut executor,
+                                );
                                 print_extension_annotations(&annotations);
                                 eprintln!("{}", render_stderr_error(&error));
                             }
@@ -1940,6 +1981,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         },
                     ),
                     &mut annotations,
+                    &mut executor,
                 );
                 println!("^C");
             }
@@ -2006,7 +2048,10 @@ fn quiesce_extension_callbacks(
     quiescence.wait()
 }
 
-fn begin_extension_session(extensions: &Arc<Mutex<LuaExtensionHost>>) {
+fn begin_extension_session(
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+    executor: &mut NativeExecutor,
+) {
     let restored_session = std::env::var("QUIRL_SESSION_ID")
         .ok()
         .filter(|session| !session.trim().is_empty());
@@ -2019,6 +2064,7 @@ fn begin_extension_session(extensions: &Arc<Mutex<LuaExtensionHost>>) {
             },
         ),
         &mut annotations,
+        executor,
     );
     if let Some(session_id) = restored_session {
         apply_observation_actions(
@@ -2027,12 +2073,16 @@ fn begin_extension_session(extensions: &Arc<Mutex<LuaExtensionHost>>) {
                 ExtensionEventData::SessionRestore { session_id },
             ),
             &mut annotations,
+            executor,
         );
     }
     print_extension_annotations(&annotations);
 }
 
-fn emit_directory_snapshot(extensions: &Arc<Mutex<LuaExtensionHost>>) {
+fn emit_directory_snapshot(
+    extensions: &Arc<Mutex<LuaExtensionHost>>,
+    executor: &mut NativeExecutor,
+) {
     let current = std::env::current_dir()
         .unwrap_or_default()
         .display()
@@ -2047,6 +2097,7 @@ fn emit_directory_snapshot(extensions: &Arc<Mutex<LuaExtensionHost>>) {
             },
         ),
         &mut annotations,
+        executor,
     );
     print_extension_annotations(&annotations);
 }
@@ -2055,6 +2106,7 @@ fn prepare_extension_plan(
     extensions: &Arc<Mutex<LuaExtensionHost>>,
     source: &str,
     effects: Vec<String>,
+    executor: &mut NativeExecutor,
 ) -> Result<PlannedExecution, ShellError> {
     let mut planned = PlannedExecution::new(source);
     apply_plan_actions(
@@ -2066,6 +2118,7 @@ fn prepare_extension_plan(
             },
         )?,
         &mut planned,
+        executor,
     )?;
     Ok(planned)
 }
@@ -2073,14 +2126,18 @@ fn prepare_extension_plan(
 fn apply_plan_actions(
     actions: Vec<ExtensionAction>,
     planned: &mut PlannedExecution,
+    executor: &mut NativeExecutor,
 ) -> Result<(), ShellError> {
+    let mut environment_updates = Vec::new();
     for action in actions {
         match action {
             ExtensionAction::Diagnose { message } => {
                 eprintln!("extension: {}", terminal_safe_extension_text(&message));
             }
             ExtensionAction::RewritePlan { source } => planned.source = source,
-            ExtensionAction::SetEnvironment { name, value } => std::env::set_var(name, value),
+            ExtensionAction::SetEnvironment { name, value } => {
+                environment_updates.push((name, value));
+            }
             ExtensionAction::BlockExecution { reason } => {
                 return Err(ShellError::new(
                     ErrorCode::Validation,
@@ -2094,19 +2151,24 @@ fn apply_plan_actions(
             }
         }
     }
+    executor.set_environment_variables(&environment_updates)?;
     Ok(())
 }
 
 fn apply_observation_actions(
     actions: Vec<ExtensionAction>,
     annotations: &mut BTreeMap<String, serde_json::Value>,
+    executor: &mut NativeExecutor,
 ) {
+    let mut environment_updates = Vec::new();
     for action in actions {
         match action {
             ExtensionAction::Diagnose { message } => {
                 eprintln!("extension: {}", terminal_safe_extension_text(&message));
             }
-            ExtensionAction::SetEnvironment { name, value } => std::env::set_var(name, value),
+            ExtensionAction::SetEnvironment { name, value } => {
+                environment_updates.push((name, value));
+            }
             ExtensionAction::AnnotateResult { key, value } => {
                 annotations.insert(key, value);
             }
@@ -2115,12 +2177,16 @@ fn apply_observation_actions(
             }
         }
     }
+    if let Err(error) = executor.set_environment_variables(&environment_updates) {
+        eprintln!("extension: {}", render_stderr_error(&error));
+    }
 }
 
 fn emit_outcome_events(
     extensions: &Arc<Mutex<LuaExtensionHost>>,
     outcome: &CommandOutcome,
     annotations: &mut BTreeMap<String, serde_json::Value>,
+    executor: &mut NativeExecutor,
 ) {
     for (stream, text) in [
         (OutputStream::Stdout, outcome.stdout.as_deref()),
@@ -2137,6 +2203,7 @@ fn emit_outcome_events(
                     },
                 ),
                 annotations,
+                executor,
             );
         }
     }
@@ -2146,6 +2213,7 @@ fn emit_execution_outcome_events(
     extensions: &Arc<Mutex<LuaExtensionHost>>,
     outcome: &ExecutionOutcome,
     annotations: &mut BTreeMap<String, serde_json::Value>,
+    executor: &mut NativeExecutor,
 ) {
     match &outcome.output {
         ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => {
@@ -2153,15 +2221,16 @@ fn emit_execution_outcome_events(
                 extensions,
                 &command_outcome_projection(outcome),
                 annotations,
+                executor,
             );
         }
         ExecutionOutput::Value { value } => {
-            emit_value_output(extensions, &value.json_value(), annotations);
+            emit_value_output(extensions, &value.json_value(), annotations, executor);
         }
         ExecutionOutput::Values { values } => {
             let values =
                 serde_json::Value::Array(values.iter().map(StructuredValue::json_value).collect());
-            emit_value_output(extensions, &values, annotations);
+            emit_value_output(extensions, &values, annotations, executor);
         }
     }
 }
@@ -2200,6 +2269,7 @@ fn emit_value_output(
     extensions: &Arc<Mutex<LuaExtensionHost>>,
     value: &serde_json::Value,
     annotations: &mut BTreeMap<String, serde_json::Value>,
+    executor: &mut NativeExecutor,
 ) {
     let text = serde_json::to_string(value).unwrap_or_default();
     apply_observation_actions(
@@ -2212,6 +2282,7 @@ fn emit_value_output(
             },
         ),
         annotations,
+        executor,
     );
 }
 
@@ -3762,6 +3833,7 @@ mod tests {
     #[test]
     fn extension_plan_actions_rewrite_annotate_and_block_before_execution() {
         let mut planned = PlannedExecution::new("echo original");
+        let mut executor = NativeExecutor::default();
         apply_plan_actions(
             vec![
                 ExtensionAction::RewritePlan {
@@ -3773,6 +3845,7 @@ mod tests {
                 },
             ],
             &mut planned,
+            &mut executor,
         )
         .unwrap();
         assert_eq!(planned.source, "echo rewritten");
@@ -3783,6 +3856,7 @@ mod tests {
                 reason: "denied by policy".to_owned(),
             }],
             &mut planned,
+            &mut executor,
         )
         .unwrap_err();
         assert!(error.message.contains("blocked"));
@@ -3790,6 +3864,75 @@ mod tests {
         assert_eq!(
             terminal_safe_extension_text("raw\u{1b}[31m\rtext"),
             "raw\\u{1b}[31m\\rtext"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extension_actions_update_only_the_owning_executor_environment() {
+        let name = "QUIRL_EXTENSION_SESSION_ENVIRONMENT";
+        assert!(std::env::var_os(name).is_none());
+        let mut owner = NativeExecutor::default();
+        let mut independent = NativeExecutor::default();
+        let mut planned = PlannedExecution::new("true");
+
+        apply_plan_actions(
+            vec![ExtensionAction::SetEnvironment {
+                name: name.to_owned(),
+                value: "owner".to_owned(),
+            }],
+            &mut planned,
+            &mut owner,
+        )
+        .unwrap();
+
+        let command = format!("sh -c 'printf %s \"${name}\"'");
+        assert_eq!(
+            owner.execute_capture(&command).unwrap().stdout.as_deref(),
+            Some("owner")
+        );
+        assert_eq!(
+            independent
+                .execute_capture(&command)
+                .unwrap()
+                .stdout
+                .as_deref(),
+            Some("")
+        );
+        assert!(std::env::var_os(name).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_extension_actions_do_not_partially_commit_environment() {
+        let name = "QUIRL_BLOCKED_EXTENSION_ENVIRONMENT";
+        let mut executor = NativeExecutor::default();
+        let mut planned = PlannedExecution::new("true");
+
+        let error = apply_plan_actions(
+            vec![
+                ExtensionAction::SetEnvironment {
+                    name: name.to_owned(),
+                    value: "must-not-commit".to_owned(),
+                },
+                ExtensionAction::BlockExecution {
+                    reason: "blocked after staging".to_owned(),
+                },
+            ],
+            &mut planned,
+            &mut executor,
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("blocked"));
+        let command = format!("sh -c 'printf %s \"${name}\"'");
+        assert_eq!(
+            executor
+                .execute_capture(&command)
+                .unwrap()
+                .stdout
+                .as_deref(),
+            Some("")
         );
     }
 
