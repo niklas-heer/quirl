@@ -703,8 +703,8 @@ mod platform {
         match cleanup_result {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
             Err(Errno::EPERM) if cfg!(target_os = "macos") && owned_processes_exited => {
-                let group_probe = killpg(process_group, None);
-                if macos_eperm_group_is_gone(owned_processes_exited, &group_probe) {
+                if macos_eperm_group_is_gone(owned_processes_exited, || killpg(process_group, None))
+                {
                     Ok(())
                 } else {
                     Err(Errno::EPERM)
@@ -714,15 +714,29 @@ mod platform {
         }
     }
 
+    const GROUP_RETIREMENT_PROBES_MAX: usize = 1_024;
+
     fn macos_eperm_group_is_gone(
         owned_processes_exited: bool,
-        group_probe: &Result<(), Errno>,
+        mut probe_group: impl FnMut() -> Result<(), Errno>,
     ) -> bool {
         // Darwin documents EPERM for a group containing any process with a
         // different effective UID, so an exited leader alone proves nothing
-        // about descendants. Only a subsequent ESRCH probe proves that no
-        // process group remains; EPERM or success keeps cleanup fail-closed.
-        cfg!(target_os = "macos") && owned_processes_exited && *group_probe == Err(Errno::ESRCH)
+        // about descendants. Darwin can retain the zombie's group briefly
+        // after wait returns, so bounded probes admit only a later ESRCH.
+        // Persistent EPERM or success proves the group still exists and keeps
+        // cleanup fail-closed.
+        if !cfg!(target_os = "macos") || !owned_processes_exited {
+            return false;
+        }
+        for _ in 0..GROUP_RETIREMENT_PROBES_MAX {
+            match probe_group() {
+                Err(Errno::ESRCH) => return true,
+                Ok(()) | Err(Errno::EPERM) => thread::yield_now(),
+                Err(_) => return false,
+            }
+        }
+        false
     }
 
     impl Default for NativeExecutor {
@@ -4085,15 +4099,59 @@ mod platform {
 
         #[cfg(target_os = "macos")]
         #[test]
-        fn eperm_cleanup_requires_terminal_owners_and_an_absent_group() {
-            let absent_group = Err(Errno::ESRCH);
-            let changed_credentials = Err(Errno::EPERM);
-            let live_signalable_group = Ok(());
+        fn eperm_cleanup_requires_terminal_owners_and_eventual_group_absence() {
+            let mut transient_probe_count = 0_usize;
+            let retired_group = macos_eperm_group_is_gone(true, || {
+                transient_probe_count += 1;
+                if transient_probe_count < 3 {
+                    Err(Errno::EPERM)
+                } else {
+                    Err(Errno::ESRCH)
+                }
+            });
+            assert!(retired_group);
+            assert_eq!(transient_probe_count, 3);
 
-            assert!(!macos_eperm_group_is_gone(false, &absent_group));
-            assert!(!macos_eperm_group_is_gone(true, &changed_credentials));
-            assert!(!macos_eperm_group_is_gone(true, &live_signalable_group));
-            assert!(macos_eperm_group_is_gone(true, &absent_group));
+            let mut unverified_probe_count = 0_usize;
+            assert!(!macos_eperm_group_is_gone(false, || {
+                unverified_probe_count += 1;
+                Err(Errno::ESRCH)
+            }));
+            assert_eq!(unverified_probe_count, 0);
+
+            let mut changed_credentials_probe_count = 0_usize;
+            assert!(!macos_eperm_group_is_gone(true, || {
+                changed_credentials_probe_count += 1;
+                Err(Errno::EPERM)
+            }));
+            assert_eq!(changed_credentials_probe_count, GROUP_RETIREMENT_PROBES_MAX);
+
+            let mut live_group_probe_count = 0_usize;
+            assert!(!macos_eperm_group_is_gone(true, || {
+                live_group_probe_count += 1;
+                Ok(())
+            }));
+            assert_eq!(live_group_probe_count, GROUP_RETIREMENT_PROBES_MAX);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn contained_child_cleanup_preserves_a_reaped_exit_status() {
+            let containment = ChildProcessTree::new().unwrap();
+            let mut command = Command::new("sh");
+            command.args(["-c", "read _; exit 9"]).stdin(Stdio::piped());
+            containment.configure(&mut command);
+            let mut child = command.spawn().unwrap();
+            containment.assign(&mut child).unwrap();
+
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(b"exit\n").unwrap();
+            drop(stdin);
+            let status = child.wait().unwrap();
+            assert_eq!(status.code(), Some(9));
+
+            containment.terminate(&mut child).unwrap();
+            assert_eq!(child.wait().unwrap().code(), Some(9));
         }
 
         #[test]
