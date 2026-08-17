@@ -38,21 +38,12 @@ pub struct FrameModel<'a> {
     pub compact: bool,
     pub picker_query: Option<&'a str>,
     pub picker_layout: PickerLayout,
-    /// A temporary terminal-height inline viewport places this picker at the screen bottom.
-    pub picker_bottom_anchored: bool,
     pub picker_preview: bool,
     pub detail_scroll: u16,
     pub runtime: &'a RuntimeSurfaceState,
 }
 
 impl FrameModel<'_> {
-    pub fn height(&self, terminal_height: u16) -> u16 {
-        if self.picker_bottom_anchored && self.picker_query.is_some() {
-            return terminal_height.max(1);
-        }
-        self.content_height(terminal_height)
-    }
-
     fn content_height(&self, terminal_height: u16) -> u16 {
         let input_rows =
             u16::try_from(self.editor.buffer().lines().count().max(1)).unwrap_or(u16::MAX);
@@ -100,16 +91,12 @@ impl FrameModel<'_> {
     pub fn render(&self, frame: &mut Frame<'_>) {
         let viewport_area = frame.area();
         let content_height = self.content_height(viewport_area.height);
-        let area = if self.picker_bottom_anchored && self.picker_query.is_some() {
-            Rect::new(
-                viewport_area.x,
-                viewport_area.bottom().saturating_sub(content_height),
-                viewport_area.width,
-                content_height,
-            )
-        } else {
-            viewport_area
-        };
+        let area = Rect::new(
+            viewport_area.x,
+            viewport_area.bottom().saturating_sub(content_height),
+            viewport_area.width,
+            content_height,
+        );
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -173,7 +160,7 @@ impl FrameModel<'_> {
                 area.width.saturating_sub(offset),
                 popup_height,
             );
-            let docs_allowed = self.picker_query.map_or(area.width >= 100, |_| {
+            let docs_allowed = self.picker_query.map_or(area.width >= 72, |_| {
                 self.picker_preview
                     && (area.width >= 100
                         || (self.picker_layout == PickerLayout::Full && area.width >= 72))
@@ -670,7 +657,6 @@ mod tests {
                     compact,
                     picker_query: None,
                     picker_layout: PickerLayout::Adaptive,
-                    picker_bottom_anchored: false,
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
@@ -752,7 +738,6 @@ mod tests {
                     compact: false,
                     picker_query: None,
                     picker_layout: PickerLayout::Adaptive,
-                    picker_bottom_anchored: false,
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
@@ -809,7 +794,6 @@ mod tests {
                     compact: false,
                     picker_query: None,
                     picker_layout: PickerLayout::Adaptive,
-                    picker_bottom_anchored: false,
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
@@ -882,7 +866,6 @@ mod tests {
                     compact: false,
                     picker_query: None,
                     picker_layout: PickerLayout::Adaptive,
-                    picker_bottom_anchored: false,
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
@@ -933,12 +916,53 @@ mod tests {
             compact: true,
             picker_query: None,
             picker_layout: PickerLayout::Adaptive,
-            picker_bottom_anchored: false,
             picker_preview: true,
             detail_scroll: 0,
             runtime: &runtime,
         };
-        assert_eq!(model.height(4), 3);
+        let mut terminal = Terminal::new(TestBackend::new(78, 4)).unwrap();
+        terminal.draw(|frame| model.render(frame)).unwrap();
+        let rendered = (0..4).map(|y| row(&terminal, y)).collect::<String>();
+        assert!(!rendered.contains("demo"));
+        assert!(row(&terminal, 3).contains("command"));
+    }
+
+    #[test]
+    fn fullscreen_status_stays_on_the_actual_bottom_row_after_resize() {
+        let editor = EditorState::new("emacs", Vec::new());
+        let completion = CompletionState::new(Catalog::builtin(), None);
+        let runtime = RuntimeSurfaceState::new();
+        let model = FrameModel {
+            context_left: "~/project",
+            context_right: "",
+            editor: &editor,
+            completion: &completion,
+            mode: Mode::Command,
+            diagnostic: None,
+            highlight_spans: &[],
+            theme: Theme::new(true),
+            unicode: true,
+            symbols: SurfaceSymbols::Unicode,
+            semantic_hints: true,
+            hints: true,
+            timings: None,
+            compact: false,
+            picker_query: None,
+            picker_layout: PickerLayout::Adaptive,
+            picker_preview: true,
+            detail_scroll: 0,
+            runtime: &runtime,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(78, 12)).unwrap();
+        terminal.draw(|frame| model.render(frame)).unwrap();
+        assert!(row(&terminal, 11).contains("command"));
+        assert!(row(&terminal, 3).trim().is_empty());
+        assert!(row(&terminal, 10).contains('❯'));
+
+        terminal.backend_mut().resize(52, 6);
+        terminal.draw(|frame| model.render(frame)).unwrap();
+        assert!(row(&terminal, 5).contains("command"));
+        assert!(row(&terminal, 4).contains('❯'));
     }
 
     #[test]
@@ -1016,12 +1040,10 @@ mod tests {
                     compact: false,
                     picker_query: Some("sta"),
                     picker_layout: PickerLayout::Full,
-                    picker_bottom_anchored: false,
                     picker_preview: false,
                     detail_scroll: 0,
                     runtime: &runtime,
                 };
-                assert_eq!(model.height(12), 12);
                 model.render(frame);
             })
             .unwrap();
@@ -1072,12 +1094,10 @@ mod tests {
                     compact: false,
                     picker_query: Some(""),
                     picker_layout: PickerLayout::Adaptive,
-                    picker_bottom_anchored: true,
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,
                 };
-                assert_eq!(model.height(30), 30);
                 model.render(frame);
             })
             .unwrap();
@@ -1193,7 +1213,6 @@ mod tests {
                     compact: false,
                     picker_query: None,
                     picker_layout: PickerLayout::Adaptive,
-                    picker_bottom_anchored: false,
                     picker_preview: true,
                     detail_scroll: 0,
                     runtime: &runtime,

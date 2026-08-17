@@ -61,7 +61,13 @@ impl StatusBarModel<'_> {
             String::new()
         };
 
-        let right = if self.completion.open {
+        let right = if self.completion.open && self.completion.automatic {
+            if self.unicode {
+                "↑↓ select · Tab choose · Enter run · Esc close".to_owned()
+            } else {
+                "up/down select | Tab choose | Enter run | Esc close".to_owned()
+            }
+        } else if self.completion.open {
             if self.unicode {
                 "↑↓ move · Enter accept · Esc close".to_owned()
             } else {
