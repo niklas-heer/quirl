@@ -2329,6 +2329,26 @@ mod tests {
     }
 
     #[test]
+    fn builtin_ls_is_the_canonical_source_for_cluster_members() {
+        let catalog = Catalog::builtin();
+        let command = catalog.find("ls").unwrap();
+        for (short, long) in [("-a", "--all"), ("-l", "--long")] {
+            let argument = command
+                .options
+                .iter()
+                .find(|argument| argument.names.iter().any(|name| name == short))
+                .unwrap();
+            assert_eq!(argument.kind, ArgumentKind::Flag);
+            assert!(argument.names.iter().any(|name| name == long));
+            assert_eq!(argument.provenance.confidence, Confidence::Exact);
+        }
+        assert!(command
+            .examples
+            .iter()
+            .any(|example| example == "ls -la src"));
+    }
+
+    #[test]
     fn static_argument_values_are_completed_after_space_or_equals() {
         let spaced = Catalog::builtin().complete("quirl index build --format j", 28);
         assert_eq!(spaced[0].value, "json");

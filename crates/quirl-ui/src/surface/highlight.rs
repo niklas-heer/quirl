@@ -1,6 +1,7 @@
-use quirl_catalog::{Catalog, CommandSpec, Confidence};
+use quirl_catalog::{ArgumentKind, Catalog, CommandSpec, Confidence};
 use quirl_syntax::{
-    highlight, parse_command_list, CommandList, HighlightKind, HighlightSpan, Mode,
+    highlight, parse_command_list, CommandList, HighlightKind, HighlightSpan, Mode, Quoting,
+    SimpleCommand, Word,
 };
 use std::{
     collections::{HashSet, VecDeque},
@@ -17,6 +18,8 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+use super::editor::MAX_EDITOR_BUFFER_BYTES;
 
 const TIMING_WINDOW: usize = 128;
 const MAX_PATH_DIRECTORIES: usize = 256;
@@ -131,11 +134,22 @@ impl InputAnalyzer {
             return;
         }
         let started = Instant::now();
-        let spans = highlight(buffer, mode);
-        let diagnostic = self
-            .catalog
-            .as_deref()
-            .and_then(|catalog| diagnostic_for(catalog, &self.path_commands, buffer, mode, &spans));
+        let within_input_bound = buffer.len() <= MAX_EDITOR_BUFFER_BYTES;
+        let spans = if within_input_bound {
+            highlight(buffer, mode)
+        } else {
+            vec![HighlightSpan {
+                range: 0..buffer.len(),
+                kind: HighlightKind::Argument,
+            }]
+        };
+        let diagnostic = if within_input_bound {
+            self.catalog.as_deref().and_then(|catalog| {
+                diagnostic_for(catalog, &self.path_commands, buffer, mode, &spans)
+            })
+        } else {
+            None
+        };
         self.current = InputAnalysis { spans, diagnostic };
         self.cached_revision = Some(revision);
         self.cached_mode = mode;
@@ -422,7 +436,9 @@ fn diagnostic_for(
         .iter()
         .find(|span| span.kind == HighlightKind::Command)?;
     let command = buffer.get(command_span.range.clone())?.trim();
-    let catalog_command = resolve_catalog_command(catalog, &parsed);
+    let first_command = parsed.pipelines.first()?.commands.first()?;
+    let catalog_command =
+        resolve_catalog_command(catalog, first_command).map(|(command, _)| command);
     if catalog_command.is_none() && !command.contains('/') {
         let path_status = path_commands.command_status(command);
         if path_status == Some(false)
@@ -462,53 +478,240 @@ fn diagnostic_for(
         }
     }
 
-    let command = catalog_command?;
-    if command.provenance.confidence < Confidence::High {
-        return None;
-    }
-    let unknown = spans.iter().find(|span| {
-        span.kind == HighlightKind::Flag
-            && buffer.get(span.range.clone()).is_some_and(|flag| {
-                !command
-                    .options
-                    .iter()
-                    .flat_map(|option| &option.names)
-                    .any(|known| known == flag)
-            })
-    })?;
-    let flag = buffer.get(unknown.range.clone())?;
+    let (command, unknown) = unknown_option(catalog, &parsed, spans)?;
+    let flag = buffer.get(unknown.clone())?;
     Some(SurfaceDiagnostic {
         message: format!("unknown flag `{flag}` for `{}`", command.path),
         severity: DiagnosticSeverity::Warning,
-        range: Some(unknown.range.clone()),
+        range: Some(unknown),
     })
 }
 
 fn resolve_catalog_command<'a>(
     catalog: &'a Catalog,
-    parsed: &CommandList,
-) -> Option<&'a CommandSpec> {
-    let words = &parsed.pipelines.first()?.commands.first()?.words;
+    command: &SimpleCommand,
+) -> Option<(&'a CommandSpec, usize)> {
     catalog
         .commands
         .iter()
-        .filter(|command| {
-            let path_word_count = command.path.split_whitespace().count();
-            path_word_count <= words.len()
-                && command
-                    .path
-                    .split_whitespace()
-                    .zip(words)
-                    .all(|(expected, actual)| expected == actual)
+        .flat_map(|candidate| {
+            std::iter::once(candidate.path.as_str())
+                .chain(candidate.aliases.iter().map(String::as_str))
+                .filter_map(move |invocation| {
+                    invocation_matches(invocation, &command.words)
+                        .then_some((candidate, invocation.split_whitespace().count()))
+                })
         })
-        .max_by_key(|command| command.path.split_whitespace().count())
-        .or_else(|| {
-            catalog.commands.iter().find(|command| {
-                words
-                    .first()
-                    .is_some_and(|word| command.aliases.iter().any(|alias| alias == word))
-            })
-        })
+        .max_by_key(|(_, word_count)| *word_count)
+}
+
+fn invocation_matches(invocation: &str, words: &[String]) -> bool {
+    let mut invocation_words = invocation.split_whitespace();
+    let matches = invocation_words
+        .by_ref()
+        .zip(words)
+        .all(|(expected, actual)| expected == actual);
+    matches && invocation_words.next().is_none()
+}
+
+fn unknown_option<'a>(
+    catalog: &'a Catalog,
+    parsed: &CommandList,
+    spans: &[HighlightSpan],
+) -> Option<(&'a CommandSpec, Range<usize>)> {
+    let mut flag_ranges = spans
+        .iter()
+        .filter(|span| span.kind == HighlightKind::Flag)
+        .map(|span| span.range.clone());
+    for pipeline in &parsed.pipelines {
+        for parsed_command in &pipeline.commands {
+            let resolved = resolve_catalog_command(catalog, parsed_command);
+            let short_options = resolved.and_then(|(command, _)| {
+                (command.provenance.confidence >= Confidence::High)
+                    .then(|| ShortOptionLookup::new(command))
+            });
+            let mut consumes_next = false;
+            let mut options_terminated = false;
+            for (word_index, word) in parsed_command.word_ir.iter().enumerate() {
+                let range = (word_index > 0 && presentation_flag(word))
+                    .then(|| flag_ranges.next())
+                    .flatten();
+                let Some((command, invocation_word_count)) = resolved else {
+                    continue;
+                };
+                if word_index < invocation_word_count
+                    || command.provenance.confidence < Confidence::High
+                {
+                    continue;
+                }
+                let token = parsed_command.words.get(word_index)?;
+                if consumes_next {
+                    consumes_next = false;
+                    continue;
+                }
+                if options_terminated {
+                    continue;
+                }
+                if token == "--" {
+                    options_terminated = true;
+                    continue;
+                }
+                if token == "-" || !token.starts_with('-') {
+                    continue;
+                }
+                let Some(short_options) = short_options.as_ref() else {
+                    continue;
+                };
+                match option_token(command, short_options, token) {
+                    OptionToken::Known => {}
+                    OptionToken::ConsumesNext => consumes_next = true,
+                    OptionToken::Unknown => {
+                        if let Some(range) = range {
+                            return Some((command, range));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionToken {
+    Known,
+    ConsumesNext,
+    Unknown,
+}
+
+fn option_token(
+    command: &CommandSpec,
+    short_options: &ShortOptionLookup<'_>,
+    token: &str,
+) -> OptionToken {
+    if token.starts_with("--") {
+        return long_option_token(command, token);
+    }
+    if let Some(argument) = named_option(command, token) {
+        return match argument.kind {
+            ArgumentKind::Option => OptionToken::ConsumesNext,
+            ArgumentKind::Flag => OptionToken::Known,
+            ArgumentKind::Positional => OptionToken::Unknown,
+        };
+    }
+
+    let Some(cluster) = token.strip_prefix('-') else {
+        return OptionToken::Unknown;
+    };
+    for (offset, member) in cluster.char_indices() {
+        let Some(argument) = short_options.get(member) else {
+            return OptionToken::Unknown;
+        };
+        match argument.kind {
+            ArgumentKind::Flag => {}
+            ArgumentKind::Option => {
+                let suffix_start = offset.saturating_add(member.len_utf8());
+                return if suffix_start < cluster.len() {
+                    OptionToken::Known
+                } else {
+                    OptionToken::ConsumesNext
+                };
+            }
+            ArgumentKind::Positional => return OptionToken::Unknown,
+        }
+    }
+    if cluster.is_empty() {
+        OptionToken::Unknown
+    } else {
+        OptionToken::Known
+    }
+}
+
+fn long_option_token(command: &CommandSpec, token: &str) -> OptionToken {
+    let (name, has_attached_value) = token
+        .split_once('=')
+        .map_or((token, false), |(name, _)| (name, true));
+    let Some(argument) = named_option(command, name) else {
+        return OptionToken::Unknown;
+    };
+    match argument.kind {
+        ArgumentKind::Option if has_attached_value => OptionToken::Known,
+        ArgumentKind::Option => OptionToken::ConsumesNext,
+        ArgumentKind::Flag if has_attached_value => OptionToken::Unknown,
+        ArgumentKind::Flag => OptionToken::Known,
+        ArgumentKind::Positional => OptionToken::Unknown,
+    }
+}
+
+fn named_option<'a>(
+    command: &'a CommandSpec,
+    name: &str,
+) -> Option<&'a quirl_catalog::ArgumentSpec> {
+    command.options.iter().find(|argument| {
+        argument.kind != ArgumentKind::Positional
+            && argument.names.iter().any(|candidate| candidate == name)
+    })
+}
+
+struct ShortOptionLookup<'a> {
+    ascii: [Option<&'a quirl_catalog::ArgumentSpec>; 128],
+    unicode: Vec<(char, &'a quirl_catalog::ArgumentSpec)>,
+}
+
+impl<'a> ShortOptionLookup<'a> {
+    fn new(command: &'a CommandSpec) -> Self {
+        let mut lookup = Self {
+            ascii: [None; 128],
+            unicode: Vec::new(),
+        };
+        for argument in &command.options {
+            if argument.kind == ArgumentKind::Positional {
+                continue;
+            }
+            for name in &argument.names {
+                let Some(member) = single_short_member(name) else {
+                    continue;
+                };
+                if member.is_ascii() {
+                    let Ok(index) = usize::try_from(u32::from(member)) else {
+                        continue;
+                    };
+                    if lookup.ascii[index].is_none() {
+                        lookup.ascii[index] = Some(argument);
+                    }
+                } else {
+                    lookup.unicode.push((member, argument));
+                }
+            }
+        }
+        lookup
+    }
+
+    fn get(&self, member: char) -> Option<&'a quirl_catalog::ArgumentSpec> {
+        if member.is_ascii() {
+            let index = usize::try_from(u32::from(member)).ok()?;
+            return self.ascii.get(index).copied().flatten();
+        }
+        self.unicode
+            .iter()
+            .find_map(|(candidate, argument)| (*candidate == member).then_some(*argument))
+    }
+}
+
+fn single_short_member(name: &str) -> Option<char> {
+    let short = name.strip_prefix('-')?;
+    if short.starts_with('-') {
+        return None;
+    }
+    let mut characters = short.chars();
+    let member = characters.next()?;
+    characters.next().is_none().then_some(member)
+}
+
+fn presentation_flag(word: &Word) -> bool {
+    word.parts
+        .first()
+        .is_some_and(|part| part.quoting == Quoting::Unquoted && part.text.starts_with('-'))
 }
 
 fn edit_distance_bounded(left: &str, right: &str, maximum: usize) -> Option<usize> {
@@ -589,6 +792,7 @@ fn timing_p95(samples: &VecDeque<Duration>) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quirl_catalog::{import_bash, import_fish, import_help, import_zsh};
     use std::sync::atomic::AtomicU64;
 
     static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
@@ -611,6 +815,31 @@ mod tests {
     }
 
     #[test]
+    fn semantic_analysis_stops_at_the_editor_utf8_byte_bound() {
+        let catalog = Catalog::builtin();
+        let mut analyzer = InputAnalyzer::new(catalog);
+        let exact = format!("ls -{}", "a".repeat(MAX_EDITOR_BUFFER_BYTES - "ls -".len()));
+        assert_eq!(exact.len(), MAX_EDITOR_BUFFER_BYTES);
+        analyzer.ensure(1, &exact, Mode::Command);
+        assert!(analyzer.current().diagnostic.is_none());
+        assert_eq!(
+            analyzer.current().spans.last().unwrap().range.end,
+            exact.len()
+        );
+
+        let oversized = format!("{exact}é");
+        analyzer.ensure(2, &oversized, Mode::Command);
+        assert!(analyzer.current().diagnostic.is_none());
+        assert_eq!(
+            analyzer.current().spans,
+            [HighlightSpan {
+                range: 0..oversized.len(),
+                kind: HighlightKind::Argument,
+            }]
+        );
+    }
+
+    #[test]
     fn exact_catalog_commands_warn_about_unknown_flags() {
         let catalog = Catalog::builtin();
         let mut analyzer = InputAnalyzer::new(catalog);
@@ -623,11 +852,159 @@ mod tests {
     }
 
     #[test]
+    fn builtin_option_validation_handles_clusters_long_options_and_terminators() {
+        let catalog = Catalog::builtin();
+        for input in [
+            "ls -al",
+            "ls -la",
+            "ls --all",
+            "ls --format=json",
+            "ls --format json",
+            "ls --format -not-an-option",
+            "ls -- -not-an-option",
+            "ls -",
+        ] {
+            assert_no_diagnostic(catalog.clone(), input);
+        }
+
+        for (input, unknown) in [
+            ("ls -alz", "-alz"),
+            ("ls --al", "--al"),
+            ("ls --all=yes", "--all=yes"),
+            ("ls --formatjson", "--formatjson"),
+        ] {
+            assert_unknown_flag(catalog.clone(), input, unknown);
+        }
+    }
+
+    #[test]
+    fn short_option_with_a_value_ends_cluster_decomposition() {
+        let mut catalog = Catalog::builtin();
+        let command = catalog.find("ls").unwrap().clone();
+        let mut output = command
+            .options
+            .iter()
+            .find(|argument| argument.names == ["--format"])
+            .unwrap()
+            .clone();
+        output.names = vec!["-o".to_owned(), "--output".to_owned()];
+        catalog
+            .commands
+            .iter_mut()
+            .find(|candidate| candidate.path == "ls")
+            .unwrap()
+            .options
+            .push(output);
+
+        for input in [
+            "ls -ovalue",
+            "ls -aovalue",
+            "ls -oa",
+            "ls -ao value",
+            "ls -o -looks-like-a-flag",
+        ] {
+            assert_no_diagnostic(catalog.clone(), input);
+        }
+        assert_unknown_flag(catalog, "ls -ao value -z", "-z");
+    }
+
+    #[test]
+    fn subcommands_multiword_aliases_and_utf8_short_names_resolve_exactly() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .commands
+            .iter_mut()
+            .find(|command| command.path == "quirl index build")
+            .unwrap()
+            .aliases
+            .push("quirl ib".to_owned());
+        let ls = catalog
+            .commands
+            .iter_mut()
+            .find(|command| command.path == "ls")
+            .unwrap();
+        ls.aliases.push("ll".to_owned());
+        let mut utf8 = ls
+            .options
+            .iter()
+            .find(|argument| argument.names.contains(&"-a".to_owned()))
+            .unwrap()
+            .clone();
+        utf8.names = vec!["-é".to_owned()];
+        ls.options.push(utf8);
+
+        for input in [
+            "ll -al",
+            "quirl index build --format=json",
+            "quirl ib --format json",
+            "ls -éa",
+        ] {
+            assert_no_diagnostic(catalog.clone(), input);
+        }
+        assert_unknown_flag(
+            catalog,
+            "quirl index build --definitely-invalid",
+            "--definitely-invalid",
+        );
+    }
+
+    #[test]
+    fn declarative_imports_validate_clusters_but_heuristic_imports_do_not_guess() {
+        let mut catalog = Catalog::builtin();
+        catalog.commands.clear();
+        for report in [
+            import_fish(
+                "complete -c fish-ls -s a\ncomplete -c fish-ls -s l\ncomplete -c fish-ls -s o -r",
+                "ls.fish",
+            ),
+            import_bash("complete -W '-a -l -o=' bash-ls", "ls.bash"),
+            import_zsh(
+                "#compdef zsh-ls\n_arguments '-a[all]' '-l[long]' '-o[output]:file:_files'",
+                "_zsh-ls",
+            ),
+            import_help(
+                "Usage: help-ls [OPTIONS]\n  -a, --all  all entries",
+                "help-ls.txt",
+            ),
+        ] {
+            catalog.merge_report(report);
+        }
+
+        for input in [
+            "fish-ls -aloresult",
+            "bash-ls -aloresult",
+            "zsh-ls -aloresult",
+            "help-ls -unknown",
+        ] {
+            assert_no_diagnostic(catalog.clone(), input);
+        }
+        for command in ["fish-ls", "bash-ls", "zsh-ls"] {
+            let input = format!("{command} -alz");
+            assert_unknown_flag(catalog.clone(), &input, "-alz");
+        }
+    }
+
+    #[test]
     fn medium_confidence_commands_do_not_guess_about_flags() {
         let catalog = Catalog::builtin();
         let mut analyzer = InputAnalyzer::new(catalog);
         analyzer.ensure(1, "git --definitely-invalid", Mode::Command);
         assert!(analyzer.current().diagnostic.is_none());
+    }
+
+    fn assert_no_diagnostic(catalog: Catalog, input: &str) {
+        let mut analyzer = InputAnalyzer::new(catalog);
+        analyzer.ensure(1, input, Mode::Command);
+        assert_eq!(analyzer.current().diagnostic, None, "input: {input}");
+    }
+
+    fn assert_unknown_flag(catalog: Catalog, input: &str, unknown: &str) {
+        let mut analyzer = InputAnalyzer::new(catalog);
+        analyzer.ensure(1, input, Mode::Command);
+        let diagnostic = analyzer.current().diagnostic.as_ref().unwrap();
+        assert_eq!(diagnostic.severity, DiagnosticSeverity::Warning);
+        let range = diagnostic.range.clone().unwrap();
+        assert_eq!(&input[range], unknown);
     }
 
     #[test]
