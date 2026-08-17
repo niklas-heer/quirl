@@ -43,6 +43,7 @@ const DISCOVERY_STATE_VERSION: u32 = 1;
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DISCOVERY_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const DISCOVERY_DEADLINE: Duration = Duration::from_millis(750);
+const BACKGROUND_DISCOVERY_DEADLINE: Duration = Duration::from_secs(30);
 static NEXT_INDEX_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 static DATABASE_PUBLICATION: Mutex<()> = Mutex::new(());
 
@@ -52,8 +53,16 @@ static DATABASE_PUBLICATION: Mutex<()> = Mutex::new(());
 pub struct CatalogRefresh {
     cancelled: Arc<AtomicBool>,
     changed: Arc<AtomicBool>,
+    requested_generation: Arc<AtomicU64>,
     wake: Arc<(Mutex<()>, Condvar)>,
     worker: Option<JoinHandle<()>>,
+}
+
+pub(crate) trait CatalogRefreshObserver: Send + Sync {
+    fn refresh_started(&self);
+    fn refresh_published(&self);
+    fn refresh_unchanged(&self);
+    fn refresh_failed(&self, error: &ShellError);
 }
 
 impl CatalogRefresh {
@@ -63,12 +72,36 @@ impl CatalogRefresh {
     pub fn take_changed(&self) -> bool {
         self.changed.swap(false, Ordering::AcqRel)
     }
+
+    pub(crate) fn request_refresh(&self) -> Result<(), ShellError> {
+        let _guard = self.wake.0.lock().map_err(|_| {
+            ShellError::new(
+                ErrorCode::Io,
+                "the catalog refresh request lock was poisoned",
+            )
+            .with_help("Restart Quirl to create a fresh catalog worker")
+        })?;
+        increment_generation(
+            &self.requested_generation,
+            "catalog refresh request generation",
+        )?;
+        self.wake.1.notify_one();
+        Ok(())
+    }
+
+    pub(crate) fn cancel(&self) {
+        let _guard = match self.wake.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.cancelled.store(true, Ordering::Release);
+        self.wake.1.notify_all();
+    }
 }
 
 impl Drop for CatalogRefresh {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Release);
-        self.wake.1.notify_all();
+        self.cancel();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -85,6 +118,18 @@ struct DiscoveryConfig {
     help_roots: Vec<PathBuf>,
     man_roots: Vec<PathBuf>,
     stale_after: Duration,
+}
+
+struct CatalogRefreshWorker {
+    config: DiscoveryConfig,
+    cancelled: Arc<AtomicBool>,
+    changed: Arc<AtomicBool>,
+    requested_generation: Arc<AtomicU64>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    observer: Arc<dyn CatalogRefreshObserver>,
+    refresh_interval: Duration,
+    refresh_deadline: Duration,
+    reload_environment: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -480,10 +525,31 @@ pub(crate) fn build_default_embeddings_if_current(
             Ok(())
         },
     )?;
+    if !publish_embeddings_if_current(
+        &path,
+        &source,
+        &encoded,
+        cancelled,
+        requested_generation,
+        generation,
+    )? {
+        return Ok(None);
+    }
+    Ok(Some(report))
+}
+
+fn publish_embeddings_if_current(
+    path: &Path,
+    source: &[u8],
+    encoded: &[u8],
+    cancelled: &AtomicBool,
+    requested_generation: &AtomicU64,
+    generation: u64,
+) -> Result<bool, ShellError> {
     if cancelled.load(Ordering::Acquire)
         || requested_generation.load(Ordering::Acquire) != generation
     {
-        return Ok(None);
+        return Ok(false);
     }
     let _publication = DATABASE_PUBLICATION.lock().map_err(|_| {
         ShellError::new(
@@ -492,15 +558,15 @@ pub(crate) fn build_default_embeddings_if_current(
         )
         .with_help("Restart Quirl before rebuilding local command intelligence")
     })?;
-    let current = read_index(&path)?;
+    let current = read_index(path)?;
     if current != source
         || cancelled.load(Ordering::Acquire)
         || requested_generation.load(Ordering::Acquire) != generation
     {
-        return Ok(None);
+        return Ok(false);
     }
-    write_index_bytes_atomically_unlocked(&path, &encoded, intelligence::DATABASE_BYTES_MAX)?;
-    Ok(Some(report))
+    write_index_bytes_atomically_unlocked(path, encoded, intelligence::DATABASE_BYTES_MAX)?;
+    Ok(true)
 }
 
 /// Read and validate bounded row counts from the default command database.
@@ -516,24 +582,67 @@ pub(crate) fn default_embeddings_are_current() -> Result<bool, ShellError> {
     intelligence::embeddings_are_current(&bytes, &path)
 }
 
-/// Start periodic catalog discovery without delaying construction or first
-/// paint of the interactive editor. Failures are cache misses: the worker never
-/// owns terminal state and builtins remain immediately available.
-pub fn start_interactive_catalog_refresh() -> Option<CatalogRefresh> {
+#[cfg(debug_assertions)]
+pub(crate) fn mark_default_embeddings_current_for_test() -> Result<(), ShellError> {
+    let path = default_database_path()?;
+    let _publication = DATABASE_PUBLICATION.lock().map_err(|_| {
+        ShellError::new(
+            ErrorCode::Io,
+            "the command-database publication lock was poisoned",
+        )
+        .with_help("Restart Quirl before updating the test command database")
+    })?;
+    let source = read_index(&path)?;
+    let encoded = intelligence::mark_embeddings_current_for_test(&source, &path)?;
+    write_index_bytes_atomically_unlocked(&path, &encoded, intelligence::DATABASE_BYTES_MAX)
+}
+
+/// Start the one periodic catalog worker after interactive catalog admission.
+/// The initial full scan begins immediately, uses the longer background
+/// deadline, and never owns terminal state.
+pub(crate) fn start_interactive_catalog_refresh(
+    observer: Arc<dyn CatalogRefreshObserver>,
+) -> Option<CatalogRefresh> {
     let config = DiscoveryConfig::from_environment()?;
+    start_catalog_refresh_with_config(
+        config,
+        observer,
+        DISCOVERY_REFRESH_INTERVAL,
+        BACKGROUND_DISCOVERY_DEADLINE,
+        true,
+    )
+}
+
+fn start_catalog_refresh_with_config(
+    config: DiscoveryConfig,
+    observer: Arc<dyn CatalogRefreshObserver>,
+    refresh_interval: Duration,
+    refresh_deadline: Duration,
+    reload_environment: bool,
+) -> Option<CatalogRefresh> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let changed = Arc::new(AtomicBool::new(false));
+    let requested_generation = Arc::new(AtomicU64::new(1));
     let wake = Arc::new((Mutex::new(()), Condvar::new()));
-    let worker_cancelled = Arc::clone(&cancelled);
-    let worker_changed = Arc::clone(&changed);
-    let worker_wake = Arc::clone(&wake);
+    let worker_state = CatalogRefreshWorker {
+        config,
+        cancelled: Arc::clone(&cancelled),
+        changed: Arc::clone(&changed),
+        requested_generation: Arc::clone(&requested_generation),
+        wake: Arc::clone(&wake),
+        observer,
+        refresh_interval,
+        refresh_deadline,
+        reload_environment,
+    };
     let worker = thread::Builder::new()
         .name("quirl-catalog-refresh".to_owned())
-        .spawn(move || refresh_loop(config, &worker_cancelled, &worker_changed, &worker_wake))
+        .spawn(move || refresh_loop(worker_state))
         .ok()?;
     Some(CatalogRefresh {
         cancelled,
         changed,
+        requested_generation,
         wake,
         worker: Some(worker),
     })
@@ -548,8 +657,15 @@ pub fn initialize_interactive_catalog() {
     let Some(config) = DiscoveryConfig::from_environment() else {
         return;
     };
-    let _ =
-        initialize_interactive_catalog_with_deadline(&config, Instant::now() + DISCOVERY_DEADLINE);
+    #[cfg(debug_assertions)]
+    let deadline = if env::var_os("QUIRL_TEST_CATALOG_FORCE_TIMEOUT").is_some() {
+        Instant::now()
+    } else {
+        Instant::now() + DISCOVERY_DEADLINE
+    };
+    #[cfg(not(debug_assertions))]
+    let deadline = Instant::now() + DISCOVERY_DEADLINE;
+    let _ = initialize_interactive_catalog_with_deadline(&config, deadline);
 }
 
 fn initialize_interactive_catalog_with_deadline(
@@ -637,32 +753,87 @@ impl DiscoveryConfig {
     }
 }
 
-fn refresh_loop(
-    config: DiscoveryConfig,
-    cancelled: &AtomicBool,
-    changed: &AtomicBool,
-    wake: &(Mutex<()>, Condvar),
-) {
+fn refresh_loop(worker: CatalogRefreshWorker) {
+    let mut completed_generation = 0_u64;
     loop {
-        let current = DiscoveryConfig::from_environment().unwrap_or_else(|| config.clone());
-        if refresh_catalog_cache(&current, Instant::now() + DISCOVERY_DEADLINE, cancelled)
-            .is_ok_and(|refreshed| refreshed)
-        {
-            changed.store(true, Ordering::Release);
+        let requested = match wait_for_refresh_request(
+            completed_generation,
+            &worker.cancelled,
+            &worker.requested_generation,
+            &worker.wake,
+            worker.refresh_interval,
+        ) {
+            Ok(Some(requested)) => requested,
+            Ok(None) | Err(_) => return,
+        };
+        let current = if worker.reload_environment {
+            DiscoveryConfig::from_environment().unwrap_or_else(|| worker.config.clone())
+        } else {
+            worker.config.clone()
+        };
+        worker.observer.refresh_started();
+        match refresh_catalog_cache(
+            &current,
+            Instant::now() + worker.refresh_deadline,
+            &worker.cancelled,
+        ) {
+            Ok(true) => {
+                worker.changed.store(true, Ordering::Release);
+                worker.observer.refresh_published();
+            }
+            Ok(false) => worker.observer.refresh_unchanged(),
+            Err(error) => worker.observer.refresh_failed(&error),
         }
+        if worker.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        completed_generation = requested;
+    }
+}
+
+fn wait_for_refresh_request(
+    completed_generation: u64,
+    cancelled: &AtomicBool,
+    requested_generation: &AtomicU64,
+    wake: &(Mutex<()>, Condvar),
+    refresh_interval: Duration,
+) -> Result<Option<u64>, ShellError> {
+    let mut guard = wake.0.lock().map_err(|_| {
+        ShellError::new(
+            ErrorCode::Io,
+            "the catalog refresh worker lock was poisoned",
+        )
+        .with_help("Restart Quirl to create a fresh catalog worker")
+    })?;
+    loop {
         if cancelled.load(Ordering::Acquire) {
-            return;
+            return Ok(None);
         }
-        let Ok(guard) = wake.0.lock() else {
-            return;
-        };
-        let Ok((_guard, wait)) = wake.1.wait_timeout(guard, DISCOVERY_REFRESH_INTERVAL) else {
-            return;
-        };
-        if cancelled.load(Ordering::Acquire) || !wait.timed_out() {
-            return;
+        let requested = requested_generation.load(Ordering::Acquire);
+        if requested > completed_generation {
+            return Ok(Some(requested));
+        }
+        let (next_guard, wait) = wake.1.wait_timeout(guard, refresh_interval).map_err(|_| {
+            ShellError::new(ErrorCode::Io, "the catalog refresh wait lock was poisoned")
+                .with_help("Restart Quirl to create a fresh catalog worker")
+        })?;
+        guard = next_guard;
+        if wait.timed_out() {
+            increment_generation(requested_generation, "catalog refresh timer generation")?;
         }
     }
+}
+
+fn increment_generation(counter: &AtomicU64, name: &str) -> Result<u64, ShellError> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .map(|value| value + 1)
+        .map_err(|_| {
+            ShellError::new(ErrorCode::ResourceLimit, format!("{name} was exhausted"))
+                .with_help("Restart Quirl to reset the bounded generation counter")
+        })
 }
 
 fn refresh_catalog_cache(
@@ -2105,6 +2276,32 @@ mod tests {
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
+    #[derive(Default)]
+    struct TestRefreshObserver {
+        started: AtomicUsize,
+        published: AtomicUsize,
+        unchanged: AtomicUsize,
+        failed: AtomicUsize,
+    }
+
+    impl CatalogRefreshObserver for TestRefreshObserver {
+        fn refresh_started(&self) {
+            self.started.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn refresh_published(&self) {
+            self.published.fetch_add(1, Ordering::Release);
+        }
+
+        fn refresh_unchanged(&self) {
+            self.unchanged.fetch_add(1, Ordering::Release);
+        }
+
+        fn refresh_failed(&self, _error: &ShellError) {
+            self.failed.fetch_add(1, Ordering::Release);
+        }
+    }
+
     #[derive(Debug, Parser)]
     struct IndexCli {
         #[command(subcommand)]
@@ -2146,6 +2343,17 @@ mod tests {
         fs::write(path, b"not executed").unwrap();
         #[cfg(unix)]
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn wait_for_observation(counter: &AtomicUsize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while counter.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "background catalog observation exceeded its test deadline"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn refresh(config: &DiscoveryConfig) -> Result<bool, ShellError> {
@@ -2278,6 +2486,102 @@ mod tests {
         assert!(load_catalog_at(&config.index_path)
             .find("after-fallback")
             .is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn background_discovery_replaces_timed_out_fallback_without_input() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        assert!(initialize_interactive_catalog_with_deadline(&config, Instant::now()).unwrap());
+        write_executable(&config.path_roots[0].join("idle-background-tool"));
+        let observed = Arc::new(TestRefreshObserver::default());
+        let observer: Arc<dyn CatalogRefreshObserver> = observed.clone();
+
+        let refresh = start_catalog_refresh_with_config(
+            config.clone(),
+            observer,
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+            false,
+        )
+        .unwrap();
+        wait_for_observation(&observed.published);
+
+        assert!(load_catalog_at(&config.index_path)
+            .find("idle-background-tool")
+            .is_some());
+        assert_eq!(observed.started.load(Ordering::Acquire), 1);
+        drop(refresh);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn background_discovery_failure_is_bounded_and_cancellable() {
+        let directory = temporary_directory();
+        let mut config = discovery_config(&directory);
+        config.path_roots = vec![directory.clone(); INDEX_ROOTS_MAX + 1];
+        let observed = Arc::new(TestRefreshObserver::default());
+        let observer: Arc<dyn CatalogRefreshObserver> = observed.clone();
+        let refresh = start_catalog_refresh_with_config(
+            config,
+            observer,
+            Duration::from_secs(60),
+            Duration::from_millis(1),
+            false,
+        )
+        .unwrap();
+
+        wait_for_observation(&observed.failed);
+        let started = Instant::now();
+        drop(refresh);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn database_change_during_embedding_rejects_old_bytes_and_indexes_latest() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        write_catalog_atomically(&config.index_path, &Catalog::builtin(), None).unwrap();
+        let old_source = read_index(&config.index_path).unwrap();
+        let old_embeddings =
+            intelligence::mark_embeddings_current_for_test(&old_source, &config.index_path)
+                .unwrap();
+        write_executable(&config.path_roots[0].join("newest-generation-tool"));
+        assert!(refresh(&config).unwrap());
+        let cancelled = AtomicBool::new(false);
+        let requested = AtomicU64::new(1);
+
+        assert!(!publish_embeddings_if_current(
+            &config.index_path,
+            &old_source,
+            &old_embeddings,
+            &cancelled,
+            &requested,
+            1,
+        )
+        .unwrap());
+
+        let latest_source = read_index(&config.index_path).unwrap();
+        let latest_embeddings =
+            intelligence::mark_embeddings_current_for_test(&latest_source, &config.index_path)
+                .unwrap();
+        assert!(publish_embeddings_if_current(
+            &config.index_path,
+            &latest_source,
+            &latest_embeddings,
+            &cancelled,
+            &requested,
+            1,
+        )
+        .unwrap());
+        let published = read_index(&config.index_path).unwrap();
+        assert!(decode_catalog(&published, &config.index_path)
+            .unwrap()
+            .find("newest-generation-tool")
+            .is_some());
+        assert!(intelligence::embeddings_are_current(&published, &config.index_path).unwrap());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2522,6 +2826,7 @@ mod tests {
         drop(CatalogRefresh {
             cancelled,
             changed,
+            requested_generation: Arc::new(AtomicU64::new(1)),
             wake,
             worker: Some(worker),
         });

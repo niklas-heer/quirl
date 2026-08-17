@@ -40,6 +40,14 @@ builtin-only SQLite image. A valid prior database is never replaced by this
 fallback, and a later successful discovery generation replaces the fallback
 through the normal publication path.
 
+Catalog admission also starts one session-owned discovery worker immediately;
+it does not wait for `read_line` to return. Its full scan has an explicit
+30-second background deadline and a 60-second periodic interval, while accepted
+input only requests an additional coalesced scan. Discovery activity is cached
+for the fixed bottom status row. A completed database publication sets the
+catalog-changed bit and requests embedding for that new generation before main
+adopts the catalog at its next safe prompt boundary.
+
 Semantic inference uses `model2vec-rs` with only its `local-only` and `onig`
 features and the `minishlab/potion-base-8M` model. After the interactive catalog
 is admitted, the composition root starts one session-owned worker. If the
@@ -64,7 +72,9 @@ again only after a refreshed database has been published. It skips work when
 every bounded semantic document already has a matching model id and source
 fingerprint. Automatic encoding checks cancellation between 32-document
 batches and publishes only if both the request generation and source database
-remain current. `quirl ai index` remains an explicit diagnostic/refresh tool;
+remain current. If database bytes change without a matching request while an
+embedding build is in flight, the worker retries against the newest bytes
+instead of sleeping until user input. `quirl ai index` remains an explicit diagnostic/refresh tool;
 it is not required for normal setup. `quirl ai search`, `quirl ai related`, and
 interactive natural mode read the same database. Missing model files or
 embeddings select deterministic lexical ranking. Natural mode and AI
@@ -90,7 +100,8 @@ subcommands only display suggestions and never execute one.
   complete database.
 - Initial indexing starts only after catalog admission. Refresh indexing is
   requested only after refreshed database publication; database publication is
-  serialized and an embedding result revalidates its exact source bytes.
+  serialized and an embedding result revalidates its exact source bytes. Full
+  discovery and its follow-up embedding run while an untouched shell is idle.
 - Background work never owns terminal state. Cancellation is visible between
   download chunks and embedding batches; terminal restoration precedes the
   bounded worker join.
