@@ -20,10 +20,14 @@ real-PTY check must preserve:
   contract without allowing guest instructions before anchored ownership.
 - **Anchor construction:** Quirl starts absolute `/bin/sh` with a fixed script,
   an empty environment, piped standard input, and null terminal-facing output.
-  The script installs ignored dispositions for interactive terminal signals
-  before a one-byte readiness handshake. Spawn, process-group verification,
-  early exit, malformed readiness, and each two-second setup wait all unwind by
-  killing and reaping the anchor before an error is returned.
+  The script ignores interrupt, termination, and background-terminal signals,
+  but retains the default `SIGTSTP` disposition before its one-byte readiness
+  handshake. The foreground wait polls that owned anchor as a stop sentinel;
+  observing it stopped causes one anchored group `SIGSTOP`, covering a Darwin
+  PTY delivery where the anchor stops but a guest misses the terminal
+  `SIGTSTP`. Spawn, process-group verification, early exit, malformed
+  readiness, and each two-second setup wait all unwind by killing and reaping
+  the anchor before an error is returned.
 - **Partial spawn:** every child and descriptor is owned immediately. Failure
   after any spawn kills the process group, kills each direct child as a
   fallback, reaps every direct child, closes pending pipe ends, and returns the
@@ -88,7 +92,8 @@ wait, for at most four seconds of total setup; the trusted staging shell becomes
 the first guest rather than adding another live process. The reader is joined on
 every startup outcome. Native stage and retained-job limits therefore also
 bound anchors; established groups retain no anchor reader thread or output
-buffer.
+buffer. Foreground waits poll at most 16 queued anchor status transitions per
+turn before yielding to child polling and cancellation.
 
 The canonical Unix PTY harness automates foreground-group ownership, native
 `Ctrl-Z`/`Ctrl-C`, `jobs`/`bg`/`fg`, fast-leader and construction-failure

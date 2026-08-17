@@ -44,7 +44,11 @@ The anchor is absolute `/bin/sh` running a fixed, argument-free script with an
 empty environment. Standard input is a private keepalive pipe, standard output
 is a private readiness pipe, and standard error is null, so it never reads or
 writes the user terminal. Before reporting ready it ignores `SIGHUP`, `SIGINT`,
-`SIGQUIT`, `SIGTERM`, `SIGTSTP`, `SIGTTIN`, and `SIGTTOU`. `SIGKILL` and
+`SIGQUIT`, `SIGTERM`, `SIGTTIN`, and `SIGTTOU`. It retains the default
+`SIGTSTP` disposition and is polled as the foreground stop sentinel. On Darwin,
+the PTY can stop the anchor while a guest in the same foreground group misses
+the terminal `SIGTSTP`; observing the anchor stop causes Quirl to send the
+still-owned group `SIGSTOP` and wait for every guest to stop. `SIGKILL` and
 `SIGSTOP` retain their kernel-defined behavior, allowing deterministic cleanup
 and explicit whole-job suspension. A one-byte handshake must arrive within two
 seconds and process-group membership is verified before any guest instruction
@@ -73,7 +77,9 @@ most two seconds. Native construction also waits at most two seconds for the
 trusted leader stage to stop, bounding complete native setup to four seconds;
 that stage becomes the guest and is not an additional retained process. Native
 pipeline-stage and retained-job limits bound the number of live anchors, and
-each `ChildProcessTree` owns exactly one anchor and one guest root.
+each `ChildProcessTree` owns exactly one anchor and one guest root. A foreground
+poll turn consumes at most 16 queued anchor status transitions before returning
+to guest polling and cancellation.
 
 Failure before readiness kills and reaps the anchor without starting guest
 code. Failure after any guest spawn keeps the original operating error while a
