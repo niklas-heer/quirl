@@ -1,3 +1,4 @@
+use crate::lua_worker::{LuaWorkerCancellation as LuaCancellation, LuaWorkerRuntime as LuaRuntime};
 use crate::{
     bounded_file::{read_optional_regular_file, read_regular_file, ReadFileOptions},
     extension_scheduler::{
@@ -18,8 +19,8 @@ use quirl_core::{
     ValueInputContract, ValueOutputContract,
 };
 use quirl_lua::{
-    CommandRegistration, ConfigStore, EventHandlerReport, LuaCancellation, LuaPolicy,
-    LuaRunnerContext, LuaRuntime, PluginRegistrations, QuirlConfig, MAX_LUA_RUNNER_STREAM_VALUES,
+    CommandRegistration, ConfigStore, EventHandlerReport, LuaPolicy, LuaRunnerContext,
+    PluginRegistrations, QuirlConfig, MAX_LUA_RUNNER_STREAM_VALUES,
 };
 use quirl_plugin::{
     doctor_plugin, normalize_plugin_commands, parse_plugin_manifest, validate_plugin_manifest,
@@ -1905,7 +1906,7 @@ impl LuaExtensionHost {
         let mut config = ConfigStore::default();
         if let Some(path) = &snapshot.config {
             let runtime = LuaRuntime::new(LuaPolicy::config())?;
-            config.reload(&runtime, path)?;
+            config.install(runtime.load_config_file(path)?)?;
         }
 
         let mut plugin_runtimes = Vec::with_capacity(snapshot.plugins.len());

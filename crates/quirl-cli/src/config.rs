@@ -1,8 +1,9 @@
+use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::{Subcommand, ValueEnum};
 use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
 use quirl_lua::{
-    builtin_theme, builtin_theme_names, format_source, LuaPolicy, LuaRuntime, QuirlConfig,
-    ThemeColors, CONFIG_SCHEMA_VERSION, MAX_LUA_SOURCE_BYTES, MAX_THEME_NAME_BYTES,
+    builtin_theme, builtin_theme_names, format_source, LuaPolicy, QuirlConfig, ThemeColors,
+    CONFIG_SCHEMA_VERSION, MAX_LUA_SOURCE_BYTES, MAX_THEME_NAME_BYTES,
 };
 use serde::Serialize;
 use std::{

@@ -1,4 +1,5 @@
 use crate::agent::installed_agent_catalog;
+use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::{Subcommand, ValueEnum};
 use quirl_catalog::Catalog;
 use quirl_contract::{
@@ -6,7 +7,7 @@ use quirl_contract::{
     PackageManifest, PackagePublishPlan, PackageSourceAudit, ValidationDiagnostic,
 };
 use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
-use quirl_lua::{LuaRuntime, HOST_API};
+use quirl_lua::HOST_API;
 use serde::Serialize;
 use std::{
     fs,

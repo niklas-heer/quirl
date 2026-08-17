@@ -2,6 +2,12 @@
 
 mod builtin;
 
+fn noninteractive_process_error(source: &str, message: &str) -> quirl_core::ShellError {
+    quirl_core::ShellError::new(quirl_core::ErrorCode::InvalidArgument, message)
+        .with_command(source)
+        .with_help("Run one foreground command without job-control or session-state built-ins")
+}
+
 /// Version of the serialized native runner contract.
 pub const RUNNER_PROTOCOL_VERSION: u32 = 2;
 /// Historical runner version retained as fail-closed compatibility evidence.
@@ -414,6 +420,7 @@ mod platform {
         jobs: Vec<Job>,
         next_job_id: u32,
         substitution_depth: u8,
+        noninteractive_host: bool,
         #[cfg(test)]
         fail_stopped_terminal_mode_read: bool,
     }
@@ -429,6 +436,12 @@ mod platform {
             Ok(Self {
                 process_group: Mutex::new(None),
             })
+        }
+
+        /// Configure `command` so its child becomes the leader of a fresh
+        /// process group before any guest code can run.
+        pub fn configure(&self, command: &mut Command) {
+            command.process_group(0);
         }
 
         /// Complete Unix containment setup for `child`.
@@ -497,6 +510,7 @@ mod platform {
                 jobs: Vec::new(),
                 next_job_id: 1,
                 substitution_depth: 0,
+                noninteractive_host: false,
                 #[cfg(test)]
                 fail_stopped_terminal_mode_read: false,
             }
@@ -515,6 +529,12 @@ mod platform {
     }
 
     impl NativeExecutor {
+        pub(crate) fn noninteractive_host() -> Self {
+            let mut executor = Self::default();
+            executor.noninteractive_host = true;
+            executor
+        }
+
         /// Execute an ordinary foreground command with terminal streams
         /// inherited. Unlike capture APIs, interactive output is not retained
         /// or rejected at the programmatic capture ceiling. This trusted-local
@@ -722,7 +742,23 @@ mod platform {
             }
             let pipeline = self.expand_pipeline(pipeline, request, previous_status)?;
             let pipeline = &pipeline;
+            if self.noninteractive_host && pipeline.background {
+                return Err(super::noninteractive_process_error(
+                    source,
+                    "background execution is unavailable to isolated Lua",
+                ));
+            }
             if pipeline.commands.len() == 1 {
+                if self.noninteractive_host
+                    && pipeline.commands[0].words.first().is_some_and(|name| {
+                        matches!(name.as_str(), "cd" | "export" | "jobs" | "fg" | "bg")
+                    })
+                {
+                    return Err(super::noninteractive_process_error(
+                        source,
+                        "stateful and job-control built-ins are unavailable to isolated Lua",
+                    ));
+                }
                 if pipeline.background
                     && pipeline.commands[0].words.first().is_some_and(|name| {
                         matches!(name.as_str(), "cd" | "ls" | "export" | "jobs" | "fg" | "bg")
@@ -1031,7 +1067,7 @@ mod platform {
             // until both the foreground process group and saved terminal modes
             // have been restored. Per-syscall locking would still allow another
             // executor to steal the terminal between handoff and restoration.
-            let terminal_lease = if pipeline.background {
+            let terminal_lease = if pipeline.background || self.noninteractive_host {
                 ForegroundTerminalLease::none()
             } else {
                 ForegroundTerminalLease::acquire(request)?
@@ -1041,7 +1077,7 @@ mod platform {
             // group is either registered as a job or handed to the waiter.
             // Extension callbacks and other user code must stay outside this
             // window so an early child notification cannot observe half a job.
-            let mut spawned = PipelineConstructionGuard::default();
+            let mut spawned = PipelineConstructionGuard::new();
             let mut previous_reader: Option<PipeReader> = None;
             let mut capture_reader = None;
             let mut stderr_readers = Vec::new();
@@ -1070,7 +1106,12 @@ mod platform {
                         "Use `> file 2>&1` to merge both streams into the file, or use an explicit Bash/Zsh island for ordered descriptor routing",
                     ));
                 }
-                let input = input_stdio(command, previous_reader.take(), index > 0)?;
+                let input = input_stdio(
+                    command,
+                    previous_reader.take(),
+                    index > 0,
+                    self.noninteractive_host,
+                )?;
                 let (stdout, next_reader, writer, redirected_stdout) =
                     output_stdio(command, last, capture_streams)?;
                 if last && capture_streams {
@@ -1125,7 +1166,6 @@ mod platform {
                     stderr_stdio(command, capture_streams)?
                 };
                 process.stdin(input.stdio).stdout(stdout).stderr(stderr);
-                #[cfg(unix)]
                 process.process_group(spawned.process_group.unwrap_or(0));
                 let mut child = process.spawn().map_err(|error| {
                     ShellError::new(
@@ -1840,6 +1880,7 @@ mod platform {
         command: &SimpleCommand,
         previous: Option<PipeReader>,
         has_upstream: bool,
+        stdin_is_null: bool,
     ) -> Result<PreparedInput, ShellError> {
         enum InputSource {
             File(File),
@@ -1900,7 +1941,7 @@ mod platform {
             None => Ok(PreparedInput {
                 stdio: previous.map_or_else(
                     || {
-                        if has_upstream {
+                        if has_upstream || stdin_is_null {
                             Stdio::null()
                         } else {
                             Stdio::inherit()
@@ -2206,13 +2247,19 @@ mod platform {
         .with_help("Retry the command; report repeated process-group construction failures"))
     }
 
-    #[derive(Default)]
     struct PipelineConstructionGuard {
         children: Vec<JobChild>,
         process_group: Option<i32>,
     }
 
     impl PipelineConstructionGuard {
+        fn new() -> Self {
+            Self {
+                children: Vec::new(),
+                process_group: None,
+            }
+        }
+
         fn push(&mut self, mut child: Child) -> Result<(), ShellError> {
             let process_id = i32::try_from(child.id()).map_err(|error| {
                 let _ = child.kill();
@@ -3696,7 +3743,7 @@ mod platform {
             command.process_group(0);
             let child = command.spawn().unwrap();
             let pid = Pid::from_raw(i32::try_from(child.id()).unwrap());
-            let mut guard = PipelineConstructionGuard::default();
+            let mut guard = PipelineConstructionGuard::new();
             guard.push(child).unwrap();
             drop(guard);
             assert!(kill(pid, None).is_err());
@@ -3790,7 +3837,7 @@ mod platform {
                 // planned suffix, which must never be reached after the fault.
                 let fault_after = case_index % PIPELINE_STAGES_MAX + 1;
                 let planned_stages = fault_after + rng.index(PIPELINE_STAGES_MAX + 1 - fault_after);
-                let mut guard = PipelineConstructionGuard::default();
+                let mut guard = PipelineConstructionGuard::new();
                 let mut process_ids = Vec::with_capacity(fault_after);
 
                 for stage in 0..planned_stages {
@@ -3964,6 +4011,7 @@ mod platform {
     pub struct NativeExecutor {
         jobs: Vec<Job>,
         next_job_id: u32,
+        noninteractive_host: bool,
     }
 
     /// A kill-on-close Job Object used by non-shell process adapters.
@@ -3974,6 +4022,10 @@ mod platform {
         pub fn new() -> Result<Self, ShellError> {
             JobObject::new().map(Self)
         }
+
+        /// Configure `command` before spawning a child for this containment object.
+        /// Windows Job Object assignment is completed after spawn.
+        pub fn configure(&self, _command: &mut Command) {}
 
         /// Assign `child` to this containment object.
         pub fn assign(&self, child: &mut Child) -> Result<(), ShellError> {
@@ -3991,6 +4043,7 @@ mod platform {
             Self {
                 jobs: Vec::new(),
                 next_job_id: 1,
+                noninteractive_host: false,
             }
         }
     }
@@ -4008,6 +4061,12 @@ mod platform {
     }
 
     impl NativeExecutor {
+        pub(crate) fn noninteractive_host() -> Self {
+            let mut executor = Self::default();
+            executor.noninteractive_host = true;
+            executor
+        }
+
         /// Execute an ordinary foreground command with terminal streams
         /// inherited. Unlike capture APIs, interactive output is not retained
         /// or rejected at the programmatic capture ceiling. This trusted-local
@@ -4202,7 +4261,23 @@ mod platform {
             if let Some(request) = request {
                 request.ensure_active()?;
             }
+            if self.noninteractive_host && pipeline.background {
+                return Err(super::noninteractive_process_error(
+                    source,
+                    "background execution is unavailable to isolated Lua",
+                ));
+            }
             if pipeline.commands.len() == 1 {
+                if self.noninteractive_host
+                    && pipeline.commands[0].words.first().is_some_and(|name| {
+                        matches!(name.as_str(), "cd" | "export" | "jobs" | "fg" | "bg")
+                    })
+                {
+                    return Err(super::noninteractive_process_error(
+                        source,
+                        "stateful and job-control built-ins are unavailable to isolated Lua",
+                    ));
+                }
                 if pipeline.background
                     && pipeline.commands[0].words.first().is_some_and(|name| {
                         matches!(name.as_str(), "cd" | "ls" | "export" | "jobs" | "fg" | "bg")
@@ -4356,6 +4431,8 @@ mod platform {
                         if let Some(stdout) = previous_stdout.take() {
                             process.stdin(Stdio::from(stdout));
                         } else if index > 0 {
+                            process.stdin(Stdio::null());
+                        } else if self.noninteractive_host {
                             process.stdin(Stdio::null());
                         } else {
                             process.stdin(Stdio::inherit());
@@ -4882,6 +4959,94 @@ mod platform {
 
 pub use platform::{ChildProcessTree, JobState, JobStatus, NativeExecutor};
 
+/// RAII ownership for one directly spawned process tree.
+///
+/// Construction establishes containment before returning. Every drop path
+/// terminates the contained tree and reaps the direct child, including callers
+/// that fail while taking pipes or starting protocol readers.
+pub struct ContainedChild {
+    containment: ChildProcessTree,
+    child: std::process::Child,
+    reaped: bool,
+}
+
+impl ContainedChild {
+    /// Spawn `command` without allowing a partially initialized child to escape.
+    pub fn spawn(command: &mut std::process::Command) -> Result<Self, quirl_core::ShellError> {
+        let containment = ChildProcessTree::new()?;
+        containment.configure(command);
+        let mut child = command.spawn().map_err(|error| {
+            quirl_core::ShellError::new(
+                quirl_core::ErrorCode::ProcessSpawn,
+                "could not start contained child process",
+            )
+            .with_context(error.to_string())
+            .with_help("Check the executable and retry after reducing process pressure")
+        })?;
+        if let Err(error) = containment.assign(&mut child) {
+            let _ = containment.terminate(&mut child);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        Ok(Self {
+            containment,
+            child,
+            reaped: false,
+        })
+    }
+
+    /// Borrow the direct child to take its configured pipes.
+    pub fn child_mut(&mut self) -> &mut std::process::Child {
+        &mut self.child
+    }
+
+    /// Observe direct-child exit without relinquishing cleanup ownership.
+    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, quirl_core::ShellError> {
+        self.child.try_wait().map_err(|error| {
+            quirl_core::ShellError::new(
+                quirl_core::ErrorCode::Io,
+                "could not observe contained child status",
+            )
+            .with_context(error.to_string())
+            .with_help("Retry; report repeated process observation failures")
+        })
+    }
+
+    /// Terminate the complete tree and reap the direct child exactly once.
+    pub fn terminate_and_reap(
+        &mut self,
+    ) -> Result<std::process::ExitStatus, quirl_core::ShellError> {
+        let terminate = self.containment.terminate(&mut self.child);
+        let waited = self.child.wait().map_err(|error| {
+            quirl_core::ShellError::new(
+                quirl_core::ErrorCode::Io,
+                "could not reap contained child process",
+            )
+            .with_context(error.to_string())
+            .with_help("Report the unreaped process and restart Quirl")
+        });
+        if waited.is_ok() {
+            self.reaped = true;
+        }
+        match (terminate, waited) {
+            (Ok(()), Ok(status)) => Ok(status),
+            (Err(error), Ok(_)) | (Err(error), Err(_)) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+        }
+    }
+}
+
+impl Drop for ContainedChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.containment.terminate(&mut self.child);
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
+    }
+}
+
 #[cfg(any(unix, test))]
 fn summarize_job_lifecycle(
     children: impl IntoIterator<Item = (JobStatus, Option<i32>)>,
@@ -4913,6 +5078,17 @@ fn summarize_job_lifecycle(
 pub fn sandboxed_process_host() -> quirl_core::ProcessHost {
     std::sync::Arc::new(|request| {
         let mut executor = NativeExecutor::default();
+        executor.execute_capture_request(request)
+    })
+}
+
+/// Noninteractive process host for requests proxied from an isolated runtime.
+///
+/// Standard input is closed, terminal ownership is never transferred, and the
+/// ordinary platform process-tree container remains responsible for cleanup.
+pub fn isolated_process_host() -> quirl_core::ProcessHost {
+    std::sync::Arc::new(|request| {
+        let mut executor = NativeExecutor::noninteractive_host();
         executor.execute_capture_request(request)
     })
 }
@@ -5438,5 +5614,61 @@ mod backend_contract_tests {
                 "seed={seed} case={case_index} did not converge"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_child_termination_reaps_the_direct_child() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = ContainedChild::spawn(&mut command).unwrap();
+        let started = Instant::now();
+        let status = child.terminate_and_reap().unwrap();
+        assert!(!status.success());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn contained_child_spawn_failure_returns_without_partial_ownership() {
+        let mut command =
+            std::process::Command::new("quirl-test-executable-that-must-not-exist-3f830f7d");
+        let error = match ContainedChild::spawn(&mut command) {
+            Ok(_) => panic!("missing executable unexpectedly spawned"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::ProcessSpawn);
+    }
+
+    #[test]
+    fn isolated_process_host_closes_stdin_and_rejects_background_work() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let host = isolated_process_host();
+        let outcome = host(quirl_core::ProcessRequest {
+            command: if cfg!(windows) { "cmd /c more" } else { "cat" }.to_owned(),
+            deadline: std::time::Duration::from_secs(1),
+            cancelled: std::sync::Arc::clone(&cancelled),
+            max_output_bytes: 1024,
+        })
+        .unwrap();
+        assert_eq!(outcome.stdout.as_deref(), Some(""));
+
+        let error = host(quirl_core::ProcessRequest {
+            command: if cfg!(windows) {
+                "cmd /c timeout /t 1 &"
+            } else {
+                "sleep 1 &"
+            }
+            .to_owned(),
+            deadline: std::time::Duration::from_secs(1),
+            cancelled,
+            max_output_bytes: 1024,
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert!(error.message.contains("background"));
     }
 }

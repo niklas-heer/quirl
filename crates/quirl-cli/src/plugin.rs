@@ -1,10 +1,11 @@
 use crate::bounded_file::{read_optional_regular_file, read_regular_file, ReadFileOptions};
+use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::{Subcommand, ValueEnum};
 use quirl_core::{
     escape_json_terminal_controls, escape_terminal_controls, ContributionKind, ErrorCode,
     ShellError,
 };
-use quirl_lua::{CommandRegistration, LuaPolicy, LuaRuntime};
+use quirl_lua::{CommandRegistration, LuaPolicy};
 use quirl_plugin::{
     doctor_plugin, parse_plugin_manifest, permission_diff, resolve_plugin,
     validate_plugin_manifest, AdapterInitializeRequest, AdapterInitializeResponse, DoctorReport,

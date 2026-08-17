@@ -1,4 +1,5 @@
 use crate::bounded_file::{read_regular_file, ReadFileOptions};
+use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::ValueEnum;
 use quirl_core::{
     escape_json_terminal_controls, replace_file_atomically, AtomicReplaceOptions, ErrorCode,
@@ -13,7 +14,7 @@ use quirl_data::{
     },
     DataRuntime,
 };
-use quirl_lua::{format_file, LuaPolicy, LuaRunnerContext, LuaRuntime, MAX_LUA_SOURCE_BYTES};
+use quirl_lua::{format_file, LuaPolicy, LuaRunnerContext, MAX_LUA_SOURCE_BYTES};
 use quirl_process::{sandboxed_process_host, ChildProcessTree, NativeExecutor};
 use quirl_syntax::{check_script, parse_command_list};
 use quirl_ui::render_error;

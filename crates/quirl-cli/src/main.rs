@@ -8,6 +8,7 @@ mod extension_scheduler;
 mod extensions;
 mod index;
 mod lsp;
+mod lua_worker;
 mod mcp;
 mod package;
 mod pick;
@@ -26,6 +27,7 @@ use extensions::{
     LuaExtensionHost,
 };
 use index::IndexCommand;
+use lua_worker::LuaWorkerRuntime as LuaRuntime;
 use mcp::ServeCommand;
 use package::PackageCommand;
 use pick::PickCommand;
@@ -40,9 +42,7 @@ use quirl_core::{
     ExtensionEventData, OutputStream, ProcessRequest, ShellError, StructuredValue,
 };
 use quirl_data::{DataEnvelope, DataOutput, DataRenderFormat, DataRuntime};
-use quirl_lua::{
-    sdk_json, sdk_lua, sdk_markdown, LuaPolicy, LuaRuntime, QuirlConfig, MAX_LUA_SOURCE_BYTES,
-};
+use quirl_lua::{sdk_json, sdk_lua, sdk_markdown, LuaPolicy, QuirlConfig, MAX_LUA_SOURCE_BYTES};
 use quirl_picker::{ItemKind, PickItem, Picker, MAX_PICKER_ITEMS};
 use quirl_process::{sandboxed_process_host, JobStatus, NativeExecutor, DEFAULT_CAPTURE_BYTES};
 use quirl_syntax::{classify, InteractiveLine, Mode};
@@ -272,6 +272,12 @@ enum DataOutputFormat {
 }
 
 fn main() -> ExitCode {
+    if lua_worker::worker_requested() {
+        return match lua_worker::run_worker() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     let cli = Cli::parse();
     if cli.build_info {
         print_json_value(serde_json::json!({
