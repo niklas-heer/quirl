@@ -11,6 +11,7 @@ use std::{
 const MAX_FILE_ITEMS: usize = 20_000;
 const MAX_STDIN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STDIN_ITEMS: usize = 20_000;
+const MAX_HISTORY_ITEMS: usize = 20_000;
 
 #[derive(Debug, Args)]
 pub struct PickCommand {
@@ -125,23 +126,16 @@ fn stdin_items_from(reader: impl Read) -> Result<Vec<PickItem>, ShellError> {
 
 fn history_items() -> Result<Vec<PickItem>, ShellError> {
     let path = quirl_ui::history_path()?;
-    let source = match fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(ShellError::new(
-                ErrorCode::Io,
-                format!("could not read history at {}", path.display()),
-            )
-            .with_context(error.to_string())
-            .with_help("Set QUIRL_HISTORY to a readable history file"));
-        }
-    };
-    Ok(source
-        .lines()
+    history_items_from(&path)
+}
+
+fn history_items_from(path: &Path) -> Result<Vec<PickItem>, ShellError> {
+    Ok(quirl_ui::read_history(path)?
+        .into_iter()
         .rev()
+        .take(MAX_HISTORY_ITEMS)
         .enumerate()
-        .map(|(index, line)| text_item(index, ItemKind::History, line))
+        .map(|(index, entry)| text_item(index, ItemKind::History, &entry))
         .collect())
 }
 
@@ -289,5 +283,30 @@ mod tests {
         let error = stdin_items_from(std::io::Cursor::new(many_items)).unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert!(error.details.help[0].contains("20000"));
+    }
+
+    #[test]
+    fn history_source_reuses_bounded_tail_reader_and_decodes_multiline_entries() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "quirl-pick-history-{}-{unique}",
+            std::process::id()
+        ));
+        let mut source = "old\n".repeat(MAX_HISTORY_ITEMS + 10);
+        source.push_str(&"x".repeat(64 * 1024 + 1));
+        source.push('\n');
+        source.push_str("printf one<\\n>printf two\n");
+        fs::write(&path, source).unwrap();
+
+        let items = history_items_from(&path).unwrap();
+        assert_eq!(items.len(), MAX_HISTORY_ITEMS);
+        assert_eq!(items[0].label, "printf one\nprintf two");
+        assert_eq!(items[0].value, "printf one\nprintf two");
+        assert!(items.iter().all(|item| item.label.len() <= 64 * 1024));
+
+        fs::remove_file(path).unwrap();
     }
 }

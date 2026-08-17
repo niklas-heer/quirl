@@ -23,6 +23,9 @@ const MAX_PATH_DIRECTORIES: usize = 256;
 const MAX_PATH_ENTRIES_PER_DIRECTORY: usize = 4_096;
 const MAX_PATH_COMMANDS: usize = 65_536;
 const MAX_PATH_NAME_BYTES: usize = 1024 * 1024;
+const COMMAND_SUGGESTION_TOKEN_BYTES_MAX: usize = 256;
+const COMMAND_SUGGESTION_CANDIDATES_MAX: usize = 1_024;
+const COMMAND_SUGGESTION_DISTANCE_MAX: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // The rendering contract includes hints even though the first analyzer emits
@@ -425,14 +428,31 @@ fn diagnostic_for(
         if path_status == Some(false)
             && buffer[command_span.range.end..].contains(char::is_whitespace)
         {
-            let suggestion = catalog
-                .commands
-                .iter()
-                .filter_map(|item| item.path.split_whitespace().next())
-                .min_by_key(|candidate| edit_distance(command, candidate));
+            let suggestion = (command.len() <= COMMAND_SUGGESTION_TOKEN_BYTES_MAX)
+                .then(|| {
+                    catalog
+                        .commands
+                        .iter()
+                        .filter_map(|item| item.path.split_whitespace().next())
+                        .take(COMMAND_SUGGESTION_CANDIDATES_MAX)
+                        .filter_map(|candidate| {
+                            edit_distance_bounded(
+                                command,
+                                candidate,
+                                COMMAND_SUGGESTION_DISTANCE_MAX,
+                            )
+                            .map(|distance| (candidate, distance))
+                        })
+                        .min_by_key(|(candidate, distance)| (*distance, *candidate))
+                        .map(|(candidate, _)| candidate)
+                })
+                .flatten();
+            let command_label = bounded_command_label(command);
             let message = suggestion.map_or_else(
-                || format!("unknown command `{command}`"),
-                |candidate| format!("unknown command `{command}` — did you mean `{candidate}`?"),
+                || format!("unknown command `{command_label}`"),
+                |candidate| {
+                    format!("unknown command `{command_label}` — did you mean `{candidate}`?")
+                },
             );
             return Some(SurfaceDiagnostic {
                 message,
@@ -491,19 +511,62 @@ fn resolve_catalog_command<'a>(
         })
 }
 
-fn edit_distance(left: &str, right: &str) -> usize {
-    let mut previous = (0..=right.chars().count()).collect::<Vec<_>>();
-    for (left_index, left_char) in left.chars().enumerate() {
-        let mut current = vec![left_index + 1];
-        for (right_index, right_char) in right.chars().enumerate() {
-            let replace = previous[right_index] + usize::from(left_char != right_char);
-            let insert = current[right_index] + 1;
-            let delete = previous[right_index + 1] + 1;
-            current.push(replace.min(insert).min(delete));
-        }
-        previous = current;
+fn edit_distance_bounded(left: &str, right: &str, maximum: usize) -> Option<usize> {
+    if left.len() > COMMAND_SUGGESTION_TOKEN_BYTES_MAX
+        || right.len() > COMMAND_SUGGESTION_TOKEN_BYTES_MAX
+    {
+        return None;
     }
-    previous.last().copied().unwrap_or(0)
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    if left.len().abs_diff(right.len()) > maximum {
+        return None;
+    }
+
+    let unreachable = maximum.saturating_add(1);
+    let mut previous = (0..=right.len())
+        .map(|index| index.min(unreachable))
+        .collect::<Vec<_>>();
+    let mut current = vec![unreachable; right.len().saturating_add(1)];
+    for (left_index, left_character) in left.iter().enumerate() {
+        current.fill(unreachable);
+        let row = left_index.saturating_add(1);
+        if row <= maximum {
+            current[0] = row;
+        }
+        let start = row.saturating_sub(maximum).max(1);
+        let end = row.saturating_add(maximum).min(right.len());
+        let mut row_minimum = current[0];
+        if start <= end {
+            for column in start..=end {
+                let replace = previous[column - 1]
+                    .saturating_add(usize::from(*left_character != right[column - 1]));
+                let insert = current[column - 1].saturating_add(1);
+                let delete = previous[column].saturating_add(1);
+                current[column] = replace.min(insert).min(delete).min(unreachable);
+                row_minimum = row_minimum.min(current[column]);
+            }
+        }
+        if row_minimum > maximum {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous
+        .get(right.len())
+        .copied()
+        .filter(|distance| *distance <= maximum)
+}
+
+fn bounded_command_label(command: &str) -> String {
+    if command.len() <= COMMAND_SUGGESTION_TOKEN_BYTES_MAX {
+        return command.to_owned();
+    }
+    let mut end = COMMAND_SUGGESTION_TOKEN_BYTES_MAX;
+    while end > 0 && !command.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &command[..end])
 }
 
 fn record_timing(samples: &mut VecDeque<Duration>, elapsed: Duration) {
@@ -578,6 +641,37 @@ mod tests {
             diagnostic_for(&catalog, &path_commands, input, Mode::Command, &spans).unwrap();
         assert_eq!(diagnostic.severity, DiagnosticSeverity::Error);
         assert!(diagnostic.message.contains("did you mean `git`"));
+    }
+
+    #[test]
+    fn command_suggestions_use_bounded_tokens_and_banded_distance() {
+        assert_eq!(edit_distance_bounded("gti", "git", 3), Some(2));
+        assert_eq!(edit_distance_bounded("git", "git", 0), Some(0));
+        assert_eq!(edit_distance_bounded("a", "abcdefgh", 3), None);
+        assert_eq!(
+            edit_distance_bounded(
+                &"a".repeat(COMMAND_SUGGESTION_TOKEN_BYTES_MAX + 1),
+                "git",
+                COMMAND_SUGGESTION_DISTANCE_MAX,
+            ),
+            None
+        );
+
+        let catalog = Catalog::builtin();
+        let mut path_commands = PathCommandCache::new(None);
+        path_commands.ready = true;
+        let token = "x".repeat(COMMAND_SUGGESTION_TOKEN_BYTES_MAX + 1);
+        let input = format!("{token} argument");
+        let spans = highlight(&input, Mode::Command);
+        let diagnostic =
+            diagnostic_for(&catalog, &path_commands, &input, Mode::Command, &spans).unwrap();
+        assert_eq!(
+            diagnostic.message,
+            format!(
+                "unknown command `{}…`",
+                "x".repeat(COMMAND_SUGGESTION_TOKEN_BYTES_MAX)
+            )
+        );
     }
 
     #[test]

@@ -2,17 +2,17 @@ use super::{
     completion::{CompletionItem, CompletionKind},
     editor::PickerKind,
 };
-use crate::{PickerItem, PickerItemKind, PickerRanker};
+use crate::{
+    PickerItem, PickerItemKind, PickerRanker, PICKER_QUERY_BYTES_MAX, PICKER_RANKING_TEXT_BYTES_MAX,
+};
 use quirl_catalog::Catalog;
 use std::{fs, path::Path, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
 
 const OVERLAY_ITEMS_MAX: usize = 4_096;
 const OVERLAY_RESULTS_MAX: usize = 256;
-const OVERLAY_QUERY_BYTES_MAX: usize = 1_024;
 const OVERLAY_ITEM_BYTES_MAX: usize = 16 * 1_024;
 const OVERLAY_RETAINED_BYTES_MAX: usize = 2 * 1_024 * 1_024;
-const RANKING_TEXT_BYTES_MAX: usize = 2 * 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerLayout {
@@ -86,7 +86,7 @@ impl PickerOverlay {
         self.label = label;
         self.expanded = expanded;
         self.active = true;
-        self.query = truncate_utf8(query, OVERLAY_QUERY_BYTES_MAX);
+        self.query = truncate_utf8(query, PICKER_QUERY_BYTES_MAX);
 
         let mut retained_bytes = 0_usize;
         for item in items.into_iter().take(OVERLAY_ITEMS_MAX) {
@@ -101,8 +101,8 @@ impl PickerOverlay {
             self.ranking.push(PickerItem {
                 id: format!("{label}:{index}"),
                 kind: picker_item_kind(item.kind),
-                label: truncate_utf8(&item.display, RANKING_TEXT_BYTES_MAX),
-                description: truncate_utf8(&item.summary, RANKING_TEXT_BYTES_MAX),
+                label: truncate_utf8(&item.display, PICKER_RANKING_TEXT_BYTES_MAX),
+                description: truncate_utf8(&item.summary, PICKER_RANKING_TEXT_BYTES_MAX),
                 preview: None,
                 value: item.value.clone(),
             });
@@ -136,7 +136,7 @@ impl PickerOverlay {
             return None;
         }
         let text = text.replace(['\r', '\n'], " ");
-        if self.query.len().saturating_add(text.len()) > OVERLAY_QUERY_BYTES_MAX {
+        if self.query.len().saturating_add(text.len()) > PICKER_QUERY_BYTES_MAX {
             return None;
         }
         self.query.push_str(&text);
@@ -211,7 +211,7 @@ pub fn contextual_help_query(catalog: &Catalog, line: &str, cursor: usize) -> St
                 .max_by_key(|path| path.len())
         })
         .max_by_key(|path| path.len());
-    truncate_utf8(context.unwrap_or(prefix), OVERLAY_QUERY_BYTES_MAX)
+    truncate_utf8(context.unwrap_or(prefix), PICKER_QUERY_BYTES_MAX)
 }
 
 pub fn items(
@@ -381,7 +381,7 @@ mod tests {
         let visible = overlay.open(items, "bounded", false);
         assert_eq!(visible.len(), OVERLAY_RESULTS_MAX);
         assert!(overlay
-            .insert_query(&"x".repeat(OVERLAY_QUERY_BYTES_MAX + 1))
+            .insert_query(&"x".repeat(PICKER_QUERY_BYTES_MAX + 1))
             .is_none());
         assert_eq!(overlay.query(), Some(""));
     }
