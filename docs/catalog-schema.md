@@ -43,6 +43,35 @@ compiled builtins, so an old cache cannot remove or overwrite an exact builtin.
 Unknown schema versions fail validation and should be rebuilt with
 `quirl index build`.
 
+## Durable discovery cache
+
+Interactive startup initializes the same catalog cache automatically; users do
+not need to run `quirl index build`. The rich surface performs this bounded work
+after its first frame, while the simple fallback performs it eagerly under the
+same 750 ms deadline. Later refreshes run once per minute on a single
+cancellable worker and never on highlighting, editing, or completion paths.
+
+Discovery inspects executable entries in `PATH` and reads declarative Fish,
+Bash, Zsh, help, and man sources. It never invokes an executable, a shell,
+`man`, or a user startup file. `QUIRL_HELP_PATH` and `QUIRL_MAN_PATH` add
+path-list roots; user and system `share/quirl/help` and `share/quirl/man`
+directories are also considered. Existing source, entry, byte, record, and
+diagnostic limits apply to automatic refreshes.
+Declarative source symlinks are canonicalized to a regular target and then
+subjected to the same size, permission, and hard-link checks; cache destination
+and parent symlinks remain rejected.
+
+`catalog.json.discovery.json` is a deny-unknown, versioned sidecar containing a
+bounded sorted source inventory, content/metadata fingerprints, refresh time,
+and the fingerprint and schema version of `catalog.json`. A missing, stale,
+corrupt, incompatible, or mismatched sidecar is a cache miss. Quirl rebuilds a
+complete catalog from current builtins plus imported facts and atomically
+replaces the files. The catalog is committed first; interruption between the
+two commits therefore leaves a detectable mismatch rather than a falsely fresh
+cache. Concurrent shells may duplicate bounded discovery, but readers observe
+only complete atomic documents. Cache failures fall back to current builtins
+and cannot prevent terminal startup or clean shutdown.
+
 Plugin commands are normalized only after manifest validation. Platform v0.1
 requires the plugin name as the command namespace, preventing implicit builtin
 shadowing. Normalized records carry the package version, declared typed IO,
