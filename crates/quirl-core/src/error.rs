@@ -38,8 +38,16 @@ pub struct ErrorLabel {
     /// Complete source text containing the labelled range, when it is safe to retain.
     pub source: Option<String>,
     /// Inclusive start byte offset into [`Self::source`].
+    ///
+    /// The machine contract encodes this as `u64`; the in-memory index is a
+    /// checked platform-width projection used only with Rust strings.
+    #[serde(with = "wire_usize")]
     pub start: usize,
     /// Exclusive end byte offset into [`Self::source`].
+    ///
+    /// The machine contract encodes this as `u64`; the in-memory index is a
+    /// checked platform-width projection used only with Rust strings.
+    #[serde(with = "wire_usize")]
     pub end: usize,
     /// Explanation associated with this source range.
     pub message: String,
@@ -142,3 +150,46 @@ impl fmt::Display for ShellError {
 }
 
 impl Error for ShellError {}
+
+pub(crate) mod wire_usize {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(crate) fn serialize<S>(value: &usize, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value = u64::try_from(*value).map_err(serde::ser::Error::custom)?;
+        value.serialize(serializer)
+    }
+
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<usize, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        usize::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_label_offsets_use_a_checked_u64_wire_representation() {
+        let label = ErrorLabel {
+            source: None,
+            start: usize::MAX,
+            end: usize::MAX,
+            message: "location".to_owned(),
+        };
+        let encoded = serde_json::to_value(&label).unwrap();
+        let platform_max = u64::try_from(usize::MAX).unwrap();
+        assert_eq!(encoded["start"], serde_json::json!(platform_max));
+        assert_eq!(encoded["end"], serde_json::json!(platform_max));
+        assert_eq!(
+            serde_json::from_value::<ErrorLabel>(encoded).unwrap(),
+            label
+        );
+    }
+}

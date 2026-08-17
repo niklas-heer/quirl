@@ -14,7 +14,8 @@ quirl agent manifest --format json
 quirl agent validate context.json --kind context --format json
 ```
 
-Every JSON document has a `document_type`, integer `schema_version`, and named
+Agent documents currently use frozen-major schema version 2. Every JSON
+document has a `document_type`, integer `schema_version`, and named
 `fnv1a64:` schema/content hashes. FNV-1a is used only as a stable freshness
 checksum; it is not an authenticity or security claim. Schema hashes cover
 deterministic structural descriptors for every nested field, enum, default,
@@ -37,15 +38,19 @@ to the authoritative complete record.
 
 Validation rejects unknown fields, incompatible schema versions, hash drift,
 nondeterministic ordering, and context budget drift. Catalog hashes are
-recomputed from their serialized command and host content. Context and
-manifest documents are subsets/projections, so `quirl agent validate` compares
-their catalog and host-API hashes with trusted anchors rebuilt from the running
-binary; the lower-level unanchored validator rejects those document kinds.
+recomputed from their serialized command and host content, then compared with
+trusted anchors when supplied. Context and manifest documents are
+subsets/projections, so `quirl agent validate` always compares their catalog
+and host-API hashes with anchors rebuilt from the running binary; the
+lower-level unanchored validator rejects those document kinds while permitting
+catalog self-consistency checks.
 Manifest content and nested capability hashes are also recomputed. Validation
 parses data only and does not grant authority or execute commands/Lua.
-Validation reads at most 4 MiB from a regular file. Larger inputs fail with a
-resource-limit diagnostic before JSON parsing or allocation proportional to
-the declared file size.
+Both the CLI reader and `quirl-contract` validator admit at most 4 MiB. Larger
+inputs fail with a resource-limit diagnostic before JSON parsing or allocation
+proportional to the declared file size. Token budgets and estimates use `u64`
+on the version-2 wire contract and convert to platform indices only at checked
+in-memory boundaries.
 
 ## Package manifest
 
@@ -89,8 +94,9 @@ required = true
 documentation = "Target deployment environment"
 ```
 
-All tables deny unknown fields. Package entry paths must be relative `.lua`
-paths without parent traversal. Capability requests must be sorted, unique, and
+All tables deny unknown fields. Package entry paths must be portable relative
+`.lua` paths without parent traversal, backslashes, or drive prefixes.
+Capability requests must be sorted, unique, and
 present in `quirl agent manifest`. Contributed command names must match exactly
 one `public_commands` record. Public command metadata must include a summary,
 detailed contract, typed input/output and arguments, examples, explicit
@@ -114,7 +120,8 @@ Package file lists contain normalized package-relative paths, so invoking the
 build with an absolute or relative manifest path produces the same build
 record. The record includes the resolved Quirl version and installed host-API
 hash.
-Package manifests are UTF-8 regular files limited to 256 KiB. Lua entries are
+Package manifests are UTF-8 regular files limited to 256 KiB by both the CLI
+reader and the owning contract parser. Lua entries are
 regular files limited to 4 MiB. Entry containment is checked against the
 canonical package directory; parent traversal, external symlink targets,
 directory or special-file entries, identity changes during resolution, and

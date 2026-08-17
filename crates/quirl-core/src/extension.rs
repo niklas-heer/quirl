@@ -4,14 +4,22 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 /// Current wire version for extension events, actions, and registrations.
-pub const EXTENSION_PROTOCOL_VERSION: u32 = 1;
+pub const EXTENSION_PROTOCOL_VERSION: u32 = 2;
 /// Inclusive upper bound, in milliseconds, for one extension callback.
 pub const MAX_EXTENSION_DEADLINE_MS: u64 = 250;
 /// Canonical structural description used to fingerprint the extension protocol.
 ///
 /// Change this descriptor whenever a serialized shape, semantic rule, or bound
 /// changes; [`extension_schema_hash`] derives the advertised identity from it.
-pub const EXTENSION_SCHEMA_DESCRIPTOR: &str = "quirl.extension@1{ExtensionEvent{deny_unknown;protocol_version:u32;sequence:u64;data:ExtensionEventData};ExtensionEventData:tag(kind)[session_start{restored:bool}|session_restore{session_id:string}|directory_changed{previous:string,current:string}|command_plan{source:string,effects:array<string>}|execution_progress{completed:u64,total:null|u64,message:null|string}|output{stream:stdout|stderr,bytes:usize,text:null|string}|cancellation{reason:string}|result{status:i32,duration_ms:u64}|error{error:ShellError}];ExtensionAction:tag(action)[diagnose{message:string}|rewrite_plan{source:string}|set_environment{name:string,value:string}|block_execution{reason:string}|annotate_result{key:string,value:Value}];EventSubscription{deny_unknown;name:string;events:unique-array<EventKind>;capabilities:array<ExtensionCapability>;deadline_ms:1..250};ContributionRegistration{deny_unknown;kind:catalog|completion|panel;name:string;deadline_ms:1..250;plain_fallback:null|string};capabilities:events_observe|plan_rewrite|environment_mutate|output_read|execution_block|catalog_contribute|completion_contribute|ui_panel;event_sequence:strictly-increasing}";
+pub const EXTENSION_SCHEMA_DESCRIPTOR: &str = "quirl.extension@2{ExtensionEvent{deny_unknown;protocol_version:u32;sequence:u64;data:ExtensionEventData};ExtensionEventData:tag(kind)[session_start{restored:bool}|session_restore{session_id:string}|directory_changed{previous:string,current:string}|command_plan{source:string,effects:array<string>}|execution_progress{completed:u64,total:null|u64,message:null|terminal-safe-string}|output{stream:stdout|stderr,bytes:u64,text:null|terminal-safe-string}|cancellation{reason:terminal-safe-string}|result{status:i32,duration_ms:u64}|error{error:ShellError}];ExtensionAction:tag(action)[diagnose{message:string}|rewrite_plan{source:string}|set_environment{name:string,value:string}|block_execution{reason:string}|annotate_result{key:string,value:Value{nodes<=100000;depth<=64;text_bytes<=8388608;terminal-safe-keys-and-strings}}];EventSubscription{deny_unknown;name:string;events:unique-array<EventKind>;capabilities:array<ExtensionCapability>;deadline_ms:1..250};ContributionRegistration{deny_unknown;kind:catalog|completion|panel;name:string;deadline_ms:1..250;plain_fallback:null|string};capabilities:events_observe|plan_rewrite|environment_mutate|output_read|execution_block|catalog_contribute|completion_contribute|ui_panel;event_sequence:strictly-increasing}";
+/// Historical extension protocol descriptor retained for version-1 identity checks.
+pub const EXTENSION_SCHEMA_V1_DESCRIPTOR: &str = "quirl.extension@1{ExtensionEvent{deny_unknown;protocol_version:u32;sequence:u64;data:ExtensionEventData};ExtensionEventData:tag(kind)[session_start{restored:bool}|session_restore{session_id:string}|directory_changed{previous:string,current:string}|command_plan{source:string,effects:array<string>}|execution_progress{completed:u64,total:null|u64,message:null|string}|output{stream:stdout|stderr,bytes:usize,text:null|string}|cancellation{reason:string}|result{status:i32,duration_ms:u64}|error{error:ShellError}];ExtensionAction:tag(action)[diagnose{message:string}|rewrite_plan{source:string}|set_environment{name:string,value:string}|block_execution{reason:string}|annotate_result{key:string,value:Value}];EventSubscription{deny_unknown;name:string;events:unique-array<EventKind>;capabilities:array<ExtensionCapability>;deadline_ms:1..250};ContributionRegistration{deny_unknown;kind:catalog|completion|panel;name:string;deadline_ms:1..250;plain_fallback:null|string};capabilities:events_observe|plan_rewrite|environment_mutate|output_read|execution_block|catalog_contribute|completion_contribute|ui_panel;event_sequence:strictly-increasing}";
+/// Maximum container and scalar nodes scanned in one untrusted JSON value.
+pub const JSON_TERMINAL_VALUE_NODES_MAX: usize = 100_000;
+/// Maximum nesting depth scanned in one untrusted JSON value.
+pub const JSON_TERMINAL_VALUE_DEPTH_MAX: usize = 64;
+/// Maximum aggregate UTF-8 bytes scanned across JSON keys and string leaves.
+pub const JSON_TERMINAL_VALUE_TEXT_BYTES_MAX: usize = 8 * 1024 * 1024;
 
 /// Return the deterministic compatibility fingerprint for the extension protocol.
 pub fn extension_schema_hash() -> String {
@@ -103,6 +111,10 @@ pub enum ExtensionEventData {
         /// Stream that produced the data.
         stream: OutputStream,
         /// Number of raw bytes represented by this event.
+        ///
+        /// Serialization uses a fixed-width `u64`; this in-memory count is a
+        /// checked projection of the wire value.
+        #[serde(with = "crate::error::wire_usize")]
         bytes: usize,
         /// Decoded, terminal-safe text when the host elects to expose content.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,7 +196,7 @@ impl ExtensionEvent {
     /// `previous_sequence` is the last accepted sequence for the same session;
     /// `None` marks the first event. Returns [`ErrorCode::Validation`] when the
     /// version is unsupported, the sequence does not increase strictly, or an
-    /// output/cancellation string contains terminal controls.
+    /// progress/output/cancellation string contains terminal controls.
     pub fn validate_after(&self, previous_sequence: Option<u64>) -> Result<(), ShellError> {
         if self.protocol_version != EXTENSION_PROTOCOL_VERSION {
             return Err(extension_error(format!(
@@ -203,6 +215,13 @@ impl ExtensionEvent {
         } = &self.data
         {
             reject_terminal_controls("extension output", text)?;
+        }
+        if let ExtensionEventData::ExecutionProgress {
+            message: Some(message),
+            ..
+        } = &self.data
+        {
+            reject_terminal_controls("extension progress message", message)?;
         }
         if let ExtensionEventData::Cancellation { reason } = &self.data {
             reject_terminal_controls("extension cancellation reason", reason)?;
@@ -525,26 +544,116 @@ pub fn escape_json_terminal_controls(serialized: &str) -> String {
     rendered
 }
 
-/// Recursively validate every object key and string leaf before an extension
+/// Iteratively validate every object key and string leaf before an extension
 /// value reaches catalog, completion, or UI consumers.
+///
+/// Traversal rejects values above [`JSON_TERMINAL_VALUE_NODES_MAX`],
+/// [`JSON_TERMINAL_VALUE_DEPTH_MAX`], or
+/// [`JSON_TERMINAL_VALUE_TEXT_BYTES_MAX`] before scheduling excess work.
 pub fn reject_json_terminal_controls(context: &str, value: &Value) -> Result<(), ShellError> {
-    match value {
-        Value::String(value) => reject_terminal_controls(context, value),
-        Value::Array(values) => {
-            for value in values {
-                reject_json_terminal_controls(context, value)?;
-            }
-            Ok(())
+    let mut stack = vec![(value, 0_usize)];
+    let mut scheduled_nodes = 1_usize;
+    let mut text_bytes = 0_usize;
+    while let Some((value, depth)) = stack.pop() {
+        if depth > JSON_TERMINAL_VALUE_DEPTH_MAX {
+            return Err(json_terminal_value_limit_error(
+                context,
+                "depth",
+                JSON_TERMINAL_VALUE_DEPTH_MAX,
+                depth,
+            ));
         }
-        Value::Object(values) => {
-            for (key, value) in values {
-                reject_terminal_controls(context, key)?;
-                reject_json_terminal_controls(context, value)?;
+        match value {
+            Value::String(value) => {
+                text_bytes = checked_json_text_bytes(context, text_bytes, value.len())?;
+                reject_terminal_controls(context, value)?;
             }
-            Ok(())
+            Value::Array(values) => schedule_json_children(
+                context,
+                values.iter().rev(),
+                depth,
+                &mut scheduled_nodes,
+                &mut stack,
+            )?,
+            Value::Object(values) => {
+                schedule_json_children(
+                    context,
+                    values.values().rev(),
+                    depth,
+                    &mut scheduled_nodes,
+                    &mut stack,
+                )?;
+                for key in values.keys() {
+                    text_bytes = checked_json_text_bytes(context, text_bytes, key.len())?;
+                    reject_terminal_controls(context, key)?;
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
     }
+    Ok(())
+}
+
+fn schedule_json_children<'a>(
+    context: &str,
+    children: impl ExactSizeIterator<Item = &'a Value>,
+    depth: usize,
+    scheduled_nodes: &mut usize,
+    stack: &mut Vec<(&'a Value, usize)>,
+) -> Result<(), ShellError> {
+    let child_count = children.len();
+    let observed = scheduled_nodes.saturating_add(child_count);
+    if observed > JSON_TERMINAL_VALUE_NODES_MAX {
+        return Err(json_terminal_value_limit_error(
+            context,
+            "nodes",
+            JSON_TERMINAL_VALUE_NODES_MAX,
+            observed,
+        ));
+    }
+    let child_depth = depth.saturating_add(1);
+    if child_count > 0 && child_depth > JSON_TERMINAL_VALUE_DEPTH_MAX {
+        return Err(json_terminal_value_limit_error(
+            context,
+            "depth",
+            JSON_TERMINAL_VALUE_DEPTH_MAX,
+            child_depth,
+        ));
+    }
+    *scheduled_nodes = observed;
+    stack.extend(children.map(|value| (value, child_depth)));
+    Ok(())
+}
+
+fn checked_json_text_bytes(
+    context: &str,
+    current: usize,
+    additional: usize,
+) -> Result<usize, ShellError> {
+    let observed = current.saturating_add(additional);
+    if observed > JSON_TERMINAL_VALUE_TEXT_BYTES_MAX {
+        return Err(json_terminal_value_limit_error(
+            context,
+            "text bytes",
+            JSON_TERMINAL_VALUE_TEXT_BYTES_MAX,
+            observed,
+        ));
+    }
+    Ok(observed)
+}
+
+fn json_terminal_value_limit_error(
+    context: &str,
+    kind: &str,
+    limit: usize,
+    observed: usize,
+) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        format!("{context} exceeds its JSON {kind} limit"),
+    )
+    .with_context(format!("limit: {limit}; observed: {observed}"))
+    .with_help("Return a smaller and shallower extension value")
 }
 
 fn validate_name(context: &str, value: &str) -> Result<(), ShellError> {
@@ -582,6 +691,8 @@ fn extension_error(message: impl Into<String>) -> ShellError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EXTENSION_EVENT_V1_FIXTURE: &str = r#"{"protocol_version":1,"sequence":1,"data":{"kind":"output","stream":"stdout","bytes":1}}"#;
 
     #[test]
     fn event_sequences_are_strictly_ordered() {
@@ -635,6 +746,118 @@ mod tests {
     fn nested_contribution_strings_reject_terminal_controls() {
         let nested = serde_json::json!({"rows": [["safe", {"value": "\u{1b}[31mraw"}]]});
         assert!(reject_json_terminal_controls("contribution", &nested).is_err());
+    }
+
+    #[test]
+    fn nested_json_validation_accepts_exact_depth_and_rejects_the_next_level() {
+        let mut exact = Value::Null;
+        for _ in 0..JSON_TERMINAL_VALUE_DEPTH_MAX {
+            exact = Value::Array(vec![exact]);
+        }
+        reject_json_terminal_controls("contribution", &exact).unwrap();
+
+        let excess = Value::Array(vec![exact]);
+        let error = reject_json_terminal_controls("contribution", &excess).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(
+            error.details.context[0].contains(&format!("limit: {JSON_TERMINAL_VALUE_DEPTH_MAX}"))
+        );
+        assert!(error.details.context[0]
+            .contains(&format!("observed: {}", JSON_TERMINAL_VALUE_DEPTH_MAX + 1)));
+    }
+
+    #[test]
+    fn broad_json_validation_rejects_nodes_before_scheduling_excess_work() {
+        let mut exact = Value::Array(vec![Value::Null; JSON_TERMINAL_VALUE_NODES_MAX - 1]);
+        reject_json_terminal_controls("contribution", &exact).unwrap();
+        let Value::Array(values) = &mut exact else {
+            unreachable!("the test constructs an array")
+        };
+        values.push(Value::Null);
+        let excess = exact;
+        let error = reject_json_terminal_controls("contribution", &excess).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(
+            error.details.context[0].contains(&format!("limit: {JSON_TERMINAL_VALUE_NODES_MAX}"))
+        );
+        assert!(error.details.context[0]
+            .contains(&format!("observed: {}", JSON_TERMINAL_VALUE_NODES_MAX + 1)));
+    }
+
+    #[test]
+    fn json_validation_rejects_text_above_the_scan_limit() {
+        let mut exact = "x".repeat(JSON_TERMINAL_VALUE_TEXT_BYTES_MAX);
+        reject_json_terminal_controls("contribution", &Value::String(exact.clone())).unwrap();
+        exact.push('x');
+        let excess = Value::String(exact);
+        let error = reject_json_terminal_controls("contribution", &excess).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0]
+            .contains(&format!("limit: {JSON_TERMINAL_VALUE_TEXT_BYTES_MAX}")));
+    }
+
+    #[test]
+    fn progress_messages_reject_terminal_controls_but_allow_layout_text() {
+        let unsafe_event = ExtensionEvent::new(
+            1,
+            ExtensionEventData::ExecutionProgress {
+                completed: 1,
+                total: Some(2),
+                message: Some("working\u{1b}[31m".to_owned()),
+            },
+        );
+        assert_eq!(
+            unsafe_event.validate_after(None).unwrap_err().code,
+            ErrorCode::Validation
+        );
+
+        let safe_event = ExtensionEvent::new(
+            1,
+            ExtensionEventData::ExecutionProgress {
+                completed: 1,
+                total: Some(2),
+                message: Some("working\nnext\titem".to_owned()),
+            },
+        );
+        safe_event.validate_after(None).unwrap();
+    }
+
+    #[test]
+    fn extension_v1_fails_closed_and_byte_counts_use_u64_wire_values() {
+        let mut previous = ExtensionEvent::new(
+            1,
+            ExtensionEventData::Output {
+                stream: OutputStream::Stdout,
+                bytes: usize::MAX,
+                text: None,
+            },
+        );
+        let encoded = serde_json::to_value(&previous).unwrap();
+        assert_eq!(
+            encoded["data"]["bytes"],
+            serde_json::json!(u64::try_from(usize::MAX).unwrap())
+        );
+        assert_eq!(
+            serde_json::from_value::<ExtensionEvent>(encoded).unwrap(),
+            previous
+        );
+
+        previous.protocol_version = 1;
+        assert_eq!(
+            previous.validate_after(None).unwrap_err().code,
+            ErrorCode::Validation
+        );
+        assert_eq!(
+            crate::schema_fingerprint(EXTENSION_SCHEMA_V1_DESCRIPTOR),
+            "fnv1a64:cedb09998598e80a"
+        );
+        assert_eq!(extension_schema_hash(), "fnv1a64:bfddb053a448bfe8");
+
+        let historical: ExtensionEvent = serde_json::from_str(EXTENSION_EVENT_V1_FIXTURE).unwrap();
+        assert_eq!(
+            historical.validate_after(None).unwrap_err().code,
+            ErrorCode::Validation
+        );
     }
 
     #[test]

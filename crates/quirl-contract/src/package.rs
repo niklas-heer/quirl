@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Current version of package manifests, builds, and publish-plan documents.
 pub const PACKAGE_SCHEMA_VERSION: u32 = 1;
+/// Maximum UTF-8 bytes accepted by the package-manifest parser.
+pub const PACKAGE_MANIFEST_BYTES_MAX: usize = 256 * 1024;
 
 const PACKAGE_METADATA_SCHEMA: &str = "PackageMetadata{deny_unknown;name:string;version:string;entry:string;quirl:string;summary:string(default-empty);license:string(default-empty)}";
 const PACKAGE_CAPABILITY_SCHEMA: &str =
@@ -254,11 +256,23 @@ pub struct PackagePublishPlan {
     pub network_performed: bool,
 }
 
-/// Parses a strict TOML manifest, rejecting unknown fields and malformed values.
+/// Parses a bounded strict TOML manifest, rejecting unknown fields and malformed values.
 ///
 /// `origin` is included in the returned [`ShellError`] and source label so callers
-/// can render an actionable diagnostic for the correct file.
+/// can render an actionable diagnostic for the correct file. Inputs larger than
+/// [`PACKAGE_MANIFEST_BYTES_MAX`] fail before TOML parsing.
 pub fn parse_package_manifest(source: &str, origin: &str) -> Result<PackageManifest, ShellError> {
+    if source.len() > PACKAGE_MANIFEST_BYTES_MAX {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!("Quirl package manifest {origin} exceeds its byte limit"),
+        )
+        .with_context(format!(
+            "limit: {PACKAGE_MANIFEST_BYTES_MAX}; observed: {}",
+            source.len()
+        ))
+        .with_help("Keep plugin.toml at or below 256 KiB"));
+    }
     toml::from_str(source).map_err(|error| {
         let mut diagnostic = ShellError::new(
             ErrorCode::Validation,
@@ -811,6 +825,9 @@ fn valid_entry(entry: &str) -> bool {
 }
 
 fn normalize_package_path(path: &str) -> Option<String> {
+    if path.contains(['\\', ':']) {
+        return None;
+    }
     let path = std::path::Path::new(path);
     if path.is_absolute() {
         return None;
@@ -924,6 +941,59 @@ documentation = "Target deployment environment"
         let error = parse_package_manifest(&source, "plugin.toml").unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
         assert!(!error.details.labels.is_empty());
+    }
+
+    #[test]
+    fn manifest_byte_limit_accepts_exact_and_rejects_valid_plus_one() {
+        let mut source = VALID.to_owned();
+        source.push_str("\n#");
+        source.extend(std::iter::repeat_n(
+            'x',
+            PACKAGE_MANIFEST_BYTES_MAX - source.len(),
+        ));
+        assert_eq!(source.len(), PACKAGE_MANIFEST_BYTES_MAX);
+        parse_package_manifest(&source, "plugin.toml").unwrap();
+
+        source.push('x');
+        let error = parse_package_manifest(&source, "plugin.toml").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains(&format!("limit: {PACKAGE_MANIFEST_BYTES_MAX}")));
+        assert!(error.details.context[0]
+            .contains(&format!("observed: {}", PACKAGE_MANIFEST_BYTES_MAX + 1)));
+    }
+
+    #[test]
+    fn package_entry_rejects_native_and_cross_platform_traversal_shapes() {
+        let mut manifest = parse_package_manifest(VALID, "plugin.toml").unwrap();
+        for entry in [
+            "../evil.lua",
+            "/tmp/evil.lua",
+            r"..\..\evil.lua",
+            r"C:\temp\evil.lua",
+        ] {
+            manifest.package.entry = entry.to_owned();
+            let report =
+                validate_package_manifest(&manifest, true, &["process.spawn".to_owned()], "0.1.0");
+            assert!(
+                report
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "package.entry"),
+                "entry {entry:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn arbitrary_precision_package_version_is_inert_contract_text() {
+        let mut manifest = parse_package_manifest(VALID, "plugin.toml").unwrap();
+        manifest.package.version = "99999999999999999999.0.0".to_owned();
+        let report =
+            validate_package_manifest(&manifest, true, &["process.spawn".to_owned()], "0.1.0");
+        assert!(!report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "package.version"));
     }
 
     #[test]

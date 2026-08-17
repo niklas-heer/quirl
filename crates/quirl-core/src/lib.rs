@@ -25,7 +25,8 @@ pub use extension::{
     validate_contribution_set, ContributionKind, ContributionRegistration, EventKind,
     EventSubscription, ExtensionAction, ExtensionCapability, ExtensionEvent, ExtensionEventData,
     OutputStream, EXTENSION_PROTOCOL_VERSION, EXTENSION_SCHEMA_DESCRIPTOR,
-    MAX_EXTENSION_DEADLINE_MS,
+    EXTENSION_SCHEMA_V1_DESCRIPTOR, JSON_TERMINAL_VALUE_DEPTH_MAX, JSON_TERMINAL_VALUE_NODES_MAX,
+    JSON_TERMINAL_VALUE_TEXT_BYTES_MAX, MAX_EXTENSION_DEADLINE_MS,
 };
 pub use process::{
     directory_entries, directory_entries_with_options, CommandOutcome, DirectoryOptions,
@@ -33,5 +34,5 @@ pub use process::{
 };
 pub use protocol::{
     schema_fingerprint, CompatibilityPolicy, VersionPolicy, COMMON_ABI_SCHEMA_DESCRIPTOR,
-    COMMON_ABI_SCHEMA_VERSION, PROTOCOL_FREEZE_VERSION,
+    COMMON_ABI_SCHEMA_V1_DESCRIPTOR, COMMON_ABI_SCHEMA_VERSION, PROTOCOL_FREEZE_VERSION,
 };

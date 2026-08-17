@@ -9,7 +9,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Current version of every agent-facing JSON document owned by this crate.
-pub const AGENT_SCHEMA_VERSION: u32 = 1;
+pub const AGENT_SCHEMA_VERSION: u32 = 2;
+/// Maximum bytes accepted by an agent-document validation entry point.
+pub const AGENT_DOCUMENT_BYTES_MAX: usize = 4 * 1024 * 1024;
 /// Default maximum estimated token count used when selecting agent context.
 pub const DEFAULT_TOKEN_BUDGET: usize = 6_000;
 /// Smallest accepted context budget, below which useful schema context cannot fit.
@@ -26,7 +28,9 @@ const CAPABILITY_SCHEMA: &str = "InstalledCapability{deny_unknown;name:string;ve
 /// Canonical structural description used to fingerprint [`AgentCatalog`] documents.
 pub const AGENT_CATALOG_SCHEMA_DESCRIPTOR: &str = "AgentCatalog{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;quirl_version:string;catalog_schema_version:u32;catalog_hash:string;host_api_schema_version:u32;host_api_hash:string;commands:array<AgentCommand>;host_api:array<HostCapability>;capabilities:array<InstalledCapability>}";
 /// Canonical structural description used to fingerprint [`AgentContext`] documents.
-pub const AGENT_CONTEXT_SCHEMA_DESCRIPTOR: &str = "AgentContext{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;query:string;token_budget:usize;estimated_tokens:usize;token_estimator:string;truncated:bool;catalog_hash:string;host_api_hash:string;commands:array<AgentCommand>;host_api:array<HostCapability>}";
+pub const AGENT_CONTEXT_SCHEMA_DESCRIPTOR: &str = "AgentContext{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;query:string;token_budget:u64;estimated_tokens:u64;token_estimator:string;truncated:bool;catalog_hash:string;host_api_hash:string;commands:array<AgentCommand>;host_api:array<HostCapability>}";
+/// Historical context shape emitted by agent schema version 1.
+pub const AGENT_CONTEXT_SCHEMA_V1_DESCRIPTOR: &str = "AgentContext{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;query:string;token_budget:usize;estimated_tokens:usize;token_estimator:string;truncated:bool;catalog_hash:string;host_api_hash:string;commands:array<AgentCommand>;host_api:array<HostCapability>}";
 const MANIFEST_COMPONENT_SCHEMA: &str = "AgentManifestComponents{SchemaDescriptor{deny_unknown;name:string;version:u32;schema_hash:string;content_hash:string};AgentTool{deny_unknown;name:string;version:string;summary:string;effects:array<Effect>};AgentValidator{deny_unknown;name:string;command:string;schema_version:u32;schema_hash:string}}";
 /// Canonical structural description used to fingerprint [`AgentManifest`] documents.
 pub const AGENT_MANIFEST_SCHEMA_DESCRIPTOR: &str = "AgentManifest{deny_unknown;document_type:string;schema_version:u32;schema_hash:string;content_hash:string;quirl_version:string;schemas:array<SchemaDescriptor>;capabilities:array<InstalledCapability>;tools:array<AgentTool>;validators:array<AgentValidator>}";
@@ -235,9 +239,9 @@ pub struct AgentContext {
     /// Original query used to rank catalog entries.
     pub query: String,
     /// Maximum token estimate requested by the caller.
-    pub token_budget: usize,
+    pub token_budget: u64,
     /// Estimate for the selected query and payload, never above the budget.
-    pub estimated_tokens: usize,
+    pub estimated_tokens: u64,
     /// Identifier for the estimation algorithm so consumers can interpret the bound.
     pub token_estimator: String,
     /// Whether otherwise-relevant entries were omitted to respect the budget.
@@ -587,12 +591,20 @@ pub fn build_agent_context(
             .then_with(|| left.key().cmp(right.key()))
     });
 
+    let token_budget_wire = u64::try_from(token_budget).map_err(|_| {
+        ShellError::new(
+            ErrorCode::ResourceLimit,
+            "agent token budget cannot be represented by the fixed-width contract",
+        )
+        .with_context(format!("observed token budget: {token_budget}"))
+        .with_help("Use a token budget no greater than u64::MAX")
+    })?;
     let mut context = AgentContext {
         document_type: "quirl.agent.context".to_owned(),
         schema_version: AGENT_SCHEMA_VERSION,
         schema_hash: agent_context_schema_hash(),
         query: query.to_owned(),
-        token_budget,
+        token_budget: token_budget_wire,
         estimated_tokens: 0,
         token_estimator: "canonical-json-unicode-scalars-divided-by-4-v1".to_owned(),
         truncated: false,
@@ -609,7 +621,7 @@ pub fn build_agent_context(
         )
         .with_help("Shorten the query or increase --token-budget"));
     }
-    context.estimated_tokens = base_estimate;
+    context.estimated_tokens = token_count_to_wire(base_estimate);
     let candidate_count = candidates.len();
     let mut content_truncated = false;
     for candidate in candidates {
@@ -621,7 +633,7 @@ pub fn build_agent_context(
                 let estimated = estimate_payload_tokens(&proposed)?;
                 if estimated <= token_budget {
                     context = proposed;
-                    context.estimated_tokens = estimated;
+                    context.estimated_tokens = token_count_to_wire(estimated);
                     continue;
                 }
 
@@ -635,7 +647,7 @@ pub fn build_agent_context(
                 let estimated = estimate_payload_tokens(&compact)?;
                 if estimated <= token_budget {
                     context = compact;
-                    context.estimated_tokens = estimated;
+                    context.estimated_tokens = token_count_to_wire(estimated);
                     content_truncated = true;
                 }
             }
@@ -646,13 +658,13 @@ pub fn build_agent_context(
                 let estimated = estimate_payload_tokens(&proposed)?;
                 if estimated <= token_budget {
                     context = proposed;
-                    context.estimated_tokens = estimated;
+                    context.estimated_tokens = token_count_to_wire(estimated);
                 }
             }
         }
     }
     sort_context(&mut context);
-    context.estimated_tokens = estimate_payload_tokens(&context)?;
+    context.estimated_tokens = token_count_to_wire(estimate_payload_tokens(&context)?);
     context.truncated =
         content_truncated || context.commands.len() + context.host_api.len() < candidate_count;
     Ok(context)
@@ -717,9 +729,12 @@ pub fn render_context_markdown(context: &AgentContext) -> String {
     output
 }
 
-/// Validates an agent JSON document's syntax, type contract, and internal hashes.
+/// Validates a bounded agent JSON document's syntax, type contract, and internal hashes.
 ///
-/// This form does not compare content hashes with the currently installed catalog.
+/// Inputs larger than [`AGENT_DOCUMENT_BYTES_MAX`] fail before JSON parsing. This
+/// form does not compare content hashes with the currently installed catalog;
+/// unanchored catalogs remain useful for self-consistency checks, while context
+/// and manifest documents require installed anchors.
 pub fn validate_agent_document(source: &[u8], kind: AgentDocumentKind) -> ValidationReport {
     validate_agent_document_with_anchors(source, kind, None)
 }
@@ -727,14 +742,21 @@ pub fn validate_agent_document(source: &[u8], kind: AgentDocumentKind) -> Valida
 /// Validates an agent JSON document and optionally enforces installed-content anchors.
 ///
 /// Anchors let callers reject a structurally valid but stale catalog, context, or
-/// manifest without trusting hash values supplied by that same document.
+/// manifest without trusting hash values supplied by that same document. Inputs
+/// larger than [`AGENT_DOCUMENT_BYTES_MAX`] fail before JSON parsing. Passing no
+/// anchors permits catalog self-consistency validation but makes context and
+/// manifest validation fail with `agent.trusted_anchor_required`.
 pub fn validate_agent_document_with_anchors(
     source: &[u8],
     kind: AgentDocumentKind,
     anchors: Option<&AgentValidationAnchors>,
 ) -> ValidationReport {
     match kind {
-        AgentDocumentKind::Catalog => validate_typed::<AgentCatalog>(source, validate_catalog),
+        AgentDocumentKind::Catalog => {
+            validate_typed::<AgentCatalog>(source, |catalog, diagnostics| {
+                validate_catalog(catalog, anchors, diagnostics);
+            })
+        }
         AgentDocumentKind::Context => {
             validate_typed::<AgentContext>(source, |context, diagnostics| {
                 validate_context(context, anchors, diagnostics);
@@ -924,14 +946,31 @@ fn estimate_payload_tokens(context: &AgentContext) -> Result<usize, ShellError> 
     Ok(json.chars().count().div_ceil(4))
 }
 
+fn token_count_to_wire(count: usize) -> u64 {
+    u64::try_from(count).map_or(u64::MAX, |count| count)
+}
+
 fn validate_typed<T: DeserializeOwned>(
     source: &[u8],
     validate: impl FnOnce(&T, &mut Vec<ValidationDiagnostic>),
 ) -> ValidationReport {
     let mut diagnostics = Vec::new();
-    match serde_json::from_slice::<T>(source) {
-        Ok(document) => validate(&document, &mut diagnostics),
-        Err(error) => diagnostics.push(ValidationDiagnostic {
+    if source.len() > AGENT_DOCUMENT_BYTES_MAX {
+        diagnostics.push(ValidationDiagnostic {
+            code: "agent.resource_limit".to_owned(),
+            severity: DiagnosticSeverity::Error,
+            message: format!(
+                "agent document exceeds its byte limit; limit: {AGENT_DOCUMENT_BYTES_MAX}; observed: {}",
+                source.len()
+            ),
+            path: "$".to_owned(),
+            help: "Reduce the document or regenerate a bounded installed-surface projection"
+                .to_owned(),
+        });
+    } else if let Err(error) = serde_json::from_slice::<T>(source).map(|document| {
+        validate(&document, &mut diagnostics);
+    }) {
+        diagnostics.push(ValidationDiagnostic {
             code: "agent.schema".to_owned(),
             severity: DiagnosticSeverity::Error,
             message: error.to_string(),
@@ -939,7 +978,7 @@ fn validate_typed<T: DeserializeOwned>(
             help:
                 "Use the matching `quirl agent ... --format json` schema and remove unknown fields"
                     .to_owned(),
-        }),
+        });
     }
     ValidationReport {
         document_type: "quirl.agent.validation".to_owned(),
@@ -951,7 +990,11 @@ fn validate_typed<T: DeserializeOwned>(
     }
 }
 
-fn validate_catalog(catalog: &AgentCatalog, diagnostics: &mut Vec<ValidationDiagnostic>) {
+fn validate_catalog(
+    catalog: &AgentCatalog,
+    anchors: Option<&AgentValidationAnchors>,
+    diagnostics: &mut Vec<ValidationDiagnostic>,
+) {
     validate_header(
         &catalog.document_type,
         "quirl.agent.catalog",
@@ -982,6 +1025,20 @@ fn validate_catalog(catalog: &AgentCatalog, diagnostics: &mut Vec<ValidationDiag
         validate_hash(
             &catalog.host_api_hash,
             &expected,
+            "host_api_hash",
+            diagnostics,
+        );
+    }
+    if let Some(anchors) = anchors {
+        validate_hash(
+            &catalog.catalog_hash,
+            &anchors.catalog_hash,
+            "catalog_hash",
+            diagnostics,
+        );
+        validate_hash(
+            &catalog.host_api_hash,
+            &anchors.host_api_hash,
             "host_api_hash",
             diagnostics,
         );
@@ -1021,7 +1078,7 @@ fn validate_context(
         );
     }
     match estimate_payload_tokens(context) {
-        Ok(expected) if expected != context.estimated_tokens => push_error(
+        Ok(expected) if token_count_to_wire(expected) != context.estimated_tokens => push_error(
             diagnostics,
             "agent.context.estimate",
             &format!(
@@ -1031,7 +1088,7 @@ fn validate_context(
             "estimated_tokens",
             "Regenerate the document instead of editing its budget metadata",
         ),
-        Ok(expected) if expected > context.token_budget => push_error(
+        Ok(expected) if token_count_to_wire(expected) > context.token_budget => push_error(
             diagnostics,
             "agent.context.budget",
             &format!(
@@ -1305,6 +1362,8 @@ mod tests {
     use super::*;
     use quirl_catalog::Catalog;
 
+    const AGENT_CONTEXT_V1_FIXTURE: &str = r#"{"document_type":"quirl.agent.context","schema_version":1,"schema_hash":"fnv1a64:7b0dacacc4a5e71d","query":"fixture","token_budget":64,"estimated_tokens":2,"token_estimator":"canonical-json-unicode-scalars-divided-by-4-v1","truncated":false,"catalog_hash":"fnv1a64:catalog","host_api_hash":"fnv1a64:host","commands":[],"host_api":[]}"#;
+
     fn host_api() -> Vec<HostCapability> {
         vec![
             HostCapability {
@@ -1425,6 +1484,103 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.path == "catalog_hash"));
+    }
+
+    #[test]
+    fn catalog_validation_uses_supplied_anchors_but_allows_unanchored_self_checks() {
+        let catalog = build_agent_catalog(&Catalog::builtin(), &host_api(), "0.1.0").unwrap();
+        let anchors = AgentValidationAnchors::from(&catalog);
+        let matching = validate_agent_document_with_anchors(
+            &serde_json::to_vec(&catalog).unwrap(),
+            AgentDocumentKind::Catalog,
+            Some(&anchors),
+        );
+        assert!(matching.valid, "{:?}", matching.diagnostics);
+
+        let mut stale = catalog;
+        stale.commands[0].summary.push_str(" stale");
+        stale.catalog_hash = hash_json(&stale.commands, "command catalog").unwrap();
+        let source = serde_json::to_vec(&stale).unwrap();
+        let unanchored = validate_agent_document(&source, AgentDocumentKind::Catalog);
+        assert!(unanchored.valid, "{:?}", unanchored.diagnostics);
+
+        let anchored = validate_agent_document_with_anchors(
+            &source,
+            AgentDocumentKind::Catalog,
+            Some(&anchors),
+        );
+        assert!(!anchored.valid);
+        assert!(anchored
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.path == "catalog_hash"));
+    }
+
+    #[test]
+    fn agent_document_byte_limit_accepts_exact_and_rejects_valid_plus_one() {
+        let catalog = build_agent_catalog(&Catalog::builtin(), &host_api(), "0.1.0").unwrap();
+        let mut source = serde_json::to_vec(&catalog).unwrap();
+        source.resize(AGENT_DOCUMENT_BYTES_MAX, b' ');
+        let exact = validate_agent_document(&source, AgentDocumentKind::Catalog);
+        assert!(exact.valid, "{:?}", exact.diagnostics);
+
+        source.push(b' ');
+        let excess = validate_agent_document(&source, AgentDocumentKind::Catalog);
+        assert!(!excess.valid);
+        assert_eq!(excess.diagnostics[0].code, "agent.resource_limit");
+        assert!(excess.diagnostics[0]
+            .message
+            .contains(&format!("limit: {AGENT_DOCUMENT_BYTES_MAX}")));
+        assert!(excess.diagnostics[0]
+            .message
+            .contains(&format!("observed: {}", AGENT_DOCUMENT_BYTES_MAX + 1)));
+    }
+
+    #[test]
+    fn context_wire_budget_is_fixed_width_and_previous_major_fails_closed() {
+        let catalog = build_agent_catalog(&Catalog::builtin(), &host_api(), "0.1.0").unwrap();
+        let anchors = AgentValidationAnchors::from(&catalog);
+        let mut context = build_agent_context(&catalog, "git commit", 500).unwrap();
+        context.token_budget = u64::MAX;
+        let source = serde_json::to_vec(&context).unwrap();
+        let decoded: AgentContext = serde_json::from_slice(&source).unwrap();
+        assert_eq!(decoded.token_budget, u64::MAX);
+
+        context.schema_version = 1;
+        let previous = validate_agent_document_with_anchors(
+            &serde_json::to_vec(&context).unwrap(),
+            AgentDocumentKind::Context,
+            Some(&anchors),
+        );
+        assert!(!previous.valid);
+        assert!(previous
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "agent.schema_version"));
+        let previous_hash = structural_schema_hash(&[
+            AGENT_CONTEXT_SCHEMA_V1_DESCRIPTOR,
+            COMMAND_SCHEMA,
+            OPTION_SCHEMA,
+            COMPLETION_SCHEMA,
+            IO_SCHEMA,
+            PROVENANCE_SCHEMA,
+            HOST_SCHEMA,
+        ]);
+        assert_eq!(previous_hash, "fnv1a64:7b0dacacc4a5e71d");
+        assert_ne!(previous_hash, agent_context_schema_hash());
+
+        let historical = validate_agent_document_with_anchors(
+            AGENT_CONTEXT_V1_FIXTURE.as_bytes(),
+            AgentDocumentKind::Context,
+            Some(&AgentValidationAnchors {
+                catalog_hash: "fnv1a64:catalog".to_owned(),
+                host_api_hash: "fnv1a64:host".to_owned(),
+            }),
+        );
+        assert!(historical
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "agent.schema_version"));
     }
 
     #[test]

@@ -710,6 +710,10 @@ pub enum ExecutionOutputTarget {
     /// Retain each byte stream up to the explicit per-stream ceiling.
     Capture {
         /// Maximum bytes retained separately for stdout and stderr.
+        ///
+        /// Serialization uses a fixed-width `u64`; this in-memory index is a
+        /// checked projection used by Rust buffers.
+        #[serde(with = "crate::error::wire_usize")]
         max_bytes_per_stream: usize,
     },
     /// Preserve a structured value without stringification.
@@ -1235,6 +1239,32 @@ mod tests {
             value = StructuredValue::List(vec![value]);
         }
         assert_eq!(value.validate().unwrap_err().code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn structured_value_unknown_fields_fail_closed() {
+        let source = serde_json::json!({
+            "type": "string",
+            "value": "safe",
+            "unknown": true,
+        });
+        assert!(serde_json::from_value::<StructuredValue>(source).is_err());
+    }
+
+    #[test]
+    fn capture_limit_uses_a_checked_u64_wire_representation() {
+        let target = ExecutionOutputTarget::Capture {
+            max_bytes_per_stream: usize::MAX,
+        };
+        let encoded = serde_json::to_value(target).unwrap();
+        assert_eq!(
+            encoded["max_bytes_per_stream"],
+            serde_json::json!(u64::try_from(usize::MAX).unwrap())
+        );
+        assert_eq!(
+            serde_json::from_value::<ExecutionOutputTarget>(encoded).unwrap(),
+            target
+        );
     }
 
     #[test]
