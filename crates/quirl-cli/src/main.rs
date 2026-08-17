@@ -2,6 +2,7 @@
 
 mod agent;
 mod ai;
+mod ai_bootstrap;
 mod author;
 mod bounded_file;
 mod config;
@@ -22,6 +23,7 @@ mod script;
 
 use agent::AgentCommand;
 use ai::AiCommand;
+use ai_bootstrap::InteractiveAiBootstrap;
 use author::{DescribeCommand, DocCommand, NewCommand};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::ConfigCommand;
@@ -1639,8 +1641,13 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         (config, host.config_revision())
     };
     let history_path = history_path()?;
-    let (mut line_editor, mut catalog) =
-        configured_initial_editor(&extensions, active_config.clone(), &history_path)?;
+    let ai_bootstrap = InteractiveAiBootstrap::new();
+    let (mut line_editor, mut catalog) = configured_initial_editor(
+        &extensions,
+        &ai_bootstrap,
+        active_config.clone(),
+        &history_path,
+    )?;
     print_banner(&active_config);
     let mut mode = Mode::Command;
     // Recovery snapshots are only needed once a native command is accepted.
@@ -1721,6 +1728,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                 line_editor = configured_editor(
                     published_catalog,
                     &extensions,
+                    &ai_bootstrap,
                     active_config.clone(),
                     &history_path,
                 )?;
@@ -1738,10 +1746,12 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             line_editor = configured_editor(
                 &refreshed_catalog,
                 &extensions,
+                &ai_bootstrap,
                 active_config.clone(),
                 &history_path,
             )?;
             catalog = Some(refreshed_catalog);
+            ai_bootstrap.request_reindex();
         }
         print_extension_errors(&extensions);
         let job_states = executor.jobs();
@@ -2450,6 +2460,7 @@ impl SessionEditor {
 
 fn configured_initial_editor(
     extensions: &Arc<Mutex<LuaExtensionHost>>,
+    ai_bootstrap: &InteractiveAiBootstrap,
     config: QuirlConfig,
     history_path: &Path,
 ) -> Result<(SessionEditor, Option<Arc<Catalog>>), ShellError> {
@@ -2465,6 +2476,7 @@ fn configured_initial_editor(
             history_path.to_path_buf(),
         )?;
         editor.set_panel_provider(Box::new(CachedPanelAdapter::new(Arc::clone(extensions))));
+        editor.set_activity_provider(Box::new(ai_bootstrap.activity_provider()));
         return Ok((SessionEditor::Rich(Box::new(editor)), None));
     }
 
@@ -2472,13 +2484,15 @@ fn configured_initial_editor(
     // remains intentionally eager; only the rich first-frame path is deferred.
     index::initialize_interactive_catalog();
     let catalog = Arc::new(load_composed_catalog()?);
-    let editor = configured_editor(&catalog, extensions, config, history_path)?;
+    ai_bootstrap.catalog_admitted();
+    let editor = configured_editor(&catalog, extensions, ai_bootstrap, config, history_path)?;
     Ok((editor, Some(catalog)))
 }
 
 fn configured_editor(
     catalog: &Arc<Catalog>,
     extensions: &Arc<Mutex<LuaExtensionHost>>,
+    ai_bootstrap: &InteractiveAiBootstrap,
     config: QuirlConfig,
     history_path: &Path,
 ) -> Result<SessionEditor, ShellError> {
@@ -2494,6 +2508,7 @@ fn configured_editor(
         )
         .map(|mut editor| {
             editor.set_panel_provider(Box::new(CachedPanelAdapter::new(Arc::clone(extensions))));
+            editor.set_activity_provider(Box::new(ai_bootstrap.activity_provider()));
             SessionEditor::Rich(Box::new(editor))
         });
     }

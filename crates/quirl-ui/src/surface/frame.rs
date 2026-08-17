@@ -98,7 +98,8 @@ impl FrameModel<'_> {
                 .diagnostic
                 .filter(|_| self.compact)
                 .map(|diagnostic| diagnostic.message.as_str())
-                .or_else(|| self.runtime.notice()),
+                .or_else(|| self.runtime.notice())
+                .or_else(|| self.runtime.activity()),
             timings: self.timings,
             unicode: self.unicode,
         };

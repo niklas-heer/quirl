@@ -30,6 +30,8 @@ pub const DATA_LABEL_CHARS_MAX: usize = 256;
 pub const JOB_ACTION_ITEMS_MAX: usize = 256;
 /// Maximum aggregate terminal-safe text retained by job picker snapshots.
 pub const JOB_RETAINED_BYTES_MAX: usize = 512 * 1024;
+/// Maximum UTF-8 bytes retained for one bottom-bar activity message.
+pub const ACTIVITY_MESSAGE_BYTES_MAX: usize = 512;
 const LIVE_GENERATIONS_MAX: usize = 4;
 const PANEL_BATCHES_MAX: usize = PANEL_QUEUE_UPDATES_MAX / PANEL_COUNT_MAX;
 
@@ -136,6 +138,30 @@ pub trait InteractivePanelProvider: Send {
     fn poll_cached(&mut self) -> Result<Option<InteractivePanelBatch>, ShellError>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// One immutable background-activity publication for the bottom status bar.
+pub struct InteractiveActivitySnapshot {
+    /// Monotonic provider generation used to reject stale publications.
+    pub generation: u64,
+    /// Active terminal-independent message, or `None` to clear prior activity.
+    pub message: Option<String>,
+}
+
+/// Nonblocking source of cached background activity.
+///
+/// Implementations must never perform network, filesystem, database, or user
+/// callback work in these methods. Catalog admission may only schedule bounded
+/// work and polling must return an already-published immutable snapshot.
+pub trait InteractiveActivityProvider: Send {
+    /// Notify the provider after the complete deferred catalog is published.
+    fn catalog_admitted(&mut self) -> Result<(), ShellError> {
+        Ok(())
+    }
+
+    /// Return a newer cached activity snapshot when one is available.
+    fn poll_cached(&mut self) -> Result<Option<InteractiveActivitySnapshot>, ShellError>;
+}
+
 pub(crate) struct RuntimeSurfaceState {
     snapshot_generation: u64,
     jobs: Vec<InteractiveJobSnapshot>,
@@ -145,6 +171,9 @@ pub(crate) struct RuntimeSurfaceState {
     panel_focus: usize,
     panel_queue: VecDeque<InteractivePanelBatch>,
     provider: Option<Box<dyn InteractivePanelProvider>>,
+    activity_provider: Option<Box<dyn InteractiveActivityProvider>>,
+    activity_generation: u64,
+    activity: Option<String>,
     notice: Option<String>,
 }
 
@@ -165,12 +194,30 @@ impl RuntimeSurfaceState {
             panel_focus: 0,
             panel_queue: VecDeque::with_capacity(PANEL_BATCHES_MAX),
             provider: None,
+            activity_provider: None,
+            activity_generation: 0,
+            activity: None,
             notice: None,
         }
     }
 
     pub(crate) fn set_provider(&mut self, provider: Box<dyn InteractivePanelProvider>) {
         self.provider = Some(provider);
+    }
+
+    pub(crate) fn set_activity_provider(&mut self, provider: Box<dyn InteractiveActivityProvider>) {
+        self.activity_provider = Some(provider);
+    }
+
+    pub(crate) fn catalog_admitted(&mut self) {
+        if let Some(provider) = self.activity_provider.as_mut() {
+            if let Err(error) = provider.catalog_admitted() {
+                self.notice = Some(truncate_bytes(
+                    &escape_terminal_line(&error.message),
+                    ACTIVITY_MESSAGE_BYTES_MAX,
+                ));
+            }
+        }
     }
 
     pub(crate) fn install_snapshot(&mut self, mut snapshot: InteractiveRuntimeSnapshot) {
@@ -191,11 +238,43 @@ impl RuntimeSurfaceState {
         match result {
             Some(Ok(Some(batch))) => self.enqueue_panel_batch(batch),
             Some(Err(error)) => {
-                self.notice = Some(escape_terminal_line(&error.message));
+                self.notice = Some(truncate_bytes(
+                    &escape_terminal_line(&error.message),
+                    ACTIVITY_MESSAGE_BYTES_MAX,
+                ));
                 false
             }
             Some(Ok(None)) | None => false,
         }
+    }
+
+    pub(crate) fn poll_activity(&mut self) -> bool {
+        let result = self
+            .activity_provider
+            .as_mut()
+            .map(|provider| provider.poll_cached());
+        match result {
+            Some(Ok(Some(snapshot))) => self.install_activity(snapshot),
+            Some(Err(error)) => {
+                self.notice = Some(truncate_bytes(
+                    &escape_terminal_line(&error.message),
+                    ACTIVITY_MESSAGE_BYTES_MAX,
+                ));
+                false
+            }
+            Some(Ok(None)) | None => false,
+        }
+    }
+
+    fn install_activity(&mut self, snapshot: InteractiveActivitySnapshot) -> bool {
+        if snapshot.generation <= self.activity_generation {
+            return false;
+        }
+        self.activity_generation = snapshot.generation;
+        self.activity = snapshot.message.map(|message| {
+            truncate_bytes(&escape_terminal_line(&message), ACTIVITY_MESSAGE_BYTES_MAX)
+        });
+        true
     }
 
     fn enqueue_panel_batch(&mut self, batch: InteractivePanelBatch) -> bool {
@@ -283,6 +362,10 @@ impl RuntimeSurfaceState {
 
     pub(crate) fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
+    }
+
+    pub(crate) fn activity(&self) -> Option<&str> {
+        self.activity.as_deref()
     }
 
     pub(crate) fn job_items(&self, replace_end: usize) -> Vec<super::completion::CompletionItem> {
@@ -552,6 +635,78 @@ mod tests {
             panels: Vec::new(),
         }));
         assert!(state.focused_panel().is_none());
+    }
+
+    struct ActivityProvider {
+        snapshots: VecDeque<InteractiveActivitySnapshot>,
+    }
+
+    struct AdmissionFailureProvider;
+
+    impl InteractiveActivityProvider for AdmissionFailureProvider {
+        fn catalog_admitted(&mut self) -> Result<(), ShellError> {
+            Err(ShellError::new(
+                ErrorCode::Io,
+                format!("failed\u{1b}[31m{}", "x".repeat(700)),
+            ))
+        }
+
+        fn poll_cached(&mut self) -> Result<Option<InteractiveActivitySnapshot>, ShellError> {
+            Err(ShellError::new(
+                ErrorCode::Io,
+                format!("poll failed\u{1b}[31m{}", "y".repeat(700)),
+            ))
+        }
+    }
+
+    impl InteractiveActivityProvider for ActivityProvider {
+        fn poll_cached(&mut self) -> Result<Option<InteractiveActivitySnapshot>, ShellError> {
+            Ok(self.snapshots.pop_front())
+        }
+    }
+
+    #[test]
+    fn activity_poll_is_live_generation_safe_escaped_and_bounded() {
+        let mut state = RuntimeSurfaceState::new();
+        state.set_activity_provider(Box::new(ActivityProvider {
+            snapshots: VecDeque::from([
+                InteractiveActivitySnapshot {
+                    generation: 2,
+                    message: Some(format!("download\u{1b}[31m{}", "x".repeat(700))),
+                },
+                InteractiveActivitySnapshot {
+                    generation: 1,
+                    message: Some("stale".to_owned()),
+                },
+                InteractiveActivitySnapshot {
+                    generation: 3,
+                    message: None,
+                },
+            ]),
+        }));
+        assert!(state.poll_activity());
+        let activity = state.activity().unwrap();
+        assert!(!activity.contains('\u{1b}'));
+        assert!(activity.len() <= ACTIVITY_MESSAGE_BYTES_MAX);
+        assert!(!state.poll_activity());
+        assert_ne!(state.activity(), Some("stale"));
+        assert!(state.poll_activity());
+        assert_eq!(state.activity(), None);
+        assert!(!state.poll_activity());
+    }
+
+    #[test]
+    fn activity_admission_failure_is_a_bounded_nonfatal_notice() {
+        let mut state = RuntimeSurfaceState::new();
+        state.set_activity_provider(Box::new(AdmissionFailureProvider));
+        state.catalog_admitted();
+        let notice = state.notice().unwrap();
+        assert!(!notice.contains('\u{1b}'));
+        assert!(notice.len() <= ACTIVITY_MESSAGE_BYTES_MAX);
+        assert!(!state.poll_activity());
+        let poll_notice = state.notice().unwrap();
+        assert!(!poll_notice.contains('\u{1b}'));
+        assert!(poll_notice.len() <= ACTIVITY_MESSAGE_BYTES_MAX);
     }
 
     #[test]

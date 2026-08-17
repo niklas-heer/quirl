@@ -9,10 +9,11 @@ pub use panel::{
     ProcessPanelRow,
 };
 pub use surface::{
-    select_surface, CatalogLoader, InteractiveDataSnapshot, InteractiveJobAction,
-    InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
-    InteractivePanelSnapshot, InteractiveRuntimeSnapshot, InteractiveSignal, RichSurface,
-    SurfaceKind, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, JOB_ACTION_ITEMS_MAX,
+    select_surface, CatalogLoader, InteractiveActivityProvider, InteractiveActivitySnapshot,
+    InteractiveDataSnapshot, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
+    InteractivePanelBatch, InteractivePanelProvider, InteractivePanelSnapshot,
+    InteractiveRuntimeSnapshot, InteractiveSignal, RichSurface, SurfaceKind,
+    ACTIVITY_MESSAGE_BYTES_MAX, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, JOB_ACTION_ITEMS_MAX,
     JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
     PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
 };

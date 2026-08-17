@@ -33,6 +33,7 @@ const CHECK_NAMES: &[&str] = &[
     "rich-editing",
     "mode-switch-and-palette-screen",
     "automatic-command-intelligence",
+    "automatic-ai-bootstrap-activity",
     "durable-command-discovery",
     "deferred-catalog-admission",
     "catalog-failure-restores-terminal",
@@ -69,6 +70,7 @@ struct SessionOptions {
     path: Option<PathBuf>,
     index_dir: Option<PathBuf>,
     help_path: Option<PathBuf>,
+    ai_bootstrap_fake: bool,
 }
 
 struct Session {
@@ -193,6 +195,14 @@ return quirl.config {{
                 OsString::from("1"),
             );
         }
+        environment.insert(
+            OsString::from(if options.ai_bootstrap_fake {
+                "QUIRL_TEST_AI_BOOTSTRAP_FAKE"
+            } else {
+                "QUIRL_TEST_AI_BOOTSTRAP_DISABLED"
+            }),
+            OsString::from("1"),
+        );
         if options.no_color {
             environment.insert(OsString::from("NO_COLOR"), OsString::from("1"));
         }
@@ -242,7 +252,9 @@ impl TempDirectory {
             let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
             let path = env::temp_dir().join(format!("{label}-{}-{id}", std::process::id()));
             match create_private_directory(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => {
+                    return fs::canonicalize(path).map(|path| Self { path });
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
@@ -376,7 +388,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 14] {
+fn checks() -> [CheckCase; 15] {
     [
         CheckCase {
             name: "rich-editing",
@@ -389,6 +401,10 @@ fn checks() -> [CheckCase; 14] {
         CheckCase {
             name: "automatic-command-intelligence",
             run: check_automatic_command_intelligence,
+        },
+        CheckCase {
+            name: "automatic-ai-bootstrap-activity",
+            run: check_automatic_ai_bootstrap_activity,
         },
         CheckCase {
             name: "durable-command-discovery",
@@ -833,6 +849,35 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     ensure_terminal_restored(&session, cleanup_start, "command-intelligence EOF")
 }
 
+fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), Box<dyn Error>> {
+    let mut session = Session::new(
+        binary,
+        SessionOptions {
+            ai_bootstrap_fake: true,
+            rows: Some(12),
+            columns: Some(120),
+            ..SessionOptions::default()
+        },
+    )?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    session
+        .pty
+        .wait_for_screen("live AI download status", |screen| {
+            screen
+                .bottom_line()
+                .contains("AI: downloading potion-base-8M")
+        })?;
+    session
+        .pty
+        .wait_for_screen("live AI indexing status", |screen| {
+            screen.bottom_line().contains("AI: indexing local commands")
+        })?;
+    let cleanup_start = session.pty.output().len();
+    session.pty.send(key::CTRL_D)?;
+    ensure_status(session.pty.wait_exit()?, 0, "AI bootstrap activity EOF")?;
+    ensure_terminal_restored(&session, cleanup_start, "AI bootstrap activity EOF")
+}
+
 fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> {
     // Failure model: a cold write may be partial, a warm read may rewrite state,
     // refresh may publish inside an editor turn, hostile declarations may run,
@@ -1067,7 +1112,7 @@ fn check_deferred_catalog_admission(binary: &Path) -> Result<(), Box<dyn Error>>
     fs::write(&session.catalog_gate, b"release\n")?;
     session.pty.wait_for(b"QUEUED_AFTER_ADMISSION")?;
     session.pty.resize(30, 120)?;
-    wait_for_prompt(&mut session)?;
+    wait_for_standard_status(&mut session)?;
     session.pty.type_text("git st")?;
     session.pty.send(b"\t")?;
     session.pty.wait_for(b"git status [--short]")?;

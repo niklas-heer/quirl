@@ -111,7 +111,7 @@ Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unl
 | --- | --- | --- | --- |
 | Command `❯` | Bytes and processes; compatibility grammar; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `cargo test --workspace`, `false \|\| echo recovered` | `mode command`; force external with `^ls` |
 | Data `◆` | Unambiguous Quirl grammar; typed, lazy values; external programs require an adapter or `^command`; failures are `Result` values | `ps \| where cpu > 20 \| sort cpu desc`, `open users.json \| get users \| select name email` | `mode data`; one-shot `data { ... }` |
-| Natural `✦` | Local command and option discovery over the SQLite catalog; potion-base-8M semantic ranking when indexed; suggestions never execute | `copy a directory while preserving permissions`, `find the option that follows symlinks` | `mode natural` or `mode nl`; Alt-M cycles modes |
+| Natural `✦` | Local command and option discovery over the SQLite catalog; the pinned potion-base-8M model downloads and indexes automatically after first paint; suggestions never execute | `copy a directory while preserving permissions`, `find the option that follows symlinks` | `mode natural` or `mode nl`; Alt-M cycles modes |
 
 ```quirl
 ◆ http get /health | match {
@@ -933,6 +933,7 @@ On 15 August 2026, the following decisions were reviewed and agreed:
 - **Lua 5.4 as the extension language:** Rust implements the product; one pinned Lua runtime and generated `quirl` SDK serve config, scripts, trusted plugins; annotations improve tooling while Rust schemas enforce boundaries.
 - **Batteries-included scope:** ship coherent navigation, discovery, data, views, developer context, operations.
 - **One semantic command catalog:** completion, highlighting, docs, validation, AI discovery, plugins consume one versioned `CommandSpec` graph.
+- **Zero-setup local command intelligence:** first paint precedes bounded background model installation and SQLite embedding; the bottom status row reports cached activity, failures retain lexical search, and refreshed catalogs re-index automatically.
 - **Self-describing AI interface:** export installed capabilities as token-budgeted Markdown or canonical JSON with check/format/lint and optional MCP access.
 - **Lua plugin platform plus Wasm isolation:** trusted Lua gets generated SDK metadata and explicit capabilities; untrusted/portable plugins use the same capability model through WebAssembly components.
 - **Native typed fuzzy picker:** history, files, completion, commands, data values, plugins share one previewable, scriptable selection engine.
