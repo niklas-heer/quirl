@@ -29,7 +29,7 @@ pub const COMPLETION_SCHEMA_DESCRIPTOR: &str = "quirl.completion@1{Completion{de
 mod import;
 
 pub use import::{
-    import_bash, import_fish, import_help, import_man, import_zsh, ImportDiagnostic, ImportReport,
+    ImportDiagnostic, ImportReport, import_bash, import_fish, import_help, import_man, import_zsh,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -231,6 +231,7 @@ pub enum Confidence {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 /// Trust relationship between Quirl and the producer of a catalog fact.
+#[derive(Default)]
 pub enum Trust {
     /// Fact is compiled into the Quirl binary.
     Builtin,
@@ -241,13 +242,8 @@ pub enum Trust {
     /// Fact was imported from an external observation.
     Imported,
     /// Fact was inferred from prose or another ambiguous representation.
+    #[default]
     Heuristic,
-}
-
-impl Default for Trust {
-    fn default() -> Self {
-        Self::Heuristic
-    }
 }
 
 /// Attribution for a catalog fact. Imported command options retain their own
@@ -612,7 +608,11 @@ impl Catalog {
                             &["lua", "quirl"],
                             "Choose Lua (the default) or native Quirl (`.qrl`)",
                         ),
-                        option(&["--directory"], Some("path"), "Choose the destination directory"),
+                        option(
+                            &["--directory"],
+                            Some("path"),
+                            "Choose the destination directory",
+                        ),
                     ],
                     &["quirl new script", "quirl new script --lang quirl"],
                     &[Effect::WriteFilesystem],
@@ -643,8 +643,16 @@ impl Catalog {
                             Some("text|json|markdown|html"),
                             "Choose a deterministic documentation view",
                         ),
-                        option(&["--output"], Some("path"), "Atomically write the generated view"),
-                        option(&["--open"], None, "Open the explicit output in the default viewer"),
+                        option(
+                            &["--output"],
+                            Some("path"),
+                            "Atomically write the generated view",
+                        ),
+                        option(
+                            &["--open"],
+                            None,
+                            "Open the explicit output in the default viewer",
+                        ),
                     ],
                     &["quirl doc --format html --output target/quirl-docs/catalog.html --open"],
                     &[Effect::WriteFilesystem, Effect::SpawnProcess],
@@ -674,7 +682,11 @@ impl Catalog {
                     "quirl check <file|directory> [--format text|json]",
                     "Validate scripts without executing them",
                     "Deterministically discovers Lua and Quirl scripts through a bounded, non-recursive traversal that skips links and build/VCS directories; checks Lua syntax, annotations, modules, and restricted APIs plus Quirl statement structure; and aggregates structured diagnostics without executing source.",
-                    vec![option(&["--format"], Some("text|json"), "Choose diagnostic output")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose diagnostic output",
+                    )],
                     &["quirl check scripts/deploy.lua --format json"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
@@ -694,7 +706,11 @@ impl Catalog {
                     "quirl lint <file|directory> [--format text|json]",
                     "Lint scripts without executing them",
                     "Aggregates annotation and capability diagnostics for scripts found through the same bounded non-recursive discovery contract and rejects ambient APIs that bypass Quirl capabilities.",
-                    vec![option(&["--format"], Some("text|json"), "Choose diagnostic output")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose diagnostic output",
+                    )],
                     &["quirl lint examples/plugin.lua --format json"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
@@ -714,7 +730,11 @@ impl Catalog {
                     "quirl config check <file> [--format text|json]",
                     "Validate Lua configuration through Rust schemas",
                     "Evaluates under config restrictions and preserves the active last-known-good value on failure.",
-                    vec![option(&["--format"], Some("text|json"), "Choose output format")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose output format",
+                    )],
                     &["quirl config check examples/config.lua --format json"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
@@ -747,8 +767,15 @@ impl Catalog {
                     "quirl config web <file> [--port <port>]",
                     "Open the local schema-backed configuration form",
                     "Serves an accessible configuration form only on IPv4 loopback. The private session URL carries a CSRF token; saves validate the complete Lua configuration, retain a `.bak`, preserve non-overlapping concurrent source edits, and reject conflicting or code-controlled fields.",
-                    vec![option(&["--port"], Some("port"), "Loopback port; 0 selects an available port")],
-                    &["quirl config web ~/.config/quirl/config.lua", "quirl config web examples/config.lua --port 8787"],
+                    vec![option(
+                        &["--port"],
+                        Some("port"),
+                        "Loopback port; 0 selects an available port",
+                    )],
+                    &[
+                        "quirl config web ~/.config/quirl/config.lua",
+                        "quirl config web examples/config.lua --port 8787",
+                    ],
                     &[Effect::ReadFilesystem, Effect::WriteFilesystem],
                     Provenance::Builtin,
                 ),
@@ -767,7 +794,11 @@ impl Catalog {
                     "quirl config fmt <file> [--check]",
                     "Format a Lua configuration deterministically",
                     "Validates the authoritative configuration, then applies Quirl's deterministic Lua formatter. `--check` reports drift and never writes.",
-                    vec![option(&["--check"], None, "Report formatting drift without writing")],
+                    vec![option(
+                        &["--check"],
+                        None,
+                        "Report formatting drift without writing",
+                    )],
                     &["quirl config fmt ~/.config/quirl/config.lua --check"],
                     &[Effect::ReadFilesystem, Effect::WriteFilesystem],
                     Provenance::Builtin,
@@ -777,7 +808,11 @@ impl Catalog {
                     "quirl config export <file> [--format text|json]",
                     "Export evaluated schema-backed configuration",
                     "Reads and validates config.lua, then emits a deterministic terminal-safe text view or versioned JSON document without modifying source.",
-                    vec![option(&["--format"], Some("text|json"), "Choose output format")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose output format",
+                    )],
                     &["quirl config export ~/.config/quirl/config.lua --format json"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
@@ -787,7 +822,11 @@ impl Catalog {
                     "quirl config diff <file> <other> [--format text|json]",
                     "Compare two evaluated configurations",
                     "Loads both authoritative Lua files under the restricted schema policy and reports deterministic field-level differences without changing either file.",
-                    vec![option(&["--format"], Some("text|json"), "Choose output format")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose output format",
+                    )],
                     &["quirl config diff personal.lua work.lua --format json"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
@@ -798,7 +837,11 @@ impl Catalog {
                     "Preview a schema migration without rewriting configuration",
                     "0.1.0 only previews the unversioned-to-v1 schema insertion. `--dry-run` is required and no source or backup file is written.",
                     vec![
-                        option(&["--dry-run"], None, "Require a non-mutating migration preview"),
+                        option(
+                            &["--dry-run"],
+                            None,
+                            "Require a non-mutating migration preview",
+                        ),
                         option(&["--format"], Some("text|json"), "Choose output format"),
                     ],
                     &["quirl config migrate ~/.config/quirl/config.lua --dry-run"],
@@ -810,7 +853,11 @@ impl Catalog {
                     "quirl config doctor <file> [--format text|json]",
                     "Diagnose configuration schema and editability",
                     "Validates the authoritative configuration and reports which recognized settings are safe literal patches versus code-controlled expressions; it never writes source.",
-                    vec![option(&["--format"], Some("text|json"), "Choose output format")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose output format",
+                    )],
                     &["quirl config doctor ~/.config/quirl/config.lua"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
@@ -820,7 +867,11 @@ impl Catalog {
                     "quirl plugin check <file> [--format text|json]",
                     "Validate Lua plugin registrations",
                     "Reads at most 4 MiB from an admitted regular file, then loads a trusted plugin with process access denied and validates prompt and completion callbacks.",
-                    vec![option(&["--format"], Some("text|json"), "Choose output format")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose output format",
+                    )],
                     &["quirl plugin check examples/plugin.lua --format json"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
@@ -836,9 +887,15 @@ impl Catalog {
                             "capability",
                             "Approve one requested capability after review; repeat as needed",
                         ),
-                        option(&["--format"], Some("text|json"), "Choose accessible text or stable machine JSON"),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose accessible text or stable machine JSON",
+                        ),
                     ],
-                    &["quirl plugin add ./kubernetes-workbench --allow commands.register --format json"],
+                    &[
+                        "quirl plugin add ./kubernetes-workbench --allow commands.register --format json",
+                    ],
                     &[Effect::ReadFilesystem, Effect::WriteFilesystem],
                     Provenance::Builtin,
                 ),
@@ -847,7 +904,11 @@ impl Catalog {
                     "quirl plugin permissions <name> [--format text|json]",
                     "Inspect requested and granted plugin authority",
                     "Reads the permission lock and emits requested, granted, added, removed, and unchanged capabilities without loading plugin code.",
-                    vec![option(&["--format"], Some("text|json"), "Choose accessible text or stable machine JSON")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose accessible text or stable machine JSON",
+                    )],
                     &["quirl plugin permissions kubernetes-workbench"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
@@ -857,7 +918,11 @@ impl Catalog {
                     "quirl plugin enable <name> [--format text|json]",
                     "Enable a checksum-verified installed plugin",
                     "Runs doctor and the declared non-executing or budgeted trusted boundary before atomically enabling the existing locked plugin.",
-                    vec![option(&["--format"], Some("text|json"), "Choose accessible text or stable machine JSON")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose accessible text or stable machine JSON",
+                    )],
                     &["quirl plugin enable kubernetes-workbench"],
                     &[Effect::ReadFilesystem, Effect::WriteFilesystem],
                     Provenance::Builtin,
@@ -867,7 +932,11 @@ impl Catalog {
                     "quirl plugin disable <name> [--format text|json]",
                     "Disable a plugin while retaining its permission lock",
                     "Atomically changes only enabled state; source, checksums, versions, and granted capabilities remain locked for inspection and recovery.",
-                    vec![option(&["--format"], Some("text|json"), "Choose accessible text or stable machine JSON")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose accessible text or stable machine JSON",
+                    )],
                     &["quirl plugin disable kubernetes-workbench"],
                     &[Effect::ReadFilesystem, Effect::WriteFilesystem],
                     Provenance::Builtin,
@@ -877,7 +946,11 @@ impl Catalog {
                     "quirl plugin doctor <name> [--format text|json]",
                     "Diagnose plugin schema, source integrity, permissions, and runtime boundaries",
                     "Verifies lock schema/API versions and SHA-256 checksums, then validates trusted Lua registrations or isolated Wasm/out-of-process boundaries with accessible diagnostics.",
-                    vec![option(&["--format"], Some("text|json"), "Choose accessible text or stable machine JSON")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose accessible text or stable machine JSON",
+                    )],
                     &["quirl plugin doctor kubernetes-workbench --format json"],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
@@ -888,8 +961,16 @@ impl Catalog {
                     "Verify installed plugins without changing locked authority",
                     "Re-resolves every local source and rejects any version, checksum, API, or permission change; platform v0.1 does not perform network updates.",
                     vec![
-                        option(&["--locked"], None, "Forbid changes to versions, checksums, API versions, and capabilities"),
-                        option(&["--format"], Some("text|json"), "Choose accessible text or stable machine JSON"),
+                        option(
+                            &["--locked"],
+                            None,
+                            "Forbid changes to versions, checksums, API versions, and capabilities",
+                        ),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose accessible text or stable machine JSON",
+                        ),
                     ],
                     &["quirl plugin update --locked --format json"],
                     &[Effect::ReadFilesystem, Effect::WriteFilesystem],
@@ -900,7 +981,11 @@ impl Catalog {
                     "quirl plugin remove <name> [--format text|json]",
                     "Remove an installed plugin lock without deleting source",
                     "Atomically removes the named permission record; external source directories are never deleted by the plugin manager.",
-                    vec![option(&["--format"], Some("text|json"), "Choose accessible text or stable machine JSON")],
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose accessible text or stable machine JSON",
+                    )],
                     &["quirl plugin remove kubernetes-workbench"],
                     &[Effect::ReadFilesystem, Effect::WriteFilesystem],
                     Provenance::Builtin,
@@ -964,7 +1049,9 @@ impl Catalog {
                             "Choose agent Markdown or stable machine JSON",
                         ),
                     ],
-                    &["quirl agent context 'deploy the billing service' --format markdown --token-budget 6000"],
+                    &[
+                        "quirl agent context 'deploy the billing service' --format markdown --token-budget 6000",
+                    ],
                     &[],
                     Provenance::Builtin,
                 ),
@@ -1037,14 +1124,22 @@ impl Catalog {
                     "Find commands and options by task intent",
                     "Ranks local potion-base-8M embeddings when the model and semantic index are ready, otherwise uses deterministic bounded lexical search. Results are suggestions and are never executed.",
                     vec![
-                        option(&["--limit"], Some("count"), "Bound returned suggestions to at most 100"),
+                        option(
+                            &["--limit"],
+                            Some("count"),
+                            "Bound returned suggestions to at most 100",
+                        ),
                         option_with_static_values(
                             &["--kind"],
                             "all|command|option",
                             &["all", "command", "option"],
                             "Restrict results to commands, options, or both",
                         ),
-                        option(&["--format"], Some("text|json"), "Choose accessible text or stable machine JSON"),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose accessible text or stable machine JSON",
+                        ),
                     ],
                     &["quirl ai search 'copy a directory preserving permissions'"],
                     &[Effect::ReadFilesystem],
@@ -1056,8 +1151,16 @@ impl Catalog {
                     "Suggest related commands and options",
                     "Uses the same local semantic index as AI mode, excludes the requested command, and returns bounded suggestions without execution.",
                     vec![
-                        option(&["--limit"], Some("count"), "Bound returned suggestions to at most 100"),
-                        option(&["--format"], Some("text|json"), "Choose accessible text or stable machine JSON"),
+                        option(
+                            &["--limit"],
+                            Some("count"),
+                            "Bound returned suggestions to at most 100",
+                        ),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose accessible text or stable machine JSON",
+                        ),
                     ],
                     &["quirl ai related git commit"],
                     &[Effect::ReadFilesystem],
@@ -1237,7 +1340,10 @@ impl Catalog {
                         Some("text|json"),
                         "Choose stable text or JSON output",
                     )],
-                    &["quirl recover show", "quirl recover show 1786826467026-5841-0 --format json"],
+                    &[
+                        "quirl recover show",
+                        "quirl recover show 1786826467026-5841-0 --format json",
+                    ],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
@@ -1307,7 +1413,10 @@ impl Catalog {
                             "Choose the plain view or typed panel model",
                         ),
                     ],
-                    &["quirl view directory .", "quirl view directory --format json"],
+                    &[
+                        "quirl view directory .",
+                        "quirl view directory --format json",
+                    ],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
@@ -1335,7 +1444,10 @@ impl Catalog {
                         Some("text|json"),
                         "Choose the plain view or typed panel model",
                     )],
-                    &["quirl view panel cluster", "quirl view panel cluster --format json"],
+                    &[
+                        "quirl view panel cluster",
+                        "quirl view panel cluster --format json",
+                    ],
                     &[],
                     Provenance::Builtin,
                 ),
@@ -1346,9 +1458,21 @@ impl Catalog {
                     "Re-evaluates the native data expression until the declared sample bound or Ctrl-C, checks cancellation between stages and during refresh waits, retains a bounded completed-sample history, and reports older samples dropped from retention.",
                     vec![
                         option(&["--samples"], Some("count"), "Set a bounded sample count"),
-                        option(&["--interval-ms"], Some("ms"), "Set the cancellable refresh interval"),
-                        option(&["--capacity"], Some("count"), "Bound retained samples to at most 256"),
-                        option(&["--format"], Some("text|json"), "Choose live lines or a bounded JSON snapshot"),
+                        option(
+                            &["--interval-ms"],
+                            Some("ms"),
+                            "Set the cancellable refresh interval",
+                        ),
+                        option(
+                            &["--capacity"],
+                            Some("count"),
+                            "Bound retained samples to at most 256",
+                        ),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose live lines or a bounded JSON snapshot",
+                        ),
                     ],
                     &["quirl watch pwd --samples 3 --interval-ms 250"],
                     &[Effect::ReadFilesystem],
@@ -1400,13 +1524,41 @@ impl Catalog {
                     "Build the attributed completion index",
                     "Imports declarative Fish, Bash, and Zsh completions from admitted regular files up to 4 MiB each, retaining at most 256 commands per declaration, 2,048 commands, 4,096 candidates, and 4 MiB of normalized catalog text per file. Help/man text is limited to 1 MiB each. It never sources or executes providers, commands, or man, then atomically writes a versioned catalog.",
                     vec![
-                        repeatable_option(&["--fish"], "path", "Import a Fish completion file or directory"),
-                        repeatable_option(&["--bash"], "path", "Import a Bash completion file or directory"),
-                        repeatable_option(&["--zsh"], "path", "Import a Zsh completion file or directory"),
-                        repeatable_option(&["--help"], "path", "Parse supplied command-help text without executing its command"),
-                        repeatable_option(&["--man"], "path", "Parse supplied rendered/raw man text without invoking man"),
-                        option(&["--output"], Some("path"), "Write a specific index instead of the default cache"),
-                        option(&["--format"], Some("text|json"), "Choose the build report format"),
+                        repeatable_option(
+                            &["--fish"],
+                            "path",
+                            "Import a Fish completion file or directory",
+                        ),
+                        repeatable_option(
+                            &["--bash"],
+                            "path",
+                            "Import a Bash completion file or directory",
+                        ),
+                        repeatable_option(
+                            &["--zsh"],
+                            "path",
+                            "Import a Zsh completion file or directory",
+                        ),
+                        repeatable_option(
+                            &["--help"],
+                            "path",
+                            "Parse supplied command-help text without executing its command",
+                        ),
+                        repeatable_option(
+                            &["--man"],
+                            "path",
+                            "Parse supplied rendered/raw man text without invoking man",
+                        ),
+                        option(
+                            &["--output"],
+                            Some("path"),
+                            "Write a specific index instead of the default cache",
+                        ),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose the build report format",
+                        ),
                     ],
                     &[
                         "quirl index build",
@@ -1423,9 +1575,16 @@ impl Catalog {
                     "Reads an admitted regular catalog file up to 4 MiB, then shows source kind, confidence, origin, and fingerprint for command metadata and each retained option.",
                     vec![
                         option(&["--index"], Some("path"), "Read a specific catalog index"),
-                        option(&["--format"], Some("text|json"), "Choose the explanation format"),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose the explanation format",
+                        ),
                     ],
-                    &["quirl index explain git", "quirl index explain cargo --format json"],
+                    &[
+                        "quirl index explain git",
+                        "quirl index explain cargo --format json",
+                    ],
                     &[Effect::ReadFilesystem],
                     Provenance::Builtin,
                 ),
@@ -1435,10 +1594,22 @@ impl Catalog {
                     "Record changes to the repository",
                     "External command metadata demonstrates imported completion knowledge.",
                     vec![
-                        option(&["-m", "--message"], Some("message"), "Use the given commit message"),
-                        option(&["-a", "--all"], None, "Stage modified and deleted tracked files"),
+                        option(
+                            &["-m", "--message"],
+                            Some("message"),
+                            "Use the given commit message",
+                        ),
+                        option(
+                            &["-a", "--all"],
+                            None,
+                            "Stage modified and deleted tracked files",
+                        ),
                         option(&["--amend"], None, "Replace the tip of the current branch"),
-                        option(&["--no-verify"], None, "Bypass pre-commit and commit-msg hooks"),
+                        option(
+                            &["--no-verify"],
+                            None,
+                            "Bypass pre-commit and commit-msg hooks",
+                        ),
                     ],
                     &["git commit -m \"Explain the change\""],
                     &[Effect::WriteFilesystem, Effect::SpawnProcess],
@@ -1449,7 +1620,11 @@ impl Catalog {
                     "git status [--short]",
                     "Show repository and working-tree status",
                     "External command metadata can eventually be imported from generated specs and help output.",
-                    vec![option(&["-s", "--short"], None, "Use the compact status format")],
+                    vec![option(
+                        &["-s", "--short"],
+                        None,
+                        "Use the compact status format",
+                    )],
                     &["git status --short"],
                     &[Effect::ReadFilesystem, Effect::SpawnProcess],
                     Provenance::External,
@@ -1676,13 +1851,13 @@ impl Catalog {
             .collect::<std::collections::BTreeSet<_>>();
         let mut names = BTreeMap::<&str, &str>::new();
         for command in &self.commands {
-            if !command.id.is_empty() {
-                if let Some(previous) = ids.insert(&command.id, &command.path) {
-                    issues.push(format!(
-                        "{} duplicates stable id {} from {previous}",
-                        command.path, command.id
-                    ));
-                }
+            if !command.id.is_empty()
+                && let Some(previous) = ids.insert(&command.id, &command.path)
+            {
+                issues.push(format!(
+                    "{} duplicates stable id {} from {previous}",
+                    command.path, command.id
+                ));
             }
             if command.provenance.confidence != Confidence::Exact {
                 continue;
@@ -1706,21 +1881,21 @@ impl Catalog {
             if command.examples.is_empty() {
                 issues.push(format!("{} has no examples", command.path));
             }
-            if let Some(parent) = &command.parent {
-                if parent == &command.id || !known_ids.contains(parent.as_str()) {
-                    issues.push(format!("{} has invalid parent {parent}", command.path));
-                }
+            if let Some(parent) = &command.parent
+                && (parent == &command.id || !known_ids.contains(parent.as_str()))
+            {
+                issues.push(format!("{} has invalid parent {parent}", command.path));
             }
             for name in std::iter::once(&command.path).chain(command.aliases.iter()) {
                 if name.trim().is_empty() {
                     issues.push(format!("{} has an empty alias", command.path));
-                } else if let Some(previous) = names.insert(name, &command.path) {
-                    if previous != command.path.as_str() {
-                        issues.push(format!(
-                            "{} command name `{name}` conflicts with {previous}",
-                            command.path
-                        ));
-                    }
+                } else if let Some(previous) = names.insert(name, &command.path)
+                    && previous != command.path.as_str()
+                {
+                    issues.push(format!(
+                        "{} command name `{name}` conflicts with {previous}",
+                        command.path
+                    ));
                 }
             }
             if command
@@ -2501,10 +2676,12 @@ mod tests {
         assert_eq!(command.options.len(), 1);
         assert_eq!(command.options[0].names, ["path"]);
         assert_eq!(command.options[0].kind, ArgumentKind::Positional);
-        assert!(command
-            .examples
-            .iter()
-            .any(|example| example.starts_with("ls . |")));
+        assert!(
+            command
+                .examples
+                .iter()
+                .any(|example| example.starts_with("ls . |"))
+        );
     }
 
     #[test]
@@ -2549,9 +2726,11 @@ mod tests {
         let inside_e_acute = line.len() - 1;
         let completions = Catalog::builtin().complete(line, inside_e_acute);
         assert!(!completions.is_empty());
-        assert!(completions
-            .iter()
-            .all(|completion| completion.replace_end == "git ".len()));
+        assert!(
+            completions
+                .iter()
+                .all(|completion| completion.replace_end == "git ".len())
+        );
     }
 
     #[test]
@@ -2689,10 +2868,12 @@ mod tests {
             "cargo.bash",
         ));
         let explanation = catalog.explain("cargo").unwrap();
-        assert!(explanation
-            .facts
-            .iter()
-            .any(|fact| fact.value == "--frozen" && fact.provenance.source == Provenance::Bash));
+        assert!(
+            explanation
+                .facts
+                .iter()
+                .any(|fact| fact.value == "--frozen" && fact.provenance.source == Provenance::Bash)
+        );
         assert!(explanation.facts.iter().all(|fact| !fact.value.is_empty()));
     }
 

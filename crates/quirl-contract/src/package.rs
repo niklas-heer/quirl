@@ -1,4 +1,4 @@
-use crate::{stable_hash, DiagnosticSeverity, ValidationDiagnostic, ValidationReport};
+use crate::{DiagnosticSeverity, ValidationDiagnostic, ValidationReport, stable_hash};
 use quirl_catalog::Effect;
 use quirl_core::{ErrorCode, ShellError};
 use serde::{Deserialize, Serialize};
@@ -561,7 +561,9 @@ fn reconcile_source_contract(
             warning(
                 diagnostics,
                 "package.source_capability_not_statically_seen",
-                &format!("requested capability `{capability}` was not statically observed in the Lua entry"),
+                &format!(
+                    "requested capability `{capability}` was not statically observed in the Lua entry"
+                ),
                 "capabilities.request",
                 "Review whether the capability is used indirectly; static source auditing is conservative",
             );
@@ -578,7 +580,9 @@ fn reconcile_source_contract(
             error(
                 diagnostics,
                 "package.source_effect_undeclared",
-                &format!("Lua entry has detected `{effect:?}` behavior absent from public command effects"),
+                &format!(
+                    "Lua entry has detected `{effect:?}` behavior absent from public command effects"
+                ),
                 "public_commands.effects",
                 "Declare the detected effect on the public command that performs it",
             );
@@ -958,8 +962,10 @@ documentation = "Target deployment environment"
         let error = parse_package_manifest(&source, "plugin.toml").unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert!(error.details.context[0].contains(&format!("limit: {PACKAGE_MANIFEST_BYTES_MAX}")));
-        assert!(error.details.context[0]
-            .contains(&format!("observed: {}", PACKAGE_MANIFEST_BYTES_MAX + 1)));
+        assert!(
+            error.details.context[0]
+                .contains(&format!("observed: {}", PACKAGE_MANIFEST_BYTES_MAX + 1))
+        );
     }
 
     #[test]
@@ -990,10 +996,12 @@ documentation = "Target deployment environment"
         manifest.package.version = "99999999999999999999.0.0".to_owned();
         let report =
             validate_package_manifest(&manifest, true, &["process.spawn".to_owned()], "0.1.0");
-        assert!(!report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.version"));
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.version")
+        );
     }
 
     #[test]
@@ -1012,14 +1020,18 @@ documentation = "Target deployment environment"
         let report =
             validate_package_manifest(&manifest, true, &["process.spawn".to_owned()], "0.1.0");
         assert!(!report.valid);
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.command_examples"));
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.command_error_codes"));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.command_examples")
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.command_error_codes")
+        );
     }
 
     #[test]
@@ -1030,14 +1042,18 @@ documentation = "Target deployment environment"
         let report =
             validate_package_manifest(&manifest, true, &["process.spawn".to_owned()], "0.1.0");
         assert!(!report.valid);
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.command_effects"));
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.command_error_codes"));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.command_effects")
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.command_error_codes")
+        );
     }
 
     #[test]
@@ -1051,14 +1067,18 @@ documentation = "Target deployment environment"
         let report =
             validate_package_manifest(&manifest, true, &["process.spawn".to_owned()], "0.1.0");
         assert!(!report.valid);
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.phase3_panels"));
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.phase3_indexers"));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.phase3_panels")
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.phase3_indexers")
+        );
     }
 
     #[test]
@@ -1066,10 +1086,12 @@ documentation = "Target deployment environment"
         let manifest = parse_package_manifest(VALID, "plugin.toml").unwrap();
         let report = validate_package_manifest(&manifest, true, &[], "0.1.0");
         assert!(!report.valid);
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.capability_unavailable"));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.capability_unavailable")
+        );
     }
 
     #[test]
@@ -1078,10 +1100,12 @@ documentation = "Target deployment environment"
         let report =
             validate_package_manifest(&manifest, true, &["process.spawn".to_owned()], "0.2.0");
         assert!(!report.valid);
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.quirl_version"));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.quirl_version")
+        );
     }
 
     #[test]
@@ -1145,18 +1169,24 @@ documentation = "Target deployment environment"
         );
         assert!(!outcome.valid);
         assert!(outcome.build.is_none());
-        assert!(outcome
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.entry_lint"));
-        assert!(outcome
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.source_capability_undeclared"));
-        assert!(outcome
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.source_effect_undeclared"));
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.entry_lint")
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.source_capability_undeclared")
+        );
+        assert!(
+            outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.source_effect_undeclared")
+        );
     }
 
     #[test]

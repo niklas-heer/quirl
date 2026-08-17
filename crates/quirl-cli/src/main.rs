@@ -29,8 +29,8 @@ use author::{DescribeCommand, DocCommand, NewCommand};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::ConfigCommand;
 use extensions::{
-    merge_installed_catalog_snapshot, resolve_installed_plugin_command, LuaCompletionAdapter,
-    LuaExtensionHost,
+    LuaCompletionAdapter, LuaExtensionHost, merge_installed_catalog_snapshot,
+    resolve_installed_plugin_command,
 };
 use index::IndexCommand;
 use lua_worker::LuaWorkerRuntime as LuaRuntime;
@@ -41,27 +41,27 @@ use platform::{EventsCommand, ViewCommand, WatchCommand};
 use plugin::PluginCommand;
 use quirl_catalog::{Catalog, CommandSpec, Completion};
 use quirl_core::{
-    escape_json_terminal_controls, escape_terminal_controls, reject_terminal_controls,
     CommandOutcome, ErrorCode, ExecutionCancellation, ExecutionCleanupState, ExecutionEffect,
     ExecutionEffects, ExecutionInput, ExecutionMode, ExecutionOutcome, ExecutionOutput,
     ExecutionOutputTarget, ExecutionRequest, ExecutionSource, ExecutionStatus, ExtensionAction,
     ExtensionEventData, OutputStream, ProcessRequest, ShellError, StructuredValue,
+    escape_json_terminal_controls, escape_terminal_controls, reject_terminal_controls,
 };
 use quirl_data::{DataEnvelope, DataOutput, DataRenderFormat, DataRuntime};
-use quirl_lua::{sdk_json, sdk_lua, sdk_markdown, LuaPolicy, QuirlConfig, MAX_LUA_SOURCE_BYTES};
-use quirl_picker::{ItemKind, PickItem, Picker, MAX_PICKER_ITEMS};
+use quirl_lua::{LuaPolicy, MAX_LUA_SOURCE_BYTES, QuirlConfig, sdk_json, sdk_lua, sdk_markdown};
+use quirl_picker::{ItemKind, MAX_PICKER_ITEMS, PickItem, Picker};
 use quirl_process::{
-    sandboxed_process_host, JobStatus, NativeExecutor, OutputObserver, DEFAULT_CAPTURE_BYTES,
+    DEFAULT_CAPTURE_BYTES, JobStatus, NativeExecutor, OutputObserver, sandboxed_process_host,
 };
-use quirl_syntax::{classify, parse_command_list, InteractiveLine, Mode};
+use quirl_syntax::{InteractiveLine, Mode, classify, parse_command_list};
 use quirl_ui::{
-    editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
-    set_product_identity, terminal_supports_unicode, terminal_width, CatalogLoader,
-    ExtensionCompleter, ExtensionSuggestion, InteractiveDataSnapshot, InteractiveHistoryEntry,
-    InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch,
-    InteractivePanelProvider, InteractiveRuntimeSnapshot, InteractiveSignal, PickerItem,
+    CatalogLoader, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, ExtensionCompleter,
+    ExtensionSuggestion, InteractiveDataSnapshot, InteractiveHistoryEntry, InteractiveJobAction,
+    InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
+    InteractiveRuntimeSnapshot, InteractiveSignal, MODE_TOGGLE_HOST_COMMAND, PickerItem,
     PickerItemKind, PickerMatch, PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface,
-    SurfaceKind, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, MODE_TOGGLE_HOST_COMMAND,
+    SurfaceKind, editor_with_extensions_config_history_and_picker, history_path, render_error,
+    select_surface, set_product_identity, terminal_supports_unicode, terminal_width,
 };
 use recovery::RecoveryCommand;
 use script::ScriptLanguage;
@@ -70,7 +70,7 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{atomic::AtomicBool, mpsc, Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -1133,15 +1133,15 @@ fn execute_with_recovery(
         Ok(outcome) => {
             let duration = started.elapsed();
             let recovery_outcome = command_outcome_projection(&outcome);
-            if outcome.status_code() != 0 {
-                if let Err(error) = journal.record_failure(
+            if outcome.status_code() != 0
+                && let Err(error) = journal.record_failure(
                     &recovery_context,
                     duration,
                     Some(&recovery_outcome),
                     None,
-                ) {
-                    eprintln!("warning: {}", render_stderr_error(&error));
-                }
+                )
+            {
+                eprintln!("warning: {}", render_stderr_error(&error));
             }
             if let Some(extensions) = extensions {
                 emit_execution_outcome_events(extensions, &outcome, &mut annotations, executor);
@@ -2521,7 +2521,7 @@ fn apply_plan_actions(
                     "an extension blocked execution",
                 )
                 .with_context(reason)
-                .with_help("Review the extension policy or disable the blocking plugin"))
+                .with_help("Review the extension policy or disable the blocking plugin"));
             }
             ExtensionAction::AnnotateResult { key, value } => {
                 planned.annotations.insert(key, value);
@@ -3540,15 +3540,15 @@ fn render_execution_value(
 }
 
 fn print_outcome(outcome: &quirl_core::CommandOutcome) {
-    if let Some(stdout) = &outcome.stdout {
-        if !stdout.is_empty() {
-            println!("{stdout}");
-        }
+    if let Some(stdout) = &outcome.stdout
+        && !stdout.is_empty()
+    {
+        println!("{stdout}");
     }
-    if let Some(stderr) = &outcome.stderr {
-        if !stderr.is_empty() {
-            eprintln!("{stderr}");
-        }
+    if let Some(stderr) = &outcome.stderr
+        && !stderr.is_empty()
+    {
+        eprintln!("{stderr}");
     }
 }
 
@@ -3677,9 +3677,11 @@ mod tests {
             assert!(banner.contains("Alt-Q p actions"));
             assert!(banner.contains("prompt.symbols = \"nerd_font\""));
             assert!(!banner.contains('\u{1b}'));
-            assert!(banner
-                .lines()
-                .all(|line| UnicodeWidthStr::width(line) <= usize::from(width)));
+            assert!(
+                banner
+                    .lines()
+                    .all(|line| UnicodeWidthStr::width(line) <= usize::from(width))
+            );
             if !unicode {
                 assert!(banner.is_ascii());
             }
@@ -3691,9 +3693,11 @@ mod tests {
         for width in [1, 2, 4, 8, 16, 31] {
             let banner = onboarding_banner(width, true);
             assert!(!banner.is_empty());
-            assert!(banner
-                .lines()
-                .all(|line| UnicodeWidthStr::width(line) <= usize::from(width)));
+            assert!(
+                banner
+                    .lines()
+                    .all(|line| UnicodeWidthStr::width(line) <= usize::from(width))
+            );
             assert!(!banner.contains('\u{1b}'));
         }
     }
@@ -4486,10 +4490,12 @@ mod tests {
         let cli = Cli::try_parse_from(["quirl", "--build-info"]).unwrap();
         assert!(cli.build_info);
         assert!(cli.command.is_none());
-        assert!(!<Cli as clap::CommandFactory>::command()
-            .render_long_help()
-            .to_string()
-            .contains("build-info"));
+        assert!(
+            !<Cli as clap::CommandFactory>::command()
+                .render_long_help()
+                .to_string()
+                .contains("build-info")
+        );
     }
 
     #[test]
@@ -4724,10 +4730,10 @@ mod tests {
                         "catalog repeatability diverges for positional `{id}` on `{path}`"
                     );
                     assert!(
-                                contract.signature.contains(&documented.names[0]),
-                                "catalog signature `{}` omits its positional contract for `{id}` on `{path}`",
-                                contract.signature
-                            );
+                        contract.signature.contains(&documented.names[0]),
+                        "catalog signature `{}` omits its positional contract for `{id}` on `{path}`",
+                        contract.signature
+                    );
                     continue;
                 }
 
@@ -4826,15 +4832,16 @@ mod tests {
         );
 
         let variable = format!(
-            "QUIRL_C1_DIFFERENTIAL_{}",
+            "QUIRL_C1_DIFFERENTIAL_{}_{}",
+            std::process::id(),
             NEXT_DIFFERENTIAL_FIXTURE.fetch_add(1, Ordering::Relaxed)
         );
+        assert!(std::env::var_os(&variable).is_none());
         assert_native_and_reference_case(
             "export-assignment",
             |_| format!("export {variable}=value && printenv {variable}"),
             None,
         );
-        std::env::remove_var(variable);
 
         assert_native_and_reference_case(
             "semicolon-list-and-here-string",
@@ -4930,11 +4937,13 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
         assert!(error.message.contains("background"));
-        assert!(error
-            .details
-            .help
-            .iter()
-            .any(|help| help.contains("simple")));
+        assert!(
+            error
+                .details
+                .help
+                .iter()
+                .any(|help| help.contains("simple"))
+        );
     }
 
     #[test]
@@ -4945,9 +4954,11 @@ mod tests {
         let output = writer.finish();
         assert_eq!(output.len(), INTERACTIVE_TRANSCRIPT_OUTPUT_BYTES_MAX);
         assert!(output.ends_with("bytes …\n".as_bytes()));
-        assert!(String::from_utf8(output)
-            .unwrap()
-            .contains("discarded 128 bytes"));
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("discarded 128 bytes")
+        );
     }
 
     #[test]

@@ -227,7 +227,7 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
 
 ## Workspace hygiene
 
-- Toolchain is pinned to Rust 1.88 via `rust-toolchain.toml`; don't use
+- Toolchain is pinned to Rust 1.97.1 via `rust-toolchain.toml`; don't use
   features from newer compilers.
 - `spikes/` directories are intentionally separate Cargo workspaces so that
   mutually exclusive engine features (Luau, QuickJS, …) never unify with the

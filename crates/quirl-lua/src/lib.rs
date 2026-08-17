@@ -5,24 +5,24 @@ use mlua::{
     Value, VmState,
 };
 use quirl_core::{
-    escape_terminal_controls, reject_json_terminal_controls, reject_terminal_controls,
-    replace_file_atomically, validate_contribution_set, AtomicReplaceOptions, ContributionKind,
-    ContributionRegistration, ErrorCode, ErrorLabel, EventKind, EventSubscription,
-    ExecutionCancellation, ExecutionCleanupState, ExecutionEffect, ExecutionEffects,
-    ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget, ExecutionStatus,
-    ExtensionAction, ExtensionCapability, ExtensionEvent, ExtensionEventData, ProcessHost,
-    ProcessRequest, ShellError, StructuredValue, ValueInputContract, ValueOutputContract,
-    EXECUTION_ARGUMENTS_MAX, EXECUTION_ARGUMENT_BYTES_MAX, EXECUTION_BYTES_MAX,
+    AtomicReplaceOptions, ContributionKind, ContributionRegistration, EXECUTION_ARGUMENT_BYTES_MAX,
+    EXECUTION_ARGUMENTS_MAX, EXECUTION_BYTES_MAX, ErrorCode, ErrorLabel, EventKind,
+    EventSubscription, ExecutionCancellation, ExecutionCleanupState, ExecutionEffect,
+    ExecutionEffects, ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget,
+    ExecutionStatus, ExtensionAction, ExtensionCapability, ExtensionEvent, ExtensionEventData,
+    ProcessHost, ProcessRequest, ShellError, StructuredValue, ValueInputContract,
+    ValueOutputContract, escape_terminal_controls, reject_json_terminal_controls,
+    reject_terminal_controls, replace_file_atomically, validate_contribution_set,
 };
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Read,
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -811,8 +811,22 @@ struct BuiltinTheme {
 
 impl BuiltinTheme {
     fn to_owned_colors(self) -> ThemeColors {
-        let [accent_command, accent_data, context_primary, context_secondary, muted, border, status_background, error, warning, hint, string, operator, expansion, number] =
-            self.colors;
+        let [
+            accent_command,
+            accent_data,
+            context_primary,
+            context_secondary,
+            muted,
+            border,
+            status_background,
+            error,
+            warning,
+            hint,
+            string,
+            operator,
+            expansion,
+            number,
+        ] = self.colors;
         ThemeColors {
             accent_command: accent_command.to_owned(),
             accent_data: accent_data.to_owned(),
@@ -1556,8 +1570,7 @@ pub const HOST_API: &[HostApiSpec] = &[
     },
     HostApiSpec {
         path: "quirl.plugin.command",
-        summary:
-            "Register a documented command with exact ABI-v1 value I/O; live streams are rejected.",
+        summary: "Register a documented command with exact ABI-v1 value I/O; live streams are rejected.",
         parameters: PLUGIN_COMMAND_PARAMETER,
         returns: "nil",
         capability: Some("commands.register"),
@@ -2375,10 +2388,10 @@ impl LuaRuntime {
         let mut reports = Vec::with_capacity(handlers.len());
         for (name, function, capabilities, deadline) in handlers {
             let mut visible_event = event.clone();
-            if !capabilities.contains(&ExtensionCapability::OutputRead) {
-                if let ExtensionEventData::Output { text, .. } = &mut visible_event.data {
-                    *text = None;
-                }
+            if !capabilities.contains(&ExtensionCapability::OutputRead)
+                && let ExtensionEventData::Output { text, .. } = &mut visible_event.data
+            {
+                *text = None;
             }
             let result = self
                 .lua
@@ -5879,11 +5892,13 @@ mod tests {
         .unwrap();
         let error = runtime.eval("while true do end").unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|item| item == "lua failure: instruction"));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "lua failure: instruction")
+        );
     }
 
     #[test]
@@ -5898,11 +5913,13 @@ mod tests {
             .eval("return pcall(function() while true do end end)")
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|item| item == "lua failure: instruction"));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "lua failure: instruction")
+        );
         assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(runtime.eval("return 42").unwrap(), serde_json::json!(42));
     }
@@ -5919,11 +5936,13 @@ mod tests {
             .eval("return xpcall(function() while true do end end, function() return 'caught' end)")
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|item| item == "lua failure: instruction"));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "lua failure: instruction")
+        );
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
@@ -5954,11 +5973,13 @@ mod tests {
         runtime.cancellation_token().cancel();
         let error = runtime.eval("while true do end").unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|item| item == "lua failure: cancellation"));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "lua failure: cancellation")
+        );
     }
 
     #[test]
@@ -5974,11 +5995,13 @@ mod tests {
             let started = Instant::now();
             let error = runtime.eval(source).unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
-            assert!(error
-                .details
-                .context
-                .iter()
-                .any(|item| item == "lua failure: cancellation"));
+            assert!(
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|item| item == "lua failure: cancellation")
+            );
             assert!(started.elapsed() < Duration::from_millis(500));
         }
     }
@@ -5998,11 +6021,13 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|item| item == "lua failure: wall_time"));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "lua failure: wall_time")
+        );
         assert!(started.elapsed() < Duration::from_millis(250));
     }
 
@@ -6026,11 +6051,13 @@ mod tests {
         ] {
             let error = runtime.eval(operation).unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
-            assert!(error
-                .details
-                .context
-                .iter()
-                .any(|item| item == "lua failure: wall_time"));
+            assert!(
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|item| item == "lua failure: wall_time")
+            );
         }
     }
 
@@ -6050,11 +6077,13 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|item| item == "lua failure: memory"));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "lua failure: memory")
+        );
         assert_eq!(runtime.eval("collectgarbage(); return 42").unwrap(), 42);
     }
 
@@ -6085,11 +6114,13 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|item| item == "lua failure: memory"));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "lua failure: memory")
+        );
         LuaRuntime::new(LuaPolicy::config()).unwrap();
     }
 
@@ -6207,11 +6238,13 @@ mod tests {
                 .load_plugin_source(&source, "amplification.lua")
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
-            assert!(error
-                .details
-                .context
-                .iter()
-                .any(|item| item == "lua failure: registration"));
+            assert!(
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|item| item == "lua failure: registration")
+            );
             assert_eq!(runtime.registrations(), PluginRegistrations::default());
         }
     }
@@ -6285,11 +6318,13 @@ mod tests {
                 .load_plugin_source(&registration(input_type, output_type), "contract.lua")
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::Validation);
-            assert!(error
-                .details
-                .context
-                .iter()
-                .any(|item| item.contains("unsupported")));
+            assert!(
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|item| item.contains("unsupported"))
+            );
             assert_eq!(runtime.registrations(), PluginRegistrations::default());
         }
 
@@ -6315,9 +6350,11 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
         assert_eq!(runtime.registrations(), PluginRegistrations::default());
-        assert!(runtime
-            .render_prompt_segment("partial", &serde_json::json!({}))
-            .is_err());
+        assert!(
+            runtime
+                .render_prompt_segment("partial", &serde_json::json!({}))
+                .is_err()
+        );
 
         runtime
             .load_plugin_source(
@@ -6414,11 +6451,13 @@ mod tests {
             .render_prompt_segment("runaway", &serde_json::json!({}))
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|item| item == "lua failure: wall_time"));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "lua failure: wall_time")
+        );
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
@@ -6482,11 +6521,13 @@ mod tests {
         );
         let error = validate_completion_result(&aggregate, "bounded").unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|item| item.contains("completion retained bytes")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|item| item.contains("completion retained bytes"))
+        );
     }
 
     #[test]
@@ -6682,16 +6723,20 @@ return { main = exported }
                 "ordered-tests.lua",
             )
             .unwrap_err();
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|item| item == "test: test_a"));
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|item| item.contains("a failed")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "test: test_a")
+        );
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|item| item.contains("a failed"))
+        );
     }
 
     #[test]
@@ -6804,9 +6849,11 @@ return { main = exported }
         let error = lint_source("return os.execute('whoami')", Path::new("plugin.lua"))
             .expect_err("os access must require a capability");
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error.details.labels[0]
-            .message
-            .contains("explicit Quirl capability"));
+        assert!(
+            error.details.labels[0]
+                .message
+                .contains("explicit Quirl capability")
+        );
     }
 
     #[test]
@@ -6814,9 +6861,11 @@ return { main = exported }
         let error = lint_source("return load('return 42')", Path::new("plugin.lua"))
             .expect_err("dynamic chunks must not bypass source admission");
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error.details.labels[0]
-            .message
-            .contains("untrusted binary bytecode"));
+        assert!(
+            error.details.labels[0]
+                .message
+                .contains("untrusted binary bytecode")
+        );
     }
 
     #[test]

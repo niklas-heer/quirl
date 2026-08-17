@@ -714,9 +714,11 @@ mod tests {
         let action = ExtensionAction::RewritePlan {
             source: "echo safe".to_owned(),
         };
-        assert!(action
-            .validate(&[ExtensionCapability::EventsObserve])
-            .is_err());
+        assert!(
+            action
+                .validate(&[ExtensionCapability::EventsObserve])
+                .is_err()
+        );
         action
             .validate(&[
                 ExtensionCapability::EventsObserve,
@@ -762,8 +764,10 @@ mod tests {
         assert!(
             error.details.context[0].contains(&format!("limit: {JSON_TERMINAL_VALUE_DEPTH_MAX}"))
         );
-        assert!(error.details.context[0]
-            .contains(&format!("observed: {}", JSON_TERMINAL_VALUE_DEPTH_MAX + 1)));
+        assert!(
+            error.details.context[0]
+                .contains(&format!("observed: {}", JSON_TERMINAL_VALUE_DEPTH_MAX + 1))
+        );
     }
 
     #[test]
@@ -780,8 +784,10 @@ mod tests {
         assert!(
             error.details.context[0].contains(&format!("limit: {JSON_TERMINAL_VALUE_NODES_MAX}"))
         );
-        assert!(error.details.context[0]
-            .contains(&format!("observed: {}", JSON_TERMINAL_VALUE_NODES_MAX + 1)));
+        assert!(
+            error.details.context[0]
+                .contains(&format!("observed: {}", JSON_TERMINAL_VALUE_NODES_MAX + 1))
+        );
     }
 
     #[test]
@@ -792,8 +798,10 @@ mod tests {
         let excess = Value::String(exact);
         let error = reject_json_terminal_controls("contribution", &excess).unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error.details.context[0]
-            .contains(&format!("limit: {JSON_TERMINAL_VALUE_TEXT_BYTES_MAX}")));
+        assert!(
+            error.details.context[0]
+                .contains(&format!("limit: {JSON_TERMINAL_VALUE_TEXT_BYTES_MAX}"))
+        );
     }
 
     #[test]

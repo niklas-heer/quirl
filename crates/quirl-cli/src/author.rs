@@ -1,9 +1,9 @@
-use crate::bounded_file::{read_regular_file, ReadFileOptions};
+use crate::bounded_file::{ReadFileOptions, read_regular_file};
 use clap::{Args, ValueEnum};
 use quirl_catalog::{Catalog, CommandSpec};
 use quirl_core::{
-    escape_json_terminal_controls, escape_terminal_controls, replace_file_atomically,
-    AtomicReplaceOptions, ErrorCode, ShellError,
+    AtomicReplaceOptions, ErrorCode, ShellError, escape_json_terminal_controls,
+    escape_terminal_controls, replace_file_atomically,
 };
 use std::{
     ffi::OsString,
@@ -1000,11 +1000,13 @@ mod tests {
         assert!(created_directory.exists());
         assert!(created_directory.join("script.qrl").exists());
         assert!(preexisting.exists());
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("failure cleanup preserved created")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("failure cleanup preserved created"))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1035,11 +1037,13 @@ mod tests {
 
         assert_eq!(fs::read(&path).unwrap(), b"foreign");
         assert!(moved.exists());
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("failure cleanup preserved created file")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("failure cleanup preserved created file"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1070,11 +1074,13 @@ mod tests {
 
         assert!(directory.is_dir());
         assert!(moved.is_dir());
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("failure cleanup preserved created directory")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("failure cleanup preserved created directory"))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1086,9 +1092,11 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.starts_with("<!doctype html>"));
         assert!(!first.contains("<source>"));
-        assert!(render_catalog(&catalog, DocumentationFormat::Json)
-            .unwrap()
-            .contains("schema_version"));
+        assert!(
+            render_catalog(&catalog, DocumentationFormat::Json)
+                .unwrap()
+                .contains("schema_version")
+        );
         let command = catalog.find("quirl doc").unwrap();
         for format in [
             DocumentationFormat::Text,
@@ -1178,11 +1186,11 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read(foreign).unwrap(), b"foreign");
         assert!(moved.exists());
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("failure cleanup preserved documentation temporary")));
+        assert!(
+            error.details.context.iter().any(
+                |context| context.contains("failure cleanup preserved documentation temporary")
+            )
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1210,11 +1218,11 @@ mod tests {
         );
         assert!(moved_owned.exists());
         assert_eq!(error.message, "injected primary failure");
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("failure cleanup preserved documentation temporary")));
+        assert!(
+            error.details.context.iter().any(
+                |context| context.contains("failure cleanup preserved documentation temporary")
+            )
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -1,9 +1,9 @@
 //! Bounded background installation and indexing for local command intelligence.
 
 use crate::{index, intelligence};
-use quirl_core::{escape_terminal_line, ErrorCode, ShellError};
+use quirl_core::{ErrorCode, ShellError, escape_terminal_line};
 use quirl_ui::{
-    InteractiveActivityProvider, InteractiveActivitySnapshot, ACTIVITY_MESSAGE_BYTES_MAX,
+    ACTIVITY_MESSAGE_BYTES_MAX, InteractiveActivityProvider, InteractiveActivitySnapshot,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -11,8 +11,9 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Condvar, Mutex, Weak,
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -20,7 +21,7 @@ use std::{
 
 #[cfg(unix)]
 use nix::{
-    fcntl::{open, OFlag},
+    fcntl::{OFlag, open},
     sys::stat::Mode as FileMode,
 };
 #[cfg(unix)]
@@ -274,10 +275,10 @@ impl Shared {
     }
 
     fn cancel(&self) {
-        if let Ok(refresh) = self.catalog_refresh.lock() {
-            if let Some(refresh) = refresh.as_ref() {
-                refresh.cancel();
-            }
+        if let Ok(refresh) = self.catalog_refresh.lock()
+            && let Some(refresh) = refresh.as_ref()
+        {
+            refresh.cancel();
         }
         let _guard = match self.wake.0.lock() {
             Ok(guard) => guard,
@@ -354,10 +355,10 @@ impl index::CatalogRefreshObserver for CatalogObserver {
     fn refresh_published(&self) {
         if let Some(shared) = self.shared.upgrade() {
             shared.clear_discovery();
-            if !automatic_ai_disabled() {
-                if let Err(error) = shared.request() {
-                    shared.publish(format!("AI index deferred: {}", error.message));
-                }
+            if !automatic_ai_disabled()
+                && let Err(error) = shared.request()
+            {
+                shared.publish(format!("AI index deferred: {}", error.message));
             }
         }
     }
@@ -787,7 +788,7 @@ impl ModelTemporary {
                         path,
                         asset_names: assets.iter().map(|asset| asset.name).collect(),
                         installed: false,
-                    })
+                    });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(model_io_error("create", &path, error)),
@@ -934,7 +935,7 @@ impl Read for ChannelReader {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "bounded HTTPS reader disconnected",
-                    ))
+                    ));
                 }
             }
         }

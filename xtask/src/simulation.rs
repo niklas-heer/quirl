@@ -782,7 +782,7 @@ fn terminate_process_group(child: &mut Child) -> io::Result<()> {
     {
         use nix::{
             errno::Errno,
-            sys::signal::{killpg, Signal},
+            sys::signal::{Signal, killpg},
             unistd::Pid,
         };
 
@@ -793,11 +793,11 @@ fn terminate_process_group(child: &mut Child) -> io::Result<()> {
                 "refusing to signal unsafe process group {process_id}"
             )));
         }
-        if let Err(error) = killpg(Pid::from_raw(process_id), Signal::SIGKILL) {
-            if error != Errno::ESRCH {
-                let _ = child.kill();
-                return Err(io::Error::from(error));
-            }
+        if let Err(error) = killpg(Pid::from_raw(process_id), Signal::SIGKILL)
+            && error != Errno::ESRCH
+        {
+            let _ = child.kill();
+            return Err(io::Error::from(error));
         }
     }
     #[cfg(not(unix))]
@@ -1151,7 +1151,9 @@ mod tests {
             total_bytes: 0,
         };
         assert_eq!(
-            classify(&success, &success, &divergent, &manifest, &manifest, &manifest,),
+            classify(
+                &success, &success, &divergent, &manifest, &manifest, &manifest,
+            ),
             Classification::ReferenceDivergence
         );
     }
@@ -1168,9 +1170,11 @@ mod tests {
                 bounded_output(&mut adversarial_shell(script), Duration::from_secs(2)).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
             assert!(error.to_string().contains(stream));
-            assert!(error
-                .to_string()
-                .contains(&SESSION_OUTPUT_BYTES_MAX.to_string()));
+            assert!(
+                error
+                    .to_string()
+                    .contains(&SESSION_OUTPUT_BYTES_MAX.to_string())
+            );
             assert!(started.elapsed() < Duration::from_secs(2));
         }
     }

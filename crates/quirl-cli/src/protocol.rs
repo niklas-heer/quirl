@@ -3,7 +3,7 @@
 //! Schema definitions stay in their lowest owning crates. This module only
 //! assembles their identities so one golden fixture catches cross-crate drift.
 
-use quirl_core::{schema_fingerprint, CompatibilityPolicy};
+use quirl_core::{CompatibilityPolicy, schema_fingerprint};
 use serde::Serialize;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]

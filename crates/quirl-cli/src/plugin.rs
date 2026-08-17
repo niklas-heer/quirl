@@ -1,18 +1,17 @@
-use crate::bounded_file::{read_optional_regular_file, read_regular_file, ReadFileOptions};
+use crate::bounded_file::{ReadFileOptions, read_optional_regular_file, read_regular_file};
 use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::{Subcommand, ValueEnum};
 use quirl_core::{
-    escape_json_terminal_controls, escape_terminal_controls, ContributionKind, ErrorCode,
-    ShellError,
+    ContributionKind, ErrorCode, ShellError, escape_json_terminal_controls,
+    escape_terminal_controls,
 };
 use quirl_lua::{CommandRegistration, LuaPolicy};
 use quirl_plugin::{
-    doctor_plugin, parse_plugin_manifest, permission_diff, resolve_plugin,
-    validate_plugin_manifest, AdapterInitializeRequest, AdapterInitializeResponse, DoctorReport,
-    PermissionDiff, PluginLockfile, PluginManifest, PluginRuntime, ADAPTER_PROTOCOL,
-    PLUGIN_LOCK_FILE,
+    ADAPTER_PROTOCOL, AdapterInitializeRequest, AdapterInitializeResponse, DoctorReport,
+    PLUGIN_LOCK_FILE, PermissionDiff, PluginLockfile, PluginManifest, PluginRuntime, doctor_plugin,
+    parse_plugin_manifest, permission_diff, resolve_plugin, validate_plugin_manifest,
 };
-use quirl_process::{sandboxed_process_host, ChildProcessTree};
+use quirl_process::{ChildProcessTree, sandboxed_process_host};
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
@@ -21,8 +20,8 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -793,15 +792,14 @@ pub(crate) fn execute_out_of_process_adapter(
         .stderr
         .take()
         .map(|stream| spawn_adapter_reader(stream, output_budget));
-    let write_result = if let Some(mut stdin) = child.stdin.take() {
-        stdin
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin
             .write_all(&request)
-            .and_then(|()| stdin.write_all(b"\n"))
-    } else {
-        Err(io::Error::new(
+            .and_then(|()| stdin.write_all(b"\n")),
+        _ => Err(io::Error::new(
             io::ErrorKind::BrokenPipe,
             "adapter stdin pipe is unavailable",
-        ))
+        )),
     };
     if let Err(error) = write_result {
         let termination = terminate_adapter(&mut child, &containment);
@@ -1437,9 +1435,11 @@ summary = "Bounded plugin"
         let backup = fs::read(directory.join(format!("{PLUGIN_LOCK_FILE}.bak"))).unwrap();
         let decoded: PluginLockfile = serde_json::from_slice(&backup).unwrap();
         assert_eq!(decoded, lock);
-        assert!(!directory
-            .join(format!(".{PLUGIN_LOCK_FILE}.tmp-{}", std::process::id()))
-            .exists());
+        assert!(
+            !directory
+                .join(format!(".{PLUGIN_LOCK_FILE}.tmp-{}", std::process::id()))
+                .exists()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1584,11 +1584,13 @@ max_message_bytes = {max_bytes}
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error
-            .details
-            .help
-            .iter()
-            .any(|help| help.contains("private relocated snapshot")));
+        assert!(
+            error
+                .details
+                .help
+                .iter()
+                .any(|help| help.contains("private relocated snapshot"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1637,9 +1639,11 @@ max_message_bytes = {max_bytes}
             ErrorCode::Validation,
             "{response_error:?}"
         );
-        assert!(response_error
-            .message
-            .contains("invalid initialization response"));
+        assert!(
+            response_error
+                .message
+                .contains("invalid initialization response")
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1680,11 +1684,13 @@ max_message_bytes = {max_bytes}
         .unwrap_err();
         assert_eq!(output_error.code, ErrorCode::ResourceLimit);
         assert!(output_error.message.contains("output message limit"));
-        assert!(output_error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("discarded") && context.contains("retained")));
+        assert!(
+            output_error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("discarded") && context.contains("retained"))
+        );
 
         let cancelled = AtomicBool::new(true);
         let cancellation_error = execute_out_of_process_adapter(

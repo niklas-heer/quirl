@@ -3,10 +3,10 @@ use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::{Subcommand, ValueEnum};
 use quirl_catalog::Catalog;
 use quirl_contract::{
-    build_package, parse_package_manifest, DiagnosticSeverity, PackageBuild, PackageBuildOutcome,
-    PackageManifest, PackagePublishPlan, PackageSourceAudit, ValidationDiagnostic,
+    DiagnosticSeverity, PackageBuild, PackageBuildOutcome, PackageManifest, PackagePublishPlan,
+    PackageSourceAudit, ValidationDiagnostic, build_package, parse_package_manifest,
 };
-use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
+use quirl_core::{ErrorCode, ShellError, escape_json_terminal_controls, escape_terminal_controls};
 use quirl_lua::HOST_API;
 use serde::Serialize;
 use std::{
@@ -723,10 +723,12 @@ mod tests {
         );
 
         let invalid = audit_package_source(Some(Path::new("plugin.lua")), Some(b"return ("));
-        assert!(invalid
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.entry_lint"));
+        assert!(
+            invalid
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.entry_lint")
+        );
     }
 
     #[test]
@@ -966,9 +968,11 @@ mod tests {
     #[test]
     fn package_entry_rejects_invalid_utf8_without_execution() {
         let audit = audit_package_source(Some(Path::new("entry.lua")), Some(&[0xff]));
-        assert!(audit
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "package.entry_utf8"));
+        assert!(
+            audit
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "package.entry_utf8")
+        );
     }
 }

@@ -8,7 +8,7 @@ use quirl_catalog::{
     ArgumentKind as CatalogArgumentKind, ArgumentSpec, Catalog, CommandSpec, Effect, IoContract,
     Provenance, ProvenanceInfo,
 };
-use quirl_contract::{stable_hash, ArgumentKind as PackageArgumentKind, PackageCommand};
+use quirl_contract::{ArgumentKind as PackageArgumentKind, PackageCommand, stable_hash};
 use quirl_core::{ErrorCode, ShellError, ValueInputContract, ValueOutputContract};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -101,19 +101,15 @@ pub fn wasm_world_hash() -> String {
 /// Execution isolation boundary selected by a plugin manifest.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PluginRuntime {
     /// Lua executed in Quirl's policy-restricted trusted extension runtime.
+    #[default]
     TrustedLua,
     /// Validated component-model binary constrained by an explicit WIT world and budgets.
     WasmComponent,
     /// Relative executable contacted only through the bounded adapter protocol.
     OutOfProcess,
-}
-
-impl Default for PluginRuntime {
-    fn default() -> Self {
-        Self::TrustedLua
-    }
 }
 
 /// Strict, deny-unknown declaration of plugin identity, authority, and runtime bounds.
@@ -767,7 +763,9 @@ pub fn validate_plugin_manifest(
     {
         return Err(validation_error(
             "plugin identity, API, or Quirl version is invalid",
-            format!("Use a lowercase name, semantic version, summary, api = `{PLUGIN_API_VERSION}`, and a compatible Quirl range"),
+            format!(
+                "Use a lowercase name, semantic version, summary, api = `{PLUGIN_API_VERSION}`, and a compatible Quirl range"
+            ),
         ));
     }
     validate_relative_path(&manifest.plugin.entry)?;
@@ -1307,14 +1305,18 @@ fn validate_out_of_process(manifest: &PluginManifest) -> Result<(), ShellError> 
     {
         return Err(validation_error(
             "invalid or unbounded out-of-process adapter boundary",
-            format!("Use the entry itself as the relative executable, protocol `quirl.plugin.v1`, at most {MAX_ADAPTER_ARGUMENTS} arguments and {MAX_ADAPTER_ARGUMENT_BYTES} argument bytes, a callback deadline at most {MAX_ADAPTER_CALLBACK_TIMEOUT_MS} ms, and a message limit at most {MAX_ADAPTER_MESSAGE_BYTES} bytes"),
+            format!(
+                "Use the entry itself as the relative executable, protocol `quirl.plugin.v1`, at most {MAX_ADAPTER_ARGUMENTS} arguments and {MAX_ADAPTER_ARGUMENT_BYTES} argument bytes, a callback deadline at most {MAX_ADAPTER_CALLBACK_TIMEOUT_MS} ms, and a message limit at most {MAX_ADAPTER_MESSAGE_BYTES} bytes"
+            ),
         ));
     }
     let launch_grant = format!("process.spawn:{}", adapter.executable);
     if manifest.capabilities.request != [launch_grant.clone()] {
         return Err(validation_error(
             "out-of-process adapters must request only their scoped launch capability",
-            format!("Set capabilities.request = [\"{launch_grant}\"]; protocol v1 exposes no other host capabilities"),
+            format!(
+                "Set capabilities.request = [\"{launch_grant}\"]; protocol v1 exposes no other host capabilities"
+            ),
         ));
     }
     Ok(())
@@ -1545,10 +1547,10 @@ fn unknown_plugin(name: &str) -> ShellError {
 
 fn legacy_lock_contract_error(version: u64) -> ShellError {
     validation_error(
+        format!("plugin lockfile schema v{version} predates executable command I/O contracts"),
         format!(
-            "plugin lockfile schema v{version} predates executable command I/O contracts"
+            "Move plugins.lock.json intact to plugins.lock.json.legacy-v{version}, then re-add each plugin after reviewing a schema_version = 2 manifest; Quirl cannot infer the new runtime contract from an old lock"
         ),
-        format!("Move plugins.lock.json intact to plugins.lock.json.legacy-v{version}, then re-add each plugin after reviewing a schema_version = 2 manifest; Quirl cannot infer the new runtime contract from an old lock"),
     )
 }
 
@@ -1964,15 +1966,17 @@ max_message_bytes = 1024"#;
             "forged": true,
         });
         assert!(serde_json::from_value::<AdapterInitializeResponse>(forged).is_err());
-        assert!(AdapterInitializeResponse {
-            protocol: ADAPTER_PROTOCOL.to_owned(),
-            schema_version: ADAPTER_SCHEMA_VERSION,
-            api_version: PLUGIN_API_VERSION.to_owned(),
-            operation: "initialize".to_owned(),
-            status: "ready".to_owned(),
-        }
-        .validate_for(&request)
-        .is_ok());
+        assert!(
+            AdapterInitializeResponse {
+                protocol: ADAPTER_PROTOCOL.to_owned(),
+                schema_version: ADAPTER_SCHEMA_VERSION,
+                api_version: PLUGIN_API_VERSION.to_owned(),
+                operation: "initialize".to_owned(),
+                status: "ready".to_owned(),
+            }
+            .validate_for(&request)
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2039,9 +2043,11 @@ max_message_bytes = 1024"#;
         let legacy = LUA_MANIFEST.replace("schema_version = 2", "schema_version = 1");
         let manifest = parse_plugin_manifest(&legacy, "plugin.toml").unwrap();
         let error = validate_plugin_manifest(&manifest, b"return true", "0.1.0").unwrap_err();
-        assert!(error
-            .message
-            .contains("unsupported plugin schema version 1"));
+        assert!(
+            error
+                .message
+                .contains("unsupported plugin schema version 1")
+        );
         assert!(error.details.help[0].contains("schema_version = 2"));
     }
 

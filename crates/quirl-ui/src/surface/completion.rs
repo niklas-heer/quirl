@@ -1,10 +1,10 @@
 use super::super::{
-    extension_replacement_is_valid, CompletionWorker, ExtensionCompleter, ExtensionSuggestion,
+    CompletionWorker, ExtensionCompleter, ExtensionSuggestion, extension_replacement_is_valid,
 };
 use quirl_catalog::{
-    Catalog, CommandSpec, Completion, CompletionCancellation, CompletionOutcome, CompletionRequest,
-    Effect, Provenance, Trust, COMPLETION_PROTOCOL_VERSION, MAX_COMPLETION_DEADLINE_MS,
-    MAX_COMPLETION_RESULTS,
+    COMPLETION_PROTOCOL_VERSION, Catalog, CommandSpec, Completion, CompletionCancellation,
+    CompletionOutcome, CompletionRequest, Effect, MAX_COMPLETION_DEADLINE_MS,
+    MAX_COMPLETION_RESULTS, Provenance, Trust,
 };
 use quirl_core::ShellError;
 use quirl_syntax::Mode;
@@ -12,8 +12,8 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
 };
@@ -132,10 +132,10 @@ impl IntentCompletionState {
     }
 
     pub fn cancel(&mut self) {
-        if self.request_id > 0 {
-            if let Some(worker) = &self.worker {
-                worker.cancel(self.request_id);
-            }
+        if self.request_id > 0
+            && let Some(worker) = &self.worker
+        {
+            worker.cancel(self.request_id);
         }
     }
 
@@ -169,38 +169,40 @@ impl ExtensionWorker {
         let worker_response = Arc::clone(&response);
         let latest_request_id = Arc::new(AtomicU64::new(0));
         let worker_latest = Arc::clone(&latest_request_id);
-        let worker = thread::spawn(move || loop {
-            let request = {
-                let (lock, ready) = &*worker_queue;
-                let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                while state.pending.is_none() && !state.shutdown {
-                    state = ready
-                        .wait(state)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
-                if state.shutdown {
-                    return;
-                }
-                state.pending.take()
-            };
-            let Some(request) = request else {
-                continue;
-            };
-            let items = completer
-                .complete(&request.line, request.cursor)
-                .into_iter()
-                .take(COMPLETION_ITEMS_MAX)
-                .filter(|item| extension_replacement_is_valid(&request.line, item))
-                .collect();
-            if worker_latest.load(Ordering::Acquire) == request.request_id {
-                let mut slot = worker_response
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let worker = thread::spawn(move || {
+            loop {
+                let request = {
+                    let (lock, ready) = &*worker_queue;
+                    let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while state.pending.is_none() && !state.shutdown {
+                        state = ready
+                            .wait(state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    if state.shutdown {
+                        return;
+                    }
+                    state.pending.take()
+                };
+                let Some(request) = request else {
+                    continue;
+                };
+                let items = completer
+                    .complete(&request.line, request.cursor)
+                    .into_iter()
+                    .take(COMPLETION_ITEMS_MAX)
+                    .filter(|item| extension_replacement_is_valid(&request.line, item))
+                    .collect();
                 if worker_latest.load(Ordering::Acquire) == request.request_id {
-                    *slot = Some(ExtensionResponse {
-                        request_id: request.request_id,
-                        items,
-                    });
+                    let mut slot = worker_response
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if worker_latest.load(Ordering::Acquire) == request.request_id {
+                        *slot = Some(ExtensionResponse {
+                            request_id: request.request_id,
+                            items,
+                        });
+                    }
                 }
             }
         });
@@ -410,13 +412,13 @@ impl CompletionState {
         }
         self.start_workers()?;
         self.resource_notice = None;
-        if self.request_id > 0 {
-            if let Some(worker) = &mut self.worker {
-                worker.cancel(CompletionCancellation {
-                    protocol_version: COMPLETION_PROTOCOL_VERSION,
-                    request_id: self.request_id,
-                })?;
-            }
+        if self.request_id > 0
+            && let Some(worker) = &mut self.worker
+        {
+            worker.cancel(CompletionCancellation {
+                protocol_version: COMPLETION_PROTOCOL_VERSION,
+                request_id: self.request_id,
+            })?;
         }
         self.request_id = self.request_id.saturating_add(1);
         self.items.clear();
@@ -526,10 +528,10 @@ impl CompletionState {
             items.extend(catalog_items);
             self.items = bounded_items(items);
             self.catalog_ready = true;
-            if let Some(extension_items) = self.extension_pending.take() {
-                if !extension_items.is_empty() {
-                    merge_extension_items(&mut self.items, extension_items);
-                }
+            if let Some(extension_items) = self.extension_pending.take()
+                && !extension_items.is_empty()
+            {
+                merge_extension_items(&mut self.items, extension_items);
             }
             changed = true;
         }
@@ -1335,9 +1337,11 @@ mod tests {
         state.request(&line, line.len(), Mode::Command).unwrap();
         assert!(!state.open);
         assert!(!state.streaming);
-        assert!(state
-            .resource_notice()
-            .is_some_and(|notice| notice.contains("4096 query bytes")));
+        assert!(
+            state
+                .resource_notice()
+                .is_some_and(|notice| notice.contains("4096 query bytes"))
+        );
     }
 
     #[test]
@@ -1409,14 +1413,18 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(normal
-            .items
-            .iter()
-            .all(|item| item.value != "quirl data ls"));
-        assert!(normal
-            .items
-            .iter()
-            .all(|item| !item.summary.contains("typed entries in Data mode")));
+        assert!(
+            normal
+                .items
+                .iter()
+                .all(|item| item.value != "quirl data ls")
+        );
+        assert!(
+            normal
+                .items
+                .iter()
+                .all(|item| !item.summary.contains("typed entries in Data mode"))
+        );
     }
 
     #[test]
@@ -1451,12 +1459,16 @@ mod tests {
             line.len(),
             Mode::Command,
         );
-        assert!(directories
-            .iter()
-            .any(|item| item.display.ends_with("homebrew-tap/")));
-        assert!(directories
-            .iter()
-            .all(|item| !item.display.ends_with("homebrew.txt")));
+        assert!(
+            directories
+                .iter()
+                .any(|item| item.display.ends_with("homebrew-tap/"))
+        );
+        assert!(
+            directories
+                .iter()
+                .all(|item| !item.display.ends_with("homebrew.txt"))
+        );
 
         let line = format!("cd {}/home\\ b", root.display());
         let escaped = filesystem_completion_items(
@@ -1465,9 +1477,11 @@ mod tests {
             line.len(),
             Mode::Command,
         );
-        assert!(escaped
-            .iter()
-            .any(|item| item.value.ends_with("home\\ brew/")));
+        assert!(
+            escaped
+                .iter()
+                .any(|item| item.value.ends_with("home\\ brew/"))
+        );
 
         let line = format!("cat {}/home", root.display());
         let files = filesystem_completion_items(
@@ -1476,9 +1490,11 @@ mod tests {
             line.len(),
             Mode::Command,
         );
-        assert!(files
-            .iter()
-            .any(|item| item.display.ends_with("homebrew.txt")));
+        assert!(
+            files
+                .iter()
+                .any(|item| item.display.ends_with("homebrew.txt"))
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

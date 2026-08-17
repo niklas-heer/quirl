@@ -2,15 +2,15 @@
 
 use nix::{
     errno::Errno,
-    fcntl::{fcntl, FcntlArg, OFlag},
-    poll::{poll, PollFd, PollFlags, PollTimeout},
-    pty::{forkpty, ForkptyResult, Winsize},
+    fcntl::{FcntlArg, OFlag, fcntl},
+    poll::{PollFd, PollFlags, PollTimeout, poll},
+    pty::{ForkptyResult, Winsize, forkpty},
     sys::{
-        signal::{kill, Signal},
-        termios::{tcgetattr, Termios},
-        wait::{waitpid, WaitPidFlag, WaitStatus},
+        signal::{Signal, kill},
+        termios::{Termios, tcgetattr},
+        wait::{WaitPidFlag, WaitStatus, waitpid},
     },
-    unistd::{getpgrp, tcgetpgrp, Pid},
+    unistd::{Pid, getpgrp, tcgetpgrp},
 };
 use std::{
     collections::BTreeMap,
@@ -661,7 +661,7 @@ impl PtySession {
                 Ok(0) => {
                     return Err(
                         io::Error::new(io::ErrorKind::BrokenPipe, "PTY input closed").into(),
-                    )
+                    );
                 }
                 Ok(written) => offset = offset.saturating_add(written),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -829,12 +829,12 @@ impl PtySession {
     }
 
     pub(super) fn close(&mut self) -> Result<(), Box<dyn Error>> {
-        if let Some(master) = self.master.as_ref() {
-            if let Ok(group) = tcgetpgrp(master) {
-                if group.as_raw() > 0 && group != getpgrp() {
-                    kill_group(group);
-                }
-            }
+        if let Some(master) = self.master.as_ref()
+            && let Ok(group) = tcgetpgrp(master)
+            && group.as_raw() > 0
+            && group != getpgrp()
+        {
+            kill_group(group);
         }
         if let Some(child) = self.child {
             kill_group(child);

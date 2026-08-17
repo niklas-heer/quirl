@@ -5,7 +5,7 @@ use quirl_catalog::{
     Provenance, Trust,
 };
 use quirl_core::{ErrorCode, ShellError};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Current version of every agent-facing JSON document owned by this crate.
@@ -685,7 +685,11 @@ pub fn render_context_markdown(context: &AgentContext) -> String {
         context.catalog_hash,
         context.host_api_hash,
         context.estimated_tokens,
-        if context.truncated { "truncated" } else { "complete" }
+        if context.truncated {
+            "truncated"
+        } else {
+            "complete"
+        }
     );
     if !context.commands.is_empty() {
         output.push_str("## Relevant commands\n\n");
@@ -1436,10 +1440,12 @@ mod tests {
         let second = build_agent_context(&catalog, "commit changes", 500).unwrap();
         assert_eq!(first, second);
         assert!(first.estimated_tokens <= 500);
-        assert!(first
-            .commands
-            .iter()
-            .any(|command| command.path == "git commit"));
+        assert!(
+            first
+                .commands
+                .iter()
+                .any(|command| command.path == "git commit")
+        );
     }
 
     #[test]
@@ -1480,10 +1486,12 @@ mod tests {
             AgentDocumentKind::Catalog,
         );
         assert!(!report.valid);
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.path == "catalog_hash"));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == "catalog_hash")
+        );
     }
 
     #[test]
@@ -1510,10 +1518,12 @@ mod tests {
             Some(&anchors),
         );
         assert!(!anchored.valid);
-        assert!(anchored
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.path == "catalog_hash"));
+        assert!(
+            anchored
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == "catalog_hash")
+        );
     }
 
     #[test]
@@ -1528,12 +1538,16 @@ mod tests {
         let excess = validate_agent_document(&source, AgentDocumentKind::Catalog);
         assert!(!excess.valid);
         assert_eq!(excess.diagnostics[0].code, "agent.resource_limit");
-        assert!(excess.diagnostics[0]
-            .message
-            .contains(&format!("limit: {AGENT_DOCUMENT_BYTES_MAX}")));
-        assert!(excess.diagnostics[0]
-            .message
-            .contains(&format!("observed: {}", AGENT_DOCUMENT_BYTES_MAX + 1)));
+        assert!(
+            excess.diagnostics[0]
+                .message
+                .contains(&format!("limit: {AGENT_DOCUMENT_BYTES_MAX}"))
+        );
+        assert!(
+            excess.diagnostics[0]
+                .message
+                .contains(&format!("observed: {}", AGENT_DOCUMENT_BYTES_MAX + 1))
+        );
     }
 
     #[test]
@@ -1553,10 +1567,12 @@ mod tests {
             Some(&anchors),
         );
         assert!(!previous.valid);
-        assert!(previous
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "agent.schema_version"));
+        assert!(
+            previous
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "agent.schema_version")
+        );
         let previous_hash = structural_schema_hash(&[
             AGENT_CONTEXT_SCHEMA_V1_DESCRIPTOR,
             COMMAND_SCHEMA,
@@ -1577,10 +1593,12 @@ mod tests {
                 host_api_hash: "fnv1a64:host".to_owned(),
             }),
         );
-        assert!(historical
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "agent.schema_version"));
+        assert!(
+            historical
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "agent.schema_version")
+        );
     }
 
     #[test]
@@ -1613,10 +1631,12 @@ mod tests {
             &serde_json::to_vec(&context).unwrap(),
             AgentDocumentKind::Context,
         );
-        assert!(unanchored
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "agent.trusted_anchor_required"));
+        assert!(
+            unanchored
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "agent.trusted_anchor_required")
+        );
 
         context.catalog_hash = "fnv1a64:0000000000000000".to_owned();
         let tampered = validate_agent_document_with_anchors(
@@ -1625,10 +1645,12 @@ mod tests {
             Some(&anchors),
         );
         assert!(!tampered.valid);
-        assert!(tampered
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.path == "catalog_hash"));
+        assert!(
+            tampered
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == "catalog_hash")
+        );
     }
 
     #[test]
@@ -1644,14 +1666,18 @@ mod tests {
             Some(&anchors),
         );
         assert!(!report.valid);
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.path == "content_hash"));
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.path.ends_with("schema_hash")));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == "content_hash")
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path.ends_with("schema_hash"))
+        );
     }
 
     #[test]
@@ -1678,10 +1704,12 @@ mod tests {
                 .version,
             "2.3.4"
         );
-        assert!(manifest
-            .tools
-            .iter()
-            .all(|tool| tool.name.starts_with("quirl ") || tool.name == "demo run"));
+        assert!(
+            manifest
+                .tools
+                .iter()
+                .all(|tool| tool.name.starts_with("quirl ") || tool.name == "demo run")
+        );
         assert!(!manifest.tools.iter().any(|tool| tool.name == "ls"));
         assert_eq!(manifest.capabilities[0].name, "process.spawn");
     }

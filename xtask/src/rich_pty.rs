@@ -1,14 +1,14 @@
 //! End-to-end rich-terminal checks driven by the Rust PTY harness.
 
-use crate::pty::{key, PtySession, SpawnOptions, VirtualScreen, DEFAULT_TIMEOUT};
+use crate::pty::{DEFAULT_TIMEOUT, PtySession, SpawnOptions, VirtualScreen, key};
 use nix::{
     errno::Errno,
     sys::{
-        signal::{kill, Signal},
+        signal::{Signal, kill},
         stat::Mode,
         termios::LocalFlags,
     },
-    unistd::{mkfifo, Pid},
+    unistd::{Pid, mkfifo},
 };
 use std::{
     collections::BTreeMap,
@@ -2066,7 +2066,7 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
                 "partial construction leaked child {}",
                 observed_child.as_raw()
             ))
-            .into())
+            .into());
         }
     }
     execute_simple_with_marker(

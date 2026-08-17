@@ -1,6 +1,6 @@
 //! Explicit, iterative conversions at typed-data serialization boundaries.
 
-use super::{resource_limit_error, DataLimits, DataValue};
+use super::{DataLimits, DataValue, resource_limit_error};
 use crate::syntax::{SyntaxLiteral, SyntaxLiteralKind};
 use quirl_core::{ErrorCode, ShellError};
 use serde_json::{Number as JsonNumber, Value as JsonValue};

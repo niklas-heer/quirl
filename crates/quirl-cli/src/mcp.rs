@@ -8,10 +8,10 @@
 use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::{Subcommand, ValueEnum};
 use quirl_catalog::Catalog;
-use quirl_core::{escape_terminal_controls, ErrorCode, ShellError};
+use quirl_core::{ErrorCode, ShellError, escape_terminal_controls};
 use quirl_lua::format_source;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
@@ -135,7 +135,7 @@ impl McpServer {
                     Value::Null,
                     -32700,
                     "invalid JSON-RPC JSON",
-                ))
+                ));
             }
         };
         if json_depth(&value) > MAX_DEPTH {
@@ -720,11 +720,13 @@ mod tests {
     fn mcp_metadata_is_truthfully_builtin_only_and_nonexecuting() {
         let server = McpServer::new(vec![McpCapability::Catalog]);
         assert_eq!(server.catalog, Catalog::builtin());
-        assert!(server
-            .catalog
-            .commands
-            .iter()
-            .all(|command| command.provenance.source != quirl_catalog::Provenance::Plugin));
+        assert!(
+            server
+                .catalog
+                .commands
+                .iter()
+                .all(|command| command.provenance.source != quirl_catalog::Provenance::Plugin)
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
 };
-use xshell::{cmd, Shell};
+use xshell::{Shell, cmd};
 
 const DEFAULT_TEST_CASES: usize = 128;
 const DEFAULT_TEST_SEED: u64 = 7_640_891_576_956_012_809;

@@ -1,12 +1,12 @@
-use crate::bounded_file::{read_regular_file, ReadFileOptions};
+use crate::bounded_file::{ReadFileOptions, read_regular_file};
 use clap::{Subcommand, ValueEnum};
 use quirl_catalog::Catalog;
 use quirl_contract::{
-    build_agent_catalog, build_agent_context, build_agent_manifest, render_context_markdown,
-    validate_agent_document_with_anchors, AgentCatalog, AgentDocumentKind, AgentManifest,
-    AgentValidationAnchors, HostCapability, HostParameter, ValidationReport, DEFAULT_TOKEN_BUDGET,
+    AgentCatalog, AgentDocumentKind, AgentManifest, AgentValidationAnchors, DEFAULT_TOKEN_BUDGET,
+    HostCapability, HostParameter, ValidationReport, build_agent_catalog, build_agent_context,
+    build_agent_manifest, render_context_markdown, validate_agent_document_with_anchors,
 };
-use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
+use quirl_core::{ErrorCode, ShellError, escape_json_terminal_controls, escape_terminal_controls};
 use quirl_lua::HOST_API;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -316,15 +316,17 @@ mod tests {
         assert!(
             crate::Cli::try_parse_from(["quirl", "agent", "validate", "catalog.json"]).is_err()
         );
-        assert!(crate::Cli::try_parse_from([
-            "quirl",
-            "agent",
-            "validate",
-            "catalog.json",
-            "--kind",
-            "catalog"
-        ])
-        .is_ok());
+        assert!(
+            crate::Cli::try_parse_from([
+                "quirl",
+                "agent",
+                "validate",
+                "catalog.json",
+                "--kind",
+                "catalog"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -334,11 +336,13 @@ mod tests {
 
         let error = read_agent_document(&path).unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("observed:") && context.contains("limit:")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("observed:") && context.contains("limit:"))
+        );
 
         fs::remove_file(path).unwrap();
     }

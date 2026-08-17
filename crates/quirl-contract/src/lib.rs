@@ -8,21 +8,22 @@ mod agent;
 mod package;
 
 pub use agent::{
-    agent_catalog_schema_hash, agent_context_schema_hash, agent_manifest_schema_hash,
-    build_agent_catalog, build_agent_context, build_agent_manifest, render_context_markdown,
-    validate_agent_document, validate_agent_document_with_anchors, AgentCatalog, AgentCommand,
-    AgentContext, AgentDocumentKind, AgentManifest, AgentProvenance, AgentValidationAnchors,
-    DiagnosticSeverity, HostCapability, HostParameter, InstalledCapability, ValidationDiagnostic,
-    ValidationReport, AGENT_CATALOG_SCHEMA_DESCRIPTOR, AGENT_CONTEXT_SCHEMA_DESCRIPTOR,
+    AGENT_CATALOG_SCHEMA_DESCRIPTOR, AGENT_CONTEXT_SCHEMA_DESCRIPTOR,
     AGENT_CONTEXT_SCHEMA_V1_DESCRIPTOR, AGENT_DOCUMENT_BYTES_MAX, AGENT_MANIFEST_SCHEMA_DESCRIPTOR,
-    AGENT_SCHEMA_VERSION, DEFAULT_TOKEN_BUDGET, MINIMUM_TOKEN_BUDGET,
+    AGENT_SCHEMA_VERSION, AgentCatalog, AgentCommand, AgentContext, AgentDocumentKind,
+    AgentManifest, AgentProvenance, AgentValidationAnchors, DEFAULT_TOKEN_BUDGET,
+    DiagnosticSeverity, HostCapability, HostParameter, InstalledCapability, MINIMUM_TOKEN_BUDGET,
+    ValidationDiagnostic, ValidationReport, agent_catalog_schema_hash, agent_context_schema_hash,
+    agent_manifest_schema_hash, build_agent_catalog, build_agent_context, build_agent_manifest,
+    render_context_markdown, validate_agent_document, validate_agent_document_with_anchors,
 };
 pub use package::{
-    build_package, package_build_schema_hash, package_manifest_schema_hash, parse_package_manifest,
-    validate_package_manifest, ArgumentKind, PackageArgument, PackageBuild, PackageBuildOutcome,
-    PackageCapabilitySection, PackageCommand, PackageContributions, PackageManifest,
-    PackageMetadata, PackagePublishPlan, PackageSourceAudit, PACKAGE_BUILD_SCHEMA_DESCRIPTOR,
-    PACKAGE_MANIFEST_BYTES_MAX, PACKAGE_SCHEMA_DESCRIPTOR, PACKAGE_SCHEMA_VERSION,
+    ArgumentKind, PACKAGE_BUILD_SCHEMA_DESCRIPTOR, PACKAGE_MANIFEST_BYTES_MAX,
+    PACKAGE_SCHEMA_DESCRIPTOR, PACKAGE_SCHEMA_VERSION, PackageArgument, PackageBuild,
+    PackageBuildOutcome, PackageCapabilitySection, PackageCommand, PackageContributions,
+    PackageManifest, PackageMetadata, PackagePublishPlan, PackageSourceAudit, build_package,
+    package_build_schema_hash, package_manifest_schema_hash, parse_package_manifest,
+    validate_package_manifest,
 };
 
 /// Stable, dependency-free hash used in versioned schema identifiers.

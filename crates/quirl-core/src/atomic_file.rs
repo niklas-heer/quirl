@@ -50,7 +50,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 #[cfg(unix)]
 use nix::{
-    fcntl::{open, OFlag},
+    fcntl::{OFlag, open},
     sys::stat::Mode,
 };
 
@@ -645,20 +645,18 @@ fn validate_regular_metadata(
         )
         .with_help("Pass a real regular source file, not a symlink or special file"));
     }
-    if let Some(expected) = links_expected {
-        if let Some(observed) = hard_link_count(metadata) {
-            if observed == expected {
-                return Ok(());
-            }
-            return Err(ShellError::new(
-                ErrorCode::InvalidArgument,
-                format!("{} has hard-link aliases", path.display()),
-            )
-            .with_context(format!("expected links: {expected}; observed: {observed}"))
-            .with_help(
-                "Format a copied regular file so replacing it cannot split hard-link aliases",
-            ));
+    if let Some(expected) = links_expected
+        && let Some(observed) = hard_link_count(metadata)
+    {
+        if observed == expected {
+            return Ok(());
         }
+        return Err(ShellError::new(
+            ErrorCode::InvalidArgument,
+            format!("{} has hard-link aliases", path.display()),
+        )
+        .with_context(format!("expected links: {expected}; observed: {observed}"))
+        .with_help("Format a copied regular file so replacing it cannot split hard-link aliases"));
     }
     Ok(())
 }
@@ -960,11 +958,13 @@ mod tests {
             .unwrap_err();
 
             assert_eq!(error.code, ErrorCode::Io, "stage: {failed_stage:?}");
-            assert!(error
-                .details
-                .context
-                .iter()
-                .any(|context| context.contains("injected transaction failure")));
+            assert!(
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|context| context.contains("injected transaction failure"))
+            );
             if matches!(
                 failed_stage,
                 TransactionStage::CandidateRenamed | TransactionStage::ParentSynced
@@ -982,11 +982,13 @@ mod tests {
             } else {
                 assert_eq!(fs::read(&source).unwrap(), b"original bytes\n");
                 assert!(fs::read_dir(&directory.0).unwrap().count() >= 2);
-                assert!(error
-                    .details
-                    .context
-                    .iter()
-                    .any(|context| context.contains("failure cleanup preserved")));
+                assert!(
+                    error
+                        .details
+                        .context
+                        .iter()
+                        .any(|context| context.contains("failure cleanup preserved"))
+                );
             }
         }
     }
@@ -1047,11 +1049,13 @@ mod tests {
             .find(|path| path != &source && path != &moved)
             .unwrap();
         assert_eq!(fs::read(replacement).unwrap(), b"foreign");
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("failure cleanup preserved temporary")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("failure cleanup preserved temporary"))
+        );
     }
 
     #[cfg(unix)]
@@ -1081,11 +1085,13 @@ mod tests {
         );
         assert!(moved_owned.exists());
         assert_eq!(error.message, "injected primary failure");
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("failure cleanup preserved temporary")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("failure cleanup preserved temporary"))
+        );
     }
 
     #[cfg(unix)]

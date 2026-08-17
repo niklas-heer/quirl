@@ -1,6 +1,6 @@
 use clap::{Args, ValueEnum};
 use quirl_catalog::Catalog;
-use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
+use quirl_core::{ErrorCode, ShellError, escape_json_terminal_controls, escape_terminal_controls};
 use quirl_picker::{ItemKind, PickItem, Picker};
 use std::{
     fs,

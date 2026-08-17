@@ -1,7 +1,7 @@
 //! Bounded immutable runtime snapshots composed into the interactive frame.
 
 use crate::{LiveBuffer, LiveSample, PanelModel};
-use quirl_core::{escape_terminal_line, ErrorCode, ShellError, StructuredValue};
+use quirl_core::{ErrorCode, ShellError, StructuredValue, escape_terminal_line};
 use std::collections::VecDeque;
 
 /// Maximum extension panels retained by the rich surface.
@@ -210,13 +210,13 @@ impl RuntimeSurfaceState {
     }
 
     pub(crate) fn catalog_admitted(&mut self) {
-        if let Some(provider) = self.activity_provider.as_mut() {
-            if let Err(error) = provider.catalog_admitted() {
-                self.notice = Some(truncate_bytes(
-                    &escape_terminal_line(&error.message),
-                    ACTIVITY_MESSAGE_BYTES_MAX,
-                ));
-            }
+        if let Some(provider) = self.activity_provider.as_mut()
+            && let Err(error) = provider.catalog_admitted()
+        {
+            self.notice = Some(truncate_bytes(
+                &escape_terminal_line(&error.message),
+                ACTIVITY_MESSAGE_BYTES_MAX,
+            ));
         }
     }
 
@@ -771,9 +771,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["fg 7", "fg 8", "bg 8"]
         );
-        assert!(jobs
-            .iter()
-            .all(|item| item.kind == super::super::completion::CompletionKind::Job));
+        assert!(
+            jobs.iter()
+                .all(|item| item.kind == super::super::completion::CompletionKind::Job)
+        );
         let data = state.data_items(0);
         assert_eq!(data[0].value, "42");
         assert_eq!(data[0].kind, super::super::completion::CompletionKind::Data);

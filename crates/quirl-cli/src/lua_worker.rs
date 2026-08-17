@@ -5,7 +5,7 @@
 //! compact JSON behind a fixed-width length prefix; both peers reject unknown
 //! fields and over-limit payloads before allocation.
 
-use crate::bounded_file::{read_regular_file, ReadFileOptions};
+use crate::bounded_file::{ReadFileOptions, read_regular_file};
 use quirl_core::{
     CommandOutcome, ContributionKind, ErrorCode, ExecutionCancellation, ExecutionCleanupState,
     ExecutionEffects, ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget,
@@ -13,13 +13,13 @@ use quirl_core::{
     ProcessHost, ProcessRequest, ShellError,
 };
 use quirl_lua::{
-    EventHandlerReport, LuaPolicy, LuaRunnerContext, LuaRuntime, PluginRegistrations, QuirlConfig,
-    MAX_LUA_SOURCE_BYTES,
+    EventHandlerReport, LuaPolicy, LuaRunnerContext, LuaRuntime, MAX_LUA_SOURCE_BYTES,
+    PluginRegistrations, QuirlConfig,
 };
 use quirl_process::{
-    isolated_process_host, ContainedChild, DEFAULT_CAPTURE_BYTES, NATIVE_COMMAND_BYTES_MAX,
+    ContainedChild, DEFAULT_CAPTURE_BYTES, NATIVE_COMMAND_BYTES_MAX, isolated_process_host,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -27,9 +27,9 @@ use std::{
     path::Path,
     process::{ChildStdin, Command, Stdio},
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError},
-        Arc, Mutex,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -49,8 +49,7 @@ const POLICY_WALL_TIME_MS_MAX: u64 = 60_000;
 const ERROR_ITEMS_MAX: usize = 64;
 const ERROR_TEXT_BYTES_MAX: usize = 256 * 1024;
 
-pub(crate) const LUA_WORKER_PROTOCOL_DESCRIPTOR: &str =
-    "quirl.lua-worker@1{frame:u32be-length<=5242880+json;request:{deny_unknown,version=1,id:u64,operation};response:{deny_unknown,version=1,id:u64,ok:bool,result:any,error?:ShellError{labels.start/end:u32}};host-call:{deny_unknown,request_id:u64,call_id:u32,command<=1048576,deadline_ms:u64,max_output_bytes<=1048576};event.output.bytes:u64;context.capture.max_bytes_per_stream:u64;test-count:u64;policy:{memory_bytes:1..=67108864,instructions:1..=100000000,wall_time_ms:1..=60000};host-calls-per-request<=16;timeout|cancel|protocol-failure:kill-tree+reap+poison;stdio:stdin+stderr-protocol,stdout=null,terminal:none}";
+pub(crate) const LUA_WORKER_PROTOCOL_DESCRIPTOR: &str = "quirl.lua-worker@1{frame:u32be-length<=5242880+json;request:{deny_unknown,version=1,id:u64,operation};response:{deny_unknown,version=1,id:u64,ok:bool,result:any,error?:ShellError{labels.start/end:u32}};host-call:{deny_unknown,request_id:u64,call_id:u32,command<=1048576,deadline_ms:u64,max_output_bytes<=1048576};event.output.bytes:u64;context.capture.max_bytes_per_stream:u64;test-count:u64;policy:{memory_bytes:1..=67108864,instructions:1..=100000000,wall_time_ms:1..=60000};host-calls-per-request<=16;timeout|cancel|protocol-failure:kill-tree+reap+poison;stdio:stdin+stderr-protocol,stdout=null,terminal:none}";
 #[cfg(test)]
 const REQUEST_FIXTURE_V1: &str = r#"{"kind":"request","request":{"version":1,"id":7,"operation":{"operation":"eval","source":"return 42"}}}"#;
 #[cfg(test)]

@@ -1,8 +1,8 @@
 [package]
 name = "quirl-footprint-spike"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.88"
+edition = "2024"
+rust-version = "1.97.1"
 publish = false
 
 [features]
@@ -29,3 +29,4 @@ strip = "symbols"
 
 # Each engine is built separately so Cargo never unifies incompatible VM features.
 [workspace]
+resolver = "3"

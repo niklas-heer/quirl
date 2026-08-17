@@ -1,12 +1,12 @@
 use crate::intelligence;
 use clap::{ArgAction, Subcommand, ValueEnum};
 use quirl_catalog::{
-    import_bash, import_fish, import_help, import_man, import_zsh, Catalog, CommandSpec,
-    Confidence, Effect, ImportDiagnostic, ImportReport, IoContract, Provenance, ProvenanceInfo,
+    Catalog, CommandSpec, Confidence, Effect, ImportDiagnostic, ImportReport, IoContract,
+    Provenance, ProvenanceInfo, import_bash, import_fish, import_help, import_man, import_zsh,
 };
 use quirl_core::{
-    escape_json_terminal_controls, escape_terminal_controls, replace_file_atomically,
-    AtomicReplaceOptions, ErrorCode, ShellError,
+    AtomicReplaceOptions, ErrorCode, ShellError, escape_json_terminal_controls,
+    escape_terminal_controls, replace_file_atomically,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,8 +17,8 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -2703,8 +2703,8 @@ mod tests {
     use clap::Parser;
     use quirl_catalog::Provenance;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
     };
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -2819,14 +2819,18 @@ mod tests {
         .unwrap();
         assert!(diagnostics.is_empty());
         let explanation = catalog.explain("demo").unwrap();
-        assert!(explanation
-            .facts
-            .iter()
-            .any(|fact| fact.provenance.source == Provenance::Fish));
-        assert!(explanation
-            .facts
-            .iter()
-            .any(|fact| fact.provenance.source == Provenance::Bash));
+        assert!(
+            explanation
+                .facts
+                .iter()
+                .any(|fact| fact.provenance.source == Provenance::Fish)
+        );
+        assert!(
+            explanation
+                .facts
+                .iter()
+                .any(|fact| fact.provenance.source == Provenance::Bash)
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2854,12 +2858,14 @@ mod tests {
             ("serve", Provenance::Help),
             ("inspect", Provenance::Man),
         ] {
-            assert!(catalog
-                .explain(command)
-                .unwrap()
-                .facts
-                .iter()
-                .any(|fact| fact.provenance.source == provenance));
+            assert!(
+                catalog
+                    .explain(command)
+                    .unwrap()
+                    .facts
+                    .iter()
+                    .any(|fact| fact.provenance.source == provenance)
+            );
         }
         fs::remove_dir_all(directory).unwrap();
     }
@@ -2920,9 +2926,11 @@ mod tests {
 
         write_executable(&config.path_roots[0].join("after-fallback"));
         assert!(refresh(&config).unwrap());
-        assert!(load_catalog_at(&config.index_path)
-            .find("after-fallback")
-            .is_some());
+        assert!(
+            load_catalog_at(&config.index_path)
+                .find("after-fallback")
+                .is_some()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2945,9 +2953,11 @@ mod tests {
         .unwrap();
         wait_for_observation(&observed.published);
 
-        assert!(load_catalog_at(&config.index_path)
-            .find("idle-background-tool")
-            .is_some());
+        assert!(
+            load_catalog_at(&config.index_path)
+                .find("idle-background-tool")
+                .is_some()
+        );
         assert_eq!(observed.started.load(Ordering::Acquire), 1);
         drop(refresh);
         fs::remove_dir_all(directory).unwrap();
@@ -2990,34 +3000,40 @@ mod tests {
         let cancelled = AtomicBool::new(false);
         let requested = AtomicU64::new(1);
 
-        assert!(!publish_embeddings_if_current(
-            &config.index_path,
-            &old_source,
-            &old_embeddings,
-            &cancelled,
-            &requested,
-            1,
-        )
-        .unwrap());
+        assert!(
+            !publish_embeddings_if_current(
+                &config.index_path,
+                &old_source,
+                &old_embeddings,
+                &cancelled,
+                &requested,
+                1,
+            )
+            .unwrap()
+        );
 
         let latest_source = read_index(&config.index_path).unwrap();
         let latest_embeddings =
             intelligence::mark_embeddings_current_for_test(&latest_source, &config.index_path)
                 .unwrap();
-        assert!(publish_embeddings_if_current(
-            &config.index_path,
-            &latest_source,
-            &latest_embeddings,
-            &cancelled,
-            &requested,
-            1,
-        )
-        .unwrap());
-        let published = read_index(&config.index_path).unwrap();
-        assert!(decode_catalog(&published, &config.index_path)
+        assert!(
+            publish_embeddings_if_current(
+                &config.index_path,
+                &latest_source,
+                &latest_embeddings,
+                &cancelled,
+                &requested,
+                1,
+            )
             .unwrap()
-            .find("newest-generation-tool")
-            .is_some());
+        );
+        let published = read_index(&config.index_path).unwrap();
+        assert!(
+            decode_catalog(&published, &config.index_path)
+                .unwrap()
+                .find("newest-generation-tool")
+                .is_some()
+        );
         assert!(intelligence::embeddings_are_current(&published, &config.index_path).unwrap());
         fs::remove_dir_all(directory).unwrap();
     }
@@ -3028,11 +3044,13 @@ mod tests {
         let mut config = discovery_config(&directory);
         config.path_roots = vec![directory.clone(); INDEX_ROOTS_MAX + 1];
 
-        assert!(initialize_interactive_catalog_with_deadline(
-            &config,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .unwrap());
+        assert!(
+            initialize_interactive_catalog_with_deadline(
+                &config,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap()
+        );
 
         let bytes = read_index(&config.index_path).unwrap();
         let (catalog, state) = intelligence::decode_database(&bytes, &config.index_path).unwrap();
@@ -3135,9 +3153,11 @@ mod tests {
 
         assert!(refresh(&config).unwrap());
 
-        assert!(load_catalog_at(&config.index_path)
-            .find("recover")
-            .is_some());
+        assert!(
+            load_catalog_at(&config.index_path)
+                .find("recover")
+                .is_some()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3162,9 +3182,11 @@ mod tests {
             .collect();
 
         assert!(results.iter().any(Result::is_ok));
-        assert!(load_catalog_at(&config.index_path)
-            .find("parallel")
-            .is_some());
+        assert!(
+            load_catalog_at(&config.index_path)
+                .find("parallel")
+                .is_some()
+        );
         let bytes = read_index(&config.index_path).unwrap();
         let (_, state_json) = intelligence::decode_database(&bytes, &config.index_path).unwrap();
         let state: DiscoveryState = serde_json::from_str(&state_json.unwrap()).unwrap();
@@ -3284,9 +3306,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(option_results
-            .iter()
-            .any(|result| result.command == "cp" && result.target.contains("-p")));
+        assert!(
+            option_results
+                .iter()
+                .any(|result| result.command == "cp" && result.target.contains("-p"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3331,17 +3355,23 @@ mod tests {
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
-        assert!(messages
-            .iter()
-            .any(|message| message.contains("compressed")));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("compressed"))
+        );
         assert!(messages.iter().any(|message| message.contains("oversized")));
-        assert!(messages
-            .iter()
-            .any(|message| message.contains("unresolved")));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("unresolved"))
+        );
         assert!(messages.iter().any(|message| message.contains("UTF-8")));
-        assert!(messages
-            .iter()
-            .any(|message| message.contains("during fingerprinting")));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("during fingerprinting"))
+        );
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
@@ -3394,9 +3424,11 @@ mod tests {
         refresh(&config).unwrap();
 
         assert!(!marker.exists());
-        assert!(load_catalog_at(&config.index_path)
-            .find("safe-command")
-            .is_some());
+        assert!(
+            load_catalog_at(&config.index_path)
+                .find("safe-command")
+                .is_some()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3414,9 +3446,11 @@ mod tests {
         config.index_path = linked.join("catalog.json");
 
         assert!(refresh(&config).is_err());
-        assert!(load_catalog_at(&config.index_path)
-            .find("quirl run")
-            .is_some());
+        assert!(
+            load_catalog_at(&config.index_path)
+                .find("quirl run")
+                .is_some()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3528,11 +3562,13 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read(replacement).unwrap(), b"foreign");
         assert!(moved.exists());
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("failure cleanup preserved index temporary")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("failure cleanup preserved index temporary"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3621,16 +3657,20 @@ mod tests {
         );
 
         assert_eq!(error.message, "originating index failure");
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("injected primary failure")));
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("failure cleanup preserved index temporary")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("injected primary failure"))
+        );
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("failure cleanup preserved index temporary"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3702,15 +3742,17 @@ mod tests {
             merged.find("quirl run").unwrap().summary,
             "stale cached summary"
         );
-        assert!(merged
-            .find("quirl run")
-            .unwrap()
-            .options
-            .iter()
-            .all(|argument| !argument
-                .names
+        assert!(
+            merged
+                .find("quirl run")
+                .unwrap()
+                .options
                 .iter()
-                .any(|name| name == "--removed-stale-flag")));
+                .all(|argument| !argument
+                    .names
+                    .iter()
+                    .any(|name| name == "--removed-stale-flag"))
+        );
     }
 
     #[test]

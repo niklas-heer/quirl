@@ -7,9 +7,9 @@
 
 use quirl_catalog::{Catalog, CommandSpec};
 use quirl_core::{ErrorCode, ShellError};
-use quirl_lua::{LuaRuntime, HOST_API};
+use quirl_lua::{HOST_API, LuaRuntime};
 use quirl_syntax::check_script;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     io::{BufRead, ErrorKind, Read, Write},
@@ -553,16 +553,16 @@ fn quirl_completions(catalog: &Catalog, text: &str, offset: usize, prefix: &str)
         }
         if command_starts_line(command, line) {
             for option in &command.options {
-                if let Some(name) = option.names.first() {
-                    if prefix.is_empty() || name.to_ascii_lowercase().starts_with(&prefix) {
-                        items.push(json!({
-                            "label": name,
-                            "kind": 5,
-                            "detail": option.value_type,
-                            "documentation": {"kind": "markdown", "value": option.documentation},
-                            "insertText": name,
-                        }));
-                    }
+                if let Some(name) = option.names.first()
+                    && (prefix.is_empty() || name.to_ascii_lowercase().starts_with(&prefix))
+                {
+                    items.push(json!({
+                        "label": name,
+                        "kind": 5,
+                        "detail": option.value_type,
+                        "documentation": {"kind": "markdown", "value": option.documentation},
+                        "insertText": name,
+                    }));
                 }
             }
         }
@@ -1174,10 +1174,12 @@ mod tests {
             "return os.execute('touch never')",
         );
         assert_eq!(messages[0]["method"], "textDocument/publishDiagnostics");
-        assert!(!messages[0]["params"]["diagnostics"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(
+            !messages[0]["params"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1189,16 +1191,20 @@ mod tests {
             "position": {"line": 0, "character": 10}
         });
         let completion = request(&mut service, 1, "textDocument/completion", params.clone());
-        assert!(completion["result"]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["label"] == "quirl.cwd"));
+        assert!(
+            completion["result"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["label"] == "quirl.cwd")
+        );
         let signature = request(&mut service, 2, "textDocument/signatureHelp", params);
-        assert!(signature["result"]["signatures"][0]["label"]
-            .as_str()
-            .unwrap()
-            .starts_with("quirl.cwd("));
+        assert!(
+            signature["result"]["signatures"][0]["label"]
+                .as_str()
+                .unwrap()
+                .starts_with("quirl.cwd(")
+        );
 
         let hover = request(
             &mut service,
@@ -1209,10 +1215,12 @@ mod tests {
                 "position": {"line": 0, "character": 3}
             }),
         );
-        assert!(hover["result"]["contents"]["value"]
-            .as_str()
-            .unwrap()
-            .contains("quirl.cwd("));
+        assert!(
+            hover["result"]["contents"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("quirl.cwd(")
+        );
     }
 
     #[test]
@@ -1232,11 +1240,13 @@ mod tests {
                 "position": {"line": 0, "character": 9}
             }),
         );
-        assert!(completion["result"]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["label"] == "quirl check"));
+        assert!(
+            completion["result"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["label"] == "quirl check")
+        );
     }
 
     #[test]
@@ -1277,11 +1287,13 @@ mod tests {
                 "textDocument/completion",
                 json!({"textDocument": {"uri": uri}, "position": {"line": 0, "character": 9}}),
             );
-            assert!(completion["result"]["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| item["label"] == "quirl check"));
+            assert!(
+                completion["result"]["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["label"] == "quirl check")
+            );
         }
     }
 
@@ -1294,10 +1306,12 @@ mod tests {
             "quirl",
             "false || echo recovered",
         );
-        assert!(messages[0]["params"]["diagnostics"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(
+            messages[0]["params"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1357,20 +1371,26 @@ mod tests {
             .iter()
             .find(|completion| completion["label"] == "demo run")
             .unwrap();
-        assert!(completion["documentation"]["value"]
-            .as_str()
-            .unwrap()
-            .contains("Output: `Values<String>`"));
+        assert!(
+            completion["documentation"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("Output: `Values<String>`")
+        );
         let hover = quirl_hover(&service.catalog, "demo run", 4).unwrap();
-        assert!(hover["contents"]["value"]
-            .as_str()
-            .unwrap()
-            .contains("Input: `Path`"));
+        assert!(
+            hover["contents"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("Input: `Path`")
+        );
         let signature = quirl_signature(&service.catalog, "demo run", 8).unwrap();
-        assert!(signature["signatures"][0]["documentation"]["value"]
-            .as_str()
-            .unwrap()
-            .contains("Output: `Values<String>`"));
+        assert!(
+            signature["signatures"][0]["documentation"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("Output: `Values<String>`")
+        );
     }
 
     #[test]
@@ -1712,11 +1732,13 @@ mod tests {
         let partial = b"Content-Length: 5\r\n\r\n{}";
         let partial_error = read_message(&mut BufReader::new(Cursor::new(partial))).unwrap_err();
         assert_eq!(partial_error.code, ErrorCode::Validation);
-        assert!(partial_error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("received_bytes")));
+        assert!(
+            partial_error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("received_bytes"))
+        );
 
         let partial_headers = b"X-Test: incomplete\r\n";
         let header_error =
@@ -1741,11 +1763,13 @@ mod tests {
         let truncated = &truncated[..truncated.len() - 1];
         let error = read_message(&mut BufReader::new(Cursor::new(truncated))).unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("received_bytes")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("received_bytes"))
+        );
     }
 
     #[test]

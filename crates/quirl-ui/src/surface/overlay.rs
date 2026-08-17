@@ -3,8 +3,8 @@ use super::{
     editor::PickerKind,
 };
 use crate::{
-    InteractiveHistoryEntry, PickerItem, PickerItemKind, PickerRanker, PICKER_QUERY_BYTES_MAX,
-    PICKER_RANKING_TEXT_BYTES_MAX,
+    InteractiveHistoryEntry, PICKER_QUERY_BYTES_MAX, PICKER_RANKING_TEXT_BYTES_MAX, PickerItem,
+    PickerItemKind, PickerRanker,
 };
 use quirl_catalog::Catalog;
 use std::{fs, path::Path, sync::Arc};
@@ -396,9 +396,11 @@ mod tests {
             .collect();
         let visible = overlay.open(items, "bounded", false);
         assert_eq!(visible.len(), OVERLAY_RESULTS_MAX);
-        assert!(overlay
-            .insert_query(&"x".repeat(PICKER_QUERY_BYTES_MAX + 1))
-            .is_none());
+        assert!(
+            overlay
+                .insert_query(&"x".repeat(PICKER_QUERY_BYTES_MAX + 1))
+                .is_none()
+        );
         assert_eq!(overlay.query(), Some(""));
     }
 

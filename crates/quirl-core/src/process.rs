@@ -4,7 +4,7 @@ use std::{
     cmp::Ordering,
     fs,
     path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, UNIX_EPOCH},
 };
 

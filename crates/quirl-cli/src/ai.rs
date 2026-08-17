@@ -2,7 +2,7 @@
 
 use crate::{index, intelligence};
 use clap::{Subcommand, ValueEnum};
-use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
+use quirl_core::{ErrorCode, ShellError, escape_json_terminal_controls, escape_terminal_controls};
 use serde::Serialize;
 use std::{fs, path::PathBuf};
 

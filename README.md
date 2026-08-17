@@ -9,7 +9,7 @@
   folded into a single fast Rust binary.
 
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-  [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](rust-toolchain.toml)
+  [![Rust](https://img.shields.io/badge/rust-1.97.1%2B-orange.svg)](rust-toolchain.toml)
   [![Status](https://img.shields.io/badge/status-0.1_Unix_release_candidate-blue.svg)](#status)
 </div>
 
@@ -55,7 +55,7 @@ into typed structures and validated before the rest of the shell can use them.
 
 ## Quick start
 
-The repository pins Rust 1.88.0 through `rust-toolchain.toml`. No system Lua
+The repository pins Rust 1.97.1 through `rust-toolchain.toml`. No system Lua
 installation is required.
 
 ```console

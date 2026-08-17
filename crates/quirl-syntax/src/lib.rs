@@ -562,9 +562,10 @@ fn reject_reserved_dialect_forms(tokens: &[Token]) -> Result<(), CommandSyntaxEr
     let mut command_position = true;
     let mut redirect_target = false;
     for token in tokens {
-        if let TokenKind::Word(word) = &token.kind {
-            if contains_unquoted_brace_expansion(word) {
-                return Err(CommandSyntaxError {
+        if let TokenKind::Word(word) = &token.kind
+            && contains_unquoted_brace_expansion(word)
+        {
+            return Err(CommandSyntaxError {
                     message: format!(
                         "unsupported C1 dialect control form `{}`",
                         word.text()
@@ -573,7 +574,6 @@ fn reject_reserved_dialect_forms(tokens: &[Token]) -> Result<(), CommandSyntaxEr
                     end: token.end,
                     help: "Run it as `bash { ... }` or `zsh { ... }`; the bounded reference island preserves the selected dialect's control semantics".to_owned(),
                 });
-            }
         }
         if redirect_target {
             redirect_target = false;
@@ -794,13 +794,11 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                         if substitution_openings
                             .last()
                             .is_some_and(|opening| opening.depth == substitution_depth)
+                            && let Some(opening) = substitution_openings.pop()
+                            && let Some((active, start)) = opening.suspended_quote
                         {
-                            if let Some(opening) = substitution_openings.pop() {
-                                if let Some((active, start)) = opening.suspended_quote {
-                                    substitution_quote = Some(active);
-                                    substitution_quote_open = Some(start);
-                                }
-                            }
+                            substitution_quote = Some(active);
+                            substitution_quote_open = Some(start);
                         }
                         substitution_depth = substitution_depth.saturating_sub(1);
                     }
@@ -1256,10 +1254,10 @@ pub fn classify(mode: Mode, input: &str) -> InteractiveLine<'_> {
     if input == "mode toggle" {
         return InteractiveLine::ToggleMode;
     }
-    if let Some(value) = input.strip_prefix("mode ") {
-        if let Ok(mode) = value.trim().parse() {
-            return InteractiveLine::ChangeMode(mode);
-        }
+    if let Some(value) = input.strip_prefix("mode ")
+        && let Ok(mode) = value.trim().parse()
+    {
+        return InteractiveLine::ChangeMode(mode);
     }
     if input == "help" {
         return InteractiveLine::Help(None);
@@ -1605,9 +1603,11 @@ mod tests {
             "2>&1 if true; then echo yes; fi",
         ] {
             let error = parse_command_list(source).unwrap_err();
-            assert!(error
-                .message
-                .starts_with("unsupported C1 dialect control form"));
+            assert!(
+                error
+                    .message
+                    .starts_with("unsupported C1 dialect control form")
+            );
             assert!(error.help.contains("bash { ... }"));
             assert!(error.help.contains("zsh { ... }"));
         }
@@ -1616,10 +1616,12 @@ mod tests {
     #[test]
     fn double_quoted_substitution_stays_double_quoted_and_invalid_descriptors_fail_closed() {
         let graph = parse_command_list("printf '%s' \"$(printf '*.qrl')\"").unwrap();
-        assert!(graph.pipelines[0].commands[0].word_ir[2]
-            .parts
-            .iter()
-            .all(|part| part.quoting == Quoting::Double));
+        assert!(
+            graph.pipelines[0].commands[0].word_ir[2]
+                .parts
+                .iter()
+                .all(|part| part.quoting == Quoting::Double)
+        );
         for source in ["echo nope 3> output", "echo nope 1>&2", "cat 0<&1"] {
             let error = parse_command_list(source).unwrap_err();
             assert!(error.help.contains("bash { ... }"));
@@ -1706,9 +1708,11 @@ mod tests {
         let plus_one = format!("printf $({}", &exact["printf ".len()..]);
         let error = parse_command_list(&plus_one).unwrap_err();
         assert!(error.message.contains("nesting"));
-        assert!(error
-            .help
-            .contains(&MAX_COMMAND_SUBSTITUTION_DEPTH.to_string()));
+        assert!(
+            error
+                .help
+                .contains(&MAX_COMMAND_SUBSTITUTION_DEPTH.to_string())
+        );
     }
 
     #[test]

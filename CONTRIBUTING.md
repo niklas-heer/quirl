@@ -22,7 +22,7 @@ not a release gate. The exact boundary is recorded in
 ## Set up the workspace
 
 Install [Rustup](https://rustup.rs). The repository's `rust-toolchain.toml`
-selects Rust 1.88; Cargo builds the repository-local `xtask`, and no separate
+selects Rust 1.97.1; Cargo builds the repository-local `xtask`, and no separate
 task runner or system Lua installation is needed. On Unix, that Rust-owned
 `xtask` also runs the bounded real-PTY harness in `xtask/src/pty.rs` and
 `xtask/src/rich_pty.rs`; no separate scripting-language toolchain is required.

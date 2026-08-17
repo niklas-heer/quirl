@@ -8,14 +8,14 @@ mod runtime;
 mod statusbar;
 mod transcript;
 
-pub use degrade::{select_surface, SurfaceKind};
+pub use degrade::{SurfaceKind, select_surface};
 pub use runtime::{
+    ACTIVITY_MESSAGE_BYTES_MAX, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX,
     InteractiveActivityProvider, InteractiveActivitySnapshot, InteractiveDataSnapshot,
     InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch,
     InteractivePanelProvider, InteractivePanelSnapshot, InteractiveRuntimeSnapshot,
-    ACTIVITY_MESSAGE_BYTES_MAX, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, JOB_ACTION_ITEMS_MAX,
-    JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
-    PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+    JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX,
+    PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
 };
 
 /// One-shot rich-session loader that returns the complete immutable catalog.
@@ -43,13 +43,13 @@ use self::{
     editor::{EditAction, EditorState},
     frame::FrameModel,
     highlight::InputAnalyzer,
-    overlay::{contextual_help_query, PickerLayout, PickerOverlay},
+    overlay::{PickerLayout, PickerOverlay, contextual_help_query},
     runtime::RuntimeSurfaceState,
     transcript::{TextPosition, Transcript, TranscriptLimits},
 };
 use super::{
-    read_history, ExtensionCompleter, PickerRanker, QuirlPrompt, MAX_HISTORY_ENCODED_ENTRY_BYTES,
-    MAX_HISTORY_ENTRY_BYTES, MAX_HISTORY_RETAINED_BYTES,
+    ExtensionCompleter, MAX_HISTORY_ENCODED_ENTRY_BYTES, MAX_HISTORY_ENTRY_BYTES,
+    MAX_HISTORY_RETAINED_BYTES, PickerRanker, QuirlPrompt, read_history,
 };
 use crate::theme::Theme;
 use crossterm::{
@@ -64,11 +64,11 @@ use crossterm::{
 };
 use quirl_catalog::Catalog;
 use quirl_core::{
-    replace_file_atomically, AtomicReplaceOptions, ErrorCode, OutputStream, ShellError,
+    AtomicReplaceOptions, ErrorCode, OutputStream, ShellError, replace_file_atomically,
 };
 use quirl_lua::QuirlConfig;
-use quirl_syntax::{parse_command_list, Mode};
-use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal, TerminalOptions, Viewport};
+use quirl_syntax::{Mode, parse_command_list};
+use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
@@ -1332,13 +1332,14 @@ impl RichSurface {
                 .min(area.height.saturating_sub(1)),
         );
         let maximum_start = self.transcript.line_count().saturating_sub(visible_rows);
-        let start = if track_max == 0 {
-            0
-        } else {
-            track_position
-                .saturating_mul(maximum_start)
-                .saturating_add(track_max / 2)
-                / track_max
+        let start = match track_max {
+            0 => 0,
+            track_length => {
+                track_position
+                    .saturating_mul(maximum_start)
+                    .saturating_add(track_length / 2)
+                    / track_length
+            }
         };
         self.transcript.scroll_to(start, visible_rows);
     }
@@ -1817,13 +1818,13 @@ impl SurfaceTerminal {
 
     fn release(&mut self) -> Result<(), ShellError> {
         let mut failure = None;
-        if let Some(mut terminal) = self.terminal.take() {
-            if let Err(error) = terminal.show_cursor() {
-                retain_error(
-                    &mut failure,
-                    terminal_error("restore the terminal cursor")(error),
-                );
-            }
+        if let Some(mut terminal) = self.terminal.take()
+            && let Err(error) = terminal.show_cursor()
+        {
+            retain_error(
+                &mut failure,
+                terminal_error("restore the terminal cursor")(error),
+            );
         }
         if let Err(error) = execute!(
             io::stderr(),
@@ -2422,11 +2423,13 @@ mod tests {
             surface.completion.poll(editor.buffer(), editor.cursor());
             std::thread::yield_now();
         }
-        assert!(surface
-            .completion
-            .items
-            .iter()
-            .any(|item| item.value == "--all" && item.kind == completion::CompletionKind::Flag));
+        assert!(
+            surface
+                .completion
+                .items
+                .iter()
+                .any(|item| item.value == "--all" && item.kind == completion::CompletionKind::Flag)
+        );
     }
 
     #[test]

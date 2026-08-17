@@ -1,8 +1,8 @@
 [package]
 name = "quirl-typescript-quickjs-spike"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.88"
+edition = "2024"
+rust-version = "1.97.1"
 publish = false
 
 [dependencies]
@@ -15,3 +15,4 @@ lto = "thin"
 strip = "symbols"
 
 [workspace]
+resolver = "3"

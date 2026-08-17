@@ -5,17 +5,17 @@ mod surface;
 mod theme;
 
 pub use panel::{
-    directory_panel, process_panel, LiveBuffer, LiveSample, LiveSnapshot, PanelModel,
-    ProcessPanelRow,
+    LiveBuffer, LiveSample, LiveSnapshot, PanelModel, ProcessPanelRow, directory_panel,
+    process_panel,
 };
 pub use surface::{
-    select_surface, set_product_identity, CatalogLoader, InteractiveActivityProvider,
-    InteractiveActivitySnapshot, InteractiveDataSnapshot, InteractiveHistoryEntry,
-    InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch,
-    InteractivePanelProvider, InteractivePanelSnapshot, InteractiveRuntimeSnapshot,
-    InteractiveSignal, RichSurface, SurfaceKind, ACTIVITY_MESSAGE_BYTES_MAX, DATA_ITEMS_MAX,
-    DATA_RETAINED_BYTES_MAX, JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX,
-    PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+    ACTIVITY_MESSAGE_BYTES_MAX, CatalogLoader, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX,
+    InteractiveActivityProvider, InteractiveActivitySnapshot, InteractiveDataSnapshot,
+    InteractiveHistoryEntry, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
+    InteractivePanelBatch, InteractivePanelProvider, InteractivePanelSnapshot,
+    InteractiveRuntimeSnapshot, InteractiveSignal, JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX,
+    PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX,
+    PANEL_ROWS_MAX, RichSurface, SurfaceKind, select_surface, set_product_identity,
 };
 
 use crossterm::{
@@ -24,22 +24,22 @@ use crossterm::{
 };
 use nu_ansi_term::{Color, Style};
 use quirl_catalog::{
-    Catalog, CommandSpec, CompletionCancellation, CompletionOutcome, CompletionRequest,
-    CompletionResponse, COMPLETION_PROTOCOL_VERSION, MAX_COMPLETION_DEADLINE_MS,
-    MAX_COMPLETION_QUERY_BYTES, MAX_COMPLETION_RESULTS,
+    COMPLETION_PROTOCOL_VERSION, Catalog, CommandSpec, CompletionCancellation, CompletionOutcome,
+    CompletionRequest, CompletionResponse, MAX_COMPLETION_DEADLINE_MS, MAX_COMPLETION_QUERY_BYTES,
+    MAX_COMPLETION_RESULTS,
 };
 use quirl_core::{
-    escape_terminal_controls, escape_terminal_line, ErrorCode, ShellError, VersionPolicy,
+    ErrorCode, ShellError, VersionPolicy, escape_terminal_controls, escape_terminal_line,
 };
 use quirl_lua::QuirlConfig;
 use quirl_syntax::{HighlightKind, Mode};
 use reedline::{
-    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
     Completer, CursorConfig, DefaultHinter, DefaultValidator, DescriptionMenu, DescriptionMode,
     EditCommand, EditMode, Emacs, FileBackedHistory, Helix, Highlighter, History, HistoryItem,
     HistoryItemId, HistorySessionId, IdeMenu, InputMode, KeyCode, KeyModifiers, MenuBuilder,
     OutputMode, Prompt, PromptEditMode, PromptHistorySearch, PromptViMode, Reedline, ReedlineEvent,
     ReedlineMenu, ReedlineRawEvent, SearchQuery, Span, StyledText, Suggestion, Vi,
+    default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
 };
 #[cfg(test)]
 use std::sync::mpsc;
@@ -52,8 +52,8 @@ use std::{
     io::{self, IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
         Arc, Condvar, Mutex,
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -340,10 +340,10 @@ impl PickerRanker for StablePickerRanker {
                 let mut matched = Vec::new();
                 for wanted in query.chars() {
                     let (byte, _) = search.find(|(_, character)| *character == wanted)?;
-                    if let Some(character_index) = searchable.label_index_at(byte) {
-                        if matched.last().copied() != Some(character_index) {
-                            matched.push(character_index);
-                        }
+                    if let Some(character_index) = searchable.label_index_at(byte)
+                        && matched.last().copied() != Some(character_index)
+                    {
+                        matched.push(character_index);
                     }
                 }
                 Some(PickerMatch {
@@ -762,10 +762,10 @@ impl EditMode for QuirlEditMode {
         if is_ctrl_d(&event) {
             return ReedlineEvent::CtrlD;
         }
-        if self.needs_basic_edit_fallback {
-            if let Some(event) = basic_edit_fallback(&event) {
-                return event;
-            }
+        if self.needs_basic_edit_fallback
+            && let Some(event) = basic_edit_fallback(&event)
+        {
+            return event;
         }
         if is_history_search(&event) {
             let replace_active =
@@ -1153,33 +1153,35 @@ impl PromptContextScheduler {
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("quirl-prompt-context".to_owned())
-            .spawn(move || loop {
-                let request = {
+            .spawn(move || {
+                loop {
+                    let request = {
+                        let mut state = lock_recover(&worker_shared.state);
+                        while state.pending.is_none() && !state.shutdown {
+                            state = match worker_shared.request_ready.wait(state) {
+                                Ok(state) => state,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                        }
+                        if state.shutdown {
+                            return;
+                        }
+                        let request = state.pending.take();
+                        state.active = request.as_ref().map(|request| request.cwd.clone());
+                        request
+                    };
+                    let Some(request) = request else {
+                        continue;
+                    };
+                    let entry = loader(request.cwd.clone(), request.previous);
                     let mut state = lock_recover(&worker_shared.state);
-                    while state.pending.is_none() && !state.shutdown {
-                        state = match worker_shared.request_ready.wait(state) {
-                            Ok(state) => state,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
+                    if !state.shutdown {
+                        insert_prompt_cache_entry(&mut state, request.cwd, entry);
                     }
-                    if state.shutdown {
-                        return;
-                    }
-                    let request = state.pending.take();
-                    state.active = request.as_ref().map(|request| request.cwd.clone());
-                    request
-                };
-                let Some(request) = request else {
-                    continue;
-                };
-                let entry = loader(request.cwd.clone(), request.previous);
-                let mut state = lock_recover(&worker_shared.state);
-                if !state.shutdown {
-                    insert_prompt_cache_entry(&mut state, request.cwd, entry);
+                    state.active = None;
+                    state.refresh_generation = state.refresh_generation.wrapping_add(1);
+                    worker_shared.refreshed.notify_all();
                 }
-                state.active = None;
-                state.refresh_generation = state.refresh_generation.wrapping_add(1);
-                worker_shared.refreshed.notify_all();
             })
             .ok();
         Self {
@@ -2155,55 +2157,57 @@ impl CompletionWorker {
         let worker_response = Arc::clone(&response);
         let latest_request_id = Arc::new(AtomicU64::new(0));
         let worker_latest = Arc::clone(&latest_request_id);
-        let worker = thread::spawn(move || loop {
-            let request = {
-                let (lock, ready) = &*worker_queue;
-                let mut state = lock_recover(lock);
-                while state.pending.is_none() && !state.shutdown {
-                    state = match ready.wait(state) {
-                        Ok(state) => state,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                }
-                if state.shutdown {
-                    return;
-                }
-                state.pending.take()
-            };
-            let Some(request) = request else {
-                continue;
-            };
-            let request_id = request.request_id;
-            if worker_latest.load(Ordering::Acquire) != request_id {
-                continue;
-            }
-            let started = Instant::now();
-            let mut outcome = if worker_latest.load(Ordering::Acquire) != request_id {
-                CompletionOutcome::Cancelled
-            } else {
-                CompletionOutcome::Ready {
-                    items: catalog
-                        .complete(&request.line, request.cursor)
-                        .into_iter()
-                        .take(request.limit)
-                        .collect(),
-                }
-            };
-            if worker_latest.load(Ordering::Acquire) != request_id {
-                outcome = CompletionOutcome::Cancelled;
-            } else if started.elapsed() >= Duration::from_millis(request.deadline_ms) {
-                outcome = CompletionOutcome::DeadlineExceeded;
-            }
-            if worker_latest.load(Ordering::Acquire) == request_id {
-                let mut slot = lock_recover(&worker_response);
+        let worker = thread::spawn(move || {
+            loop {
+                let request = {
+                    let (lock, ready) = &*worker_queue;
+                    let mut state = lock_recover(lock);
+                    while state.pending.is_none() && !state.shutdown {
+                        state = match ready.wait(state) {
+                            Ok(state) => state,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                    }
+                    if state.shutdown {
+                        return;
+                    }
+                    state.pending.take()
+                };
+                let Some(request) = request else {
+                    continue;
+                };
+                let request_id = request.request_id;
                 if worker_latest.load(Ordering::Acquire) != request_id {
                     continue;
                 }
-                *slot = Some(CompletionResponse {
-                    protocol_version: COMPLETION_PROTOCOL_VERSION,
-                    request_id,
-                    outcome,
-                });
+                let started = Instant::now();
+                let mut outcome = if worker_latest.load(Ordering::Acquire) != request_id {
+                    CompletionOutcome::Cancelled
+                } else {
+                    CompletionOutcome::Ready {
+                        items: catalog
+                            .complete(&request.line, request.cursor)
+                            .into_iter()
+                            .take(request.limit)
+                            .collect(),
+                    }
+                };
+                if worker_latest.load(Ordering::Acquire) != request_id {
+                    outcome = CompletionOutcome::Cancelled;
+                } else if started.elapsed() >= Duration::from_millis(request.deadline_ms) {
+                    outcome = CompletionOutcome::DeadlineExceeded;
+                }
+                if worker_latest.load(Ordering::Acquire) == request_id {
+                    let mut slot = lock_recover(&worker_response);
+                    if worker_latest.load(Ordering::Acquire) != request_id {
+                        continue;
+                    }
+                    *slot = Some(CompletionResponse {
+                        protocol_version: COMPLETION_PROTOCOL_VERSION,
+                        request_id,
+                        outcome,
+                    });
+                }
             }
         });
         Self {
@@ -3149,9 +3153,11 @@ mod tests {
             value: "outside".to_owned(),
             rank_bias: 0,
         });
-        assert!(StablePickerRanker
-            .rank(&items, "unique", PICKER_RESULTS_MAX)
-            .is_empty());
+        assert!(
+            StablePickerRanker
+                .rank(&items, "unique", PICKER_RESULTS_MAX)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3172,16 +3178,20 @@ mod tests {
         let result = completer.complete("git c", 5);
         assert_eq!(result[0].value, "git commit");
         assert!(result[0].description.as_deref().unwrap().contains("Record"));
-        assert!(result[0]
-            .display_override
-            .as_deref()
-            .unwrap()
-            .contains("[command]"));
-        assert!(result[0]
-            .description
-            .as_deref()
-            .unwrap()
-            .contains("source: catalog"));
+        assert!(
+            result[0]
+                .display_override
+                .as_deref()
+                .unwrap()
+                .contains("[command]")
+        );
+        assert!(
+            result[0]
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("source: catalog")
+        );
     }
 
     #[test]
@@ -3200,11 +3210,13 @@ mod tests {
         assert_eq!(suggestion.value, "");
         assert_eq!(suggestion.span, Span::new(line.len(), line.len()));
         assert!(!suggestion.append_whitespace);
-        assert!(suggestion
-            .display_override
-            .as_deref()
-            .unwrap()
-            .contains(&command.signature));
+        assert!(
+            suggestion
+                .display_override
+                .as_deref()
+                .unwrap()
+                .contains(&command.signature)
+        );
         let description = suggestion.description.as_deref().unwrap();
         assert!(description.contains(&command.summary));
         assert!(description.contains(&command.details));
@@ -3923,9 +3935,11 @@ mod tests {
         }
 
         let state = lock_recover(&scheduler.shared.state);
-        assert!(!state
-            .entries
-            .contains_key(Path::new("/tmp/quirl-prompt-cache-0")));
+        assert!(
+            !state
+                .entries
+                .contains_key(Path::new("/tmp/quirl-prompt-cache-0"))
+        );
         let newest = PathBuf::from(format!(
             "/tmp/quirl-prompt-cache-{}",
             MAX_PROMPT_CACHE_ENTRIES.saturating_mul(2).saturating_sub(1)
@@ -4465,14 +4479,18 @@ mod tests {
         let suggestions = completer.complete("cts", 3);
         assert_eq!(suggestions[0].value, "cargo test --workspace");
         assert_eq!(suggestions[0].span, Span::new(0, 3));
-        assert!(suggestions[0]
-            .display_override
-            .as_deref()
-            .is_some_and(|display| display.contains("[history]")));
-        assert!(suggestions[0]
-            .description
-            .as_deref()
-            .is_some_and(|description| description.contains("source: picker")));
+        assert!(
+            suggestions[0]
+                .display_override
+                .as_deref()
+                .is_some_and(|display| display.contains("[history]"))
+        );
+        assert!(
+            suggestions[0]
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("source: picker"))
+        );
 
         PickerInvocation::File.activate(&picker_invocation);
         let line = "cat crates/quirlXYZ trailing";

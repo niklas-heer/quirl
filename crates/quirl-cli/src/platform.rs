@@ -1,22 +1,22 @@
 use crate::{
-    bounded_file::{read_regular_file, ReadFileOptions},
+    bounded_file::{ReadFileOptions, read_regular_file},
     extensions::LuaExtensionHost,
 };
 use clap::{Args, Subcommand, ValueEnum};
 use quirl_core::{
-    directory_entries, escape_json_terminal_controls, ContributionKind, ErrorCode, EventKind,
-    ExtensionCapability, ExtensionEvent, ShellError, EXTENSION_PROTOCOL_VERSION,
+    ContributionKind, EXTENSION_PROTOCOL_VERSION, ErrorCode, EventKind, ExtensionCapability,
+    ExtensionEvent, ShellError, directory_entries, escape_json_terminal_controls,
 };
 use quirl_data::DataRuntime;
-use quirl_ui::{directory_panel, process_panel, LiveBuffer, LiveSample, ProcessPanelRow};
+use quirl_ui::{LiveBuffer, LiveSample, ProcessPanelRow, directory_panel, process_panel};
 use serde::{Deserialize, Serialize};
 use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Duration,

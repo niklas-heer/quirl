@@ -1,6 +1,6 @@
 use crate::lua_worker::{LuaWorkerCancellation as LuaCancellation, LuaWorkerRuntime as LuaRuntime};
 use crate::{
-    bounded_file::{read_optional_regular_file, read_regular_file, ReadFileOptions},
+    bounded_file::{ReadFileOptions, read_optional_regular_file, read_regular_file},
     extension_scheduler::{
         ExtensionScheduler, ExtensionSchedulerHandle, ExtensionWork, ExtensionWorkBatch,
         ExtensionWorkContext, WorkPriority,
@@ -12,39 +12,39 @@ use quirl_catalog::{
 #[cfg(test)]
 use quirl_catalog::{Confidence, Provenance, ProvenanceInfo, Trust};
 use quirl_core::{
-    validate_contribution_set, ContributionKind, ContributionRegistration, ErrorCode,
-    ExecutionEffect, ExecutionEffects, ExecutionInput, ExecutionOutcome, ExecutionOutput,
-    ExecutionOutputTarget, ExecutionPlan, ExecutionRequest, ExecutionSource, ExtensionAction,
-    ExtensionEvent, ExtensionEventData, ShellError, StructuredValue, StructuredValueKind,
-    ValueInputContract, ValueOutputContract,
+    ContributionKind, ContributionRegistration, ErrorCode, ExecutionEffect, ExecutionEffects,
+    ExecutionInput, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget, ExecutionPlan,
+    ExecutionRequest, ExecutionSource, ExtensionAction, ExtensionEvent, ExtensionEventData,
+    ShellError, StructuredValue, StructuredValueKind, ValueInputContract, ValueOutputContract,
+    validate_contribution_set,
 };
 use quirl_lua::{
     CommandRegistration, ConfigStore, EventHandlerReport, LuaPolicy, LuaRunnerContext,
-    PluginRegistrations, QuirlConfig, MAX_LUA_RUNNER_STREAM_VALUES,
+    MAX_LUA_RUNNER_STREAM_VALUES, PluginRegistrations, QuirlConfig,
 };
 use quirl_plugin::{
-    doctor_plugin, normalize_plugin_commands, parse_plugin_manifest, validate_plugin_manifest,
-    LockedPlugin, PluginLockfile, PluginManifest, PluginRuntime, PLUGIN_LOCK_FILE,
+    LockedPlugin, PLUGIN_LOCK_FILE, PluginLockfile, PluginManifest, PluginRuntime, doctor_plugin,
+    normalize_plugin_commands, parse_plugin_manifest, validate_plugin_manifest,
 };
-use quirl_syntax::{parse_command_list, Mode};
+use quirl_syntax::{Mode, parse_command_list};
 use quirl_ui::{
     ExtensionCompleter, ExtensionSuggestion, InteractivePanelBatch, InteractivePanelSnapshot,
-    PanelModel, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
-    PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+    PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX,
+    PANEL_ROWS_MAX, PanelModel,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     env,
     ffi::OsString,
     fs,
     hash::{Hash, Hasher},
     path::{Component, Path, PathBuf},
     sync::{
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
-        Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
 };
@@ -543,14 +543,14 @@ impl LuaExtensionHost {
                     ));
                     return ExtensionReloadState::Rejected;
                 }
-                if let Some(scheduler) = &self.scheduler {
-                    if let Err(error) = scheduler.activate_generation(next_revision) {
-                        self.observed_fingerprint = Some(candidate_fingerprint);
-                        self.record_error(error.with_context(
-                            "extension reload rejected; retaining the last known-good generation",
-                        ));
-                        return ExtensionReloadState::Rejected;
-                    }
+                if let Some(scheduler) = &self.scheduler
+                    && let Err(error) = scheduler.activate_generation(next_revision)
+                {
+                    self.observed_fingerprint = Some(candidate_fingerprint);
+                    self.record_error(error.with_context(
+                        "extension reload rejected; retaining the last known-good generation",
+                    ));
+                    return ExtensionReloadState::Rejected;
                 }
                 self.config = config;
                 self.plugin_paths = plugin_paths;
@@ -828,10 +828,10 @@ impl LuaExtensionHost {
     }
 
     fn start_prompt_refresh(&mut self, context: Arc<Value>) {
-        if let Some(previous) = self.prompt_refresh.take() {
-            if let Some(scheduler) = &self.scheduler {
-                scheduler.cancel_batch(&previous.batch);
-            }
+        if let Some(previous) = self.prompt_refresh.take()
+            && let Some(scheduler) = &self.scheduler
+        {
+            scheduler.cancel_batch(&previous.batch);
         }
         let request_id = match self.prompt_request_id.checked_add(1) {
             Some(request_id) => request_id,
@@ -940,10 +940,8 @@ impl LuaExtensionHost {
             self.prompt_refresh = Some(refresh);
             return;
         }
-        if !complete {
-            if let Some(scheduler) = &self.scheduler {
-                scheduler.cancel_batch(&refresh.batch);
-            }
+        if !complete && let Some(scheduler) = &self.scheduler {
+            scheduler.cancel_batch(&refresh.batch);
         }
         if refresh.generation != self.revision || refresh.request_id != self.prompt_request_id {
             return;
@@ -1192,10 +1190,8 @@ impl LuaExtensionHost {
             self.panel_refresh = Some(refresh);
             return;
         }
-        if !complete {
-            if let Some(scheduler) = &self.scheduler {
-                scheduler.cancel_batch(&refresh.batch);
-            }
+        if !complete && let Some(scheduler) = &self.scheduler {
+            scheduler.cancel_batch(&refresh.batch);
         }
         if refresh.generation != self.revision || refresh.request_id != self.panel_request_id {
             return;
@@ -1755,10 +1751,10 @@ impl LuaExtensionHost {
     /// return a detached wait handle for a pre-execution safe point.
     pub(crate) fn begin_callback_quiescence(&mut self) -> ExtensionCallbackQuiescence {
         self.poll_prompt_refresh();
-        if let Some(refresh) = self.prompt_refresh.take() {
-            if let Some(scheduler) = &self.scheduler {
-                scheduler.cancel_batch(&refresh.batch);
-            }
+        if let Some(refresh) = self.prompt_refresh.take()
+            && let Some(scheduler) = &self.scheduler
+        {
+            scheduler.cancel_batch(&refresh.batch);
         }
         let scheduler = self.scheduler.as_ref().map(ExtensionScheduler::handle);
         if let Some(scheduler) = &scheduler {
@@ -2301,17 +2297,17 @@ fn validate_plugin_argument_value(
     specification: &quirl_catalog::ArgumentSpec,
     value: &str,
 ) -> Result<(), ShellError> {
-    if let Some(quirl_catalog::CompletionSource::Static { values }) = &specification.values {
-        if !values.iter().any(|candidate| candidate == value) {
-            return Err(plugin_argument_error(
-                command,
-                format!(
-                    "argument `{}` must be one of: {}",
-                    specification.names.first().cloned().unwrap_or_default(),
-                    values.join(", ")
-                ),
-            ));
-        }
+    if let Some(quirl_catalog::CompletionSource::Static { values }) = &specification.values
+        && !values.iter().any(|candidate| candidate == value)
+    {
+        return Err(plugin_argument_error(
+            command,
+            format!(
+                "argument `{}` must be one of: {}",
+                specification.names.first().cloned().unwrap_or_default(),
+                values.join(", ")
+            ),
+        ));
     }
     let normalized = specification.value_type.to_ascii_lowercase();
     let valid = match normalized.as_str() {
@@ -3698,11 +3694,13 @@ max_message_bytes = 65536
         write_managed_lock(&root, &denied);
         assert_eq!(host.reload_if_changed(), ExtensionReloadState::Rejected);
         assert!(host.named_prompt_segments(Mode::Command, 0).is_empty());
-        assert!(host.take_errors().iter().any(|error| error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("capability denied: prompt.register"))));
+        assert!(host.take_errors().iter().any(|error| {
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("capability denied: prompt.register"))
+        }));
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -3720,10 +3718,12 @@ max_message_bytes = 65536
         let mut catalog = Catalog::builtin();
         catalog.merge(commands.clone());
         assert!(catalog.find("managed run").is_some());
-        assert!(catalog
-            .complete("managed r", "managed r".len())
-            .iter()
-            .any(|completion| completion.value == "managed run"));
+        assert!(
+            catalog
+                .complete("managed r", "managed r".len())
+                .iter()
+                .any(|completion| completion.value == "managed run")
+        );
         let first_help = catalog.find("managed run").unwrap();
         assert_eq!(first_help.signature, "managed run");
         assert_eq!(first_help.summary, "Run managed");
@@ -3790,9 +3790,11 @@ max_message_bytes = 65536
                 ExecutionInput::Value(StructuredValue::String("unexpected".to_owned())),
             )
             .unwrap_err();
-        assert!(unexpected
-            .message
-            .contains("does not accept pipeline input"));
+        assert!(
+            unexpected
+                .message
+                .contains("does not accept pipeline input")
+        );
 
         let echo_request = host
             .lock()
@@ -4066,12 +4068,14 @@ max_message_bytes = 65536
         assert_eq!(removed.code, ErrorCode::InvalidCommand);
         assert!(removed.message.contains("disappeared before execution"));
         let host_guard = host.lock().unwrap();
-        assert!(host_guard
-            .scheduler
-            .as_ref()
-            .unwrap()
-            .handle()
-            .wait_generation_idle(host_guard.revision, Duration::from_secs(1)));
+        assert!(
+            host_guard
+                .scheduler
+                .as_ref()
+                .unwrap()
+                .handle()
+                .wait_generation_idle(host_guard.revision, Duration::from_secs(1))
+        );
         drop(host_guard);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -4081,9 +4085,11 @@ max_message_bytes = 65536
         let directory = temporary_extension_directory();
         let root = directory.join("managed-state");
 
-        assert!(installed_plugin_commands_from_root(&root)
-            .unwrap()
-            .is_empty());
+        assert!(
+            installed_plugin_commands_from_root(&root)
+                .unwrap()
+                .is_empty()
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -4100,11 +4106,13 @@ max_message_bytes = 65536
 
         assert_eq!(error.code, ErrorCode::Validation);
         assert_eq!(error.message, "managed plugin lockfile is corrupt");
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("installed plugin catalog snapshot")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("installed plugin catalog snapshot"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4125,8 +4133,11 @@ max_message_bytes = 65536
             }],
             ..Catalog::builtin().commands[0].clone()
         };
-        let error = bind_plugin_invocation(&[command.clone()], &format!("{} nope", command.path))
-            .unwrap_err();
+        let error = bind_plugin_invocation(
+            std::slice::from_ref(&command),
+            &format!("{} nope", command.path),
+        )
+        .unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidArgument);
         assert!(error.details.context[0].contains("positive-integer"));
 
@@ -4260,9 +4271,11 @@ max_message_bytes = 65536
             host.reload_if_changed_with_cancellation(&cancelled),
             ExtensionReloadState::Rejected
         );
-        assert!(host.take_errors().iter().any(|error| error
-            .message
-            .contains("managed plugin reload was cancelled")));
+        assert!(host.take_errors().iter().any(|error| {
+            error
+                .message
+                .contains("managed plugin reload was cancelled")
+        }));
         assert_eq!(
             host.reload_if_changed(),
             ExtensionReloadState::Reloaded { revision: 1 }
@@ -4357,11 +4370,13 @@ max_message_bytes = 65536
             error.code,
             ErrorCode::Io | ErrorCode::ResourceLimit
         ));
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("limit")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("limit"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4540,10 +4555,11 @@ quirl.extension.contribute {
             catalog.find("demo").unwrap().provenance.source,
             Provenance::Plugin
         );
-        assert!(host
-            .complete("demo-v", 6)
-            .iter()
-            .any(|item| item.value == "demo-value"));
+        assert!(
+            host.complete("demo-v", 6)
+                .iter()
+                .any(|item| item.value == "demo-value")
+        );
         let panel = host
             .render_panel_contribution("demo-panel", &json!({}))
             .unwrap();
@@ -4769,11 +4785,13 @@ quirl.prompt.add_segment {
         assert_eq!(host.reload_if_changed(), ExtensionReloadState::Rejected);
         assert!(host.scheduler.is_none());
         let errors = host.take_errors();
-        assert!(errors.iter().any(|error| error
-            .details
-            .context
-            .iter()
-            .any(|context| { context.contains(&format!("limit: {MAX_LOADED_PLUGIN_RUNTIMES}")) })));
+        assert!(errors.iter().any(|error| {
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains(&format!("limit: {MAX_LOADED_PLUGIN_RUNTIMES}")))
+        }));
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -4788,11 +4806,13 @@ quirl.prompt.add_segment {
             let mut host = LuaExtensionHost::from_paths(None, vec![first, second]);
             assert_eq!(host.reload_if_changed(), ExtensionReloadState::Rejected);
             let errors = host.take_errors();
-            assert!(errors.iter().any(|error| error
-                .details
-                .context
-                .iter()
-                .any(|context| context.contains("observed: 65; limit: 64"))));
+            assert!(errors.iter().any(|error| {
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|context| context.contains("observed: 65; limit: 64"))
+            }));
             fs::remove_dir_all(directory).unwrap();
         }
     }
@@ -4823,10 +4843,11 @@ quirl.prompt.add_segment {
             .dispatch_event(ExtensionEventData::SessionStart { restored: false })
             .unwrap();
         assert_eq!(actions.len(), MAX_EXTENSION_EVENT_ACTIONS);
-        assert!(host
-            .take_errors()
-            .iter()
-            .any(|error| error.message.contains("event actions")));
+        assert!(
+            host.take_errors()
+                .iter()
+                .any(|error| error.message.contains("event actions"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -1,6 +1,6 @@
 use crate::{
-    imported_argument, imported_command, Catalog, CommandSpec, CompletionSource, Confidence,
-    OptionSpec, Provenance, ProvenanceInfo, CATALOG_SCHEMA_VERSION,
+    CATALOG_SCHEMA_VERSION, Catalog, CommandSpec, CompletionSource, Confidence, OptionSpec,
+    Provenance, ProvenanceInfo, imported_argument, imported_command,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path};
@@ -335,15 +335,15 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
                 }
                 dynamic.push(format!("_describe {}", candidates.source));
             }
-            if !candidates.from_array {
-                if let Err(message) = admit_candidates(
+            if !candidates.from_array
+                && let Err(message) = admit_candidates(
                     &mut candidate_count,
                     candidates.values.len(),
                     "Zsh `_describe` candidates",
-                ) {
-                    push_diagnostic(&mut diagnostics, diagnostic(origin, line_number, message));
-                    continue;
-                }
+                )
+            {
+                push_diagnostic(&mut diagnostics, diagnostic(origin, line_number, message));
+                continue;
             }
             described.extend(candidates.values);
         }
@@ -358,15 +358,15 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
                 }
                 dynamic.push(format!("_values {}", candidates.source));
             }
-            if !candidates.from_array {
-                if let Err(message) = admit_candidates(
+            if !candidates.from_array
+                && let Err(message) = admit_candidates(
                     &mut candidate_count,
                     candidates.values.len(),
                     "Zsh `_values` candidates",
-                ) {
-                    push_diagnostic(&mut diagnostics, diagnostic(origin, line_number, message));
-                    continue;
-                }
+                )
+            {
+                push_diagnostic(&mut diagnostics, diagnostic(origin, line_number, message));
+                continue;
             }
             values.extend(candidates.values);
         }
@@ -591,28 +591,28 @@ fn zsh_commands(
                 commands.extend(declared.into_iter().map(str::to_owned));
             }
         }
-        if trimmed.starts_with("compdef ") {
-            if let Ok(tokens) = shell_words(trimmed) {
-                let declared = tokens
-                    .iter()
-                    .skip(2)
-                    .filter(|value| !value.starts_with('-'))
-                    .collect::<Vec<_>>();
-                if declared.len() > MAX_COMMANDS_PER_DECLARATION {
-                    push_diagnostic(
-                        diagnostics,
-                        diagnostic(
-                            origin,
-                            *line_number,
-                            format!(
-                                "Zsh `compdef` declaration has {} commands; limit is {MAX_COMMANDS_PER_DECLARATION}",
-                                declared.len()
-                            ),
+        if trimmed.starts_with("compdef ")
+            && let Ok(tokens) = shell_words(trimmed)
+        {
+            let declared = tokens
+                .iter()
+                .skip(2)
+                .filter(|value| !value.starts_with('-'))
+                .collect::<Vec<_>>();
+            if declared.len() > MAX_COMMANDS_PER_DECLARATION {
+                push_diagnostic(
+                    diagnostics,
+                    diagnostic(
+                        origin,
+                        *line_number,
+                        format!(
+                            "Zsh `compdef` declaration has {} commands; limit is {MAX_COMMANDS_PER_DECLARATION}",
+                            declared.len()
                         ),
-                    );
-                } else {
-                    commands.extend(declared.into_iter().map(|value| (*value).clone()));
-                }
+                    ),
+                );
+            } else {
+                commands.extend(declared.into_iter().map(|value| (*value).clone()));
             }
         }
         if commands.len() > MAX_RETAINED_COMMANDS {
@@ -631,10 +631,10 @@ fn zsh_commands(
             break;
         }
     }
-    if commands.is_empty() {
-        if let Some(name) = inferred_name_from_origin(origin) {
-            commands.push(name);
-        }
+    if commands.is_empty()
+        && let Some(name) = inferred_name_from_origin(origin)
+    {
+        commands.push(name);
     }
     commands.sort();
     commands.dedup();
@@ -790,15 +790,15 @@ fn zsh_call_candidates(tokens: &[String], arrays: &HashMap<String, Vec<String>>)
     let mut arguments = positional.into_iter();
     let _label = arguments.next();
     let remaining = arguments.cloned().collect::<Vec<_>>();
-    if remaining.len() == 1 {
-        if let Some(values) = arrays.get(&remaining[0]) {
-            return ZshCandidates {
-                values: values.clone(),
-                dynamic: false,
-                source: remaining[0].clone(),
-                from_array: true,
-            };
-        }
+    if remaining.len() == 1
+        && let Some(values) = arrays.get(&remaining[0])
+    {
+        return ZshCandidates {
+            values: values.clone(),
+            dynamic: false,
+            source: remaining[0].clone(),
+            from_array: true,
+        };
     }
     let dynamic = remaining.iter().any(|value| is_dynamic_zsh(value))
         || remaining.len() == 1 && remaining.first().is_some_and(|value| is_identifier(value));
@@ -916,15 +916,15 @@ fn documentation_command(lines: &[&str], origin: &str) -> Option<String> {
         let usage = trimmed
             .strip_prefix("Usage:")
             .or_else(|| trimmed.strip_prefix("usage:"));
-        if let Some(usage) = usage {
-            if let Some(command) = usage.split_whitespace().next() {
-                return Some(command.rsplit('/').next().unwrap_or(command).to_owned());
-            }
+        if let Some(usage) = usage
+            && let Some(command) = usage.split_whitespace().next()
+        {
+            return Some(command.rsplit('/').next().unwrap_or(command).to_owned());
         }
-        if let Some(name) = trimmed.strip_prefix(".Nm ") {
-            if let Some(command) = name.split_whitespace().next() {
-                return Some(command.to_owned());
-            }
+        if let Some(name) = trimmed.strip_prefix(".Nm ")
+            && let Some(command) = name.split_whitespace().next()
+        {
+            return Some(command.to_owned());
         }
     }
     inferred_name_from_origin(origin)
@@ -938,12 +938,10 @@ fn documentation_summary(lines: &[&str]) -> Option<String> {
             in_name_section = section.trim_matches('"').eq_ignore_ascii_case("NAME");
             continue;
         }
-        if in_name_section {
-            if let Some(summary) = trimmed.strip_prefix(".Nd ") {
-                let summary = normalize_mdoc_text(summary, None);
-                if !summary.is_empty() {
-                    return Some(summary);
-                }
+        if in_name_section && let Some(summary) = trimmed.strip_prefix(".Nd ") {
+            let summary = normalize_mdoc_text(summary, None);
+            if !summary.is_empty() {
+                return Some(summary);
             }
         }
     }
@@ -1305,21 +1303,21 @@ fn parse_fish_declaration(
             }
             continue;
         }
-        if let Some(option) = &option {
-            if !scoped_subcommands.is_empty() {
-                for subcommand in &scoped_subcommands {
-                    let path = format!("{command} {subcommand}");
-                    imported.push(imported_command(
-                        path.clone(),
-                        format!("{path} [options]"),
-                        "External subcommand".to_owned(),
-                        format!("Options discovered for `{path}`."),
-                        vec![option.clone()],
-                        provenance.clone(),
-                    ));
-                }
-                continue;
+        if let Some(option) = &option
+            && !scoped_subcommands.is_empty()
+        {
+            for subcommand in &scoped_subcommands {
+                let path = format!("{command} {subcommand}");
+                imported.push(imported_command(
+                    path.clone(),
+                    format!("{path} [options]"),
+                    "External subcommand".to_owned(),
+                    format!("Options discovered for `{path}`."),
+                    vec![option.clone()],
+                    provenance.clone(),
+                ));
             }
+            continue;
         }
         imported.push(imported_command(
             command.clone(),
@@ -1883,24 +1881,28 @@ complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Prin
             .find(|command| command.path == "ghq get")
             .unwrap();
         assert_eq!(get.summary, "Clone/sync with a remote repository");
-        assert!(get
-            .options
-            .iter()
-            .any(|option| option.names == ["--update", "-u"]));
+        assert!(
+            get.options
+                .iter()
+                .any(|option| option.names == ["--update", "-u"])
+        );
         let list = report
             .commands
             .iter()
             .find(|command| command.path == "ghq list")
             .unwrap();
         assert_eq!(list.summary, "List local repositories");
-        assert!(list
-            .options
-            .iter()
-            .any(|option| option.names == ["--full-path", "-p"]));
-        assert!(!report
-            .commands
-            .iter()
-            .any(|command| command.path.contains("__fish")));
+        assert!(
+            list.options
+                .iter()
+                .any(|option| option.names == ["--full-path", "-p"])
+        );
+        assert!(
+            !report
+                .commands
+                .iter()
+                .any(|command| command.path.contains("__fish"))
+        );
     }
 
     #[test]
@@ -1914,18 +1916,24 @@ _c=(
 _describe -t commands Commands _c
 "#;
         let report = import_zsh(source, "_ghq");
-        assert!(report
-            .commands
-            .iter()
-            .any(|command| command.path == "ghq get"));
-        assert!(report
-            .commands
-            .iter()
-            .any(|command| command.path == "ghq list"));
-        assert!(!report
-            .commands
-            .iter()
-            .any(|command| { matches!(command.path.as_str(), "ghq Commands" | "ghq _c") }));
+        assert!(
+            report
+                .commands
+                .iter()
+                .any(|command| command.path == "ghq get")
+        );
+        assert!(
+            report
+                .commands
+                .iter()
+                .any(|command| command.path == "ghq list")
+        );
+        assert!(
+            !report
+                .commands
+                .iter()
+                .any(|command| { matches!(command.path.as_str(), "ghq Commands" | "ghq _c") })
+        );
     }
 
     #[test]
@@ -2008,10 +2016,11 @@ _values 'environment' staging production
             .find(|option| option.names == ["--output"])
             .unwrap();
         assert_eq!(output.value_type, "file");
-        assert!(report
-            .commands
-            .iter()
-            .any(|command| command.path == "deploy start" && command.summary == "Start services"));
+        assert!(
+            report.commands.iter().any(
+                |command| command.path == "deploy start" && command.summary == "Start services"
+            )
+        );
     }
 
     #[test]
@@ -2028,9 +2037,11 @@ _values 'environment' staging production
             "commands.fish",
         );
         assert!(fish_plus_one.commands.is_empty());
-        assert!(fish_plus_one.diagnostics[0]
-            .message
-            .contains(&format!("limit is {MAX_COMMANDS_PER_DECLARATION}")));
+        assert!(
+            fish_plus_one.diagnostics[0]
+                .message
+                .contains(&format!("limit is {MAX_COMMANDS_PER_DECLARATION}"))
+        );
 
         let bash_commands = (0..MAX_COMMANDS_PER_DECLARATION)
             .map(|index| format!("bash{index}"))
@@ -2044,9 +2055,11 @@ _values 'environment' staging production
             "commands.bash",
         );
         assert!(bash_plus_one.commands.is_empty());
-        assert!(bash_plus_one.diagnostics[0]
-            .message
-            .contains(&format!("limit is {MAX_COMMANDS_PER_DECLARATION}")));
+        assert!(
+            bash_plus_one.diagnostics[0]
+                .message
+                .contains(&format!("limit is {MAX_COMMANDS_PER_DECLARATION}"))
+        );
 
         let zsh_commands = (0..MAX_COMMANDS_PER_DECLARATION)
             .map(|index| format!("zsh{index}"))
@@ -2056,9 +2069,11 @@ _values 'environment' staging production
         assert_eq!(zsh_exact.commands.len(), MAX_COMMANDS_PER_DECLARATION);
         assert!(zsh_exact.diagnostics.is_empty());
         let zsh_plus_one = import_zsh(&format!("#compdef {zsh_commands} overflow"), "_commands");
-        assert!(zsh_plus_one.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains(&format!("limit is {MAX_COMMANDS_PER_DECLARATION}"))));
+        assert!(zsh_plus_one.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains(&format!("limit is {MAX_COMMANDS_PER_DECLARATION}"))
+        }));
     }
 
     #[test]
@@ -2086,9 +2101,11 @@ _values 'environment' staging production
             "candidates.fish",
         );
         assert!(fish_plus_one.commands.is_empty());
-        assert!(fish_plus_one.diagnostics[0]
-            .message
-            .contains(&format!("limit is {MAX_IMPORT_CANDIDATES}")));
+        assert!(
+            fish_plus_one.diagnostics[0]
+                .message
+                .contains(&format!("limit is {MAX_IMPORT_CANDIDATES}"))
+        );
 
         let joined = candidates.join(" ");
         let bash_exact = import_bash(&format!("complete -W '{joined}' demo"), "candidates.bash");
@@ -2099,9 +2116,11 @@ _values 'environment' staging production
             "candidates.bash",
         );
         assert!(bash_plus_one.commands.is_empty());
-        assert!(bash_plus_one.diagnostics[0]
-            .message
-            .contains(&format!("limit is {MAX_IMPORT_CANDIDATES}")));
+        assert!(
+            bash_plus_one.diagnostics[0]
+                .message
+                .contains(&format!("limit is {MAX_IMPORT_CANDIDATES}"))
+        );
 
         let zsh_candidates = (0..MAX_IMPORT_CANDIDATES)
             .map(|index| format!("value{index}"))
@@ -2117,9 +2136,11 @@ _values 'environment' staging production
             &format!("#compdef demo\n_values values {zsh_candidates} overflow"),
             "_candidates",
         );
-        assert!(zsh_plus_one.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains(&format!("limit is {MAX_IMPORT_CANDIDATES}"))));
+        assert!(zsh_plus_one.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains(&format!("limit is {MAX_IMPORT_CANDIDATES}"))
+        }));
     }
 
     #[test]
@@ -2140,9 +2161,11 @@ _values 'environment' staging production
             "_amplification",
         );
         assert_eq!(plus_one.commands.len(), MAX_RETAINED_COMMANDS);
-        assert!(plus_one.diagnostics.iter().any(|diagnostic| diagnostic
-            .message
-            .contains(&format!("limit is {MAX_RETAINED_COMMANDS}"))));
+        assert!(plus_one.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains(&format!("limit is {MAX_RETAINED_COMMANDS}"))
+        }));
     }
 
     #[test]
@@ -2165,9 +2188,11 @@ _values 'environment' staging production
 
             let plus_one = format!("{exact}x");
             let report = importer(&plus_one, origin);
-            assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
-                .message
-                .contains(&format!("{MAX_COMPLETION_IMPORT_BYTES} UTF-8 bytes"))));
+            assert!(report.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains(&format!("{MAX_COMPLETION_IMPORT_BYTES} UTF-8 bytes"))
+            }));
         }
     }
 
@@ -2208,9 +2233,11 @@ _values 'environment' staging production
             "plus-one",
             1,
         ));
-        assert!(diagnostics[0]
-            .message
-            .contains(&format!("limit is {MAX_RETAINED_IMPORT_BYTES}")));
+        assert!(
+            diagnostics[0]
+                .message
+                .contains(&format!("limit is {MAX_RETAINED_IMPORT_BYTES}"))
+        );
     }
 
     #[test]
@@ -2256,14 +2283,18 @@ _values 'environment' staging production
         let report = import_man(source, "demo.man");
         let command = &report.commands[0];
         assert_eq!(command.provenance.source, Provenance::Man);
-        assert!(command
-            .options
-            .iter()
-            .any(|option| option.names.contains(&"--quiet".to_owned())));
-        assert!(command
-            .options
-            .iter()
-            .any(|option| option.names == ["--format"]));
+        assert!(
+            command
+                .options
+                .iter()
+                .any(|option| option.names.contains(&"--quiet".to_owned()))
+        );
+        assert!(
+            command
+                .options
+                .iter()
+                .any(|option| option.names == ["--format"])
+        );
     }
 
     #[test]
@@ -2365,9 +2396,11 @@ _values 'environment' staging production
         source.push_str(&"x".repeat(MAX_HELP_BYTES + 32));
         let report = import_help(&source, "huge.help");
         assert_eq!(report.commands[0].path, "huge");
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("truncated")));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("truncated"))
+        );
     }
 }

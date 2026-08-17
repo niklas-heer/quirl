@@ -1,8 +1,8 @@
 [package]
 name = "quirl-luau-spike"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.88"
+edition = "2024"
+rust-version = "1.97.1"
 publish = false
 
 [dependencies]
@@ -16,3 +16,4 @@ strip = "symbols"
 
 # Keep Luau's mutually exclusive mlua engine feature out of Quirl's Lua workspace.
 [workspace]
+resolver = "3"

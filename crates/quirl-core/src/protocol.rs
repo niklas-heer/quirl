@@ -126,9 +126,11 @@ mod tests {
 
     #[test]
     fn common_abi_v1_fails_closed_and_current_value_shape_is_typed() {
-        assert!(VersionPolicy::frozen(COMMON_ABI_SCHEMA_VERSION)
-            .validate("common ABI", 1)
-            .is_err());
+        assert!(
+            VersionPolicy::frozen(COMMON_ABI_SCHEMA_VERSION)
+                .validate("common ABI", 1)
+                .is_err()
+        );
         let value = crate::StructuredValue::Duration { nanoseconds: 42 };
         assert_eq!(
             serde_json::to_value(value).unwrap(),

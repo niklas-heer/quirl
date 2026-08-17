@@ -41,8 +41,8 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     panic::{self, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -834,9 +834,11 @@ mod tests {
         ));
         gate.release();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(scheduler
-            .handle()
-            .wait_generation_idle(1, Duration::from_secs(1)));
+        assert!(
+            scheduler
+                .handle()
+                .wait_generation_idle(1, Duration::from_secs(1))
+        );
         assert_eq!(*lock_recover(&order), vec![1, 2]);
     }
 
@@ -884,9 +886,11 @@ mod tests {
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         scheduler.cancel_batch(&queued_batch);
         gate.release();
-        assert!(scheduler
-            .handle()
-            .wait_generation_idle(1, Duration::from_secs(1)));
+        assert!(
+            scheduler
+                .handle()
+                .wait_generation_idle(1, Duration::from_secs(1))
+        );
     }
 
     #[test]
@@ -932,9 +936,11 @@ mod tests {
             .unwrap();
         new_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         gate.release();
-        assert!(scheduler
-            .handle()
-            .wait_generation_idle(1, Duration::from_secs(1)));
+        assert!(
+            scheduler
+                .handle()
+                .wait_generation_idle(1, Duration::from_secs(1))
+        );
         assert_eq!(stale_ran.load(Ordering::Relaxed), 0);
         assert_eq!(
             MAX_RETAINED_EXTENSION_GENERATIONS,
@@ -966,9 +972,11 @@ mod tests {
             )
             .unwrap();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(scheduler
-            .handle()
-            .wait_generation_idle(1, Duration::from_secs(1)));
+        assert!(
+            scheduler
+                .handle()
+                .wait_generation_idle(1, Duration::from_secs(1))
+        );
     }
 
     #[test]
@@ -1010,9 +1018,11 @@ mod tests {
             .unwrap();
         thread::sleep(Duration::from_millis(25));
         gate.release();
-        assert!(scheduler
-            .handle()
-            .wait_generation_idle(1, Duration::from_secs(1)));
+        assert!(
+            scheduler
+                .handle()
+                .wait_generation_idle(1, Duration::from_secs(1))
+        );
         assert!(!expired_ran.load(Ordering::Relaxed));
     }
 

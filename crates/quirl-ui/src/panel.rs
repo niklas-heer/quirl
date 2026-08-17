@@ -1,4 +1,4 @@
-use quirl_core::{escape_terminal_line, reject_terminal_controls, Entry, ErrorCode, ShellError};
+use quirl_core::{Entry, ErrorCode, ShellError, escape_terminal_line, reject_terminal_controls};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;

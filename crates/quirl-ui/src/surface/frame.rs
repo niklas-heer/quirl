@@ -3,20 +3,20 @@ use super::{
     editor::EditorState,
     highlight::{DiagnosticSeverity, SurfaceDiagnostic},
     overlay::PickerLayout,
-    runtime::{RuntimeSurfaceState, PANEL_VISIBLE_ROWS_MAX},
+    runtime::{PANEL_VISIBLE_ROWS_MAX, RuntimeSurfaceState},
     statusbar::StatusBarModel,
     transcript::Transcript,
 };
-use crate::theme::Theme;
 use crate::SurfaceSymbols;
+use crate::theme::Theme;
 use quirl_core::{escape_terminal_controls, escape_terminal_line};
 use quirl_syntax::{HighlightKind, HighlightSpan, Mode};
 use ratatui::{
+    Frame,
     layout::{Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
-    Frame,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -219,18 +219,18 @@ impl FrameModel<'_> {
                         || (self.picker_layout == PickerLayout::Full && area.width >= 72))
             });
             self.render_completion(frame, popup_area, docs_allowed);
-        } else if area.height >= 3 {
-            if let Some((id, panel)) = self.runtime.focused_panel() {
-                let desired = u16::try_from(panel.rows.len().min(PANEL_VISIBLE_ROWS_MAX))
-                    .unwrap_or(u16::MAX)
-                    .saturating_add(3);
-                self.render_panel(
-                    frame,
-                    Rect::new(area.x, area.y, area.width, area.height.min(desired)),
-                    id,
-                    panel,
-                );
-            }
+        } else if area.height >= 3
+            && let Some((id, panel)) = self.runtime.focused_panel()
+        {
+            let desired = u16::try_from(panel.rows.len().min(PANEL_VISIBLE_ROWS_MAX))
+                .unwrap_or(u16::MAX)
+                .saturating_add(3);
+            self.render_panel(
+                frame,
+                Rect::new(area.x, area.y, area.width, area.height.min(desired)),
+                id,
+                panel,
+            );
         }
     }
 
@@ -407,13 +407,12 @@ impl FrameModel<'_> {
             if self.semantic_hints
                 && viewport.end == part.len()
                 && line_index + 1 == self.editor.buffer().lines().count().max(1)
+                && let Some(suggestion) = self.editor.autosuggestion()
             {
-                if let Some(suggestion) = self.editor.autosuggestion() {
-                    spans.push(Span::styled(
-                        escape_terminal_line(suggestion),
-                        self.theme.dim().add_modifier(Modifier::ITALIC),
-                    ));
-                }
+                spans.push(Span::styled(
+                    escape_terminal_line(suggestion),
+                    self.theme.dim().add_modifier(Modifier::ITALIC),
+                ));
             }
             lines.push(Line::from(spans));
             offset = line_end.saturating_add(1);
@@ -830,12 +829,12 @@ fn cursor_visual_position(value: &str, cursor: usize) -> (usize, usize) {
 mod tests {
     use super::*;
     use crate::surface::{
+        CompletionState,
         completion::{CompletionItem, CompletionKind},
         editor::EditAction,
-        CompletionState,
     };
     use quirl_catalog::Catalog;
-    use ratatui::{backend::TestBackend, style::Color, Terminal};
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
 
     fn rendered_model_in_mode(
         width: u16,
@@ -1491,26 +1490,34 @@ mod tests {
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        assert!(!buffer
-            .cell((4, 0))
-            .unwrap()
-            .modifier
-            .contains(Modifier::REVERSED));
-        assert!(buffer
-            .cell((5, 0))
-            .unwrap()
-            .modifier
-            .contains(Modifier::REVERSED));
-        assert!(buffer
-            .cell((12, 0))
-            .unwrap()
-            .modifier
-            .contains(Modifier::REVERSED));
-        assert!(!buffer
-            .cell((13, 0))
-            .unwrap()
-            .modifier
-            .contains(Modifier::REVERSED));
+        assert!(
+            !buffer
+                .cell((4, 0))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            buffer
+                .cell((5, 0))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            buffer
+                .cell((12, 0))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !buffer
+                .cell((13, 0))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]

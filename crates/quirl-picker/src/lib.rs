@@ -4,8 +4,8 @@ use quirl_core::{ErrorCode, ShellError, VersionPolicy};
 use serde::{Deserialize, Serialize};
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},

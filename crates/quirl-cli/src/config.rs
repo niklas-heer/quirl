@@ -1,9 +1,9 @@
 use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::{Subcommand, ValueEnum};
-use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
+use quirl_core::{ErrorCode, ShellError, escape_json_terminal_controls, escape_terminal_controls};
 use quirl_lua::{
-    builtin_theme, builtin_theme_names, format_source, LuaPolicy, QuirlConfig, ThemeColors,
-    CONFIG_SCHEMA_VERSION, MAX_LUA_SOURCE_BYTES, MAX_THEME_NAME_BYTES,
+    CONFIG_SCHEMA_VERSION, LuaPolicy, MAX_LUA_SOURCE_BYTES, MAX_THEME_NAME_BYTES, QuirlConfig,
+    ThemeColors, builtin_theme, builtin_theme_names, format_source,
 };
 use serde::Serialize;
 use std::{
@@ -776,7 +776,7 @@ fn handle_web_request(file: &Path, session: &mut WebSession, request: HttpReques
             let form = match parse_form(&request.body) {
                 Ok(form) => form,
                 Err(error) => {
-                    return HttpResponse::page(400, render_form(session, Some(&error.message)))
+                    return HttpResponse::page(400, render_form(session, Some(&error.message)));
                 }
             };
             if form.get("csrf") != Some(&session.token) {
@@ -1308,7 +1308,9 @@ fn write_http_response(stream: &mut TcpStream, response: &HttpResponse) -> io::R
     };
     let header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store, max-age=0\r\nPragma: no-cache\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n",
-        response.status, reason, response.body.len()
+        response.status,
+        reason,
+        response.body.len()
     );
     stream
         .write_all(header.as_bytes())
@@ -1699,13 +1701,13 @@ fn recover_missing_source(file: &Path, recovery: &Path, error: ShellError) -> Sh
     }
     match fs::hard_link(recovery, file) {
         Ok(()) => {
-            if recovery != backup_path(file) {
-                if let Err(cleanup_error) = fs::remove_file(recovery) {
-                    return error
-                        .with_context(format!("recovery source: {}", recovery.display()))
-                        .with_context(format!("recovery cleanup failed: {cleanup_error}"))
-                        .with_help("Review and remove the retained recovery link after reloading");
-                }
+            if recovery != backup_path(file)
+                && let Err(cleanup_error) = fs::remove_file(recovery)
+            {
+                return error
+                    .with_context(format!("recovery source: {}", recovery.display()))
+                    .with_context(format!("recovery cleanup failed: {cleanup_error}"))
+                    .with_help("Review and remove the retained recovery link after reloading");
             }
             if let Err(sync_error) = sync_parent(file) {
                 return error
@@ -2259,14 +2261,15 @@ fn field_values(tokens: &[Token], open: usize, field: &str) -> Vec<usize> {
             TokenKind::Symbol(b'}') | TokenKind::Symbol(b')') | TokenKind::Symbol(b']') => {
                 depth = depth.saturating_sub(1);
             }
-            _ if depth == 0 && identifier_is(&tokens[index], field) => {
-                if matches!(
+            _ if depth == 0
+                && identifier_is(&tokens[index], field)
+                && matches!(
                     tokens.get(index + 1).map(|token| &token.kind),
                     Some(TokenKind::Symbol(b'='))
-                ) && tokens.get(index + 2).is_some()
-                {
-                    values.push(index + 2);
-                }
+                )
+                && tokens.get(index + 2).is_some() =>
+            {
+                values.push(index + 2);
             }
             _ => {}
         }
@@ -2507,10 +2510,12 @@ return config
             fs::read_to_string(backup_path(&file)).unwrap(),
             example_source()
         );
-        assert!(!fs::symlink_metadata(backup_path(&file))
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            !fs::symlink_metadata(backup_path(&file))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2529,18 +2534,22 @@ return config
         set(&file, "picker.preview", "false").unwrap();
 
         assert_eq!(fs::read_to_string(&target).unwrap(), example_source());
-        assert!(!fs::symlink_metadata(&file)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            !fs::symlink_metadata(&file)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(
             fs::read_to_string(backup_path(&file)).unwrap(),
             example_source()
         );
-        assert!(!fs::symlink_metadata(backup_path(&file))
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            !fs::symlink_metadata(backup_path(&file))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2554,9 +2563,11 @@ return config
         assert_eq!(set(&file, "prompt.symbols", "nerd_font").unwrap(), 0);
         let config = load(&file).unwrap();
         assert_eq!(config.prompt.symbols, "nerd_font");
-        assert!(fs::read_to_string(&file)
-            .unwrap()
-            .contains("symbols = \"nerd_font\""));
+        assert!(
+            fs::read_to_string(&file)
+                .unwrap()
+                .contains("symbols = \"nerd_font\"")
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2864,9 +2875,11 @@ return config
         apply_web_form(&file, &mut session, &form).unwrap();
 
         assert_eq!(load(&file).unwrap().ui.theme, "ansi");
-        assert!(fs::read_to_string(&file)
-            .unwrap()
-            .contains("theme = \"ansi\""));
+        assert!(
+            fs::read_to_string(&file)
+                .unwrap()
+                .contains("theme = \"ansi\"")
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2914,10 +2927,12 @@ return config
 
         assert!(matches!(error, WebFormFailure::Conflict(_)));
         assert_eq!(error.status(), 409);
-        assert!(error
-            .error()
-            .message
-            .contains("changed concurrently: editor.keymap"));
+        assert!(
+            error
+                .error()
+                .message
+                .contains("changed concurrently: editor.keymap")
+        );
         assert_eq!(fs::read_to_string(&file).unwrap(), external);
         fs::remove_dir_all(directory).unwrap();
     }

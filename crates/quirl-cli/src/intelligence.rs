@@ -3,14 +3,14 @@
 use model2vec_rs::model::StaticModel;
 use quirl_catalog::{ArgumentKind, Catalog, CompletionSource};
 use quirl_core::{ErrorCode, ShellError};
-use rusqlite::{limits::Limit, params, serialize::Data, Connection, Transaction, MAIN_DB};
+use rusqlite::{Connection, MAIN_DB, Transaction, limits::Limit, params, serialize::Data};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
     env,
     io::Cursor,
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
 };
 
@@ -1266,9 +1266,11 @@ mod tests {
             .search("list a directory as typed entries", 8)
             .unwrap();
         assert!(directory.iter().any(|result| result.command == "cd"));
-        assert!(listing
-            .iter()
-            .any(|result| result.command == "quirl data ls"));
+        assert!(
+            listing
+                .iter()
+                .any(|result| result.command == "quirl data ls")
+        );
     }
 
     #[test]

@@ -9,8 +9,8 @@ pub mod syntax;
 mod value_boundary;
 
 use quirl_core::{
-    directory_entries_with_options, DirectoryOptions, Entry, EntryKind, ErrorCode, ProcessHost,
-    ProcessRequest, ShellError, StructuredValue,
+    DirectoryOptions, Entry, EntryKind, ErrorCode, ProcessHost, ProcessRequest, ShellError,
+    StructuredValue, directory_entries_with_options,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,8 +20,8 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
         Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
     time::Duration,
 };
@@ -31,8 +31,8 @@ use syntax::{
     DataSyntaxLimits, DataTransform, SortDirection, Spanned,
 };
 use value_boundary::{
-    data_value_from_json, data_value_from_syntax, data_value_from_toml, data_value_from_yaml,
-    json_from_data_value, validate_data_value, ValueUsage,
+    ValueUsage, data_value_from_json, data_value_from_syntax, data_value_from_toml,
+    data_value_from_yaml, json_from_data_value, validate_data_value,
 };
 
 /// Resource limits applied before data enters the evaluator.
@@ -1727,7 +1727,7 @@ fn parse_csv_record_display(
                         path,
                         line_number,
                         "characters after a closing quote must be a comma",
-                    ))
+                    ));
                 }
             }
         } else {
@@ -1739,7 +1739,7 @@ fn parse_csv_record_display(
                         path,
                         line_number,
                         "quote must begin a field",
-                    ))
+                    ));
                 }
                 _ => current.push(character),
             }
@@ -1848,13 +1848,13 @@ fn open_tar_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
                     return Err(tar_error_display(
                         &display,
                         "PAX extended headers are unsupported for 0.1.0 tar inspection",
-                    ))
+                    ));
                 }
                 other => {
                     return Err(tar_error_display(
                         &display,
                         format!("unsupported entry type byte {other}"),
-                    ))
+                    ));
                 }
             };
             let payload_blocks = size.checked_add(511).ok_or_else(|| {
@@ -3536,12 +3536,16 @@ mod tests {
     #[test]
     fn malformed_predicates_and_incomparable_sorts_are_errors() {
         let runtime = DataRuntime::new();
-        assert!(runtime
-            .eval_typed(r#"[{"value":1}] | where value = 1"#)
-            .is_err());
-        assert!(runtime
-            .eval_typed(r#"[{"value":1},{"value":"one"}] | sort value"#)
-            .is_err());
+        assert!(
+            runtime
+                .eval_typed(r#"[{"value":1}] | where value = 1"#)
+                .is_err()
+        );
+        assert!(
+            runtime
+                .eval_typed(r#"[{"value":1},{"value":"one"}] | sort value"#)
+                .is_err()
+        );
         assert!(runtime.eval_typed("[1,2 | length").is_err());
     }
 
@@ -3795,9 +3799,11 @@ mod tests {
             max_nodes: 3,
             ..DataLimits::DEFAULT
         });
-        assert!(runtime
-            .eval_typed(&format!("open {}", exact_nodes.path().display()))
-            .is_ok());
+        assert!(
+            runtime
+                .eval_typed(&format!("open {}", exact_nodes.path().display()))
+                .is_ok()
+        );
         let error = runtime
             .eval_typed(&format!("open {}", excess_nodes.path().display()))
             .unwrap_err();
@@ -4349,18 +4355,21 @@ mod tests {
     #[test]
     fn option_result_and_task_states_remain_explicit_at_the_abi_boundary() {
         let none = DataEnvelope::none();
-        assert!(none
-            .render(DataRenderFormat::Json)
-            .unwrap()
-            .contains("\"option\""));
+        assert!(
+            none.render(DataRenderFormat::Json)
+                .unwrap()
+                .contains("\"option\"")
+        );
         let failure = DataEnvelope::result_error(ShellError::new(ErrorCode::Data, "bad input"));
         let json = failure.render(DataRenderFormat::Json).unwrap();
         assert!(json.contains("\"state\": \"error\""));
         assert!(json.contains("\"code\": \"data\""));
-        assert!(DataEnvelope::pending_task()
-            .render(DataRenderFormat::Plain)
-            .unwrap()
-            .contains("Pending"));
+        assert!(
+            DataEnvelope::pending_task()
+                .render(DataRenderFormat::Plain)
+                .unwrap()
+                .contains("Pending")
+        );
 
         let first = DataRuntime::new().eval_envelope("[] | first").unwrap();
         assert_eq!(first, DataEnvelope::none());

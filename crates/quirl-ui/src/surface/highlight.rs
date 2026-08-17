@@ -1,7 +1,7 @@
 use quirl_catalog::{ArgumentKind, Catalog, CommandSpec, Confidence};
 use quirl_syntax::{
-    highlight, parse_command_list, CommandList, HighlightKind, HighlightSpan, Mode, Quoting,
-    SimpleCommand, Word,
+    CommandList, HighlightKind, HighlightSpan, Mode, Quoting, SimpleCommand, Word, highlight,
+    parse_command_list,
 };
 use std::{
     collections::{HashSet, VecDeque},
@@ -11,9 +11,9 @@ use std::{
     ops::Range,
     path::Path,
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
-        Arc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},

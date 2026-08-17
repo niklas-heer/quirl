@@ -3,7 +3,7 @@
 use quirl_core::{ErrorCode, ShellError};
 use quirl_syntax::Mode;
 use quirl_ui::InteractiveHistoryEntry;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 use std::{
     collections::HashSet,
     env, fs,

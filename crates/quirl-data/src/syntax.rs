@@ -754,7 +754,7 @@ fn lex(source: &str, limits: DataSyntaxLimits) -> Result<Vec<Token>, DataSyntaxD
                             "comparison operator is incomplete",
                             start..index,
                             "Use one of `==`, `!=`, `<`, `<=`, `>`, or `>=`",
-                        ))
+                        ));
                     }
                 }
             }
@@ -875,7 +875,7 @@ fn parse_source(
                 span,
                 "pwd does not accept arguments",
                 "Use `pwd` by itself as the data source",
-            ))
+            ));
         }
         "files" | "ls" => DataSource::Files {
             path: decode_source_argument(source, tokens, false, limits)?,
@@ -960,7 +960,7 @@ fn parse_transform(
                         tokens[2].span.clone(),
                         "sort direction must be `asc` or `desc`",
                         "Use `sort <field> [asc|desc]`",
-                    ))
+                    ));
                 }
             };
             DataTransform::Sort { field, direction }
@@ -995,21 +995,26 @@ fn parse_transform(
                 span,
                 "where requires a complete comparison",
                 "Use `where <field> <comparison> <value> [and|or ...]`",
-            ))
+            ));
         }
-        known if matches!(known, "length" | "first" | "lines" | "get" | "select" | "sort" | "take" | "from" | "to") => {
+        known
+            if matches!(
+                known,
+                "length" | "first" | "lines" | "get" | "select" | "sort" | "take" | "from" | "to"
+            ) =>
+        {
             return Err(usage_error(
                 span,
                 format!("invalid arguments for `{known}`"),
                 "Check the focused data transform syntax in `help data`",
-            ))
+            ));
         }
         _ => {
             return Err(syntax_error(
                 format!("unknown data transform `{command}`"),
                 tokens[0].span.clone(),
                 "Use `get`, `where`, `select`, `sort`, `take`, `first`, `length`, `lines`, `from json`, or `to json`",
-            ))
+            ));
         }
     };
     Ok(Spanned { value, span })
@@ -1075,7 +1080,7 @@ fn parse_predicate(
                     operator_token.span.clone(),
                     "comparisons must be joined by `and` or `or`",
                     "Use `and` or `or` between complete comparisons",
-                ))
+                ));
             }
         };
         operators.push(Spanned {
@@ -1114,7 +1119,7 @@ fn parse_predicate_literal(
                 token.span.clone(),
                 "predicate value must be a scalar literal",
                 "Use a quoted string, bare name, Boolean, null, or JSON number",
-            ))
+            ));
         }
     };
     Ok(SyntaxLiteral {
@@ -1192,7 +1197,7 @@ fn parse_literal(
                             "literal values require a comma separator",
                             value.span,
                             "Insert `,` between adjacent list items or record fields",
-                        ))
+                        ));
                     }
                 }
             } else if root.replace(value).is_some() {
@@ -1254,7 +1259,7 @@ fn parse_literal(
                                     token.span.clone(),
                                     "list items require a comma separator",
                                     "Insert `,` between list items",
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1347,7 +1352,7 @@ fn parse_literal(
                                 token.span.clone(),
                                 "record fields require a comma separator",
                                 "Insert `,` between record fields",
-                            ))
+                            ));
                         }
                     },
                 },
@@ -1391,7 +1396,7 @@ fn parse_literal(
                     token.span.clone(),
                     "structured literals require JSON double-quoted strings",
                     "Replace single quotes with JSON double quotes",
-                ))
+                ));
             }
             TokenKind::Bare => {
                 let text = token_text(source, token);
@@ -1418,7 +1423,7 @@ fn parse_literal(
                     "expected a JSON-compatible literal value",
                     token.span.clone(),
                     "Use null, a Boolean, number, string, list, or record",
-                ))
+                ));
             }
         }
     }
@@ -1479,7 +1484,7 @@ fn decode_word(
                 token.span.clone(),
                 "path must be one bare or quoted value",
                 "Quote paths containing whitespace or data punctuation",
-            ))
+            ));
         }
     };
     Ok(Spanned {
@@ -2022,12 +2027,16 @@ mod tests {
         let spans = highlight_data_expression(source, DataSyntaxLimits::DEFAULT);
         assert_eq!(spans.first().unwrap().range.start, 0);
         assert_eq!(spans.last().unwrap().range.end, source.len());
-        assert!(spans
-            .iter()
-            .any(|span| span.kind == DataHighlightKind::Keyword));
-        assert!(spans
-            .iter()
-            .any(|span| span.kind == DataHighlightKind::Operator));
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.kind == DataHighlightKind::Keyword)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.kind == DataHighlightKind::Operator)
+        );
     }
 
     #[test]

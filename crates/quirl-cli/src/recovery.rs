@@ -1,6 +1,6 @@
 use clap::{Subcommand, ValueEnum};
 use quirl_core::{
-    escape_json_terminal_controls, escape_terminal_controls, CommandOutcome, ErrorCode, ShellError,
+    CommandOutcome, ErrorCode, ShellError, escape_json_terminal_controls, escape_terminal_controls,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -20,7 +20,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 #[cfg(unix)]
 use nix::{
-    fcntl::{open, OFlag},
+    fcntl::{OFlag, open},
     sys::stat::Mode,
 };
 
@@ -483,16 +483,14 @@ impl RecoveryJournal {
                 .file_type()
                 .map(|kind| kind.is_file())
                 .unwrap_or(false)
-            {
-                if let Some(id) = entry
+                && let Some(id) = entry
                     .path()
                     .file_stem()
                     .and_then(|stem| stem.to_str())
                     .filter(|_| entry.path().extension().is_some_and(|ext| ext == "json"))
                     .filter(|id| is_valid_id(id))
-                {
-                    ids.push(id.to_owned());
-                }
+            {
+                ids.push(id.to_owned());
             }
         }
         ids.sort_unstable_by(|left, right| {
@@ -1287,10 +1285,10 @@ fn shell_token_spans(value: &str) -> Vec<(usize, usize)> {
             }
         } else if matches!(character, '\'' | '"') {
             quote = Some(character);
-        } else if character.is_whitespace() {
-            if let Some(start) = start.take() {
-                spans.push((start, index));
-            }
+        } else if character.is_whitespace()
+            && let Some(start) = start.take()
+        {
+            spans.push((start, index));
         }
     }
     if let Some(start) = start {
@@ -1527,22 +1525,26 @@ mod tests {
                 .unwrap_err();
 
             assert_eq!(error.code, ErrorCode::Io);
-            assert!(error
-                .details
-                .context
-                .iter()
-                .any(|context| context.contains("injected snapshot failure")));
+            assert!(
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|context| context.contains("injected snapshot failure"))
+            );
             let expected_entries = if failed_stage == SnapshotWriteStage::Installed {
                 2
             } else {
                 1
             };
             assert_eq!(fs::read_dir(&directory).unwrap().count(), expected_entries);
-            assert!(error
-                .details
-                .context
-                .iter()
-                .any(|context| context.contains("failure cleanup preserved recovery")));
+            assert!(
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|context| context.contains("failure cleanup preserved recovery"))
+            );
             fs::remove_dir_all(directory).unwrap();
         }
     }
@@ -1571,16 +1573,20 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, ErrorCode::Io);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("injected primary failure")));
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("failure cleanup preserved recovery temporary")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("injected primary failure"))
+        );
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("failure cleanup preserved recovery temporary"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1615,11 +1621,13 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read(replacement).unwrap(), b"foreign");
         assert!(moved.exists());
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context.contains("failure cleanup preserved recovery temporary")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("failure cleanup preserved recovery temporary"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

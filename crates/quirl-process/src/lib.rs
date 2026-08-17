@@ -377,24 +377,24 @@ mod simulation_support {
 #[cfg(unix)]
 mod platform {
     use super::{
-        allocate_job_id, builtin, validate_native_plan, validate_native_source, OutputObserver,
-        SessionEnvironment, ARITHMETIC_DEPTH_MAX, ARITHMETIC_SOURCE_BYTES_MAX,
-        DEFAULT_CAPTURE_BYTES, EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
+        ARITHMETIC_DEPTH_MAX, ARITHMETIC_SOURCE_BYTES_MAX, DEFAULT_CAPTURE_BYTES,
+        EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, OutputObserver, RETAINED_JOBS_MAX,
+        SessionEnvironment, allocate_job_id, builtin, validate_native_plan, validate_native_source,
     };
 
     use nix::{
         errno::Errno,
         sys::{
-            signal::{kill, killpg, pthread_sigmask, SigSet, SigmaskHow, Signal},
-            termios::{tcgetattr, tcsetattr, SetArg, Termios},
-            wait::{waitpid, WaitPidFlag, WaitStatus},
+            signal::{SigSet, SigmaskHow, Signal, kill, killpg, pthread_sigmask},
+            termios::{SetArg, Termios, tcgetattr, tcsetattr},
+            wait::{WaitPidFlag, WaitStatus, waitpid},
         },
-        unistd::{getpgid, setpgid, tcgetpgrp, tcsetpgrp, Pid},
+        unistd::{Pid, getpgid, setpgid, tcgetpgrp, tcsetpgrp},
     };
-    use os_pipe::{pipe, PipeReader, PipeWriter};
+    use os_pipe::{PipeReader, PipeWriter, pipe};
     use quirl_core::{CommandOutcome, ErrorCode, OutputStream, ProcessRequest, ShellError};
     use quirl_syntax::{
-        parse_command_list, ListConnector, Pipeline, Quoting, RedirectKind, SimpleCommand, Word,
+        ListConnector, Pipeline, Quoting, RedirectKind, SimpleCommand, Word, parse_command_list,
     };
     use serde::{Deserialize, Serialize};
     #[cfg(test)]
@@ -406,9 +406,9 @@ mod platform {
         path::{Path, PathBuf},
         process::{Child, ChildStdin, ChildStdout, Command, Stdio},
         sync::{
-            atomic::{AtomicUsize, Ordering},
-            mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, TryRecvError},
             Arc, Mutex, MutexGuard, OnceLock, TryLockError,
+            atomic::{AtomicUsize, Ordering},
+            mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel, sync_channel},
         },
         thread::{self, JoinHandle},
         time::{Duration, Instant},
@@ -2684,15 +2684,11 @@ mod platform {
                 result.stdout.as_deref().unwrap_or_default().as_bytes(),
             )?;
             result.stdout = capture.then(String::new);
-        } else if !capture {
-            if let Some(stdout) = result.stdout.take() {
-                io_write_all(std::io::stdout(), stdout.as_bytes(), "standard output")?;
-            }
+        } else if !capture && let Some(stdout) = result.stdout.take() {
+            io_write_all(std::io::stdout(), stdout.as_bytes(), "standard output")?;
         }
-        if !capture {
-            if let Some(stderr) = result.stderr.take() {
-                io_write_all(std::io::stderr(), stderr.as_bytes(), "standard error")?;
-            }
+        if !capture && let Some(stderr) = result.stderr.take() {
+            io_write_all(std::io::stderr(), stderr.as_bytes(), "standard error")?;
         }
         Ok(result)
     }
@@ -2835,10 +2831,10 @@ mod platform {
     }
 
     fn resume_job(job: &Job) -> Result<(), ShellError> {
-        if let Some(anchor) = job.process_group_anchor.as_ref() {
-            if anchor.signal(Signal::SIGCONT).is_ok() {
-                return Ok(());
-            }
+        if let Some(anchor) = job.process_group_anchor.as_ref()
+            && anchor.signal(Signal::SIGCONT).is_ok()
+        {
+            return Ok(());
         }
         let mut resumed = false;
         let mut failure = None;
@@ -3054,12 +3050,12 @@ mod platform {
         let started = Instant::now();
         let process_id = Pid::from_raw(process_group);
         loop {
-            if let Some(request) = request {
-                if let Err(error) = request.ensure_active() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error);
-                }
+            if let Some(request) = request
+                && let Err(error) = request.ensure_active()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
             }
             match waitpid(
                 process_id,
@@ -3189,13 +3185,13 @@ mod platform {
                 }
                 let retained = budget.claim(count);
                 bytes.extend_from_slice(&chunk[..retained]);
-                if retained > 0 {
-                    if let Some((sender, stream)) = &output {
-                        let _ = sender.send(OutputEvent {
-                            stream: *stream,
-                            bytes: chunk[..retained].to_vec(),
-                        });
-                    }
+                if retained > 0
+                    && let Some((sender, stream)) = &output
+                {
+                    let _ = sender.send(OutputEvent {
+                        stream: *stream,
+                        bytes: chunk[..retained].to_vec(),
+                    });
                 }
                 discarded_bytes = discarded_bytes.saturating_add((count - retained) as u64);
             }
@@ -3759,7 +3755,7 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use crate::simulation_support::{configuration, DeterministicRng};
+        use crate::simulation_support::{DeterministicRng, configuration};
         use std::{
             fs,
             sync::atomic::{AtomicUsize, Ordering},
@@ -4292,12 +4288,14 @@ mod platform {
             }));
             assert!(started.elapsed() < Duration::from_secs(1));
             drop(held);
-            assert!(ForegroundTerminalLease::acquire_from(
-                &TERMINAL_LEASE_TEST_LOCK,
-                None,
-                Duration::from_secs(1)
-            )
-            .is_ok());
+            assert!(
+                ForegroundTerminalLease::acquire_from(
+                    &TERMINAL_LEASE_TEST_LOCK,
+                    None,
+                    Duration::from_secs(1)
+                )
+                .is_ok()
+            );
         }
 
         #[test]
@@ -4332,11 +4330,13 @@ mod platform {
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
             assert!(error.message.contains("output limit"));
-            assert!(error
-                .details
-                .context
-                .iter()
-                .any(|context| context.contains("discarded") && context.contains("retained")));
+            assert!(
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|context| context.contains("discarded") && context.contains("retained"))
+            );
         }
 
         #[test]
@@ -4349,11 +4349,13 @@ mod platform {
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
             assert!(error.message.contains("output limit"));
-            assert!(error
-                .details
-                .context
-                .iter()
-                .any(|context| context.contains("discarded 32768 bytes")));
+            assert!(
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|context| context.contains("discarded 32768 bytes"))
+            );
         }
 
         #[test]
@@ -4419,11 +4421,13 @@ mod platform {
                 .execute_capture_request(request)
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
-            assert!(error
-                .details
-                .context
-                .iter()
-                .any(|context| context.contains("discarded 1024 bytes")));
+            assert!(
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|context| context.contains("discarded 1024 bytes"))
+            );
         }
 
         #[test]
@@ -4476,10 +4480,11 @@ mod platform {
         #[test]
         fn builtin_redirects_are_opened_before_state_mutation() {
             let variable = format!(
-                "QUIRL_PROCESS_REDIRECT_{}",
+                "QUIRL_PROCESS_REDIRECT_{}_{}",
+                std::process::id(),
                 NEXT_TEMP_PATH.fetch_add(1, Ordering::Relaxed)
             );
-            env::remove_var(&variable);
+            assert!(env::var_os(&variable).is_none());
             let missing = temporary_path("missing-parent").join("output");
             let mut executor = NativeExecutor::default();
             let error = executor
@@ -4879,11 +4884,13 @@ mod platform {
             anchor.termination_signaled = true;
             let error = anchor.finish_termination(Err(Errno::EPERM)).unwrap_err();
             assert_eq!(error.code, ErrorCode::Io);
-            assert!(error
-                .details
-                .context
-                .iter()
-                .any(|value| value.contains("EPERM")));
+            assert!(
+                error
+                    .details
+                    .context
+                    .iter()
+                    .any(|value| value.contains("EPERM"))
+            );
             assert!(anchor.released);
             assert_eq!(anchor.process_group(), process_group.as_raw());
         }
@@ -5072,11 +5079,11 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::{
-        allocate_job_id, builtin, validate_native_plan, validate_native_source, OutputObserver,
-        SessionEnvironment, DEFAULT_CAPTURE_BYTES, HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
+        DEFAULT_CAPTURE_BYTES, HERE_STRING_BYTES_MAX, OutputObserver, RETAINED_JOBS_MAX,
+        SessionEnvironment, allocate_job_id, builtin, validate_native_plan, validate_native_source,
     };
     use quirl_core::{CommandOutcome, ErrorCode, OutputStream, ProcessRequest, ShellError};
-    use quirl_syntax::{parse_command_list, ListConnector, Pipeline, RedirectKind, SimpleCommand};
+    use quirl_syntax::{ListConnector, Pipeline, RedirectKind, SimpleCommand, parse_command_list};
     use serde::{Deserialize, Serialize};
     use std::{
         fs::{File, OpenOptions},
@@ -5084,8 +5091,8 @@ mod platform {
         os::windows::io::AsRawHandle,
         process::{Child, ChildStdout, Command, Stdio},
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
         thread::{self, JoinHandle},
         time::Instant,
@@ -5093,9 +5100,9 @@ mod platform {
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE},
         System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject,
         },
     };
 
@@ -6439,12 +6446,12 @@ impl ProcessBackend for NativeExecutor {
 #[cfg(test)]
 mod backend_contract_tests {
     use super::*;
-    use crate::simulation_support::{configuration, DeterministicRng};
+    use crate::simulation_support::{DeterministicRng, configuration};
     use quirl_core::ErrorCode;
     use std::{
         fs,
         path::PathBuf,
-        sync::{atomic::AtomicBool, Arc},
+        sync::{Arc, atomic::AtomicBool},
         thread,
         time::{Duration, Instant},
     };
@@ -6839,10 +6846,12 @@ mod backend_contract_tests {
             JobStatus::Stopped
         );
         #[cfg(windows)]
-        assert!(ProcessBackend::suspend_job(&mut backend, jobs[0].id)
-            .unwrap_err()
-            .message
-            .contains("does not support job suspension"));
+        assert!(
+            ProcessBackend::suspend_job(&mut backend, jobs[0].id)
+                .unwrap_err()
+                .message
+                .contains("does not support job suspension")
+        );
         let started = Instant::now();
         let cancelled = ProcessBackend::cancel_job(&mut backend, jobs[0].id).unwrap();
         assert_eq!(cancelled.status, JobStatus::Done);

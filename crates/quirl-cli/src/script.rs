@@ -1,21 +1,21 @@
-use crate::bounded_file::{read_regular_file, ReadFileOptions};
+use crate::bounded_file::{ReadFileOptions, read_regular_file};
 use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::ValueEnum;
 use quirl_core::{
-    escape_json_terminal_controls, replace_file_atomically, AtomicReplaceOptions, ErrorCode,
-    ExecutionCancellation, ExecutionCleanupState, ExecutionDeadline, ExecutionEffects,
-    ExecutionInput, ExecutionMode, ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget,
-    ExecutionPlan, ExecutionRequest, ExecutionSource, ExecutionStatus, ProcessRequest, ShellError,
-    StructuredValue, EXECUTION_CAPTURE_BYTES_MAX,
+    AtomicReplaceOptions, EXECUTION_CAPTURE_BYTES_MAX, ErrorCode, ExecutionCancellation,
+    ExecutionCleanupState, ExecutionDeadline, ExecutionEffects, ExecutionInput, ExecutionMode,
+    ExecutionOutcome, ExecutionOutput, ExecutionOutputTarget, ExecutionPlan, ExecutionRequest,
+    ExecutionSource, ExecutionStatus, ProcessRequest, ShellError, StructuredValue,
+    escape_json_terminal_controls, replace_file_atomically,
 };
 use quirl_data::{
-    syntax::{
-        format_data_expression, parse_data_expression, DataSyntaxDiagnosticKind, DataSyntaxLimits,
-    },
     DataRuntime,
+    syntax::{
+        DataSyntaxDiagnosticKind, DataSyntaxLimits, format_data_expression, parse_data_expression,
+    },
 };
-use quirl_lua::{format_file, LuaPolicy, LuaRunnerContext, MAX_LUA_SOURCE_BYTES};
-use quirl_process::{sandboxed_process_host, ChildProcessTree, NativeExecutor};
+use quirl_lua::{LuaPolicy, LuaRunnerContext, MAX_LUA_SOURCE_BYTES, format_file};
+use quirl_process::{ChildProcessTree, NativeExecutor, sandboxed_process_host};
 use quirl_syntax::{check_script, parse_command_list};
 use quirl_ui::render_error;
 use serde::Serialize;
@@ -28,8 +28,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -439,7 +439,7 @@ impl RetainedPathBytes {
 
     fn retain(&mut self, path: &Path) -> Result<usize, ShellError> {
         let bytes = path.as_os_str().as_encoded_bytes().len();
-        let observed = self.current.checked_add(bytes).unwrap_or(usize::MAX);
+        let observed = self.current.saturating_add(bytes);
         if observed > self.maximum {
             return Err(discovery_limit_error(
                 path,
@@ -554,9 +554,7 @@ fn discover_supported_files_with_hook(
             let entry = item.map_err(|error| path_error(&directory.path, error))?;
             let name = entry.file_name();
             let name_bytes = name.as_encoded_bytes().len();
-            scanned_name_bytes = scanned_name_bytes
-                .checked_add(name_bytes)
-                .unwrap_or(usize::MAX);
+            scanned_name_bytes = scanned_name_bytes.saturating_add(name_bytes);
             if scanned_name_bytes > limits.scanned_name_bytes_max {
                 return Err(discovery_limit_error(
                     &directory.path,
@@ -1504,7 +1502,7 @@ fn run_reference_script(
             return Err(ShellError::new(
                 ErrorCode::InvalidArgument,
                 "reference runner requires Bash or Zsh",
-            ))
+            ));
         }
     }
     // The syntax-error classifier matches untranslated interpreter
@@ -2067,12 +2065,13 @@ fn command_block_diagnostics(
         let line = line.strip_suffix('\r').unwrap_or(line);
         let leading = line.len().saturating_sub(line.trim_start().len());
         let trimmed = line.trim();
-        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-            if let Err(mut error) = parse_command_list(trimmed) {
-                error.start += offset + leading;
-                error.end += offset + leading;
-                diagnostics.push(error);
-            }
+        if !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && let Err(mut error) = parse_command_list(trimmed)
+        {
+            error.start += offset + leading;
+            error.end += offset + leading;
+            diagnostics.push(error);
         }
         offset += raw_line.len();
     }
@@ -2654,9 +2653,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error.details.labels[0]
-            .message
-            .contains("explicit Quirl capability"));
+        assert!(
+            error.details.labels[0]
+                .message
+                .contains("explicit Quirl capability")
+        );
     }
 
     #[test]
@@ -2850,11 +2851,13 @@ mod tests {
 
     fn assert_discovery_limit(error: &ShellError, limit: usize, observed: usize) {
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(error
-            .details
-            .context
-            .iter()
-            .any(|context| context == &format!("limit: {limit}; observed: {observed}")));
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context == &format!("limit: {limit}; observed: {observed}"))
+        );
     }
 
     #[test]
@@ -3055,11 +3058,13 @@ mod tests {
         let source = format!("data ^external touch {} | from\n", marker.display());
         let error = check_quirl_source(&source, "check.qrl").unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidCommand);
-        assert!(error
-            .details
-            .labels
-            .iter()
-            .any(|label| label.message.contains("invalid arguments for `from`")));
+        assert!(
+            error
+                .details
+                .labels
+                .iter()
+                .any(|label| label.message.contains("invalid arguments for `from`"))
+        );
         let lsp = lsp_native_diagnostics(&source);
         assert!(lsp.iter().any(|diagnostic| {
             diagnostic.source == "quirl-data"

@@ -1,4 +1,4 @@
-use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
+use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use quirl_catalog::Catalog;
 use quirl_lua::QuirlConfig;
 use quirl_syntax::Mode;
@@ -853,10 +853,10 @@ impl PtySession {
         }
         let _ = self.child.wait();
         drop(self.writer);
-        if let Some(handle) = self.reader_thread.take() {
-            if handle.is_finished() {
-                let _ = handle.join();
-            }
+        if let Some(handle) = self.reader_thread.take()
+            && handle.is_finished()
+        {
+            let _ = handle.join();
         }
     }
 }
@@ -1755,17 +1755,21 @@ mod tests {
     #[test]
     fn semantic_proxy_classifies_command_option_and_value_segments() {
         let segments = semantic_highlight_proxy(&Catalog::builtin(), "git commit --amend now");
-        assert!(segments
-            .iter()
-            .any(
+        assert!(
+            segments.iter().any(
                 |(class, value)| matches!(class, HighlightClass::KnownCommand) && *value == "git"
-            ));
-        assert!(segments
-            .iter()
-            .any(|(class, value)| matches!(class, HighlightClass::Option) && *value == "--amend"));
-        assert!(segments
-            .iter()
-            .any(|(class, value)| matches!(class, HighlightClass::Value) && *value == "now"));
+            )
+        );
+        assert!(
+            segments.iter().any(
+                |(class, value)| matches!(class, HighlightClass::Option) && *value == "--amend"
+            )
+        );
+        assert!(
+            segments
+                .iter()
+                .any(|(class, value)| matches!(class, HighlightClass::Value) && *value == "now")
+        );
     }
 
     #[test]
@@ -1862,8 +1866,10 @@ mod tests {
         assert_eq!(rejected.target_result, "measured_miss");
         assert!(!rejected.hard_gate_passed);
         assert!(!rejected.release_gate_accepted);
-        assert!(binary_size_gate_failure(&rejected)
-            .is_some_and(|failure| failure.contains("hard limit")));
+        assert!(
+            binary_size_gate_failure(&rejected)
+                .is_some_and(|failure| failure.contains("hard limit"))
+        );
     }
 
     #[test]

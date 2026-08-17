@@ -54,7 +54,7 @@ current contract above or an accepted ADR/runtime source, it is direction—not
 landed behavior or release evidence.
 
 ```text
-quirl · ~/src/payments                         command · git: feature/typed-runners · rust 1.88
+quirl · ~/src/payments                      command · git: feature/typed-runners · rust 1.97.1
 > quirl run deploy.lua --env staging
   hint: incomplete value; Tab accepts `staging` declared by deploy.lua:12
 ▦ ls services | where status == "degraded" | preview
