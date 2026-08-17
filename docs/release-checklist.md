@@ -132,7 +132,7 @@ The exact commands and adversarial text-only checks are also recorded in the
 [security and accessibility audit](security-accessibility-audit-v0.1.md).
 
 The historical P14 candidate's release artifact passed every automated scenario
-in `scripts/check-rich-pty.py` on actual macOS hardware. That run covered rich
+in `cargo xtask rich-pty` on actual macOS hardware. That run covered rich
 editing, completion, integrated runtime behavior, review regressions, native job
 control, noninteractive dialect islands, suspend/resume, fallback selection,
 and `NO_COLOR`. It used a programmatic 120×40 pseudo-terminal, not a named

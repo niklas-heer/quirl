@@ -1,6 +1,10 @@
 //! Reproducible development, documentation, test, and release tasks for Quirl.
 
 use clap::{Parser, Subcommand};
+#[cfg(unix)]
+mod pty;
+#[cfg(unix)]
+mod rich_pty;
 mod simulation;
 
 use std::{
@@ -53,6 +57,16 @@ enum Task {
     },
     /// Build all public Rust API documentation with warnings denied.
     Docs,
+    /// Run bounded real-terminal checks through the Rust PTY harness.
+    #[cfg(unix)]
+    RichPty {
+        /// Quirl binary to launch inside each isolated PTY session.
+        #[arg(long, default_value = "target/debug/quirl")]
+        binary: PathBuf,
+        /// Run only this named check; repeat to select multiple checks.
+        #[arg(long)]
+        check: Vec<String>,
+    },
     /// Check website mirrors, lint, types, and a production build without rewriting sources.
     WebsiteCheck,
     /// Explore replayable shell sessions against clean Bash and Zsh references.
@@ -111,6 +125,15 @@ fn execute(cli: Cli) -> Result<(), Box<dyn Error>> {
         Task::Test { seed, cases } => task_test(&root, seed, cases),
         Task::Check { seed, cases } => task_check(&root, seed, cases),
         Task::Docs => task_docs(&root),
+        #[cfg(unix)]
+        Task::RichPty { binary, check } => {
+            let binary = if binary.is_absolute() {
+                binary
+            } else {
+                root.join(binary)
+            };
+            rich_pty::run(&root, &binary, &check)
+        }
         Task::WebsiteCheck => task_website_check(&root),
         Task::Simulate {
             seed,
@@ -158,17 +181,11 @@ fn task_test(root: &Path, seed: u64, cases: usize) -> Result<(), Box<dyn Error>>
         .run()?;
     #[cfg(unix)]
     {
-        cmd!(sh, "python3 scripts/test_pty_harness.py")
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .run()?;
         cmd!(sh, "cargo build -p quirl-cli")
             .env("QUIRL_TEST_SEED", &seed)
             .env("QUIRL_TEST_CASES", &cases)
             .run()?;
-        cmd!(sh, "python3 scripts/check-rich-pty.py target/debug/quirl")
-            .env("QUIRL_TEST_SEED", &seed)
-            .env("QUIRL_TEST_CASES", &cases)
-            .run()?;
+        rich_pty::run(root, &debug_quirl_binary(root), &[])?;
     }
     cmd!(sh, "cargo run -p quirl-cli -- test examples/lua_tests.lua")
         .env("QUIRL_TEST_SEED", &seed)

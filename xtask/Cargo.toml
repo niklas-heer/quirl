@@ -12,9 +12,10 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 xshell.workspace = true
+unicode-width.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix.workspace = true
+nix = { workspace = true, features = ["fs", "poll"] }
 
 [lints]
 workspace = true
