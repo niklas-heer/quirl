@@ -206,7 +206,7 @@ reusing the revision-keyed syntax analysis. Every draw records a rolling P95
 - **Undo/redo**: linear stacks bounded to 256 states and 8 MiB each. Keystroke
   coalescing and an undo tree are later enhancements.
 - **Kill ring**: `Ctrl-U`/`Ctrl-W`/`Ctrl-Y` semantics in the Emacs keymap;
-  `Ctrl-K` opens the shipped palette, so Emacs kill-to-end and registers remain
+  `Alt-Q p` opens the shipped palette, so Emacs kill-to-end and registers remain
   future keymap-parity work.
 - **Paste safety**: bracketed paste inserts literally — newlines in pasted text
   never trigger execution; the frame shows `⇪ pasted 3 lines` in the status
@@ -242,9 +242,10 @@ enum EditAction {
 | `Shift-Tab` | Expand completion into full picker | §10 contract |
 | `Enter` | Accept (or newline if input incomplete) | |
 | `Alt-Enter` | Force newline | |
-| `Alt-M` | Command/data mode toggle | existing `quirl:mode-toggle` host action |
+| `Alt-Q`, then a mnemonic | Quirl leader for modes, pickers, jobs, and results | collision-free internal command namespace |
 | `Ctrl-Space` | Command/data mode toggle compatibility alias | some terminals cannot distinguish this from NUL |
-| `Ctrl-R` / `Ctrl-T` / `Alt-C` / `Ctrl-K` | History / files / directories / palette picker | existing bindings + Alt-C |
+| `Ctrl-R` or `Up` | Cwd-aware fuzzy history | conventional history entrypoint |
+| `Alt-Q f/c/p/j/r` | Files / directories / palette / jobs / results | Quirl leader namespace |
 | `Ctrl-G` / `Alt-D` | Active jobs / cached typed-data picker | snapshots only; selection inserts a revalidated command or data expression |
 | `Ctrl-C` | Clear line, dismiss popup; never exits | |
 | `Ctrl-D` | EOF on empty line → exit | |
@@ -265,7 +266,7 @@ Glyphs come from `PromptSymbols` profiles — `plain` profile substitutes ASCII
 ```
  ~/projects/quirl  main ✚2                                 1 job · 412ms · ✘1
 ❯ cargo build --release▌
- command   Alt-M mode · Tab complete · ^K palette · ^R history        quirl
+ ❯ NORMAL   Alt-Q Quirl · Tab complete · ↑ / Ctrl-R history           quirl
 ```
 
 Row 1 — **context row**: existing prompt segments. Left list (`directory`,
@@ -277,7 +278,7 @@ surface consumes escaped, rendered left/right `QuirlPrompt` strings and gives
 the branch suffix a secondary style rather than retaining one styled span per
 source segment.
 
-Row 2 — **input row**: mode indicator (`❯` command / `◆` data), one space,
+Row 2 — **input row**: mode indicator (`❯` normal / `▦` data / `✧` AI), one space,
 the highlighted buffer, hardware cursor at the edit position
 (`Frame::set_cursor_position`). Inline history autosuggestion renders dim
 after the cursor.
@@ -343,7 +344,7 @@ remain clear so resize cannot leave stale geometry behind.
 
 ### 5.4 Data mode
 
-Identical layout; the mode indicator becomes `◆`, the accent color switches to
+Identical layout; the mode indicator becomes `▦`, the accent color switches to
 the data accent (one accent per mode, §7), and the status bar reads
 `· data ·`. Highlighting uses the data-expression lexer once it exposes spans;
 until then data mode renders with the plain style rather than wrong guesses.
@@ -366,7 +367,7 @@ only if they can be proven not to reflow scrollback. Controlled by
 
 ### 5.6 Picker overlays
 
-`Ctrl-R`/`Ctrl-T`/`Alt-C`/`Ctrl-K`/`Ctrl-G`/`Alt-D` reuse the frame: the popup region becomes a
+`Ctrl-R`/`Up` and the `Alt-Q` picker chords reuse the frame: the popup region becomes a
 picker (query row + virtualized result list + optional preview pane),
 honoring `picker.layout`:
 
@@ -374,7 +375,7 @@ honoring `picker.layout`:
 - `full`: terminal-height picker using the same full-screen frame and RAII
   lifecycle as ordinary editing.
 
-The shipped `Ctrl-K` command palette always requests a terminal-height
+The shipped `Alt-Q p` command palette always requests a terminal-height
 region and positions its bounded adaptive content against the bottom edge. It
 does not perform another screen transition; the existing terminal guard releases
 the shared alternate screen before execution, suspension, or error return.
@@ -463,7 +464,7 @@ patching the lexer style with a diagnostic severity style.
 | Role | Default | Used by |
 | --- | --- | --- |
 | `accent.command` | green | indicator `❯`, popup selection, match highlights |
-| `accent.data` | magenta | indicator `◆` and all accent uses in data mode |
+| `accent.data` | magenta | indicator `▦` and all accent uses in data mode |
 | `command.known` / `command.unknown` | green / red | input row |
 | `flag` | cyan | input row |
 | `string` | yellow | quoted regions |
@@ -603,7 +604,7 @@ and explicit editor, completion, picker, PATH, undo, and history bounds. The
 full permutation implied above (especially every degradation row, `NO_COLOR`,
 plain symbols, lifecycle reconstruction, and named terminal snapshots) remains
 release-evidence work. `cargo xtask rich-pty` covers deletion, wrapping,
-Alt-M repaint, completion, execution handoff, and Ctrl-D on a real Unix PTY.
+Alt-Q leader repaint, completion, execution handoff, and Ctrl-D on a real Unix PTY.
 
 ---
 

@@ -96,7 +96,8 @@ embedding set.
 
 `quirl ai search` supports natural-language command search and option search;
 `quirl ai related` provides related-command and related-option suggestions.
-The interactive `natural`/`nl` mode exposes the same ranking. When either the
+The interactive `ai` mode exposes the same ranking (`natural`, `nl`, and
+`human` remain aliases). When either the
 local model or matching embeddings are unavailable, the query uses bounded,
 deterministic lexical ranking. Suggestions are display-only and are never
 executed automatically.

@@ -94,7 +94,7 @@ export default function HomePage() {
               </div>
             </div>
             <div className="terminal-footer">
-              <span>Alt-M command mode</span>
+              <span>Alt-Q Quirl leader</span>
               <span>Tab complete</span>
               <span>F1 help</span>
             </div>

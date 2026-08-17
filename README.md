@@ -37,7 +37,7 @@ In German, a *Quirl* is the humble wooden whisk: a simple tool that takes
 ingredients which do not naturally mix and folds them into something smooth.
 Quirl does that for the command line.
 
-- **Familiar command mode** keeps the quoting, redirects, byte pipes, boolean
+- **Familiar normal mode** keeps the quoting, redirects, byte pipes, boolean
   lists, and jobs you already use, with explicit Bash and Zsh islands for
   syntax outside Quirl's frozen native core.
 - **Typed data pipelines** add an explicit data mode for records, tables,
@@ -72,8 +72,8 @@ cargo xtask demo
 ```
 
 Inside an interactive session, <kbd>Tab</kbd> opens semantic completion,
-<kbd>F1</kbd> opens contextual help, <kbd>Alt-M</kbd> changes mode,
-<kbd>Ctrl-R</kbd> searches history, and <kbd>Ctrl-T</kbd> opens the file picker.
+<kbd>F1</kbd> opens contextual help, <kbd>Alt-Q</kbd> opens Quirl's leader menu,
+<kbd>Ctrl-R</kbd> or <kbd>Up</kbd> searches cwd-aware history; <kbd>Alt-Q</kbd>, then <kbd>f</kbd>, opens the file picker.
 
 For requirements and a guided first session, see the website's
 [getting-started section](website/content/docs/getting-started/index.mdx).

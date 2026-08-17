@@ -137,8 +137,8 @@ cargo build -p quirl-cli
 cargo xtask rich-pty --check mode-switch-and-palette-screen
 ```
 
-The focused interaction sends the legacy-terminal encodings for Alt-M and
-Ctrl-K exactly. It asserts that repeated mode switches retain the edit buffer
+The focused interaction sends the legacy-terminal encoding for Alt-Q and
+Alt-Q leader chords exactly. It asserts that repeated mode switches retain the edit buffer
 without feedback scrollback, the palette status is on the physical bottom row,
 and dismissal erases the expanded viewport before restoring the compact prompt.
 

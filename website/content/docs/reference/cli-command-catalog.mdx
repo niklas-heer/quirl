@@ -149,11 +149,11 @@ Options:
 
 - `expression` — Positional `expression` declared by the builtin command signature.
 
-## `mode <command|data|toggle>`
+## `mode <normal|data|ai|toggle>`
 
 Switch the visible interactive grammar
 
-Command mode carries bytes and process status. Data mode evaluates Quirl's native structured values and pipelines.
+Normal mode carries bytes and process status. Data mode evaluates Quirl's native structured values and pipelines. AI mode searches the local command database and inserts suggestions for review without executing them.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -161,7 +161,7 @@ Command mode carries bytes and process status. Data mode evaluates Quirl's nativ
 
 Options:
 
-- `command|data|toggle` — Positional `command|data|toggle` declared by the builtin command signature.
+- `normal|data|ai|toggle` — Positional `normal|data|ai|toggle` declared by the builtin command signature.
 
 ## `quirl agent catalog [--format text|json]`
 
@@ -222,6 +222,67 @@ Options:
 - `file` — Positional `file` declared by the builtin command signature.
 - `--format` — Choose accessible diagnostics or stable JSON
 - `--kind` — Select the deny-unknown document schema
+
+## `quirl ai index [--format text|json]`
+
+Build local semantic command and option embeddings
+
+Loads potion-base-8M from local files, embeds bounded command and option documents, validates every vector, and atomically replaces the SQLite database only after a complete transaction.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
+Options:
+
+- `--format` — Choose accessible text or stable machine JSON
+
+## `quirl ai related <command...> [--limit count] [--format text|json]`
+
+Suggest related commands and options
+
+Uses the same local semantic index as AI mode, excludes the requested command, and returns bounded suggestions without execution.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
+Options:
+
+- `command` — Positional `command` declared by the builtin command signature.
+- `--format` — Choose accessible text or stable machine JSON
+- `--limit` — Bound returned suggestions to at most 100
+
+## `quirl ai search <query...> [--limit count] [--kind all|command|option] [--format text|json]`
+
+Find commands and options by task intent
+
+Ranks local potion-base-8M embeddings when the model and semantic index are ready, otherwise uses deterministic bounded lexical search. Results are suggestions and are never executed.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
+Options:
+
+- `query` — Positional `query` declared by the builtin command signature.
+- `--format` — Choose accessible text or stable machine JSON
+- `--kind` — Restrict results to commands, options, or both
+- `--limit` — Bound returned suggestions to at most 100
+
+## `quirl ai status [--format text|json]`
+
+Inspect local command-intelligence readiness
+
+Reports the SQLite command database and potion-base-8M file locations without loading a model or contacting the network.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
+Options:
+
+- `--format` — Choose accessible text or stable machine JSON
 
 ## `quirl catalog [--format text|json|markdown]`
 

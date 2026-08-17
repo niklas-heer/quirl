@@ -100,9 +100,10 @@ remain current. If database bytes change without a matching request while an
 embedding build is in flight, the worker retries against the newest bytes
 instead of sleeping until user input. `quirl ai index` remains an explicit diagnostic/refresh tool;
 it is not required for normal setup. `quirl ai search`, `quirl ai related`, and
-interactive natural mode read the same database. Missing model files or
-embeddings select deterministic lexical ranking. Natural mode and AI
-subcommands only display suggestions and never execute one.
+interactive AI mode read the same database. Missing model files or embeddings
+select deterministic lexical ranking. AI mode inserts a selected suggestion
+into normal mode for review, while AI subcommands only display suggestions;
+neither path executes one directly.
 
 ## Failure model and invariants
 

@@ -1,5 +1,13 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -9,6 +17,8 @@ const outputBytesMax = 8 * 1024 * 1024;
 const timeoutMs = 120_000;
 const arguments_ = process.argv.slice(2);
 const checkMode = arguments_.includes('--check');
+const isolatedIndexRoot = mkdtempSync(join(tmpdir(), 'quirl-reference-'));
+const isolatedIndexPath = join(isolatedIndexRoot, 'catalog.sqlite3');
 
 if (arguments_.some((argument) => argument !== '--check')) {
   throw new Error('usage: node scripts/sync-generated-reference.mjs [--check]');
@@ -38,6 +48,7 @@ function generate(commandArguments) {
     {
       cwd: repositoryRoot,
       encoding: 'utf8',
+      env: { ...process.env, QUIRL_INDEX_PATH: isolatedIndexPath },
       maxBuffer: outputBytesMax,
       timeout: timeoutMs,
     },
@@ -55,19 +66,23 @@ function generate(commandArguments) {
 
 const driftedFiles = [];
 
-for (const reference of references) {
-  const body = generate(reference.arguments);
-  const target = join(websiteRoot, reference.target);
-  const rendered = `---\ntitle: ${JSON.stringify(reference.title)}\ndescription: ${JSON.stringify(reference.description)}\n---\n\n{/* Generated from the compiled Quirl catalog. Run npm run sync:reference; do not edit this page by hand. */}\n\n${body}\n`;
+try {
+  for (const reference of references) {
+    const body = generate(reference.arguments);
+    const target = join(websiteRoot, reference.target);
+    const rendered = `---\ntitle: ${JSON.stringify(reference.title)}\ndescription: ${JSON.stringify(reference.description)}\n---\n\n{/* Generated from the compiled Quirl catalog. Run npm run sync:reference; do not edit this page by hand. */}\n\n${body}\n`;
 
-  if (checkMode) {
-    if (!existsSync(target) || readFileSync(target, 'utf8') !== rendered) {
-      driftedFiles.push(relative(repositoryRoot, target));
+    if (checkMode) {
+      if (!existsSync(target) || readFileSync(target, 'utf8') !== rendered) {
+        driftedFiles.push(relative(repositoryRoot, target));
+      }
+    } else {
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, rendered);
     }
-  } else {
-    mkdirSync(dirname(target), { recursive: true });
-    writeFileSync(target, rendered);
   }
+} finally {
+  rmSync(isolatedIndexRoot, { recursive: true, force: true });
 }
 
 if (driftedFiles.length > 0) {

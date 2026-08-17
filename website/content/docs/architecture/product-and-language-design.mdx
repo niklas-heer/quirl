@@ -62,7 +62,7 @@ landed behavior or release evidence.
 quirl · ~/src/payments                         command · git: feature/typed-runners · rust 1.88
 > quirl run deploy.lua --env staging
   hint: incomplete value; Tab accepts `staging` declared by deploy.lua:12
-◆ ls services | where status == "degraded" | preview
+▦ ls services | where status == "degraded" | preview
   3 rows
 ```
 
@@ -110,15 +110,16 @@ Compatibility, structured data, rich UI, and a real extension language pull in d
 
 ### A modal shell, not a modal trap
 
-Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unlike Vim, every action has a textual form so sessions are reproducible and accessible. Switch modes with `Alt-M`.
+Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unlike Vim, every action has a textual form so sessions are reproducible and accessible. Open Quirl's leader menu with `Alt-Q`, then press `n`, `d`, or `i` for normal, data, or AI mode.
 
 | Mode | Contract | Examples | Explicit entry |
 | --- | --- | --- | --- |
-| Command `❯` | Bytes and processes; compatibility grammar; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `cargo test --workspace`, `false \|\| echo recovered` | `mode command`; force external with `^ls` |
-| Data `◆` | Unambiguous Quirl grammar; typed, lazy values; external programs require an adapter or `^command`; failures are `Result` values | `ps \| where cpu > 20 \| sort cpu desc`, `open users.json \| get users \| select name email` | `mode data`; one-shot `data { ... }` |
+| Normal `❯` | Bytes and processes; compatibility grammar; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `cargo test --workspace`, `false \|\| echo recovered` | `mode normal` (legacy: `mode command`); force external with `^ls` |
+| Data `▦` | Unambiguous Quirl grammar; typed, lazy values; external programs require an adapter or `^command`; failures are `Result` values | `ps \| where cpu > 20 \| sort cpu desc`, `open users.json \| get users \| select name email` | `mode data`; one-shot `data { ... }` |
+| AI `✧` | Live command and option discovery over the SQLite catalog; the pinned potion-base-8M model downloads and indexes automatically after first paint. Enter inserts the selected suggestion into normal mode for review and never executes it directly. | `copy a directory while preserving permissions`, `find the option that follows symlinks` | `mode ai`; `Alt-Q i` selects it. `mode natural`, `mode nl`, and `mode human` remain aliases. |
 
 ```text title="Quirl"
-◆ http get /health | match {
+▦ http get /health | match {
     { status: 200, .. } => "up"
     error => error?
   }
@@ -364,10 +365,10 @@ type Entry = {
   target: Path?,
 }
 
-◆ ls                         # adaptive human view
-◆ ls | where type == dir     # structured filter
-◆ ls --all --long            # familiar flags remain
-◆ ls | view tree             # renderer chosen explicitly
+▦ ls                         # adaptive human view
+▦ ls | where type == dir     # structured filter
+▦ ls --all --long            # familiar flags remain
+▦ ls | view tree             # renderer chosen explicitly
 ❯ ls | grep Cargo            # command mode emits compatible text
 ❯ ^ls -la                    # bypass built-in; run system ls
 ```
@@ -557,13 +558,13 @@ The input buffer is parsed continuously, understands command schemas and annotat
 fzf proves fuzzy selection is a terminal primitive. Quirl includes a native, typed picker in the line editor and exposes the same engine to commands, scripts, and plugins. Users should not have to install a finder and wire shell-specific bindings merely to search history or files.
 
 - **Typed selection:** displays labels, highlights, metadata, and previews but returns the original value. Picking a `Process`, `Path`, history entry, or plugin record never round-trips through lossy display text.
-- **Shared muscle memory:** `Ctrl-R` history, `Ctrl-T` files, `Alt-C` directories, `Ctrl-K` all actions, and `Shift-Tab` expands completion into the full picker. Bindings are discoverable and remappable.
+- **Shared muscle memory:** `Ctrl-R` or `Up` opens fuzzy history, `Alt-Q` owns Quirl-internal chords (`f` files, `c` directories, `p` actions, `j` jobs, `r` results), and `Shift-Tab` expands completion into the full picker. Conventional shell editing chords remain available.
 - **Interactive contract:** single/multi-select, exact/fuzzy/inverse terms, source switching, live reload, safe previews, named actions, cancellable/backpressured providers, and virtualized rendering.
 - **Script contract:** `pick` accepts byte lines or typed streams and emits selected values. `--query`, `--multi`, `--preview`, `--format`, and non-interactive fallback rules are testable.
 
 ```text title="Quirl"
-◆ ls **/*.rs | pick --display path --preview source | open
-◆ ps | where cpu > 5 | pick --multi --preview process | kill --confirm
+▦ ls **/*.rs | pick --display path --preview source | open
+▦ ps | where cpu > 5 | pick --multi --preview process | kill --confirm
 ❯ git branch --format='%(refname:short)' | pick --query feature
 ```
 
@@ -798,8 +799,7 @@ evidence required for that decision; they are not a current task list:
   through a single native plan across built-ins and external processes;
   the C0 surface (`ls | grep …`, `> file`, quoting) no longer round-trips
   through the compatibility shell.
-- **Durable history and picker.** History persists across sessions;
-  `Ctrl-R` opens the typed picker over history entries, and the same engine
+- **Durable history and picker.** A separate bounded SQLite database records command, working directory, status, duration, and mode across sessions. Same-directory entries receive a ranking preference; `Ctrl-R` or `Up` opens the typed picker over history entries, and the same engine
   serves files and palette actions with a plain-text fallback.
 - **Completion ingestion.** Fish declarative completions plus at least one
   of Bash/Zsh translate into `CommandSpec` entries with provenance and
@@ -931,12 +931,13 @@ and accessible text output, per the release criterion in §10.
 
 On 15 August 2026, the following decisions were reviewed and agreed:
 
-- **Two explicit interactive modes:** command mode uses bytes and compatibility syntax; data mode uses typed value pipelines.
+- **Three explicit interactive modes:** normal mode uses bytes and compatibility syntax; data mode uses typed value pipelines; AI mode searches local command knowledge and inserts a selected command for review without execution.
 - **C0–C4 compatibility levels:** optimize copy/paste and common interactive syntax; use reference interpreters for exact dialect behavior.
 - **Result-based errors outside command mode:** retain traditional status interactively; require explicit failure handling in data pipelines and scripts.
 - **Lua 5.4 as the extension language:** Rust implements the product; one pinned Lua runtime and generated `quirl` SDK serve config, scripts, trusted plugins; annotations improve tooling while Rust schemas enforce boundaries.
 - **Batteries-included scope:** ship coherent navigation, discovery, data, views, developer context, operations.
 - **One semantic command catalog:** completion, highlighting, docs, validation, AI discovery, plugins consume one versioned `CommandSpec` graph.
+- **Zero-setup local command intelligence:** first paint precedes bounded background model installation, full catalog discovery (including non-executing PATH-gated system man-page semantics), and SQLite embedding even while the shell remains idle; the bottom status row reports cached activity, failures retain lexical search, and refreshed catalogs re-index automatically.
 - **Self-describing AI interface:** export installed capabilities as token-budgeted Markdown or canonical JSON with check/format/lint and optional MCP access.
 - **Lua plugin platform plus Wasm isolation:** trusted Lua gets generated SDK metadata and explicit capabilities; untrusted/portable plugins use the same capability model through WebAssembly components.
 - **Native typed fuzzy picker:** history, files, completion, commands, data values, plugins share one previewable, scriptable selection engine.

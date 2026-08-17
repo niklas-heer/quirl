@@ -104,10 +104,10 @@ font or a Nerd Font was used. A glyph difference must never change behavior.
 - [ ] `config web` renders bounded no-JavaScript preview cards for built-in and
   configured custom themes, and selecting a card updates only the validated
   `ui.theme` literal through the existing backup transaction.
-- [ ] The mode indicator is always visible; `Alt-M` switches command/data
+- [ ] The mode indicator is always visible; `Alt-Q` opens the Quirl leader
   mode and the text labels remain understandable without relying on color.
-- [ ] Tab completion, `Ctrl-R` history, `Ctrl-T` files, `Alt-C` directories,
-  and `Ctrl-K` catalog actions are keyboard navigable and return the selected
+- [ ] Tab completion, `Ctrl-R`/`Up` history, and the `Alt-Q` file, directory,
+  and catalog-action chords are keyboard navigable and return the selected
   typed value in the rich surface.
 - [ ] `ui.surface = "simple"`, `TERM=dumb`, a non-TTY stderr, and terminal
   height below five rows select the Reedline fallback rather than attempting
