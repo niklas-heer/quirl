@@ -249,7 +249,10 @@ mod platform {
     };
 
     #[cfg(unix)]
-    use std::os::unix::{ffi::OsStrExt, process::CommandExt};
+    use std::os::unix::{
+        ffi::OsStrExt,
+        process::{CommandExt, ExitStatusExt},
+    };
 
     /// Aggregate lifecycle state for a native job.
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -427,14 +430,20 @@ mod platform {
 
     /// Cross-platform containment hook for a directly spawned child process.
     pub struct ChildProcessTree {
-        process_group: Mutex<Option<i32>>,
+        process_group: Mutex<ContainedProcessGroup>,
+    }
+
+    enum ContainedProcessGroup {
+        Unassigned,
+        Live(i32),
+        Exited,
     }
 
     impl ChildProcessTree {
         /// Create the Unix containment hook.
         pub fn new() -> Result<Self, ShellError> {
             Ok(Self {
-                process_group: Mutex::new(None),
+                process_group: Mutex::new(ContainedProcessGroup::Unassigned),
             })
         }
 
@@ -457,24 +466,34 @@ mod platform {
                 .with_context(error.to_string())
                 .with_help("Report this platform-specific process error")
             })?;
-            verify_process_group(child, process_id, process_id)?;
+            let verification = verify_process_group(child, process_id, process_id)?;
             let mut group = self.process_group.lock().map_err(|_| {
                 ShellError::new(ErrorCode::Io, "process containment state is unavailable")
                     .with_help("Restart Quirl before launching another contained process")
             })?;
-            if group.replace(process_id).is_some() {
+            if !matches!(*group, ContainedProcessGroup::Unassigned) {
                 return Err(ShellError::new(
                     ErrorCode::InvalidArgument,
                     "process containment object already owns a child",
                 )
                 .with_help("Create one containment object for each direct child tree"));
             }
+            *group = match verification {
+                ProcessGroupVerification::Live => ContainedProcessGroup::Live(process_id),
+                ProcessGroupVerification::Exited(_) => ContainedProcessGroup::Exited,
+            };
             Ok(())
         }
 
         /// Terminate a directly spawned child if it is still live.
         pub fn terminate(&self, child: &mut Child) -> Result<(), ShellError> {
-            let group = self.process_group.lock().ok().and_then(|group| *group);
+            let group = self.process_group.lock().ok().and_then(|group| {
+                if let ContainedProcessGroup::Live(process_group) = *group {
+                    Some(process_group)
+                } else {
+                    None
+                }
+            });
             let group_result = group.map(|group| killpg(Pid::from_raw(group), Signal::SIGKILL));
             let child_result = child.kill();
             let group_ok = matches!(group_result, None | Some(Ok(())) | Some(Err(Errno::ESRCH)));
@@ -2223,17 +2242,63 @@ mod platform {
         Ok(())
     }
 
+    #[derive(Debug)]
+    enum ProcessGroupVerification {
+        Live,
+        Exited(i32),
+    }
+
+    fn observe_fast_child_exit(
+        child: &mut Child,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        const STATUS_OBSERVATIONS_MAX: usize = 1_024;
+        for _ in 0..STATUS_OBSERVATIONS_MAX {
+            match child.try_wait() {
+                Ok(None) => thread::yield_now(),
+                result => return result,
+            }
+        }
+        Ok(None)
+    }
+
     fn verify_process_group(
         child: &mut Child,
         process_id: i32,
         process_group: i32,
-    ) -> Result<(), ShellError> {
+    ) -> Result<ProcessGroupVerification, ShellError> {
         let process_id = Pid::from_raw(process_id);
         let expected_group = Pid::from_raw(process_group);
         let set_result = setpgid(process_id, expected_group);
         let observed_group = getpgid(Some(process_id));
+        let mut exited_child_context = None;
         if observed_group == Ok(expected_group) {
-            return Ok(());
+            return Ok(ProcessGroupVerification::Live);
+        }
+        if set_result == Err(Errno::ESRCH) && observed_group == Err(Errno::ESRCH) {
+            let leader_cleanup = if process_id == expected_group {
+                killpg(expected_group, Signal::SIGKILL)
+            } else {
+                Err(Errno::ESRCH)
+            };
+            // macOS reports EPERM for a process group whose only remaining
+            // member is the owned zombie. A live same-user descendant would
+            // instead make this kill succeed, so it is contained before the
+            // direct child is reaped and its PID can be reused.
+            let leader_contained = matches!(leader_cleanup, Ok(()) | Err(Errno::ESRCH))
+                || cfg!(target_os = "macos") && leader_cleanup == Err(Errno::EPERM);
+            let child_status = observe_fast_child_exit(child);
+            exited_child_context = Some(format!(
+                "; leader_cleanup={leader_cleanup:?}; child_status={child_status:?}"
+            ));
+            if leader_contained {
+                if let Ok(Some(status)) = child_status {
+                    let exit_status = status
+                        .code()
+                        .or_else(|| status.signal().map(|signal| 128 + signal))
+                        .unwrap_or(1);
+                    return Ok(ProcessGroupVerification::Exited(exit_status));
+                }
+            }
         }
         let _ = child.kill();
         let _ = child.wait();
@@ -2242,7 +2307,8 @@ mod platform {
             "could not establish the native pipeline process group",
         )
         .with_context(format!(
-            "pid {process_id}; expected group {expected_group}; setpgid={set_result:?}; getpgid={observed_group:?}"
+            "pid {process_id}; expected group {expected_group}; setpgid={set_result:?}; getpgid={observed_group:?}{}",
+            exited_child_context.unwrap_or_default()
         ))
         .with_help("Retry the command; report repeated process-group construction failures"))
     }
@@ -2272,12 +2338,20 @@ mod platform {
                 .with_help("Report this platform-specific process error")
             })?;
             let process_group = self.process_group.unwrap_or(process_id);
-            verify_process_group(&mut child, process_id, process_group)?;
-            self.process_group.get_or_insert(process_group);
+            let verification = verify_process_group(&mut child, process_id, process_group)?;
+            let (status, exit_status) = match verification {
+                ProcessGroupVerification::Live => {
+                    self.process_group.get_or_insert(process_group);
+                    (JobStatus::Running, None)
+                }
+                ProcessGroupVerification::Exited(exit_status) => {
+                    (JobStatus::Done, Some(exit_status))
+                }
+            };
             self.children.push(JobChild {
                 child,
-                status: JobStatus::Running,
-                exit_status: None,
+                status,
+                exit_status,
             });
             Ok(())
         }
@@ -3749,13 +3823,67 @@ mod platform {
             assert!(kill(pid, None).is_err());
         }
 
+        #[cfg(target_os = "macos")]
+        fn guard_after_leader_kernel_exit(command: &str) -> PipelineConstructionGuard {
+            const STATUS_OBSERVATIONS_MAX: usize = 100_000;
+            let mut command_builder = Command::new("sh");
+            command_builder.arg("-c").arg(command).process_group(0);
+            let mut child = command_builder.spawn().unwrap();
+            let process_id = Pid::from_raw(i32::try_from(child.id()).unwrap());
+            for _ in 0..STATUS_OBSERVATIONS_MAX {
+                if getpgid(Some(process_id)) == Err(Errno::ESRCH) {
+                    let mut guard = PipelineConstructionGuard::new();
+                    guard.push(child).unwrap();
+                    return guard;
+                }
+                thread::yield_now();
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "child {process_id} did not exit within {STATUS_OBSERVATIONS_MAX} bounded observations"
+            );
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn exited_leader_is_recorded_without_retaining_a_reusable_group_id() {
+            for (command, expected_status) in [("exit 0", 0), ("exit 23", 23)] {
+                let guard = guard_after_leader_kernel_exit(command);
+
+                assert_eq!(guard.process_group, None);
+                assert_eq!(guard.children[0].status, JobStatus::Done);
+                assert_eq!(guard.children[0].exit_status, Some(expected_status));
+            }
+        }
+
+        #[test]
+        fn live_child_in_the_wrong_group_fails_closed_and_is_reaped() {
+            let mut command = Command::new("sh");
+            command.arg("-c").arg("sleep 10");
+            let mut child = command.spawn().unwrap();
+            let process_id = i32::try_from(child.id()).unwrap();
+
+            let error = verify_process_group(&mut child, process_id, process_id).unwrap_err();
+
+            assert_eq!(error.code, ErrorCode::ProcessSpawn);
+            assert!(error.message.contains("process group"));
+            assert!(child.try_wait().unwrap().is_some());
+            assert!(kill(Pid::from_raw(process_id), None).is_err());
+        }
+
         #[test]
         fn immediate_leader_exit_does_not_break_verified_group_construction() {
-            for _ in 0..64 {
+            for _ in 0..128 {
                 let outcome = NativeExecutor::default()
                     .execute_capture("true | cat")
                     .unwrap();
                 assert_eq!(outcome.status, 0);
+
+                let outcome = NativeExecutor::default()
+                    .execute_capture("printf value | sh -c 'exit 23'")
+                    .unwrap();
+                assert_eq!(outcome.status, 23);
             }
         }
 
