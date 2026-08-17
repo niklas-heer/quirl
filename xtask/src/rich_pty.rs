@@ -572,7 +572,7 @@ fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Err
         let output_start = session.pty.output().len();
         session.pty.send(key::ALT_M)?;
         session.pty.wait_for_screen(
-            &format!("bottom-anchored {expected_mode} mode frame"),
+            &format!("bottom-status {expected_mode} mode frame"),
             |screen| {
                 screen
                     .bottom_line()
@@ -596,7 +596,7 @@ fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.send(key::CTRL_K)?;
     session
         .pty
-        .wait_for_screen("bottom-anchored Ctrl-K palette", |screen| {
+        .wait_for_screen("top-anchored Ctrl-K palette", |screen| {
             let bottom = screen.bottom_line();
             bottom.starts_with("data |")
                 && bottom.contains("results (picker)")
@@ -611,20 +611,20 @@ fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.send(key::ESCAPE)?;
     session
         .pty
-        .wait_for_screen("compact prompt after palette dismissal", |screen| {
+        .wait_for_screen("top editor after palette dismissal", |screen| {
             let text = screen.text();
             screen.bottom_line().starts_with("data | Alt-M mode")
                 && !text.contains("picker")
                 && !text.contains("results (picker)")
         })?;
     let lines = session.pty.screen().lines();
-    let compact = &lines[lines.len().saturating_sub(3)..];
-    if compact
+    let top = &lines[..lines.len().min(3)];
+    if top
         .get(1)
         .is_none_or(|line| !line.contains("MODE_BUFFER_RETAINED"))
     {
         return Err(io::Error::other(format!(
-            "palette dismissal did not restore bottom editor; bottom_rows={compact:?}"
+            "palette dismissal did not restore the top editor; top_rows={top:?}"
         ))
         .into());
     }
