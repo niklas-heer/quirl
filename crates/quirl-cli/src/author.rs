@@ -1,12 +1,217 @@
+use crate::bounded_file::{read_regular_file, ReadFileOptions};
 use clap::{Args, ValueEnum};
 use quirl_catalog::{Catalog, CommandSpec};
-use quirl_core::{escape_json_terminal_controls, escape_terminal_controls, ErrorCode, ShellError};
+use quirl_core::{
+    escape_json_terminal_controls, escape_terminal_controls, replace_file_atomically,
+    AtomicReplaceOptions, ErrorCode, ShellError,
+};
 use std::{
-    fs,
-    io::Write,
+    ffi::OsString,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+const AUTHOR_PATH_BYTES_MAX: usize = 4 * 1024;
+const DOCUMENT_OUTPUT_BYTES_MAX: usize = 8 * 1024 * 1024;
+const DIRECTORY_DEPTH_MAX: usize = 64;
+const TEMPORARY_NAME_ATTEMPTS_MAX: usize = 64;
+static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
+// Failure cleanup is deliberately non-destructive: safe Rust cannot atomically
+// condition unlink or rmdir on the identity captured from an open handle. Only
+// the bounded success path removes a transaction-generated temporary name, and
+// that final unlink requires a cooperative containing namespace.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateStage {
+    DirectoriesReady,
+    PartialWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputWriteStage {
+    ContentSynced,
+    Installed,
+}
+
+#[derive(Debug)]
+struct OwnedPath {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl OwnedPath {
+    fn from_file(path: PathBuf, file: &File) -> Result<Self, ShellError> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| io_error("inspect", &path, error))?;
+        Ok(Self::from_metadata(path, &metadata))
+    }
+
+    fn from_metadata(path: PathBuf, metadata: &fs::Metadata) -> Self {
+        Self {
+            path,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(unix)]
+    fn matches(&self, path: &Path) -> bool {
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+    }
+
+    #[cfg(not(unix))]
+    fn matches(&self, _path: &Path) -> bool {
+        false
+    }
+
+    fn remove_committed(&self) -> io::Result<()> {
+        // This is success-only cleanup of a bounded transaction name. Safe Rust
+        // cannot condition unlink on identity, so the containing namespace must
+        // remain cooperative for this final post-commit unlink.
+        fs::remove_file(&self.path)
+    }
+}
+
+struct CreationTransaction {
+    created_file: Option<OwnedPath>,
+    created_directories: Vec<OwnedPath>,
+}
+
+impl CreationTransaction {
+    fn new() -> Self {
+        Self {
+            created_file: None,
+            created_directories: Vec::new(),
+        }
+    }
+
+    fn cleanup(&mut self, mut error: ShellError) -> ShellError {
+        if let Some(owned) = self.created_file.take() {
+            error = error.with_context(format!(
+                "failure cleanup preserved created file {}",
+                owned.path().display()
+            ));
+        }
+        while let Some(owned) = self.created_directories.pop() {
+            error = error.with_context(format!(
+                "failure cleanup preserved created directory {} because safe Rust cannot condition removal on identity",
+                owned.path().display()
+            ));
+        }
+        error
+    }
+
+    fn commit(&mut self) {
+        self.created_file = None;
+        self.created_directories.clear();
+    }
+}
+
+impl Drop for CreationTransaction {
+    fn drop(&mut self) {
+        self.created_file = None;
+        self.created_directories.clear();
+    }
+}
+
+struct TemporaryOutput {
+    temporary: Option<OwnedPath>,
+    destination: Option<PathBuf>,
+}
+
+impl TemporaryOutput {
+    fn new(path: PathBuf, file: &File) -> Result<Self, ShellError> {
+        Ok(Self {
+            temporary: Some(OwnedPath::from_file(path, file)?),
+            destination: None,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        self.temporary
+            .as_ref()
+            .map(OwnedPath::path)
+            .unwrap_or_else(|| Path::new("<installed-temporary>"))
+    }
+
+    fn installed(&mut self, destination: &Path) {
+        self.destination = Some(destination.to_path_buf());
+    }
+
+    fn owns(&self, path: &Path) -> bool {
+        self.temporary
+            .as_ref()
+            .is_some_and(|temporary| temporary.matches(path))
+    }
+
+    fn disarm(&mut self) {
+        self.temporary = None;
+        self.destination = None;
+    }
+
+    fn cleanup(&mut self, error: ShellError) -> ShellError {
+        self.cleanup_with_hook(error, |_| Ok(()))
+    }
+
+    fn cleanup_with_hook(
+        &mut self,
+        mut error: ShellError,
+        mut after_identity_check: impl FnMut(&Path) -> io::Result<()>,
+    ) -> ShellError {
+        if let Some(destination) = self.destination.take() {
+            let _matched = self.owns(&destination);
+            if let Err(hook_error) = after_identity_check(&destination) {
+                error = error.with_context(format!(
+                    "documentation output preservation hook failed for {}: {hook_error}",
+                    destination.display()
+                ));
+            }
+            error = error.with_context(format!(
+                "failure cleanup preserved installed documentation output {}",
+                destination.display()
+            ));
+        }
+        if let Some(temporary) = self.temporary.take() {
+            let _matched = temporary.matches(temporary.path());
+            if let Err(hook_error) = after_identity_check(temporary.path()) {
+                error = error.with_context(format!(
+                    "documentation temporary preservation hook failed for {}: {hook_error}",
+                    temporary.path().display()
+                ));
+            }
+            error = error.with_context(format!(
+                "failure cleanup preserved documentation temporary {}",
+                temporary.path().display()
+            ));
+        }
+        error
+    }
+}
+
+impl Drop for TemporaryOutput {
+    fn drop(&mut self) {
+        self.destination = None;
+        self.temporary = None;
+    }
+}
 
 #[derive(Debug, Args)]
 pub(crate) struct NewCommand {
@@ -57,6 +262,13 @@ pub(crate) enum DocumentationFormat {
 }
 
 pub(crate) fn create(command: NewCommand) -> Result<i32, ShellError> {
+    create_with_hook(command, |_| Ok(()))
+}
+
+fn create_with_hook(
+    command: NewCommand,
+    mut after_stage: impl FnMut(CreateStage) -> io::Result<()>,
+) -> Result<i32, ShellError> {
     validate_script_name(&command.name)?;
     let extension = match command.lang {
         NewLanguage::Lua => "lua",
@@ -65,19 +277,34 @@ pub(crate) fn create(command: NewCommand) -> Result<i32, ShellError> {
     let path = command
         .directory
         .join(format!("{}.{}", command.name, extension));
-    if path.exists() {
-        return Err(ShellError::new(
-            ErrorCode::Validation,
-            format!("{} already exists", path.display()),
-        )
-        .with_help("Choose a new script name or move the existing file first"));
+    validate_author_path(&path)?;
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!("{} already exists", path.display()),
+            )
+            .with_help("Choose a new script name or move the existing file first"));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("inspect", &path, error)),
     }
-    fs::create_dir_all(&command.directory).map_err(|error| io_error("create", &path, error))?;
+    let mut transaction = CreationTransaction::new();
+    if let Err(error) = create_directories(&command.directory, &mut transaction) {
+        return Err(transaction.cleanup(error));
+    }
+    if let Err(error) = after_stage(CreateStage::DirectoriesReady) {
+        return Err(transaction.cleanup(io_error("prepare", &path, error)));
+    }
     let source = match command.lang {
         NewLanguage::Lua => lua_script_template(&command.name),
         NewLanguage::Quirl => quirl_script_template(&command.name),
     };
-    write_new_file(&path, source.as_bytes())?;
+    if let Err(error) = write_new_file(&path, source.as_bytes(), &mut transaction, &mut after_stage)
+    {
+        return Err(transaction.cleanup(error));
+    }
+    transaction.commit();
     println!(
         "created {}",
         escape_terminal_controls(&path.display().to_string())
@@ -300,47 +527,327 @@ fn escape_html(source: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-fn write_new_file(path: &Path, contents: &[u8]) -> Result<(), ShellError> {
-    let mut options = fs::OpenOptions::new();
+fn write_new_file(
+    path: &Path,
+    contents: &[u8],
+    transaction: &mut CreationTransaction,
+    after_stage: &mut impl FnMut(CreateStage) -> io::Result<()>,
+) -> Result<(), ShellError> {
+    let mut options = OpenOptions::new();
     options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
     let mut file = options
         .open(path)
         .map_err(|error| io_error("create", path, error))?;
-    file.write_all(contents)
+    transaction.created_file = Some(OwnedPath::from_file(path.to_path_buf(), &file)?);
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| io_error("secure", path, error))?;
+    let split = contents.len().div_ceil(2);
+    file.write_all(&contents[..split])
+        .and_then(|()| after_stage(CreateStage::PartialWrite))
+        .and_then(|()| file.write_all(&contents[split..]))
         .and_then(|()| file.sync_all())
-        .map_err(|error| io_error("write", path, error))
+        .map_err(|error| io_error("write", path, error))?;
+    validate_regular_output(path, Some(&file), 1)
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), ShellError> {
+    validate_author_path(path)?;
+    if contents.len() > DOCUMENT_OUTPUT_BYTES_MAX {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!(
+                "documentation output {} exceeds its write limit",
+                path.display()
+            ),
+        )
+        .with_context(format!(
+            "limit: {DOCUMENT_OUTPUT_BYTES_MAX}; observed: {}",
+            contents.len()
+        ))
+        .with_help("Choose a smaller catalog or write documentation in narrower sections"));
+    }
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent).map_err(|error| io_error("create", parent, error))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            ShellError::new(
-                ErrorCode::InvalidArgument,
-                "documentation output has no file name",
-            )
-            .with_help("Choose a regular output file path")
-        })?;
-    let temporary = parent.join(format!(".{file_name}.quirl.tmp"));
-    let result = (|| {
-        let mut file =
-            fs::File::create(&temporary).map_err(|error| io_error("create", &temporary, error))?;
-        file.write_all(contents)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| io_error("write", &temporary, error))?;
-        fs::rename(&temporary, path).map_err(|error| io_error("replace", path, error))?;
-        sync_parent_directory(parent)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    let mut directories = CreationTransaction::new();
+    if let Err(error) = create_directories(parent, &mut directories) {
+        return Err(directories.cleanup(error));
     }
-    result
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            validate_regular_output(path, None, 1)?;
+            let expected = read_regular_file(ReadFileOptions {
+                path,
+                bytes_max: DOCUMENT_OUTPUT_BYTES_MAX,
+                context: "documentation output",
+                help: "Use an unlinked regular documentation output at or below 8 MiB",
+                io_error_code: ErrorCode::Io,
+            })?;
+            replace_file_atomically(
+                path,
+                &expected,
+                contents,
+                AtomicReplaceOptions {
+                    bytes_max: DOCUMENT_OUTPUT_BYTES_MAX,
+                },
+            )?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            install_new_output(path, contents, parent)?;
+        }
+        Err(error) => return Err(io_error("inspect", path, error)),
+    }
+    directories.commit();
+    Ok(())
+}
+
+fn install_new_output(path: &Path, contents: &[u8], parent: &Path) -> Result<(), ShellError> {
+    install_new_output_with_hook(path, contents, parent, |_| Ok(()))
+}
+
+fn install_new_output_with_hook(
+    path: &Path,
+    contents: &[u8],
+    parent: &Path,
+    mut after_stage: impl FnMut(OutputWriteStage) -> io::Result<()>,
+) -> Result<(), ShellError> {
+    let (temporary, mut file) = create_output_temporary(path)?;
+    let mut guard = TemporaryOutput::new(temporary.clone(), &file).map_err(|error| {
+        error.with_context(format!(
+            "failure cleanup preserved documentation temporary {}",
+            temporary.display()
+        ))
+    })?;
+    file.write_all(contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| after_stage(OutputWriteStage::ContentSynced))
+        .map_err(|error| guard.cleanup(io_error("write", guard.path(), error)))?;
+    validate_regular_output(guard.path(), Some(&file), 1).map_err(|error| guard.cleanup(error))?;
+    drop(file);
+    fs::hard_link(guard.path(), path)
+        .map_err(|error| guard.cleanup(io_error("install", path, error)))?;
+    guard.installed(path);
+    if let Err(error) = after_stage(OutputWriteStage::Installed) {
+        return Err(guard.cleanup(io_error("install", path, error)));
+    }
+    if !guard.owns(path) {
+        return Err(guard.cleanup(
+            ShellError::new(
+                ErrorCode::Validation,
+                format!(
+                    "{} changed during documentation installation",
+                    path.display()
+                ),
+            )
+            .with_help("Remove the conflicting output entry and retry"),
+        ));
+    }
+    if let Err(error) = validate_regular_output(path, None, 2) {
+        return Err(guard.cleanup(error));
+    }
+    if let Err(error) = sync_parent_directory(parent) {
+        return Err(guard.cleanup(error));
+    }
+    guard
+        .temporary
+        .as_ref()
+        .map(OwnedPath::remove_committed)
+        .transpose()
+        .map_err(|error| guard.cleanup(io_error("clean", guard.path(), error)))?;
+    guard.disarm();
+    let _ = sync_parent_directory(parent);
+    Ok(())
+}
+
+fn create_output_temporary(path: &Path) -> Result<(PathBuf, File), ShellError> {
+    let name = path.file_name().ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::InvalidArgument,
+            "documentation output has no file name",
+        )
+        .with_help("Choose a regular output file path")
+    })?;
+    for _ in 0..TEMPORARY_NAME_ATTEMPTS_MAX {
+        let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(name);
+        temporary_name.push(format!(".quirl-{}-{sequence}.tmp", std::process::id()));
+        let temporary = path.with_file_name(temporary_name);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&temporary) {
+            Ok(file) => {
+                #[cfg(unix)]
+                if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    return Err(io_error("secure", &temporary, error).with_context(format!(
+                        "failure cleanup preserved documentation temporary {}",
+                        temporary.display()
+                    )));
+                }
+                return Ok((temporary, file));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(io_error("create", &temporary, error)),
+        }
+    }
+    Err(ShellError::new(
+        ErrorCode::ResourceLimit,
+        "documentation temporary-name attempts exhausted",
+    )
+    .with_context(format!(
+        "limit: {TEMPORARY_NAME_ATTEMPTS_MAX}; observed: {TEMPORARY_NAME_ATTEMPTS_MAX}"
+    ))
+    .with_help("Remove stale hidden documentation temporary files and retry"))
+}
+
+fn validate_author_path(path: &Path) -> Result<(), ShellError> {
+    let bytes = path.as_os_str().as_encoded_bytes().len();
+    if bytes <= AUTHOR_PATH_BYTES_MAX && path.file_name().is_some() {
+        return Ok(());
+    }
+    Err(ShellError::new(
+        ErrorCode::ResourceLimit,
+        "authoring path exceeds its bounded portable representation",
+    )
+    .with_context(format!("limit: {AUTHOR_PATH_BYTES_MAX}; observed: {bytes}"))
+    .with_help("Choose a shorter path with a regular file name"))
+}
+
+fn create_directories(
+    directory: &Path,
+    transaction: &mut CreationTransaction,
+) -> Result<(), ShellError> {
+    let mut missing = Vec::new();
+    let mut cursor = directory;
+    loop {
+        if missing.len() >= DIRECTORY_DEPTH_MAX {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                format!(
+                    "directory path {} exceeds its depth limit",
+                    directory.display()
+                ),
+            )
+            .with_context(format!(
+                "limit: {DIRECTORY_DEPTH_MAX}; observed: at least {}",
+                missing.len() + 1
+            ))
+            .with_help("Choose a shallower authoring directory"));
+        }
+        match fs::symlink_metadata(cursor) {
+            Ok(metadata) if metadata.file_type().is_dir() => break,
+            Ok(_) => {
+                return Err(ShellError::new(
+                    ErrorCode::Validation,
+                    format!("{} is not a real directory", cursor.display()),
+                )
+                .with_help("Replace links and special files in the output path"));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                cursor = cursor
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+            }
+            Err(error) => return Err(io_error("inspect", cursor, error)),
+        }
+    }
+    for path in missing.into_iter().rev() {
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|error| io_error("inspect", &path, error))?;
+                transaction
+                    .created_directories
+                    .push(OwnedPath::from_metadata(path, &metadata));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|inspect_error| io_error("inspect", &path, inspect_error))?;
+                if !metadata.file_type().is_dir() {
+                    return Err(ShellError::new(
+                        ErrorCode::Validation,
+                        format!("{} was replaced while creating directories", path.display()),
+                    )
+                    .with_help("Remove the conflicting entry and retry"));
+                }
+            }
+            Err(error) => return Err(io_error("create", &path, error)),
+        }
+    }
+    Ok(())
+}
+
+fn validate_regular_output(
+    path: &Path,
+    open_file: Option<&File>,
+    links_expected: u64,
+) -> Result<(), ShellError> {
+    let path_metadata =
+        fs::symlink_metadata(path).map_err(|error| io_error("inspect", path, error))?;
+    if !path_metadata.file_type().is_file() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!("{} is not a regular output file", path.display()),
+        )
+        .with_help("Use an unlinked regular file, not a symlink or special file"));
+    }
+    #[cfg(unix)]
+    {
+        if path_metadata.nlink() != links_expected {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!("{} has hard-link aliases", path.display()),
+            )
+            .with_context(format!(
+                "expected links: {links_expected}; observed: {}",
+                path_metadata.nlink()
+            ))
+            .with_help("Use an unlinked regular output file"));
+        }
+        if let Some(file) = open_file {
+            let file_metadata = file
+                .metadata()
+                .map_err(|error| io_error("inspect", path, error))?;
+            if path_metadata.dev() != file_metadata.dev()
+                || path_metadata.ino() != file_metadata.ino()
+            {
+                return Err(ShellError::new(
+                    ErrorCode::Validation,
+                    format!("{} changed during output preparation", path.display()),
+                )
+                .with_help("Remove the conflicting entry and retry"));
+            }
+            let mode = file_metadata.mode() & 0o777;
+            if mode != 0o600 {
+                return Err(ShellError::new(
+                    ErrorCode::Validation,
+                    format!("{} has unexpected temporary permissions", path.display()),
+                )
+                .with_context(format!("expected mode: 0o600; observed mode: {mode:#o}"))
+                .with_help("Remove the conflicting entry and retry"));
+            }
+        }
+        if links_expected == 2 {
+            let mode = path_metadata.mode() & 0o777;
+            if mode != 0o600 {
+                return Err(ShellError::new(
+                    ErrorCode::Validation,
+                    format!("{} has unexpected installed permissions", path.display()),
+                )
+                .with_context(format!("expected mode: 0o600; observed mode: {mode:#o}"))
+                .with_help("Remove the conflicting entry and retry"));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -458,7 +965,117 @@ mod tests {
         let output = crate::script::run(&path, None, &[]).unwrap();
         assert_eq!(output.status, 0);
         assert_eq!(output.value, serde_json::json!(1));
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_new_script_preserves_owned_entries_and_preexisting_data() {
+        let root = temporary_directory("rollback");
+        let preexisting = root.join("preexisting");
+        fs::create_dir_all(&preexisting).unwrap();
+        let marker = preexisting.join("keep.txt");
+        fs::write(&marker, b"keep").unwrap();
+        let created_directory = preexisting.join("new/deep");
+
+        let error = create_with_hook(
+            NewCommand {
+                name: "script".to_owned(),
+                lang: NewLanguage::Quirl,
+                directory: created_directory.clone(),
+            },
+            |stage| {
+                if stage == CreateStage::PartialWrite {
+                    Err(io::Error::other("injected script write failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Io);
+        assert_eq!(fs::read(&marker).unwrap(), b"keep");
+        assert!(created_directory.exists());
+        assert!(created_directory.join("script.qrl").exists());
+        assert!(preexisting.exists());
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("failure cleanup preserved created")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_script_rollback_preserves_a_concurrent_file_replacement() {
+        let directory = temporary_directory("file-replacement");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("script.qrl");
+        let moved = directory.join("moved-owned-script");
+
+        let error = create_with_hook(
+            NewCommand {
+                name: "script".to_owned(),
+                lang: NewLanguage::Quirl,
+                directory: directory.clone(),
+            },
+            |stage| {
+                if stage == CreateStage::PartialWrite {
+                    fs::rename(&path, &moved)?;
+                    fs::write(&path, b"foreign")?;
+                    return Err(io::Error::other("injected replacement failure"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(fs::read(&path).unwrap(), b"foreign");
+        assert!(moved.exists());
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("failure cleanup preserved created file")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_script_rollback_preserves_a_concurrent_directory_replacement() {
+        let root = temporary_directory("directory-replacement");
+        fs::create_dir(&root).unwrap();
+        let directory = root.join("created/deep");
+        let moved = root.join("moved-owned-directory");
+
+        let error = create_with_hook(
+            NewCommand {
+                name: "script".to_owned(),
+                lang: NewLanguage::Quirl,
+                directory: directory.clone(),
+            },
+            |stage| {
+                if stage == CreateStage::DirectoriesReady {
+                    fs::rename(&directory, &moved)?;
+                    fs::create_dir(&directory)?;
+                    return Err(io::Error::other("injected directory replacement"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(directory.is_dir());
+        assert!(moved.is_dir());
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("failure cleanup preserved created directory")));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -529,6 +1146,181 @@ mod tests {
         atomic_write(&path, b"second\n").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "second\n");
         assert!(!directory.join(".catalog.md.quirl.tmp").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn documentation_cleanup_preserves_a_concurrent_temporary_replacement() {
+        let directory = temporary_directory("temporary-replacement");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("catalog.md");
+        let moved = directory.join("moved-owned-temporary");
+
+        let error = install_new_output_with_hook(&path, b"content", &directory, |stage| {
+            if stage == OutputWriteStage::ContentSynced {
+                let temporary = fs::read_dir(&directory)?
+                    .next()
+                    .ok_or_else(|| io::Error::other("temporary was not visible"))??
+                    .path();
+                fs::rename(&temporary, &moved)?;
+                fs::write(&temporary, b"foreign")?;
+                return Err(io::Error::other("injected temporary replacement"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        let foreign = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| entry != &moved)
+            .unwrap();
+        assert_eq!(fs::read(foreign).unwrap(), b"foreign");
+        assert!(moved.exists());
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("failure cleanup preserved documentation temporary")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn documentation_failure_cleanup_preserves_replacement_after_final_identity_check() {
+        let directory = temporary_directory("last-cleanup-race");
+        fs::create_dir(&directory).unwrap();
+        let output = directory.join("catalog.md");
+        let moved_owned = directory.join("moved-owned-temporary");
+        let (temporary, file) = create_output_temporary(&output).unwrap();
+        let mut guard = TemporaryOutput::new(temporary.clone(), &file).unwrap();
+        drop(file);
+        let primary = ShellError::new(ErrorCode::Io, "injected primary failure");
+
+        let error = guard.cleanup_with_hook(primary, |observed_path| {
+            assert_eq!(observed_path, temporary);
+            fs::rename(observed_path, &moved_owned)?;
+            fs::write(observed_path, b"foreign-after-identity-check")
+        });
+
+        assert_eq!(
+            fs::read(&temporary).unwrap(),
+            b"foreign-after-identity-check"
+        );
+        assert!(moved_owned.exists());
+        assert_eq!(error.message, "injected primary failure");
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("failure cleanup preserved documentation temporary")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn documentation_cleanup_preserves_colliding_temporary_and_destination_entries() {
+        let directory = temporary_directory("installed-replacement");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("catalog.md");
+        let moved_temporary = directory.join("moved-owned-temporary");
+        let moved_destination = directory.join("moved-owned-destination");
+
+        let error = install_new_output_with_hook(&path, b"content", &directory, |stage| {
+            if stage == OutputWriteStage::Installed {
+                let temporary = fs::read_dir(&directory)?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .find(|entry| entry.as_ref().is_ok_and(|entry| entry != &path))
+                    .ok_or_else(|| io::Error::other("temporary was not visible"))??;
+                fs::rename(&temporary, &moved_temporary)?;
+                fs::rename(&path, &moved_destination)?;
+                fs::write(&temporary, b"foreign")?;
+                fs::hard_link(&temporary, &path)?;
+                return Err(io::Error::other("injected installed replacement"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert_eq!(fs::read(&path).unwrap(), b"foreign");
+        let replacement_temporary = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| {
+                entry != &path && entry != &moved_temporary && entry != &moved_destination
+            })
+            .unwrap();
+        assert_eq!(fs::read(replacement_temporary).unwrap(), b"foreign");
+        assert!(moved_temporary.exists());
+        assert!(moved_destination.exists());
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .filter(|context| context.contains("failure cleanup preserved"))
+                .count()
+                >= 2
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn documentation_output_accepts_exact_limit_and_rejects_limit_plus_one() {
+        let directory = temporary_directory("output-limit");
+        let path = directory.join("catalog.txt");
+        atomic_write(&path, &vec![b'x'; DOCUMENT_OUTPUT_BYTES_MAX]).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            DOCUMENT_OUTPUT_BYTES_MAX as u64
+        );
+
+        let error = atomic_write(&path, &vec![b'x'; DOCUMENT_OUTPUT_BYTES_MAX + 1]).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            DOCUMENT_OUTPUT_BYTES_MAX as u64
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn documentation_output_rejects_symlinks_hardlinks_and_special_files() {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory("output-kinds");
+        fs::create_dir(&directory).unwrap();
+        let outside = directory.join("outside");
+        fs::write(&outside, b"outside").unwrap();
+
+        let symlink_path = directory.join("symlink");
+        symlink(&outside, &symlink_path).unwrap();
+        assert_eq!(
+            atomic_write(&symlink_path, b"replacement")
+                .unwrap_err()
+                .code,
+            ErrorCode::Validation
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+
+        let hardlink_path = directory.join("hardlink");
+        fs::hard_link(&outside, &hardlink_path).unwrap();
+        assert_eq!(
+            atomic_write(&hardlink_path, b"replacement")
+                .unwrap_err()
+                .code,
+            ErrorCode::Validation
+        );
+
+        let socket_path = directory.join("socket");
+        mkfifo(&socket_path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        assert_eq!(
+            atomic_write(&socket_path, b"replacement").unwrap_err().code,
+            ErrorCode::Validation
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 }

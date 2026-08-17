@@ -5,16 +5,24 @@ use quirl_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     fs::{File, OpenOptions},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+#[cfg(unix)]
+use nix::{
+    fcntl::{open, OFlag},
+    sys::stat::Mode,
+};
 
 const DOCUMENT_TYPE: &str = "quirl.recovery.snapshot";
 pub const RECOVERY_SCHEMA_VERSION: u32 = 2;
@@ -26,7 +34,126 @@ const MAX_ENVIRONMENT_CHANGES: usize = 256;
 const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024;
 const MAX_SNAPSHOTS: usize = 32;
 const MAX_RECOVERY_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_RECOVERY_DIRECTORY_ENTRIES: usize = 1_024;
+const RECOVERY_DIRECTORY_DEPTH_MAX: usize = 64;
+const TEMPORARY_NAME_ATTEMPTS_MAX: usize = 64;
 static NEXT_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
+
+// Failure cleanup never unlinks an armed transaction name. The recovery
+// directory is private (0700), so successful writes may remove their one hidden
+// temporary under the narrower assumption that this private namespace remains
+// cooperative through the final post-commit unlink.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotWriteStage {
+    PartialWrite,
+    ContentSynced,
+    Installed,
+}
+
+struct SnapshotTransaction {
+    temporary: Option<SnapshotOwnedPath>,
+    destination: PathBuf,
+    destination_owned: bool,
+}
+
+#[derive(Debug)]
+struct SnapshotOwnedPath {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl SnapshotOwnedPath {
+    fn new(path: PathBuf, file: &File) -> Result<Self, ShellError> {
+        let metadata = file
+            .metadata()
+            .map_err(|error| recovery_io_error("inspect", &path, error))?;
+        Ok(Self {
+            path,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(unix)]
+    fn matches(&self, path: &Path) -> bool {
+        fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+    }
+
+    #[cfg(not(unix))]
+    fn matches(&self, _path: &Path) -> bool {
+        false
+    }
+
+    fn remove_committed(&self) -> io::Result<()> {
+        // Recovery uses a private 0700 directory. This success-only unlink is
+        // bounded to one transaction name and assumes that namespace remains
+        // cooperative through the final post-commit cleanup.
+        fs::remove_file(&self.path)
+    }
+}
+
+impl SnapshotTransaction {
+    fn new(temporary: PathBuf, file: &File, destination: PathBuf) -> Result<Self, ShellError> {
+        Ok(Self {
+            temporary: Some(SnapshotOwnedPath::new(temporary, file)?),
+            destination,
+            destination_owned: false,
+        })
+    }
+
+    fn temporary(&self) -> &Path {
+        self.temporary
+            .as_ref()
+            .map(SnapshotOwnedPath::path)
+            .unwrap_or_else(|| Path::new("<removed-temporary>"))
+    }
+
+    fn owns(&self, path: &Path) -> bool {
+        self.temporary
+            .as_ref()
+            .is_some_and(|temporary| temporary.matches(path))
+    }
+
+    fn cleanup(&mut self, mut error: ShellError) -> ShellError {
+        if self.destination_owned {
+            self.destination_owned = false;
+            error = error.with_context(format!(
+                "failure cleanup preserved recovery destination {}",
+                self.destination.display()
+            ));
+        }
+        if let Some(temporary) = self.temporary.take() {
+            error = error.with_context(format!(
+                "failure cleanup preserved recovery temporary {}",
+                temporary.path().display()
+            ));
+        }
+        error
+    }
+
+    fn commit(&mut self) {
+        self.destination_owned = false;
+        self.temporary = None;
+    }
+}
+
+impl Drop for SnapshotTransaction {
+    fn drop(&mut self) {
+        self.destination_owned = false;
+        self.temporary = None;
+    }
+}
 
 #[derive(Debug, Subcommand)]
 pub enum RecoveryCommand {
@@ -170,8 +297,7 @@ impl RecoveryJournal {
         outcome: Option<&CommandOutcome>,
         error: Option<&ShellError>,
     ) -> Result<String, ShellError> {
-        fs::create_dir_all(&self.directory)
-            .map_err(|error| recovery_io_error("create", &self.directory, error))?;
+        create_recovery_directories(&self.directory)?;
         secure_recovery_directory(&self.directory)?;
         let created_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -226,8 +352,15 @@ impl RecoveryJournal {
     }
 
     fn write_snapshot(&self, snapshot: &RecoverySnapshot) -> Result<(), ShellError> {
+        self.write_snapshot_with_hook(snapshot, |_| Ok(()))
+    }
+
+    fn write_snapshot_with_hook(
+        &self,
+        snapshot: &RecoverySnapshot,
+        mut after_stage: impl FnMut(SnapshotWriteStage) -> io::Result<()>,
+    ) -> Result<(), ShellError> {
         let destination = self.directory.join(format!("{}.json", snapshot.id));
-        let temporary = self.directory.join(format!(".{}.tmp", snapshot.id));
         let bytes = serde_json::to_vec_pretty(snapshot).map_err(|error| {
             ShellError::new(ErrorCode::Io, "could not serialize recovery snapshot")
                 .with_context(error.to_string())
@@ -236,18 +369,73 @@ impl RecoveryJournal {
         if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
             return Err(oversized_snapshot_error(&snapshot.id, bytes.len() as u64));
         }
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options
-            .open(&temporary)
-            .map_err(|error| recovery_io_error("create", &temporary, error))?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| recovery_io_error("write", &temporary, error))?;
-        fs::rename(&temporary, &destination)
-            .map_err(|error| recovery_io_error("install", &destination, error))?;
+        reject_existing_snapshot_destination(&destination)?;
+        let (temporary, mut file) = create_snapshot_temporary(&destination)?;
+        let mut transaction =
+            SnapshotTransaction::new(temporary.clone(), &file, destination.clone()).map_err(
+                |error| {
+                    error.with_context(format!(
+                        "failure cleanup preserved recovery temporary {}",
+                        temporary.display()
+                    ))
+                },
+            )?;
+        let split = bytes.len().div_ceil(2);
+        if let Err(error) = file.write_all(&bytes[..split]).and_then(|()| {
+            after_stage(SnapshotWriteStage::PartialWrite)?;
+            file.write_all(&bytes[split..])?;
+            file.sync_all()?;
+            after_stage(SnapshotWriteStage::ContentSynced)
+        }) {
+            return Err(transaction.cleanup(recovery_io_error(
+                "write",
+                transaction.temporary(),
+                error,
+            )));
+        }
+        if let Err(error) = validate_snapshot_file(transaction.temporary(), &file, 1) {
+            return Err(transaction.cleanup(error));
+        }
+        drop(file);
+        if let Err(error) = fs::hard_link(transaction.temporary(), &destination) {
+            return Err(transaction.cleanup(recovery_io_error("install", &destination, error)));
+        }
+        transaction.destination_owned = true;
+        if !transaction.owns(&destination) {
+            return Err(transaction.cleanup(
+                ShellError::new(
+                    ErrorCode::Validation,
+                    format!(
+                        "recovery destination {} changed during installation",
+                        destination.display()
+                    ),
+                )
+                .with_help("Review the preserved destination and temporary before retrying"),
+            ));
+        }
+        if let Err(error) = validate_snapshot_path(&destination, 2) {
+            return Err(transaction.cleanup(error));
+        }
+        if let Err(error) = after_stage(SnapshotWriteStage::Installed) {
+            return Err(transaction.cleanup(recovery_io_error("install", &destination, error)));
+        }
+        if let Err(error) = sync_recovery_directory(&self.directory) {
+            return Err(transaction.cleanup(error));
+        }
+        transaction
+            .temporary
+            .as_ref()
+            .map(SnapshotOwnedPath::remove_committed)
+            .transpose()
+            .map_err(|error| {
+                transaction.cleanup(recovery_io_error("clean", transaction.temporary(), error))
+            })?;
+        transaction.temporary = None;
+        // The installed snapshot is already durable. Failure to persist only
+        // the temporary-name removal must not turn the committed write into an
+        // ambiguous returned failure.
+        let _ = sync_recovery_directory(&self.directory);
+        transaction.commit();
         self.enforce_retention()
     }
 
@@ -257,14 +445,14 @@ impl RecoveryJournal {
         let mut retained_bytes = 0_u64;
         for id in ids {
             let path = self.directory.join(format!("{id}.json"));
-            let size = fs::metadata(&path)
-                .map_err(|error| recovery_io_error("inspect", &path, error))?
-                .len();
+            let size = validate_snapshot_path(&path, 1)?.len();
             if retained < MAX_SNAPSHOTS && retained_bytes.saturating_add(size) <= MAX_RECOVERY_BYTES
             {
                 retained += 1;
                 retained_bytes = retained_bytes.saturating_add(size);
             } else {
+                // Retention is successful policy cleanup inside the secured
+                // 0700 recovery namespace, not transaction failure cleanup.
                 fs::remove_file(&path).map_err(|error| recovery_io_error("prune", &path, error))?;
             }
         }
@@ -278,7 +466,18 @@ impl RecoveryJournal {
             Err(error) => return Err(recovery_io_error("read", &self.directory, error)),
         };
         let mut ids = Vec::new();
-        for entry in entries {
+        for (entry_index, entry) in entries.enumerate() {
+            if entry_index >= MAX_RECOVERY_DIRECTORY_ENTRIES {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "recovery directory exceeds its entry limit",
+                )
+                .with_context(format!(
+                    "limit: {MAX_RECOVERY_DIRECTORY_ENTRIES}; observed: at least {}",
+                    entry_index + 1
+                ))
+                .with_help("Remove stale recovery entries before retrying"));
+            }
             let entry = entry.map_err(|error| recovery_io_error("read", &self.directory, error))?;
             if entry
                 .file_type()
@@ -307,19 +506,10 @@ impl RecoveryJournal {
     fn read(&self, id: &str) -> Result<RecoverySnapshot, ShellError> {
         validate_id(id)?;
         let path = self.directory.join(format!("{id}.json"));
-        let canonical_directory = fs::canonicalize(&self.directory)
-            .map_err(|error| recovery_io_error("resolve", &self.directory, error))?;
-        let canonical_path =
-            fs::canonicalize(&path).map_err(|error| recovery_io_error("resolve", &path, error))?;
-        if !canonical_path.starts_with(&canonical_directory) {
-            return Err(ShellError::new(
-                ErrorCode::Validation,
-                format!("recovery snapshot `{id}` resolves outside the recovery directory"),
-            )
-            .with_help("Remove the snapshot symlink and use a regular journal file"));
-        }
-        let file = File::open(&canonical_path)
-            .map_err(|error| recovery_io_error("read", &canonical_path, error))?;
+        validate_snapshot_path(&path, 1)?;
+        let file = open_snapshot_no_follow(&path)
+            .map_err(|error| recovery_io_error("read", &path, error))?;
+        validate_snapshot_file(&path, &file, 1)?;
         let size = file
             .metadata()
             .map_err(|error| recovery_io_error("inspect", &path, error))?
@@ -338,13 +528,264 @@ impl RecoveryJournal {
     }
 }
 
+fn reject_existing_snapshot_destination(path: &Path) -> Result<(), ShellError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(recovery_io_error("inspect", path, error)),
+        Ok(_) => Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "recovery snapshot destination {} already exists",
+                path.display()
+            ),
+        )
+        .with_help("Remove the stale entry only after confirming it is not needed")),
+    }
+}
+
+fn create_snapshot_temporary(destination: &Path) -> Result<(PathBuf, File), ShellError> {
+    for _ in 0..TEMPORARY_NAME_ATTEMPTS_MAX {
+        let sequence = NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
+        let name = destination.file_name().ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::InvalidArgument,
+                "recovery snapshot destination has no file name",
+            )
+            .with_help("Use a recovery directory containing regular snapshot file names")
+        })?;
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(name);
+        temporary_name.push(format!(".{}-{sequence}.tmp", std::process::id()));
+        let temporary = destination.with_file_name(temporary_name);
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&temporary) {
+            Ok(file) => {
+                #[cfg(unix)]
+                if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    return Err(recovery_io_error("secure", &temporary, error).with_context(
+                        format!(
+                            "failure cleanup preserved recovery temporary {}",
+                            temporary.display()
+                        ),
+                    ));
+                }
+                return Ok((temporary, file));
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(recovery_io_error("create", &temporary, error)),
+        }
+    }
+    Err(ShellError::new(
+        ErrorCode::ResourceLimit,
+        "recovery snapshot temporary-name attempts exhausted",
+    )
+    .with_context(format!(
+        "limit: {TEMPORARY_NAME_ATTEMPTS_MAX}; observed: {TEMPORARY_NAME_ATTEMPTS_MAX}"
+    ))
+    .with_help("Remove stale hidden recovery temporary files before retrying"))
+}
+
+fn validate_snapshot_path(path: &Path, links_expected: u64) -> Result<fs::Metadata, ShellError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| recovery_io_error("inspect", path, error))?;
+    validate_snapshot_metadata(path, &metadata, links_expected)?;
+    Ok(metadata)
+}
+
+fn validate_snapshot_file(path: &Path, file: &File, links_expected: u64) -> Result<(), ShellError> {
+    let path_metadata = validate_snapshot_path(path, links_expected)?;
+    let file_metadata = file
+        .metadata()
+        .map_err(|error| recovery_io_error("inspect", path, error))?;
+    validate_snapshot_metadata(path, &file_metadata, links_expected)?;
+    #[cfg(unix)]
+    if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "recovery snapshot {} changed during admission",
+                path.display()
+            ),
+        )
+        .with_help("Retry after removing the conflicting recovery entry"));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    links_expected: u64,
+) -> Result<(), ShellError> {
+    if !metadata.file_type().is_file() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!("recovery snapshot {} is not a regular file", path.display()),
+        )
+        .with_help("Remove links and special files from the recovery directory"));
+    }
+    #[cfg(unix)]
+    {
+        if metadata.nlink() != links_expected {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!("recovery snapshot {} has hard-link aliases", path.display()),
+            )
+            .with_context(format!(
+                "expected links: {links_expected}; observed: {}",
+                metadata.nlink()
+            ))
+            .with_help("Copy the snapshot to an unlinked private regular file"));
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode != 0o600 {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!(
+                    "recovery snapshot {} has unsafe permissions",
+                    path.display()
+                ),
+            )
+            .with_context(format!("expected mode: 0o600; observed mode: {mode:#o}"))
+            .with_help("Set the snapshot mode to 0600 before reading it"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_snapshot_no_follow(path: &Path) -> io::Result<File> {
+    let descriptor = open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn open_snapshot_no_follow(path: &Path) -> io::Result<File> {
+    OpenOptions::new().read(true).open(path)
+}
+
+#[cfg(unix)]
+fn sync_recovery_directory(path: &Path) -> Result<(), ShellError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| recovery_io_error("synchronize", path, error))
+}
+
+#[cfg(not(unix))]
+fn sync_recovery_directory(_path: &Path) -> Result<(), ShellError> {
+    Ok(())
+}
+
+fn create_recovery_directories(directory: &Path) -> Result<(), ShellError> {
+    let mut missing = Vec::new();
+    let mut cursor = directory;
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(metadata) if metadata.file_type().is_dir() => break,
+            Ok(_) => {
+                return Err(ShellError::new(
+                    ErrorCode::Validation,
+                    format!("recovery path {} is not a real directory", cursor.display()),
+                )
+                .with_help("Replace links and special files with private directories"));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if missing.len() >= RECOVERY_DIRECTORY_DEPTH_MAX {
+                    return Err(ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        format!(
+                            "recovery path {} exceeds its depth limit",
+                            directory.display()
+                        ),
+                    )
+                    .with_context(format!(
+                        "limit: {RECOVERY_DIRECTORY_DEPTH_MAX}; observed: at least {}",
+                        missing.len() + 1
+                    ))
+                    .with_help("Choose a shallower recovery directory"));
+                }
+                missing.push(cursor.to_path_buf());
+                cursor = cursor
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+            }
+            Err(error) => return Err(recovery_io_error("inspect", cursor, error)),
+        }
+    }
+
+    let mut created = Vec::<PathBuf>::new();
+    for path in missing.into_iter().rev() {
+        if let Err(error) = fs::create_dir(&path) {
+            let mut shell_error = recovery_io_error("create", &path, error);
+            while let Some(created_path) = created.pop() {
+                shell_error = shell_error.with_context(format!(
+                    "recovery directory {} was preserved because cleanup cannot atomically prove path ownership",
+                    created_path.display()
+                ));
+            }
+            return Err(shell_error);
+        }
+        #[cfg(unix)]
+        if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o700)) {
+            let mut shell_error = recovery_io_error("secure", &path, error);
+            shell_error = shell_error.with_context(format!(
+                "recovery directory {} was preserved because cleanup cannot atomically prove path ownership",
+                path.display()
+            ));
+            while let Some(created_path) = created.pop() {
+                shell_error = shell_error.with_context(format!(
+                    "recovery directory {} was preserved because cleanup cannot atomically prove path ownership",
+                    created_path.display()
+                ));
+            }
+            return Err(shell_error);
+        }
+        created.push(path);
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn secure_recovery_directory(path: &Path) -> Result<(), ShellError> {
-    let mut permissions = fs::metadata(path)
-        .map_err(|error| recovery_io_error("inspect", path, error))?
-        .permissions();
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| recovery_io_error("inspect", path, error))?;
+    if !metadata.file_type().is_dir() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!("recovery path {} is not a real directory", path.display()),
+        )
+        .with_help("Replace links and special files with a private directory"));
+    }
+    let mut permissions = metadata.permissions();
     permissions.set_mode(0o700);
-    fs::set_permissions(path, permissions).map_err(|error| recovery_io_error("secure", path, error))
+    fs::set_permissions(path, permissions)
+        .map_err(|error| recovery_io_error("secure", path, error))?;
+    let mode = fs::symlink_metadata(path)
+        .map_err(|error| recovery_io_error("inspect", path, error))?
+        .mode()
+        & 0o777;
+    if mode == 0o700 {
+        Ok(())
+    } else {
+        Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "recovery directory {} has unsafe permissions",
+                path.display()
+            ),
+        )
+        .with_context(format!("expected mode: 0o700; observed mode: {mode:#o}"))
+        .with_help("Set the recovery directory mode to 0700 before retrying"))
+    }
 }
 
 #[cfg(not(unix))]
@@ -973,6 +1414,22 @@ mod tests {
         ))
     }
 
+    fn test_snapshot(id: &str) -> RecoverySnapshot {
+        RecoverySnapshot {
+            document_type: DOCUMENT_TYPE.to_owned(),
+            schema_version: RECOVERY_SCHEMA_VERSION,
+            id: id.to_owned(),
+            created_unix_ms: 1,
+            command: "false".to_owned(),
+            cwd: "/tmp".to_owned(),
+            environment: EnvironmentDiff::default(),
+            output: CapturedOutput::default(),
+            duration_ms: 1,
+            status: Some(1),
+            error_chain: vec!["failed".to_owned()],
+        }
+    }
+
     #[test]
     fn snapshot_is_versioned_atomic_bounded_and_contains_no_secret_values() {
         let directory = test_directory("atomic");
@@ -1047,6 +1504,192 @@ mod tests {
     }
 
     #[test]
+    fn partial_write_and_install_failures_preserve_owned_snapshot_entries() {
+        for failed_stage in [
+            SnapshotWriteStage::PartialWrite,
+            SnapshotWriteStage::Installed,
+        ] {
+            let directory = test_directory("write-failure");
+            fs::create_dir(&directory).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let journal = RecoveryJournal::new(directory.clone(), BTreeMap::new());
+            let snapshot = test_snapshot("0001-0001-0001");
+
+            let error = journal
+                .write_snapshot_with_hook(&snapshot, |stage| {
+                    if stage == failed_stage {
+                        Err(io::Error::other("injected snapshot failure"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+
+            assert_eq!(error.code, ErrorCode::Io);
+            assert!(error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("injected snapshot failure")));
+            let expected_entries = if failed_stage == SnapshotWriteStage::Installed {
+                2
+            } else {
+                1
+            };
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), expected_entries);
+            assert!(error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("failure cleanup preserved recovery")));
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_failure_preserves_the_originating_snapshot_error() {
+        let directory = test_directory("cleanup-failure");
+        fs::create_dir(&directory).unwrap();
+        let journal = RecoveryJournal::new(directory.clone(), BTreeMap::new());
+        let snapshot = test_snapshot("0001-0001-0001");
+
+        let error = journal
+            .write_snapshot_with_hook(&snapshot, |stage| {
+                if stage == SnapshotWriteStage::PartialWrite {
+                    let temporary = fs::read_dir(&directory)?
+                        .next()
+                        .ok_or_else(|| io::Error::other("temporary was not visible"))??
+                        .path();
+                    fs::remove_file(&temporary)?;
+                    fs::create_dir(&temporary)?;
+                    return Err(io::Error::other("injected primary failure"));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Io);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("injected primary failure")));
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("failure cleanup preserved recovery temporary")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_temporary_replacement_is_preserved_during_rollback() {
+        let directory = test_directory("concurrent-temporary");
+        fs::create_dir(&directory).unwrap();
+        let journal = RecoveryJournal::new(directory.clone(), BTreeMap::new());
+        let snapshot = test_snapshot("0001-0001-0001");
+        let moved = directory.join("moved-owned-temporary");
+
+        let error = journal
+            .write_snapshot_with_hook(&snapshot, |stage| {
+                if stage == SnapshotWriteStage::ContentSynced {
+                    let temporary = fs::read_dir(&directory)?
+                        .next()
+                        .ok_or_else(|| io::Error::other("temporary was not visible"))??
+                        .path();
+                    fs::rename(&temporary, &moved)?;
+                    fs::write(&temporary, b"foreign")?;
+                    return Err(io::Error::other("injected temporary replacement"));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+
+        let replacement = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| entry != &moved)
+            .unwrap();
+        assert_eq!(fs::read(replacement).unwrap(), b"foreign");
+        assert!(moved.exists());
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|context| context.contains("failure cleanup preserved recovery temporary")));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_destination_replacement_is_preserved_during_rollback() {
+        let directory = test_directory("concurrent-install");
+        fs::create_dir(&directory).unwrap();
+        let journal = RecoveryJournal::new(directory.clone(), BTreeMap::new());
+        let snapshot = test_snapshot("0001-0001-0001");
+        let destination = directory.join("0001-0001-0001.json");
+        let moved_destination = directory.join("moved-owned-snapshot");
+        let moved_temporary = directory.join("moved-owned-temporary");
+
+        let error = journal
+            .write_snapshot_with_hook(&snapshot, |stage| {
+                if stage == SnapshotWriteStage::Installed {
+                    let temporary = fs::read_dir(&directory)?
+                        .map(|entry| entry.map(|entry| entry.path()))
+                        .find(|entry| entry.as_ref().is_ok_and(|entry| entry != &destination))
+                        .ok_or_else(|| io::Error::other("temporary was not visible"))??;
+                    fs::rename(&temporary, &moved_temporary)?;
+                    fs::rename(&destination, &moved_destination)?;
+                    fs::write(&temporary, b"foreign")?;
+                    fs::hard_link(&temporary, &destination)?;
+                    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+                    return Err(io::Error::other("injected post-install failure"));
+                }
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"foreign");
+        let replacement_temporary = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|entry| {
+                entry != &destination && entry != &moved_temporary && entry != &moved_destination
+            })
+            .unwrap();
+        assert_eq!(fs::read(replacement_temporary).unwrap(), b"foreign");
+        assert!(moved_destination.exists());
+        assert!(moved_temporary.exists());
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .filter(|context| context.contains("failure cleanup preserved recovery"))
+                .count()
+                >= 2
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_directory_entry_limit_accepts_exactly_limit_and_rejects_limit_plus_one() {
+        let directory = test_directory("entry-limit");
+        fs::create_dir(&directory).unwrap();
+        let journal = RecoveryJournal::new(directory.clone(), BTreeMap::new());
+        for index in 0..MAX_RECOVERY_DIRECTORY_ENTRIES {
+            fs::write(directory.join(format!("ignored-{index}")), b"").unwrap();
+        }
+        assert!(journal.ids().unwrap().is_empty());
+        fs::write(directory.join("one-too-many"), b"").unwrap();
+        assert_eq!(journal.ids().unwrap_err().code, ErrorCode::ResourceLimit);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn invalid_ids_cannot_escape_the_recovery_directory() {
         let journal = RecoveryJournal::new(test_directory("traversal"), BTreeMap::new());
         let error = journal.read("../../secret").unwrap_err();
@@ -1069,7 +1712,25 @@ mod tests {
 
         let error = journal.read(id).unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error.message.contains("outside"));
+        assert!(error.message.contains("not a regular file"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_directory_creation_rejects_intermediate_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_directory("directory-symlink");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let link = root.join("link");
+        symlink(&outside, &link).unwrap();
+
+        let error = create_recovery_directories(&link.join("nested")).unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(!outside.join("nested").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1169,11 +1830,10 @@ mod tests {
         let journal = RecoveryJournal::new(directory.clone(), BTreeMap::new());
         for index in 0..20_u64 {
             let id = format!("{:020}-{:010}-{index:020}", 1_000 + index, 1);
-            fs::write(
-                directory.join(format!("{id}.json")),
-                vec![b'x'; MAX_SNAPSHOT_BYTES as usize - 1],
-            )
-            .unwrap();
+            let path = directory.join(format!("{id}.json"));
+            fs::write(&path, vec![b'x'; MAX_SNAPSHOT_BYTES as usize - 1]).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         journal.enforce_retention().unwrap();
         let retained_bytes = journal
@@ -1189,11 +1849,10 @@ mod tests {
         assert!(retained_bytes <= MAX_RECOVERY_BYTES);
 
         let oversized_id = "99999999999999999999-0000000001-00000000000000000001";
-        fs::write(
-            directory.join(format!("{oversized_id}.json")),
-            vec![b'x'; MAX_SNAPSHOT_BYTES as usize + 1],
-        )
-        .unwrap();
+        let oversized_path = directory.join(format!("{oversized_id}.json"));
+        fs::write(&oversized_path, vec![b'x'; MAX_SNAPSHOT_BYTES as usize + 1]).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(oversized_path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             journal.read(oversized_id).unwrap_err().code,
             ErrorCode::ResourceLimit
