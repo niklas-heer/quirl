@@ -9,9 +9,10 @@ mod statusbar;
 
 pub use degrade::{select_surface, SurfaceKind};
 pub use runtime::{
-    InteractiveDataSnapshot, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
-    InteractivePanelBatch, InteractivePanelProvider, InteractivePanelSnapshot,
-    InteractiveRuntimeSnapshot, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, JOB_ACTION_ITEMS_MAX,
+    InteractiveActivityProvider, InteractiveActivitySnapshot, InteractiveDataSnapshot,
+    InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch,
+    InteractivePanelProvider, InteractivePanelSnapshot, InteractiveRuntimeSnapshot,
+    ACTIVITY_MESSAGE_BYTES_MAX, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, JOB_ACTION_ITEMS_MAX,
     JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
     PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
 };
@@ -232,6 +233,7 @@ impl RichSurface {
         self.completion.publish_catalog(Arc::clone(&catalog));
         self.input_analysis.publish_catalog(Arc::clone(&catalog));
         self.catalog = Some(catalog);
+        self.runtime.catalog_admitted();
         Ok(())
     }
 
@@ -243,6 +245,14 @@ impl RichSurface {
     /// Attach a nonblocking provider of completed asynchronous panel snapshots.
     pub fn set_panel_provider(&mut self, provider: Box<dyn InteractivePanelProvider>) {
         self.runtime.set_provider(provider);
+    }
+
+    /// Attach a nonblocking provider of cached bottom-bar activity.
+    pub fn set_activity_provider(&mut self, provider: Box<dyn InteractiveActivityProvider>) {
+        self.runtime.set_activity_provider(provider);
+        if self.catalog.is_some() {
+            self.runtime.catalog_admitted();
+        }
     }
 
     /// Run one blocking interactive edit session and return after terminal release.
@@ -341,6 +351,10 @@ impl RichSurface {
                 continue;
             }
             if self.runtime.poll_panels() {
+                dirty = true;
+                continue;
+            }
+            if self.runtime.poll_activity() {
                 dirty = true;
                 continue;
             }

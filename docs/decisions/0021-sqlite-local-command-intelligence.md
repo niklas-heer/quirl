@@ -37,18 +37,34 @@ and refresh bounds. Legacy JSON catalog schemas remain read-only migration
 inputs; all writes use SQLite.
 
 Semantic inference uses `model2vec-rs` with only its `local-only` and `onig`
-features and the `minishlab/potion-base-8M` model. The editor never downloads a
-model. Three admitted regular files have explicit limits: 1 MiB configuration,
-4 MiB tokenizer, and 64 MiB weights. Encoding panics from the dependency are
-caught at the boundary. Document count, document bytes, query bytes, result
-count, token length, batch size, vector dimensions, serialized bytes, and
-finite float values are validated.
+features and the `minishlab/potion-base-8M` model. After the interactive catalog
+is admitted, the composition root starts one session-owned worker. If the
+default model is absent or corrupt, that worker downloads the three files from
+revision `bf8b056651a2c21b8d2565580b8569da283cab23` over bounded rustls HTTPS,
+streams them into a private staging directory, verifies exact byte counts and
+SHA-256 digests, and publishes the directory with one rename and parent sync.
+An invalid auto-owned destination is quarantined before a clean install;
+explicit `QUIRL_MODEL_PATH` destinations are never replaced automatically.
 
-`quirl ai index` is the explicit control-plane operation that builds
-embeddings. `quirl ai search`, `quirl ai related`, and interactive natural mode
-read the same database. Missing model files or embeddings select deterministic
-lexical ranking; malformed installed model files are operating errors. Natural
-mode and AI subcommands only display suggestions and never execute one.
+The model files total 30,920,628 bytes. Redirects, connect/global/body waits,
+channel retention, staging-name attempts, directory depth, file bytes, and
+activity text are bounded. The network reader publishes at most two 64 KiB
+chunks ahead, so cancellation disconnects the installer promptly even if an
+underlying HTTPS call remains blocked until its own timeout. Encoding panics
+from the dependency are caught at the boundary. Document count, document
+bytes, query bytes, result count, token length, batch size, vector dimensions,
+serialized bytes, and finite float values are validated.
+
+The worker builds embeddings automatically after initial catalog admission and
+again only after a refreshed database has been published. It skips work when
+every bounded semantic document already has a matching model id and source
+fingerprint. Automatic encoding checks cancellation between 32-document
+batches and publishes only if both the request generation and source database
+remain current. `quirl ai index` remains an explicit diagnostic/refresh tool;
+it is not required for normal setup. `quirl ai search`, `quirl ai related`, and
+interactive natural mode read the same database. Missing model files or
+embeddings select deterministic lexical ranking. Natural mode and AI
+subcommands only display suggestions and never execute one.
 
 ## Failure model and invariants
 
@@ -60,6 +76,18 @@ mode and AI subcommands only display suggestions and never execute one.
   records and revalidates the canonical catalog fingerprint.
 - Stale embeddings are ignored because each row carries the source document
   fingerprint and model id.
+- Download, hashing, model loading, and SQLite work never run on render or
+  per-keystroke threads. The UI polls only generation-numbered immutable cache
+  snapshots and rejects stale generations.
+- Partial, short, oversized, or hash-mismatched assets remain staging files and
+  never become model input. Failure preserves lexical search and the last
+  complete database.
+- Initial indexing starts only after catalog admission. Refresh indexing is
+  requested only after refreshed database publication; database publication is
+  serialized and an embedding result revalidates its exact source bytes.
+- Background work never owns terminal state. Cancellation is visible between
+  download chunks and embedding batches; terminal restoration precedes the
+  bounded worker join.
 - No SQLite connection or model is shared across threads. Each bounded
   operation owns its connection and model lifetime.
 - No AI output crosses into the execution planner without a separate explicit
@@ -71,6 +99,7 @@ mode and AI subcommands only display suggestions and never execute one.
   corresponding compile-time/binary-size cost.
 - A default database can answer structured command and option queries without
   reparsing completion sources or man text.
-- Embedding generation is explicit control-plane work, not prompt latency.
-- Semantic ranking degrades predictably to lexical ranking when optional model
-  assets are absent.
+- Embedding generation and model installation are automatic background
+  control-plane work, never prompt latency.
+- Semantic ranking degrades predictably to lexical ranking during setup and
+  after any failed download or rebuild.

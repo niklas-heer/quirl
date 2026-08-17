@@ -44,6 +44,7 @@ const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DISCOVERY_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const DISCOVERY_DEADLINE: Duration = Duration::from_millis(750);
 static NEXT_INDEX_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+static DATABASE_PUBLICATION: Mutex<()> = Mutex::new(());
 
 /// A cancellable, bounded background refresh owned by one interactive session.
 /// Dropping the guard wakes and joins its single worker before terminal shutdown
@@ -443,11 +444,76 @@ pub(crate) fn build_default_embeddings() -> Result<intelligence::EmbeddingReport
     Ok(report)
 }
 
+/// Build embeddings for one requested catalog generation and publish them only
+/// while the source database and request generation are still current.
+pub(crate) fn build_default_embeddings_if_current(
+    cancelled: &AtomicBool,
+    requested_generation: &AtomicU64,
+    generation: u64,
+) -> Result<Option<intelligence::EmbeddingReport>, ShellError> {
+    let path = default_database_path()?;
+    let model_path = intelligence::default_model_path().ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::InvalidArgument,
+            "cannot determine the local model path",
+        )
+        .with_help("Set QUIRL_MODEL_PATH or HOME and retry")
+    })?;
+    let source = read_index(&path).map_err(|error| {
+        error.with_help("Wait for command discovery before indexing embeddings")
+    })?;
+    let (encoded, report) = intelligence::build_embeddings_cancellable(
+        &source,
+        &path,
+        &model_path,
+        intelligence::AUTOMATIC_EMBEDDING_BATCH_SIZE,
+        || {
+            if cancelled.load(Ordering::Acquire)
+                || requested_generation.load(Ordering::Acquire) != generation
+            {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "automatic embedding build was cancelled",
+                )
+                .with_help("The newest catalog generation will be indexed instead"));
+            }
+            Ok(())
+        },
+    )?;
+    if cancelled.load(Ordering::Acquire)
+        || requested_generation.load(Ordering::Acquire) != generation
+    {
+        return Ok(None);
+    }
+    let _publication = DATABASE_PUBLICATION.lock().map_err(|_| {
+        ShellError::new(
+            ErrorCode::Io,
+            "the command-database publication lock was poisoned",
+        )
+        .with_help("Restart Quirl before rebuilding local command intelligence")
+    })?;
+    let current = read_index(&path)?;
+    if current != source
+        || cancelled.load(Ordering::Acquire)
+        || requested_generation.load(Ordering::Acquire) != generation
+    {
+        return Ok(None);
+    }
+    write_index_bytes_atomically_unlocked(&path, &encoded, intelligence::DATABASE_BYTES_MAX)?;
+    Ok(Some(report))
+}
+
 /// Read and validate bounded row counts from the default command database.
 pub(crate) fn default_database_stats() -> Result<intelligence::DatabaseStats, ShellError> {
     let path = default_database_path()?;
     let bytes = read_index(&path)?;
     intelligence::database_stats(&bytes, &path)
+}
+
+pub(crate) fn default_embeddings_are_current() -> Result<bool, ShellError> {
+    let path = default_database_path()?;
+    let bytes = read_index(&path)?;
+    intelligence::embeddings_are_current(&bytes, &path)
 }
 
 /// Start periodic catalog discovery without delaying construction or first
@@ -1630,6 +1696,21 @@ fn write_index_bytes_atomically(
     encoded: &[u8],
     bytes_max: usize,
 ) -> Result<(), ShellError> {
+    let _publication = DATABASE_PUBLICATION.lock().map_err(|_| {
+        ShellError::new(
+            ErrorCode::Io,
+            "the command-database publication lock was poisoned",
+        )
+        .with_help("Restart Quirl before updating the local command database")
+    })?;
+    write_index_bytes_atomically_unlocked(path, encoded, bytes_max)
+}
+
+fn write_index_bytes_atomically_unlocked(
+    path: &Path,
+    encoded: &[u8],
+    bytes_max: usize,
+) -> Result<(), ShellError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
@@ -1829,7 +1910,7 @@ fn validate_index_installed(path: &Path) -> Result<(), ShellError> {
     Ok(())
 }
 
-fn create_index_directories(directory: &Path) -> Result<(), ShellError> {
+pub(crate) fn create_index_directories(directory: &Path) -> Result<(), ShellError> {
     const DEPTH_MAX: usize = 64;
     let mut missing = Vec::new();
     let mut cursor = directory;
@@ -1853,6 +1934,7 @@ fn create_index_directories(directory: &Path) -> Result<(), ShellError> {
                         "Use a cache directory that is not writable by group or other users",
                     ));
                 }
+                validate_existing_directory_ancestors(cursor)?;
                 break;
             }
             Ok(_) => return Err(nonregular_index_input(cursor)),
@@ -1897,15 +1979,30 @@ fn create_index_directories(directory: &Path) -> Result<(), ShellError> {
     Ok(())
 }
 
+fn validate_existing_directory_ancestors(directory: &Path) -> Result<(), ShellError> {
+    for ancestor in directory
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+    {
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|error| index_io_error("inspect", ancestor, error))?;
+        if !metadata.file_type().is_dir() {
+            return Err(nonregular_index_input(ancestor));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
-fn sync_index_directory(path: &Path) -> Result<(), ShellError> {
+pub(crate) fn sync_index_directory(path: &Path) -> Result<(), ShellError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| index_io_error("synchronize", path, error))
 }
 
 #[cfg(not(unix))]
-fn sync_index_directory(_path: &Path) -> Result<(), ShellError> {
+pub(crate) fn sync_index_directory(_path: &Path) -> Result<(), ShellError> {
     Ok(())
 }
 
@@ -1954,7 +2051,7 @@ mod tests {
             NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&path).unwrap();
-        path
+        fs::canonicalize(path).unwrap()
     }
 
     fn test_budget() -> IndexBuildBudget {

@@ -23,6 +23,7 @@ const DOCUMENTS_MAX: usize = 65_536;
 const DOCUMENT_BYTES_MAX: usize = 16 * 1024;
 const EMBEDDING_DIMENSIONS_MAX: usize = 2_048;
 const EMBEDDING_BATCH_SIZE: usize = 256;
+pub(crate) const AUTOMATIC_EMBEDDING_BATCH_SIZE: usize = 32;
 const MODEL_ID: &str = "minishlab/potion-base-8M";
 const MODEL_CONFIG_BYTES_MAX: u64 = 1024 * 1024;
 const MODEL_TOKENIZER_BYTES_MAX: u64 = 4 * 1024 * 1024;
@@ -180,7 +181,7 @@ pub(crate) fn default_model_path() -> Option<PathBuf> {
 }
 
 pub(crate) fn model_is_installed(path: &Path) -> bool {
-    validate_model_files(path).is_ok()
+    crate::ai_bootstrap::validate_pinned_model(path).is_ok()
 }
 
 pub(crate) fn database_stats(bytes: &[u8], path: &Path) -> Result<DatabaseStats, ShellError> {
@@ -192,6 +193,27 @@ pub(crate) fn database_stats(bytes: &[u8], path: &Path) -> Result<DatabaseStats,
         documents: count_rows(&connection, path, "semantic_documents")?,
         embeddings: count_rows(&connection, path, "embeddings")?,
     })
+}
+
+pub(crate) fn embeddings_are_current(bytes: &[u8], path: &Path) -> Result<bool, ShellError> {
+    let connection = deserialize_database(bytes, path)?;
+    validate_schema(&connection, path)?;
+    let documents = count_rows(&connection, path, "semantic_documents")?;
+    let current = connection
+        .query_row(
+            "SELECT count(*) FROM semantic_documents d JOIN embeddings e ON e.document_id = d.document_id AND e.model_id = ?1 AND e.document_fingerprint = d.fingerprint",
+            params![MODEL_ID],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| invalid_database(path, error))?;
+    let current = usize::try_from(current).map_err(|_| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "the command database contains an invalid current-embedding count",
+        )
+        .with_help("Rebuild the local command database")
+    })?;
+    Ok(current == documents)
 }
 
 pub(crate) fn encode_database(
@@ -284,24 +306,56 @@ pub(crate) fn build_embeddings(
     path: &Path,
     model_path: &Path,
 ) -> Result<(Vec<u8>, EmbeddingReport), ShellError> {
+    build_embeddings_cancellable(bytes, path, model_path, EMBEDDING_BATCH_SIZE, || Ok(()))
+}
+
+pub(crate) fn build_embeddings_cancellable(
+    bytes: &[u8],
+    path: &Path,
+    model_path: &Path,
+    batch_size: usize,
+    mut check_cancelled: impl FnMut() -> Result<(), ShellError>,
+) -> Result<(Vec<u8>, EmbeddingReport), ShellError> {
     let mut connection = deserialize_database(bytes, path)?;
     validate_schema(&connection, path)?;
     let documents = read_documents(&connection, path)?;
     let model = load_model(model_path)?;
-    let texts: Vec<String> = documents
-        .iter()
-        .map(|document| document.body.clone())
-        .collect();
-    let vectors = catch_unwind(AssertUnwindSafe(|| {
-        model.encode_with_args(&texts, Some(256), EMBEDDING_BATCH_SIZE)
-    }))
-    .map_err(|_| {
-        ShellError::new(
-            ErrorCode::Validation,
-            "the local Model2Vec tokenizer failed",
-        )
-        .with_help("Replace the model files with an intact potion-base-8M release")
-    })?;
+    if batch_size == 0 || batch_size > EMBEDDING_BATCH_SIZE {
+        return Err(resource_limit(
+            "embedding batch size",
+            EMBEDDING_BATCH_SIZE,
+            batch_size,
+        ));
+    }
+    let mut vectors = Vec::with_capacity(documents.len());
+    for batch in documents.chunks(batch_size) {
+        check_cancelled()?;
+        let texts: Vec<String> = batch.iter().map(|document| document.body.clone()).collect();
+        let mut encoded = catch_unwind(AssertUnwindSafe(|| {
+            model.encode_with_args(&texts, Some(256), batch_size)
+        }))
+        .map_err(|_| {
+            ShellError::new(
+                ErrorCode::Validation,
+                "the local Model2Vec tokenizer failed",
+            )
+            .with_help("Replace the model files with an intact potion-base-8M release")
+        })?;
+        if encoded.len() != batch.len() {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "the local Model2Vec model returned an incomplete embedding batch",
+            )
+            .with_context(format!(
+                "expected vectors: {}; observed: {}",
+                batch.len(),
+                encoded.len()
+            ))
+            .with_help("Replace the model files and rebuild the semantic index"));
+        }
+        vectors.append(&mut encoded);
+    }
+    check_cancelled()?;
     if vectors.len() != documents.len() {
         return Err(ShellError::new(
             ErrorCode::Validation,
@@ -831,6 +885,7 @@ fn load_model(path: &Path) -> Result<StaticModel, ShellError> {
 }
 
 fn validate_model_files(path: &Path) -> Result<(), ShellError> {
+    crate::ai_bootstrap::validate_pinned_model(path)?;
     for (name, bytes_max) in [
         ("config.json", MODEL_CONFIG_BYTES_MAX),
         ("tokenizer.json", MODEL_TOKENIZER_BYTES_MAX),
@@ -1092,5 +1147,29 @@ mod tests {
         let query = "x".repeat(QUERY_BYTES_MAX + 1);
         let error = validate_query(&query, 8).unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn current_embedding_readiness_requires_every_document_fingerprint() {
+        let path = Path::new("catalog.sqlite3");
+        let bytes = encode_database(&Catalog::builtin(), None).unwrap();
+        assert!(!embeddings_are_current(&bytes, path).unwrap());
+        let connection = deserialize_database(&bytes, path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO embeddings(document_id, model_id, dimensions, vector_le_f32, document_fingerprint) SELECT document_id, ?1, 1, x'00000000', fingerprint FROM semantic_documents",
+                params![MODEL_ID],
+            )
+            .unwrap();
+        let current = serialize_database(&connection).unwrap();
+        assert!(embeddings_are_current(&current, path).unwrap());
+        connection
+            .execute(
+                "UPDATE embeddings SET document_fingerprint = 'stale' WHERE document_id = (SELECT min(document_id) FROM embeddings)",
+                [],
+            )
+            .unwrap();
+        let stale = serialize_database(&connection).unwrap();
+        assert!(!embeddings_are_current(&stale, path).unwrap());
     }
 }
