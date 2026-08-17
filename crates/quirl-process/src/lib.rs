@@ -649,6 +649,7 @@ mod platform {
 
         /// Terminate a directly spawned child if it is still live.
         pub fn terminate(&self, child: &mut Child) -> Result<(), ShellError> {
+            let child_exited = matches!(child.try_wait(), Ok(Some(_)));
             let group = self.process_group.lock().ok().and_then(|group| {
                 if let ContainedProcessGroup::Live(process_group) = *group {
                     Some(process_group)
@@ -656,9 +657,10 @@ mod platform {
                     None
                 }
             });
-            let group_result = group.map(|group| killpg(Pid::from_raw(group), Signal::SIGKILL));
+            let group_result =
+                group.map(|group| terminate_process_group(Pid::from_raw(group), child_exited));
             let child_result = child.kill();
-            let group_ok = matches!(group_result, None | Some(Ok(())) | Some(Err(Errno::ESRCH)));
+            let group_ok = matches!(group_result, None | Some(Ok(())));
             let child_ok = match &child_result {
                 Ok(()) => true,
                 Err(error) => error.kind() == ErrorKind::InvalidInput,
@@ -683,6 +685,44 @@ mod platform {
                 .with_help("Retry the command; report repeated process termination failures"))
             }
         }
+    }
+
+    fn terminate_process_group(
+        process_group: Pid,
+        owned_processes_exited: bool,
+    ) -> Result<(), Errno> {
+        let cleanup_result = killpg(process_group, Signal::SIGKILL);
+        resolve_process_group_cleanup(process_group, cleanup_result, owned_processes_exited)
+    }
+
+    fn resolve_process_group_cleanup(
+        process_group: Pid,
+        cleanup_result: Result<(), Errno>,
+        owned_processes_exited: bool,
+    ) -> Result<(), Errno> {
+        match cleanup_result {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(Errno::EPERM) if cfg!(target_os = "macos") && owned_processes_exited => {
+                let group_probe = killpg(process_group, None);
+                if macos_eperm_group_is_gone(owned_processes_exited, &group_probe) {
+                    Ok(())
+                } else {
+                    Err(Errno::EPERM)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn macos_eperm_group_is_gone(
+        owned_processes_exited: bool,
+        group_probe: &Result<(), Errno>,
+    ) -> bool {
+        // Darwin documents EPERM for a group containing any process with a
+        // different effective UID, so an exited leader alone proves nothing
+        // about descendants. Only a subsequent ESRCH probe proves that no
+        // process group remains; EPERM or success keeps cleanup fail-closed.
+        cfg!(target_os = "macos") && owned_processes_exited && *group_probe == Err(Errno::ESRCH)
     }
 
     impl Default for NativeExecutor {
@@ -1454,7 +1494,7 @@ mod platform {
                 .iter()
                 .any(|child| child.status == JobStatus::Stopped);
             if !stopped {
-                terminate_group_descendants(process_group)?;
+                terminate_group_descendants(&children, process_group)?;
             }
             let stopped_terminal_modes = if stopped {
                 terminal.current_modes()?
@@ -1533,7 +1573,7 @@ mod platform {
                     // Direct children can exit before descendants close capture
                     // and input pipes. Contain the group before joining tasks so
                     // refresh remains bounded even when cleanup itself fails.
-                    let _ = terminate_group_descendants(job.state.process_group);
+                    let _ = terminate_group_descendants(&job.children, job.state.process_group);
                     finish_job_tasks_silently(job);
                 }
             }
@@ -1580,7 +1620,7 @@ mod platform {
                     job.state.status = JobStatus::Stopped;
                     return Ok(None);
                 }
-                terminate_group_descendants(job.state.process_group)?;
+                terminate_group_descendants(&job.children, job.state.process_group)?;
                 terminal.restore()?;
                 job.state.status = JobStatus::Done;
                 job.state.exit_status = Some(status);
@@ -2459,13 +2499,10 @@ mod platform {
             } else {
                 Err(Errno::ESRCH)
             };
-            // macOS reports EPERM for a process group whose only remaining
-            // member is the owned zombie. A live same-user descendant would
-            // instead make this kill succeed, so it is contained before the
-            // direct child is reaped and its PID can be reused.
-            let leader_contained = matches!(leader_cleanup, Ok(()) | Err(Errno::ESRCH))
-                || cfg!(target_os = "macos") && leader_cleanup == Err(Errno::EPERM);
             let child_status = observe_fast_child_exit(child);
+            let child_exited = matches!(child_status, Ok(Some(_)));
+            let leader_contained =
+                resolve_process_group_cleanup(expected_group, leader_cleanup, child_exited).is_ok();
             exited_child_context = Some(format!(
                 "; leader_cleanup={leader_cleanup:?}; child_status={child_status:?}"
             ));
@@ -2567,19 +2604,27 @@ mod platform {
         }
     }
 
-    fn terminate_group_descendants(process_group: Option<i32>) -> Result<(), ShellError> {
+    fn terminate_group_descendants(
+        children: &[JobChild],
+        process_group: Option<i32>,
+    ) -> Result<(), ShellError> {
         let Some(process_group) = process_group else {
             return Ok(());
         };
-        match killpg(Pid::from_raw(process_group), Signal::SIGKILL) {
-            Ok(()) | Err(Errno::ESRCH) => Ok(()),
-            Err(error) => Err(ShellError::new(
-                ErrorCode::Io,
-                "could not terminate remaining pipeline descendants",
-            )
-            .with_context(error.to_string())
-            .with_help("Retry the command; report repeated process-group cleanup failures")),
-        }
+        let owned_processes_exited = !children.is_empty()
+            && children
+                .iter()
+                .all(|child| child.status == JobStatus::Done && child.exit_status.is_some());
+        terminate_process_group(Pid::from_raw(process_group), owned_processes_exited).map_err(
+            |error| {
+                ShellError::new(
+                    ErrorCode::Io,
+                    "could not terminate remaining pipeline descendants",
+                )
+                .with_context(error.to_string())
+                .with_help("Retry the command; report repeated process-group cleanup failures")
+            },
+        )
     }
 
     fn spawn_reader(reader: impl Read + Send + 'static, limit: usize) -> ReaderTask {
@@ -4036,6 +4081,19 @@ mod platform {
                 assert_eq!(guard.children[0].status, JobStatus::Done);
                 assert_eq!(guard.children[0].exit_status, Some(expected_status));
             }
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn eperm_cleanup_requires_terminal_owners_and_an_absent_group() {
+            let absent_group = Err(Errno::ESRCH);
+            let changed_credentials = Err(Errno::EPERM);
+            let live_signalable_group = Ok(());
+
+            assert!(!macos_eperm_group_is_gone(false, &absent_group));
+            assert!(!macos_eperm_group_is_gone(true, &changed_credentials));
+            assert!(!macos_eperm_group_is_gone(true, &live_signalable_group));
+            assert!(macos_eperm_group_is_gone(true, &absent_group));
         }
 
         #[test]
