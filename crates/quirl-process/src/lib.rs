@@ -3375,6 +3375,10 @@ mod platform {
         fn release(&mut self) {
             self.guard.take();
         }
+
+        fn permits_handoff(&self) -> bool {
+            self.guard.is_some()
+        }
     }
 
     struct ForegroundTerminal {
@@ -3416,7 +3420,7 @@ mod platform {
             lease: ForegroundTerminalLease,
         ) -> Result<Self, ShellError> {
             let mut restore_modes = None;
-            let restore_group = if std::io::stdin().is_terminal() {
+            let restore_group = if lease.permits_handoff() && std::io::stdin().is_terminal() {
                 if let Some(group) = process_group {
                     let _blocked = BlockedTerminalSignals::new()?;
                     restore_modes = Some(tcgetattr(std::io::stdin()).map_err(|error| {
@@ -4160,6 +4164,25 @@ mod platform {
                 Duration::from_secs(1)
             )
             .is_ok());
+        }
+
+        #[test]
+        fn unleased_terminal_wrapper_never_changes_the_foreground_group() {
+            if !std::io::stdin().is_terminal() {
+                return;
+            }
+            let original_group = tcgetpgrp(std::io::stdin()).unwrap();
+            let anchor = ProcessGroupAnchor::spawn().unwrap();
+            let terminal = ForegroundTerminal::give_to(
+                Some(anchor.process_group()),
+                ForegroundTerminalLease::none(),
+            )
+            .unwrap();
+
+            assert_eq!(tcgetpgrp(std::io::stdin()).unwrap(), original_group);
+
+            drop(terminal);
+            anchor.terminate_owned_group().unwrap();
         }
 
         #[test]
