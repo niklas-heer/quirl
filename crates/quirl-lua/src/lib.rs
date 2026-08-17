@@ -1,8 +1,8 @@
 //! Restricted Lua 5.4 runtime for Quirl configuration, scripts, and trusted plugins.
 
 use mlua::{
-    Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, RegistryKey, StdLib, Table, Value,
-    VmState,
+    Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, MultiValue, RegistryKey, StdLib, Table,
+    Value, VmState,
 };
 use quirl_core::{
     escape_terminal_controls, reject_json_terminal_controls, reject_terminal_controls,
@@ -665,7 +665,8 @@ impl Default for CompletionConfig {
 }
 
 impl QuirlConfig {
-    fn validate(&self, source: &str) -> Result<(), ShellError> {
+    /// Revalidate configuration received from persistence or a worker protocol.
+    pub fn validate(&self, source: &str) -> Result<(), ShellError> {
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(validation_error(
                 source,
@@ -1440,7 +1441,8 @@ impl PluginRegistrations {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 /// Isolated result of dispatching one typed event to one plugin handler.
 ///
 /// A handler failure is retained beside an empty action list so later independent
@@ -1583,6 +1585,7 @@ struct Budget {
     started: Instant,
     deadline: Instant,
     wall_time: Duration,
+    termination: Option<ShellError>,
 }
 
 #[derive(Clone)]
@@ -1663,14 +1666,25 @@ impl ConfigStore {
         self.active = candidate;
         Ok(&self.active)
     }
+
+    /// Atomically install an already validated cross-process candidate.
+    pub fn install(&mut self, candidate: QuirlConfig) -> Result<&QuirlConfig, ShellError> {
+        candidate.validate("isolated Lua configuration")?;
+        self.active = candidate;
+        Ok(&self.active)
+    }
 }
 
 /// Sandboxed Lua 5.4 VM with explicit policy, capabilities, and callback registries.
 ///
 /// Only table, string, math, and UTF-8 standard libraries are installed. `io`,
-/// `os`, `debug`, `package`, and `require` remain unavailable. All public execution
-/// paths reset bounded instruction and wall budgets and return [`ShellError`] rather
-/// than exposing raw Lua values to higher crates.
+/// `os`, `debug`, `package`, `require`, and the dynamic chunk loader remain
+/// unavailable. Native Lua string patterns are disabled because their C
+/// implementation cannot observe the wall deadline; explicit literal
+/// `string.find` remains available. All public execution paths reset bounded
+/// instruction and wall budgets and return [`ShellError`] rather than exposing raw
+/// Lua values to higher crates. Policy termination propagates through guest `pcall`
+/// and `xpcall`; ordinary guest errors remain catchable.
 pub struct LuaRuntime {
     lua: Lua,
     policy: LuaPolicy,
@@ -1787,13 +1801,17 @@ impl LuaRuntime {
             started,
             deadline,
             wall_time: policy.wall_time,
+            termination: None,
         }));
         let registrations = Arc::new(Mutex::new(PluginRegistrations::default()));
         let callbacks = Arc::new(Mutex::new(PluginCallbacks::default()));
         let last_event_sequence = Arc::new(Mutex::new(None));
 
-        install_restrictions(&lua).map_err(|error| lua_error(error, None, 0))?;
+        install_restrictions(&lua, Arc::clone(&budget))
+            .map_err(|error| lua_error(error, None, 0))?;
         install_budget_hook(&lua, Arc::clone(&budget), Arc::clone(&cancelled))
+            .map_err(|error| lua_error(error, None, 0))?;
+        install_protected_call_guards(&lua, Arc::clone(&budget))
             .map_err(|error| lua_error(error, None, 0))?;
         install_host_api(
             &lua,
@@ -1928,12 +1946,23 @@ impl LuaRuntime {
     /// [`QuirlConfig`] crosses the Lua boundary.
     pub fn load_config_file(&self, path: &Path) -> Result<QuirlConfig, ShellError> {
         let source = read_source(path)?;
-        lint_source(&source, path)?;
+        self.load_config_source(&source, &path.display().to_string())
+    }
+
+    /// Evaluate an immutable configuration source snapshot and validate its schema.
+    pub fn load_config_source(
+        &self,
+        source: &str,
+        source_name: &str,
+    ) -> Result<QuirlConfig, ShellError> {
+        let path = Path::new(source_name);
+        validate_source_length(source, path)?;
+        lint_source(source, path)?;
         self.reset_budget();
         let value = self
             .lua
-            .load(&source)
-            .set_name(path.to_string_lossy())
+            .load(source)
+            .set_name(source_name)
             .eval::<Value>()
             .map_err(|error| lua_error(error, Some(path), source.len()))?;
         let mut config = self.lua.from_value::<QuirlConfig>(value).map_err(|error| {
@@ -2716,6 +2745,7 @@ impl LuaRuntime {
         budget.started = started;
         budget.deadline = expires;
         budget.wall_time = wall_time;
+        budget.termination = None;
     }
 }
 
@@ -3504,14 +3534,96 @@ pub fn sdk_markdown() -> String {
     output
 }
 
-fn install_restrictions(lua: &Lua) -> mlua::Result<()> {
+fn install_restrictions(lua: &Lua, budget: Arc<Mutex<Budget>>) -> mlua::Result<()> {
     let globals = lua.globals();
     for name in [
-        "debug", "dofile", "io", "loadfile", "os", "package", "print", "require", "warn",
+        "debug", "dofile", "io", "load", "loadfile", "os", "package", "print", "require", "warn",
     ] {
         globals.set(name, Value::Nil)?;
     }
+    let string = globals.get::<Table>("string")?;
+    // Lua's pattern matcher runs entirely in C and adversarial patterns can take
+    // exponential time without invoking the instruction hook. Literal search is
+    // the useful bounded subset that the existing library exposes explicitly.
+    for name in ["gmatch", "gsub", "match"] {
+        let pattern_budget = Arc::clone(&budget);
+        string.set(
+            name,
+            lua.create_function(move |_, _: MultiValue| {
+                let error = lua_resource_error(
+                    "wall_time",
+                    format!(
+                        "string.{name} uses native pattern matching that cannot observe the wall deadline"
+                    ),
+                    "Use bounded literal string.find(..., true) or perform typed matching in Rust",
+                );
+                Err::<MultiValue, _>(terminate_shared_budget(&pattern_budget, error)?)
+            })?,
+        )?;
+    }
+    let original_find = string.get::<Function>("find")?;
+    let find_budget = Arc::clone(&budget);
+    string.set(
+        "find",
+        lua.create_function(move |_, arguments: MultiValue| {
+            let plain = arguments.get(3).is_some_and(|value| value == &Value::Boolean(true));
+            if !plain {
+                let error = lua_resource_error(
+                    "wall_time",
+                    "string.find pattern matching cannot observe the wall deadline",
+                    "Pass true as string.find's fourth argument to request bounded literal matching",
+                );
+                return Err(terminate_shared_budget(&find_budget, error)?);
+            }
+            original_find.call::<MultiValue>(arguments)
+        })?,
+    )?;
     Ok(())
+}
+
+fn install_protected_call_guards(lua: &Lua, budget: Arc<Mutex<Budget>>) -> mlua::Result<()> {
+    let globals = lua.globals();
+    // Preserve protected calls for ordinary guest errors, but inspect the Rust-owned
+    // terminal state before returning. Each nested guard therefore propagates policy
+    // termination outward instead of converting it into a resumable Lua result.
+    for name in ["pcall", "xpcall"] {
+        let protected_call = globals.get::<Function>(name)?;
+        let protected_budget = Arc::clone(&budget);
+        globals.set(
+            name,
+            lua.create_function(move |_, arguments: MultiValue| {
+                let result = protected_call.call::<MultiValue>(arguments)?;
+                ensure_budget_not_terminated(&protected_budget)?;
+                Ok(result)
+            })?,
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_budget_not_terminated(budget: &Arc<Mutex<Budget>>) -> mlua::Result<()> {
+    let budget = budget
+        .lock()
+        .map_err(|_| mlua::Error::RuntimeError("quirl budget state is unavailable".to_owned()))?;
+    match &budget.termination {
+        Some(error) => Err(mlua::Error::external(error.clone())),
+        None => Ok(()),
+    }
+}
+
+fn terminate_budget(budget: &mut Budget, error: ShellError) -> mlua::Error {
+    let error = budget.termination.get_or_insert(error).clone();
+    mlua::Error::external(error)
+}
+
+fn terminate_shared_budget(
+    budget: &Arc<Mutex<Budget>>,
+    error: ShellError,
+) -> mlua::Result<mlua::Error> {
+    let mut budget = budget
+        .lock()
+        .map_err(|_| mlua::Error::RuntimeError("quirl budget state is unavailable".to_owned()))?;
+    Ok(terminate_budget(&mut budget, error))
 }
 
 fn install_budget_hook(
@@ -3525,36 +3637,42 @@ fn install_budget_hook(
             let mut budget = budget.lock().map_err(|_| {
                 mlua::Error::RuntimeError("quirl budget state is unavailable".to_owned())
             })?;
+            if let Some(error) = &budget.termination {
+                return Err(mlua::Error::external(error.clone()));
+            }
             if cancelled.load(Ordering::Relaxed) {
-                return Err(mlua::Error::external(lua_resource_error(
+                let error = lua_resource_error(
                     "cancellation",
                     "cancellation flag: set",
                     "Clear cancellation only before deliberately reusing the runtime",
-                )));
+                );
+                return Err(terminate_budget(&mut budget, error));
             }
             if budget.remaining_instructions < HOOK_GRANULARITY {
                 let observed = budget
                     .instruction_limit
                     .saturating_sub(budget.remaining_instructions);
-                return Err(mlua::Error::external(lua_resource_error(
+                let error = lua_resource_error(
                     "instruction",
                     format!(
                         "instructions observed: approximately {observed}; limit: {}",
                         budget.instruction_limit
                     ),
                     "Reduce Lua work or raise instruction_limit after review",
-                )));
+                );
+                return Err(terminate_budget(&mut budget, error));
             }
             if Instant::now() > budget.deadline {
                 let observed = budget.started.elapsed().as_millis();
-                return Err(mlua::Error::external(lua_resource_error(
+                let error = lua_resource_error(
                     "wall_time",
                     format!(
                         "elapsed: {observed} ms; limit: {} ms",
                         budget.wall_time.as_millis()
                     ),
                     "Reduce callback work or raise wall_time after review",
-                )));
+                );
+                return Err(terminate_budget(&mut budget, error));
             }
             budget.remaining_instructions -= HOOK_GRANULARITY;
             Ok(VmState::Continue)
@@ -3605,11 +3723,12 @@ fn install_host_api(
                 ));
             };
             if process_cancelled.load(Ordering::Relaxed) {
-                return Err(mlua::Error::external(lua_resource_error(
+                let error = lua_resource_error(
                     "cancellation",
                     "cancellation flag: set",
                     "Clear cancellation only before deliberately reusing the runtime",
-                )));
+                );
+                return Err(terminate_shared_budget(&process_budget, error)?);
             }
             let deadline = process_budget
                 .lock()
@@ -3619,13 +3738,14 @@ fn install_host_api(
                 .deadline
                 .saturating_duration_since(Instant::now());
             if deadline.is_zero() {
-                return Err(mlua::Error::external(lua_resource_error(
+                let error = lua_resource_error(
                     "wall_time",
                     "remaining wall time: 0 ms",
                     "Reduce host-call work or raise wall_time after review",
-                )));
+                );
+                return Err(terminate_shared_budget(&process_budget, error)?);
             }
-            let outcome = process_host(ProcessRequest {
+            let outcome = match process_host(ProcessRequest {
                 command,
                 // The budget is reset to each callback's declared deadline before invoking Lua.
                 // A host call must consume the same remaining budget, rather than giving a short
@@ -3633,8 +3753,13 @@ fn install_host_api(
                 deadline,
                 cancelled: Arc::clone(&process_cancelled),
                 max_output_bytes: MAX_PROCESS_OUTPUT_BYTES,
-            })
-            .map_err(mlua::Error::external)?;
+            }) {
+                Ok(outcome) => outcome,
+                Err(error) if error.code == ErrorCode::ResourceLimit => {
+                    return Err(terminate_shared_budget(&process_budget, error)?);
+                }
+                Err(error) => return Err(mlua::Error::external(error)),
+            };
             let result = lua.create_table()?;
             let ok = outcome.status == 0;
             result.set("ok", ok)?;
@@ -4749,6 +4874,10 @@ fn lint_source(source: &str, path: &Path) -> Result<(), ShellError> {
             "module loading must use Quirl's package resolver",
         ),
         ("dofile(", "dofile is unavailable in Quirl Lua"),
+        (
+            "load(",
+            "dynamic chunks are unavailable because untrusted binary bytecode is not admitted",
+        ),
         ("loadfile(", "loadfile is unavailable in Quirl Lua"),
     ];
     let mut error = ShellError::new(ErrorCode::Validation, "Lua validation failed")
@@ -5758,6 +5887,68 @@ mod tests {
     }
 
     #[test]
+    fn pcall_cannot_resume_after_the_instruction_budget_terminates() {
+        let runtime = LuaRuntime::new(LuaPolicy {
+            instruction_limit: HOOK_GRANULARITY,
+            ..LuaPolicy::script()
+        })
+        .unwrap();
+        let started = Instant::now();
+        let error = runtime
+            .eval("return pcall(function() while true do end end)")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|item| item == "lua failure: instruction"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(runtime.eval("return 42").unwrap(), serde_json::json!(42));
+    }
+
+    #[test]
+    fn xpcall_cannot_resume_after_the_instruction_budget_terminates() {
+        let runtime = LuaRuntime::new(LuaPolicy {
+            instruction_limit: HOOK_GRANULARITY,
+            ..LuaPolicy::script()
+        })
+        .unwrap();
+        let started = Instant::now();
+        let error = runtime
+            .eval("return xpcall(function() while true do end end, function() return 'caught' end)")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|item| item == "lua failure: instruction"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn protected_calls_still_catch_ordinary_guest_errors() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        let value = runtime
+            .eval(
+                r#"
+                local pcall_ok, pcall_error = pcall(function() error("ordinary") end)
+                local xpcall_ok, xpcall_error = xpcall(
+                    function() error("ordinary") end,
+                    function() return "handled" end
+                )
+                return { pcall_ok, type(pcall_error), xpcall_ok, xpcall_error }
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([false, "string", false, "handled"])
+        );
+    }
+
+    #[test]
     fn cancellation_stops_lua_at_the_instruction_hook() {
         let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
         runtime.cancellation_token().cancel();
@@ -5768,6 +5959,79 @@ mod tests {
             .context
             .iter()
             .any(|item| item == "lua failure: cancellation"));
+    }
+
+    #[test]
+    fn cancellation_cannot_be_swallowed_by_protected_calls() {
+        for protected_call in ["pcall", "xpcall"] {
+            let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+            runtime.cancellation_token().cancel();
+            let source = if protected_call == "pcall" {
+                "return pcall(function() while true do end end)"
+            } else {
+                "return xpcall(function() while true do end end, function() return 'caught' end)"
+            };
+            let started = Instant::now();
+            let error = runtime.eval(source).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "lua failure: cancellation"));
+            assert!(started.elapsed() < Duration::from_millis(500));
+        }
+    }
+
+    #[test]
+    fn native_string_patterns_fail_closed_before_the_wall_deadline() {
+        let runtime = LuaRuntime::new(LuaPolicy {
+            instruction_limit: 100_000_000,
+            wall_time: Duration::from_millis(25),
+            ..LuaPolicy::config()
+        })
+        .unwrap();
+        let started = Instant::now();
+        let error = runtime
+            .eval(
+                "local s = string.rep('a', 24); local p = string.rep('a?', 24) .. string.rep('a', 24); return string.match(s, p)",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error
+            .details
+            .context
+            .iter()
+            .any(|item| item == "lua failure: wall_time"));
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn string_patterns_are_restricted_but_literal_find_remains_available() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        assert_eq!(
+            runtime
+                .eval(
+                    "local first, last = string.find('a.b', '.', 1, true); return { first, last }"
+                )
+                .unwrap(),
+            serde_json::json!([2, 2])
+        );
+
+        for operation in [
+            "return string.find('abc', 'a.c')",
+            "return string.match('abc', 'a.c')",
+            "return string.gmatch('abc', '.')",
+            "return string.gsub('abc', '.', 'x')",
+        ] {
+            let error = runtime.eval(operation).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error
+                .details
+                .context
+                .iter()
+                .any(|item| item == "lua failure: wall_time"));
+        }
     }
 
     #[test]
@@ -5890,13 +6154,14 @@ mod tests {
         let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
         let value = runtime
             .eval(
-                "return { io == nil, os == nil, debug == nil, package == nil, require == nil, dofile == nil, loadfile == nil, print == nil, warn == nil, coroutine == nil, table ~= nil, string ~= nil, math ~= nil, utf8 ~= nil }",
+                "return { io == nil, os == nil, debug == nil, package == nil, require == nil, dofile == nil, load == nil, loadfile == nil, print == nil, warn == nil, coroutine == nil, table ~= nil, string ~= nil, math ~= nil, utf8 ~= nil }",
             )
             .unwrap();
         assert_eq!(
             value,
             serde_json::json!([
-                true, true, true, true, true, true, true, true, true, true, true, true, true, true
+                true, true, true, true, true, true, true, true, true, true, true, true, true, true,
+                true
             ])
         );
     }
@@ -6542,6 +6807,16 @@ return { main = exported }
         assert!(error.details.labels[0]
             .message
             .contains("explicit Quirl capability"));
+    }
+
+    #[test]
+    fn linter_rejects_dynamic_chunk_loading() {
+        let error = lint_source("return load('return 42')", Path::new("plugin.lua"))
+            .expect_err("dynamic chunks must not bypass source admission");
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.details.labels[0]
+            .message
+            .contains("untrusted binary bytecode"));
     }
 
     #[test]

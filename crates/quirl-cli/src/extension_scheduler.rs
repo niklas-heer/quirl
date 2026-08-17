@@ -28,9 +28,9 @@
 //! - callback panics end that job but are caught at the worker boundary, so one
 //!   plugin cannot kill a shared worker or strand its in-flight accounting;
 //! - shutdown rejects new work, discards the bounded queue, cancels active
-//!   callbacks, and waits only for a caller-supplied duration. Workers that do
-//!   not acknowledge cancellation are detached with `Arc`-owned state rather
-//!   than delaying terminal, child, or persistence cleanup.
+//!   callbacks, and reports whether they quiesced within the caller's wait.
+//!   Final destruction joins every thread; production callbacks supervise a
+//!   killable Lua process, so no abandoned host thread can retain guest work.
 //!
 //! Callback owners remain responsible for clearing a runtime cancellation flag
 //! while holding that runtime's exclusive lease. The scheduler never runs Lua
@@ -527,10 +527,7 @@ impl ExtensionSchedulerHandle {
 impl Drop for ExtensionScheduler {
     fn drop(&mut self) {
         let _ = self.shutdown(Duration::from_millis(25));
-        // Any remaining handles are deliberately detached. Every thread and
-        // callback owns the shared state it still needs through `Arc`.
-        self.workers.clear();
-        self.deadline_monitor.take();
+        self.join_finished_threads();
     }
 }
 

@@ -427,7 +427,7 @@ mod tests {
         let source = fs::read_to_string(&path).unwrap();
         assert!(source.contains("---@module script"));
         assert!(source.contains("return { main = main }"));
-        quirl_lua::LuaRuntime::check_file(&path).unwrap();
+        crate::lua_worker::LuaWorkerRuntime::check_file(&path).unwrap();
         let output = crate::script::run(&path, None, &["staging".to_owned()]).unwrap();
         assert_eq!(output.status, 0);
         assert_eq!(output.value["script"], "script");

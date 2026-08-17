@@ -5,10 +5,11 @@
 //! JSON-RPC request, so an MCP client cannot obtain ambient execution rights by
 //! discovering a tool.
 
+use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::{Subcommand, ValueEnum};
 use quirl_catalog::Catalog;
 use quirl_core::{escape_terminal_controls, ErrorCode, ShellError};
-use quirl_lua::{format_source, LuaRuntime};
+use quirl_lua::format_source;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
