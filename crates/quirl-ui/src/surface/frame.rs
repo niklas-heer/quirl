@@ -192,7 +192,7 @@ impl FrameModel<'_> {
                 .unwrap_or(u16::MAX)
                 .saturating_add(2)
                 .saturating_add(u16::from(self.picker_query.is_some()))
-                .max(if area.width >= 100 { 7 } else { 3 });
+                .max(if area.width >= 100 { 12 } else { 3 });
             let popup_height = area.height.min(desired_popup_height);
             let replace_start = self
                 .completion
@@ -560,19 +560,22 @@ impl FrameModel<'_> {
             let inner = block.inner(docs_area);
             frame.render_widget(block, docs_area);
             if let Some(item) = self.completion.selected_item() {
-                let docs = vec![
+                let mut docs = vec![
                     Line::styled(
                         escape_terminal_line(&item.display),
                         self.theme.accent(self.mode),
                     ),
-                    Line::raw(""),
-                    Line::raw(escape_terminal_line(&item.detail)),
-                    Line::raw(""),
                     Line::styled(
                         format!("source: {} · {}", item.source, item.trust),
                         self.theme.dim(),
                     ),
+                    Line::raw(""),
                 ];
+                docs.extend(
+                    item.detail
+                        .lines()
+                        .map(|line| Line::raw(escape_terminal_line(line))),
+                );
                 frame.render_widget(
                     Paragraph::new(docs)
                         .wrap(ratatui::widgets::Wrap { trim: true })

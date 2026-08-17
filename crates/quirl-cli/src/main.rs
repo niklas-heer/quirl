@@ -50,16 +50,18 @@ use quirl_core::{
 use quirl_data::{DataEnvelope, DataOutput, DataRenderFormat, DataRuntime};
 use quirl_lua::{sdk_json, sdk_lua, sdk_markdown, LuaPolicy, QuirlConfig, MAX_LUA_SOURCE_BYTES};
 use quirl_picker::{ItemKind, PickItem, Picker, MAX_PICKER_ITEMS};
-use quirl_process::{sandboxed_process_host, JobStatus, NativeExecutor, DEFAULT_CAPTURE_BYTES};
+use quirl_process::{
+    sandboxed_process_host, JobStatus, NativeExecutor, OutputObserver, DEFAULT_CAPTURE_BYTES,
+};
 use quirl_syntax::{classify, parse_command_list, InteractiveLine, Mode};
 use quirl_ui::{
     editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
-    terminal_supports_unicode, terminal_width, CatalogLoader, ExtensionCompleter,
-    ExtensionSuggestion, InteractiveDataSnapshot, InteractiveHistoryEntry, InteractiveJobAction,
-    InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
-    InteractiveRuntimeSnapshot, InteractiveSignal, PickerItem, PickerItemKind, PickerMatch,
-    PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind, DATA_ITEMS_MAX,
-    DATA_RETAINED_BYTES_MAX, MODE_TOGGLE_HOST_COMMAND,
+    set_product_identity, terminal_supports_unicode, terminal_width, CatalogLoader,
+    ExtensionCompleter, ExtensionSuggestion, InteractiveDataSnapshot, InteractiveHistoryEntry,
+    InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch,
+    InteractivePanelProvider, InteractiveRuntimeSnapshot, InteractiveSignal, PickerItem,
+    PickerItemKind, PickerMatch, PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface,
+    SurfaceKind, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, MODE_TOGGLE_HOST_COMMAND,
 };
 use recovery::RecoveryCommand;
 use script::ScriptLanguage;
@@ -293,7 +295,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     if cli.build_info {
         print_json_value(serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "version": env!("CARGO_PKG_VERSION"),
             "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             "optimization_level": env!("QUIRL_BUILD_OPT_LEVEL"),
@@ -301,6 +303,8 @@ fn main() -> ExitCode {
             "operating_system": std::env::consts::OS,
             "architecture": std::env::consts::ARCH,
             "source_commit": env!("QUIRL_BUILD_COMMIT"),
+            "build_timestamp": env!("QUIRL_BUILD_TIMESTAMP"),
+            "official_release": env!("QUIRL_OFFICIAL_RELEASE") == "true",
             "source_dirty": match env!("QUIRL_BUILD_DIRTY") {
                 "true" => Some(true),
                 "false" => Some(false),
@@ -324,6 +328,23 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn product_build_identity() -> String {
+    if env!("QUIRL_OFFICIAL_RELEASE") == "true" {
+        return format!("v{}", env!("CARGO_PKG_VERSION"));
+    }
+    let commit = env!("QUIRL_BUILD_COMMIT");
+    let short_commit = commit.get(..7).unwrap_or(commit);
+    let dirty = if env!("QUIRL_BUILD_DIRTY") == "true" {
+        "*"
+    } else {
+        ""
+    };
+    format!(
+        "dev@{}+{short_commit}{dirty}",
+        env!("QUIRL_BUILD_TIMESTAMP")
+    )
 }
 
 fn run(cli: Cli) -> Result<i32, ShellError> {
@@ -605,6 +626,7 @@ fn run_exec_with_recovery(source: &str) -> Result<i32, ShellError> {
         source,
         Some(&extensions),
         ExecutionOutputMode::Capture,
+        None,
     )
     .map(|report| report.status)
 }
@@ -734,6 +756,15 @@ fn execute_execution_request(
     request: ExecutionRequest,
     extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
 ) -> Result<ExecutionOutcome, ShellError> {
+    execute_execution_request_streaming(executor, request, extensions, None)
+}
+
+fn execute_execution_request_streaming(
+    executor: &mut NativeExecutor,
+    request: ExecutionRequest,
+    extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
+    observer: Option<&mut OutputObserver<'_>>,
+) -> Result<ExecutionOutcome, ShellError> {
     let plan = request.plan()?;
     plan.ensure_active("before engine initialization")?;
     if !matches!(plan.input(), ExecutionInput::None) && plan.mode() != ExecutionMode::Plugin {
@@ -746,7 +777,7 @@ fn execute_execution_request(
     }
     let deadline_guard = DeadlineCancellationGuard::arm(&plan, "before mode dispatch")?;
     let result = match plan.mode() {
-        ExecutionMode::NativeCommand => execute_native_plan(executor, &plan),
+        ExecutionMode::NativeCommand => execute_native_plan(executor, &plan, observer),
         ExecutionMode::QuirlScript | ExecutionMode::LuaScript => {
             script::execute_plan(executor, &plan)
         }
@@ -792,6 +823,7 @@ fn execute_execution_request(
 fn execute_native_plan(
     executor: &mut NativeExecutor,
     plan: &quirl_core::ExecutionPlan,
+    observer: Option<&mut OutputObserver<'_>>,
 ) -> Result<ExecutionOutcome, ShellError> {
     require_declared_effect(plan, ExecutionEffect::SpawnProcess)?;
     let deadline = plan
@@ -814,7 +846,10 @@ fn execute_native_plan(
     let outcome = match plan.output() {
         ExecutionOutputTarget::Capture {
             max_bytes_per_stream: _,
-        } => executor.execute_capture_request(request)?,
+        } => match observer {
+            Some(observer) => executor.execute_capture_request_streaming(request, observer)?,
+            None => executor.execute_capture_request(request)?,
+        },
         ExecutionOutputTarget::Inherit => executor.execute_interactive_request(request)?,
         ExecutionOutputTarget::Value => unreachable!("value output was rejected above"),
     };
@@ -1021,6 +1056,7 @@ fn execute_with_recovery(
     source: &str,
     extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
     output_mode: ExecutionOutputMode,
+    observer: Option<&mut OutputObserver<'_>>,
 ) -> Result<ExecutionReport, ShellError> {
     let planned = match extensions {
         Some(extensions) => {
@@ -1092,6 +1128,7 @@ fn execute_with_recovery(
         output_mode,
         extensions,
         plugin_command.as_ref(),
+        observer,
     ) {
         Ok(outcome) => {
             let duration = started.elapsed();
@@ -1209,8 +1246,15 @@ fn execute_command_or_dialect_island(
     source: &str,
     output_mode: ExecutionOutputMode,
 ) -> Result<CommandOutcome, ShellError> {
-    execute_command_or_dialect_island_with_extensions(executor, source, output_mode, None, None)
-        .map(|outcome| command_outcome_projection(&outcome))
+    execute_command_or_dialect_island_with_extensions(
+        executor,
+        source,
+        output_mode,
+        None,
+        None,
+        None,
+    )
+    .map(|outcome| command_outcome_projection(&outcome))
 }
 
 fn execute_command_or_dialect_island_with_extensions(
@@ -1219,6 +1263,7 @@ fn execute_command_or_dialect_island_with_extensions(
     output_mode: ExecutionOutputMode,
     extensions: Option<&Arc<Mutex<LuaExtensionHost>>>,
     installed: Option<&extensions::InstalledPluginCommand>,
+    observer: Option<&mut OutputObserver<'_>>,
 ) -> Result<ExecutionOutcome, ShellError> {
     if output_mode == ExecutionOutputMode::RichViewport
         && installed.is_none()
@@ -1290,10 +1335,12 @@ fn execute_command_or_dialect_island_with_extensions(
             ExecutionEffects::all(),
         )?
     };
-    execute_execution_request(executor, request, extensions).map_err(|mut error| {
-        error.details.command = Some(source.to_owned());
-        error
-    })
+    execute_execution_request_streaming(executor, request, extensions, observer).map_err(
+        |mut error| {
+            error.details.command = Some(source.to_owned());
+            error
+        },
+    )
 }
 
 fn recovery_journal(
@@ -1716,6 +1763,7 @@ fn interactive_job_snapshots(jobs: &[quirl_process::JobState]) -> Vec<Interactiv
 }
 
 fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
+    set_product_identity(&product_build_identity())?;
     let mut executor = NativeExecutor::default();
     let runtime_extensions_present = extensions
         .lock()
@@ -1927,26 +1975,89 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         let started = Instant::now();
                         let journal = recovery_journal(&mut recovery)?;
                         let output_mode = line_editor.command_output_mode();
-                        let transcript_result = match execute_with_recovery(
-                            &mut executor,
-                            journal,
-                            command,
-                            Some(&extensions),
-                            output_mode,
-                        ) {
+                        let streaming = line_editor.begin_command_stream(command, &prompt)?;
+                        let mut streamed_any = false;
+                        let execution = if streaming {
+                            let mut observer = |stream, bytes: &[u8]| {
+                                streamed_any |= !bytes.is_empty();
+                                line_editor.append_command_stream(stream, bytes, &prompt)
+                            };
+                            execute_with_recovery(
+                                &mut executor,
+                                journal,
+                                command,
+                                Some(&extensions),
+                                output_mode,
+                                Some(&mut observer),
+                            )
+                        } else {
+                            execute_with_recovery(
+                                &mut executor,
+                                journal,
+                                command,
+                                Some(&extensions),
+                                output_mode,
+                                None,
+                            )
+                        };
+                        let transcript_result = match execution {
                             Ok(report) => {
                                 last_status = report.status;
-                                line_editor.append_command_transcript(
-                                    command,
-                                    &report.stdout,
-                                    &report.stderr,
-                                    report.status,
-                                    started.elapsed(),
-                                )
+                                if streaming {
+                                    if !streamed_any {
+                                        for chunk in report.stdout.chunks(8 * 1024) {
+                                            line_editor.append_command_stream(
+                                                OutputStream::Stdout,
+                                                chunk,
+                                                &prompt,
+                                            )?;
+                                        }
+                                        for chunk in report.stderr.chunks(8 * 1024) {
+                                            line_editor.append_command_stream(
+                                                OutputStream::Stderr,
+                                                chunk,
+                                                &prompt,
+                                            )?;
+                                        }
+                                    }
+                                    line_editor.finish_command_stream(
+                                        report.status,
+                                        started.elapsed(),
+                                        &prompt,
+                                    )
+                                } else {
+                                    line_editor.append_command_transcript(
+                                        command,
+                                        &report.stdout,
+                                        &report.stderr,
+                                        report.status,
+                                        started.elapsed(),
+                                    )
+                                }
                             }
                             Err(error) => {
                                 last_status = 1;
-                                line_editor.append_command_error(command, &error, started.elapsed())
+                                if streaming {
+                                    let rendered = render_error(&error, false);
+                                    for chunk in rendered.as_bytes().chunks(8 * 1024) {
+                                        line_editor.append_command_stream(
+                                            OutputStream::Stderr,
+                                            chunk,
+                                            &prompt,
+                                        )?;
+                                    }
+                                    line_editor.finish_command_stream(
+                                        last_status,
+                                        started.elapsed(),
+                                        &prompt,
+                                    )
+                                } else {
+                                    line_editor.append_command_error(
+                                        command,
+                                        &error,
+                                        started.elapsed(),
+                                    )
+                                }
                             }
                         };
                         let elapsed = started.elapsed();
@@ -2733,6 +2844,42 @@ impl SessionEditor {
     ) -> Result<(), ShellError> {
         if let Self::Rich(editor) = self {
             return editor.append_transcript(command, stdout, stderr, status, duration);
+        }
+        Ok(())
+    }
+
+    fn begin_command_stream(
+        &mut self,
+        command: &str,
+        prompt: &QuirlPrompt,
+    ) -> Result<bool, ShellError> {
+        let Self::Rich(editor) = self else {
+            return Ok(false);
+        };
+        editor.begin_command_stream(command, prompt)?;
+        Ok(true)
+    }
+
+    fn append_command_stream(
+        &mut self,
+        stream: OutputStream,
+        bytes: &[u8],
+        prompt: &QuirlPrompt,
+    ) -> Result<(), ShellError> {
+        if let Self::Rich(editor) = self {
+            editor.append_command_stream(stream, bytes, prompt)?;
+        }
+        Ok(())
+    }
+
+    fn finish_command_stream(
+        &mut self,
+        status: i32,
+        duration: Duration,
+        prompt: &QuirlPrompt,
+    ) -> Result<(), ShellError> {
+        if let Self::Rich(editor) = self {
+            editor.finish_command_stream(status, duration, prompt)?;
         }
         Ok(())
     }
@@ -3832,6 +3979,7 @@ mod tests {
             &mut NativeExecutor::default(),
             "sh -c 'printf viewport-out; printf viewport-error >&2; exit 7'",
             ExecutionOutputMode::RichViewport,
+            None,
             None,
             None,
         )

@@ -41,6 +41,7 @@ const CHECK_NAMES: &[&str] = &[
     "interactive-runtime",
     "cwd-history",
     "retained-output-cycles",
+    "external-command-compatibility",
     "rich-review-regressions",
     "native-job-control",
     "noninteractive-dialect-islands",
@@ -76,6 +77,7 @@ struct SessionOptions {
     ai_bootstrap_fake: bool,
     catalog_force_timeout: bool,
     catalog_refresh_enabled: bool,
+    fish_completion: Option<String>,
 }
 
 struct Session {
@@ -115,6 +117,13 @@ return quirl.config {{
 "#
             ),
         )?;
+        if let Some(completion) = options.fish_completion.as_deref() {
+            let fish_dir = config_dir.join("fish");
+            create_private_directory(&fish_dir)?;
+            let completion_dir = fish_dir.join("completions");
+            create_private_directory(&completion_dir)?;
+            fs::write(completion_dir.join("ghq.fish"), completion)?;
+        }
 
         let path = options.path.clone().map_or_else(
             || env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin")),
@@ -411,7 +420,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 17] {
+fn checks() -> [CheckCase; 18] {
     [
         CheckCase {
             name: "rich-editing",
@@ -456,6 +465,10 @@ fn checks() -> [CheckCase; 17] {
         CheckCase {
             name: "retained-output-cycles",
             run: check_retained_output_cycles,
+        },
+        CheckCase {
+            name: "external-command-compatibility",
+            run: check_external_command_compatibility,
         },
         CheckCase {
             name: "rich-review-regressions",
@@ -1592,6 +1605,135 @@ fn check_retained_output_cycles(binary: &Path) -> Result<(), Box<dyn Error>> {
         })?;
     session.pty.send(key::CTRL_D)?;
     ensure_status(session.pty.wait_exit()?, 0, "retained-output cycles")
+}
+
+fn check_external_command_compatibility(binary: &Path) -> Result<(), Box<dyn Error>> {
+    let fixtures = TempDirectory::new("quirl-external-compatibility")?;
+    let binary_dir = fixtures.path.join("bin");
+    create_private_directory(&binary_dir)?;
+    let finished = fixtures.path.join("GHQ_FINISHED");
+    write_executable(
+        &binary_dir.join("ghq"),
+        &format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               get)\n\
+                 printf '\\033[0;32mclone\\033[0m %s\\n' \"$2\"\n\
+                 printf 'progress 10%%\\rprogress 20%%\\n'\n\
+                 /bin/sleep 1\n\
+                 printf 'clone complete\\n'\n\
+                 : > {}\n\
+                 ;;\n\
+               list) printf 'github.com/example/repository\\n' ;;\n\
+               *) printf 'unexpected ghq arguments\\n' >&2; exit 64 ;;\n\
+             esac\n",
+            shell_quote(&finished)
+        ),
+    )?;
+    let fish = r#"
+complete -c ghq -f
+complete -c ghq -s h -l help -d 'Show help'
+complete -c ghq -n __fish_ghq_needs_subcommand -a get -d 'Clone/sync with a remote repository'
+complete -c ghq -n __fish_ghq_needs_subcommand -a list -d 'List local repositories'
+complete -c ghq -n __fish_ghq_needs_subcommand -a root -d 'Show repositories root'
+complete -c ghq -n '__fish_seen_subcommand_from get' -s u -l update -d 'Update local repository if cloned already'
+complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Print full paths'
+"#;
+    let index_dir = fixtures.path.join("index");
+    create_private_directory(&index_dir)?;
+    let mut session = Session::new(
+        binary,
+        SessionOptions {
+            path: Some(binary_dir),
+            index_dir: Some(index_dir.clone()),
+            catalog_refresh_enabled: true,
+            fish_completion: Some(fish.to_owned()),
+            symbols: Some("unicode"),
+            rows: Some(20),
+            columns: Some(160),
+            ..SessionOptions::default()
+        },
+    )?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    session
+        .pty
+        .wait_for_screen("development build identity in status bar", |screen| {
+            let bottom = screen.bottom_line();
+            bottom.contains("🌀") && bottom.contains("dev@")
+        })?;
+    wait_for_file_contents(&mut session, &index_dir.join("catalog.sqlite3"), b"ghq get")?;
+    session.pty.resize(20, 400)?;
+    wait_for_command_information(
+        &mut session,
+        "ghq",
+        &[
+            "subcommands available",
+            "Clone/sync with a remote repository",
+            "List local repositories",
+            "source: fish-import",
+        ],
+    )?;
+    let information = session.pty.screen().text();
+    if information.contains("ghq _c")
+        || information.contains("ghq Commands")
+        || information.contains("Subcommand imported from Zsh")
+        || information.contains("Command discovered from Fish completion metadata")
+    {
+        return Err(screen_error(
+            "GHQ completion exposed importer internals instead of command documentation",
+            session.pty.screen(),
+        ));
+    }
+    session.pty.send(key::ESCAPE)?;
+    clear_editor(&mut session)?;
+    session.pty.resize(20, 160)?;
+    let command = "ghq get git@github.com:niklas-heer/homebrew-tap.git";
+    let output_start = session.pty.output().len();
+    session.pty.type_text(command)?;
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("GHQ progress streamed before process exit", |screen| {
+            let text = screen.text();
+            text.contains("clone git@github.com:niklas-heer/homebrew-tap.git")
+                && text.contains("progress 20%")
+                && !text.contains("clone complete")
+                && screen.bottom_line().contains("running")
+        })?;
+    if finished.exists() {
+        return Err(io::Error::other(
+            "GHQ fixture completed before its first progress frame was observable",
+        )
+        .into());
+    }
+    if session.pty.screen().text().contains("\\u{1b}")
+        || session.pty.screen().text().contains("progress 10%")
+    {
+        return Err(screen_error(
+            "streamed ANSI or carriage-return progress was rendered as literal escape text",
+            session.pty.screen(),
+        ));
+    }
+    session.pty.wait_for_screen(
+        "GHQ command completed inside persistent viewport",
+        |screen| {
+            let text = screen.text();
+            text.contains("clone complete")
+                && text.contains("── exit 0")
+                && screen.bottom_line().contains("NORMAL")
+                && screen.bottom_line().contains("dev@")
+        },
+    )?;
+    if !finished.is_file() {
+        return Err(io::Error::other("GHQ fixture did not reach process completion").into());
+    }
+    ensure_alternate_screen_unchanged(&session, output_start, "streamed GHQ fixture")?;
+    session.pty.send(key::CTRL_D)?;
+    ensure_status(
+        session.pty.wait_exit()?,
+        0,
+        "external command compatibility",
+    )
 }
 
 fn transcript_tail_flows_into_prompt(screen: &VirtualScreen, command: &str, output: &str) -> bool {

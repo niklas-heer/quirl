@@ -63,7 +63,9 @@ use crossterm::{
     terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use quirl_catalog::Catalog;
-use quirl_core::{replace_file_atomically, AtomicReplaceOptions, ErrorCode, ShellError};
+use quirl_core::{
+    replace_file_atomically, AtomicReplaceOptions, ErrorCode, OutputStream, ShellError,
+};
 use quirl_lua::QuirlConfig;
 use quirl_syntax::{parse_command_list, Mode};
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal, TerminalOptions, Viewport};
@@ -75,7 +77,7 @@ use std::{
     fs::OpenOptions,
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -92,13 +94,178 @@ const TRANSCRIPT_LINES_MAX: usize = 50_000;
 const TRANSCRIPT_BYTES_MAX: usize = 16 * 1024 * 1024;
 const TRANSCRIPT_COPY_BYTES_MAX: usize = 1024 * 1024;
 const TRANSCRIPT_MOUSE_SCROLL_LINES: usize = 3;
+const STREAM_CHUNK_BYTES_MAX: usize = 8 * 1024;
+const ANSI_CSI_BYTES_MAX: usize = 64;
+const ANSI_OSC_BYTES_MAX: usize = 4 * 1024;
+const PRODUCT_IDENTITY_BYTES_MAX: usize = 64;
+static PRODUCT_IDENTITY: OnceLock<String> = OnceLock::new();
 #[cfg(test)]
 static HISTORY_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Install the bounded build identity rendered by rich status bars in this process.
+///
+/// The identity is immutable after first use so concurrent surfaces cannot disagree about the
+/// running executable. Calling this again with the same value is idempotent.
+pub fn set_product_identity(identity: &str) -> Result<(), ShellError> {
+    if identity.len() > PRODUCT_IDENTITY_BYTES_MAX {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "status-bar build identity exceeds its byte limit",
+        )
+        .with_context(format!(
+            "limit {PRODUCT_IDENTITY_BYTES_MAX} bytes; observed {} bytes",
+            identity.len()
+        ))
+        .with_help("Use a shorter release version or development build identifier"));
+    }
+    let identity = quirl_core::escape_terminal_line(identity);
+    if PRODUCT_IDENTITY
+        .get()
+        .is_some_and(|current| current == &identity)
+    {
+        return Ok(());
+    }
+    PRODUCT_IDENTITY.set(identity).map_err(|_| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "status-bar build identity is already initialized",
+        )
+        .with_help("Install build identity once before constructing the first rich surface")
+    })
+}
+
+fn product_identity() -> &'static str {
+    PRODUCT_IDENTITY
+        .get_or_init(|| format!("v{}", env!("CARGO_PKG_VERSION")))
+        .as_str()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MouseDrag {
     Selection { anchor: TextPosition, dragged: bool },
     Scrollbar,
+}
+
+#[derive(Debug, Default)]
+struct StreamingText {
+    utf8_tail: Vec<u8>,
+    line: String,
+    sequence: TerminalSequence,
+}
+
+#[derive(Debug, Default)]
+enum TerminalSequence {
+    #[default]
+    Ground,
+    Escape,
+    Csi(usize),
+    Osc(usize),
+    OscEscape(usize),
+}
+
+impl StreamingText {
+    fn reset(&mut self) {
+        self.utf8_tail.clear();
+        self.line.clear();
+        self.sequence = TerminalSequence::Ground;
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        let text = decode_utf8_chunk(&mut self.utf8_tail, bytes);
+        self.push_text(&text)
+    }
+
+    fn finish(&mut self) -> Vec<String> {
+        let mut text = String::new();
+        if !self.utf8_tail.is_empty() {
+            text.push('\u{fffd}');
+            self.utf8_tail.clear();
+        }
+        let mut lines = self.push_text(&text);
+        if !self.line.is_empty() {
+            lines.push(std::mem::take(&mut self.line));
+        }
+        self.sequence = TerminalSequence::Ground;
+        lines
+    }
+
+    fn push_text(&mut self, text: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        for character in text.chars() {
+            match &mut self.sequence {
+                TerminalSequence::Ground => match character {
+                    '\u{1b}' => self.sequence = TerminalSequence::Escape,
+                    '\n' => lines.push(std::mem::take(&mut self.line)),
+                    '\r' => self.line.clear(),
+                    '\t' => self.line.push_str("    "),
+                    value if !value.is_control() => self.line.push(value),
+                    _ => {}
+                },
+                TerminalSequence::Escape => {
+                    self.sequence = match character {
+                        '[' => TerminalSequence::Csi(0),
+                        ']' => TerminalSequence::Osc(0),
+                        _ => TerminalSequence::Ground,
+                    };
+                }
+                TerminalSequence::Csi(count) => {
+                    *count = count.saturating_add(character.len_utf8());
+                    if ('@'..='~').contains(&character) || *count >= ANSI_CSI_BYTES_MAX {
+                        self.sequence = TerminalSequence::Ground;
+                    }
+                }
+                TerminalSequence::Osc(count) => {
+                    *count = count.saturating_add(character.len_utf8());
+                    if character == '\u{7}' || *count >= ANSI_OSC_BYTES_MAX {
+                        self.sequence = TerminalSequence::Ground;
+                    } else if character == '\u{1b}' {
+                        self.sequence = TerminalSequence::OscEscape(*count);
+                    }
+                }
+                TerminalSequence::OscEscape(count) => {
+                    self.sequence = if character == '\\' || *count >= ANSI_OSC_BYTES_MAX {
+                        TerminalSequence::Ground
+                    } else {
+                        TerminalSequence::Osc(count.saturating_add(character.len_utf8()))
+                    };
+                }
+            }
+        }
+        lines
+    }
+}
+
+fn decode_utf8_chunk(tail: &mut Vec<u8>, bytes: &[u8]) -> String {
+    let mut combined = Vec::with_capacity(tail.len().saturating_add(bytes.len()));
+    combined.append(tail);
+    combined.extend_from_slice(bytes);
+    let mut decoded = String::new();
+    let mut remaining = combined.as_slice();
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(text) => {
+                decoded.push_str(text);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    decoded.push_str(std::str::from_utf8(&remaining[..valid]).unwrap_or_default());
+                }
+                match error.error_len() {
+                    Some(length) => {
+                        decoded.push('\u{fffd}');
+                        remaining = &remaining[valid.saturating_add(length)..];
+                    }
+                    None => {
+                        tail.extend_from_slice(&remaining[valid..]);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    decoded
 }
 
 fn legacy_history(path: &Path) -> Vec<InteractiveHistoryEntry> {
@@ -169,6 +336,9 @@ pub struct RichSurface {
     transcript_area: Rect,
     mouse_drag: Option<MouseDrag>,
     intent_completion: IntentCompletionState,
+    stream_stdout: StreamingText,
+    stream_stderr: StreamingText,
+    stream_had_output: bool,
 }
 
 impl RichSurface {
@@ -225,6 +395,9 @@ impl RichSurface {
             transcript_area: Rect::default(),
             mouse_drag: None,
             intent_completion: IntentCompletionState::default(),
+            stream_stdout: StreamingText::default(),
+            stream_stderr: StreamingText::default(),
+            stream_had_output: false,
         })
     }
 
@@ -280,6 +453,9 @@ impl RichSurface {
             transcript_area: Rect::default(),
             mouse_drag: None,
             intent_completion: IntentCompletionState::default(),
+            stream_stdout: StreamingText::default(),
+            stream_stderr: StreamingText::default(),
+            stream_had_output: false,
         })
     }
 
@@ -307,6 +483,116 @@ impl RichSurface {
         self.output_notice =
             Some("result kept in viewport · PageUp/PageDown scroll · Alt-Q O copy".to_owned());
         Ok(())
+    }
+
+    /// Start one foreground command record while the alternate-screen viewport remains owned.
+    pub fn begin_command_stream(
+        &mut self,
+        command: &str,
+        prompt: &QuirlPrompt,
+    ) -> Result<(), ShellError> {
+        self.dismiss_picker();
+        self.stream_stdout.reset();
+        self.stream_stderr.reset();
+        self.stream_had_output = false;
+        self.append_transcript_line(&format!("❯ {command}"));
+        self.output_notice = Some("running · output streams into this viewport".to_owned());
+        self.draw_execution(prompt)
+    }
+
+    /// Append one bounded stdout or stderr chunk and repaint the active command viewport.
+    pub fn append_command_stream(
+        &mut self,
+        stream: OutputStream,
+        bytes: &[u8],
+        prompt: &QuirlPrompt,
+    ) -> Result<(), ShellError> {
+        if bytes.len() > STREAM_CHUNK_BYTES_MAX {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "process output chunk exceeds the rich viewport limit",
+            )
+            .with_context(format!(
+                "limit {STREAM_CHUNK_BYTES_MAX} bytes; observed {} bytes",
+                bytes.len()
+            ))
+            .with_help("Deliver process output in chunks no larger than 8 KiB"));
+        }
+        let lines = match stream {
+            OutputStream::Stdout => self.stream_stdout.push(bytes),
+            OutputStream::Stderr => self.stream_stderr.push(bytes),
+        };
+        self.append_stream_lines(lines);
+        self.draw_execution(prompt)
+    }
+
+    /// Finish the active command record after every captured reader has been drained.
+    pub fn finish_command_stream(
+        &mut self,
+        status: i32,
+        duration: Duration,
+        prompt: &QuirlPrompt,
+    ) -> Result<(), ShellError> {
+        let stdout = self.stream_stdout.finish();
+        self.append_stream_lines(stdout);
+        let stderr = self.stream_stderr.finish();
+        self.append_stream_lines(stderr);
+        if !self.stream_had_output {
+            self.append_transcript_line("(no output)");
+        }
+        self.append_transcript_line(&format!("── exit {status} · {}ms ──", duration.as_millis()));
+        self.output_cursor_line = self.transcript.line_count().saturating_sub(1);
+        self.output_notice =
+            Some("result kept in viewport · PageUp/PageDown scroll · Alt-Q O copy".to_owned());
+        self.draw_execution(prompt)
+    }
+
+    fn append_stream_lines(&mut self, lines: Vec<String>) {
+        for line in lines {
+            self.stream_had_output = true;
+            self.append_transcript_line(&line);
+        }
+    }
+
+    fn draw_execution(&mut self, prompt: &QuirlPrompt) -> Result<(), ShellError> {
+        let editor = EditorState::new(&self.keymap, Vec::new());
+        let symbols = prompt.surface_symbols();
+        let unicode = symbols.uses_unicode();
+        let color = std::io::stderr().is_terminal()
+            && env::var_os("NO_COLOR").is_none()
+            && !env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb"));
+        let theme = self.theme.with_color(color);
+        let context_left = prompt.surface_context_left();
+        let context_right = prompt.surface_context_right();
+        let (terminal_width, terminal_height) = terminal::size().unwrap_or((80, 24));
+        let model = FrameModel {
+            context_left: &context_left,
+            context_right: &context_right,
+            editor: &editor,
+            completion: &self.completion,
+            mode: prompt.mode,
+            diagnostic: None,
+            highlight_spans: &[],
+            theme,
+            unicode,
+            symbols,
+            semantic_hints: self.semantic_hints,
+            hints: self.hints,
+            timings: None,
+            compact: terminal_height < 8,
+            picker_query: None,
+            picker_layout: self.picker_layout,
+            picker_preview: self.picker_preview,
+            detail_scroll: 0,
+            runtime: &self.runtime,
+            transcript: Some(&self.transcript),
+            transcript_truncated: self.transcript_truncated,
+            output_focus: false,
+            output_notice: self.output_notice.as_deref(),
+        };
+        self.transcript_area =
+            model.transcript_area(Rect::new(0, 0, terminal_width, terminal_height));
+        self.terminal.draw(&model)
     }
 
     fn append_transcript_bytes(&mut self, bytes: &[u8]) {
@@ -2385,6 +2671,27 @@ mod tests {
         surface.return_to_tail_for_input();
 
         assert!(surface.transcript.follows_tail());
+    }
+
+    #[test]
+    fn streaming_text_strips_split_ansi_and_keeps_progress_replacement() {
+        let mut stream = StreamingText::default();
+        assert!(stream.push(b"\x1b[0;3").is_empty());
+        assert_eq!(
+            stream.push(b"2mclone\x1b[0m ssh://example\n"),
+            ["clone ssh://example"]
+        );
+        assert_eq!(stream.push(b"10%\r20%\n"), ["20%"]);
+    }
+
+    #[test]
+    fn streaming_text_preserves_utf8_split_across_chunks() {
+        let mut stream = StreamingText::default();
+        let bytes = "repo → target\n".as_bytes();
+        let split = bytes.iter().position(|byte| *byte == 0xe2).unwrap() + 1;
+        assert!(stream.push(&bytes[..split]).is_empty());
+        assert_eq!(stream.push(&bytes[split..]), ["repo → target"]);
+        assert!(stream.finish().is_empty());
     }
 
     #[test]

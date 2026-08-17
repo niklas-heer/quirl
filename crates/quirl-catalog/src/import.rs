@@ -426,13 +426,17 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
                 continue;
             }
             let path = format!("{command} {name}");
+            let summary = summary.unwrap_or("External subcommand").to_owned();
             retention_exhausted = !retain_commands(
                 &mut imported,
                 vec![imported_command(
                     path.clone(),
                     format!("{path} [options]"),
-                    summary.unwrap_or("Subcommand imported from Zsh").to_owned(),
-                    "Imported from a static Zsh `_describe` candidate.".to_owned(),
+                    summary.clone(),
+                    format!(
+                        "{} Run `{path} --help` for authoritative runtime usage.",
+                        sentence(&summary)
+                    ),
                     Vec::new(),
                     provenance.clone(),
                 )],
@@ -703,6 +707,10 @@ fn zsh_static_arrays(
             continue;
         };
         if let Ok(values) = shell_words(&source[cursor + 1..end]) {
+            if values.iter().any(|value| is_dynamic_zsh(value)) {
+                index = end + 1;
+                continue;
+            }
             match admit_candidates(candidate_count, values.len(), "Zsh static array candidates") {
                 Ok(()) => {
                     arrays.insert(name.to_owned(), values);
@@ -764,7 +772,22 @@ struct ZshCandidates {
 }
 
 fn zsh_call_candidates(tokens: &[String], arrays: &HashMap<String, Vec<String>>) -> ZshCandidates {
-    let mut arguments = tokens.iter().filter(|token| !token.starts_with('-'));
+    let mut positional = Vec::new();
+    let mut index = 0_usize;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if matches!(token.as_str(), "-t" | "-J" | "-V" | "-M" | "-o" | "-O") {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if token.starts_with('-') {
+            index = index.saturating_add(1);
+            continue;
+        }
+        positional.push(token);
+        index = index.saturating_add(1);
+    }
+    let mut arguments = positional.into_iter();
     let _label = arguments.next();
     let remaining = arguments.cloned().collect::<Vec<_>>();
     if remaining.len() == 1 {
@@ -1254,33 +1277,107 @@ fn parse_fish_declaration(
         ProvenanceInfo::imported(Provenance::Fish, Confidence::High, origin, fingerprint);
     let summary = description
         .clone()
-        .unwrap_or_else(|| "Imported Fish completion".to_owned());
+        .unwrap_or_else(|| "External command".to_owned());
     let option = (!names.is_empty())
         .then(|| imported_argument(names, value, summary.clone(), provenance.clone()));
-    let mut details = String::from("Imported from a declarative Fish `complete` definition.");
-    if !conditions.is_empty() {
-        details.push_str(" Conditions: ");
-        details.push_str(&conditions.join("; "));
-        details.push('.');
+    let scoped_subcommands = fish_seen_subcommands(&conditions);
+    let declares_subcommands = option.is_none()
+        && conditions
+            .iter()
+            .any(|condition| condition.contains("needs_subcommand"));
+    let static_arguments = fish_static_arguments(&arguments);
+    let mut imported = Vec::new();
+    for command in commands {
+        if declares_subcommands && !static_arguments.is_empty() {
+            for subcommand in &static_arguments {
+                let path = format!("{command} {subcommand}");
+                imported.push(imported_command(
+                    path.clone(),
+                    format!("{path} [options]"),
+                    summary.clone(),
+                    format!(
+                        "{} Run `{path} --help` for authoritative runtime usage.",
+                        sentence(&summary)
+                    ),
+                    Vec::new(),
+                    provenance.clone(),
+                ));
+            }
+            continue;
+        }
+        if let Some(option) = &option {
+            if !scoped_subcommands.is_empty() {
+                for subcommand in &scoped_subcommands {
+                    let path = format!("{command} {subcommand}");
+                    imported.push(imported_command(
+                        path.clone(),
+                        format!("{path} [options]"),
+                        "External subcommand".to_owned(),
+                        format!("Options discovered for `{path}`."),
+                        vec![option.clone()],
+                        provenance.clone(),
+                    ));
+                }
+                continue;
+            }
+        }
+        imported.push(imported_command(
+            command.clone(),
+            format!("{command} [options]"),
+            "External command".to_owned(),
+            format!("Completion metadata discovered for `{command}`."),
+            option.clone().into_iter().collect(),
+            provenance.clone(),
+        ));
     }
-    if !arguments.is_empty() {
-        details.push_str(" Static or dynamic argument declaration: ");
-        details.push_str(&arguments.join(" "));
-        details.push('.');
+    Ok(imported)
+}
+
+fn fish_seen_subcommands(conditions: &[String]) -> Vec<String> {
+    let mut subcommands = Vec::new();
+    for condition in conditions {
+        let Some((_, declared)) = condition.split_once("__fish_seen_subcommand_from") else {
+            continue;
+        };
+        subcommands.extend(
+            shell_words(declared)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|value| is_static_completion_word(value)),
+        );
     }
-    Ok(commands
-        .into_iter()
-        .map(|path| {
-            imported_command(
-                path.clone(),
-                format!("{path} [options]"),
-                "Command discovered from Fish completion metadata".to_owned(),
-                details.clone(),
-                option.clone().into_iter().collect(),
-                provenance.clone(),
-            )
-        })
-        .collect())
+    subcommands.sort();
+    subcommands.dedup();
+    subcommands
+}
+
+fn fish_static_arguments(arguments: &[String]) -> Vec<String> {
+    let mut values = arguments
+        .iter()
+        .filter(|argument| !argument.contains('(') && !argument.contains('$'))
+        .flat_map(|argument| shell_words(argument).unwrap_or_default())
+        .filter(|value| is_static_completion_word(value))
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn is_static_completion_word(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn sentence(text: &str) -> String {
+    let text = text.trim();
+    if text.ends_with(['.', '!', '?']) {
+        text.to_owned()
+    } else {
+        format!("{text}.")
+    }
 }
 
 fn parse_bash_declaration(
@@ -1414,7 +1511,50 @@ fn merge_report_commands(report: &mut ImportReport, commands: Vec<CommandSpec>) 
         commands: std::mem::take(&mut report.commands),
     };
     catalog.merge(commands);
+    enrich_imported_parent_commands(&mut catalog.commands);
     report.commands = catalog.commands;
+}
+
+fn enrich_imported_parent_commands(commands: &mut [CommandSpec]) {
+    let child_facts = commands
+        .iter()
+        .filter_map(|child| {
+            let (parent, name) = child.path.rsplit_once(' ')?;
+            Some((parent.to_owned(), name.to_owned(), child.summary.clone()))
+        })
+        .collect::<Vec<_>>();
+    for command in commands {
+        let children = child_facts
+            .iter()
+            .filter(|(parent, _, _)| parent == &command.path)
+            .collect::<Vec<_>>();
+        if children.is_empty() {
+            continue;
+        }
+        if matches!(
+            command.summary.as_str(),
+            "External command"
+                | "Imported Fish completion"
+                | "Command discovered from Fish completion metadata"
+                | "Command discovered from Zsh completion metadata"
+        ) {
+            command.summary = format!("{} subcommands available", children.len());
+        }
+        let retained_facts = command
+            .details
+            .find(" Static values:")
+            .or_else(|| command.details.find(" Dynamic declarations"))
+            .map_or_else(String::new, |start| command.details[start..].to_owned());
+        command.details = format!(
+            "Available subcommands: {}.",
+            children
+                .iter()
+                .map(|(_, name, summary)| format!("{name} — {summary}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        command.details.push_str(&retained_facts);
+    }
 }
 
 fn admit_candidates(
@@ -1703,7 +1843,7 @@ mod tests {
         assert_eq!(command.options[0].names, vec!["--environment", "-e"]);
         assert_eq!(command.options[0].value_type, "value");
         assert_eq!(command.options[0].documentation, "Target environment");
-        assert!(command.details.contains("__fish_use_subcommand"));
+        assert_eq!(command.summary, "External command");
         assert_eq!(command.options[0].provenance.source, Provenance::Fish);
     }
 
@@ -1716,6 +1856,76 @@ mod tests {
         assert_eq!(report.commands.len(), 1);
         assert_eq!(report.commands[0].options[0].names, vec!["--output"]);
         assert_eq!(report.commands[0].options[1].names, vec!["--verbose"]);
+    }
+
+    #[test]
+    fn fish_subcommands_and_scoped_options_form_command_paths() {
+        let source = r#"
+complete -c ghq -f
+complete -c ghq -n __fish_ghq_needs_subcommand -a get -d 'Clone/sync with a remote repository'
+complete -c ghq -n __fish_ghq_needs_subcommand -a list -d 'List local repositories'
+complete -c ghq -n '__fish_seen_subcommand_from get' -s u -l update -d 'Update an existing clone'
+complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Print full paths'
+"#;
+        let report = import_fish(source, "ghq.fish");
+        assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
+        let root = report
+            .commands
+            .iter()
+            .find(|command| command.path == "ghq")
+            .unwrap();
+        assert_eq!(root.summary, "2 subcommands available");
+        assert!(root.details.contains("get — Clone/sync"));
+        assert!(root.details.contains("list — List local"));
+        let get = report
+            .commands
+            .iter()
+            .find(|command| command.path == "ghq get")
+            .unwrap();
+        assert_eq!(get.summary, "Clone/sync with a remote repository");
+        assert!(get
+            .options
+            .iter()
+            .any(|option| option.names == ["--update", "-u"]));
+        let list = report
+            .commands
+            .iter()
+            .find(|command| command.path == "ghq list")
+            .unwrap();
+        assert_eq!(list.summary, "List local repositories");
+        assert!(list
+            .options
+            .iter()
+            .any(|option| option.names == ["--full-path", "-p"]));
+        assert!(!report
+            .commands
+            .iter()
+            .any(|command| command.path.contains("__fish")));
+    }
+
+    #[test]
+    fn zsh_describe_skips_tag_arguments_and_resolves_static_array() {
+        let source = r#"#compdef ghq
+local -a _c
+_c=(
+  'get:Clone/sync with a remote repository'
+  'list:List local repositories'
+)
+_describe -t commands Commands _c
+"#;
+        let report = import_zsh(source, "_ghq");
+        assert!(report
+            .commands
+            .iter()
+            .any(|command| command.path == "ghq get"));
+        assert!(report
+            .commands
+            .iter()
+            .any(|command| command.path == "ghq list"));
+        assert!(!report
+            .commands
+            .iter()
+            .any(|command| { matches!(command.path.as_str(), "ghq Commands" | "ghq _c") }));
     }
 
     #[test]

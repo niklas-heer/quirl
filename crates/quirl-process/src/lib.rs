@@ -12,6 +12,9 @@ use std::{
 pub const SESSION_ENVIRONMENT_VARIABLES_MAX: usize = 65_536;
 /// Maximum key and value bytes retained by one native executor's environment snapshot.
 pub const SESSION_ENVIRONMENT_BYTES_MAX: usize = 16 * 1024 * 1024;
+/// Callback invoked with one bounded retained-output chunk during native execution.
+pub type OutputObserver<'a> =
+    dyn FnMut(quirl_core::OutputStream, &[u8]) -> Result<(), quirl_core::ShellError> + 'a;
 
 pub(crate) struct SessionEnvironment {
     variables: BTreeMap<OsString, OsString>,
@@ -374,9 +377,9 @@ mod simulation_support {
 #[cfg(unix)]
 mod platform {
     use super::{
-        allocate_job_id, builtin, validate_native_plan, validate_native_source, SessionEnvironment,
-        ARITHMETIC_DEPTH_MAX, ARITHMETIC_SOURCE_BYTES_MAX, DEFAULT_CAPTURE_BYTES,
-        EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
+        allocate_job_id, builtin, validate_native_plan, validate_native_source, OutputObserver,
+        SessionEnvironment, ARITHMETIC_DEPTH_MAX, ARITHMETIC_SOURCE_BYTES_MAX,
+        DEFAULT_CAPTURE_BYTES, EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
     };
 
     use nix::{
@@ -389,7 +392,7 @@ mod platform {
         unistd::{getpgid, setpgid, tcgetpgrp, tcsetpgrp, Pid},
     };
     use os_pipe::{pipe, PipeReader, PipeWriter};
-    use quirl_core::{CommandOutcome, ErrorCode, ProcessRequest, ShellError};
+    use quirl_core::{CommandOutcome, ErrorCode, OutputStream, ProcessRequest, ShellError};
     use quirl_syntax::{
         parse_command_list, ListConnector, Pipeline, Quoting, RedirectKind, SimpleCommand, Word,
     };
@@ -397,13 +400,14 @@ mod platform {
     #[cfg(test)]
     use std::env;
     use std::{
+        cell::RefCell,
         fs::{File, OpenOptions},
         io::{ErrorKind, IsTerminal, Read, Write},
         path::{Path, PathBuf},
         process::{Child, ChildStdin, ChildStdout, Command, Stdio},
         sync::{
             atomic::{AtomicUsize, Ordering},
-            mpsc::{sync_channel, Receiver, RecvTimeoutError},
+            mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, TryRecvError},
             Arc, Mutex, MutexGuard, OnceLock, TryLockError,
         },
         thread::{self, JoinHandle},
@@ -464,6 +468,15 @@ mod platform {
     struct ReaderCapture {
         bytes: Vec<u8>,
         discarded_bytes: u64,
+    }
+
+    struct OutputEvent {
+        stream: OutputStream,
+        bytes: Vec<u8>,
+    }
+
+    struct OutputObserverHandle<'a> {
+        callback: RefCell<&'a mut OutputObserver<'a>>,
     }
 
     struct CaptureBudget {
@@ -1150,6 +1163,24 @@ mod platform {
             self.execute_inner_with_request(&request.command, true, Some(context))
         }
 
+        /// Execute a captured foreground command while reporting bounded output chunks.
+        ///
+        /// The observer runs on the executor's owning thread after the complete process graph
+        /// has been committed. Each chunk is at most 8 KiB and is also charged to the request's
+        /// retained-output limit. Observer failure terminates and reaps the foreground graph
+        /// before the error is returned.
+        pub fn execute_capture_request_streaming(
+            &mut self,
+            request: ProcessRequest,
+            observer: &mut OutputObserver<'_>,
+        ) -> Result<CommandOutcome, ShellError> {
+            let context = RequestContext::new(&request)?;
+            let observer = OutputObserverHandle {
+                callback: RefCell::new(observer),
+            };
+            self.execute_inner_with_observer(&request.command, true, Some(context), Some(&observer))
+        }
+
         /// Execute a foreground command with inherited streams under the
         /// caller's cancellation and deadline. No stdout or stderr is retained.
         pub fn execute_interactive_request(
@@ -1253,6 +1284,16 @@ mod platform {
             capture: bool,
             request: Option<RequestContext<'_>>,
         ) -> Result<CommandOutcome, ShellError> {
+            self.execute_inner_with_observer(input, capture, request, None)
+        }
+
+        fn execute_inner_with_observer(
+            &mut self,
+            input: &str,
+            capture: bool,
+            request: Option<RequestContext<'_>>,
+            observer: Option<&OutputObserverHandle<'_>>,
+        ) -> Result<CommandOutcome, ShellError> {
             self.environment.ensure_valid()?;
             if let Some(request) = request {
                 request.ensure_active()?;
@@ -1289,7 +1330,14 @@ mod platform {
                         continue;
                     }
                 }
-                last = self.execute_pipeline(pipeline, input, capture, request, last.status)?;
+                last = self.execute_pipeline(
+                    pipeline,
+                    input,
+                    capture,
+                    request,
+                    observer,
+                    last.status,
+                )?;
                 if capture {
                     append_captured_output(
                         &mut captured_stdout,
@@ -1316,6 +1364,7 @@ mod platform {
             source: &str,
             capture: bool,
             request: Option<RequestContext<'_>>,
+            observer: Option<&OutputObserverHandle<'_>>,
             previous_status: i32,
         ) -> Result<CommandOutcome, ShellError> {
             if let Some(request) = request {
@@ -1358,7 +1407,7 @@ mod platform {
                     return Ok(result);
                 }
             }
-            self.spawn_pipeline(pipeline, source, capture, request)
+            self.spawn_pipeline(pipeline, source, capture, request, observer)
         }
 
         fn expand_pipeline(
@@ -1629,6 +1678,7 @@ mod platform {
             source: &str,
             capture: bool,
             request: Option<RequestContext<'_>>,
+            observer: Option<&OutputObserverHandle<'_>>,
         ) -> Result<CommandOutcome, ShellError> {
             // Foreground ownership is process-global. Acquire the lease before
             // the first child can inherit the controlling terminal, and keep it
@@ -1653,6 +1703,12 @@ mod platform {
             let capture_streams = capture && !pipeline.background;
             let output_limit = retained_output_limit(request.map(|request| request.request));
             let stderr_budget = Arc::new(CaptureBudget::new(output_limit));
+            let (output_sender, output_receiver) = if observer.is_some() {
+                let (sender, receiver) = channel();
+                (Some(sender), Some(receiver))
+            } else {
+                (None, None)
+            };
 
             for (index, command) in pipeline.commands.iter().enumerate() {
                 let last = index + 1 == pipeline.commands.len();
@@ -1741,8 +1797,13 @@ mod platform {
                     spawned.push(child)?;
                 }
                 if let Some(stderr) = child_stderr {
-                    stderr_readers
-                        .push(spawn_reader_with_budget(stderr, Arc::clone(&stderr_budget)));
+                    stderr_readers.push(spawn_reader_with_budget(
+                        stderr,
+                        Arc::clone(&stderr_budget),
+                        output_sender
+                            .clone()
+                            .map(|sender| (sender, OutputStream::Stderr)),
+                    ));
                 }
                 if let Some(writer) = input.writer {
                     pending_writers.push(writer);
@@ -1797,11 +1858,22 @@ mod platform {
             let process_group = spawned.process_group;
             let mut terminal = ForegroundTerminal::give_to(process_group, terminal_lease)?;
             let (mut children, mut process_group_anchor) = spawned.release();
-            let stdout_reader = capture_reader.map(|reader| spawn_reader(reader, output_limit));
+            let stdout_reader = capture_reader.map(|reader| {
+                spawn_reader_observed(
+                    reader,
+                    output_limit,
+                    output_sender.map(|sender| (sender, OutputStream::Stdout)),
+                )
+            });
             let child_count = children.len();
-            let wait_error =
-                wait_for_foreground_children(&mut children, &mut process_group_anchor, request)
-                    .err();
+            let wait_error = wait_for_foreground_children(
+                &mut children,
+                &mut process_group_anchor,
+                request,
+                observer,
+                output_receiver.as_ref(),
+            )
+            .err();
             if let Some(error) = wait_error {
                 terminate_children(&mut children, &mut process_group_anchor);
                 let _ = terminal.restore();
@@ -1868,9 +1940,11 @@ mod platform {
             let stdout = join_reader(stdout_reader, "pipeline output");
             let stderr = join_readers(stderr_readers, "command error output");
             let writers = join_writers(writers);
+            let stream = drain_output_events(observer, output_receiver.as_ref(), usize::MAX);
             let stdout = stdout?;
             let stderr = stderr?;
             writers?;
+            stream?;
             Ok(outcome(
                 status,
                 capture.then_some(stdout),
@@ -1934,6 +2008,8 @@ mod platform {
                 wait_for_foreground_children(
                     &mut job.children,
                     &mut job.process_group_anchor,
+                    None,
+                    None,
                     None,
                 )?;
                 let status = job
@@ -3089,13 +3165,18 @@ mod platform {
         })
     }
 
-    fn spawn_reader(reader: impl Read + Send + 'static, limit: usize) -> ReaderTask {
-        spawn_reader_with_budget(reader, Arc::new(CaptureBudget::new(limit)))
+    fn spawn_reader_observed(
+        reader: impl Read + Send + 'static,
+        limit: usize,
+        output: Option<(Sender<OutputEvent>, OutputStream)>,
+    ) -> ReaderTask {
+        spawn_reader_with_budget(reader, Arc::new(CaptureBudget::new(limit)), output)
     }
 
     fn spawn_reader_with_budget(
         mut reader: impl Read + Send + 'static,
         budget: Arc<CaptureBudget>,
+        output: Option<(Sender<OutputEvent>, OutputStream)>,
     ) -> ReaderTask {
         thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -3108,6 +3189,14 @@ mod platform {
                 }
                 let retained = budget.claim(count);
                 bytes.extend_from_slice(&chunk[..retained]);
+                if retained > 0 {
+                    if let Some((sender, stream)) = &output {
+                        let _ = sender.send(OutputEvent {
+                            stream: *stream,
+                            bytes: chunk[..retained].to_vec(),
+                        });
+                    }
+                }
                 discarded_bytes = discarded_bytes.saturating_add((count - retained) as u64);
             }
             Ok(ReaderCapture {
@@ -3500,6 +3589,8 @@ mod platform {
         children: &mut [JobChild],
         process_group_anchor: &mut Option<ProcessGroupAnchor>,
         request: Option<RequestContext<'_>>,
+        observer: Option<&OutputObserverHandle<'_>>,
+        output: Option<&Receiver<OutputEvent>>,
     ) -> Result<(), ShellError> {
         // A pipeline is one job: if any member stops, stop every remaining
         // live member before returning it to the job table. Waiting children in
@@ -3509,6 +3600,7 @@ mod platform {
         // and every observed exit is reaped exactly once into `JobChild`.
         let mut stop_propagated = false;
         loop {
+            drain_output_events(observer, output, 64)?;
             for child in children
                 .iter_mut()
                 .filter(|child| child.status != JobStatus::Done)
@@ -3544,6 +3636,24 @@ mod platform {
             }
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn drain_output_events(
+        observer: Option<&OutputObserverHandle<'_>>,
+        output: Option<&Receiver<OutputEvent>>,
+        event_count_max: usize,
+    ) -> Result<(), ShellError> {
+        let (Some(observer), Some(output)) = (observer, output) else {
+            return Ok(());
+        };
+        for _ in 0..event_count_max {
+            let event = match output.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            (observer.callback.borrow_mut())(event.stream, &event.bytes)?;
+        }
+        Ok(())
     }
 
     fn stop_live_children(
@@ -3956,6 +4066,32 @@ mod platform {
             assert_eq!(result.status, 0);
             assert_eq!(result.stdout.as_deref(), Some("leftrecovered"));
             assert_eq!(result.stderr.as_deref(), Some("left-errorrecovered-error"));
+        }
+
+        #[test]
+        fn streaming_capture_reports_output_before_process_exit() {
+            let finished = temporary_path("streaming-finished");
+            let request = ProcessRequest {
+                command: format!(
+                    "sh -c 'printf first; sleep 0.2; printf second; : > {}'",
+                    finished.display()
+                ),
+                deadline: Duration::from_secs(2),
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: 1024,
+            };
+            let mut first_arrived_while_running = false;
+            let outcome = NativeExecutor::default()
+                .execute_capture_request_streaming(request, &mut |stream, bytes| {
+                    if stream == OutputStream::Stdout && bytes == b"first" {
+                        first_arrived_while_running = !finished.exists();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert!(first_arrived_while_running);
+            assert_eq!(outcome.stdout.as_deref(), Some("firstsecond"));
+            fs::remove_file(finished).unwrap();
         }
 
         #[test]
@@ -4725,6 +4861,8 @@ mod platform {
                 &mut guard.children,
                 &mut guard.process_group_anchor,
                 None,
+                None,
+                None,
             )
             .unwrap();
             assert_eq!(guard.children[0].status, JobStatus::Stopped);
@@ -4934,10 +5072,10 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::{
-        allocate_job_id, builtin, validate_native_plan, validate_native_source, SessionEnvironment,
-        DEFAULT_CAPTURE_BYTES, HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
+        allocate_job_id, builtin, validate_native_plan, validate_native_source, OutputObserver,
+        SessionEnvironment, DEFAULT_CAPTURE_BYTES, HERE_STRING_BYTES_MAX, RETAINED_JOBS_MAX,
     };
-    use quirl_core::{CommandOutcome, ErrorCode, ProcessRequest, ShellError};
+    use quirl_core::{CommandOutcome, ErrorCode, OutputStream, ProcessRequest, ShellError};
     use quirl_syntax::{parse_command_list, ListConnector, Pipeline, RedirectKind, SimpleCommand};
     use serde::{Deserialize, Serialize};
     use std::{
@@ -5195,6 +5333,26 @@ mod platform {
         ) -> Result<CommandOutcome, ShellError> {
             let context = RequestContext::new(&request)?;
             self.execute_inner_with_request(&request.command, true, Some(context))
+        }
+
+        /// Execute a captured foreground command and report its bounded output.
+        ///
+        /// Windows currently delivers the retained stream chunks immediately after the
+        /// contained process graph exits; Unix backends additionally deliver them while the
+        /// graph is running. Observer failure is returned after process cleanup is complete.
+        pub fn execute_capture_request_streaming(
+            &mut self,
+            request: ProcessRequest,
+            observer: &mut OutputObserver<'_>,
+        ) -> Result<CommandOutcome, ShellError> {
+            let outcome = self.execute_capture_request(request)?;
+            if let Some(stdout) = &outcome.stdout {
+                observer(OutputStream::Stdout, stdout.as_bytes())?;
+            }
+            if let Some(stderr) = &outcome.stderr {
+                observer(OutputStream::Stderr, stderr.as_bytes())?;
+            }
+            Ok(outcome)
         }
 
         /// Execute a foreground command with inherited streams under the

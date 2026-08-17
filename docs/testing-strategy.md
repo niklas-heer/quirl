@@ -22,6 +22,7 @@ cases against each available reference shell, and runs guest-side Lua tests.
 | Seeded lifecycle simulation | Process-group state remains safe under reordered/stale events and converges after faults freeze | Seed, case index, step, child, transition, bounded convergence steps |
 | Adversarial and fault | Limits, cancellation, symlink checks, recovery, plugin integrity, and terminal escaping fail closed | Tests that cross every declared boundary |
 | Real PTY | Editing, deletion, mode changes, completion, wrapping, cursor queries, and Ctrl-D work through a terminal | PTY smoke and release matrix |
+| External-command compatibility | Real argv, status, stdout/stderr, progress timing, ANSI filtering, and completion subcommand scope match the supported shell contract | Deterministic GHQ-shaped fixtures plus Bash/Zsh differential cases |
 | Guest runtime | Lua code sees the documented sandbox and API rather than Rust-only test shortcuts | `examples/lua_tests.lua` |
 | Website release gate | Mirrors and release-evidence attribution match canonical sources, and the documentation site lints, type-checks, and builds | `npm --prefix website run check` / `cargo xtask website-check` |
 | Release evidence | Startup, repaint latency, retention, binary size, digest, and source identity meet budgets | `cargo xtask release-preview` and `release-gate` |
@@ -125,11 +126,21 @@ seconds by default, the screen to 262,144 cells, and forced child cleanup to two
 seconds. Session teardown kills both the foreground process group and the PTY
 session group before reaping the leader.
 
+`external-command-compatibility` installs an isolated GHQ-shaped executable and
+Fish completion file. It proves that an scp-style repository argument reaches
+the child unchanged, colored progress becomes visible before a one-second child
+finishes, carriage-return progress replaces its prior value, alternate-screen
+ownership remains stable, and completion exposes real subcommand paths and
+descriptions rather than importer implementation names. Fixtures use no network
+and mark completion independently so a final-output-only renderer cannot pass
+by racing the assertion.
+
 Run the harness model tests and one focused end-to-end interaction with:
 
 ```console
 cargo build -p quirl-cli
 cargo xtask rich-pty --check mode-switch-and-palette-screen
+cargo xtask rich-pty --check external-command-compatibility
 ```
 
 The focused interaction sends the legacy-terminal encoding for Alt-Q and
@@ -158,6 +169,10 @@ and dismissal erases the expanded viewport before restoring the compact prompt.
 - Bound generated input size, case count, subprocess output, and elapsed time.
 - For terminal work, verify `NO_COLOR`, `TERM=dumb`, narrow widths, Unicode
   graphemes, wrapped lines, and hostile control characters.
+- For external-command regressions, assert an intermediate state before child
+  exit as well as final bytes/status. Run the same bounded argv/output fixture
+  through clean Bash and Zsh when the claim concerns shell semantics; use the
+  PTY model when the claim concerns visibility or terminal state.
 
 The rationale and non-goals are recorded in
 [ADR 0011](decisions/0011-deterministic-testing-and-bounded-engineering.md).

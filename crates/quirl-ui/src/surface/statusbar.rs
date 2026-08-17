@@ -83,9 +83,11 @@ impl StatusBarModel<'_> {
                 "up/down move | Enter accept | Esc close".to_owned()
             }
         } else if let Some(timings) = self.timings {
-            timings.to_owned()
+            format!("{timings} · {}", super::product_identity())
+        } else if self.unicode {
+            format!("🌀 {}", super::product_identity())
         } else {
-            "◉ quirl".to_owned()
+            format!("quirl {}", super::product_identity())
         };
         let left_text = left.join(separator);
         let fixed = UnicodeWidthStr::width(left_text.as_str())

@@ -144,8 +144,9 @@ impl SurfaceTerminal {
 ```
 
 Accepting an ordinary foreground command does not call `release_session`. The
-rich session retains terminal ownership while the CLI runs a bounded capture
-request and commits its completed outcome to the transcript. A background
+rich session retains terminal ownership while the CLI runs a bounded streaming
+capture request, admits sanitized lines as they arrive, and commits the final
+status after both readers drain. A background
 pipeline is rejected before spawn. `release_session` remains the single cleanup
 path for suspension, EOF, fatal errors, explicit compatibility handoff, and
 normal exit.
@@ -179,18 +180,20 @@ Rules:
 │ 1. enter raw mode + alternate screen once; build the FrameModel            │
 │ 2. edit loop: keys → EditorState; async events → completion/segments       │
 │ 3. on Accept: freeze the command; pause input, not the alternate screen    │
-│ 4. classify foreground rich execution → bounded capture; reject `&`       │
-│ 5. convert the complete outcome into one terminal-safe transcript entry    │
-│ 6. admit/evict atomically, redraw, and return to step 2                     │
+│ 4. classify foreground rich execution → bounded streaming capture; reject &│
+│ 5. sanitize ≤8 KiB chunks; admit complete progress lines and redraw         │
+│ 6. drain/reap; append final status, redraw, and return to step 2             │
 │ 7. on suspend/EOF/fatal error/exit: restore the main screen and raw state   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Stage 1 is completion-atomic: the child outcome appears after the command
-finishes. It does not promise live output, arbitrary input while the child
-runs, or stdout/stderr interleaving. The existing capture owner drains and
-reaps on success, failure, cancellation, and the 1 MiB-per-stream resource
-boundary before the UI admits a result.
+Ordinary native stdout and stderr appear while the child runs. Reader threads
+retain at most 1 MiB per stream and publish only retained chunks of at most
+8 KiB; the executor's owning thread performs every UI callback after process
+graph construction. The same capture owner drains and reaps on success,
+failure, cancellation, observer failure, and resource overflow. Command input
+remains paused, and concurrent stdout/stderr delivery is not a byte-ordering
+guarantee.
 
 Stage 1 rejects every command graph containing a background pipeline before
 spawn. The existing process engine intentionally leaves background streams
@@ -213,25 +216,24 @@ scrolls behind it. A scrolled-away viewport gives the transcript the full body.
 Completion, documentation, and picker overlays reuse a bounded transcript
 region without changing the logical scroll anchor or moving the live prompt.
 
-One completion-atomic transcript entry contains terminal-safe values
-equivalent to:
+One active transcript record accumulates terminal-safe lines equivalent to:
 
 ```rust
 struct TranscriptEntry {
     command: String,
     status: i32,
     duration: Duration,
-    stdout: String,
-    stderr: String,
+    stdout_lines: Vec<String>,
+    stderr_lines: Vec<String>,
     rendered_error: Option<String>,
 }
 ```
 
-The concrete type may use owned bounded wrappers instead of these illustrative
-field types. It must preserve the distinction between stdout, stderr, and a
-structured shell error because stage 1 capture does not preserve cross-stream
-ordering. Control-sequence filtering and UTF-8 repair happen before retained
-byte accounting, and visible loss is marked rather than silently discarded.
+The concrete type uses bounded retained lines rather than this illustrative
+shape. The command is admitted before spawn-visible progress, complete lines
+are appended as chunks arrive, and status/duration commit only after drain and
+reap. Control-sequence filtering and UTF-8 repair happen before retained byte
+accounting, and visible loss is marked rather than silently discarded.
 
 The transcript retains at most 16 MiB of terminal-safe text and 50,000 logical
 lines. Admission computes both costs before changing visible state. When a new
@@ -708,7 +710,7 @@ In-crate `#[cfg(test)]` modules, behavior-sentence names, run by `cargo xtask ch
   suspension, EOF, fatal render failure, and normal exit each restore the main
   screen exactly once.
 - **Execution separation**: rich ordinary foreground commands select the 1
-  MiB-per-stream capture path and commit only complete outcomes. Rich mode
+  MiB-per-stream streaming capture path and commit status only after drain. Rich mode
   rejects a background pipeline before spawn. Simple mode inherits streams and
   retains background-job compatibility. PTY-only applications are not
   presented as supported rich captures.
@@ -777,7 +779,7 @@ distinguishes landed behavior from remaining parity and release-evidence work.
 
 | Milestone | Current status | Remaining acceptance work |
 | --- | --- | --- |
-| **M1 — Frame + transcript** | Landed editor baseline: full-screen alternate viewport, bottom status, Quirl-owned 64 KiB grapheme editor, bounded undo/history, Emacs/Helix/Vim states, flowing transcript/context/input rows, prefix history, autosuggestion, completion-atomic captured foreground commands, proportional keyboard/mouse scrolling, exact mouse/keyboard selection, and bounded copy | Keep interactive PTY/VT support outside this milestone |
+| **M1 — Frame + transcript** | Landed editor baseline: full-screen alternate viewport, bottom status, Quirl-owned 64 KiB grapheme editor, bounded undo/history, Emacs/Helix/Vim states, flowing transcript/context/input rows, prefix history, autosuggestion, bounded streaming captured foreground commands, proportional keyboard/mouse scrolling, exact mouse/keyboard selection, and bounded copy | Keep interactive PTY/VT support outside this milestone |
 | **M2 — Highlighting + diagnostics** | Landed baseline: revision-cached `quirl_syntax::highlight`, bounded asynchronous executable-PATH snapshot, parse/unknown-command/unknown-flag diagnostics, severity styling, draw/highlight P95, and Ratatui/adversarial 4 KiB tests | Expand generated totality coverage and record evidence that the 4 KiB/first-paint budgets pass on release terminals |
 | **M3 — Completion popup** | Landed: always-on exact-command information and flag-prefix options, bounded catalog and extension workers/results, catalog-first asynchronous merge, selection stability, stale suppression, docs/provenance pane, token anchoring, match styling, virtualization, and narrow list-only rendering | Record named ≤8 ms first-result evidence and broader provider fault/terminal snapshots |
 | **M4 — Overlays + keymaps** | Landed: history/files/directories/palette overlays use the shared `quirl-picker` ranker through a composition-root adapter; queries are bounded and editable; Shift-Tab expands completion; adaptive/bottom and terminal-height full layouts honor preview config; Emacs/Helix/Vim editor modes remain available | Decide kitty/synchronized-output negotiation and gather named real-terminal layout evidence |
@@ -855,8 +857,8 @@ The integration maintains these invariants:
   raw mode before the process receives `SIGTSTP`; resume reacquires a newly
   measured viewport. A frame prepared for an older size is never deliberately
   written after a resize event has been observed. If stage 1 execution delays
-  event polling, its next turn applies the queued resize before painting the
-  completed outcome.
+  event polling, output repaint remeasures the viewport and the next input turn
+  applies any queued resize before accepting input.
 - **Provider failure or removal.** Panel providers execute only on the existing
   extension workers. First paint consumes the last complete cache, a failure
   preserves that last complete per-provider value, and a newer installed

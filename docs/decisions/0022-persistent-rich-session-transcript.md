@@ -56,7 +56,7 @@ behavior, configuration migration, accessibility fallback, and terminal
 restoration. This ADR supersedes only ADR 0012's per-command alternate-screen
 release, transient normal-screen prompt, and native-scrollback contracts.
 
-### Stage 1: completion-atomic ordinary foreground commands
+### Stage 1: bounded streaming ordinary foreground commands
 
 Stage 1 reuses the existing process owner and capture contract:
 
@@ -68,22 +68,26 @@ Stage 1 reuses the existing process owner and capture contract:
   would permit asynchronous child bytes to corrupt later frames;
 - `quirl-process` continues to own process groups, deadlines, cancellation,
   exit status, draining, and reaping;
-- the CLI converts one completed outcome into one terminal-safe transcript
-  entry containing the accepted command, status, duration, stdout, stderr, or
-  a rendered structured error; and
-- the UI commits that entry atomically after execution completes. Stage 1 does
-  not claim live streaming, command input while a child runs, or preserved
-  stdout/stderr interleaving.
+- capture readers publish retained chunks of at most 8 KiB through an
+  in-process channel while they continue draining stdout and stderr;
+- the process owner invokes the UI observer only after the complete process
+  graph has been committed, and observer failure terminates and reaps the graph;
+- the UI commits the accepted command first, repaints terminal-safe completed
+  lines as chunks arrive, and appends status and duration after both readers
+  have drained; and
+- command input remains paused while a child runs. Chunk delivery preserves
+  observed progress but does not claim byte-perfect stdout/stderr ordering.
 
 Capture overflow remains `ErrorCode::ResourceLimit`. The process owner drains
 and reaps the child, and the transcript renders an actionable error with the
 configured and observed limits. Partial captured bytes are never presented as
 a complete successful result.
 
-Captured output crosses a terminal-text boundary before entering the
-transcript. The boundary accepts UTF-8 text plus the supported line controls,
-filters unsupported control sequences, and records truncation or decoding
-loss explicitly. Stage 1 does not interpret arbitrary VT, OSC, or DCS streams.
+Captured output crosses a stateful terminal-text boundary before entering the
+transcript. The boundary repairs UTF-8 split across chunks, removes bounded SGR
+and other CSI/OSC sequences, treats carriage return as replacement of the
+pending progress line, and records truncation or decoding loss explicitly. It
+does not interpret arbitrary VT screen state, OSC actions, or DCS streams.
 
 The simple/Reedline surface keeps inherited terminal execution, native
 scrollback, and background-job behavior. It remains the explicit compatibility

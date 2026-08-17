@@ -775,6 +775,13 @@ fn catalog_command<'catalog>(
 }
 
 fn command_capability_detail(command: &CommandSpec) -> String {
+    let mut detail = format!("{}\n\nUsage: {}", command.details, command.signature);
+    if matches!(
+        command.provenance.source,
+        Provenance::Fish | Provenance::Bash | Provenance::Zsh
+    ) {
+        return detail;
+    }
     let effects = if command.effects.is_empty() {
         "none".to_owned()
     } else {
@@ -795,10 +802,11 @@ fn command_capability_detail(command: &CommandSpec) -> String {
     } else {
         "bounded result"
     };
-    format!(
-        "{} Capabilities: {} input -> {} output ({streaming}); effects: {effects}.",
-        command.details, command.io.input, command.io.output
-    )
+    detail.push_str(&format!(
+        "\n\nCapabilities: {} input -> {} output ({streaming}); effects: {effects}.",
+        command.io.input, command.io.output
+    ));
+    detail
 }
 
 const fn provenance_label(source: Provenance) -> &'static str {
