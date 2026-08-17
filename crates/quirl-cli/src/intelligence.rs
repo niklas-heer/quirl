@@ -216,6 +216,25 @@ pub(crate) fn embeddings_are_current(bytes: &[u8], path: &Path) -> Result<bool, 
     Ok(current == documents)
 }
 
+#[cfg(debug_assertions)]
+pub(crate) fn mark_embeddings_current_for_test(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<Vec<u8>, ShellError> {
+    let connection = deserialize_database(bytes, path)?;
+    validate_schema(&connection, path)?;
+    connection
+        .execute("DELETE FROM embeddings", [])
+        .map_err(database_error)?;
+    connection
+        .execute(
+            "INSERT INTO embeddings(document_id, model_id, dimensions, vector_le_f32, document_fingerprint) SELECT document_id, ?1, 1, x'00000000', fingerprint FROM semantic_documents",
+            params![MODEL_ID],
+        )
+        .map_err(database_error)?;
+    serialize_database(&connection)
+}
+
 pub(crate) fn encode_database(
     catalog: &Catalog,
     discovery_state_json: Option<&str>,

@@ -71,6 +71,8 @@ struct SessionOptions {
     index_dir: Option<PathBuf>,
     help_path: Option<PathBuf>,
     ai_bootstrap_fake: bool,
+    catalog_force_timeout: bool,
+    catalog_refresh_enabled: bool,
 }
 
 struct Session {
@@ -192,6 +194,18 @@ return quirl.config {{
         if options.catalog_failure {
             environment.insert(
                 OsString::from("QUIRL_TEST_CATALOG_FAILURE"),
+                OsString::from("1"),
+            );
+        }
+        if options.catalog_force_timeout {
+            environment.insert(
+                OsString::from("QUIRL_TEST_CATALOG_FORCE_TIMEOUT"),
+                OsString::from("1"),
+            );
+        }
+        if !options.catalog_refresh_enabled {
+            environment.insert(
+                OsString::from("QUIRL_TEST_CATALOG_REFRESH_DISABLED"),
                 OsString::from("1"),
             );
         }
@@ -850,16 +864,37 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
 }
 
 fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), Box<dyn Error>> {
+    let fixtures = TempDirectory::new("quirl-idle-ai-bootstrap")?;
+    let binary_dir = fixtures.path.join("bin");
+    let index_dir = fixtures.path.join("index");
+    create_private_directory(&binary_dir)?;
+    create_private_directory(&index_dir)?;
+    write_executable(
+        &binary_dir.join("idle-background-tool"),
+        "#!/bin/sh\nexit 0\n",
+    )?;
+    let catalog_path = index_dir.join("catalog.sqlite3");
     let mut session = Session::new(
         binary,
         SessionOptions {
             ai_bootstrap_fake: true,
+            catalog_force_timeout: true,
+            catalog_refresh_enabled: true,
+            path: Some(binary_dir),
+            index_dir: Some(index_dir),
             rows: Some(12),
             columns: Some(120),
             ..SessionOptions::default()
         },
     )?;
     session.pty.wait_for(STARTUP_MARKER)?;
+    session
+        .pty
+        .wait_for_screen("live AI discovery status", |screen| {
+            screen
+                .bottom_line()
+                .contains("AI: discovering local commands")
+        })?;
     session
         .pty
         .wait_for_screen("live AI download status", |screen| {
@@ -872,6 +907,8 @@ fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), Box<dyn Er
         .wait_for_screen("live AI indexing status", |screen| {
             screen.bottom_line().contains("AI: indexing local commands")
         })?;
+    wait_for_file_contents(&mut session, &catalog_path, b"idle-background-tool")?;
+    wait_for_file_contents(&mut session, &catalog_path, b"minishlab/potion-base-8M")?;
     let cleanup_start = session.pty.output().len();
     session.pty.send(key::CTRL_D)?;
     ensure_status(session.pty.wait_exit()?, 0, "AI bootstrap activity EOF")?;
@@ -1027,7 +1064,11 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     )?;
     let _permissions = DirectoryPermissionsGuard::make_read_only(&corrupt_index)?;
     let mut degraded = discovery_session(binary, &binary_dir, &corrupt_index, &help_dir)?;
-    degraded.pty.wait_for(STARTUP_MARKER)?;
+    degraded
+        .pty
+        .wait_for_screen("corrupt-cache fallback frame", |screen| {
+            screen.bottom_line().starts_with("command")
+        })?;
     wait_for_command_information(
         &mut degraded,
         "ls",
@@ -1039,7 +1080,11 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     )?;
     degraded.pty.send(key::ENTER)?;
     degraded.pty.wait_for(b"FALLBACK_BUILTIN_VISIBLE")?;
-    wait_for_prompt(&mut degraded)?;
+    degraded
+        .pty
+        .wait_for_screen("corrupt-cache fallback returned", |screen| {
+            screen.bottom_line().starts_with("command")
+        })?;
     let cleanup_start = degraded.pty.output().len();
     degraded.pty.send(key::CTRL_D)?;
     ensure_status(degraded.pty.wait_exit()?, 0, "corrupt-cache fallback")?;
@@ -1574,6 +1619,7 @@ fn discovery_session(
             path: Some(path.to_path_buf()),
             index_dir: Some(index_dir.to_path_buf()),
             help_path: Some(help_path.to_path_buf()),
+            catalog_refresh_enabled: true,
             rows: Some(18),
             columns: Some(400),
             ..SessionOptions::default()

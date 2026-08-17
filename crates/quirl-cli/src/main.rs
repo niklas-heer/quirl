@@ -1665,7 +1665,6 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     // `QuirlPrompt::new`. Start Git/filesystem refresh after that prompt has
     // returned so an idle worker thread is not on the cold-paint boundary.
     let mut prompt_context: Option<PromptContextScheduler> = None;
-    let mut catalog_refresh = None;
     let mut first_prompt = true;
 
     loop {
@@ -1734,10 +1733,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                 )?;
             }
         }
-        if catalog_refresh
-            .as_ref()
-            .is_some_and(index::CatalogRefresh::take_changed)
-        {
+        if ai_bootstrap.take_catalog_changed() {
             // Cache publication is complete before this flag is set. Adopt it
             // only between editor turns, when no terminal handoff, callback,
             // or input buffer is partially committed.
@@ -1792,12 +1788,10 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             catalog = line_editor.published_catalog();
         }
         first_prompt = false;
-        if catalog_refresh.is_none() {
-            // Initial discovery completed during editor admission. Periodic
-            // refresh begins only after terminal startup and never runs on the
-            // editor's per-keystroke path.
-            catalog_refresh = index::start_interactive_catalog_refresh();
-        }
+        // Admission already owns the single catalog worker. Accepted input is
+        // only an additional rescan hint; idle discovery began after first
+        // paint and does not depend on reaching this prompt boundary.
+        ai_bootstrap.request_catalog_refresh();
         if prompt_context.is_none() {
             let scheduler = PromptContextScheduler::default();
             // Start the bounded refresh after the first input so command execution can

@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc, Condvar, Mutex,
+        mpsc, Arc, Condvar, Mutex, Weak,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -108,8 +108,7 @@ impl InteractiveAiBootstrap {
     }
 
     pub(crate) fn request_reindex(&self) {
-        #[cfg(debug_assertions)]
-        if std::env::var_os("QUIRL_TEST_AI_BOOTSTRAP_DISABLED").is_some() {
+        if automatic_ai_disabled() {
             return;
         }
         self.shared.start_worker();
@@ -123,6 +122,28 @@ impl InteractiveAiBootstrap {
         if let Err(error) = self.shared.admit_catalog() {
             self.shared
                 .publish(format!("AI unavailable: {}", error.message));
+        }
+    }
+
+    pub(crate) fn take_catalog_changed(&self) -> bool {
+        self.shared
+            .catalog_refresh
+            .lock()
+            .ok()
+            .and_then(|refresh| refresh.as_ref().map(index::CatalogRefresh::take_changed))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn request_catalog_refresh(&self) {
+        let result = self
+            .shared
+            .catalog_refresh
+            .lock()
+            .ok()
+            .and_then(|refresh| refresh.as_ref().map(index::CatalogRefresh::request_refresh));
+        if let Some(Err(error)) = result {
+            self.shared
+                .publish(format!("AI discovery deferred: {}", error.message));
         }
     }
 }
@@ -165,9 +186,16 @@ struct Shared {
     cancelled: Arc<AtomicBool>,
     requested_generation: AtomicU64,
     activity_generation: AtomicU64,
-    activity: Mutex<Option<String>>,
+    activity: Mutex<ActivityState>,
     wake: (Mutex<()>, Condvar),
     worker: Mutex<Option<JoinHandle<()>>>,
+    catalog_refresh: Mutex<Option<index::CatalogRefresh>>,
+}
+
+#[derive(Default)]
+struct ActivityState {
+    intelligence: Option<String>,
+    discovery: Option<String>,
 }
 
 impl Shared {
@@ -178,9 +206,10 @@ impl Shared {
             cancelled: Arc::new(AtomicBool::new(false)),
             requested_generation: AtomicU64::new(0),
             activity_generation: AtomicU64::new(0),
-            activity: Mutex::new(None),
+            activity: Mutex::new(ActivityState::default()),
             wake: (Mutex::new(()), Condvar::new()),
             worker: Mutex::new(None),
+            catalog_refresh: Mutex::new(None),
         }
     }
 
@@ -206,13 +235,30 @@ impl Shared {
         if self.admitted.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        #[cfg(debug_assertions)]
-        if std::env::var_os("QUIRL_TEST_AI_BOOTSTRAP_DISABLED").is_some() {
+        if !automatic_catalog_refresh_disabled() {
+            self.start_catalog_refresh();
+        }
+        if automatic_ai_disabled() {
             return Ok(());
         }
         self.publish("AI: preparing local model".to_owned());
         self.start_worker();
         self.request()
+    }
+
+    fn start_catalog_refresh(self: &Arc<Self>) {
+        let observer: Arc<dyn index::CatalogRefreshObserver> = Arc::new(CatalogObserver {
+            shared: Arc::downgrade(self),
+        });
+        let Some(refresh) = index::start_interactive_catalog_refresh(observer) else {
+            self.publish("AI discovery deferred: catalog worker unavailable".to_owned());
+            return;
+        };
+        match self.catalog_refresh.lock() {
+            Ok(mut slot) if slot.is_none() => *slot = Some(refresh),
+            Ok(_) => {}
+            Err(_) => self.publish("AI discovery deferred: refresh lock poisoned".to_owned()),
+        }
     }
 
     fn request(&self) -> Result<(), ShellError> {
@@ -226,6 +272,11 @@ impl Shared {
     }
 
     fn cancel(&self) {
+        if let Ok(refresh) = self.catalog_refresh.lock() {
+            if let Some(refresh) = refresh.as_ref() {
+                refresh.cancel();
+            }
+        }
         let _guard = match self.wake.0.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -236,7 +287,7 @@ impl Shared {
 
     fn publish(&self, message: String) {
         if let Ok(mut activity) = self.activity.lock() {
-            *activity = Some(truncate_utf8(
+            activity.intelligence = Some(truncate_utf8(
                 &escape_terminal_line(&message),
                 ACTIVITY_MESSAGE_BYTES_MAX,
             ));
@@ -246,7 +297,24 @@ impl Shared {
 
     fn clear(&self) {
         if let Ok(mut activity) = self.activity.lock() {
-            *activity = None;
+            activity.intelligence = None;
+            let _ = increment_counter(&self.activity_generation, "AI activity generation");
+        }
+    }
+
+    fn publish_discovery(&self, message: String) {
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.discovery = Some(truncate_utf8(
+                &escape_terminal_line(&message),
+                ACTIVITY_MESSAGE_BYTES_MAX,
+            ));
+            let _ = increment_counter(&self.activity_generation, "AI activity generation");
+        }
+    }
+
+    fn clear_discovery(&self) {
+        if let Ok(mut activity) = self.activity.lock() {
+            activity.discovery = None;
             let _ = increment_counter(&self.activity_generation, "AI activity generation");
         }
     }
@@ -258,9 +326,71 @@ impl Shared {
         })?;
         Ok(InteractiveActivitySnapshot {
             generation: self.activity_generation.load(Ordering::Acquire),
-            message: activity.clone(),
+            message: activity
+                .discovery
+                .clone()
+                .or_else(|| activity.intelligence.clone()),
         })
     }
+}
+
+struct CatalogObserver {
+    shared: Weak<Shared>,
+}
+
+impl index::CatalogRefreshObserver for CatalogObserver {
+    fn refresh_started(&self) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.publish_discovery("AI: discovering local commands".to_owned());
+            #[cfg(debug_assertions)]
+            if std::env::var_os("QUIRL_TEST_AI_BOOTSTRAP_FAKE").is_some() {
+                let _ = wait_test_discovery_stage(&shared);
+            }
+        }
+    }
+
+    fn refresh_published(&self) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.clear_discovery();
+            if !automatic_ai_disabled() {
+                if let Err(error) = shared.request() {
+                    shared.publish(format!("AI index deferred: {}", error.message));
+                }
+            }
+        }
+    }
+
+    fn refresh_unchanged(&self) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.clear_discovery();
+        }
+    }
+
+    fn refresh_failed(&self, _error: &ShellError) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.clear_discovery();
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn automatic_ai_disabled() -> bool {
+    std::env::var_os("QUIRL_TEST_AI_BOOTSTRAP_DISABLED").is_some()
+}
+
+#[cfg(not(debug_assertions))]
+fn automatic_ai_disabled() -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
+fn automatic_catalog_refresh_disabled() -> bool {
+    std::env::var_os("QUIRL_TEST_CATALOG_REFRESH_DISABLED").is_some()
+}
+
+#[cfg(not(debug_assertions))]
+fn automatic_catalog_refresh_disabled() -> bool {
+    false
 }
 
 fn worker_loop(shared: &Shared) {
@@ -291,39 +421,42 @@ fn worker_loop(shared: &Shared) {
                 guard = next_guard;
             }
         };
-        run_generation(shared, &fetcher, requested);
-        completed_generation = requested;
+        if run_generation(shared, &fetcher, requested) {
+            completed_generation = requested;
+        }
     }
 }
 
-fn run_generation(shared: &Shared, fetcher: &UreqFetcher, generation: u64) {
+fn run_generation(shared: &Shared, fetcher: &UreqFetcher, generation: u64) -> bool {
     #[cfg(debug_assertions)]
     if std::env::var_os("QUIRL_TEST_AI_BOOTSTRAP_FAKE").is_some() {
         shared.publish("AI: downloading potion-base-8M (50%)".to_owned());
         if wait_test_stage(shared) {
             shared.publish("AI: indexing local commands".to_owned());
-            let _ = wait_test_stage(shared);
-            shared.clear();
+            if wait_test_stage(shared) {
+                let _ = index::mark_default_embeddings_current_for_test();
+                shared.clear();
+            }
         }
-        return;
+        return true;
     }
     let Some(model_path) = intelligence::default_model_path() else {
         shared.publish("AI unavailable: local model path is not configured".to_owned());
-        return;
+        return true;
     };
     if validate_pinned_model(&model_path).is_err() {
         shared.publish("AI: downloading potion-base-8M (0%)".to_owned());
         if let Err(error) = install_model(fetcher, &model_path, shared) {
             shared.publish(format!("AI download failed: {}", error.message));
-            return;
+            return true;
         }
     }
     if shared.cancelled.load(Ordering::Acquire) {
-        return;
+        return true;
     }
     if index::default_embeddings_are_current().unwrap_or(false) {
         shared.clear();
-        return;
+        return true;
     }
     shared.publish("AI: indexing local commands".to_owned());
     match index::build_default_embeddings_if_current(
@@ -337,15 +470,36 @@ fn run_generation(shared: &Shared, fetcher: &UreqFetcher, generation: u64) {
                 report.documents
             ));
             shared.clear();
+            true
         }
-        Ok(None) => {}
-        Err(error) => shared.publish(format!("AI index failed: {}", error.message)),
+        Ok(None) => generation_was_superseded_or_cancelled(shared, generation),
+        Err(_) if generation_was_superseded_or_cancelled(shared, generation) => true,
+        Err(error) => {
+            shared.publish(format!("AI index failed: {}", error.message));
+            true
+        }
     }
+}
+
+fn generation_was_superseded_or_cancelled(shared: &Shared, generation: u64) -> bool {
+    shared.cancelled.load(Ordering::Acquire)
+        || shared.requested_generation.load(Ordering::Acquire) != generation
 }
 
 #[cfg(debug_assertions)]
 fn wait_test_stage(shared: &Shared) -> bool {
     for _ in 0..20 {
+        if shared.cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+#[cfg(debug_assertions)]
+fn wait_test_discovery_stage(shared: &Shared) -> bool {
+    for _ in 0..10 {
         if shared.cancelled.load(Ordering::Acquire) {
             return false;
         }
@@ -1042,6 +1196,34 @@ mod tests {
             shared.requested_generation.load(Ordering::Acquire),
             u64::MAX
         );
+    }
+
+    #[test]
+    fn discovery_activity_is_visible_and_publication_requests_latest_index() {
+        let shared = Arc::new(Shared::new());
+        let observer = CatalogObserver {
+            shared: Arc::downgrade(&shared),
+        };
+
+        index::CatalogRefreshObserver::refresh_started(&observer);
+        assert_eq!(
+            shared.snapshot().unwrap().message.as_deref(),
+            Some("AI: discovering local commands")
+        );
+        index::CatalogRefreshObserver::refresh_published(&observer);
+        assert_eq!(shared.requested_generation.load(Ordering::Acquire), 1);
+        assert_eq!(shared.snapshot().unwrap().message, None);
+    }
+
+    #[test]
+    fn database_change_during_embedding_retries_then_admits_latest_generation() {
+        let shared = Shared::new();
+        shared.requested_generation.store(1, Ordering::Release);
+
+        assert!(!generation_was_superseded_or_cancelled(&shared, 1));
+        increment_counter(&shared.requested_generation, "test generation").unwrap();
+        assert!(generation_was_superseded_or_cancelled(&shared, 1));
+        assert!(!generation_was_superseded_or_cancelled(&shared, 2));
     }
 
     #[test]

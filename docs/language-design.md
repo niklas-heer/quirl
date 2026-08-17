@@ -933,7 +933,7 @@ On 15 August 2026, the following decisions were reviewed and agreed:
 - **Lua 5.4 as the extension language:** Rust implements the product; one pinned Lua runtime and generated `quirl` SDK serve config, scripts, trusted plugins; annotations improve tooling while Rust schemas enforce boundaries.
 - **Batteries-included scope:** ship coherent navigation, discovery, data, views, developer context, operations.
 - **One semantic command catalog:** completion, highlighting, docs, validation, AI discovery, plugins consume one versioned `CommandSpec` graph.
-- **Zero-setup local command intelligence:** first paint precedes bounded background model installation and SQLite embedding; the bottom status row reports cached activity, failures retain lexical search, and refreshed catalogs re-index automatically.
+- **Zero-setup local command intelligence:** first paint precedes bounded background model installation, full catalog discovery, and SQLite embedding even while the shell remains idle; the bottom status row reports cached activity, failures retain lexical search, and refreshed catalogs re-index automatically.
 - **Self-describing AI interface:** export installed capabilities as token-budgeted Markdown or canonical JSON with check/format/lint and optional MCP access.
 - **Lua plugin platform plus Wasm isolation:** trusted Lua gets generated SDK metadata and explicit capabilities; untrusted/portable plugins use the same capability model through WebAssembly components.
 - **Native typed fuzzy picker:** history, files, completion, commands, data values, plugins share one previewable, scriptable selection engine.
