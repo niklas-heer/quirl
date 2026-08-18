@@ -9,6 +9,7 @@
 )]
 
 mod builtin;
+pub mod local_completion;
 
 use std::{
     collections::BTreeMap,
