@@ -25,7 +25,7 @@ from urllib.parse import quote
 
 
 FIXTURE_SCHEMA_VERSION = 1
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 FIXTURE_BYTES_MAX = 1024 * 1024
 DESCRIPTION_BYTES_MAX = 4096
 SPLITS_MAX = 16
@@ -742,7 +742,7 @@ def _assemble_report(
     rss_bytes, rss_method = child_peak_rss()
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
-        "suite": "quirl_local_retrieval_v1",
+        "suite": "quirl_local_retrieval_v2",
         "network_loading": False,
         "execution_policy": "search-only; returned commands are never executed",
         "fixture": {
@@ -768,9 +768,10 @@ def _assemble_report(
                 "semantic_documents": status.get("semantic_documents"),
                 "embeddings": status.get("embeddings"),
                 "semantic_ready": status.get("semantic_ready"),
+                "embedding_index_identity": status.get("embedding_index_identity"),
             },
             "model": model_report,
-            "model_identity": status.get("model"),
+            "model_identity": status.get("model_identity"),
             "model_ready": status.get("model_ready"),
         },
         "parameters": {

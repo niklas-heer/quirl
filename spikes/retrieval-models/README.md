@@ -28,7 +28,7 @@ python3 spikes/retrieval-models/evaluate.py \
   --quirl target/debug/quirl \
   --database target/retrieval-evaluation-catalog.sqlite3 \
   --fixture spikes/retrieval-models/fixture-v1.json \
-  > target/retrieval-evaluation-v1.json
+  > target/retrieval-evaluation-v2.json
 ```
 
 The empty completion-path variables make this reproduction independent of
@@ -46,7 +46,7 @@ python3 spikes/retrieval-models/evaluate.py \
   --quirl target/release/quirl \
   --database /absolute/path/to/catalog.sqlite3 \
   --model /absolute/path/to/potion-base-8M \
-  > target/retrieval-evaluation-v1.json
+  > target/retrieval-evaluation-v2.json
 ```
 
 To measure the installed pinned automatic model while preserving its automatic
@@ -57,7 +57,9 @@ The report is a versioned JSON envelope containing Recall@1/5/10, MRR,
 multilingual/destructive/unseen-command and split slices, individual cold
 subprocess latency, aggregate latency percentiles, peak child RSS, and SHA-256
 identities for the fixture, binary, database, and optional bounded model tree.
-`quirl ai status` must also confirm that network loading is disabled.
+Version 2 also records the full loaded-model manifest identity and the stored
+embedding generation identity rather than a repository label alone. `quirl ai
+status` must also confirm that network loading is disabled.
 
 ## Bounds and interpretation
 
