@@ -254,6 +254,12 @@ fn parse_git_status(output: &str) -> Option<GitStatus> {
             if value != "(detached)" && valid_git_token(value) {
                 status.branch = Some(value.to_owned());
             }
+        } else if let Some(value) = line.strip_prefix("# branch.upstream ") {
+            // The upstream name is not rendered yet, but porcelain v2 emits
+            // it before branch.ab whenever tracking is configured.
+            if !valid_git_token(value) {
+                return None;
+            }
         } else if let Some(value) = line.strip_prefix("# branch.ab ") {
             let mut fields = value.split_whitespace();
             status.ahead = parse_signed_count(fields.next()?, '+')?;
@@ -318,7 +324,7 @@ mod tests {
     #[test]
     fn porcelain_v2_renders_branch_and_bounded_state_counts() {
         let parsed = parse_git_status(
-            "# branch.oid 0123456789abcdef\n# branch.head feature/context\n# branch.ab +2 -1\n# stash 3\n1 M. N... 0 0 0 a b file\n1 .M N... 0 0 0 a b file2\nu UU N... 0 0 0 a b c file3\n? new\n",
+            "# branch.oid 0123456789abcdef\n# branch.head feature/context\n# branch.upstream origin/feature/context\n# branch.ab +2 -1\n# stash 3\n1 M. N... 0 0 0 a b file\n1 .M N... 0 0 0 a b file2\nu UU N... 0 0 0 a b c file3\n? new\n",
         )
         .expect("valid fixture");
         assert_eq!(parsed.branch.as_deref(), Some("feature/context"));

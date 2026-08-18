@@ -700,6 +700,9 @@ impl RichSurface {
         let mut prompt_prepared = false;
 
         loop {
+            if prompt.poll_native_context() {
+                dirty = true;
+            }
             if dirty {
                 let (terminal_width, terminal_height) = terminal::size().unwrap_or((80, 24));
                 if self.catalog.is_some() {

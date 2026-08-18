@@ -1,5 +1,5 @@
 use super::{completion::CompletionState, editor::EditorState};
-use crate::theme::Theme;
+use crate::{SurfaceSymbols, theme::Theme};
 use quirl_syntax::Mode;
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -12,24 +12,22 @@ pub struct StatusBarModel<'a> {
     pub hints: bool,
     pub notice: Option<&'a str>,
     pub timings: Option<&'a str>,
-    pub unicode: bool,
+    pub symbols: SurfaceSymbols,
 }
 
 impl StatusBarModel<'_> {
     pub fn line(&self, theme: Theme) -> Line<'static> {
-        let separator = if self.unicode { " │ " } else { " | " };
+        let unicode = self.symbols.uses_unicode();
+        let separator = match self.symbols {
+            SurfaceSymbols::Plain => " | ",
+            SurfaceSymbols::Unicode => " │ ",
+            SurfaceSymbols::NerdFont => " \u{e0b1} ",
+        };
         let mut left = Vec::new();
         if let Some(label) = self.editor.mode().label() {
             left.push(label.to_owned());
         }
-        let mode_icon = match (self.unicode, self.mode) {
-            (true, Mode::Command) => "❯",
-            (true, Mode::Data) => "▦",
-            (true, Mode::Natural) => "✧",
-            (false, Mode::Command) => ">",
-            (false, Mode::Data) => "D",
-            (false, Mode::Natural) => "AI",
-        };
+        let mode_icon = self.symbols.status_mode_icon(self.mode);
         left.push(format!(
             " {mode_icon} {} ",
             self.mode.to_string().to_uppercase()
@@ -42,10 +40,10 @@ impl StatusBarModel<'_> {
         } else if let Some(notice) = self.completion.resource_notice() {
             notice.to_owned()
         } else if let Some(lines) = self.editor.pasted_lines() {
-            if self.unicode {
-                format!("⇪ pasted {lines} lines")
-            } else {
-                format!("pasted {lines} lines")
+            match self.symbols {
+                SurfaceSymbols::NerdFont => format!("\u{f0ea} pasted {lines} lines"),
+                SurfaceSymbols::Unicode => format!("⇪ pasted {lines} lines"),
+                SurfaceSymbols::Plain => format!("pasted {lines} lines"),
             }
         } else if self.completion.open || self.completion.streaming {
             let streaming = if self.completion.streaming {
@@ -71,23 +69,27 @@ impl StatusBarModel<'_> {
         };
 
         let right = if self.completion.open && self.completion.automatic {
-            if self.unicode {
+            if unicode {
                 "↑↓ select · Tab choose · Enter run · Esc close".to_owned()
             } else {
                 "up/down select | Tab choose | Enter run | Esc close".to_owned()
             }
         } else if self.completion.open {
-            if self.unicode {
+            if unicode {
                 "↑↓ move · Enter accept · Esc close".to_owned()
             } else {
                 "up/down move | Enter accept | Esc close".to_owned()
             }
         } else if let Some(timings) = self.timings {
             format!("{timings} · {}", super::product_identity())
-        } else if self.unicode {
-            format!("🌀 {}", super::product_identity())
         } else {
-            format!("quirl {}", super::product_identity())
+            match self.symbols {
+                SurfaceSymbols::NerdFont => {
+                    format!("\u{f120} {}", super::product_identity())
+                }
+                SurfaceSymbols::Unicode => format!("🌀 {}", super::product_identity()),
+                SurfaceSymbols::Plain => format!("quirl {}", super::product_identity()),
+            }
         };
         let left_text = left.join(separator);
         let fixed = UnicodeWidthStr::width(left_text.as_str())

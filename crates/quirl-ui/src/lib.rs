@@ -55,7 +55,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{self, IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -462,9 +462,48 @@ pub fn terminal_width() -> Option<u16> {
 }
 
 /// Whether conservative UI chrome may use broadly supported Unicode glyphs.
-/// Private-use patched-font symbols remain a separate explicit opt-in.
 pub fn terminal_supports_unicode() -> bool {
     unicode_is_safe(dumb_terminal(), locale_supports_unicode())
+}
+
+/// Whether the active terminal identifies documented built-in Nerd Font symbols.
+///
+/// Font selection is not exposed by a portable terminal protocol. This therefore
+/// recognizes only terminals that guarantee a bundled symbol fallback. Users of a
+/// patched font in any other terminal can still select `prompt.symbols = "nerd_font"`.
+pub fn terminal_supports_nerd_font() -> bool {
+    unicode_is_safe(dumb_terminal(), locale_supports_unicode())
+        && terminal_environment_has_builtin_nerd_symbols()
+}
+
+fn terminal_environment_has_builtin_nerd_symbols() -> bool {
+    terminal_has_builtin_nerd_symbols(
+        env::var_os("TERM").as_deref(),
+        env::var_os("TERM_PROGRAM").as_deref(),
+        env::var_os("KITTY_WINDOW_ID").as_deref(),
+        env::var_os("WEZTERM_PANE").as_deref(),
+    )
+}
+
+fn terminal_has_builtin_nerd_symbols(
+    term: Option<&OsStr>,
+    term_program: Option<&OsStr>,
+    kitty_window_id: Option<&OsStr>,
+    wezterm_pane: Option<&OsStr>,
+) -> bool {
+    if kitty_window_id.is_some_and(|value| !value.is_empty())
+        || wezterm_pane.is_some_and(|value| !value.is_empty())
+    {
+        return true;
+    }
+    let term = term.and_then(OsStr::to_str).unwrap_or_default();
+    let term_program = term_program.and_then(OsStr::to_str).unwrap_or_default();
+    ["xterm-kitty", "xterm-ghostty", "wezterm"]
+        .iter()
+        .any(|expected| term.eq_ignore_ascii_case(expected))
+        || ["kitty", "ghostty", "wezterm"]
+            .iter()
+            .any(|expected| term_program.eq_ignore_ascii_case(expected))
 }
 
 const fn unicode_is_safe(dumb: bool, unicode_locale: bool) -> bool {
@@ -1131,6 +1170,7 @@ struct RefreshRequest {
 
 type PromptContextLoader =
     dyn Fn(PathBuf, Option<PromptCacheEntry>) -> PromptCacheEntry + Send + Sync + 'static;
+type NativeContextProvider = dyn Fn() -> Option<NativePromptContext> + Send + Sync + 'static;
 
 /// A stale-while-refresh cache for native prompt context.
 ///
@@ -1244,6 +1284,15 @@ impl PromptContextScheduler {
     pub fn sample_current_dir(&self) -> PromptContextSample {
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         self.sample(&cwd)
+    }
+
+    /// Return the latest complete context for `cwd`.
+    ///
+    /// This read never starts work and is intended for an editor that repaints
+    /// after a previously scheduled background refresh completes.
+    pub fn cached_context(&self, cwd: &Path) -> Option<NativePromptContext> {
+        let state = lock_recover(&self.shared.state);
+        state.entries.get(cwd).map(|entry| entry.context.clone())
     }
 
     /// Return cached/fallback context for `cwd` and schedule one bounded refresh.
@@ -1557,6 +1606,7 @@ pub struct QuirlPrompt {
     configured_right: Vec<String>,
     configured_symbols: String,
     named_extension_segments: HashMap<String, String>,
+    native_context_provider: Option<Arc<NativeContextProvider>>,
     styled: bool,
     theme: Theme,
 }
@@ -1605,10 +1655,29 @@ impl SurfaceSymbols {
             Self::NerdFont => "\u{f105} ",
         }
     }
+
+    pub(crate) const fn status_mode_icon(self, mode: Mode) -> &'static str {
+        match (self, mode) {
+            (Self::Plain, Mode::Command) => ">",
+            (Self::Plain, Mode::Data) => "D",
+            (Self::Plain, Mode::Natural) => "AI",
+            (Self::Unicode, Mode::Command) => "❯",
+            (Self::Unicode, Mode::Data) => "▦",
+            (Self::Unicode, Mode::Natural) => "✧",
+            (Self::NerdFont, Mode::Command) => "\u{f120}",
+            (Self::NerdFont, Mode::Data) => "\u{f1c0}",
+            (Self::NerdFont, Mode::Natural) => "\u{f544}",
+        }
+    }
 }
 
 impl PromptSymbols {
-    fn resolve(requested: &str, dumb: bool, unicode_locale: bool) -> Self {
+    fn resolve(
+        requested: &str,
+        dumb: bool,
+        unicode_locale: bool,
+        nerd_font_terminal: bool,
+    ) -> Self {
         if dumb {
             return Self::Plain;
         }
@@ -1616,6 +1685,7 @@ impl PromptSymbols {
             "plain" => Self::Plain,
             "unicode" => Self::Unicode,
             "nerd_font" => Self::NerdFont,
+            _ if unicode_locale && nerd_font_terminal => Self::NerdFont,
             _ if unicode_locale => Self::Unicode,
             _ => Self::Plain,
         }
@@ -1715,6 +1785,7 @@ impl QuirlPrompt {
             configured_right: Vec::new(),
             configured_symbols: "auto".to_owned(),
             named_extension_segments: HashMap::new(),
+            native_context_provider: None,
             styled,
             theme: Theme::new(styled),
         }
@@ -1765,13 +1836,46 @@ impl QuirlPrompt {
 
     /// Apply a snapshot returned by [`PromptContextScheduler`].
     pub fn with_native_context(mut self, context: NativePromptContext) -> Self {
-        self.cwd = safe_prompt_text(&context.directory);
-        self.git_branch = context.git_branch.map(|branch| safe_prompt_text(&branch));
-        self.git_state = context.git_state.map(|state| safe_prompt_text(&state));
-        self.rust_version = context
+        self.apply_native_context(context);
+        self
+    }
+
+    /// Attach a nonblocking reader for completed background context refreshes.
+    ///
+    /// Rich editing polls this reader at its existing bounded event-loop cadence;
+    /// the provider must return cached data and must not perform filesystem or
+    /// process work on the editor thread.
+    pub fn with_native_context_provider<F>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> Option<NativePromptContext> + Send + Sync + 'static,
+    {
+        self.native_context_provider = Some(Arc::new(provider));
+        self
+    }
+
+    pub(crate) fn poll_native_context(&mut self) -> bool {
+        let Some(provider) = self.native_context_provider.clone() else {
+            return false;
+        };
+        provider().is_some_and(|context| self.apply_native_context(context))
+    }
+
+    fn apply_native_context(&mut self, context: NativePromptContext) -> bool {
+        let directory = safe_prompt_text(&context.directory);
+        let git_branch = context.git_branch.map(|branch| safe_prompt_text(&branch));
+        let git_state = context.git_state.map(|state| safe_prompt_text(&state));
+        let rust_version = context
             .rust_version
             .map(|version| safe_prompt_text(&version));
-        self
+        let changed = self.cwd != directory
+            || self.git_branch != git_branch
+            || self.git_state != git_state
+            || self.rust_version != rust_version;
+        self.cwd = directory;
+        self.git_branch = git_branch;
+        self.git_state = git_state;
+        self.rust_version = rust_version;
+        changed
     }
 
     /// Set the exit status that can be rendered by the configured `status` segment.
@@ -1864,10 +1968,13 @@ impl QuirlPrompt {
     }
 
     fn symbols(&self) -> PromptSymbols {
+        let dumb = dumb_terminal();
+        let unicode_locale = locale_supports_unicode();
         PromptSymbols::resolve(
             &self.configured_symbols,
-            dumb_terminal(),
-            locale_supports_unicode(),
+            dumb,
+            unicode_locale,
+            !dumb && unicode_locale && terminal_environment_has_builtin_nerd_symbols(),
         )
     }
 
@@ -3424,34 +3531,62 @@ mod tests {
     }
 
     #[test]
-    fn auto_symbols_only_use_unicode_for_a_unicode_locale() {
+    fn auto_symbols_promote_only_with_unicode_and_bundled_nerd_font_evidence() {
         assert!(unicode_is_safe(false, true));
         assert!(!unicode_is_safe(false, false));
         assert!(!unicode_is_safe(true, true));
         assert_eq!(
-            PromptSymbols::resolve("auto", false, true),
+            PromptSymbols::resolve("auto", false, true, false),
             PromptSymbols::Unicode
         );
         assert_eq!(
-            PromptSymbols::resolve("auto", false, false),
+            PromptSymbols::resolve("auto", false, true, true),
+            PromptSymbols::NerdFont
+        );
+        assert_eq!(
+            PromptSymbols::resolve("auto", false, false, true),
             PromptSymbols::Plain
         );
         assert_eq!(
-            PromptSymbols::resolve("nerd_font", false, true),
+            PromptSymbols::resolve("nerd_font", false, true, false),
             PromptSymbols::NerdFont
         );
         assert_eq!(
-            PromptSymbols::resolve("nerd_font", false, false),
+            PromptSymbols::resolve("nerd_font", false, false, false),
             PromptSymbols::NerdFont
         );
         assert_eq!(
-            PromptSymbols::resolve("unicode", false, false),
+            PromptSymbols::resolve("unicode", false, false, true),
             PromptSymbols::Unicode
         );
         assert_eq!(
-            PromptSymbols::resolve("nerd_font", true, true),
+            PromptSymbols::resolve("nerd_font", true, true, true),
             PromptSymbols::Plain
         );
+        assert!(terminal_has_builtin_nerd_symbols(
+            Some(std::ffi::OsStr::new("xterm-kitty")),
+            None,
+            None,
+            None,
+        ));
+        assert!(terminal_has_builtin_nerd_symbols(
+            None,
+            Some(std::ffi::OsStr::new("WezTerm")),
+            None,
+            None,
+        ));
+        assert!(terminal_has_builtin_nerd_symbols(
+            None,
+            Some(std::ffi::OsStr::new("ghostty")),
+            None,
+            None,
+        ));
+        assert!(!terminal_has_builtin_nerd_symbols(
+            Some(std::ffi::OsStr::new("xterm-256color")),
+            Some(std::ffi::OsStr::new("iTerm.app")),
+            None,
+            None,
+        ));
         assert!(locale_name_supports_unicode(std::ffi::OsStr::new(
             "en_US.UTF-8"
         )));
@@ -3894,6 +4029,31 @@ mod tests {
             },
         );
         assert_eq!(prompt.render_prompt_right(), "rust 1.97.1");
+    }
+
+    #[test]
+    fn completed_native_context_repaints_an_active_prompt_once() {
+        let config = QuirlConfig {
+            prompt: PromptConfig {
+                symbols: "plain".to_owned(),
+                left: vec!["directory".to_owned(), "git_branch".to_owned()],
+                right: Vec::new(),
+                ..PromptConfig::default()
+            },
+            ..QuirlConfig::default()
+        };
+        let completed = NativePromptContext {
+            directory: "quirl".to_owned(),
+            git_branch: Some("main".to_owned()),
+            git_state: Some("~12".to_owned()),
+            rust_version: Some("1.97.1".to_owned()),
+        };
+        let mut prompt = QuirlPrompt::with_config(Mode::Command, &config)
+            .with_native_context_provider(move || Some(completed.clone()));
+
+        assert!(prompt.poll_native_context());
+        assert!(!prompt.poll_native_context());
+        assert_eq!(prompt.render_prompt_left(), "quirl | on main\n");
     }
 
     #[test]

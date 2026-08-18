@@ -352,8 +352,9 @@ enum EditAction {
 ## 5. Visual specification
 
 All mockups assume a 78-column terminal, `unicode` symbol profile, defaults.
-Glyphs come from `PromptSymbols` profiles — `plain` profile substitutes ASCII
-(`>`, `data>`, `*`, `!`) exactly as today; never require Nerd Fonts.
+Glyphs come from `PromptSymbols` profiles: `auto` promotes to private-use icons
+only for terminals with documented built-in Nerd symbols, while `plain`
+substitutes ASCII (`>`, `data>`, `*`, `!`) and remains universally safe.
 
 ### 5.1 Frame at rest (command mode)
 

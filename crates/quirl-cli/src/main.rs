@@ -54,8 +54,7 @@ use quirl_data::{DataEnvelope, DataOutput, DataRenderFormat, DataRuntime};
 use quirl_lua::{LuaPolicy, MAX_LUA_SOURCE_BYTES, QuirlConfig, sdk_json, sdk_lua, sdk_markdown};
 use quirl_picker::{ItemKind, MAX_PICKER_ITEMS, PickItem, Picker};
 use quirl_process::{
-    DEFAULT_CAPTURE_BYTES, DeveloperContextProbe, JobStatus, NativeExecutor, OutputObserver,
-    sandboxed_process_host,
+    DEFAULT_CAPTURE_BYTES, JobStatus, NativeExecutor, OutputObserver, sandboxed_process_host,
 };
 use quirl_syntax::{InteractiveLine, Mode, classify, parse_command_list};
 use quirl_ui::{
@@ -66,7 +65,7 @@ use quirl_ui::{
     PROMPT_FIRST_PAINT_BUDGET, PickerItem, PickerItemKind, PickerMatch, PickerRanker,
     PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind,
     editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
-    set_product_identity, terminal_supports_unicode, terminal_width,
+    set_product_identity, terminal_supports_nerd_font, terminal_supports_unicode, terminal_width,
 };
 use recovery::RecoveryCommand;
 use script::ScriptLanguage;
@@ -1951,14 +1950,33 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     let mut lua = None;
     let mut last_status = 0;
     let mut last_duration: Option<Duration> = None;
-    // The first prompt already renders the current directory from
-    // `QuirlPrompt::new`. Start Git/filesystem refresh after that prompt has
-    // returned so an idle worker thread is not on the cold-paint boundary.
-    let mut prompt_context: Option<(
-        PromptContextScheduler,
-        Arc<RwLock<DeveloperContextProbe>>,
-        u64,
-    )> = None;
+    // The welcome text is the cold first paint. Start developer discovery only
+    // after it is visible, then let the rich editor adopt the complete result
+    // on a later bounded poll without requiring the user to submit a line.
+    let prompt_environment_generation = executor.environment_generation();
+    let prompt_probe = Arc::new(RwLock::new(executor.developer_context_probe()));
+    let worker_probe = Arc::clone(&prompt_probe);
+    let prompt_scheduler = Arc::new(PromptContextScheduler::with_project_context_loader(
+        PROMPT_FIRST_PAINT_BUDGET,
+        move |cwd| {
+            let probe = worker_probe
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let snapshot = probe.probe(cwd);
+            NativeProjectContext {
+                git_branch: snapshot.git_branch,
+                git_state: snapshot.git_state,
+                rust_version: snapshot.rust_version,
+            }
+        },
+    ));
+    let _ = prompt_scheduler.sample_current_dir();
+    let mut prompt_context = (
+        prompt_scheduler,
+        prompt_probe,
+        prompt_environment_generation,
+    );
     let mut first_prompt = true;
     loop {
         if !first_prompt {
@@ -2054,7 +2072,8 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             .with_status(last_status)
             .with_jobs(active_jobs)
             .with_named_extension_segments(extension_segments);
-        if let Some((scheduler, probe, environment_generation)) = &mut prompt_context {
+        {
+            let (scheduler, probe, environment_generation) = &mut prompt_context;
             let current_generation = executor.environment_generation();
             if current_generation != *environment_generation {
                 let mut probe = probe
@@ -2063,7 +2082,14 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                 *probe = executor.developer_context_probe();
                 *environment_generation = current_generation;
             }
-            prompt = prompt.with_native_context(scheduler.sample_current_dir().context);
+            let prompt_directory = std::env::current_dir().unwrap_or_default();
+            let sample = scheduler.sample(&prompt_directory);
+            let cached_scheduler = Arc::clone(scheduler);
+            prompt = prompt
+                .with_native_context(sample.context)
+                .with_native_context_provider(move || {
+                    cached_scheduler.cached_context(&prompt_directory)
+                });
         }
         if let Some(duration) = last_duration {
             prompt = prompt.with_duration(duration);
@@ -2097,30 +2123,6 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         // only an additional rescan hint; idle discovery began after first
         // paint and does not depend on reaching this prompt boundary.
         ai_bootstrap.request_catalog_refresh();
-        if prompt_context.is_none() {
-            let environment_generation = executor.environment_generation();
-            let probe = Arc::new(RwLock::new(executor.developer_context_probe()));
-            let worker_probe = Arc::clone(&probe);
-            let scheduler = PromptContextScheduler::with_project_context_loader(
-                PROMPT_FIRST_PAINT_BUDGET,
-                move |cwd| {
-                    let probe = worker_probe
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    let snapshot = probe.probe(cwd);
-                    NativeProjectContext {
-                        git_branch: snapshot.git_branch,
-                        git_state: snapshot.git_state,
-                        rust_version: snapshot.rust_version,
-                    }
-                },
-            );
-            // Start the bounded refresh after the first input so command execution can
-            // overlap it and the second prompt can consume the completed snapshot.
-            let _ = scheduler.sample_current_dir();
-            prompt_context = Some((scheduler, probe, environment_generation));
-        }
         match signal {
             Ok(InteractiveSignal::Success(buffer)) => {
                 sync_history(&mut line_editor, &history_path)?;
@@ -3341,10 +3343,12 @@ fn print_banner(config: &QuirlConfig) {
         return;
     }
     let unicode = unicode_chrome(&config.prompt.symbols, terminal_supports_unicode());
+    let nerd_font = config.prompt.symbols == "nerd_font"
+        || (config.prompt.symbols == "auto" && terminal_supports_nerd_font());
     let banner = if config.editor.banner == "compact" {
         compact_welcome(terminal_width().unwrap_or(80), unicode)
     } else {
-        onboarding_banner(terminal_width().unwrap_or(80), unicode)
+        onboarding_banner(terminal_width().unwrap_or(80), unicode, nerd_font)
     };
     if color_enabled(
         terminal,
@@ -3365,7 +3369,7 @@ fn show_welcome(banner: &str, terminal: bool) -> bool {
     banner != "none" && terminal
 }
 
-fn onboarding_banner(width: u16, unicode: bool) -> String {
+fn onboarding_banner(width: u16, unicode: bool, nerd_font: bool) -> String {
     let width = usize::from(width.max(1));
     if width < 32 {
         return minimal_onboarding(width);
@@ -3408,7 +3412,11 @@ fn onboarding_banner(width: u16, unicode: bool) -> String {
             ]
             .join(separator),
         );
-        lines.push("Nerd Font prompt: set prompt.symbols = \"nerd_font\" in config.lua".to_owned());
+        lines.push(if nerd_font {
+            "Nerd Font icons: enabled".to_owned()
+        } else {
+            "Nerd Font prompt: set prompt.symbols = \"nerd_font\" in config.lua".to_owned()
+        });
         lines.push("Type help to explore commands.".to_owned());
     } else if width >= 64 {
         lines.push(["NORMAL: processes/bytes", "DATA: typed values"].join(separator));
@@ -3421,14 +3429,22 @@ fn onboarding_banner(width: u16, unicode: bool) -> String {
             .join(separator),
         );
         lines.push(["Alt-Q f files", "Alt-Q p actions", "F1 help"].join(separator));
-        lines.push("Nerd Font prompt: prompt.symbols = \"nerd_font\"".to_owned());
+        lines.push(if nerd_font {
+            "Nerd Font icons: enabled".to_owned()
+        } else {
+            "Nerd Font prompt: prompt.symbols = \"nerd_font\"".to_owned()
+        });
     } else {
         lines.push("Processes + typed data".to_owned());
         lines.push(["Alt-Q Quirl", "Tab complete"].join(separator));
         lines.push(["Ctrl-R history", "Alt-Q f files"].join(separator));
         lines.push(["Alt-Q p actions", "F1 help"].join(separator));
-        lines.push("Nerd Font prompt:".to_owned());
-        lines.push("  prompt.symbols = \"nerd_font\"".to_owned());
+        if nerd_font {
+            lines.push("Nerd Font icons: enabled".to_owned());
+        } else {
+            lines.push("Nerd Font prompt:".to_owned());
+            lines.push("  prompt.symbols = \"nerd_font\"".to_owned());
+        }
     }
     lines.join("\n")
 }
@@ -3902,7 +3918,7 @@ mod tests {
     #[test]
     fn onboarding_adapts_without_hiding_daily_driver_shortcuts() {
         for (width, unicode) in [(32, false), (64, true), (96, true)] {
-            let banner = onboarding_banner(width, unicode);
+            let banner = onboarding_banner(width, unicode, false);
             assert!(banner.contains("Alt-Q Quirl"));
             assert!(banner.contains("semantic completion") || banner.contains("Tab complete"));
             assert!(banner.contains("Ctrl-R history"));
@@ -3924,7 +3940,7 @@ mod tests {
     #[test]
     fn onboarding_has_a_display_width_safe_minimal_layout() {
         for width in [1, 2, 4, 8, 16, 31] {
-            let banner = onboarding_banner(width, true);
+            let banner = onboarding_banner(width, true, false);
             assert!(!banner.is_empty());
             assert!(
                 banner
@@ -3933,6 +3949,13 @@ mod tests {
             );
             assert!(!banner.contains('\u{1b}'));
         }
+    }
+
+    #[test]
+    fn onboarding_reports_an_enabled_nerd_font_profile_without_setup_advice() {
+        let banner = onboarding_banner(96, true, true);
+        assert!(banner.contains("Nerd Font icons: enabled"));
+        assert!(!banner.contains("prompt.symbols"));
     }
 
     #[test]

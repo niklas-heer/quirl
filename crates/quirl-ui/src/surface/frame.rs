@@ -99,7 +99,7 @@ impl FrameModel<'_> {
             .filter(|_| !self.compact)
             .zip(layout.diagnostic)
         {
-            let glyph = diagnostic_glyph(diagnostic.severity, self.unicode);
+            let glyph = diagnostic_glyph(diagnostic.severity, self.symbols);
             let style = self.theme.diagnostic(diagnostic.severity);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -160,7 +160,7 @@ impl FrameModel<'_> {
                 .or_else(|| self.runtime.notice())
                 .or_else(|| self.runtime.activity()),
             timings: self.timings,
-            unicode: self.unicode,
+            symbols: self.symbols,
         };
         frame.render_widget(Paragraph::new(status.line(self.theme)), layout.status);
 
@@ -469,7 +469,14 @@ impl FrameModel<'_> {
         let results_area = if let Some(query) = self.picker_query {
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(if self.unicode { "⌕ " } else { "> " }, self.theme.dim()),
+                    Span::styled(
+                        match self.symbols {
+                            SurfaceSymbols::NerdFont => "\u{f002} ",
+                            SurfaceSymbols::Unicode => "⌕ ",
+                            SurfaceSymbols::Plain => "> ",
+                        },
+                        self.theme.dim(),
+                    ),
                     Span::styled(escape_terminal_line(query), self.theme.accent(self.mode)),
                 ])),
                 Rect::new(inner.x, inner.y, inner.width, 1),
@@ -505,7 +512,7 @@ impl FrameModel<'_> {
             .take(visible_rows);
         let lines = rows
             .map(|(index, item)| {
-                let glyph = item.kind.glyph(self.unicode);
+                let glyph = item.kind.glyph(self.symbols);
                 let selected = index == self.completion.selected;
                 let row_style = if selected {
                     self.theme.selected(self.mode)
@@ -802,14 +809,17 @@ fn escaped_width(value: &str) -> usize {
     UnicodeWidthStr::width(escaped.as_str())
 }
 
-fn diagnostic_glyph(severity: DiagnosticSeverity, unicode: bool) -> &'static str {
-    match (severity, unicode) {
-        (DiagnosticSeverity::Error, true) => "  ✘ ",
-        (DiagnosticSeverity::Warning, true) => "  ▲ ",
-        (DiagnosticSeverity::Hint, true) => "  ℹ ",
-        (DiagnosticSeverity::Error, false) => "  E ",
-        (DiagnosticSeverity::Warning, false) => "  W ",
-        (DiagnosticSeverity::Hint, false) => "  H ",
+fn diagnostic_glyph(severity: DiagnosticSeverity, symbols: SurfaceSymbols) -> &'static str {
+    match (severity, symbols) {
+        (DiagnosticSeverity::Error, SurfaceSymbols::NerdFont) => "  \u{f057} ",
+        (DiagnosticSeverity::Warning, SurfaceSymbols::NerdFont) => "  \u{f071} ",
+        (DiagnosticSeverity::Hint, SurfaceSymbols::NerdFont) => "  \u{f05a} ",
+        (DiagnosticSeverity::Error, SurfaceSymbols::Unicode) => "  ✘ ",
+        (DiagnosticSeverity::Warning, SurfaceSymbols::Unicode) => "  ▲ ",
+        (DiagnosticSeverity::Hint, SurfaceSymbols::Unicode) => "  ℹ ",
+        (DiagnosticSeverity::Error, SurfaceSymbols::Plain) => "  E ",
+        (DiagnosticSeverity::Warning, SurfaceSymbols::Plain) => "  W ",
+        (DiagnosticSeverity::Hint, SurfaceSymbols::Plain) => "  H ",
     }
 }
 
@@ -1080,10 +1090,22 @@ mod tests {
     }
 
     #[test]
-    fn nerd_font_profile_uses_only_explicit_private_use_chrome() {
+    fn nerd_font_profile_applies_icons_across_rich_surface_chrome() {
         assert_eq!(
             SurfaceSymbols::NerdFont.input_indicator(Mode::Command),
             "\u{f105} "
+        );
+        assert_eq!(
+            SurfaceSymbols::NerdFont.status_mode_icon(Mode::Data),
+            "\u{f1c0}"
+        );
+        assert_eq!(
+            CompletionKind::Command.glyph(SurfaceSymbols::NerdFont),
+            "\u{f120}"
+        );
+        assert_eq!(
+            diagnostic_glyph(DiagnosticSeverity::Warning, SurfaceSymbols::NerdFont),
+            "  \u{f071} "
         );
         assert!(SurfaceSymbols::NerdFont.uses_unicode());
     }

@@ -1,5 +1,6 @@
 use super::super::{
-    CompletionWorker, ExtensionCompleter, ExtensionSuggestion, extension_replacement_is_valid,
+    CompletionWorker, ExtensionCompleter, ExtensionSuggestion, SurfaceSymbols,
+    extension_replacement_is_valid,
 };
 use quirl_catalog::{
     COMPLETION_PROTOCOL_VERSION, Catalog, CommandSpec, Completion, CompletionCancellation,
@@ -35,22 +36,29 @@ pub enum CompletionKind {
 }
 
 impl CompletionKind {
-    pub const fn glyph(self, unicode: bool) -> &'static str {
-        match (self, unicode) {
-            (Self::Command, true) => "λ",
-            (Self::Flag, true) => "–",
-            (Self::Path, true) => "/",
-            (Self::Value, true) => "≡",
-            (Self::History, true) => "↺",
-            (Self::Job, true) => "◉",
-            (Self::Data, true) => "◆",
-            (Self::Command, false) => "c",
-            (Self::Flag, false) => "f",
-            (Self::Path, false) => "p",
-            (Self::Value, false) => "v",
-            (Self::History, false) => "h",
-            (Self::Job, false) => "j",
-            (Self::Data, false) => "d",
+    pub(crate) const fn glyph(self, symbols: SurfaceSymbols) -> &'static str {
+        match (self, symbols) {
+            (Self::Command, SurfaceSymbols::NerdFont) => "\u{f120}",
+            (Self::Flag, SurfaceSymbols::NerdFont) => "\u{f024}",
+            (Self::Path, SurfaceSymbols::NerdFont) => "\u{f07c}",
+            (Self::Value, SurfaceSymbols::NerdFont) => "\u{f0ae}",
+            (Self::History, SurfaceSymbols::NerdFont) => "\u{f1da}",
+            (Self::Job, SurfaceSymbols::NerdFont) => "\u{f085}",
+            (Self::Data, SurfaceSymbols::NerdFont) => "\u{f1c0}",
+            (Self::Command, SurfaceSymbols::Unicode) => "λ",
+            (Self::Flag, SurfaceSymbols::Unicode) => "–",
+            (Self::Path, SurfaceSymbols::Unicode) => "/",
+            (Self::Value, SurfaceSymbols::Unicode) => "≡",
+            (Self::History, SurfaceSymbols::Unicode) => "↺",
+            (Self::Job, SurfaceSymbols::Unicode) => "◉",
+            (Self::Data, SurfaceSymbols::Unicode) => "◆",
+            (Self::Command, SurfaceSymbols::Plain) => "c",
+            (Self::Flag, SurfaceSymbols::Plain) => "f",
+            (Self::Path, SurfaceSymbols::Plain) => "p",
+            (Self::Value, SurfaceSymbols::Plain) => "v",
+            (Self::History, SurfaceSymbols::Plain) => "h",
+            (Self::Job, SurfaceSymbols::Plain) => "j",
+            (Self::Data, SurfaceSymbols::Plain) => "d",
         }
     }
 }
