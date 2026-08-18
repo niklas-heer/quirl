@@ -37,7 +37,9 @@ catalog "native-tools" {
         intent "duplicate a file"
         platform "linux"
         platform "macos"
-        flag "--recursive" short="-r" summary="Copy recursively" description="Descend into source directories."
+        flag "--recursive" short="-r" summary="Copy recursively" description="Descend into source directories." {
+            platform "linux"
+        }
         flag "--target" value="directory" summary="Select a target" description="Place copied paths in this directory." action="directories"
         argument "source" summary="Source path" description="Read data from this path." required=#true action="files"
         argument "destination" summary="Destination path" description="Write data to this path." action="files"
@@ -96,7 +98,7 @@ Each command may contain only these child nodes:
 | `alias "token"` | Zero or more alternate invocation tokens, unique within the sibling scope. |
 | `intent "phrase"` | Zero or more unique task-language phrases included in semantic search. |
 | `platform "selector"` | Zero or more effective-platform selectors; omission inherits the parent. |
-| `flag "--long" ...` | Zero or more named options, with unique canonical and short-alias spellings per command. |
+| `flag "--long" ...` | Zero or more named options, with unique canonical and short-alias spellings on every overlapping platform scope. |
 | `argument "name" ...` | Zero or more ordered positional arguments. |
 | `command "name" ...` | Zero or more recursively bounded subcommands. |
 
@@ -112,7 +114,9 @@ with `--`; its nonempty remainder uses lowercase ASCII letters, digits, and
 hyphens and begins with a lowercase letter or digit. A POSIX short-only
 spelling is `-` followed by one ASCII letter or digit. A Windows spelling
 starts with `/` and then uses one or more ASCII letters, digits, or hyphens.
-Flags have no child block.
+Flags may contain only `platform "selector"` children. Omission inherits the
+owning command's effective platform set. A declared flag scope is intersected
+with that command and must remain nonempty.
 
 | Property | Required | Contract |
 | --- | --- | --- |
@@ -124,8 +128,11 @@ Flags have no child block.
 | `repeatable` | no | Boolean, default `#false`; whether the flag may occur more than once. |
 | `action` | no | Closed native completion action for the consumed value; invalid on a boolean flag. |
 
-Canonical and short-alias spellings share one uniqueness namespace within a command. The
-schema does not currently express conflicts, static enum values, defaults,
+Canonical and short-alias spellings share one uniqueness namespace within a
+command on overlapping platforms. The same spelling may be declared more than
+once only when every declaration has a disjoint effective platform scope; this
+allows GNU and macOS meanings to coexist without leaking either variant onto
+the other host. The schema does not currently express conflicts, static enum values, defaults,
 deprecation, types, or dynamic providers; none may be inferred from upstream
 syntax.
 
@@ -153,7 +160,8 @@ The closed platform values are `any`, `linux`, `macos`, `windows`, and
 inherits `any`. A subcommand with no platform nodes inherits its parent.
 Specific child platforms are intersected with the parent's effective set and
 must leave at least one platform. Declaring `any` on a child means the inherited
-parent set; it does not widen support.
+parent set; it does not widen support. Flags follow the same rule and inherit
+their command when they have no platform children.
 
 Runtime selection filters commands and their flag, argument, and semantic
 projections by the requested host platform. Asking for platform `any` disables
@@ -185,14 +193,14 @@ The parser rejects input rather than ignoring it. Rejection includes:
 
 - more than one top-level node or a root other than `catalog`;
 - missing or duplicate provenance, or a catalog without commands;
-- unknown catalog or command child nodes;
+- unknown catalog, command, or flag child nodes;
 - unknown or duplicate properties;
 - typed KDL nodes or values, incorrect property types, missing required
   strings, unexpected positional values, or child blocks on scalar nodes;
 - empty, whitespace-only, control-containing, oversized, or malformed names
   and strings;
-- duplicate aliases, intents, platforms, flags, arguments, sibling tokens, or
-  normalized paths;
+- duplicate aliases, intents, platforms, overlapping flag spellings, arguments,
+  sibling tokens, or normalized paths;
 - `any` combined with another platform, a child platform outside its parent,
   a completion action on a boolean flag, a required argument after an optional
   one, or a non-final repeatable argument; and
@@ -249,7 +257,7 @@ The parser canonicalizes meaning before compilation:
 
 - root commands and subcommands sort by canonical name;
 - aliases and intent phrases sort lexically after duplicate checking;
-- flags sort by canonical long name;
+- flags sort by canonical spelling and then effective platform scope;
 - platforms sort by their closed enum order after inheritance/intersection;
 - positional arguments retain authored order; and
 - flattened commands sort by full canonical path and receive stable one-based
@@ -272,9 +280,9 @@ causes admission to fail.
 ## Normalized and semantic projections
 
 The database contains normalized tables for the catalog snapshot, provenance,
-commands, aliases, effective platforms, intent phrases, flags, arguments, and
-semantic documents. Commands store canonical full paths and parent identifiers;
-flags and arguments retain summaries, descriptions, cardinality, value names,
+commands, aliases, effective platforms, intent phrases, flags, flag platforms,
+arguments, semantic documents, and semantic-document platforms. Commands store
+canonical full paths and parent identifiers; flags and arguments retain summaries, descriptions, cardinality, value names,
 and closed actions.
 
 Every command creates one semantic document whose body concatenates its full

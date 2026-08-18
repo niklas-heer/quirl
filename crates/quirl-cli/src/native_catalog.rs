@@ -111,11 +111,35 @@ mod tests {
                 .any(|command| command.path == "docker compose alpha dry-run")
         );
         assert!(first.iter().any(|command| command.aliases == ["g"]));
+
+        let macos_ls = first.iter().find(|command| command.path == "ls").unwrap();
+        assert!(macos_ls.options.iter().any(|option| option.names == ["-a"]));
+        assert!(
+            macos_ls
+                .options
+                .iter()
+                .all(|option| !option.names.iter().any(|name| name == "--all"))
+        );
+        let linux = load_commands(EMBEDDED_NATIVE_DATABASE, NativePlatform::Linux).unwrap();
+        let linux_ls = linux.iter().find(|command| command.path == "ls").unwrap();
+        assert!(
+            linux_ls
+                .options
+                .iter()
+                .any(|option| option.names.iter().any(|name| name == "--all"))
+        );
     }
 
     #[test]
     fn native_facts_reach_completion_help_and_agent_surfaces() {
         let catalog = builtin_native_catalog();
+        let ls_line = "ls -a";
+        assert!(
+            catalog
+                .complete(ls_line, ls_line.len())
+                .iter()
+                .any(|item| item.value == "-a")
+        );
         let line = "docker compose alpha d";
         let completions = catalog.complete(line, line.len());
         assert!(

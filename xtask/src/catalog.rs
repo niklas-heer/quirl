@@ -1013,6 +1013,7 @@ fn parse_go_flags(
                 || method.contains("Slice")
                 || method.starts_with("Count"),
             action: (!is_bool).then_some(action).flatten(),
+            platforms: vec![NativePlatform::Any],
         });
     }
     flags.sort_by(|left, right| left.name.cmp(&right.name));
@@ -1160,6 +1161,9 @@ fn build_command_tree(
             subcommands.sort_by(|left, right| left.name.cmp(&right.name));
             entry.command.subcommands = subcommands;
             entry.command.platforms = platforms.to_vec();
+            for flag in &mut entry.command.flags {
+                flag.platforms = platforms.to_vec();
+            }
             built.insert(variable, entry.command);
             continue;
         }
@@ -1581,7 +1585,7 @@ fn render_command(
         )?;
     }
     for flag in &command.flags {
-        render_flag(output, flag, &format!("{indent}    "))?;
+        render_flag(output, flag, &command.platforms, &format!("{indent}    "))?;
     }
     for argument in &command.arguments {
         render_argument(output, argument, &format!("{indent}    "))?;
@@ -1593,7 +1597,12 @@ fn render_command(
     Ok(())
 }
 
-fn render_flag(output: &mut String, flag: &NativeFlag, indent: &str) -> Result<(), Box<dyn Error>> {
+fn render_flag(
+    output: &mut String,
+    flag: &NativeFlag,
+    inherited_platforms: &[NativePlatform],
+    indent: &str,
+) -> Result<(), Box<dyn Error>> {
     write!(
         output,
         "{indent}flag {} summary={} description={}",
@@ -1616,7 +1625,19 @@ fn render_flag(output: &mut String, flag: &NativeFlag, indent: &str) -> Result<(
     if let Some(action) = flag.action {
         write!(output, " action={}", quote(action_name(action))?)?;
     }
-    output.push('\n');
+    if flag.platforms == inherited_platforms {
+        output.push('\n');
+        return Ok(());
+    }
+    output.push_str(" {\n");
+    for platform in &flag.platforms {
+        writeln!(
+            output,
+            "{indent}    platform {}",
+            quote(platform_name(*platform))?
+        )?;
+    }
+    writeln!(output, "{indent}}}")?;
     Ok(())
 }
 
@@ -2319,6 +2340,7 @@ mod tests {
                     required: false,
                     repeatable: false,
                     action: Some(NativeCompletionAction::Files),
+                    platforms: vec![NativePlatform::Linux, NativePlatform::Macos],
                 }],
                 arguments: Vec::new(),
                 subcommands: Vec::new(),

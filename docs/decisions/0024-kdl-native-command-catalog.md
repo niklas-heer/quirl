@@ -52,9 +52,10 @@ authority.
 
 The native compiler parses and validates the complete KDL document, constructs
 a canonical typed tree, and compiles it in memory into SQLite application
-`QCNC`, schema version 2. One transaction writes both an exact typed snapshot
-and normalized provenance, command, alias, platform, intent, flag, argument,
-and semantic-document projections. Canonical ordering, explicit identifiers,
+`QCNC`, schema version 3. One transaction writes both an exact typed snapshot
+and normalized provenance, command, alias, command-platform, intent, flag,
+flag-platform, argument, semantic-document, and document-platform projections.
+Canonical ordering, explicit identifiers,
 fixed schema pragmas, and the absence of wall-clock data make equal typed input
 produce byte-identical database images.
 
@@ -202,6 +203,12 @@ does not invoke Carapace or parse a draft as a fallback. Native catalog failure
 must not prevent terminal startup, command execution, cancellation, or clean
 shutdown.
 
+Local discovery keeps completion/help input and manual-page input in separate
+bounded byte budgets. A large Fish, Bash, or Zsh installation therefore cannot
+consume the allowance needed to recover host-specific manual-page facts. Both
+budgets remain finite and are enforced before parsing; separation changes fair
+admission, not the overall requirement that discovery work be bounded.
+
 ## Failure model and invariants
 
 - KDL and upstream imports are untrusted inputs. Parsing and traversal are
@@ -215,8 +222,10 @@ shutdown.
   not infer, delete, promote, or reorder meaning-bearing positional arguments.
 - Build determinism excludes timestamps, host paths, locale, filesystem order,
   random identifiers, and network state from the database image.
-- Platform selection is metadata filtering. `any` is exclusive, child support
-  cannot exceed parent support, and an empty intersection is invalid.
+- Platform selection is metadata filtering. `any` is exclusive, command and
+  flag support cannot exceed the parent scope, and an empty intersection is
+  invalid. Duplicate flag spellings are valid only across disjoint effective
+  platform scopes.
 - Completion actions are closed declarations. Compilation and lookup never run
   them; a runtime provider applies its own bounds and capability policy.
 - The database is an all-or-nothing generation. Snapshot, normalized rows, and

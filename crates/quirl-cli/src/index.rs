@@ -38,6 +38,7 @@ const INDEX_DIRECTORY_ENTRIES_MAX: usize = 8_192;
 const INDEX_FILES_MAX: usize = 4_096;
 const INDEX_PATH_BYTES_MAX: usize = 1024 * 1024;
 const INDEX_SOURCE_BYTES_TOTAL_MAX: usize = 16 * 1024 * 1024;
+const INDEX_MAN_SOURCE_BYTES_TOTAL_MAX: usize = 16 * 1024 * 1024;
 const INDEX_RECORDS_MAX: usize = 65_536;
 const INDEX_RETAINED_BYTES_MAX: usize = 16 * 1024 * 1024;
 const INDEX_DIAGNOSTICS_MAX: usize = 4_096;
@@ -329,6 +330,7 @@ struct IndexBounds {
     files_max: usize,
     path_bytes_max: usize,
     source_bytes_max: usize,
+    man_source_bytes_max: usize,
     records_max: usize,
     retained_bytes_max: usize,
     diagnostics_max: usize,
@@ -341,6 +343,7 @@ impl IndexBounds {
         files_max: INDEX_FILES_MAX,
         path_bytes_max: INDEX_PATH_BYTES_MAX,
         source_bytes_max: INDEX_SOURCE_BYTES_TOTAL_MAX,
+        man_source_bytes_max: INDEX_MAN_SOURCE_BYTES_TOTAL_MAX,
         records_max: INDEX_RECORDS_MAX,
         retained_bytes_max: INDEX_RETAINED_BYTES_MAX,
         diagnostics_max: INDEX_DIAGNOSTICS_MAX,
@@ -354,6 +357,7 @@ struct IndexBuildBudget {
     files: usize,
     path_bytes: usize,
     source_bytes: usize,
+    man_source_bytes: usize,
     records: usize,
     retained_bytes: usize,
     diagnostics: usize,
@@ -368,6 +372,7 @@ impl IndexBuildBudget {
             files: 0,
             path_bytes: 0,
             source_bytes: 0,
+            man_source_bytes: 0,
             records: 0,
             retained_bytes: 0,
             diagnostics: 0,
@@ -1239,7 +1244,7 @@ fn catalog_from_files_checked(
     }
     for path in man_files {
         check_active()?;
-        let source = match read_documentation(path, budget) {
+        let source = match read_man_documentation(path, budget) {
             Ok(source) => source,
             Err(error) => {
                 push_index_diagnostic(
@@ -1362,6 +1367,17 @@ fn admit_source_bytes(bytes: usize, budget: &mut IndexBuildBudget) -> Result<(),
     let source_bytes = budget.source_bytes.saturating_add(bytes);
     ensure_index_limit("source bytes", budget.bounds.source_bytes_max, source_bytes)?;
     budget.source_bytes = source_bytes;
+    Ok(())
+}
+
+fn admit_man_source_bytes(bytes: usize, budget: &mut IndexBuildBudget) -> Result<(), ShellError> {
+    let source_bytes = budget.man_source_bytes.saturating_add(bytes);
+    ensure_index_limit(
+        "man-page source bytes",
+        budget.bounds.man_source_bytes_max,
+        source_bytes,
+    )?;
+    budget.man_source_bytes = source_bytes;
     Ok(())
 }
 
@@ -2150,6 +2166,20 @@ fn read_documentation(path: &Path, budget: &mut IndexBuildBudget) -> Result<Stri
         "Supply help or man text in a readable UTF-8 regular file at or below 1 MiB",
     )?;
     admit_source_bytes(source.len(), budget)?;
+    Ok(source)
+}
+
+fn read_man_documentation(
+    path: &Path,
+    budget: &mut IndexBuildBudget,
+) -> Result<String, ShellError> {
+    let source = read_index_utf8(
+        path,
+        DOCUMENTATION_READ_LIMIT,
+        "man-page source",
+        "Supply man text in a readable UTF-8 regular file at or below 1 MiB",
+    )?;
+    admit_man_source_bytes(source.len(), budget)?;
     Ok(source)
 }
 
@@ -3362,6 +3392,38 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn completion_source_budget_cannot_starve_man_page_imports() {
+        let directory = temporary_directory();
+        let fish = directory.join("large.fish");
+        let man = directory.join("cp.1");
+        fs::write(&fish, "# x\n").unwrap();
+        fs::write(&man, bsd_cp_man_page()).unwrap();
+        let bounds = IndexBounds {
+            source_bytes_max: 4,
+            man_source_bytes_max: bsd_cp_man_page().len(),
+            ..IndexBounds::PRODUCTION
+        };
+        let mut budget = IndexBuildBudget::new(bounds);
+
+        let (catalog, _) = catalog_from_files_checked(
+            std::slice::from_ref(&fish),
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&man),
+            &mut budget,
+            || Ok(()),
+        )
+        .unwrap();
+
+        let cp = catalog.find("cp").unwrap();
+        assert!(cp.options.iter().any(|option| option.names == ["-R"]));
+        assert_eq!(budget.source_bytes, 4);
+        assert_eq!(budget.man_source_bytes, bsd_cp_man_page().len());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn automatic_man_discovery_isolates_bad_pages_and_deduplicates_aliases() {
@@ -3539,6 +3601,7 @@ mod tests {
             files_max: 2,
             path_bytes_max: 8,
             source_bytes_max: 4,
+            man_source_bytes_max: 4,
             records_max: 2,
             retained_bytes_max: 128,
             diagnostics_max: 2,
@@ -3549,6 +3612,7 @@ mod tests {
         admit_index_path(Path::new("one"), &mut budget).unwrap();
         admit_index_path(Path::new("two"), &mut budget).unwrap();
         admit_source_bytes(4, &mut budget).unwrap();
+        admit_man_source_bytes(4, &mut budget).unwrap();
 
         assert_eq!(
             admit_index_path(Path::new("x"), &mut budget)
@@ -3558,6 +3622,10 @@ mod tests {
         );
         assert_eq!(
             admit_source_bytes(1, &mut budget).unwrap_err().code,
+            ErrorCode::ResourceLimit
+        );
+        assert_eq!(
+            admit_man_source_bytes(1, &mut budget).unwrap_err().code,
             ErrorCode::ResourceLimit
         );
         assert_eq!(

@@ -24,7 +24,7 @@ use std::{
 /// SQLite application identity for native Quirl command catalogs (`QCNC`).
 pub const NATIVE_DATABASE_APPLICATION_ID: i64 = 0x5143_4e43;
 /// Current SQLite schema version for native Quirl command catalogs.
-pub const NATIVE_DATABASE_SCHEMA_VERSION: i64 = 2;
+pub const NATIVE_DATABASE_SCHEMA_VERSION: i64 = 3;
 
 const SOURCE_BYTES_HARD_MAX: usize = 4 * 1024 * 1024;
 const DATABASE_BYTES_HARD_MAX: usize = 128 * 1024 * 1024;
@@ -94,11 +94,14 @@ CREATE TABLE flags (
     value_name TEXT,
     required INTEGER NOT NULL CHECK (required IN (0, 1)),
     repeatable INTEGER NOT NULL CHECK (repeatable IN (0, 1)),
-    action TEXT,
-    UNIQUE (command_id, name),
-    UNIQUE (command_id, short_name)
+    action TEXT
 );
 CREATE INDEX flags_command_name ON flags(command_id, name, flag_id);
+CREATE TABLE flag_platforms (
+    flag_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    PRIMARY KEY (flag_id, platform)
+) WITHOUT ROWID;
 CREATE TABLE arguments (
     argument_id INTEGER PRIMARY KEY NOT NULL,
     command_id INTEGER NOT NULL,
@@ -121,6 +124,11 @@ CREATE TABLE semantic_documents (
     body TEXT NOT NULL
 );
 CREATE INDEX semantic_documents_command ON semantic_documents(command_id, document_id);
+CREATE TABLE semantic_document_platforms (
+    document_id INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    PRIMARY KEY (document_id, platform)
+) WITHOUT ROWID;
 "#;
 
 /// Resource ceilings applied while parsing, compiling, publishing, and querying.
@@ -236,7 +244,7 @@ impl fmt::Display for NativeCatalogDiagnostic {
 
 impl std::error::Error for NativeCatalogDiagnostic {}
 
-/// Platform selector applied to commands and every child projection.
+/// Platform selector applied to commands, flags, and every child projection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum NativePlatform {
@@ -401,6 +409,8 @@ pub struct NativeFlag {
     pub repeatable: bool,
     /// Optional declarative native completion action for the consumed value.
     pub action: Option<NativeCompletionAction>,
+    /// Effective platforms on which this flag spelling and behavior apply.
+    pub platforms: Vec<NativePlatform>,
 }
 
 /// One command node with depth-bounded child commands.
@@ -744,7 +754,7 @@ fn parse_command(
     let mut aliases = Vec::new();
     let mut intents = Vec::new();
     let mut declared_platforms = Vec::new();
-    let mut flags = Vec::new();
+    let mut flag_nodes = Vec::new();
     let mut arguments = Vec::new();
     let mut command_nodes = Vec::new();
     if let Some(children) = children {
@@ -779,7 +789,7 @@ fn parse_command(
                             counts.flags,
                         ));
                     }
-                    flags.push(parse_flag(child, source_name, limits)?);
+                    flag_nodes.push(child);
                 }
                 "argument" => {
                     counts.arguments = counts.arguments.saturating_add(1);
@@ -810,7 +820,7 @@ fn parse_command(
         ("aliases", aliases.len()),
         ("intent phrases", intents.len()),
         ("platforms", declared_platforms.len()),
-        ("flags", flags.len()),
+        ("flags", flag_nodes.len()),
         ("arguments", arguments.len()),
         ("subcommands", command_nodes.len()),
     ] {
@@ -829,14 +839,18 @@ fn parse_command(
         validate_identifier(alias, "alias", node, source_name)?;
     }
     validate_unique_strings(&mut intents, "intent phrase", node, source_name)?;
-    validate_flag_set(&mut flags, node, source_name)?;
-    validate_argument_set(&arguments, node, source_name)?;
     let platforms = effective_platforms(
         inherited_platforms,
         &mut declared_platforms,
         node,
         source_name,
     )?;
+    let mut flags = Vec::with_capacity(flag_nodes.len());
+    for flag_node in flag_nodes {
+        flags.push(parse_flag(flag_node, &platforms, source_name, limits)?);
+    }
+    validate_flag_set(&mut flags, node, source_name)?;
+    validate_argument_set(&arguments, node, source_name)?;
     counts.documents = counts
         .documents
         .saturating_add(1)
@@ -880,6 +894,7 @@ fn parse_command(
 
 fn parse_flag(
     node: &KdlNode,
+    inherited_platforms: &[NativePlatform],
     source_name: &str,
     limits: NativeCatalogLimits,
 ) -> Result<NativeFlag, NativeCatalogDiagnostic> {
@@ -893,7 +908,43 @@ fn parse_flag(
         "value",
     ];
     validate_entries(node, 1, PROPERTIES, source_name)?;
-    reject_children(node, source_name)?;
+    let mut declared_platforms = Vec::new();
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            if child.name().value() != "platform" {
+                return Err(node_diagnostic(
+                    child,
+                    source_name,
+                    format!("unknown flag child node `{}`", child.name().value()),
+                    "Use only platform child nodes on flags",
+                ));
+            }
+            let value = parse_scalar_node(child, "platform", source_name, limits)?;
+            declared_platforms.push(NativePlatform::parse(&value).ok_or_else(|| {
+                node_diagnostic(
+                    child,
+                    source_name,
+                    format!("unknown platform `{value}`"),
+                    "Use any, linux, macos, windows, or freebsd",
+                )
+            })?);
+        }
+    }
+    if declared_platforms.len() > limits.values_per_command_max {
+        return Err(node_resource_diagnostic(
+            node,
+            source_name,
+            "flag platforms",
+            limits.values_per_command_max,
+            declared_platforms.len(),
+        ));
+    }
+    let platforms = effective_platforms(
+        inherited_platforms,
+        &mut declared_platforms,
+        node,
+        source_name,
+    )?;
     let name = required_argument_string(node, 0, "flag name", source_name, limits)?;
     if !valid_flag_name(&name) {
         return Err(node_diagnostic(
@@ -949,6 +1000,7 @@ fn parse_flag(
         required,
         repeatable,
         action,
+        platforms,
     })
 }
 
@@ -1213,7 +1265,7 @@ fn effective_platforms(
         return Err(node_diagnostic(
             node,
             source_name,
-            "command contains a duplicate platform",
+            "platform declaration contains a duplicate platform",
             "Keep each platform at most once",
         ));
     }
@@ -1243,8 +1295,8 @@ fn effective_platforms(
         return Err(node_diagnostic(
             node,
             source_name,
-            "subcommand platforms do not overlap their parent command",
-            "Remove the child platform declaration or select a parent-supported platform",
+            "declared platforms do not overlap inherited platforms",
+            "Remove the platform declaration or select an inherited platform",
         ));
     }
     Ok(result)
@@ -1277,21 +1329,36 @@ fn validate_flag_set(
     node: &KdlNode,
     source_name: &str,
 ) -> Result<(), NativeCatalogDiagnostic> {
-    let mut names = BTreeSet::new();
+    let mut names = BTreeMap::<&str, Vec<&[NativePlatform]>>::new();
     for flag in flags.iter() {
         for name in std::iter::once(&flag.name).chain(flag.short.iter()) {
-            if !names.insert(name) {
+            let scopes = names.entry(name).or_default();
+            if scopes
+                .iter()
+                .any(|existing| platform_sets_overlap(existing, &flag.platforms))
+            {
                 return Err(node_diagnostic(
                     node,
                     source_name,
                     format!("duplicate flag name `{name}`"),
-                    "Use each long and short flag name at most once per command",
+                    "Use each long and short flag name at most once on overlapping platforms",
                 ));
             }
+            scopes.push(&flag.platforms);
         }
     }
-    flags.sort_by(|left, right| left.name.cmp(&right.name));
+    flags.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.platforms.cmp(&right.platforms))
+    });
     Ok(())
+}
+
+fn platform_sets_overlap(left: &[NativePlatform], right: &[NativePlatform]) -> bool {
+    left.contains(&NativePlatform::Any)
+        || right.contains(&NativePlatform::Any)
+        || left.iter().any(|platform| right.contains(platform))
 }
 
 fn validate_argument_set(
@@ -1624,6 +1691,15 @@ struct FlatCommand<'a> {
     depth: usize,
 }
 
+struct SemanticDocumentInsert<'a> {
+    kind: &'a str,
+    command_id: i64,
+    target: &'a str,
+    title: &'a str,
+    body: &'a str,
+    platforms: &'a [NativePlatform],
+}
+
 /// Compile a validated typed catalog into a deterministic, bounded SQLite image.
 ///
 /// The exact typed JSON snapshot and every normalized projection are committed in
@@ -1827,11 +1903,14 @@ fn insert_catalog(
         insert_document(
             transaction,
             next_document_id,
-            "command",
-            command_id,
-            &flat.path,
-            &flat.path,
-            &body,
+            SemanticDocumentInsert {
+                kind: "command",
+                command_id,
+                target: &flat.path,
+                title: &flat.path,
+                body: &body,
+                platforms: &flat.command.platforms,
+            },
         )?;
         next_document_id = next_document_id.saturating_add(1);
         for flag in &flat.command.flags {
@@ -1852,6 +1931,16 @@ fn insert_catalog(
                     ],
                 )
                 .map_err(|error| database_diagnostic("<native catalog>", "insert flag", error))?;
+            for platform in &flag.platforms {
+                transaction
+                    .execute(
+                        "INSERT INTO flag_platforms(flag_id, platform) VALUES (?1, ?2)",
+                        params![next_flag_id, platform.as_str()],
+                    )
+                    .map_err(|error| {
+                        database_diagnostic("<native catalog>", "insert flag platform", error)
+                    })?;
+            }
             let title = flag.short.as_ref().map_or_else(
                 || flag.name.clone(),
                 |short| format!("{} {short}", flag.name),
@@ -1867,11 +1956,14 @@ fn insert_catalog(
             insert_document(
                 transaction,
                 next_document_id,
-                "flag",
-                command_id,
-                &flag.name,
-                &title,
-                &body,
+                SemanticDocumentInsert {
+                    kind: "flag",
+                    command_id,
+                    target: &flag.name,
+                    title: &title,
+                    body: &body,
+                    platforms: &flag.platforms,
+                },
             )?;
             next_flag_id = next_flag_id.saturating_add(1);
             next_document_id = next_document_id.saturating_add(1);
@@ -1900,11 +1992,14 @@ fn insert_catalog(
             insert_document(
                 transaction,
                 next_document_id,
-                "argument",
-                command_id,
-                &argument.name,
-                &argument.name,
-                &body,
+                SemanticDocumentInsert {
+                    kind: "argument",
+                    command_id,
+                    target: &argument.name,
+                    title: &argument.name,
+                    body: &body,
+                    platforms: &flat.command.platforms,
+                },
             )?;
             next_argument_id = next_argument_id.saturating_add(1);
             next_document_id = next_document_id.saturating_add(1);
@@ -1916,18 +2011,35 @@ fn insert_catalog(
 fn insert_document(
     transaction: &Transaction<'_>,
     document_id: i64,
-    kind: &str,
-    command_id: i64,
-    target: &str,
-    title: &str,
-    body: &str,
+    insert: SemanticDocumentInsert<'_>,
 ) -> Result<(), NativeCatalogDiagnostic> {
     transaction
         .execute(
             "INSERT INTO semantic_documents(document_id, document_kind, command_id, target, title, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![document_id, kind, command_id, target, title, body],
+            params![
+                document_id,
+                insert.kind,
+                insert.command_id,
+                insert.target,
+                insert.title,
+                insert.body
+            ],
         )
         .map_err(|error| database_diagnostic("<native catalog>", "insert semantic document", error))?;
+    for platform in insert.platforms {
+        transaction
+            .execute(
+                "INSERT INTO semantic_document_platforms(document_id, platform) VALUES (?1, ?2)",
+                params![document_id, platform.as_str()],
+            )
+            .map_err(|error| {
+                database_diagnostic(
+                    "<native catalog>",
+                    "insert semantic document platform",
+                    error,
+                )
+            })?;
+    }
     Ok(())
 }
 
@@ -2062,7 +2174,7 @@ fn validate_typed_catalog(
             typed_identifier(alias, "alias")?;
         }
         validate_typed_platforms(&command.platforms, inherited_platforms)?;
-        validate_typed_flags(&command.flags, limits)?;
+        validate_typed_flags(&command.flags, &command.platforms, limits)?;
         validate_typed_arguments(&command.arguments, limits)?;
         validate_typed_siblings(&command.subcommands, &command.name)?;
         for child in &command.subcommands {
@@ -2144,7 +2256,7 @@ fn validate_typed_platforms(
         return Err(validation_diagnostic(
             "<native catalog>",
             None,
-            "command has no effective platform",
+            "catalog item has no effective platform",
             "Use at least one platform or NativePlatform::Any",
         ));
     }
@@ -2155,7 +2267,7 @@ fn validate_typed_platforms(
         return Err(validation_diagnostic(
             "<native catalog>",
             None,
-            "command contains duplicate or contradictory platforms",
+            "catalog item contains duplicate or contradictory platforms",
             "Use unique specific platforms, or use any by itself",
         ));
     }
@@ -2167,8 +2279,8 @@ fn validate_typed_platforms(
         return Err(validation_diagnostic(
             "<native catalog>",
             None,
-            "subcommand platform is not supported by its parent",
-            "Restrict child platforms to the parent command's effective platforms",
+            "platform is not supported by its inherited scope",
+            "Restrict platforms to the inherited effective platform set",
         ));
     }
     Ok(())
@@ -2176,9 +2288,10 @@ fn validate_typed_platforms(
 
 fn validate_typed_flags(
     flags: &[NativeFlag],
+    command_platforms: &[NativePlatform],
     limits: NativeCatalogLimits,
 ) -> Result<(), NativeCatalogDiagnostic> {
-    let mut names = BTreeSet::new();
+    let mut names = BTreeMap::<&str, Vec<&[NativePlatform]>>::new();
     for flag in flags {
         if !valid_flag_name(&flag.name) {
             return Err(validation_diagnostic(
@@ -2188,14 +2301,8 @@ fn validate_typed_flags(
                 "Use a lowercase long name such as --output-file, a short-only name such as -P, or a Windows name such as /q",
             ));
         }
-        if !names.insert(&flag.name) {
-            return Err(validation_diagnostic(
-                "<native catalog>",
-                None,
-                format!("duplicate flag `{}`", flag.name),
-                "Use each flag name at most once per command",
-            ));
-        }
+        validate_typed_platforms(&flag.platforms, command_platforms)?;
+        let mut spellings = vec![flag.name.as_str()];
         if flag.short.is_some() && valid_short_flag(&flag.name) {
             return Err(validation_diagnostic(
                 "<native catalog>",
@@ -2207,15 +2314,31 @@ fn validate_typed_flags(
                 "Remove the short alias or use a long canonical spelling",
             ));
         }
-        if let Some(short) = &flag.short
-            && (!valid_short_flag(short) || !names.insert(short))
-        {
-            return Err(validation_diagnostic(
-                "<native catalog>",
-                None,
-                format!("invalid or duplicate short flag `{short}`"),
-                "Use one unique ASCII short flag such as -o",
-            ));
+        if let Some(short) = &flag.short {
+            if !valid_short_flag(short) {
+                return Err(validation_diagnostic(
+                    "<native catalog>",
+                    None,
+                    format!("invalid short flag `{short}`"),
+                    "Use one ASCII short flag such as -o",
+                ));
+            }
+            spellings.push(short);
+        }
+        for spelling in spellings {
+            let scopes = names.entry(spelling).or_default();
+            if scopes
+                .iter()
+                .any(|existing| platform_sets_overlap(existing, &flag.platforms))
+            {
+                return Err(validation_diagnostic(
+                    "<native catalog>",
+                    None,
+                    format!("duplicate flag `{spelling}` on overlapping platforms"),
+                    "Use each flag spelling at most once on overlapping platforms",
+                ));
+            }
+            scopes.push(&flag.platforms);
         }
         typed_string(&flag.summary, "flag summary", limits)?;
         typed_string(&flag.description, "flag description", limits)?;
@@ -2363,7 +2486,7 @@ impl NativeCatalogReader {
                 |parent| format!("{parent} {}", command.name),
             );
             let id = format!("native:{}:{path}", self.snapshot.name);
-            let options = native_arguments(command, &provenance);
+            let options = native_arguments(command, platform, &provenance);
             projected.push(CommandSpec {
                 id: id.clone(),
                 version: Some(self.snapshot.provenance.revision.clone()),
@@ -2466,6 +2589,7 @@ impl NativeCatalogReader {
                  JOIN commands c ON c.command_id = f.command_id
                  WHERE c.full_path = ?1
                    AND (?2 = 'any' OR EXISTS (SELECT 1 FROM command_platforms p WHERE p.command_id = c.command_id AND (p.platform = 'any' OR p.platform = ?2)))
+                   AND (?2 = 'any' OR EXISTS (SELECT 1 FROM flag_platforms p WHERE p.flag_id = f.flag_id AND (p.platform = 'any' OR p.platform = ?2)))
                    AND substr(n.token, 1, length(?3)) = ?3
                  ORDER BY n.token, f.flag_id
                  LIMIT ?4",
@@ -2573,7 +2697,7 @@ impl NativeCatalogReader {
             .prepare(
                 "SELECT c.full_path, d.target, d.title, d.body
                  FROM semantic_documents d JOIN commands c ON c.command_id = d.command_id
-                 WHERE (?1 = 'any' OR EXISTS (SELECT 1 FROM command_platforms p WHERE p.command_id = c.command_id AND (p.platform = 'any' OR p.platform = ?1)))
+                 WHERE (?1 = 'any' OR EXISTS (SELECT 1 FROM semantic_document_platforms p WHERE p.document_id = d.document_id AND (p.platform = 'any' OR p.platform = ?1)))
                  ORDER BY d.document_id LIMIT ?2",
             )
             .map_err(|error| self.query_error("prepare semantic query", error))?;
@@ -2719,41 +2843,53 @@ fn native_provenance(catalog: &NativeCatalog) -> ProvenanceInfo {
 }
 
 fn native_command_supports(command: &NativeCommand, platform: NativePlatform) -> bool {
-    platform == NativePlatform::Any
-        || command.platforms.contains(&NativePlatform::Any)
-        || command.platforms.contains(&platform)
+    native_platforms_support(&command.platforms, platform)
 }
 
-fn native_arguments(command: &NativeCommand, provenance: &ProvenanceInfo) -> Vec<ArgumentSpec> {
-    let flags = command.flags.iter().map(|flag| {
-        let action = flag.action;
-        ArgumentSpec {
-            names: flag
-                .short
-                .iter()
-                .cloned()
-                .chain(std::iter::once(flag.name.clone()))
-                .collect(),
-            kind: if flag.value_name.is_some() {
-                ArgumentKind::Option
-            } else {
-                ArgumentKind::Flag
-            },
-            value_type: action.map_or_else(
-                || flag.value_name.clone().unwrap_or_else(|| "Bool".to_owned()),
-                |action| action.value_type().to_owned(),
-            ),
-            required: flag.required,
-            repeatable: flag.repeatable,
-            values: action.map(|action| CompletionSource::Dynamic {
-                provider: action.provider_identity().to_owned(),
-            }),
-            conflicts: Vec::new(),
-            documentation: native_documentation(&flag.summary, &flag.description),
-            examples: Vec::new(),
-            provenance: provenance.clone(),
-        }
-    });
+fn native_platforms_support(platforms: &[NativePlatform], platform: NativePlatform) -> bool {
+    platform == NativePlatform::Any
+        || platforms.contains(&NativePlatform::Any)
+        || platforms.contains(&platform)
+}
+
+fn native_arguments(
+    command: &NativeCommand,
+    platform: NativePlatform,
+    provenance: &ProvenanceInfo,
+) -> Vec<ArgumentSpec> {
+    let flags = command
+        .flags
+        .iter()
+        .filter(|flag| native_platforms_support(&flag.platforms, platform))
+        .map(|flag| {
+            let action = flag.action;
+            ArgumentSpec {
+                names: flag
+                    .short
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(flag.name.clone()))
+                    .collect(),
+                kind: if flag.value_name.is_some() {
+                    ArgumentKind::Option
+                } else {
+                    ArgumentKind::Flag
+                },
+                value_type: action.map_or_else(
+                    || flag.value_name.clone().unwrap_or_else(|| "Bool".to_owned()),
+                    |action| action.value_type().to_owned(),
+                ),
+                required: flag.required,
+                repeatable: flag.repeatable,
+                values: action.map(|action| CompletionSource::Dynamic {
+                    provider: action.provider_identity().to_owned(),
+                }),
+                conflicts: Vec::new(),
+                documentation: native_documentation(&flag.summary, &flag.description),
+                examples: Vec::new(),
+                provenance: provenance.clone(),
+            }
+        });
     let positional = command.arguments.iter().map(|argument| {
         let action = argument.action;
         ArgumentSpec {
@@ -3223,6 +3359,12 @@ catalog "native-tools" {
         platform "linux"
         platform "macos"
         flag "-C" summary="Select a working directory" description="Run as if started in this directory." value="directory" action="directories"
+        flag "--platform-mode" summary="Use Linux mode" description="Use behavior defined for Linux hosts." {
+            platform "linux"
+        }
+        flag "--platform-mode" summary="Use macOS mode" description="Use behavior defined for macOS hosts." {
+            platform "macos"
+        }
         flag "--verbose" short="-v" summary="Show detail" description="Print additional operation detail."
         argument "repository" summary="Repository directory" description="Select the repository to inspect." required=#true action="directories"
         command "commit" summary="Record changes" description="Create a new commit from staged changes." {
@@ -3258,8 +3400,18 @@ catalog "native-tools" {
             vec![NativePlatform::Macos]
         );
         assert_eq!(catalog.commands[1].name, "winutil");
-        assert_eq!(catalog.commands[0].flags[0].name, "--verbose");
-        assert_eq!(catalog.commands[0].flags[1].name, "-C");
+        assert_eq!(catalog.commands[0].flags[0].name, "--platform-mode");
+        assert_eq!(
+            catalog.commands[0].flags[0].platforms,
+            [NativePlatform::Linux]
+        );
+        assert_eq!(catalog.commands[0].flags[1].name, "--platform-mode");
+        assert_eq!(
+            catalog.commands[0].flags[1].platforms,
+            [NativePlatform::Macos]
+        );
+        assert_eq!(catalog.commands[0].flags[2].name, "--verbose");
+        assert_eq!(catalog.commands[0].flags[3].name, "-C");
         assert_eq!(catalog.commands[1].flags[0].name, "/users");
         assert_eq!(
             catalog.commands[0].arguments[0].action,
@@ -3362,6 +3514,22 @@ catalog "native-tools" {
         )
         .unwrap_err();
         assert!(error.message.contains("do not overlap"));
+
+        let overlapping_flags = FIXTURE.replace(
+            "flag \"--platform-mode\" summary=\"Use macOS mode\" description=\"Use behavior defined for macOS hosts.\" {\n            platform \"macos\"",
+            "flag \"--platform-mode\" summary=\"Use macOS mode\" description=\"Use behavior defined for macOS hosts.\" {\n            platform \"linux\"",
+        );
+        let error = parse_native_catalog(
+            &overlapping_flags,
+            "overlapping-flags.kdl",
+            NativeCatalogLimits::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("duplicate flag name `--platform-mode`")
+        );
     }
 
     #[test]
@@ -3495,6 +3663,16 @@ catalog "native-tools" {
             .flags("git", NativePlatform::Linux, "-C", 10)
             .unwrap();
         assert_eq!(short_only[0].value, "-C");
+        let linux_mode = reader
+            .flags("git", NativePlatform::Linux, "--platform", 10)
+            .unwrap();
+        assert_eq!(linux_mode.len(), 1);
+        assert_eq!(linux_mode[0].summary, "Use Linux mode");
+        let macos_mode = reader
+            .flags("git", NativePlatform::Macos, "--platform", 10)
+            .unwrap();
+        assert_eq!(macos_mode.len(), 1);
+        assert_eq!(macos_mode[0].summary, "Use macOS mode");
         let windows_flag = reader
             .flags("winutil", NativePlatform::Windows, "/", 10)
             .unwrap();
@@ -3541,6 +3719,14 @@ catalog "native-tools" {
             .semantic_lookup("record staged changes", NativePlatform::Linux, 10)
             .unwrap();
         assert!(linux.iter().all(|hit| hit.command_path != "git commit"));
+        let linux_flag = reader
+            .semantic_lookup("Linux", NativePlatform::Linux, 10)
+            .unwrap();
+        assert!(linux_flag.iter().any(|hit| hit.target == "--platform-mode"));
+        let macos_flag = reader
+            .semantic_lookup("Linux", NativePlatform::Macos, 10)
+            .unwrap();
+        assert!(macos_flag.iter().all(|hit| hit.target != "--platform-mode"));
         let error = reader
             .semantic_lookup("query", NativePlatform::Any, limits.query_results_max + 1)
             .unwrap_err();

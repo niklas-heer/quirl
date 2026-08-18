@@ -1166,6 +1166,65 @@ Options:
 - `-v`, `--verbose` — Use verbose output
 - `recipes` — Recipes and arguments Recipe names followed by values for their declared parameters.
 
+## `ls [--color <when>] [-1] [-A] [-B] [-C] [-D <format>] [-F] [-G] [-H] [-I] [-L] [-O] [-P] [-R] [-S] [-T] [-U] [-W] [-X] [-a] [-b] [-c] [-d] [-e] [-f] [-g] [-h] [-i] [-k] [-l] [-m] [-n] [-o] [-p] [-q] [-r] [-s] [-t] [-u] [-v] [-w] [-x] [-y] [<paths>...]`
+
+List directory contents
+
+Lists information about files and directory contents, using the current directory when no path is supplied.
+
+Related intents: list files; show directory contents.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--color` — Control colored output Colorize names using the macOS ls color rules for the supplied mode.
+- `-1` — Use one entry per line Force single-column output with one entry on each line.
+- `-A` — Include most hidden entries Include dot-prefixed entries except the implied current and parent directory entries.
+- `-B` — Escape non-printable characters Render non-printable characters in file names using octal escapes.
+- `-C` — Use multi-column output Arrange entries vertically in multiple columns.
+- `-D` — Select the date format Format timestamps in long output using the supplied strftime format.
+- `-F` — Append file-type indicators Append a type indicator such as slash, asterisk, at sign, or pipe to each entry.
+- `-G` — Enable colored output Colorize file names using macOS ls color rules.
+- `-H` — Follow command-line symbolic links Follow symbolic links named directly on the command line.
+- `-I` — Disable implicit superuser hidden-file listing Prevent the superuser default that implicitly enables -A.
+- `-L` — Follow symbolic links Show information about the final target of each symbolic link.
+- `-O` — Show file flags Include file flags in long output.
+- `-P` — Do not follow symbolic links List symbolic links themselves rather than their targets.
+- `-R` — List recursively Descend into subdirectories and list their contents recursively.
+- `-S` — Sort by size Sort entries by size from largest to smallest.
+- `-T` — Show complete timestamps Include seconds and the year in timestamps shown by long output.
+- `-U` — Use file creation time Use creation time for sorting or timestamp display.
+- `-W` — Show whiteouts Display whiteout entries while scanning directories.
+- `-X` — Stay on one filesystem Do not cross filesystem boundaries while listing recursively.
+- `-a` — Include hidden entries Include entries whose names begin with a dot.
+- `-b` — Escape non-printable characters Render non-printable characters in file names using octal escapes.
+- `-c` — Use status-change time Use inode status-change time for sorting or timestamp display.
+- `-d` — List directories themselves Show directory entries rather than listing their contents.
+- `-e` — Show access-control lists Print each file's access-control list in long output.
+- `-f` — Do not sort directory entries Enable hidden entries and disable reverse, size, and time sorting.
+- `-g` — Retain historical compatibility Accept the historical BSD option without changing output.
+- `-h` — Use human-readable sizes Display sizes using units such as KiB, MiB, and GiB.
+- `-i` — Show inode numbers Print the inode number associated with each entry.
+- `-k` — Use 1024-byte blocks Use 1024-byte units for displayed block counts.
+- `-l` — Use long output Show permissions, ownership, size, timestamps, and names.
+- `-m` — Separate entries with commas Fill the output width with a comma-separated list of entries.
+- `-n` — Show numeric ownership Print numeric user and group identifiers in long output.
+- `-o` — Use long output without groups Like -l, but omit each entry's group.
+- `-p` — Append slashes to directories Write a slash after each entry that is a directory.
+- `-q` — Replace non-graphic characters Print a question mark in place of each non-graphic character.
+- `-r` — Reverse the sort order Reverse the selected ordering of entries.
+- `-s` — Show allocated sizes Print the number of filesystem blocks allocated to each entry.
+- `-t` — Sort by time Sort entries by the selected timestamp, newest first.
+- `-u` — Use access time Use access time for sorting or timestamp display.
+- `-v` — Print non-graphic characters directly Force unedited output for non-graphic characters.
+- `-w` — Print names without character replacement Force raw printing of non-printable characters.
+- `-x` — Sort multi-column output across rows Arrange multi-column entries across rather than down columns.
+- `-y` — Keep alphabetical and time sort directions aligned When sorting by time, sort names in the same direction as timestamps.
+- `paths` — Files or directories to list Paths to inspect; defaults to the current directory.
+
 ## `lua <expression>`
 
 Evaluate Lua without leaving command mode

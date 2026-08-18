@@ -4,61 +4,311 @@ catalog "ls" {
         intent "list files"
         intent "show directory contents"
         platform "linux"
+        platform "macos"
         platform "freebsd"
-        flag "--all" summary="do not ignore entries starting with ." description="do not ignore entries starting with ." short="-a"
-        flag "--almost-all" summary="do not list implied . and .." description="do not list implied . and .." short="-A"
-        flag "--author" summary="with -l, print the author of each file" description="with -l, print the author of each file"
-        flag "--block-size" summary="with -l, scale sizes by SIZE when printing them;" description="with -l, scale sizes by SIZE when printing them;" value="value"
-        flag "--classify" summary="append indicator (one of */=>@|) to entries" description="append indicator (one of */=>@|) to entries" short="-F"
-        flag "--color" summary="colorize the output; WHEN can be 'always' (default" description="colorize the output; WHEN can be 'always' (default" value="value"
-        flag "--context" summary="print any security context of each file" description="print any security context of each file" short="-Z"
-        flag "--dereference" summary="when showing file information for a symbolic" description="when showing file information for a symbolic" short="-L"
-        flag "--dereference-command-line" summary="follow symbolic links listed on the command line" description="follow symbolic links listed on the command line" short="-H"
-        flag "--dereference-command-line-symlink-to-dir" summary="follow each command line symbolic link that points to a directory" description="follow each command line symbolic link that points to a directory"
-        flag "--directory" summary="list directories themselves, not their contents" description="list directories themselves, not their contents" short="-d"
-        flag "--dired" summary="generate output designed for Emacs' dired mode" description="generate output designed for Emacs' dired mode" short="-D"
-        flag "--escape" summary="print C-style escapes for nongraphic characters" description="print C-style escapes for nongraphic characters" short="-b"
-        flag "--file-type" summary="likewise, except do not append '*'" description="likewise, except do not append '*'"
-        flag "--format" summary="across -x, commas -m, horizontal -x, long -l," description="across -x, commas -m, horizontal -x, long -l," value="value"
-        flag "--full-time" summary="like -l --time-style=full-iso" description="like -l --time-style=full-iso"
-        flag "--group-directories-first" summary="group directories first" description="group directories first"
-        flag "--help" summary="display this help and exit" description="display this help and exit"
-        flag "--hide" summary="do not list implied entries matching shell PATTERN" description="do not list implied entries matching shell PATTERN" value="value"
-        flag "--hide-control-chars" summary="print ? instead of nongraphic characters" description="print ? instead of nongraphic characters" short="-q"
-        flag "--human-readable" summary="with -l and -s, print sizes like 1K 234M 2G etc." description="with -l and -s, print sizes like 1K 234M 2G etc." short="-h"
-        flag "--hyperlink" summary="hyperlink file names; WHEN can be 'always'" description="hyperlink file names; WHEN can be 'always'" value="value"
-        flag "--ignore" summary="do not list implied entries matching shell PATTERN" description="do not list implied entries matching shell PATTERN" short="-I" value="value"
-        flag "--ignore-backups" summary="do not list implied entries ending with ~" description="do not list implied entries ending with ~" short="-B"
-        flag "--indicator-style" summary="append indicator with style WORD to entry names:" description="append indicator with style WORD to entry names:" value="value"
-        flag "--inode" summary="print the index number of each file" description="print the index number of each file" short="-i"
-        flag "--kibibytes" summary="default to 1024-byte blocks for disk usage;" description="default to 1024-byte blocks for disk usage;" short="-k"
-        flag "--literal" summary="print entry names without quoting" description="print entry names without quoting" short="-N"
-        flag "--no-group" summary="in a long listing, don't print group names" description="in a long listing, don't print group names" short="-G"
-        flag "--numeric-uid-gid" summary="like -l, but list numeric user and group IDs" description="like -l, but list numeric user and group IDs" short="-n"
-        flag "--quote-name" summary="enclose entry names in double quotes" description="enclose entry names in double quotes" short="-Q"
-        flag "--quoting-style" summary="use quoting style WORD for entry names:" description="use quoting style WORD for entry names:" value="value"
-        flag "--recursive" summary="list subdirectories recursively" description="list subdirectories recursively" short="-R"
-        flag "--reverse" summary="reverse order while sorting" description="reverse order while sorting" short="-r"
-        flag "--show-control-chars" summary="show nongraphic characters as-is (the default," description="show nongraphic characters as-is (the default,"
-        flag "--si" summary="likewise, but use powers of 1000 not 1024" description="likewise, but use powers of 1000 not 1024"
-        flag "--size" summary="print the allocated size of each file, in blocks" description="print the allocated size of each file, in blocks" short="-s"
-        flag "--sort" summary="sort by WORD instead of name: none (-U), size (-S)," description="sort by WORD instead of name: none (-U), size (-S)," value="value"
-        flag "--tabsize" summary="assume tab stops at each COLS instead of 8" description="assume tab stops at each COLS instead of 8" short="-T" value="value"
-        flag "--time" summary="change the default of using modification times;" description="change the default of using modification times;" value="value"
-        flag "--time-style" summary="time/date format with -l; see TIME_STYLE below" description="time/date format with -l; see TIME_STYLE below" value="value"
-        flag "--version" summary="output version information and exit" description="output version information and exit"
-        flag "--width" summary="set output width to COLS.  0 means no limit" description="set output width to COLS.  0 means no limit" short="-w" value="value"
-        flag "--zero" summary="end each output line with NUL, not newline" description="end each output line with NUL, not newline" short="-0"
-        flag "-c" summary="Use status-change time" description="With -lt, sort by and show status-change time; with -l, show it while sorting by name."
-        flag "-f" summary="Do not sort directory entries" description="Enable -aU and disable -ls and --color."
-        flag "-g" summary="Use long format without owners" description="Like -l, but omit each entry's owner."
-        flag "-l" summary="Use a long listing format" description="Show permissions, ownership, size, timestamps, and names."
+        flag "--all" summary="Include hidden entries" description="Do not ignore entries whose names begin with a dot." short="-a" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--almost-all" summary="Include most hidden entries" description="Include dot-prefixed entries except the implied current and parent directory entries." short="-A" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--author" summary="Show file authors" description="With long output, print the author associated with each file." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--block-size" summary="Select the displayed size unit" description="Scale displayed sizes using the supplied size unit." value="size" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--classify" summary="Append file-type indicators" description="Append a type indicator such as slash, asterisk, at sign, or pipe to each entry." short="-F" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--color" summary="Control colored output" description="Colorize names according to the supplied mode." value="when" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--color" summary="Control colored output" description="Colorize names using the macOS ls color rules for the supplied mode." value="when" {
+            platform "macos"
+        }
+        flag "--context" summary="Show security contexts" description="Print the security context associated with each entry." short="-Z" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--dereference" summary="Follow symbolic links" description="Show information about the final target of each symbolic link." short="-L" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--dereference-command-line" summary="Follow command-line symbolic links" description="Follow symbolic links named directly on the command line." short="-H" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--dereference-command-line-symlink-to-dir" summary="Follow command-line links to directories" description="Follow each command-line symbolic link that refers to a directory." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--directory" summary="List directories themselves" description="Show directory entries rather than listing their contents." short="-d" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--dired" summary="Emit Emacs dired metadata" description="Generate output containing position metadata for Emacs dired mode." short="-D" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--escape" summary="Escape non-graphic characters" description="Print C-style escapes for non-graphic characters in names." short="-b" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--file-type" summary="Append directory and special-type indicators" description="Append file-type indicators without marking executable regular files." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--format" summary="Select an output layout" description="Choose the across, commas, horizontal, long, single-column, or vertical layout." value="format" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--full-time" summary="Show full timestamps" description="Use long output with complete ISO timestamps." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--group-directories-first" summary="Group directories before files" description="List directories before other entries without changing the selected sort key." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--help" summary="Show usage help" description="Display command usage and exit." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--hide" summary="Hide entries matching a pattern" description="Omit implied entries whose names match the supplied shell pattern." value="pattern" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--hide-control-chars" summary="Replace non-graphic characters" description="Print a question mark in place of each non-graphic character." short="-q" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--human-readable" summary="Use human-readable sizes" description="Display sizes using units such as KiB, MiB, and GiB." short="-h" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--hyperlink" summary="Control terminal hyperlinks" description="Emit terminal hyperlinks for names according to the supplied mode." value="when" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--ignore" summary="Ignore matching entries" description="Do not list implied entries matching the supplied shell pattern." short="-I" value="pattern" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--ignore-backups" summary="Ignore backup files" description="Do not list implied entries whose names end with a tilde." short="-B" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--indicator-style" summary="Select file-type indicators" description="Append indicators to entries using the supplied style." value="style" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--inode" summary="Show inode numbers" description="Print the inode number associated with each entry." short="-i" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--kibibytes" summary="Use 1024-byte blocks" description="Use 1024-byte units for displayed block counts." short="-k" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--literal" summary="Print names literally" description="Do not quote file names containing special characters." short="-N" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-group" summary="Omit group names" description="Do not print group names in long output." short="-G" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--numeric-uid-gid" summary="Show numeric ownership" description="Print numeric user and group identifiers in long output." short="-n" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--quote-name" summary="Quote names" description="Enclose each entry name in double quotes." short="-Q" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--quoting-style" summary="Select name quoting" description="Quote entry names using the supplied style." value="style" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--recursive" summary="List recursively" description="Descend into subdirectories and list their contents recursively." short="-R" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--reverse" summary="Reverse the sort order" description="Reverse the selected ordering of entries." short="-r" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--show-control-chars" summary="Show non-graphic characters directly" description="Print non-graphic characters without replacing or escaping them." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--si" summary="Use decimal size units" description="Display human-readable sizes using powers of 1000." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--size" summary="Show allocated sizes" description="Print the allocated size of each entry in blocks." short="-s" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--sort" summary="Select a sort key" description="Sort entries using the supplied field rather than by name." value="field" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--tabsize" summary="Select tab width" description="Assume tab stops at the supplied column interval." short="-T" value="columns" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--time" summary="Select the timestamp field" description="Choose which timestamp is displayed or used for sorting." value="field" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--time-style" summary="Select the timestamp format" description="Format timestamps in long output using the supplied style." value="style" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--version" summary="Show version information" description="Display version information and exit." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--width" summary="Select output width" description="Format output for the supplied number of columns." short="-w" value="columns" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--zero" summary="Terminate entries with NUL" description="End each listed entry with a NUL byte instead of a newline." short="-0" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-1" summary="Use one entry per line" description="Force single-column output with one entry on each line." {
+            platform "macos"
+        }
+        flag "-A" summary="Include most hidden entries" description="Include dot-prefixed entries except the implied current and parent directory entries." {
+            platform "macos"
+        }
+        flag "-B" summary="Escape non-printable characters" description="Render non-printable characters in file names using octal escapes." {
+            platform "macos"
+        }
+        flag "-C" summary="Use multi-column output" description="Arrange entries vertically in multiple columns." {
+            platform "macos"
+        }
+        flag "-D" summary="Select the date format" description="Format timestamps in long output using the supplied strftime format." value="format" {
+            platform "macos"
+        }
+        flag "-F" summary="Append file-type indicators" description="Append a type indicator such as slash, asterisk, at sign, or pipe to each entry." {
+            platform "macos"
+        }
+        flag "-G" summary="Enable colored output" description="Colorize file names using macOS ls color rules." {
+            platform "macos"
+        }
+        flag "-H" summary="Follow command-line symbolic links" description="Follow symbolic links named directly on the command line." {
+            platform "macos"
+        }
+        flag "-I" summary="Disable implicit superuser hidden-file listing" description="Prevent the superuser default that implicitly enables -A." {
+            platform "macos"
+        }
+        flag "-L" summary="Follow symbolic links" description="Show information about the final target of each symbolic link." {
+            platform "macos"
+        }
+        flag "-O" summary="Show file flags" description="Include file flags in long output." {
+            platform "macos"
+        }
+        flag "-P" summary="Do not follow symbolic links" description="List symbolic links themselves rather than their targets." {
+            platform "macos"
+        }
+        flag "-R" summary="List recursively" description="Descend into subdirectories and list their contents recursively." {
+            platform "macos"
+        }
+        flag "-S" summary="Sort by size" description="Sort entries by size from largest to smallest." {
+            platform "macos"
+        }
+        flag "-T" summary="Show complete timestamps" description="Include seconds and the year in timestamps shown by long output." {
+            platform "macos"
+        }
+        flag "-U" summary="Use file creation time" description="Use creation time for sorting or timestamp display." {
+            platform "macos"
+        }
+        flag "-W" summary="Show whiteouts" description="Display whiteout entries while scanning directories." {
+            platform "macos"
+        }
+        flag "-X" summary="Stay on one filesystem" description="Do not cross filesystem boundaries while listing recursively." {
+            platform "macos"
+        }
+        flag "-a" summary="Include hidden entries" description="Include entries whose names begin with a dot." {
+            platform "macos"
+        }
+        flag "-b" summary="Escape non-printable characters" description="Render non-printable characters in file names using octal escapes." {
+            platform "macos"
+        }
+        flag "-c" summary="Use status-change time" description="Use inode status-change time for sorting or timestamp display."
+        flag "-d" summary="List directories themselves" description="Show directory entries rather than listing their contents." {
+            platform "macos"
+        }
+        flag "-e" summary="Show access-control lists" description="Print each file's access-control list in long output." {
+            platform "macos"
+        }
+        flag "-f" summary="Do not sort directory entries" description="Enable -aU and disable -ls and --color." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-f" summary="Do not sort directory entries" description="Enable hidden entries and disable reverse, size, and time sorting." {
+            platform "macos"
+        }
+        flag "-g" summary="Use long output without owners" description="Like -l, but omit each entry's owner." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-g" summary="Retain historical compatibility" description="Accept the historical BSD option without changing output." {
+            platform "macos"
+        }
+        flag "-h" summary="Use human-readable sizes" description="Display sizes using units such as KiB, MiB, and GiB." {
+            platform "macos"
+        }
+        flag "-i" summary="Show inode numbers" description="Print the inode number associated with each entry." {
+            platform "macos"
+        }
+        flag "-k" summary="Use 1024-byte blocks" description="Use 1024-byte units for displayed block counts." {
+            platform "macos"
+        }
+        flag "-l" summary="Use long output" description="Show permissions, ownership, size, timestamps, and names."
         flag "-m" summary="Separate entries with commas" description="Fill the output width with a comma-separated list of entries."
-        flag "-o" summary="Use long format without groups" description="Like -l, but omit group information."
-        flag "-t" summary="Sort by time, newest first" description="Sort using the time selected by --time, with newest entries first."
-        flag "-u" summary="Use access time" description="With -lt, sort by and show access time; with -l, show it while sorting by name."
-        flag "-v" summary="Sort version numbers naturally" description="Order embedded version numbers numerically within text."
-        flag "-x" summary="List entries across rows" description="List entries by lines instead of by columns."
+        flag "-n" summary="Show numeric ownership" description="Print numeric user and group identifiers in long output." {
+            platform "macos"
+        }
+        flag "-o" summary="Use long output without groups" description="Like -l, but omit each entry's group."
+        flag "-p" summary="Append slashes to directories" description="Write a slash after each entry that is a directory." {
+            platform "macos"
+        }
+        flag "-q" summary="Replace non-graphic characters" description="Print a question mark in place of each non-graphic character." {
+            platform "macos"
+        }
+        flag "-r" summary="Reverse the sort order" description="Reverse the selected ordering of entries." {
+            platform "macos"
+        }
+        flag "-s" summary="Show allocated sizes" description="Print the number of filesystem blocks allocated to each entry." {
+            platform "macos"
+        }
+        flag "-t" summary="Sort by time" description="Sort entries by the selected timestamp, newest first."
+        flag "-u" summary="Use access time" description="Use access time for sorting or timestamp display."
+        flag "-v" summary="Sort version numbers naturally" description="Order embedded version numbers numerically within text." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-v" summary="Print non-graphic characters directly" description="Force unedited output for non-graphic characters." {
+            platform "macos"
+        }
+        flag "-w" summary="Print names without character replacement" description="Force raw printing of non-printable characters." {
+            platform "macos"
+        }
+        flag "-x" summary="Sort multi-column output across rows" description="Arrange multi-column entries across rather than down columns."
+        flag "-y" summary="Keep alphabetical and time sort directions aligned" description="When sorting by time, sort names in the same direction as timestamps." {
+            platform "macos"
+        }
         argument "paths" summary="Files or directories to list" description="Paths to inspect; defaults to the current directory." repeatable=#true action="files"
     }
 }
