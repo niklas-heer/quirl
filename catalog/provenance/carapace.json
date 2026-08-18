@@ -3,6 +3,7 @@
   "revision": "ebfb9beda84fdf057dc9a89b59527158d23d323c",
   "license": "MIT",
   "license_file": "catalog/provenance/CARAPACE_LICENSE",
+  "license_sha256": "25dbdc5c4265ee2983e2b2cd0b5073df0a24aecc0de14a49d01ec9c702f7f22c",
   "import_policy": "Static build-time extraction from manifest-listed Go source; no upstream code is executed.",
   "curation": "Command facts are reviewed and adapted to the strict Quirl native catalog schema before promotion from draft."
 }

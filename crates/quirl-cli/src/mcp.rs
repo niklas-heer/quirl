@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn mcp_metadata_is_truthfully_immutable_and_nonexecuting() {
-        let catalog = crate::native_catalog::builtin_native_catalog().unwrap();
+        let catalog = crate::native_catalog::builtin_native_catalog();
         let server = McpServer::new(vec![McpCapability::Catalog], catalog.clone());
         assert_eq!(server.catalog, catalog);
         assert!(

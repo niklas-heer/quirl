@@ -171,6 +171,28 @@ impl Default for NativeCatalogLimits {
     }
 }
 
+impl NativeCatalogLimits {
+    /// Return the fixed limits used for Quirl's checked-in embedded catalog.
+    ///
+    /// Build tooling and runtime admission must use this same profile so a
+    /// checked artifact cannot pass CI and then exceed the executable's bounds.
+    pub const fn embedded() -> Self {
+        Self {
+            source_bytes_max: 1024 * 1024,
+            database_bytes_max: 2 * 1024 * 1024,
+            command_count_max: 2_048,
+            command_depth_max: 16,
+            flag_count_max: 8_192,
+            argument_count_max: 8_192,
+            values_per_command_max: 256,
+            string_bytes_max: 16 * 1024,
+            semantic_document_count_max: 24_576,
+            query_bytes_max: 4 * 1024,
+            query_results_max: 256,
+        }
+    }
+}
+
 /// Classification of an inert native-catalog diagnostic.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -2664,7 +2686,9 @@ fn native_provenance(catalog: &NativeCatalog) -> ProvenanceInfo {
 }
 
 fn native_command_supports(command: &NativeCommand, platform: NativePlatform) -> bool {
-    command.platforms.contains(&NativePlatform::Any) || command.platforms.contains(&platform)
+    platform == NativePlatform::Any
+        || command.platforms.contains(&NativePlatform::Any)
+        || command.platforms.contains(&platform)
 }
 
 fn native_arguments(command: &NativeCommand, provenance: &ProvenanceInfo) -> Vec<ArgumentSpec> {
@@ -2912,6 +2936,7 @@ fn publish_native_catalog_with_hook(
             "Choose an existing private directory",
         ));
     }
+    validate_parent_permissions(parent, &parent_metadata)?;
     let previous = match fs::symlink_metadata(path) {
         Ok(_) => {
             let bytes = read_admitted_file(path, limits.database_bytes_max)?;
@@ -3040,8 +3065,31 @@ fn read_admitted_file(path: &Path, bytes_max: usize) -> Result<Vec<u8>, NativeCa
     }
     let final_metadata =
         fs::symlink_metadata(path).map_err(|error| io_diagnostic("reinspect", path, error))?;
+    validate_file_metadata(path, &final_metadata, bytes_max)?;
     validate_same_file(path, &path_metadata, &final_metadata)?;
     Ok(bytes)
+}
+
+fn validate_parent_permissions(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), NativeCatalogDiagnostic> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(validation_diagnostic(
+                &path.display().to_string(),
+                None,
+                format!("native catalog parent has unsafe mode {mode:#o}"),
+                "Remove group and other write permissions or choose a private directory",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, metadata);
+    Ok(())
 }
 
 fn validate_file_metadata(
@@ -3098,7 +3146,12 @@ fn validate_same_file(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if expected.dev() != observed.dev() || expected.ino() != observed.ino() {
+        if expected.dev() != observed.dev()
+            || expected.ino() != observed.ino()
+            || expected.len() != observed.len()
+            || expected.mtime() != observed.mtime()
+            || expected.mtime_nsec() != observed.mtime_nsec()
+        {
             return Err(validation_diagnostic(
                 &path.display().to_string(),
                 None,
@@ -3109,8 +3162,10 @@ fn validate_same_file(
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        if expected.len() != observed.len() || expected.file_type() != observed.file_type() {
+        if expected.len() != observed.len()
+            || expected.file_type() != observed.file_type()
+            || expected.modified().ok() != observed.modified().ok()
+        {
             return Err(validation_diagnostic(
                 &path.display().to_string(),
                 None,
@@ -3289,6 +3344,24 @@ catalog "native-tools" {
     }
 
     #[test]
+    fn embedded_profile_rejects_one_command_beyond_its_runtime_boundary() {
+        let mut catalog = fixture();
+        let template = catalog.commands[1].clone();
+        catalog.commands = (0..=NativeCatalogLimits::embedded().command_count_max)
+            .map(|index| {
+                let mut command = template.clone();
+                command.name = format!("command-{index}");
+                command
+            })
+            .collect();
+        let error = compile_native_catalog(&catalog, NativeCatalogLimits::embedded()).unwrap_err();
+        assert_eq!(error.kind, NativeDiagnosticKind::ResourceLimit);
+        assert!(error.message.contains("command count"));
+        assert_eq!(error.context[0], "limit: 2048");
+        assert_eq!(error.context[1], "observed: 2049");
+    }
+
+    #[test]
     fn compiler_bytes_and_normalized_rows_are_deterministic() {
         let catalog = fixture();
         let limits = NativeCatalogLimits::default();
@@ -3378,6 +3451,18 @@ catalog "native-tools" {
         assert_eq!(
             arguments[0].action,
             Some(NativeCompletionAction::Directories)
+        );
+
+        let all_platforms = reader.project_commands(NativePlatform::Any);
+        assert!(
+            all_platforms
+                .iter()
+                .any(|command| command.path == "git commit")
+        );
+        assert!(
+            all_platforms
+                .iter()
+                .any(|command| command.path == "winutil")
         );
     }
 
@@ -3491,6 +3576,40 @@ catalog "native-tools" {
         assert_eq!(error.kind, NativeDiagnosticKind::ResourceLimit);
         assert_eq!(fs::read(&path).unwrap(), original_bytes);
         assert_eq!(fs::read_dir(&directory.path).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_rejects_a_shared_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("unsafe-parent");
+        fs::set_permissions(&directory.path, fs::Permissions::from_mode(0o777)).unwrap();
+        let path = directory.path.join("catalog.sqlite3");
+        let error =
+            publish_native_catalog(&path, &fixture(), NativeCatalogLimits::default()).unwrap_err();
+        assert_eq!(error.kind, NativeDiagnosticKind::Validation);
+        assert!(error.message.contains("unsafe mode"));
+        assert!(fs::read_dir(&directory.path).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_identity_detects_in_place_metadata_changes_and_hard_links() {
+        let directory = TestDirectory::new("metadata-change");
+        let path = directory.path.join("catalog.sqlite3");
+        fs::write(&path, b"before").unwrap();
+        let before = fs::metadata(&path).unwrap();
+        fs::write(&path, b"after-change").unwrap();
+        let after = fs::metadata(&path).unwrap();
+        let error = validate_same_file(&path, &before, &after).unwrap_err();
+        assert!(error.message.contains("changed while it was being read"));
+
+        let alias = directory.path.join("alias.sqlite3");
+        fs::hard_link(&path, &alias).unwrap();
+        let linked = fs::metadata(&path).unwrap();
+        let error = validate_file_metadata(&path, &linked, 1024).unwrap_err();
+        assert!(error.message.contains("hard links"));
     }
 
     struct TestDirectory {

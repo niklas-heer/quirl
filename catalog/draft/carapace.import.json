@@ -2,6 +2,8 @@
   "source_url": "https://github.com/carapace-sh/carapace-bin",
   "revision": "ebfb9beda84fdf057dc9a89b59527158d23d323c",
   "license": "MIT",
+  "license_file": "LICENSE",
+  "license_sha256": "25dbdc5c4265ee2983e2b2cd0b5073df0a24aecc0de14a49d01ec9c702f7f22c",
   "source_files": [
     "completers/common/fd_completer/cmd/root.go"
   ],
@@ -10,5 +12,14 @@
   ],
   "command_count": 1,
   "flag_count": 53,
+  "omitted_constructs": [
+    "completers/common/fd_completer/cmd/root.go:rootCmd: PositionalAnyCompletion omitted because upstream does not declare the names and documentation required by the native argument schema",
+    "rootCmd: completion action for color omitted because it is outside the closed native action set",
+    "rootCmd: completion action for hyperlink omitted because it is outside the closed native action set",
+    "rootCmd: completion action for owner omitted because it is outside the closed native action set",
+    "rootCmd: completion action for path-separator omitted because it is outside the closed native action set",
+    "rootCmd: completion action for strip-cwd-prefix omitted because it is outside the closed native action set",
+    "rootCmd: completion action for type omitted because it is outside the closed native action set"
+  ],
   "semantic_diff": []
 }
