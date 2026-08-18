@@ -57,7 +57,10 @@ pub(crate) fn embedded_root_command_names() -> Result<BTreeSet<String>, ShellErr
 
 /// Return the build-generated identity of the embedded native database.
 pub(crate) fn embedded_database_identity() -> &'static str {
-    EMBEDDED_NATIVE_CHECKSUM.trim()
+    EMBEDDED_NATIVE_CHECKSUM
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or(EMBEDDED_NATIVE_CHECKSUM.trim())
 }
 
 fn merge_loaded(catalog: &mut Catalog, loaded: Result<Vec<CommandSpec>, ShellError>) {
