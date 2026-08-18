@@ -234,3 +234,13 @@ golden inventory.
 - ADRs 0006, 0008, and 0010 remain authoritative for lifecycle behavior,
   protocol policy not amended here, and platform support scope. Where their
   layering wording conflicts with this decision, this ADR controls.
+
+## Later reconciliation
+
+[ADR 0024](/docs/architecture/decisions/0024-kdl-native-command-catalog) keeps the accepted Quirl crate
+graph unchanged while allowing the foundation `quirl-catalog` crate to own a
+strict KDL parser and deterministic SQLite **artifact format** for curated
+external native specifications. It adds no Quirl dependency edge and does not
+give the foundation layer user-cache, discovery-worker, network, or composition
+ownership. Native-catalog parse diagnostics follow this ADR's inert foundation
+diagnostic exception; effect-owning consumers map them to `ShellError`.

@@ -60,6 +60,8 @@ const documents = [
   ['docs/decisions/0016-runtime-layering-contract.md', 'architecture/decisions/0016-runtime-layering-contract.mdx'],
   ['docs/decisions/0017-shared-execution-contract.md', 'architecture/decisions/0017-shared-execution-contract.mdx'],
   ['docs/decisions/0018-typed-lua-runner-abi.md', 'architecture/decisions/0018-typed-lua-runner-abi.mdx'],
+  ['docs/decisions/0021-sqlite-local-command-intelligence.md', 'architecture/decisions/0021-sqlite-local-command-intelligence.mdx'],
+  ['docs/decisions/0024-kdl-native-command-catalog.md', 'architecture/decisions/0024-kdl-native-command-catalog.mdx'],
 ];
 
 const pageBySource = new Map(documents);

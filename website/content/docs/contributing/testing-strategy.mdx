@@ -22,7 +22,7 @@ cases against each available reference shell, and runs guest-side Lua tests.
 | Layer | What it proves | Typical evidence |
 | --- | --- | --- |
 | Unit and model | Parsers, migrations, ranking, state transitions, and renderers satisfy local invariants | In-crate behavior tests |
-| Contract and golden | Serialized protocols, schemas, catalogs, and generated SDKs do not drift silently | Exact JSON/SDK fixtures and hashes |
+| Contract and golden | Serialized protocols, schemas, catalogs, and generated SDKs do not drift silently | Exact JSON/SDK/KDL fixtures, deterministic SQLite images, and hashes |
 | Seeded differential | Supported native command composition agrees with clean Bash and Zsh behavior across generated combinations | Seed, case index, source, status, stdout, stderr |
 | Seeded lifecycle simulation | Process-group state remains safe under reordered/stale events and converges after faults freeze | Seed, case index, step, child, transition, bounded convergence steps |
 | Adversarial and fault | Limits, cancellation, symlink checks, recovery, plugin integrity, and terminal escaping fail closed | Tests that cross every declared boundary |
@@ -31,6 +31,46 @@ cases against each available reference shell, and runs guest-side Lua tests.
 | Guest runtime | Lua code sees the documented sandbox and API rather than Rust-only test shortcuts | `examples/lua_tests.lua` |
 | Website release gate | Mirrors and release-evidence attribution match canonical sources, and the documentation site lints, type-checks, and builds | `npm --prefix website run check` / `cargo xtask website-check` |
 | Release evidence | Startup, repaint latency, retention, binary size, digest, and source identity meet budgets | `cargo xtask release-preview` and `release-gate` |
+
+## Native command catalog evidence
+
+The curated external native catalog has a source/artifact boundary distinct
+from `Catalog::builtin()` and the mutable CLI intelligence cache. Its tests must
+prove all of the following:
+
+- valid strict KDL produces the expected typed command tree, while malformed
+  KDL retains source identity, UTF-8 byte spans, and actionable help;
+- unknown nodes/properties, duplicate properties and identifiers, extra
+  positional values, typed KDL annotations, invalid platforms/actions, and
+  impossible flag or argument combinations fail closed;
+- source bytes, string bytes, total commands/flags/arguments/documents,
+  per-command values, root-inclusive depth, database bytes, query bytes,
+  documents scanned, and result counts trip at the declared boundary and report
+  configured plus observed usage;
+- compiling the same typed tree twice yields byte-identical `QCNC` SQLite, and
+  reader admission rejects wrong identity, corrupt integrity, unknown snapshot
+  fields, or any normalized-row change relative to the exact snapshot;
+- command/alias, flag, argument, platform, and semantic projections have stable
+  ordering; child platforms narrow rather than widen parent support; lexical
+  ranking is platform-filtered and deterministic; and no completion action runs
+  during compilation or lookup;
+- publication fault injection after staging creation, write, content sync,
+  staged reread, destination recheck, and before rename preserves the previous
+  admitted image and removes the current staging file; contention and unsafe
+  file shapes fail without partial publication; and
+- a pinned Carapace import is bounded and writes only a review draft. Tests must
+  show that dirty pinned files, duplicate facts, cross-command action leakage,
+  and invented positional metadata fail or become explicit omissions; a
+  partial/invalid import cannot change curated KDL; formatting is
+  byte-idempotent; unchanged canonical KDL preserves the database checksum; and
+  no runtime test requires Carapace or network access.
+
+CI should run the implemented format-check, strict-check, and build operations,
+compile twice, compare exact bytes, reopen through the hardened reader, and
+publish the database checksum with the source revision. The tooling command
+names and corpus paths are deliberately deferred to the integration change;
+tests and docs must use the four operation roles from
+[the catalog contract](/docs/reference/catalog-schema) until then.
 
 ## Reproducing generated failures
 

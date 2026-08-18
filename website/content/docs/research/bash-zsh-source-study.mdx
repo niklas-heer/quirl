@@ -279,11 +279,14 @@ usage, and generation directives in one source. For an example, see
 This prevents some documentation drift, although the C implementation and
 generated outputs remain tightly coupled.
 
-Quirl's `Catalog::builtin()` is already the source for help, completion, docs,
-and AI discovery, while Clap owns executable argument parsing. The existing
-catalog/Clap parity tests are the correct near-term control. Avoid a code
-generator until maintaining those two declarations becomes a demonstrated
-cost.
+Quirl's `Catalog::builtin()` remains the source for its own help, completion,
+docs, and AI discovery, while Clap owns executable argument parsing. The
+existing catalog/Clap parity tests are the correct control for Quirl builtins.
+Strict KDL and its deterministic SQLite compiler cover a different domain:
+curated metadata for external native executables. They do not generate or
+replace Quirl's builtin declarations. Carapace may propose review-only KDL
+drafts from a pinned revision, but it is never a runtime provider or schema
+intermediary.
 
 Bash loadable builtins and Zsh modules can add executable behavior directly to
 the shell process. Zsh modules may contribute builtins, conditions, parameters,

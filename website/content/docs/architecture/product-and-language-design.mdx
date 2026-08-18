@@ -36,7 +36,10 @@ that a release artifact has been measured or published:
   plugins.
 - The semantic catalog, LSP, rich/simple terminal surfaces, process lifecycle,
   recovery, and their bounded tests are present. `Catalog::builtin()` is the
-  complete builtin-command contract; this document does not duplicate it.
+  complete Quirl builtin-command contract. Strict KDL is the human-authored
+  contract for curated external native specifications and compiles to a
+  separate immutable SQLite artifact; neither replaces the CLI-owned mutable
+  intelligence cache.
 
 The current release remains **unreleased 0.1**. In this document, “1.0” is
 either a historical/accepted scope label from an ADR or a long-term direction;
@@ -151,7 +154,10 @@ surface remain owned by the later typed evaluator work.
 
 Quirl builds a versioned semantic catalog of commands, subcommands, arguments, types, examples, effects, and documentation. Completion, highlighting, hover, validation, generated docs, AI discovery, and plugins all consume that catalog.
 
-**Command intelligence path:** discover interfaces → ingest schemas → normalize `CommandSpec` → index a versioned cache → serve every consumer (prompt, docs, LSP, AI, plugins).
+**Command intelligence path:** declare Quirl builtins in `Catalog::builtin()` +
+compile curated external KDL + discover attributable local facts → normalize
+`CommandSpec` → index the versioned CLI cache → serve every consumer (prompt,
+docs, LSP, AI, plugins).
 
 ```text
 type CommandSpec = {
@@ -183,7 +189,8 @@ Quirl imports existing definitions at index time and records source and confiden
 
 | Source | Ingestion strategy | Trust and fallback |
 | --- | --- | --- |
-| Native Quirl commands | Rust attributes, doc comments, types, generated `CommandSpec` | Exact and compile-time checked |
+| Quirl builtin commands | `Catalog::builtin()` plus executable CLI parity tests | Exact and compile-time checked |
+| Curated external native commands | Strict attributed KDL compiled to deterministic `QCNC` SQLite | Human-reviewed; platform-filtered; no runtime Carapace dependency |
 | Lua script commands | Generated SDK annotations, docstrings, argument descriptors, exports, package manifest | Host schema is exact and module-versioned |
 | Zsh completions | Translate common `_arguments`, `_describe`, and `_values` forms in an isolated Zsh worker | Cache translation; bounded worker fallback for dynamic providers |
 | Bash completions | Read `complete -p`; instrument common helpers and capture candidate metadata | Never implicitly source user RC files; sandbox dynamic functions |
@@ -204,7 +211,13 @@ quirl describe cargo.test --format markdown
 
 ### Documentation that cannot drift
 
-In Rust, source prose is written as doc comments such as `///`; attributes and derive/procedural macros attach machine-readable command metadata. The build emits one catalog into the binary. Script docstrings and checked signatures emit the same schema.
+Rust `///` comments document Rust APIs but do not provide runtime reflection.
+Quirl builtin command prose and machine-readable facts therefore live in
+`Catalog::builtin()`, checked against the executable CLI. Curated external
+native prose lives only in strict attributed KDL and compiles deterministically
+to SQLite; generated rows and Carapace drafts are not authoring sources. Script
+docstrings and validated declarations project into the composed catalog with
+their own provenance.
 
 ```rust
 #[quirl::command(
@@ -249,7 +262,12 @@ quirl serve mcp --capabilities catalog,complete,check,format
 - **Discovery:** manifests contain only installed commands and plugins, with schema hashes and versions; agents can request the smallest relevant subtree.
 - **Validation:** `check` parses, resolves, lints, validates annotations, modules, capabilities, and known host schemas without executing Lua. JSON diagnostics include codes, spans, fixes, effects, and documentation links, without claiming sound static typing for arbitrary Lua.
 - **Safety:** catalog discovery does not grant authority. Agent execution uses the same permission, preview, confirmation, and audit path as human commands.
-- **Freshness:** catalog generation belongs to compilation and package validation. Public commands without summaries, argument docs, types, examples, effects, or error codes fail the project’s quality gate.
+- **Freshness:** Quirl builtin and package catalog generation belongs to
+  compilation and package validation. Exact public `CommandSpec` records
+  without summaries, argument docs, types, examples, effects, or error codes
+  fail the quality gate. Curated external KDL has its own strict narrower schema,
+  deterministic artifact checksum, provenance/license review, and runtime
+  fallback contract; it does not invent missing exact facts.
 
 ### The complete authoring toolchain ships with the shell
 
@@ -940,7 +958,10 @@ On 15 August 2026, the following decisions were reviewed and agreed:
 - **Result-based errors outside command mode:** retain traditional status interactively; require explicit failure handling in data pipelines and scripts.
 - **Lua 5.4 as the extension language:** Rust implements the product; one pinned Lua runtime and generated `quirl` SDK serve config, scripts, trusted plugins; annotations improve tooling while Rust schemas enforce boundaries.
 - **Batteries-included scope:** ship coherent navigation, discovery, data, views, developer context, operations.
-- **One semantic command catalog:** completion, highlighting, docs, validation, AI discovery, plugins consume one versioned `CommandSpec` graph.
+- **One composed semantic command catalog:** completion, highlighting, docs,
+  validation, AI discovery, and plugins consume one versioned `CommandSpec`
+  graph. `Catalog::builtin()`, curated external KDL, and local discovery remain
+  distinct truth/admission paths before composition.
 - **Zero-setup local command intelligence:** first paint precedes bounded background model installation, full catalog discovery (including non-executing PATH-gated system man-page semantics), and SQLite embedding even while the shell remains idle; the bottom status row reports cached activity, failures retain lexical search, and refreshed catalogs re-index automatically.
 - **Self-describing AI interface:** export installed capabilities as token-budgeted Markdown or canonical JSON with check/format/lint and optional MCP access.
 - **Lua plugin platform plus Wasm isolation:** trusted Lua gets generated SDK metadata and explicit capabilities; untrusted/portable plugins use the same capability model through WebAssembly components.

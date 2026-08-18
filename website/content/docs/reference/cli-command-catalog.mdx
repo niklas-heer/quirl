@@ -33,6 +33,62 @@ Options:
 
 - `path` — Positional `path` declared by the builtin command signature.
 
+## `docker [--config <Directory>] [--context <context>] [--debug]`
+
+A self-sufficient runtime for containers
+
+Manage containers, images, networks, and composed applications.
+
+Related intents: manage containers; run a composed application.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--config` — Location of client config files Select the client configuration directory.
+- `-D`, `--debug` — Enable debug mode Enable debug output.
+- `-c`, `--context` — Name of the context to use Select the Docker context used to connect to the daemon.
+
+## `docker compose [--file <Path>...]`
+
+Define and run multi-container applications
+
+Build and operate applications declared in Compose files.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-f`, `--file` — Compose configuration file Select a Compose configuration file.
+
+## `docker compose alpha`
+
+Experimental Compose commands
+
+Use experimental Compose operations whose interface may change.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+## `docker compose alpha dry-run <command>...`
+
+Execute a command in dry-run mode
+
+Show the actions a Compose operation would perform without applying them.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `command` — Compose command Command and arguments to evaluate without applying changes.
+
 ## `export NAME=value...`
 
 Set environment variables for later commands
@@ -57,6 +113,24 @@ Options:
 
 - `%job` — Positional `%job` declared by the builtin command signature.
 
+## `git [--git-dir <Directory>] [--help] [--work-tree <Directory>]`
+
+The stupid content tracker
+
+Inspect and update distributed version-control repositories.
+
+Related intents: manage source history; work with remotes.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--git-dir` — Path to repository Set the path to the repository metadata directory.
+- `--work-tree` — Path to working tree Set the path to the working tree.
+- `-h`, `--help` — Display help message Display command help.
+
 ## `git commit [options]`
 
 Record changes to the repository
@@ -73,6 +147,56 @@ Options:
 - `--amend` — Replace the tip of the current branch
 - `--no-verify` — Bypass pre-commit and commit-msg hooks
 - `-a`, `--all` — Stage modified and deleted tracked files
+
+## `git remote [--verbose]`
+
+Manage set of tracked repositories
+
+Manage names and URLs for tracked repositories.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-v`, `--verbose` — Be verbose Show remote URLs with the listing.
+
+## `git remote add [--fetch] [--master <branch>] [--track <branch>...] <name> <repository>`
+
+Add a remote
+
+Add a named remote repository.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-f`, `--fetch` — Fetch remote branches Fetch remote branches after adding the remote.
+- `-m`, `--master` — Master branch Set the remote HEAD branch.
+- `-t`, `--track` — Branches to track Select branches to track.
+- `name` — Remote name Name assigned to the remote.
+- `repository` — Repository URL Repository location to add.
+
+## `git remote set-url [--add] [--delete] [--push] <name> <url>`
+
+Change URLs for a remote
+
+Set the fetch or push URL associated with a remote.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--add` — Add another URL Add a URL instead of replacing the existing one.
+- `--delete` — Delete matching URLs Delete remote URLs matching the supplied expression.
+- `--push` — Manipulate push URLs Operate on push URLs rather than fetch URLs.
+- `name` — Remote name Remote whose URL is changed.
+- `url` — Remote URL New or matching repository URL.
 
 ## `git status [--short]`
 
@@ -139,6 +263,23 @@ Normal mode carries bytes and process status. Data mode evaluates Quirl's native
 Options:
 
 - `normal|data|ai|toggle` — Positional `normal|data|ai|toggle` declared by the builtin command signature.
+
+## `open [--application <application>] <paths>...`
+
+Open files and directories
+
+Open a filesystem item with its associated macOS application.
+
+Related intents: open a file on macos.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-a`, `--application` — Application to use Open the item with the named application.
+- `paths` — Items to open Files or directories opened by Launch Services.
 
 ## `quirl agent catalog [--format text|json]`
 

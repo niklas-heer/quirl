@@ -54,3 +54,12 @@ and completion-source relations are validated before exact metadata passes.
   explicit compatibility migration.
 - Default values, deprecation, platform constraints, and executable dynamic
   providers remain future schema work rather than inferred facts.
+
+## Later reconciliation
+
+[ADR 0024](/docs/architecture/decisions/0024-kdl-native-command-catalog) adds strict KDL as the sole
+human-authored source for curated **external native command** specifications and
+compiles those facts to an immutable SQLite artifact. It does not replace the
+schema-v4 `CommandSpec` graph, `Catalog::builtin()` as the Quirl builtin source,
+or this ADR's provenance and merge rules; admitted curated facts are another
+attributed input to that composed graph.
