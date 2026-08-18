@@ -1,0 +1,76 @@
+catalog "native-tools" {
+    provenance author="Carapace contributors; curated by Quirl contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "docker" summary="A self-sufficient runtime for containers" description="Manage containers, images, networks, and composed applications." {
+        intent "manage containers"
+        intent "run a composed application"
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        flag "--config" summary="Location of client config files" description="Select the client configuration directory." value="directory" action="directories"
+        flag "--context" summary="Name of the context to use" description="Select the Docker context used to connect to the daemon." short="-c" value="context"
+        flag "--debug" summary="Enable debug mode" description="Enable debug output." short="-D"
+        command "compose" summary="Define and run multi-container applications" description="Build and operate applications declared in Compose files." {
+            platform "linux"
+            platform "macos"
+            platform "windows"
+            flag "--file" summary="Compose configuration file" description="Select a Compose configuration file." short="-f" value="file" repeatable=#true action="files"
+            command "alpha" summary="Experimental Compose commands" description="Use experimental Compose operations whose interface may change." {
+                platform "linux"
+                platform "macos"
+                platform "windows"
+                command "dry-run" summary="Execute a command in dry-run mode" description="Show the actions a Compose operation would perform without applying them." {
+                    platform "linux"
+                    platform "macos"
+                    platform "windows"
+                    argument "command" summary="Compose command" description="Command and arguments to evaluate without applying changes." required=#true repeatable=#true
+                }
+            }
+        }
+    }
+    command "git" summary="The stupid content tracker" description="Inspect and update distributed version-control repositories." {
+        alias "g"
+        intent "manage source history"
+        intent "work with remotes"
+        platform "any"
+        flag "--git-dir" summary="Path to repository" description="Set the path to the repository metadata directory." value="directory" action="directories"
+        flag "--help" summary="Display help message" description="Display command help." short="-h"
+        flag "--work-tree" summary="Path to working tree" description="Set the path to the working tree." value="directory" action="directories"
+        command "remote" summary="Manage set of tracked repositories" description="Manage names and URLs for tracked repositories." {
+            platform "any"
+            flag "--verbose" summary="Be verbose" description="Show remote URLs with the listing." short="-v"
+            command "add" summary="Add a remote" description="Add a named remote repository." {
+                platform "any"
+                flag "--fetch" summary="Fetch remote branches" description="Fetch remote branches after adding the remote." short="-f"
+                flag "--master" summary="Master branch" description="Set the remote HEAD branch." short="-m" value="branch"
+                flag "--track" summary="Branches to track" description="Select branches to track." short="-t" value="branch" repeatable=#true
+                argument "name" summary="Remote name" description="Name assigned to the remote." required=#true
+                argument "repository" summary="Repository URL" description="Repository location to add." required=#true
+            }
+            command "set-url" summary="Change URLs for a remote" description="Set the fetch or push URL associated with a remote." {
+                platform "any"
+                flag "--add" summary="Add another URL" description="Add a URL instead of replacing the existing one."
+                flag "--delete" summary="Delete matching URLs" description="Delete remote URLs matching the supplied expression."
+                flag "--push" summary="Manipulate push URLs" description="Operate on push URLs rather than fetch URLs."
+                argument "name" summary="Remote name" description="Remote whose URL is changed." required=#true
+                argument "url" summary="Remote URL" description="New or matching repository URL." required=#true
+            }
+        }
+    }
+    command "open" summary="Open files and directories" description="Open a filesystem item with its associated macOS application." {
+        intent "open a file on macos"
+        platform "macos"
+        flag "--application" summary="Application to use" description="Open the item with the named application." short="-a" value="application"
+        argument "paths" summary="Items to open" description="Files or directories opened by Launch Services." required=#true repeatable=#true action="files"
+    }
+    command "where" summary="Locate executable files" description="Display executable paths found through the Windows search path." {
+        intent "find a windows executable"
+        platform "windows"
+        flag "--recursive" summary="Search recursively" description="Search recursively below the selected directory." short="-r"
+        argument "pattern" summary="Executable pattern" description="Name or wildcard pattern to locate." required=#true repeatable=#true action="executables"
+    }
+    command "xdg-open" summary="Open a file or URL" description="Open a filesystem item or URL with the preferred Linux application." {
+        intent "open a file on linux"
+        platform "linux"
+        argument "target" summary="Item to open" description="File, directory, or URL passed to the desktop opener." required=#true action="files"
+    }
+}

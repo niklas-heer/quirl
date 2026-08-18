@@ -3475,8 +3475,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "nix 0.30.1",
+ "quirl-catalog",
  "serde",
  "serde_json",
+ "sha2",
  "unicode-width 0.2.2",
  "xshell",
 ]

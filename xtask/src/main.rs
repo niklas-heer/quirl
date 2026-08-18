@@ -1,6 +1,7 @@
 //! Reproducible development, documentation, test, and release tasks for Quirl.
 
 use clap::{Parser, Subcommand};
+mod catalog;
 #[cfg(unix)]
 mod pty;
 #[cfg(unix)]
@@ -33,6 +34,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Task {
+    /// Import, format, validate, and compile the build-time native command catalog.
+    Catalog {
+        #[command(subcommand)]
+        command: catalog::CatalogCommand,
+    },
     /// Format every crate in the workspace.
     Fmt,
     /// Run Clippy for every workspace target with warnings denied.
@@ -120,6 +126,7 @@ fn main() {
 fn execute(cli: Cli) -> Result<(), Box<dyn Error>> {
     let root = workspace_root()?;
     match cli.task {
+        Task::Catalog { command } => catalog::run(&root, command),
         Task::Fmt => task_fmt(&root),
         Task::Lint => task_lint(&root),
         Task::Test { seed, cases } => task_test(&root, seed, cases),
@@ -198,6 +205,7 @@ fn task_check(root: &Path, seed: u64, cases: usize) -> Result<(), Box<dyn Error>
     let sh = workspace_shell(root)?;
     cmd!(sh, "cargo fmt --all -- --check").run()?;
     cmd!(sh, "cargo run --quiet -p quirl-cli -- fmt examples --check").run()?;
+    catalog::run(root, catalog::CatalogCommand::Check)?;
     task_lint(root)?;
     task_docs(root)?;
     task_test(root, seed, cases)
