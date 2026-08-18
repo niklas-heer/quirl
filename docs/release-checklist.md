@@ -43,6 +43,14 @@ evidence, not a human signoff.
 - [ ] `Cargo.lock`, `rust-toolchain.toml`, the release profile, version strings,
   generated SDK, protocol manifest, and user-facing status text describe the
   candidate being shipped.
+- [ ] Curated external native command KDL has completed provenance, immutable
+  revision, semantic, and license review. No Carapace draft or floating upstream
+  reference is in the release source set; the importer pin identifies one
+  reviewed immutable revision.
+- [ ] The compiled native catalog is `QCNC` schema version 1, names the intended
+  platform facts, and has a recorded byte length and cryptographic checksum for
+  this exact candidate. This artifact is distinct from the mutable local
+  intelligence cache and from `Catalog::builtin()` metadata.
 - [ ] The reviewed config descriptor is schema v3, its golden fingerprint
   matches the candidate, and v0/v1/v2-to-v3 migration tests pass.
 - [ ] The supported compatibility boundary is unchanged: C0/C1-core is native
@@ -66,6 +74,16 @@ git log -1 --format='%h %s'
 
 - [ ] `cargo xtask check` passes with the pinned Rust 1.97.1 toolchain.
 - [ ] The generated Lua SDK has no diff after `cargo xtask sdk`.
+- [ ] The implemented native-catalog format-check, strict-check, and build
+  operations pass; a second build is byte-identical, and the published image
+  reopens through the hardened reader. Use the task runner's implemented
+  spelling for those operation roles; do not substitute the unimplemented
+  placeholders from the schema document.
+- [ ] Catalog tests cover schema rejection, all declared byte/count/depth/query
+  bounds, platform filtering, semantic ordering, snapshot/projection tampering,
+  and atomic-publication cleanup. Runtime tests pass without Carapace or network
+  access and preserve builtin/local-discovery fallback when the native artifact
+  is unavailable.
 - [ ] Website dependencies were installed with `npm ci --prefix website` and
   `cargo xtask website-check` passes. This non-mutating gate checks generated
   mirror/reference freshness, semantic release-evidence attribution, lint,
@@ -242,6 +260,10 @@ Before publishing the capture:
   and embedded source identity. If A changed, stop and choose a new candidate.
 - [ ] Do not rebuild after measuring. The distributable, terminal recording,
   checksums, and version tag all identify the already-gated A artifact.
+- [ ] Publish the exact CI-built native SQLite image and its checksum with the
+  source revision, `QCNC` schema version, and byte length. Verify the packaged
+  image matches those bytes; do not regenerate it during packaging or replace
+  it with a draft/import output.
 - [ ] Draft release notes with supported platforms, native compatibility scope,
   reference-shell behavior, known residual risks, and upgrade/migration notes.
   For 0.1, note that config schema v3 adds shared semantic themes on top of the
@@ -257,6 +279,10 @@ Before publishing the capture:
 - [ ] Publish the measured artifacts and checksums, then verify a clean install
   starts and reports A's expected version and source identity. Attach evidence
   produced after A as release assets or link it from B without rebuilding A.
+- [ ] On each supported platform, verify admitted curated native facts are
+  platform-filtered and that a missing, corrupt, incompatible, unsafe, or
+  wrong-platform native database falls back to Quirl builtins and bounded local
+  discovery without invoking Carapace or delaying terminal startup/shutdown.
 - [ ] Keep the tag and release immutable. Corrections use a new version rather
   than replacing a measured artifact in place.
 

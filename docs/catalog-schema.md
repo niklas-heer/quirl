@@ -1,116 +1,477 @@
-# Semantic command catalog schema v4
+# Command catalog contracts
 
-Quirl's runtime command contract is one deny-unknown, versioned catalog. Its
-durable representation is a normalized SQLite database; the database also
-retains an exact JSON snapshot so existing catalog consumers deserialize the
-same `CommandSpec` values rather than reconstructing them from SQL rows.
-Completion, generated documentation, the language service, agent context, and
-plugin contributions consume the same `CommandSpec` records from
-`quirl-catalog`; none of those projections maintains a parallel command list.
+Quirl has one composed command-intelligence graph but more than one source and
+storage lifecycle. Keeping those roles distinct prevents a generated artifact
+or an imported external fact from replacing an executable interface contract.
 
-## Command records
+| Knowledge | Human-authored truth | Runtime representation | Owner |
+| --- | --- | --- | --- |
+| Quirl builtin commands | `Catalog::builtin()` | schema-v4 `CommandSpec` records | `quirl-catalog` plus CLI parity checks |
+| Lua host capabilities | `HOST_API` | generated SDK and capability projections | `quirl-lua` |
+| Curated external native commands | strict KDL described below | deterministic, immutable `QCNC` SQLite | `quirl-catalog` |
+| Host discovery and composed intelligence | admitted builtin, plugin, curated, and locally observed facts | mutable CLI-owned catalog SQLite and embeddings | `quirl-cli` |
 
-Schema v4 gives every command a stable `id`, optional declaring `version`,
-display `path`, aliases, and an optional stable parent id. `signature`,
-`summary`, `details`, and examples describe the interface. `io` records typed
-input, output, and streaming behavior. Effects and an integer exit-code map
-make execution consequences and failures machine-readable.
+The native KDL database is not the CLI intelligence cache. It is a build
+artifact that contributes external command facts to composition. The CLI cache
+continues to hold the exact composed schema-v4 snapshot, normalized query rows,
+discovery state, and optional embeddings described by
+[ADR 0021](decisions/0021-sqlite-local-command-intelligence.md). Legacy catalog
+JSON v2/v3 exists only as a read-only migration input for that cache. KDL does
+not replace `Catalog::builtin()`, and neither SQLite database is human-authored.
 
-The JSON field is named `arguments`. Each argument records names, its
-`positional`, `option`, or `flag` kind, value type, required/repeatable state,
-an optional static or dynamic completion source, conflicts, documentation,
-examples, and fact-level provenance.
+The accepted trust and ownership decision is
+[ADR 0024](decisions/0024-kdl-native-command-catalog.md).
+
+## Strict KDL native command schema
+
+One UTF-8 document contains exactly one `catalog` root, exactly one
+`provenance` child, and at least one root `command`. The following is a schema
+example, not a claim that a particular executable ships in the curated corpus:
+
+```kdl
+catalog "native-tools" {
+    provenance author="Example project" license="MIT" revision="v1.2.3" source="https://example.invalid/native-tools"
+
+    command "copy" summary="Copy paths" description="Copy a source path to a destination path." {
+        alias "cp"
+        intent "duplicate a file"
+        platform "linux"
+        platform "macos"
+        flag "--recursive" short="-r" summary="Copy recursively" description="Descend into source directories."
+        flag "--target" value="directory" summary="Select a target" description="Place copied paths in this directory." action="directories"
+        argument "source" summary="Source path" description="Read data from this path." required=#true action="files"
+        argument "destination" summary="Destination path" description="Write data to this path." action="files"
+
+        command "status" summary="Show copy status" description="Report the current bounded copy state." {
+            intent "inspect copy progress"
+        }
+    }
+}
+```
+
+KDL node and value type annotations are not part of the schema. Strings must be
+quoted KDL strings; booleans use `#true` or `#false`. Every retained string must
+be nonempty after trimming, contain no control character, and fit the configured
+UTF-8 byte limit.
+
+### Catalog and provenance
+
+`catalog` takes one positional string and no properties. Its value is a stable
+catalog identifier made from lowercase ASCII letters, digits, hyphens, and
+underscores; its first byte must be a lowercase letter or digit. It requires a
+child block.
+
+`provenance` takes no positional values or child block and requires exactly
+these four string properties:
+
+| Property | Contract |
+| --- | --- |
+| `author` | Person, project, or organization responsible for the source facts. |
+| `license` | SPDX expression or explicit license name applying to the facts; admission still requires human license review. |
+| `revision` | Immutable upstream release, revision, or content identity used for semantic review. |
+| `source` | Absolute `https://` or `http://` URL without whitespace identifying the authoritative source material. |
+
+The compiler stores these fields in the exact typed snapshot and the normalized
+provenance table. Provenance is attribution, not executable authority and not a
+substitute for required license notices.
+
+### Commands, subcommands, and aliases
+
+Every `command` takes one positional `name`, required `summary` and
+`description` string properties, and an optional child block. A nested
+`command` is a subcommand; full paths are formed by joining canonical ancestor
+names with one ASCII space.
+
+Command names and aliases use the catalog identifier grammar: lowercase ASCII
+letters, digits, hyphens, or underscores, beginning with a lowercase letter or
+digit. An `alias` takes exactly one such string and has no properties or child
+block. Names and aliases must be unique across one sibling scope: an alias may
+not collide with its command's canonical sibling name, another alias, or a
+different sibling command. Normalized full command paths must also be unique.
+
+Each command may contain only these child nodes:
+
+| Node | Cardinality and meaning |
+| --- | --- |
+| `alias "token"` | Zero or more alternate invocation tokens, unique within the sibling scope. |
+| `intent "phrase"` | Zero or more unique task-language phrases included in semantic search. |
+| `platform "selector"` | Zero or more effective-platform selectors; omission inherits the parent. |
+| `flag "--long" ...` | Zero or more named options, with unique long and short spellings per command. |
+| `argument "name" ...` | Zero or more ordered positional arguments. |
+| `command "name" ...` | Zero or more recursively bounded subcommands. |
+
+`summary` is concise completion- and list-facing text. `description` is the
+longer behavioral contract shown by detailed consumers and included in search.
+Both are required on commands, flags, and arguments. The compiler does not
+derive one from the other and does not interpret markup.
+
+### Flags
+
+A `flag` has exactly one positional canonical long name. A valid long name
+starts with `--`; the remaining nonempty spelling uses lowercase ASCII letters,
+digits, and hyphens and begins with a lowercase letter or digit. Flags have no
+child block.
+
+| Property | Required | Contract |
+| --- | --- | --- |
+| `summary` | yes | Nonempty short description. |
+| `description` | yes | Nonempty behavioral explanation. |
+| `short` | no | `-` followed by exactly one ASCII letter or digit. |
+| `value` | no | Identifier naming the consumed value; absence makes this a boolean flag. |
+| `required` | no | Boolean, default `#false`; whether invocation requires the flag. |
+| `repeatable` | no | Boolean, default `#false`; whether the flag may occur more than once. |
+| `action` | no | Closed native completion action for the consumed value; invalid on a boolean flag. |
+
+Long and short spellings share one uniqueness namespace within a command. The
+schema does not currently express conflicts, static enum values, defaults,
+deprecation, types, or dynamic providers; none may be inferred from upstream
+syntax.
+
+### Positional arguments
+
+An `argument` has exactly one positional identifier, no child block, and the
+following properties:
+
+| Property | Required | Contract |
+| --- | --- | --- |
+| `summary` | yes | Nonempty short description. |
+| `description` | yes | Nonempty behavioral explanation. |
+| `required` | no | Boolean, default `#false`; whether omission is invalid. |
+| `repeatable` | no | Boolean, default `#false`; whether it consumes multiple values. |
+| `action` | no | Closed native completion action for candidate generation. |
+
+Argument identifiers are unique within a command. Their source order is
+semantic and becomes their ordinal. All required arguments must precede every
+optional argument, and a repeatable argument must be last.
+
+### Platforms
+
+The closed platform values are `any`, `linux`, `macos`, `windows`, and
+`freebsd`. `any` must appear alone. A root command with no platform nodes
+inherits `any`. A subcommand with no platform nodes inherits its parent.
+Specific child platforms are intersected with the parent's effective set and
+must leave at least one platform. Declaring `any` on a child means the inherited
+parent set; it does not widen support.
+
+Runtime selection filters commands and their flag, argument, and semantic
+projections by the requested host platform. Asking for platform `any` disables
+host filtering for platform-independent inspection; it does not assert that an
+upstream executable works everywhere.
+
+### Native completion actions
+
+The `action` property accepts exactly:
+
+| Value | Candidate domain |
+| --- | --- |
+| `files` | Regular files and directories. |
+| `directories` | Directories only. |
+| `executables` | Executables visible to the shell. |
+| `users` | Local user names. |
+| `groups` | Local group names. |
+| `hostnames` | Host names from bounded native configuration. |
+| `environment_variables` | Environment-variable names. |
+
+These are declarations, not build-time or query-time callbacks. The catalog
+compiler and reader never execute an action. A runtime consumer must implement
+the selected action under its own cancellation, byte, result, filesystem, and
+latency policy. The action confers no ambient capability.
+
+## Strictness and diagnostics
+
+The parser rejects input rather than ignoring it. Rejection includes:
+
+- more than one top-level node or a root other than `catalog`;
+- missing or duplicate provenance, or a catalog without commands;
+- unknown catalog or command child nodes;
+- unknown or duplicate properties;
+- typed KDL nodes or values, incorrect property types, missing required
+  strings, unexpected positional values, or child blocks on scalar nodes;
+- empty, whitespace-only, control-containing, oversized, or malformed names
+  and strings;
+- duplicate aliases, intents, platforms, flags, arguments, sibling tokens, or
+  normalized paths;
+- `any` combined with another platform, a child platform outside its parent,
+  a completion action on a boolean flag, a required argument after an optional
+  one, or a non-final repeatable argument; and
+- every configured byte, count, depth, database, scan, or query limit crossed.
+
+Diagnostics are inert `quirl-catalog` values. Each has a `syntax`,
+`validation`, `resource_limit`, `io`, or `database` kind; a caller-supplied
+source identity; a message; optional UTF-8 byte offset and length; actionable
+help; and bounded context. Resource diagnostics include the configured limit
+and observed usage when safe. The CLI or another effect owner maps these values
+to `ShellError`; the foundation parser does not perform rendering or I/O merely
+to report source errors.
+
+## Explicit resource bounds
+
+Callers may lower defaults but cannot set zero or exceed the hard maximum. The
+same limit object applies to parse, typed validation, compilation, publication,
+opening, and query operations.
+
+| Resource | Default | Hard maximum | Enforcement |
+| --- | ---: | ---: | --- |
+| KDL source bytes | 1 MiB | 4 MiB | Before KDL parsing. |
+| SQLite database bytes | 128 MiB | 128 MiB | Typed snapshot, serialized image, admitted file, and staged reread. |
+| Commands across the tree | 8,192 | 65,536 | Iterative preflight and typed validation. |
+| Root-inclusive command depth | 16 | 32 | Iterative preflight before bounded recursive construction. |
+| Flags across all commands | 32,768 | 131,072 | During parse and typed validation. |
+| Arguments across all commands | 32,768 | 131,072 | During parse and typed validation. |
+| Aliases, intents, platforms, flags, arguments, or subcommands on one command | 256 each | 1,024 each | Before retaining an unbounded local collection. |
+| Bytes in one string or source identity | 16 KiB | 64 KiB | At admission. |
+| Semantic documents retained or scanned | 65,536 | 196,608 | Build projection and lexical lookup. |
+| Combined bytes in one reader query | 4 KiB | 16 KiB | Before preparing caller-driven work. |
+| Rows returned by one reader query | 256 | 1,024 | Requested limit and collected rows. |
+| Temporary publication names attempted | 64 | 64 | Exclusive staging-file creation. |
+
+SQLite additionally limits one value to at most 4 MiB, SQL text to 64 KiB, 64
+columns, expression depth 32, 16 compound selects, 100,000 virtual-machine
+operations, 32 function arguments, 4 KiB `LIKE` patterns, and 64 bound
+variables. Triggers, attached databases, and SQLite worker threads are disabled.
+
+## Canonical formatting and deterministic compilation
+
+The formatter operation is a source review aid. Its contract is to produce
+stable KDL layout and property ordering without changing values, platform
+meaning, argument order, or provenance. Running it twice must be byte-idempotent.
+Import must never be the only way to format or validate curated source.
+
+The parser canonicalizes meaning before compilation:
+
+- root commands and subcommands sort by canonical name;
+- aliases and intent phrases sort lexically after duplicate checking;
+- flags sort by canonical long name;
+- platforms sort by their closed enum order after inheritance/intersection;
+- positional arguments retain authored order; and
+- flattened commands sort by full canonical path and receive stable one-based
+  identifiers, while flag, argument, and document identifiers follow that
+  stable traversal.
+
+Compilation uses an in-memory database with fixed page size and schema pragmas.
+One transaction writes the exact typed JSON snapshot and all normalized rows;
+no timestamp, random value, absolute build path, locale-dependent comparison,
+filesystem iteration order, or network result enters the image. Compiling the
+same typed catalog twice must yield identical bytes. `application_id` is
+`QCNC` (`0x51434e43`) and `user_version` is `1`.
+
+A reader validates the application identity, schema version, `quick_check(1)`,
+deny-unknown typed snapshot, all semantic limits, and exact deterministic
+recompilation. The last check binds normalized rows and the snapshot: editing a
+row, adding an object, changing ordering, or using a different compiler image
+causes admission to fail.
+
+## Normalized and semantic projections
+
+The database contains normalized tables for the catalog snapshot, provenance,
+commands, aliases, effective platforms, intent phrases, flags, arguments, and
+semantic documents. Commands store canonical full paths and parent identifiers;
+flags and arguments retain summaries, descriptions, cardinality, value names,
+and closed actions.
+
+Every command creates one semantic document whose body concatenates its full
+path, aliases, summary, description, and intents. Every flag document contains
+the command path, long and optional short name, summary, description, and value
+placeholder. Every argument document contains the command path, name, summary,
+and description. This projection is deterministic and carries no embeddings.
+
+Native semantic lookup is bounded deterministic lexical matching: it
+lowercases whitespace-separated query terms, scores one point for each term
+contained in a lowercased document body, discards zero-score documents, then
+orders by descending score and lexical command path, target, and title. The host
+platform filters documents before scoring. ADR 0021's local intelligence cache
+may separately embed composed documents; embeddings are not part of the native
+KDL artifact or its source of truth.
+
+Completion lookup provides prefix-filtered, stable-order projections for root
+or nested command names and aliases, flags, and ordered argument placeholders.
+It returns summaries, descriptions, and actions, never an instruction to
+execute a candidate.
+
+## Publication, artifacts, and cleanup
+
+Publication compiles and validates in memory before creating a staging file.
+The destination parent must already be a directory. Existing destinations must
+be admitted regular, unlinked, bounded, permission-safe databases; on Unix,
+group/other writable modes and link counts other than one are rejected.
+Path/handle identity is checked across reading.
+
+The publisher creates a unique sibling with exclusive creation and Unix mode
+`0600`, writes and content-syncs the complete image, rereads it, and compares
+exact bytes. It then verifies that an old destination is unchanged or that a
+previously absent destination has not appeared. Atomic rename is the publication
+point. An RAII guard removes staging files on every earlier failure or unwind.
+The parent directory is best-effort synced after rename because rolling back a
+visible valid image after a second failure could destroy the only good copy.
+
+CI must format-check and strictly validate KDL, compile twice, compare bytes,
+open the result through the hardened reader, and publish the immutable SQLite
+artifact with a cryptographic checksum bound to the exact source revision.
+Release records name the `QCNC` schema version, artifact byte length, checksum,
+and source revision. Drafts are never release inputs.
+
+## Curated and Carapace-draft workflow
+
+Carapace is only an untrusted, pinned, build-time draft source. It is never a
+runtime dependency or intermediary and cannot directly update curated KDL. A
+pinned revision update is reviewed as a supply-chain change:
+
+1. Change the tooling-owned pin to one immutable upstream revision and verify
+   the fetched/provided source identity.
+2. Run the bounded import operation for explicitly selected commands into a
+   separate draft area.
+3. Run the canonical format operation on the draft, then inspect the complete
+   KDL diff. Do not accept invented or silently dropped facts.
+4. Review command shape, subcommands, aliases, flags, argument ordering,
+   summaries, descriptions, intents, platforms, actions, and upstream version
+   meaning against authoritative documentation or the named executable.
+5. Review `author`, `license`, `revision`, and `source`; preserve any additional
+   notices required by the upstream license.
+6. Copy only approved semantic changes into curated KDL, then run format check,
+   strict schema check, deterministic build, hardened-reader validation, and
+   the catalog tests.
+7. Review the resulting checksum change. Unchanged canonical KDL must not
+   produce a different database.
+
+The tooling dependency lands after the core compiler documented here. To avoid
+inventing commands or repository paths, contributor examples use explicit role
+placeholders until the integration defines its CLI:
+
+```text
+<catalog-tool> <import-operation>   # pinned Carapace input -> review-only draft
+<catalog-tool> <format-operation>   # canonicalize KDL; run twice for idempotence
+<catalog-tool> <check-operation>    # strict schema, bounds, provenance, and drift checks
+<catalog-tool> <build-operation>    # KDL -> deterministic QCNC SQLite + checksum
+```
+
+Contributors should obtain the implemented spelling from the task runner's help
+and replace these four placeholders as one integration documentation change.
+The required order and semantics above are stable even if the eventual command
+names differ.
+
+## Runtime lookup and fallback
+
+The composition root selects curated facts by the reader's effective platform
+projection and then normalizes admitted facts into the composed command
+intelligence graph. Curated external facts do not overwrite exact Quirl builtin
+contracts or trusted plugin declarations merely because names collide; normal
+schema-v4 provenance and deterministic merge policy still apply.
+
+A missing, unsafe, oversized, corrupt, incompatible, projection-mismatched, or
+wrong-platform native database is treated as unavailable optional knowledge.
+Quirl retains `Catalog::builtin()` and the bounded local discovery/intelligence
+cache. It does not parse draft KDL, download a replacement, invoke Carapace, or
+weaken database checks on the interactive path. Failure must not block startup,
+execution, cancellation, terminal restoration, or clean shutdown.
+
+## Composed semantic catalog schema v4
+
+After composition, help, completion, LSP, agent context, plugin contributions,
+and local intelligence continue to consume schema-v4 `CommandSpec` records.
+The graph is deny-unknown and versioned; no completion, documentation, LSP,
+agent, or plugin projection maintains another command list.
+
+### Command records, quality, and migration
+
+Each command has stable `id`, optional declaring `version`, display `path`,
+aliases, optional stable parent id, signature, summary, details, examples,
+typed streaming IO, effects, integer exit-code descriptions, and fact-level
+provenance. The JSON field is named `arguments`. Each argument records names,
+its `positional`, `option`, or `flag` kind, value type, required/repeatable
+state, optional static or dynamic completion source, conflicts, documentation,
+examples, and provenance.
 
 Provenance contains source, confidence, trust, optional origin, optional
-fingerprint, and optional `generated_at`. Builtins are exact/builtin; validated
-plugin declarations are exact/trusted. Fish, Bash, and Zsh declarations remain
-attributed declared imports. Help/man extraction remains heuristic. Timestamps
-are omitted unless a producer supplies a deterministic source timestamp, so
-rebuilding an unchanged catalog stays byte-stable.
+fingerprint, and optional `generated_at`. Builtins are exact/builtin and
+validated plugin declarations are exact/trusted. Fish, Bash, and Zsh facts
+remain attributed declarations; help/man extraction remains heuristic.
+Wall-clock timestamps are omitted unless a producer supplies a deterministic
+source timestamp.
 
-## Quality and migration
-
-`Catalog::quality_issues` rejects incomplete exact records: stable identity,
-declaring version, command and argument documentation, types, examples, IO,
-and exit-code descriptions are mandatory. It also checks parent ids, alias and
+`Catalog::quality_issues()` rejects incomplete exact records: stable identity,
+declaring version, command and argument documentation, types, examples, IO, and
+exit-code descriptions are mandatory. It also validates parent ids, alias and
 argument-name uniqueness, resolvable conflicts, and nonempty static/dynamic
-completion sources. Imported records deliberately may
-carry `Unknown` IO, no version, no examples, and no exit-code map; Quirl does
-not promote incomplete external observations into exact facts.
+completion sources. Imported external observations may retain `Unknown` IO, no
+version, no examples, and no exit-code map; Quirl does not promote them to
+exact facts.
 
-`Catalog::from_json` accepts v4 and migrates cache schemas 2 and 3. Migration
-preserves paths, prose, effects, confidence, origin, and fingerprints, converts
-legacy options into arguments, derives stable ids/parents, and marks new fields
-unknown or empty. The CLI merges migrated cache records underneath current
+`Catalog::from_json()` accepts v4 and migrates cache schemas 2 and 3. Migration
+preserves paths, prose, effects, confidence, origin, and fingerprints; converts
+legacy options into arguments; derives stable ids and parents; and marks new
+facts unknown or empty. The CLI merges migrated records beneath current
 compiled builtins, so an old cache cannot remove or overwrite an exact builtin.
-Unknown schema versions fail validation and should be rebuilt with
-`quirl index build`.
+Unknown versions fail validation and require a cache rebuild.
 
-## Durable discovery cache
+### Durable local intelligence cache
 
-Interactive startup initializes the same catalog cache automatically; users do
-not need to run `quirl index build`. The rich surface performs this bounded work
-after its first frame, while the simple fallback performs it eagerly under the
-same 750 ms deadline. Later refreshes run once per minute on a single
-cancellable worker and never on highlighting, editing, or completion paths.
+Interactive startup admits the CLI-owned cache automatically. One
+session-owned discovery worker starts immediately after catalog admission, does
+not wait for accepted input, and never runs on highlighting, editing,
+completion, or rendering paths. A full scan has a 30-second background deadline
+and the periodic interval is 60 seconds; accepted input may request one
+coalesced additional scan.
 
-Discovery inspects executable entries in `PATH` and reads declarative Fish,
-Bash, Zsh, help, and man sources. It never invokes an executable, a shell,
-`man`, or a user startup file. `QUIRL_HELP_PATH` and `QUIRL_MAN_PATH` add
-path-list roots; user and system `share/quirl/help` and `share/quirl/man`
-directories are also considered. Existing source, entry, byte, record, and
-diagnostic limits apply to automatic refreshes.
-Declarative source symlinks are canonicalized to a regular target and then
-subjected to the same size, permission, and hard-link checks; cache destination
-and parent symlinks remain rejected.
+Discovery inspects executable `PATH` entries and reads admitted declarative
+Fish, Bash, Zsh, help, and man sources. It never invokes an executable, shell,
+`man`, or user startup file. The source-file ceiling is 4,096 within separate
+8,192 directory-entry, 1 MiB retained-path, 16 MiB aggregate source-byte, and
+16 MiB canonical-catalog bounds. At most 512 matching plain manual pages are
+retained; each remains within the 1 MiB documentation limit. Source admission,
+symlink handling, file type, permissions, hard links, deadlines, records, and
+diagnostics remain bounded.
 
-The default database is `$XDG_CACHE_HOME/quirl/catalog.sqlite3` (or the
-equivalent under `$HOME/.cache`) and can be overridden with
-`QUIRL_INDEX_PATH`. It contains normalized commands, aliases, arguments,
-argument names and values, conflicts, examples, effects, exit codes,
-provenance, semantic documents, and Model2Vec embeddings. Discovery state is a
-versioned JSON value inside the same transaction, containing the bounded sorted
-source inventory, content/metadata fingerprints, refresh time, and the catalog
-fingerprint and schema version. A missing, stale, corrupt, incompatible, or
-mismatched database is a cache miss. Quirl rebuilds a complete in-memory SQLite
-database from current builtins plus imported facts, validates its size, and
-atomically replaces the old file. Concurrent shells may duplicate bounded
-discovery, but readers observe only complete databases. Cache failures fall
-back to current builtins and cannot prevent terminal startup or clean shutdown.
+The default cache is `$XDG_CACHE_HOME/quirl/catalog.sqlite3` (or the equivalent
+under `$HOME/.cache`) and `QUIRL_INDEX_PATH` may select another path. It stores
+the exact composed catalog snapshot, normalized commands, aliases, arguments,
+names and values, conflicts, examples, effects, exits, provenance, semantic
+documents, Model2Vec embeddings, and versioned discovery state in transactions.
+Discovery state binds its sorted source inventory and fingerprints to the
+catalog fingerprint and schema version.
 
-Schema `user_version` 1 and application id `QUIR` identify the database. Reads
-are limited to 128 MiB, SQL runtime limits disable attached databases and
-SQLite worker threads, and command discovery remains capped at 65,536 records.
-Legacy catalog JSON schemas 2 and 3 remain readable for migration, but every new
-write uses SQLite.
+Cache application id `QUIR` and `user_version` 1 are distinct from native
+artifact identity `QCNC`. Cache reads are limited to 128 MiB, attached databases
+and SQLite worker threads are disabled, and discovery remains capped at 65,536
+records. A missing, stale, corrupt, incompatible, or fingerprint-mismatched
+cache is a miss. A complete in-memory image is atomically published; a failed
+generation preserves the last valid database. If none exists, a builtin-only
+SQLite image supplies an indexable fallback. Concurrent shells coordinate
+writers through a dedicated persistent sibling lock; readers observe only
+complete generations.
 
-## Local semantic intelligence
+### Local semantic intelligence
 
-`quirl ai index` loads `minishlab/potion-base-8M` only from local files under
-`$XDG_DATA_HOME/quirl/models/potion-base-8M` (or `QUIRL_MODEL_PATH`). Network
-model loading is compiled out. The loader admits only bounded regular
-`config.json`, `tokenizer.json`, and `model.safetensors` files. Commands and
-options become separately fingerprinted semantic documents; all vectors are
-dimension- and finiteness-checked before one transaction replaces the prior
-embedding set.
+After initial catalog admission, a session-owned worker validates or installs
+the pinned `minishlab/potion-base-8M` model and builds embeddings automatically.
+The default installer fetches exactly `config.json`, `tokenizer.json`, and
+`model.safetensors` from pinned revision
+`bf8b056651a2c21b8d2565580b8569da283cab23` over bounded rustls HTTPS, verifies
+exact byte counts and SHA-256 digests, and atomically publishes a private model
+directory. An explicit `QUIRL_MODEL_PATH` is never replaced automatically.
+Redirects, waits, retained chunks, staging attempts, directory depth, file
+bytes, documents, tokens, batches, vector dimensions, serialized bytes, and
+finite floats are bounded; cancellation is checked between streamed chunks and
+32-document batches.
 
-`quirl ai search` supports natural-language command search and option search;
-`quirl ai related` provides related-command and related-option suggestions.
-The interactive `ai` mode exposes the same ranking (`natural`, `nl`, and
-`human` remain aliases). When either the
-local model or matching embeddings are unavailable, the query uses bounded,
-deterministic lexical ranking. Suggestions are display-only and are never
-executed automatically.
+Embeddings carry model id and source-document fingerprint and publish only when
+their request generation and exact source database remain current. A changed
+database schedules the newest generation rather than allowing stale embeddings
+to overwrite it. Missing or invalid model assets and missing/stale embeddings
+select bounded deterministic lexical ranking.
 
-Plugin commands are normalized only after manifest validation. Platform v0.1
-requires the plugin name as the command namespace, preventing implicit builtin
-shadowing. Normalized records carry the package version, declared typed IO,
-arguments, effects, numeric exit codes, source fingerprint, and trusted plugin
-provenance.
+The explicit AI index operation remains a diagnostic/refresh path, not a setup
+requirement. AI search, related suggestions, and interactive AI mode read the
+same cache. Interactive selection inserts text into normal mode for review;
+subcommands display candidates. Neither executes a suggestion automatically.
 
-Builtin signatures are the declared source for positional argument shapes;
-their mechanically projected argument provenance is `high`/`declared`, not
-`exact`. Builtin CLI byte output is non-streaming with no typed input unless a
-command declares a stronger contract (`quirl data`, `ls`, and `quirl watch`).
-Static enum values are served directly by completion after either a space or
-`--option=`.
+Plugin commands enter composition only after manifest validation and retain
+their package version, typed IO, arguments, effects, numeric exit codes, source
+fingerprint, and trusted provenance. Builtin signatures remain the declaration
+for mechanically projected positional shapes, whose provenance is
+`high`/`declared`, not `exact`.
+
+These composed-cache rules remain governed by
+[ADR 0007](decisions/0007-semantic-catalog-v4.md) and
+[ADR 0021](decisions/0021-sqlite-local-command-intelligence.md). The native KDL
+compiler supplies attributable external facts without creating a parallel
+Quirl builtin contract or a second mutable cache.
