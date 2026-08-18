@@ -82,6 +82,11 @@ git log -1 --format='%h %s'
   and atomic-publication cleanup. Runtime tests pass without Carapace or network
   access and preserve builtin/local-discovery fallback when the native artifact
   is unavailable.
+- [ ] `cargo xtask rich-pty --check local-completion-discovery` passes with its
+  isolated fake Fish/Zsh providers; warm positive and negative cache tests prove
+  deterministic restart behavior and no host rc, host completion, Carapace, or
+  network dependency. The exact Carapace Bridge and Vincent Breitmoser notices
+  remain present in `crates/quirl-process/THIRD_PARTY_NOTICES.md`.
 - [ ] Website dependencies were installed with `npm ci --prefix website` and
   `cargo xtask website-check` passes. This non-mutating gate checks generated
   mirror/reference freshness, semantic release-evidence attribution, lint,

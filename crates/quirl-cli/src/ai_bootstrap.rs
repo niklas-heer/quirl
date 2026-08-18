@@ -108,6 +108,26 @@ pub(crate) struct InteractiveAiBootstrap {
     shared: Arc<Shared>,
 }
 
+pub(crate) struct LocalCompletionRequester {
+    shared: Weak<Shared>,
+}
+
+impl LocalCompletionRequester {
+    pub(crate) fn request(&self, line: &str, cursor: usize) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let result = shared.catalog_refresh.lock().ok().and_then(|refresh| {
+            refresh
+                .as_ref()
+                .map(|refresh| refresh.request_local_completion(line, cursor))
+        });
+        if let Some(Err(error)) = result {
+            shared.publish_discovery(format!("Discovery deferred: {}", error.message));
+        }
+    }
+}
+
 impl InteractiveAiBootstrap {
     pub(crate) fn new() -> Self {
         Self {
@@ -119,6 +139,12 @@ impl InteractiveAiBootstrap {
         ActivityAdapter {
             shared: Arc::clone(&self.shared),
             observed_generation: 0,
+        }
+    }
+
+    pub(crate) fn local_completion_requester(&self) -> LocalCompletionRequester {
+        LocalCompletionRequester {
+            shared: Arc::downgrade(&self.shared),
         }
     }
 
