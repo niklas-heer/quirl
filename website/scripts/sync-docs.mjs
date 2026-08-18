@@ -34,6 +34,7 @@ const documents = [
   ['docs/embedded-language-decision.md', 'architecture/why-lua.mdx'],
   ['docs/documentation-system.md', 'contributing/documentation-system.mdx'],
   ['docs/testing-strategy.md', 'contributing/testing-strategy.mdx'],
+  ['docs/releasing.md', 'project/release-0.1/operations.mdx'],
   ['docs/release-checklist.md', 'project/release-0.1/release-checklist.mdx'],
   ['docs/security-accessibility-audit-v0.1.md', 'project/release-0.1/security-accessibility-audit.mdx'],
   ['docs/adoption-plan.md', 'project/adoption-plan.mdx'],
@@ -62,6 +63,7 @@ const documents = [
   ['docs/decisions/0018-typed-lua-runner-abi.md', 'architecture/decisions/0018-typed-lua-runner-abi.mdx'],
   ['docs/decisions/0021-sqlite-local-command-intelligence.md', 'architecture/decisions/0021-sqlite-local-command-intelligence.mdx'],
   ['docs/decisions/0024-kdl-native-command-catalog.md', 'architecture/decisions/0024-kdl-native-command-catalog.mdx'],
+  ['docs/decisions/0026-rust-native-releases-and-runtime-assets.md', 'architecture/decisions/0026-rust-native-releases-and-runtime-assets.mdx'],
 ];
 
 const pageBySource = new Map(documents);

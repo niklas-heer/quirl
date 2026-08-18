@@ -12,7 +12,10 @@ supported interactive platforms. Windows is explicitly outside this release
 gate under [ADR 0010](/docs/architecture/decisions/0010-unix-first-release-scope).
 The capable-TTY default and retained Reedline fallback are governed by
 [ADR 0012](/docs/architecture/decisions/0012-ratatui-interactive-surface); shared theme behavior
-is governed by [ADR 0013](/docs/architecture/decisions/0013-lua-config-themes).
+is governed by [ADR 0013](/docs/architecture/decisions/0013-lua-config-themes). Rust-native
+release and downloadable-asset ownership is governed by
+[ADR 0026](/docs/architecture/decisions/0026-rust-native-releases-and-runtime-assets); the
+operator procedure is [documented separately](/docs/project/release-0.1/operations).
 
 This checklist uses two explicit revisions:
 
@@ -44,6 +47,12 @@ evidence, not a human signoff.
 
 ## 1. Freeze the candidate
 
+- [ ] `cargo xtask release plan` selects the reviewed version from reachable
+  Conventional Commits and `cargo xtask release prepare` shows the expected
+  idempotent version, changelog, and notes changes without writing them.
+- [ ] The preparation PR was produced from `cargo xtask release prepare
+  --write`; curated changelog content remains intact and only real product
+  version sources changed.
 - [ ] The worktree is clean and `main` is synchronized with its release remote.
 - [ ] `Cargo.lock`, `rust-toolchain.toml`, the release profile, version strings,
   generated SDK, protocol manifest, and user-facing status text describe the
@@ -56,8 +65,8 @@ evidence, not a human signoff.
   platform facts, and has a recorded byte length and cryptographic checksum for
   this exact candidate. This artifact is distinct from the mutable local
   intelligence cache and from `Catalog::builtin()` metadata.
-- [ ] The reviewed config descriptor is schema v3, its golden fingerprint
-  matches the candidate, and v0/v1/v2-to-v3 migration tests pass.
+- [ ] The reviewed config descriptor is schema v4, its golden fingerprint
+  matches the candidate, and v0/v1/v2/v3-to-v4 migration tests pass.
 - [ ] The supported compatibility boundary is unchanged: C0/C1-core is native
   on Linux/macOS; here-documents, process substitution, loops, functions,
   conditionals, and dialect control forms are explicit Bash/Zsh islands.
@@ -78,6 +87,8 @@ git log -1 --format='%h %s'
 ## 2. Run the automated gate
 
 - [ ] `cargo xtask check` passes with the pinned Rust 1.97.1 toolchain.
+- [ ] `cargo xtask release verify` accepts the clean candidate tuple and rejects
+  a dirty tree, mismatched binary version, or mismatched embedded commit.
 - [ ] The generated Lua SDK has no diff after `cargo xtask sdk`.
 - [ ] `cargo xtask catalog fmt --check`, `cargo xtask catalog check`, and
   `cargo xtask catalog build` pass; a second build is byte-identical, and the
@@ -87,6 +98,11 @@ git log -1 --format='%h %s'
   and atomic-publication cleanup. Runtime tests pass without Carapace or network
   access and preserve builtin/local-discovery fallback when the native artifact
   is unavailable.
+- [ ] `cargo xtask rich-pty --check local-completion-discovery` passes with its
+  isolated fake Fish/Zsh providers; warm positive and negative cache tests prove
+  deterministic restart behavior and no host rc, host completion, Carapace, or
+  network dependency. The exact Carapace Bridge and Vincent Breitmoser notices
+  remain present in `crates/quirl-process/THIRD_PARTY_NOTICES.md`.
 - [ ] Website dependencies were installed with `npm ci --prefix website` and
   `cargo xtask website-check` passes. This non-mutating gate checks generated
   mirror/reference freshness, semantic release-evidence attribution, lint,
@@ -261,27 +277,47 @@ Before publishing the capture:
 
 - [ ] Return to candidate A and confirm its worktree, revision, artifact digest,
   and embedded source identity. If A changed, stop and choose a new candidate.
+- [ ] Native packages were produced by `cargo xtask release package` on the
+  explicit `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+  `aarch64-unknown-linux-gnu`, and `x86_64-unknown-linux-gnu` runner matrix.
+- [ ] `cargo xtask release aggregate` accepted exactly one package for every
+  target and produced the versioned release manifest, SHA-256 file, notes, and
+  provenance from those exact bytes. A second aggregation is byte-identical.
 - [ ] Do not rebuild after measuring. The distributable, terminal recording,
   checksums, and version tag all identify the already-gated A artifact.
-- [ ] Publish the exact CI-built native SQLite image and its checksum with the
-  source revision, `QCNC` schema version, and byte length. Verify the packaged
-  image matches those bytes; do not regenerate it during packaging or replace
-  it with a draft/import output.
+- [ ] `cargo xtask assets build` produced the completion SQLite image and model
+  bundle in separate jobs, and `cargo xtask assets manifest` recorded each
+  logical name, clean candidate commit, source epoch, format/schema version,
+  exact byte length, SHA-256, immutable URL, and compatibility requirements.
+  Neither asset is in a native package.
+- [ ] Asset jobs that require credentials ran only in the protected
+  `release-assets` environment; no pull-request job or log received them.
 - [ ] Draft release notes with supported platforms, native compatibility scope,
   reference-shell behavior, known residual risks, and upgrade/migration notes.
   For 0.1, note that config schema v3 adds shared semantic themes on top of the
-  v2 rich-surface settings; legacy unversioned v0 and explicit v1/v2 config
-  migrate to v3 defaults, and no published config contract is being silently
-  reinterpreted.
-- [ ] Create an annotated version tag only after every required Linux/macOS gate
-  above is signed off, and point it explicitly at A, even if HEAD has moved to
-  evidence commit B: `git tag -a v0.1.0 "$QUIRL_CANDIDATE_COMMIT"`.
+  v2 rich-surface settings and v4 adds the default active Rust toolchain prompt
+  segment; legacy unversioned v0 and explicit v1/v2/v3 config migrate to v4
+  defaults, and no published config contract is being silently reinterpreted.
+- [ ] Create the immutable version tag only after every required Linux/macOS
+  gate above is signed off, using `cargo xtask release tag --expected-tag
+  vVERSION --write` at A. Refuse rather than move a conflicting existing tag.
 - [ ] If desired, create evidence commit B after tagging A. Restrict B to
   measured records, reviewed demo links, checksums, and release-note evidence;
   never use B's revision as the artifact source identity.
 - [ ] Publish the measured artifacts and checksums, then verify a clean install
   starts and reports A's expected version and source identity. Attach evidence
   produced after A as release assets or link it from B without rebuilding A.
+- [ ] Publish the completion database, model bundle, and asset manifest as
+  versioned GitHub Release assets. Missing assets leave first prompt and core
+  shell use available; corrupt, truncated, incompatible, or unexpected inputs
+  fail without replacing an existing valid generation.
+- [ ] Generate `Formula/quirl.rb` deterministically from the published release
+  manifest, run `cargo xtask homebrew check`, and open a tap PR with the
+  repository-scoped GitHub App (or documented fine-grained PAT fallback).
+  Never push directly to the tap's default branch.
+- [ ] The Homebrew install and bounded offline test select all four platform
+  variants by OS/architecture, verify exact hashes, install only `quirl`, and do
+  not download the completion database or model.
 - [ ] On each supported platform, verify admitted curated native facts are
   platform-filtered and that a missing, corrupt, incompatible, unsafe, or
   wrong-platform native database falls back to Quirl builtins and bounded local
@@ -292,7 +328,7 @@ Before publishing the capture:
 ## Not release blockers
 
 The following work can improve Quirl later but is not silently attached to this
-Unix 1.0 gate:
+Unix 0.1 gate:
 
 - native Windows terminal handoff, suspension semantics, and Windows hardware
   validation;
@@ -300,7 +336,9 @@ Unix 1.0 gate:
   functions, conditionals, or other Bash/Zsh dialect control forms;
 - a Wasm execution engine, remote plugin registry, publisher identity, or
   signed transparency log;
-- exact emulation of Bash/Zsh option state or framework-sized startup files.
+- exact emulation of Bash/Zsh option state or framework-sized startup files;
+- S3 or mirror-backed asset providers beyond the versioned GitHub Release
+  provider used for 0.1; and
 - removal of Reedline or replacement of the current simple-terminal fallback.
 
 These are explicit support boundaries. A future project may promote one only

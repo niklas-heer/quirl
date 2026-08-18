@@ -16,6 +16,7 @@
     "0012-ratatui-interactive-surface",
     "0013-lua-config-themes",
     "0014-external-history-provider-boundary",
-    "0015-bounded-theme-preview-gallery"
+    "0015-bounded-theme-preview-gallery",
+    "0026-rust-native-releases-and-runtime-assets"
   ]
 }

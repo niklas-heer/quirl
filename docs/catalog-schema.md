@@ -508,13 +508,14 @@ complete generations.
 
 ### Local semantic intelligence
 
-After initial catalog admission, a session-owned worker validates or installs
-the pinned `niklas-heer/quirl-command-v3-int8` model and builds embeddings
-automatically. The default installer fetches exactly `config.json`,
-`tokenizer.json`, and `model.safetensors` from pinned revision
-`quirl-command-v3-9bc5efbd14096b54` over bounded rustls HTTPS, verifies
-exact byte counts and SHA-256 digests, and atomically publishes a private model
-directory. An explicit `QUIRL_MODEL_PATH` is never replaced automatically.
+After initial catalog admission, a session-owned worker validates the current
+release's downloaded `command-model` asset and builds embeddings automatically.
+The provider-neutral release manifest fixes the model bundle's version, size,
+SHA-256 digest, format, compatibility, and immutable URL. Quirl streams that
+single bounded tar payload, verifies it before admission, expands only its
+closed three-file model layout, and atomically publishes a private,
+content-addressed model directory. It never downloads model files from a
+mutable branch. An explicit `QUIRL_MODEL_PATH` is never replaced automatically.
 Redirects, waits, retained chunks, staging attempts, directory depth, file
 bytes, documents, tokens, batches, vector dimensions, serialized bytes, and
 finite floats are bounded; cancellation is checked between streamed chunks and

@@ -60,6 +60,40 @@ other filesystem failures remain visible diagnostics. A completed database
 publication sets the catalog-changed bit and requests embedding for that new
 generation before main adopts the catalog at its next safe prompt boundary.
 
+That same worker owns local shell-provider discovery. Initial discovery probes
+only the top-level command name of a bounded subset of PATH executables; it
+does not recursively walk possible command paths. An editor-side observer may
+enqueue an exact unknown path for a narrow follow-up probe. Enqueueing performs
+no filesystem or process work, retains at most 64 paths of at most eight
+256-byte segments, and coalesces duplicates. The worker admits at most two
+Fish/Zsh requests concurrently. Each request receives one absolute sub-deadline
+within the generation's 30-second deadline, the process boundary's shared
+cancellation flag, at most 256 candidates, 256 frames, 256 KiB of combined
+output, 16 admitted roots, and no retries. Queue overflow is a bounded
+diagnostic and never delays editing.
+
+Provider children receive an empty environment plus an explicit PATH assembled
+from admitted PATH roots; the process adapter fixes the locale. Fish starts
+with `--no-config`, Zsh starts with `-d -f` and disables both user and global rc
+loading, and both see only admitted completion roots and scripts. Bash remains
+a typed later-provider contract in the SQLite overlay and composition tiers; it
+is not executed by this generation. Carapace is neither selected nor linked.
+Provider candidates are normalized before persistence: leading-dash candidates
+become flags, non-dash candidates from a command-path probe become one-segment
+child commands, controls and path separators are rejected, duplicates are
+coalesced deterministically, and useful provider descriptions remain attached
+to their individual provenance.
+
+Positive and negative observations are keyed by the native-catalog identity,
+the exact PATH executable fingerprint, the Fish/Zsh shell plus admitted-source
+fingerprint, the controlled environment fingerprint, and cwd class. A warm
+positive result or a negative hit still inside its retry window prevents a new
+process. Executable, provider-source, environment, or native-catalog changes
+therefore invalidate without deleting unrelated rows; negative expiry uses the
+caller's fixed-width timestamp. SQLite images preserve valid overlay rows when
+the central catalog generation is rebuilt, and every overlay-only publication
+uses the same catalog lock and hardened atomic replacement path.
+
 The same discovery generation scans admitted macOS, Homebrew, local, and
 configured `man1` roots without invoking `man`. Only pages whose normalized
 sectionless name matches a discovered PATH command are candidates; at most 512
@@ -110,7 +144,43 @@ select deterministic lexical ranking. AI mode inserts a selected suggestion
 into normal mode for review, while AI subcommands only display suggestions;
 neither path executes one directly.
 
+ADR 0025 replaces only this initial automatic model identity and distribution
+with the fine-tuned 8.1 MB `quirl-command-v3-int8` artifact. All installation,
+resource, cancellation, persistence, lexical-fallback, and execution-safety
+contracts in this ADR remain in force.
+
 ## Failure model and invariants
+
+- Local completion code is untrusted local code. It may hang, fork descendants,
+  ignore termination, emit malformed or excessive frames, return excessive or
+  misleading candidates, disappear after admission, or fail after partial
+  output. These are operating failures or bounded diagnostics, never panics.
+- The local-discovery resource sketch is constant in process concurrency (two
+  process-owned containment groups) and worker ownership (the existing catalog
+  worker plus at most two scoped provider calls). Retained memory is bounded by
+  the 64-path queue, per-request input/output/candidate ceilings, the existing
+  4,096-row/1,024-negative-hit/4-MiB overlay ceilings, and the 128-MiB database
+  image ceiling. Initial work is top-level only; nested work is exact and
+  demand-driven, so the worker never performs exhaustive recursive command-path
+  crawling.
+- Queue insertion and cache polling may occur for successive editor revisions,
+  but they only replace/coalesce bounded passive path values. Shell startup,
+  completion-source admission, SQLite mutation, and atomic publication occur
+  off render and per-keystroke threads. Results become visible only through the
+  existing complete catalog-generation swap between editor turns.
+- One provider attempt has one deadline and no retry. The catalog cancellation
+  flag is shared with every request. Shutdown records cancellation before join;
+  the process boundary kills the owned process group, drains bounded pipes,
+  reaps the direct child, and returns before its scoped call and catalog worker
+  can join. A provider-scoped timeout, malformed frame, excessive output, or
+  spawn failure records an identity-specific negative observation without
+  suppressing the valid base catalog or another provider's result. Global
+  refresh cancellation/deadline and worker panic still abort publication. No
+  CLI code spawns an uncontained completion child.
+- Only Fish and Zsh have executable adapters. Bash is represented in typed
+  persistence/composition metadata for a later adapter and cannot be reported
+  as a successful runtime provider. Carapace is not a runtime, build, or test
+  dependency.
 
 - Catalog publication and model installation use separate, dedicated sibling
   lock files whose names do not change when the SQLite file or model directory

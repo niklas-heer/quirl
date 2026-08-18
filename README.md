@@ -55,8 +55,18 @@ into typed structures and validated before the rest of the shell can use them.
 
 ## Quick start
 
-The repository pins Rust 1.97.1 through `rust-toolchain.toml`. No system Lua
-installation is required.
+For a published release, install the native binary from the Homebrew tap:
+
+```console
+brew install niklas-heer/tap/quirl
+```
+
+The formula installs only the `quirl` binary and its offline test never fetches
+the command model or completion database. Quirl acquires those separately in
+the background when available and remains usable in degraded mode while
+offline. Until the first `0.1.0` release and tap PR are published, build the
+candidate from source. The repository pins Rust 1.97.1 through
+`rust-toolchain.toml`; no system Lua installation is required.
 
 ```console
 git clone https://github.com/niklas-heer/quirl.git
@@ -77,6 +87,7 @@ Inside an interactive session, <kbd>Tab</kbd> opens semantic completion,
 
 For requirements and a guided first session, see the website's
 [getting-started section](website/content/docs/getting-started/index.mdx).
+Release operators should use [the Rust-native release procedure](docs/releasing.md).
 
 ## Status
 

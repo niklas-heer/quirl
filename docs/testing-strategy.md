@@ -25,7 +25,35 @@ cases against each available reference shell, and runs guest-side Lua tests.
 | External-command compatibility | Real argv, status, stdout/stderr, progress timing, ANSI filtering, and completion subcommand scope match the supported shell contract | Deterministic GHQ-shaped fixtures plus Bash/Zsh differential cases |
 | Guest runtime | Lua code sees the documented sandbox and API rather than Rust-only test shortcuts | `examples/lua_tests.lua` |
 | Website release gate | Mirrors and release-evidence attribution match canonical sources, and the documentation site lints, type-checks, and builds | `npm --prefix website run check` / `cargo xtask website-check` |
+| Release contracts | Version planning, preparation, package aggregation, strict manifests, checksums, provenance, and Homebrew rendering are deterministic and fail closed | Focused `xtask` contract tests and `cargo xtask release verify` |
+| Downloadable assets | Missing, corrupt, incompatible, cancelled, and transient downloads preserve degraded use and the previous valid generation | Injected offline downloader tests with bounded fake inputs |
 | Release evidence | Startup, repaint latency, retention, binary size, digest, and source identity meet budgets | `cargo xtask release-preview` and `release-gate` |
+
+## Release and asset contract evidence
+
+Release tests operate on temporary repositories and fixtures. They cover the
+first-release `0.1.0` rule; patch, minor, pre-1.0 breaking-minor, and stable
+breaking-major Conventional Commit histories; unreachable and malformed tags;
+non-releasing commits retained in notes; idempotent preparation; curated
+changelog preservation; and refusal to rewrite protocol, schema, plugin API,
+fixture, or historical version literals.
+
+Package tests require stable entry ordering and metadata, explicit target
+admission, exact candidate version/commit reporting, bounded reads, duplicate
+target rejection, and byte-identical aggregation. Strict versioned JSON fixtures
+must reject unknown fields, oversized collections and strings, invalid hashes,
+path traversal, unsupported schema versions, missing targets, and candidate
+identity disagreement. Formula tests exercise all four OS/architecture branches
+and prove the offline test invokes only the installed binary.
+
+Runtime asset tests use an injected downloader or bounded local server, never
+the internet. Cross every byte, deadline, redirect, retry, manifest-entry, and
+retained-state boundary. Prove that the first prompt does not wait; duplicate
+background requests coalesce; cancellation and every partial-write fault remove
+staging; corrupt, truncated, incompatible, and unexpected files are rejected;
+permanent errors stop automatic retries; transient retry state remains bounded
+and survives restart; and an admitted old generation remains usable until a
+fully verified replacement is atomically installed.
 
 ## Native command catalog evidence
 
