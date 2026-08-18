@@ -12,8 +12,10 @@ claim into another document:
    support, safety, and release-policy decisions. Proposed ADRs remain proposals
    and do not describe delivered behavior.
 2. Runtime canonical sources define executable interfaces: `Catalog::builtin()`
-   for commands and `HOST_API` for Lua. Their generated SDK/catalog outputs are
-   projections, never independent contracts.
+   for Quirl's own commands and `HOST_API` for Lua. Strict KDL is the canonical
+   human source for curated external native command specifications. Generated
+   SDK, catalog, JSON, and SQLite outputs are projections, never independent
+   contracts.
 3. Integrated implementation and behavioral tests establish what the current
    source tree actually does. User-facing prose must not outrun them.
 4. README, changelog, guides, and website entry pages are user-facing
@@ -63,9 +65,10 @@ docstring:
 
 | Interface | Authoritative source | Consumers |
 | --- | --- | --- |
-| Builtin commands and arguments | `Catalog::builtin()` in `quirl-catalog` | interactive help, completion, `quirl catalog`, `quirl describe`, `quirl doc`, LSP, MCP catalog output, and `quirl agent` |
+| Quirl builtin commands and arguments | `Catalog::builtin()` in `quirl-catalog` | interactive help, completion, `quirl catalog`, `quirl describe`, `quirl doc`, LSP, MCP catalog output, and `quirl agent` |
+| Curated external native commands | strict KDL under the [native catalog contract](catalog-schema.md) | deterministic `QCNC` SQLite, then platform-filtered composition into completion and discovery |
 | Lua host API | `HOST_API` in `quirl-lua` | LuaLS stubs, JSON, Markdown, LSP, and the AI capability catalog |
-| Imported or plugin commands | validated `CommandSpec` records with provenance | the same catalog projections after composition |
+| Locally observed or plugin commands | validated `CommandSpec` records with provenance | the same schema-v4 projections after composition |
 
 Exact catalog records must include stable identity, version, signature,
 summary, details, typed arguments and their documentation, examples, I/O,
@@ -75,19 +78,29 @@ every visible Clap leaf and argument agrees structurally with the catalog, so a
 new command cannot silently disappear from generated documentation or AI
 discovery.
 
-Clap doc comments remain short parser-facing navigation text. Full command
-contracts belong only in the catalog. Changing a catalog record automatically
-updates every catalog consumer; changing `HOST_API` requires
-`cargo xtask sdk` to refresh the checked-in Lua stub.
+That exact-record quality contract applies to Quirl builtin and trusted plugin
+`CommandSpec` records. The initial external native KDL schema is intentionally
+narrower: it captures commands, aliases, summaries, descriptions, intents,
+platforms, flags, arguments, provenance, and closed completion actions. It does
+not invent typed IO, effects, exit codes, or other schema-v4 facts. The compiled
+native SQLite is immutable input; the CLI intelligence SQLite remains the
+mutable composed cache with discovery state and embeddings.
+
+Clap doc comments remain short parser-facing navigation text. Full Quirl
+builtin contracts belong only in `Catalog::builtin()`. External native prose
+belongs only in curated KDL, never in generated SQLite or a Carapace-derived
+draft. Changing `HOST_API` requires `cargo xtask sdk` to refresh the checked-in
+Lua stub.
 
 ## Website mirrors and release validation
 
 The website's canonical Markdown mirrors are produced only by
-`website/scripts/sync-docs.mjs`; compiled catalog and Lua reference pages are
-produced only by `website/scripts/sync-generated-reference.mjs`. Never repair a
-generated MDX page directly. Run the appropriate sync command, review the
-canonical source and generated diff, then run both syncs a second time to prove
-byte idempotence.
+`website/scripts/sync-docs.mjs`; composed builtin catalog and Lua reference
+pages are produced only by `website/scripts/sync-generated-reference.mjs`.
+The external native `QCNC` SQLite artifact is not a website authoring source.
+Never repair a generated MDX page directly. Run the appropriate sync command,
+review the canonical source and generated diff, then run both syncs a second
+time to prove byte idempotence.
 
 Release evidence status has an additional semantic source of truth: the strict
 `quirl-release-evidence:v1` header in
@@ -120,10 +133,19 @@ intentionally remains Rust-focused and does not require Node.
 ## Adding or changing an interface
 
 1. Add `///` documentation with the public Rust item.
-2. If it is a command or argument, update `Catalog::builtin()` in the same
-   change. If it is a Lua host capability, update `HOST_API` and regenerate the
-   SDK.
+2. If it is a Quirl command or argument, update `Catalog::builtin()` in the same
+   change. If it is a curated external native fact, update strict KDL, review
+   its provenance and license, and regenerate the deterministic native database
+   and checksum. If it is a Lua host capability, update `HOST_API` and regenerate
+   the SDK.
 3. Add behavioral tests for the contract, including limits and errors where
    relevant.
 4. Run `cargo xtask check`. No separate documentation checklist or personal
    skill is required; the repository gate remembers the rules.
+
+Carapace can only propose an external native draft from a pinned revision. The
+four contributor operations are import to a separate draft, canonical format,
+strict check, and deterministic build. Their CLI spelling and repository paths
+belong to the follow-up tooling integration; until it lands, use the explicit
+role placeholders in [the catalog schema](catalog-schema.md) rather than
+documenting commands that do not exist.

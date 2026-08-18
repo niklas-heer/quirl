@@ -186,3 +186,13 @@ neither path executes one directly.
   control-plane work, never prompt latency.
 - Semantic ranking degrades predictably to lexical ranking during setup and
   after any failed download or rebuild.
+
+## Later reconciliation
+
+[ADR 0024](0024-kdl-native-command-catalog.md) defines a separate immutable
+`QCNC` SQLite build artifact for curated external native specifications. This
+ADR continues to govern the CLI-owned mutable intelligence cache, discovery
+state, embeddings, workers, and model lifecycle. The native artifact has its
+own database identity, exact snapshot, bounds, and deterministic compiler; it
+is an admitted input to composition, not a replacement for this cache and not a
+second owner of its runtime state.
