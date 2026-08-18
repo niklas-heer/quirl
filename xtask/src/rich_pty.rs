@@ -841,6 +841,12 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
         .pty
         .wait_for_screen("bottom status after resize restoration", |screen| {
             screen.bottom_line().contains("NORMAL")
+                && screen
+                    .lines()
+                    .iter()
+                    .filter(|line| line.contains("NORMAL"))
+                    .count()
+                    == 1
         })?;
 
     wait_for_command_information(&mut session, "ls", &["Enter run"])?;

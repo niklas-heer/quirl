@@ -68,7 +68,11 @@ use quirl_core::{
 };
 use quirl_lua::QuirlConfig;
 use quirl_syntax::{Mode, parse_command_list};
-use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
+use ratatui::{
+    Terminal, TerminalOptions, Viewport,
+    backend::{Backend, CrosstermBackend},
+    layout::Rect,
+};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
@@ -1796,17 +1800,14 @@ impl SurfaceTerminal {
                 .with_help("Retry with ui.surface = \"simple\"")
         })?;
         let area = Rect::new(0, 0, size.0, size.1);
-        if self.last_size != Some(size) {
-            let backend = CrosstermBackend::new(io::stderr());
-            let replacement = Terminal::with_options(
-                backend,
-                TerminalOptions {
-                    viewport: Viewport::Fixed(area),
-                },
-            )
-            .map_err(terminal_error("recreate the resized interactive frame"))?;
-            *terminal = replacement;
-            self.last_size = Some(size);
+        match resize_fixed_terminal(terminal, self.last_size, area) {
+            Ok(true) => self.last_size = Some(size),
+            Ok(false) => {}
+            Err(error) => {
+                let error = terminal_error("resize the interactive frame")(error);
+                self.reset_best_effort();
+                return Err(error);
+            }
         }
         let result = terminal.draw(|frame| model.render(frame)).map(|_| ());
         if let Err(error) = result {
@@ -1901,6 +1902,21 @@ impl Drop for SurfaceTerminal {
             self.reset_best_effort();
         }
     }
+}
+
+fn resize_fixed_terminal<B: Backend>(
+    terminal: &mut Terminal<B>,
+    previous_size: Option<(u16, u16)>,
+    area: Rect,
+) -> Result<bool, B::Error> {
+    let size = (area.width, area.height);
+    if previous_size == Some(size) {
+        return Ok(false);
+    }
+    // Retain Ratatui's physical-screen history. Its resize operation clears the
+    // viewport and resets the back buffer so newly exposed cells are repainted.
+    terminal.resize(area)?;
+    Ok(true)
 }
 
 fn retain_error(slot: &mut Option<ShellError>, error: ShellError) {
@@ -2364,6 +2380,39 @@ mod tests {
             assert_eq!(error.code, ErrorCode::ResourceLimit);
             assert!(error.details.context[0].contains("observed"));
         }
+    }
+
+    #[test]
+    fn fixed_terminal_resize_clears_cells_across_shrink_and_growth() {
+        use ratatui::{backend::TestBackend, widgets::Paragraph};
+
+        let large = Rect::new(0, 0, 8, 3);
+        let small = Rect::new(0, 0, 4, 2);
+        let backend = TestBackend::new(large.width, large.height);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(large),
+            },
+        )
+        .unwrap();
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("XXXXXXXX\nXXXXXXXX"), large))
+            .unwrap();
+
+        terminal.backend_mut().resize(small.width, small.height);
+        assert!(resize_fixed_terminal(&mut terminal, Some((8, 3)), small).unwrap());
+        terminal.backend().assert_buffer_lines(["    ", "    "]);
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new("old!"), small))
+            .unwrap();
+
+        terminal.backend_mut().resize(large.width, large.height);
+        assert!(resize_fixed_terminal(&mut terminal, Some((4, 2)), large).unwrap());
+        terminal
+            .backend()
+            .assert_buffer_lines(["        ", "        ", "        "]);
+        assert!(!resize_fixed_terminal(&mut terminal, Some((8, 3)), large).unwrap());
     }
 
     #[test]
