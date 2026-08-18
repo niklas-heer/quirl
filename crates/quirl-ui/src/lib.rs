@@ -1716,7 +1716,9 @@ impl PromptSymbols {
 
     fn git_state(self, value: &str) -> String {
         match self {
-            Self::NerdFont => format!("\u{f044} {value}"),
+            Self::NerdFont => {
+                render_nerd_git_state(value).unwrap_or_else(|| format!("\u{f044} {value}"))
+            }
             Self::Unicode => format!("\u{2261} {value}"),
             Self::Plain => value.to_owned(),
         }
@@ -1751,6 +1753,35 @@ impl PromptSymbols {
             Self::Plain | Self::Unicode => value,
         }
     }
+}
+
+fn render_nerd_git_state(value: &str) -> Option<String> {
+    let mut rendered = String::with_capacity(value.len());
+    let mut state_count = 0_usize;
+    for state in value.split_ascii_whitespace() {
+        let bytes = state.as_bytes();
+        let count = bytes.get(1..)?;
+        if count.is_empty() || !count.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let icon = match bytes[0] {
+            b'+' => "\u{f00c}",
+            b'~' => "\u{f044}",
+            b'!' => "\u{f071}",
+            b'?' => "\u{f128}",
+            b'^' => "\u{f062}",
+            b'v' => "\u{f063}",
+            b'*' => "\u{f187}",
+            _ => return None,
+        };
+        if state_count > 0 {
+            rendered.push(' ');
+        }
+        rendered.push_str(icon);
+        rendered.push_str(&state[1..]);
+        state_count = state_count.saturating_add(1);
+    }
+    (state_count > 0).then_some(rendered)
 }
 
 impl QuirlPrompt {
@@ -3530,6 +3561,28 @@ mod tests {
         assert_eq!(
             join_prompt_parts(&parts, PromptSymbols::NerdFont),
             "project \u{e0b1} command \u{e0b1} git:main"
+        );
+    }
+
+    #[test]
+    fn nerd_font_git_state_replaces_every_compact_counter_symbol() {
+        assert_eq!(
+            PromptSymbols::NerdFont.git_state("+1 ~2 !3 ?4 ^5 v6 *7"),
+            "\u{f00c}1 \u{f044}2 \u{f071}3 \u{f128}4 \u{f062}5 \u{f063}6 \u{f187}7"
+        );
+        assert_eq!(PromptSymbols::Unicode.git_state("~3 ^2"), "\u{2261} ~3 ^2");
+        assert_eq!(PromptSymbols::Plain.git_state("~3 ^2"), "~3 ^2");
+    }
+
+    #[test]
+    fn nerd_font_git_state_keeps_descriptive_and_unknown_states_visible() {
+        assert_eq!(
+            PromptSymbols::NerdFont.git_state("rebasing"),
+            "\u{f044} rebasing"
+        );
+        assert_eq!(
+            PromptSymbols::NerdFont.git_state("~3 future:2"),
+            "\u{f044} ~3 future:2"
         );
     }
 
