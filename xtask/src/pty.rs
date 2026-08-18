@@ -38,6 +38,7 @@ pub(super) mod key {
     pub const ALT_Q: &[u8] = b"\x1bq";
     pub const CTRL_C: &[u8] = b"\x03";
     pub const CTRL_D: &[u8] = b"\x04";
+    pub const CTRL_L: &[u8] = b"\x0c";
     pub const CTRL_U: &[u8] = b"\x15";
     pub const ESCAPE: &[u8] = b"\x1b";
     pub const ENTER: &[u8] = b"\r";

@@ -44,6 +44,8 @@ const CHECK_NAMES: &[&str] = &[
     "external-command-compatibility",
     "streamed-progress-without-newline",
     "full-screen-program-takeover",
+    "full-screen-program-spawn-failure-restores-terminal",
+    "ctrl-l-forces-full-repaint",
     "local-completion-discovery",
     "rich-review-regressions",
     "native-job-control",
@@ -442,7 +444,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 21] {
+fn checks() -> [CheckCase; 23] {
     [
         CheckCase {
             name: "rich-editing",
@@ -499,6 +501,14 @@ fn checks() -> [CheckCase; 21] {
         CheckCase {
             name: "full-screen-program-takeover",
             run: check_full_screen_program_takeover,
+        },
+        CheckCase {
+            name: "full-screen-program-spawn-failure-restores-terminal",
+            run: check_full_screen_program_spawn_failure_restores_terminal,
+        },
+        CheckCase {
+            name: "ctrl-l-forces-full-repaint",
+            run: check_ctrl_l_forces_full_repaint,
         },
         CheckCase {
             name: "local-completion-discovery",
@@ -2008,6 +2018,72 @@ fn check_full_screen_program_takeover(binary: &Path) -> Result<(), Box<dyn Error
     execute_and_resume(&mut session, "/usr/bin/printf AFTER_%s TAKEOVER")?;
     session.pty.send(key::CTRL_D)?;
     ensure_status(session.pty.wait_exit()?, 0, "full-screen program takeover")
+}
+
+fn check_full_screen_program_spawn_failure_restores_terminal(
+    binary: &Path,
+) -> Result<(), Box<dyn Error>> {
+    // Failure model: `needs_real_terminal` decides to hand a command the
+    // real terminal from its parsed source text alone, before the
+    // executable is known to exist. When the recognized full-screen program
+    // is missing from PATH, the spawn fails after the alternate screen has
+    // already been released for it. `resume_after_terminal_takeover` must
+    // still run — the rich viewport has to be reacquired and repainted
+    // before the spawn error is shown, never left stranded on the
+    // takeover's half-cleared real-terminal frame.
+    let fixtures = TempDirectory::new("quirl-full-screen-spawn-failure")?;
+    let binary_dir = fixtures.path.join("bin");
+    create_private_directory(&binary_dir)?;
+    let mut session = Session::new(
+        binary,
+        SessionOptions {
+            path: Some(binary_dir),
+            ..SessionOptions::default()
+        },
+    )?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    session.pty.type_text("lazygit")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for_screen(
+        "spawn failure surfaced after reacquiring the rich viewport",
+        |screen| {
+            let text = screen.text();
+            text.contains("could not start") && screen.bottom_line().contains("NORMAL")
+        },
+    )?;
+    execute_and_resume(&mut session, "/usr/bin/printf AFTER_SPAWN_FAILURE")?;
+    session.pty.send(key::CTRL_D)?;
+    ensure_status(
+        session.pty.wait_exit()?,
+        0,
+        "full-screen program spawn failure",
+    )
+}
+
+fn check_ctrl_l_forces_full_repaint(binary: &Path) -> Result<(), Box<dyn Error>> {
+    // Failure model: `terminal::Clear(ClearType::All)` wipes the real screen
+    // but does not by itself invalidate ratatui's internal diff buffer.
+    // Without also resetting the `Terminal` object's buffer, the next draw
+    // compares against a buffer that still believes the prior frame is on
+    // screen and re-emits only cells whose modeled content changed — leaving
+    // the freshly wiped real terminal blank wherever nothing in the frame
+    // changed, even though Ctrl-L just erased it. Sending Ctrl-L with no
+    // other edit must still repaint the full frame, not leave a blank
+    // screen behind.
+    let mut session = Session::new(binary, SessionOptions::default())?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    let since = session.pty.output().len();
+    session.pty.send(key::CTRL_L)?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[2J", since, DEFAULT_TIMEOUT)?;
+    session
+        .pty
+        .wait_for_screen("status bar repainted after Ctrl-L", |screen| {
+            screen.bottom_line().contains("Tab complete")
+        })?;
+    session.pty.send(key::CTRL_D)?;
+    ensure_status(session.pty.wait_exit()?, 0, "Ctrl-L full repaint")
 }
 
 fn check_local_completion_discovery(binary: &Path) -> Result<(), Box<dyn Error>> {

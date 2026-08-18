@@ -1201,8 +1201,7 @@ impl RichSurface {
                             self.open_picker(kind, editor.buffer(), editor.cursor(), "picker");
                         }
                         EditAction::ClearScreen => {
-                            execute!(io::stderr(), terminal::Clear(ClearType::All))
-                                .map_err(terminal_error("clear the terminal"))?;
+                            self.terminal.force_clear()?;
                         }
                         EditAction::Suspend => {
                             self.terminal.release()?;
@@ -1965,6 +1964,26 @@ impl SurfaceTerminal {
             terminal
                 .clear()
                 .map_err(terminal_error("repaint after a foreground takeover"))?;
+        }
+        Ok(())
+    }
+
+    /// Wipe the real screen and force ratatui to repaint every cell on its
+    /// next draw.
+    ///
+    /// A raw ANSI clear alone desyncs ratatui's diff buffer from the actual
+    /// screen contents: the next draw would only rewrite cells ratatui
+    /// believes changed since the prior frame, leaving the freshly blanked
+    /// regions untouched until unrelated content happens to change there.
+    /// Invalidating the buffer here keeps Ctrl-L reliable even after screen
+    /// corruption a diff-based repaint would not otherwise correct.
+    fn force_clear(&mut self) -> Result<(), ShellError> {
+        execute!(io::stderr(), terminal::Clear(ClearType::All))
+            .map_err(terminal_error("clear the terminal"))?;
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal
+                .clear()
+                .map_err(terminal_error("repaint after clearing the terminal"))?;
         }
         Ok(())
     }
