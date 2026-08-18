@@ -611,13 +611,14 @@ fn join_natural_query(query: &[String]) -> Result<String, ShellError> {
 }
 
 fn natural_execution_effects(effects: &[CatalogEffect]) -> ExecutionEffects {
-    let effects = effects.iter().map(|effect| match effect {
+    let mut declared = vec![ExecutionEffect::SpawnProcess];
+    declared.extend(effects.iter().map(|effect| match effect {
         CatalogEffect::ReadFilesystem => ExecutionEffect::ReadFilesystem,
         CatalogEffect::WriteFilesystem => ExecutionEffect::WriteFilesystem,
         CatalogEffect::SpawnProcess => ExecutionEffect::SpawnProcess,
         CatalogEffect::ChangeDirectory => ExecutionEffect::ChangeDirectory,
-    });
-    ExecutionEffects::from_effects(&effects.collect::<Vec<_>>())
+    }));
+    ExecutionEffects::from_effects(&declared)
 }
 
 fn load_composed_catalog() -> Result<Catalog, ShellError> {
@@ -3761,6 +3762,17 @@ mod tests {
             natural_command_candidate(&results).unwrap().command,
             "quirl ai run"
         );
+    }
+
+    #[test]
+    fn natural_native_execution_always_declares_process_authority() {
+        let unknown = natural_execution_effects(&[]);
+        assert!(unknown.contains(ExecutionEffect::SpawnProcess));
+        assert!(!unknown.contains(ExecutionEffect::WriteFilesystem));
+
+        let write = natural_execution_effects(&[CatalogEffect::WriteFilesystem]);
+        assert!(write.contains(ExecutionEffect::SpawnProcess));
+        assert!(write.contains(ExecutionEffect::WriteFilesystem));
     }
 
     #[test]
