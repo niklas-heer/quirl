@@ -2,7 +2,11 @@
 
 use crate::{index, intelligence};
 use clap::{Subcommand, ValueEnum};
-use quirl_contract::CommandProposalRisk;
+use quirl_catalog::Catalog;
+use quirl_contract::{
+    COMMAND_PROPOSAL_VALUE_BYTES_MAX, CommandProposal, CommandProposalRisk,
+    CommandProposalRiskReason,
+};
 use quirl_core::{ErrorCode, ShellError, escape_json_terminal_controls, escape_terminal_controls};
 use serde::Serialize;
 use std::{
@@ -13,6 +17,34 @@ use std::{
 
 const CONFIRMATION_BYTES_MAX: usize = 64;
 pub(crate) const NATURAL_PREVIEW_BYTES_MAX: usize = 16 * 1024;
+
+/// Resolve every required retrieval slot from bounded literal user input.
+pub(crate) fn resolve_natural_command_slots(
+    proposal: &mut CommandProposal,
+    catalog: &Catalog,
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+) -> Result<bool, ShellError> {
+    loop {
+        let validated = proposal.validate(catalog)?;
+        let Some(slot) = validated.unresolved_slots().first().cloned() else {
+            return Ok(true);
+        };
+        write!(
+            writer,
+            "required `{}` ({}); enter a literal value or press Ctrl-D to cancel: ",
+            escape_terminal_controls(slot.name()),
+            slot.value_kind().name()
+        )
+        .and_then(|_| writer.flush())
+        .map_err(slot_io_error)?;
+        let Some(literal) = read_slot_literal(reader)? else {
+            return Ok(false);
+        };
+        let value = slot.parse_value(&literal)?;
+        proposal.resolve_slot(&slot, value)?;
+    }
+}
 
 /// Local command-intelligence operations. None execute suggested commands.
 #[derive(Debug, Subcommand)]
@@ -179,6 +211,7 @@ pub(crate) fn execute(command: AiCommand) -> Result<i32, ShellError> {
 pub(crate) fn confirm_natural_command(
     preview: &str,
     risk: CommandProposalRisk,
+    risk_reasons: &[CommandProposalRiskReason],
     reader: &mut impl Read,
     writer: &mut impl Write,
 ) -> Result<bool, ShellError> {
@@ -202,17 +235,63 @@ pub(crate) fn confirm_natural_command(
         return Ok(false);
     }
     if risk == CommandProposalRisk::High {
-        write!(
-            writer,
-            "high-risk effects detected; type `run high-risk` to confirm: "
-        )
-        .and_then(|_| writer.flush())
-        .map_err(confirmation_io_error)?;
+        if risk_reasons.is_empty() {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "high-risk command proposal has no classified reason",
+            )
+            .with_help("Revalidate the proposal against the current catalog"));
+        }
+        writeln!(writer, "high-risk effects:").map_err(confirmation_io_error)?;
+        for reason in risk_reasons {
+            writeln!(writer, "- {}", reason.description()).map_err(confirmation_io_error)?;
+        }
+        write!(writer, "type `run high-risk` to confirm these effects: ")
+            .and_then(|_| writer.flush())
+            .map_err(confirmation_io_error)?;
         if read_confirmation(reader)? != "run high-risk" {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+fn read_slot_literal(reader: &mut impl Read) -> Result<Option<String>, ShellError> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        let count = reader.read(&mut byte).map_err(slot_io_error)?;
+        if count == 0 {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if bytes.len() == COMMAND_PROPOSAL_VALUE_BYTES_MAX {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "natural command slot value exceeded its byte limit",
+            )
+            .with_context(format!(
+                "limit: {COMMAND_PROPOSAL_VALUE_BYTES_MAX}; observed: at least {}",
+                bytes.len() + 1
+            ))
+            .with_help("Enter a shorter literal value"));
+        }
+        bytes.push(byte[0]);
+    }
+    let value = String::from_utf8(bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "natural command slot value is not valid UTF-8",
+        )
+        .with_context(error.to_string())
+        .with_help("Enter the literal as UTF-8 text")
+    })?;
+    Ok(Some(value.trim_end_matches('\r').to_owned()))
 }
 
 fn read_confirmation(reader: &mut impl Read) -> Result<String, ShellError> {
@@ -251,6 +330,15 @@ fn confirmation_io_error(error: std::io::Error) -> ShellError {
     ShellError::new(
         ErrorCode::Io,
         "could not read or display natural command confirmation",
+    )
+    .with_context(error.to_string())
+    .with_help("Check terminal input and output, then retry")
+}
+
+fn slot_io_error(error: std::io::Error) -> ShellError {
+    ShellError::new(
+        ErrorCode::Io,
+        "could not read or display a natural command slot",
     )
     .with_context(error.to_string())
     .with_help("Check terminal input and output, then retry")
@@ -397,6 +485,7 @@ mod tests {
             confirm_natural_command(
                 "'pwd'",
                 CommandProposalRisk::Ordinary,
+                &[],
                 &mut &b"yes\n"[..],
                 &mut output,
             )
@@ -412,6 +501,7 @@ mod tests {
             !confirm_natural_command(
                 "'pwd'",
                 CommandProposalRisk::Ordinary,
+                &[],
                 &mut &b"no\n"[..],
                 &mut Vec::new(),
             )
@@ -421,19 +511,27 @@ mod tests {
 
     #[test]
     fn high_risk_generated_command_requires_a_distinct_second_confirmation() {
+        let mut output = Vec::new();
         assert!(
             confirm_natural_command(
                 "'rm'",
                 CommandProposalRisk::High,
+                &[CommandProposalRiskReason::WriteFilesystem],
                 &mut &b"yes\nrun high-risk\n"[..],
-                &mut Vec::new(),
+                &mut output,
             )
             .unwrap()
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("filesystem writes or deletion")
         );
         assert!(
             !confirm_natural_command(
                 "'rm'",
                 CommandProposalRisk::High,
+                &[CommandProposalRiskReason::WriteFilesystem],
                 &mut &b"yes\nyes\n"[..],
                 &mut Vec::new(),
             )
@@ -448,6 +546,7 @@ mod tests {
             confirm_natural_command(
                 &oversized,
                 CommandProposalRisk::Ordinary,
+                &[],
                 &mut &b"yes\n"[..],
                 &mut Vec::new(),
             )
@@ -460,6 +559,7 @@ mod tests {
             confirm_natural_command(
                 "'pwd'",
                 CommandProposalRisk::Ordinary,
+                &[],
                 &mut input.as_slice(),
                 &mut Vec::new(),
             )
@@ -467,5 +567,88 @@ mod tests {
             .code,
             ErrorCode::ResourceLimit
         );
+    }
+
+    #[test]
+    fn retrieval_slots_are_resolved_as_catalog_declared_literals() {
+        let catalog = Catalog::builtin();
+        let command = catalog
+            .commands
+            .iter()
+            .find(|command| command.path == "quirl describe")
+            .unwrap();
+        let mut proposal = CommandProposal::retrieval_fallback(
+            &catalog,
+            command.id.clone(),
+            "Retrieval selected describe.",
+            "fixture-retriever-v1",
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        assert!(
+            resolve_natural_command_slots(
+                &mut proposal,
+                &catalog,
+                &mut &b"quirl run; touch nope\n"[..],
+                &mut output,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            proposal
+                .validate(&catalog)
+                .unwrap()
+                .render_trusted()
+                .unwrap(),
+            "'quirl' 'describe' 'quirl run; touch nope'"
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("required `command`")
+        );
+    }
+
+    #[test]
+    fn retrieval_slot_cancellation_and_input_limits_fail_without_rendering() {
+        let catalog = Catalog::builtin();
+        let command = catalog
+            .commands
+            .iter()
+            .find(|command| command.path == "quirl describe")
+            .unwrap();
+        let proposal = CommandProposal::retrieval_fallback(
+            &catalog,
+            command.id.clone(),
+            "Retrieval selected describe.",
+            "fixture-retriever-v1",
+        )
+        .unwrap();
+        let mut cancelled = proposal.clone();
+        assert!(
+            !resolve_natural_command_slots(
+                &mut cancelled,
+                &catalog,
+                &mut &b""[..],
+                &mut Vec::new(),
+            )
+            .unwrap()
+        );
+        assert!(cancelled.validate(&catalog).unwrap().has_unresolved_slots());
+
+        let mut oversized = proposal;
+        let input = vec![b'x'; COMMAND_PROPOSAL_VALUE_BYTES_MAX + 1];
+        assert_eq!(
+            resolve_natural_command_slots(
+                &mut oversized,
+                &catalog,
+                &mut input.as_slice(),
+                &mut Vec::new(),
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::ResourceLimit
+        );
+        assert!(oversized.validate(&catalog).unwrap().has_unresolved_slots());
     }
 }

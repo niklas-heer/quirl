@@ -1166,7 +1166,7 @@ impl Catalog {
                     "quirl ai run",
                     "quirl ai run <query...>",
                     "Preview and explicitly confirm one catalog-backed command",
-                    "Uses bounded hybrid retrieval and the retrieval-only CommandProposal fallback to select a current catalog command ID. Trusted Rust code revalidates the ID, renders the exact quoted command, and requires explicit acceptance before the existing execution path is entered. Filesystem writes and process-spawning commands require a distinct second high-risk confirmation. Commands with unresolved required arguments fail without execution; a future local planner may fill only typed catalog argument slots, never arbitrary shell text.",
+                    "Uses bounded hybrid retrieval and the retrieval-only CommandProposal fallback to select a current catalog command ID. Quirl asks the user for each unresolved required value and parses it as the catalog-declared type; neither retrieval nor the slot resolver may invent shell text. Trusted Rust code revalidates the completed proposal, renders the exact quoted command, and requires explicit acceptance before the existing execution path is entered. Unknown effects, filesystem mutation, process spawning, and session changes show their reason and require a distinct second high-risk confirmation.",
                     vec![],
                     &["quirl ai run 'show the current working directory'"],
                     &[

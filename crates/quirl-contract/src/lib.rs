@@ -41,8 +41,9 @@ pub use proposal::{
     COMMAND_PROPOSAL_SCHEMA_DESCRIPTOR, COMMAND_PROPOSAL_SCHEMA_VERSION,
     COMMAND_PROPOSAL_SOURCE_BYTES_MAX, COMMAND_PROPOSAL_VALUE_BYTES_MAX,
     COMMAND_PROPOSAL_VALUES_BYTES_MAX, CommandPlanner, CommandPlanningRequest, CommandProposal,
-    CommandProposalArgument, CommandProposalProvenance, CommandProposalRisk, CommandProposalSource,
-    CommandProposalValue, ValidatedCommandProposal, command_proposal_schema_hash,
+    CommandProposalArgument, CommandProposalProvenance, CommandProposalRisk,
+    CommandProposalRiskReason, CommandProposalSlot, CommandProposalSource, CommandProposalValue,
+    CommandProposalValueKind, ValidatedCommandProposal, command_proposal_schema_hash,
 };
 
 /// Stable, dependency-free hash used in versioned schema identifiers.

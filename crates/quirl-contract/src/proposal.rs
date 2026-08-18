@@ -134,6 +134,126 @@ pub enum CommandProposalRisk {
     High,
 }
 
+/// Catalog-derived reason that a proposal requires high-risk confirmation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandProposalRiskReason {
+    /// The catalog declares no effects, so mutation, transfer, signals, or privilege changes cannot be excluded.
+    EffectsUnknown,
+    /// The catalog declares a filesystem mutation, including possible replacement or deletion.
+    WriteFilesystem,
+    /// The catalog declares process execution, which can include network, signal, or privilege-changing tools.
+    SpawnProcess,
+    /// The catalog declares a persistent working-directory change.
+    ChangeDirectory,
+}
+
+impl CommandProposalRiskReason {
+    /// Return a concise explanation suitable for a confirmation prompt.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::EffectsUnknown => {
+                "effects are undeclared; writes, deletion, network transfer, signals, and privilege changes cannot be excluded"
+            }
+            Self::WriteFilesystem => "catalog declares filesystem writes or deletion",
+            Self::SpawnProcess => {
+                "catalog declares process execution, which may perform network, signal, or privilege-changing operations"
+            }
+            Self::ChangeDirectory => "catalog declares a persistent working-directory change",
+        }
+    }
+}
+
+/// Catalog-declared value class for one unresolved proposal slot.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandProposalValueKind {
+    /// Unconstrained UTF-8 text.
+    Text,
+    /// A filesystem path represented as UTF-8 text.
+    Path,
+    /// A signed 64-bit integer.
+    Integer,
+    /// An unsigned 64-bit integer.
+    Unsigned,
+    /// A Boolean accepted as the exact text `true` or `false`.
+    Boolean,
+}
+
+impl CommandProposalValueKind {
+    /// Return the stable human-readable name of this value class.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Path => "path",
+            Self::Integer => "integer",
+            Self::Unsigned => "unsigned integer",
+            Self::Boolean => "Boolean",
+        }
+    }
+}
+
+/// Validated reference to one unresolved value in a [`CommandProposal`].
+///
+/// The opaque argument index is tied to a command ID and argument shape. A
+/// stale or mismatched slot is rejected by [`CommandProposal::resolve_slot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandProposalSlot {
+    command_id: String,
+    argument_index: usize,
+    name: String,
+    kind: ArgumentKind,
+    value_kind: CommandProposalValueKind,
+}
+
+impl CommandProposalSlot {
+    /// Return the canonical catalog argument name shown to the user.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Return the catalog-declared value class used to parse a literal.
+    pub const fn value_kind(&self) -> CommandProposalValueKind {
+        self.value_kind
+    }
+
+    /// Parse one bounded user literal into the catalog-declared proposal type.
+    pub fn parse_value(&self, literal: &str) -> Result<CommandProposalValue, ShellError> {
+        validate_limit(
+            "command proposal slot value bytes",
+            literal.len(),
+            COMMAND_PROPOSAL_VALUE_BYTES_MAX,
+        )?;
+        if literal.contains('\0') {
+            return Err(validation_error(
+                "command proposal slot value contains an interior NUL byte",
+                "Remove the NUL byte and retry",
+            ));
+        }
+        match self.value_kind {
+            CommandProposalValueKind::Text => Ok(CommandProposalValue::Text(literal.to_owned())),
+            CommandProposalValueKind::Path => Ok(CommandProposalValue::Path(literal.to_owned())),
+            CommandProposalValueKind::Integer => literal
+                .parse::<i64>()
+                .map(CommandProposalValue::Integer)
+                .map_err(|error| typed_slot_error(self, literal, error.to_string())),
+            CommandProposalValueKind::Unsigned => literal
+                .parse::<u64>()
+                .map(CommandProposalValue::Unsigned)
+                .map_err(|error| typed_slot_error(self, literal, error.to_string())),
+            CommandProposalValueKind::Boolean => match literal {
+                "true" => Ok(CommandProposalValue::Boolean(true)),
+                "false" => Ok(CommandProposalValue::Boolean(false)),
+                _ => Err(typed_slot_error(
+                    self,
+                    literal,
+                    "expected exact `true` or `false`".to_owned(),
+                )),
+            },
+        }
+    }
+}
+
 /// Bounded natural-language request passed to a [`CommandPlanner`].
 #[derive(Debug, Clone, Copy)]
 pub struct CommandPlanningRequest<'a> {
@@ -189,6 +309,8 @@ pub struct ValidatedCommandProposal {
     arguments: Vec<ValidatedArgument>,
     effects: Vec<Effect>,
     risk: CommandProposalRisk,
+    risk_reasons: Vec<CommandProposalRiskReason>,
+    unresolved_slots: Vec<CommandProposalSlot>,
 }
 
 impl CommandProposal {
@@ -261,7 +383,8 @@ impl CommandProposal {
         let mut occurrence_counts = vec![0_usize; command.options.len()];
         let mut aggregate_value_bytes = 0_usize;
         let mut arguments = Vec::with_capacity(self.arguments.len());
-        for proposed in &self.arguments {
+        let mut unresolved_slots = Vec::new();
+        for (proposal_index, proposed) in self.arguments.iter().enumerate() {
             let (name, kind, value) = proposed_parts(proposed);
             validate_nonempty_bounded(
                 "proposal argument name",
@@ -286,6 +409,15 @@ impl CommandProposal {
             }
 
             let canonical_name = canonical_argument_name(command, specification)?.to_owned();
+            if matches!(value, Some(CommandProposalValue::Unresolved)) {
+                unresolved_slots.push(CommandProposalSlot {
+                    command_id: self.command_id.clone(),
+                    argument_index: proposal_index,
+                    name: canonical_name.clone(),
+                    kind,
+                    value_kind: declared_value_kind(&specification.value_type).into(),
+                });
+            }
             let validated = match (kind, value) {
                 (ArgumentKind::Flag, None) => ValidatedArgument::Flag {
                     name: canonical_name,
@@ -347,14 +479,84 @@ impl CommandProposal {
         }
 
         let effects = command.effects.clone();
-        let risk = classify_risk(&effects);
+        let risk_reasons = classify_risk_reasons(&effects);
+        let risk = if risk_reasons.is_empty() {
+            CommandProposalRisk::Ordinary
+        } else {
+            CommandProposalRisk::High
+        };
         Ok(ValidatedCommandProposal {
             proposal: self.clone(),
             command_path: command.path.clone(),
             arguments,
             effects,
             risk,
+            risk_reasons,
+            unresolved_slots,
         })
+    }
+
+    /// Resolve one previously validated slot with a typed value.
+    ///
+    /// This operation checks the command ID, argument index, argument shape,
+    /// unresolved state, and value class before mutation. The complete proposal
+    /// must still be revalidated against the current catalog afterward.
+    pub fn resolve_slot(
+        &mut self,
+        slot: &CommandProposalSlot,
+        value: CommandProposalValue,
+    ) -> Result<(), ShellError> {
+        if slot.command_id != self.command_id {
+            return Err(validation_error(
+                "command proposal slot belongs to a different command",
+                "Revalidate the proposal and resolve only its current slots",
+            ));
+        }
+        let proposed = self.arguments.get_mut(slot.argument_index).ok_or_else(|| {
+            validation_error(
+                "command proposal slot index is stale",
+                "Revalidate the proposal and resolve only its current slots",
+            )
+        })?;
+        let (name, kind, current) = proposed_parts_mut(proposed);
+        if name != slot.name || kind != slot.kind {
+            return Err(validation_error(
+                "command proposal slot shape changed after validation",
+                "Revalidate the proposal and resolve only its current slots",
+            ));
+        }
+        let Some(current) = current else {
+            return Err(validation_error(
+                "command proposal flag cannot accept a slot value",
+                "Resolve only positional or valued-option slots",
+            ));
+        };
+        if !matches!(current, CommandProposalValue::Unresolved) {
+            return Err(validation_error(
+                "command proposal slot was already resolved",
+                "Revalidate the proposal before resolving another value",
+            ));
+        }
+        if matches!(value, CommandProposalValue::Unresolved) {
+            return Err(validation_error(
+                "command proposal slot resolution remained unresolved",
+                "Supply a concrete typed value",
+            ));
+        }
+        let observed: CommandProposalValueKind = proposal_value_kind(&value).into();
+        if observed != slot.value_kind {
+            return Err(validation_error(
+                &format!(
+                    "command proposal slot `{}` expects {} but received {}",
+                    slot.name,
+                    slot.value_kind.name(),
+                    observed.name()
+                ),
+                "Parse the literal through the validated slot before resolving it",
+            ));
+        }
+        *current = value;
+        Ok(())
     }
 }
 
@@ -379,9 +581,19 @@ impl ValidatedCommandProposal {
         self.risk
     }
 
+    /// Return the catalog-derived reasons for high-risk confirmation.
+    pub fn risk_reasons(&self) -> &[CommandProposalRiskReason] {
+        &self.risk_reasons
+    }
+
+    /// Return validated unresolved slots in proposal order.
+    pub fn unresolved_slots(&self) -> &[CommandProposalSlot] {
+        &self.unresolved_slots
+    }
+
     /// Return whether any argument value remains unresolved.
     pub fn has_unresolved_slots(&self) -> bool {
-        self.arguments.iter().any(ValidatedArgument::is_unresolved)
+        !self.unresolved_slots.is_empty()
     }
 
     /// Render one deterministic literal command after all slots are resolved.
@@ -444,21 +656,6 @@ enum ValidatedArgument {
     },
 }
 
-impl ValidatedArgument {
-    fn is_unresolved(&self) -> bool {
-        matches!(
-            self,
-            Self::Positional {
-                value: CommandProposalValue::Unresolved,
-                ..
-            } | Self::Option {
-                value: CommandProposalValue::Unresolved,
-                ..
-            }
-        )
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeclaredValueKind {
     Text,
@@ -466,6 +663,18 @@ enum DeclaredValueKind {
     Integer,
     Unsigned,
     Boolean,
+}
+
+impl From<DeclaredValueKind> for CommandProposalValueKind {
+    fn from(value: DeclaredValueKind) -> Self {
+        match value {
+            DeclaredValueKind::Text => Self::Text,
+            DeclaredValueKind::Path => Self::Path,
+            DeclaredValueKind::Integer => Self::Integer,
+            DeclaredValueKind::Unsigned => Self::Unsigned,
+            DeclaredValueKind::Boolean => Self::Boolean,
+        }
+    }
 }
 
 fn validate_proposal_envelope(proposal: &CommandProposal) -> Result<(), ShellError> {
@@ -565,6 +774,20 @@ fn validate_command_path(command: &CommandSpec) -> Result<(), ShellError> {
 fn proposed_parts(
     argument: &CommandProposalArgument,
 ) -> (&str, ArgumentKind, Option<&CommandProposalValue>) {
+    match argument {
+        CommandProposalArgument::Positional { name, value } => {
+            (name, ArgumentKind::Positional, Some(value))
+        }
+        CommandProposalArgument::Option { name, value } => {
+            (name, ArgumentKind::Option, Some(value))
+        }
+        CommandProposalArgument::Flag { name } => (name, ArgumentKind::Flag, None),
+    }
+}
+
+fn proposed_parts_mut(
+    argument: &mut CommandProposalArgument,
+) -> (&str, ArgumentKind, Option<&mut CommandProposalValue>) {
     match argument {
         CommandProposalArgument::Positional { name, value } => {
             (name, ArgumentKind::Positional, Some(value))
@@ -742,16 +965,23 @@ fn resolved_value(value: &CommandProposalValue) -> Option<String> {
     }
 }
 
-fn classify_risk(effects: &[Effect]) -> CommandProposalRisk {
-    if !effects.is_empty()
-        && effects
-            .iter()
-            .all(|effect| matches!(effect, Effect::ReadFilesystem))
-    {
-        CommandProposalRisk::Ordinary
-    } else {
-        CommandProposalRisk::High
+fn classify_risk_reasons(effects: &[Effect]) -> Vec<CommandProposalRiskReason> {
+    if effects.is_empty() {
+        return vec![CommandProposalRiskReason::EffectsUnknown];
     }
+    let mut reasons = Vec::new();
+    for effect in effects {
+        let reason = match effect {
+            Effect::ReadFilesystem => continue,
+            Effect::WriteFilesystem => CommandProposalRiskReason::WriteFilesystem,
+            Effect::SpawnProcess => CommandProposalRiskReason::SpawnProcess,
+            Effect::ChangeDirectory => CommandProposalRiskReason::ChangeDirectory,
+        };
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+    reasons
 }
 
 fn push_single_quoted(output: &mut String, value: &str) {
@@ -773,6 +1003,19 @@ fn unresolved_error(command_path: &str, name: &str) -> ShellError {
     )
     .with_command(command_path)
     .with_help("Resolve every explicit slot before rendering the command")
+}
+
+fn typed_slot_error(slot: &CommandProposalSlot, literal: &str, context: String) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        format!(
+            "command proposal slot `{}` could not parse `{literal}` as {}",
+            slot.name,
+            slot.value_kind.name()
+        ),
+    )
+    .with_context(context)
+    .with_help("Enter a literal matching the catalog-declared type")
 }
 
 fn validate_nonempty_bounded(label: &str, value: &str, limit: usize) -> Result<(), ShellError> {
@@ -1035,7 +1278,7 @@ mod tests {
 
     #[test]
     fn unresolved_slots_validate_but_cannot_render() {
-        let proposal = CommandProposal::retrieval_fallback(
+        let mut proposal = CommandProposal::retrieval_fallback(
             &catalog(vec![]),
             "command:demo/run",
             "Retrieval selected the closest catalog entry.",
@@ -1048,12 +1291,88 @@ mod tests {
         );
         let validated = proposal.validate(&catalog(vec![])).unwrap();
         assert!(validated.has_unresolved_slots());
+        let slot = validated.unresolved_slots()[0].clone();
+        assert_eq!(slot.name(), "path");
+        assert_eq!(slot.value_kind(), CommandProposalValueKind::Path);
         assert!(
             validated
                 .render_trusted()
                 .unwrap_err()
                 .message
                 .contains("unresolved")
+        );
+
+        let value = slot.parse_value("fixture path").unwrap();
+        proposal.resolve_slot(&slot, value).unwrap();
+        let resolved = proposal.validate(&catalog(vec![])).unwrap();
+        assert!(!resolved.has_unresolved_slots());
+        assert_eq!(
+            resolved.render_trusted().unwrap(),
+            "'demo' 'run' 'fixture path'"
+        );
+    }
+
+    #[test]
+    fn slot_resolution_rejects_wrong_types_reuse_and_stale_proposals() {
+        let source = catalog(vec![]);
+        let mut proposal = CommandProposal::retrieval_fallback(
+            &source,
+            "command:demo/run",
+            "Retrieval selected the fixture.",
+            "fixture-retriever-v1",
+        )
+        .unwrap();
+        let slot = proposal.validate(&source).unwrap().unresolved_slots()[0].clone();
+        assert_eq!(
+            proposal
+                .resolve_slot(&slot, CommandProposalValue::Text("wrong".to_owned()))
+                .unwrap_err()
+                .code,
+            ErrorCode::Validation
+        );
+        proposal
+            .resolve_slot(&slot, CommandProposalValue::Path("ok".to_owned()))
+            .unwrap();
+        assert!(
+            proposal
+                .resolve_slot(&slot, CommandProposalValue::Path("again".to_owned()))
+                .is_err()
+        );
+
+        let mut other = base_proposal();
+        other.command_id = "command:other".to_owned();
+        assert!(
+            other
+                .resolve_slot(&slot, CommandProposalValue::Path("no".to_owned()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn slot_parser_enforces_declared_types_and_resource_limits() {
+        let mut source = catalog(vec![]);
+        source.commands[0].options[0].value_type = "integer".to_owned();
+        let proposal = CommandProposal::retrieval_fallback(
+            &source,
+            "command:demo/run",
+            "Retrieval selected the fixture.",
+            "fixture-retriever-v1",
+        )
+        .unwrap();
+        let slot = proposal.validate(&source).unwrap().unresolved_slots()[0].clone();
+        assert_eq!(
+            slot.parse_value("-9").unwrap(),
+            CommandProposalValue::Integer(-9)
+        );
+        assert_eq!(
+            slot.parse_value("nine").unwrap_err().code,
+            ErrorCode::Validation
+        );
+        assert_eq!(
+            slot.parse_value(&"x".repeat(COMMAND_PROPOSAL_VALUE_BYTES_MAX + 1))
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceLimit
         );
     }
 
@@ -1095,6 +1414,25 @@ mod tests {
                 .unwrap()
                 .risk(),
             CommandProposalRisk::Ordinary
+        );
+        let unknown = base_proposal().validate(&catalog(vec![])).unwrap();
+        assert_eq!(
+            unknown.risk_reasons(),
+            &[CommandProposalRiskReason::EffectsUnknown]
+        );
+        let combined = base_proposal()
+            .validate(&catalog(vec![
+                Effect::ReadFilesystem,
+                Effect::WriteFilesystem,
+                Effect::SpawnProcess,
+            ]))
+            .unwrap();
+        assert_eq!(
+            combined.risk_reasons(),
+            &[
+                CommandProposalRiskReason::WriteFilesystem,
+                CommandProposalRiskReason::SpawnProcess,
+            ]
         );
     }
 }

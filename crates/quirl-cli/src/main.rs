@@ -511,19 +511,31 @@ fn execute_natural_command(query: &[String]) -> Result<i32, ShellError> {
             .with_context(format!("ranked path: {}", candidate.command))
             .with_help("Refresh the command index and retry the natural-language request")
         })?;
-    let proposal = CommandProposal::retrieval_fallback(
+    let mut proposal = CommandProposal::retrieval_fallback(
         &catalog,
         command.id.clone(),
         format!("retrieved `{}` for the supplied task", command.path),
         "quirl-bounded-hybrid-retrieval-v1",
     )?;
+    let mut input = io::stdin().lock();
+    let mut output = io::stderr().lock();
+    if !ai::resolve_natural_command_slots(&mut proposal, &catalog, &mut input, &mut output)? {
+        writeln!(output, "natural command cancelled").map_err(|error| {
+            ShellError::new(
+                ErrorCode::Io,
+                "could not report natural command cancellation",
+            )
+            .with_context(error.to_string())
+            .with_help("Check that standard error is writable")
+        })?;
+        return Ok(1);
+    }
     let validated = proposal.validate(&catalog)?;
     let preview = validated.render_trusted()?;
     let risk = validated.risk();
+    let risk_reasons = validated.risk_reasons().to_vec();
     let effects = validated.effects().to_vec();
-    let mut input = io::stdin().lock();
-    let mut output = io::stderr().lock();
-    if !ai::confirm_natural_command(&preview, risk, &mut input, &mut output)? {
+    if !ai::confirm_natural_command(&preview, risk, &risk_reasons, &mut input, &mut output)? {
         writeln!(output, "natural command cancelled").map_err(|error| {
             ShellError::new(
                 ErrorCode::Io,
@@ -540,7 +552,11 @@ fn execute_natural_command(query: &[String]) -> Result<i32, ShellError> {
     let current_catalog = load_composed_catalog()?;
     let current = proposal.validate(&current_catalog)?;
     let current_preview = current.render_trusted()?;
-    if current_preview != preview || current.risk() != risk || current.effects() != effects {
+    if current_preview != preview
+        || current.risk() != risk
+        || current.risk_reasons() != risk_reasons
+        || current.effects() != effects
+    {
         return Err(ShellError::new(
             ErrorCode::Validation,
             "the catalog command changed after confirmation",
