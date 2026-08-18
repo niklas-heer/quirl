@@ -33,6 +33,7 @@ const MODEL_WEIGHTS_BYTES_MAX: u64 = 64 * 1024 * 1024;
 const LOCAL_OVERLAY_SCHEMA_VERSION: u32 = 1;
 const LOCAL_RECORDS_MAX: usize = 4_096;
 const LOCAL_NEGATIVE_HITS_MAX: usize = 1_024;
+const LOCAL_OVERLAY_QUERIES_MAX: usize = 8_192;
 const LOCAL_PATH_DEPTH_MAX: usize = 16;
 const LOCAL_SEGMENT_BYTES_MAX: usize = 256;
 const LOCAL_TEXT_BYTES_MAX: usize = 4 * 1024;
@@ -679,6 +680,129 @@ pub(crate) fn read_local_overlay(
     })
 }
 
+/// Read identity-valid overlay facts for a bounded set of runtime identities.
+///
+/// The single SQLite admission avoids reopening and deserializing the database
+/// once per PATH executable. Duplicate identities and records are coalesced in
+/// deterministic order before returning.
+pub(crate) fn read_local_overlays(
+    bytes: &[u8],
+    path: &Path,
+    queries: &[LocalOverlayQuery],
+) -> Result<LocalOverlay, ShellError> {
+    if queries.len() > LOCAL_OVERLAY_QUERIES_MAX {
+        return Err(resource_limit(
+            "local overlay identity queries",
+            LOCAL_OVERLAY_QUERIES_MAX,
+            queries.len(),
+        ));
+    }
+    let mut identities = BTreeMap::new();
+    for query in queries {
+        validate_fingerprint(
+            "native catalog fingerprint",
+            &query.native_catalog_fingerprint,
+        )?;
+        validate_fingerprint("executable fingerprint", &query.executable_fingerprint)?;
+        validate_fingerprint("provider fingerprint", &query.provider_fingerprint)?;
+        validate_fingerprint("environment fingerprint", &query.environment_fingerprint)?;
+        validate_persisted_u64("overlay query timestamp", query.now_unix_ms)?;
+        identities.insert(
+            (
+                query.executable_fingerprint.clone(),
+                query.provider_fingerprint.clone(),
+                query.cwd_class,
+                query.environment_fingerprint.clone(),
+            ),
+            query.now_unix_ms,
+        );
+    }
+    let connection = deserialize_database(bytes, path)?;
+    validate_schema(&connection, path)?;
+    let stored = read_local_overlay_unfiltered(&connection, path)?;
+    if queries
+        .first()
+        .is_none_or(|query| query.native_catalog_fingerprint != stored.native_catalog_fingerprint)
+        || queries
+            .iter()
+            .any(|query| query.native_catalog_fingerprint != stored.native_catalog_fingerprint)
+    {
+        return Ok(LocalOverlay {
+            records: Vec::new(),
+            negative_hits: Vec::new(),
+        });
+    }
+    let mut records = stored
+        .records
+        .into_iter()
+        .filter(|record| {
+            record.refresh_state == LocalRefreshState::Fresh
+                && identities.contains_key(&(
+                    record.executable_fingerprint.clone(),
+                    record.provider_fingerprint.clone(),
+                    record.cwd_class,
+                    record.environment_fingerprint.clone(),
+                ))
+        })
+        .collect::<Vec<_>>();
+    sort_local_records(&mut records);
+    records.dedup();
+    let mut negative_hits = stored
+        .negative_hits
+        .into_iter()
+        .filter(|hit| {
+            identities
+                .get(&(
+                    hit.executable_fingerprint.clone(),
+                    hit.provider_fingerprint.clone(),
+                    hit.cwd_class,
+                    hit.environment_fingerprint.clone(),
+                ))
+                .is_some_and(|now_unix_ms| hit.expires_unix_ms > *now_unix_ms)
+        })
+        .collect::<Vec<_>>();
+    negative_hits.sort();
+    negative_hits.dedup();
+    Ok(LocalOverlay {
+        records,
+        negative_hits,
+    })
+}
+
+/// Copy a valid local overlay into a newly encoded catalog generation.
+///
+/// Catalog rebuilds create a fresh SQLite image. This transition preserves the
+/// independently identity-validated overlay only when both images use the same
+/// native-catalog identity; malformed prior bytes remain an operating error.
+pub(crate) fn preserve_local_overlay(
+    prior_bytes: &[u8],
+    prior_path: &Path,
+    new_bytes: &[u8],
+    new_path: &Path,
+) -> Result<Vec<u8>, ShellError> {
+    let prior_connection = deserialize_database(prior_bytes, prior_path)?;
+    validate_schema(&prior_connection, prior_path)?;
+    let stored = read_local_overlay_unfiltered(&prior_connection, prior_path)?;
+    let mut new_connection = deserialize_database(new_bytes, new_path)?;
+    validate_schema(&new_connection, new_path)?;
+    let new_identity: String = new_connection
+        .query_row(
+            "SELECT native_catalog_fingerprint FROM local_overlay_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| invalid_database(new_path, error))?;
+    if new_identity == stored.native_catalog_fingerprint {
+        rewrite_local_overlay(
+            &mut new_connection,
+            &new_identity,
+            &stored.records,
+            &stored.negative_hits,
+        )?;
+    }
+    serialize_database(&new_connection)
+}
+
 /// Select one primary description without separating it from its provenance.
 ///
 /// Useful content follows the exact source-tier order. Generated discovery
@@ -833,6 +957,8 @@ pub(crate) fn record_local_negative_hit(
 const _: () = {
     let _ = read_local_overlay
         as fn(&[u8], &Path, &LocalOverlayQuery) -> Result<LocalOverlay, ShellError>;
+    let _ = read_local_overlays
+        as fn(&[u8], &Path, &[LocalOverlayQuery]) -> Result<LocalOverlay, ShellError>;
     let _ = merge_local_provider_result
         as fn(&[u8], &Path, &str, &[LocalCompletionRecord]) -> Result<Vec<u8>, ShellError>;
     let _ = record_local_negative_hit
@@ -2729,6 +2855,46 @@ mod tests {
             decode_database(&left, path).unwrap().0,
             Catalog::builtin(),
             "overlay updates must retain the canonical catalog generation",
+        );
+    }
+
+    #[test]
+    fn batched_overlay_reads_deduplicate_identities_and_enforce_the_query_bound() {
+        let path = Path::new("catalog.sqlite3");
+        let base = encode_database(&Catalog::builtin(), None).unwrap();
+        let bytes = merge_local_provider_result(
+            &base,
+            path,
+            crate::native_catalog::embedded_database_identity(),
+            &[local_record("alpha")],
+        )
+        .unwrap();
+        let query = local_query(3_000);
+        let overlay = read_local_overlays(&bytes, path, &[query.clone(), query]).unwrap();
+        assert_eq!(overlay.records.len(), 1);
+
+        let excessive = vec![local_query(3_000); LOCAL_OVERLAY_QUERIES_MAX + 1];
+        let error = read_local_overlays(&bytes, path, &excessive).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn catalog_reencoding_preserves_positive_and_negative_overlay_bytes() {
+        let path = Path::new("catalog.sqlite3");
+        let base = encode_database(&Catalog::builtin(), Some("{\"generation\":1}")).unwrap();
+        let native = crate::native_catalog::embedded_database_identity();
+        let positive =
+            merge_local_provider_result(&base, path, native, &[local_record("alpha")]).unwrap();
+        let prior =
+            record_local_negative_hit(&positive, path, native, &local_negative(2_000)).unwrap();
+        let fresh = encode_database(&Catalog::builtin(), Some("{\"generation\":2}")).unwrap();
+        let preserved = preserve_local_overlay(&prior, path, &fresh, path).unwrap();
+        let overlay = read_local_overlays(&preserved, path, &[local_query(3_000)]).unwrap();
+        assert_eq!(overlay.records.len(), 1);
+        assert_eq!(overlay.negative_hits.len(), 1);
+        assert_eq!(
+            decode_database(&preserved, path).unwrap().1.as_deref(),
+            Some("{\"generation\":2}")
         );
     }
 

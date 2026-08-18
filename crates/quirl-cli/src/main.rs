@@ -26,7 +26,7 @@ mod script;
 
 use agent::AgentCommand;
 use ai::AiCommand;
-use ai_bootstrap::InteractiveAiBootstrap;
+use ai_bootstrap::{InteractiveAiBootstrap, LocalCompletionRequester};
 use author::{DescribeCommand, DocCommand, NewCommand};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::ConfigCommand;
@@ -2931,7 +2931,10 @@ fn configured_initial_editor(
     history_path: &Path,
 ) -> Result<(SessionEditor, Option<Arc<Catalog>>), ShellError> {
     if select_surface(&config.ui.surface) == SurfaceKind::Rich {
-        let completion_adapter = LuaCompletionAdapter::new(Arc::clone(extensions));
+        let completion_adapter = LocalAwareCompletionAdapter::new(
+            Arc::clone(extensions),
+            ai_bootstrap.local_completion_requester(),
+        );
         let picker_ranker: Arc<dyn PickerRanker> = Arc::new(SharedPickerRanker);
         let loader: CatalogLoader = Box::new(load_rich_catalog);
         let mut editor = RichSurface::new_deferred(
@@ -2963,7 +2966,10 @@ fn configured_editor(
     config: QuirlConfig,
     history_path: &Path,
 ) -> Result<SessionEditor, ShellError> {
-    let completion_adapter = LuaCompletionAdapter::new(Arc::clone(extensions));
+    let completion_adapter = LocalAwareCompletionAdapter::new(
+        Arc::clone(extensions),
+        ai_bootstrap.local_completion_requester(),
+    );
     let picker_ranker: Arc<dyn PickerRanker> = Arc::new(SharedPickerRanker);
     if select_surface(&config.ui.surface) == SurfaceKind::Rich {
         return RichSurface::new(
@@ -2992,6 +2998,27 @@ fn configured_editor(
 
 #[derive(Debug)]
 struct SharedPickerRanker;
+
+struct LocalAwareCompletionAdapter {
+    lua: LuaCompletionAdapter,
+    local: LocalCompletionRequester,
+}
+
+impl LocalAwareCompletionAdapter {
+    fn new(extensions: Arc<Mutex<LuaExtensionHost>>, local: LocalCompletionRequester) -> Self {
+        Self {
+            lua: LuaCompletionAdapter::new(extensions),
+            local,
+        }
+    }
+}
+
+impl ExtensionCompleter for LocalAwareCompletionAdapter {
+    fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
+        self.local.request(line, pos);
+        self.lua.complete(line, pos)
+    }
+}
 
 #[derive(Default)]
 struct AiIntentCompleter {

@@ -42,6 +42,7 @@ const CHECK_NAMES: &[&str] = &[
     "cwd-history",
     "retained-output-cycles",
     "external-command-compatibility",
+    "local-completion-discovery",
     "rich-review-regressions",
     "native-job-control",
     "noninteractive-dialect-islands",
@@ -92,6 +93,8 @@ impl Session {
         let private = TempDirectory::new("quirl-pty")?;
         let config_dir = private.path.join("config");
         create_private_directory(&config_dir)?;
+        let xdg_config_dir = private.path.join("xdg-config");
+        create_private_directory(&xdg_config_dir)?;
         let temporary_dir = private.path.join("tmp");
         create_private_directory(&temporary_dir)?;
         let semantic_hints = options.semantic_hints.unwrap_or(true);
@@ -117,13 +120,25 @@ return quirl.config {{
 "#
             ),
         )?;
-        if let Some(completion) = options.fish_completion.as_deref() {
-            let fish_dir = config_dir.join("fish");
-            create_private_directory(&fish_dir)?;
-            let completion_dir = fish_dir.join("completions");
-            create_private_directory(&completion_dir)?;
-            fs::write(completion_dir.join("ghq.fish"), completion)?;
-        }
+        let completion_roots = if options.path.is_some()
+            || options.catalog_refresh_enabled
+            || options.fish_completion.is_some()
+        {
+            let roots = private.path.join("completion-roots");
+            create_private_directory(&roots)?;
+            let fish = roots.join("fish");
+            let bash = roots.join("bash");
+            let zsh = roots.join("zsh");
+            create_private_directory(&fish)?;
+            create_private_directory(&bash)?;
+            create_private_directory(&zsh)?;
+            if let Some(completion) = options.fish_completion.as_deref() {
+                fs::write(fish.join("ghq.fish"), completion)?;
+            }
+            Some((fish, bash, zsh))
+        } else {
+            None
+        };
 
         let path = options.path.clone().map_or_else(
             || env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin")),
@@ -185,7 +200,7 @@ return quirl.config {{
             ),
             (
                 OsString::from("XDG_CONFIG_HOME"),
-                private.path.join("xdg-config").into_os_string(),
+                xdg_config_dir.into_os_string(),
             ),
             (
                 OsString::from("XDG_DATA_HOME"),
@@ -209,6 +224,11 @@ return quirl.config {{
                 OsString::from("QUIRL_TEST_CATALOG_FAILURE"),
                 OsString::from("1"),
             );
+        }
+        if let Some((fish, bash, zsh)) = completion_roots {
+            environment.insert(OsString::from("QUIRL_FISH_PATH"), fish.into_os_string());
+            environment.insert(OsString::from("QUIRL_BASH_PATH"), bash.into_os_string());
+            environment.insert(OsString::from("QUIRL_ZSH_PATH"), zsh.into_os_string());
         }
         // PTYs that do not exercise discovery must not inherit the host's PATH
         // catalog. Dedicated discovery sessions enable the one background
@@ -420,7 +440,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 18] {
+fn checks() -> [CheckCase; 19] {
     [
         CheckCase {
             name: "rich-editing",
@@ -469,6 +489,10 @@ fn checks() -> [CheckCase; 18] {
         CheckCase {
             name: "external-command-compatibility",
             run: check_external_command_compatibility,
+        },
+        CheckCase {
+            name: "local-completion-discovery",
+            run: check_local_completion_discovery,
         },
         CheckCase {
             name: "rich-review-regressions",
@@ -602,6 +626,7 @@ fn check_rich_editing(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.send(key::ENTER)?;
     session.pty.wait_for_screen_text("DELETE_OK")?;
     session.pty.type_text("/usr/bin/printf UNICODE_e\u{301}")?;
+    session.pty.drain_for(Duration::from_millis(50))?;
     session.pty.send(b"\x7f")?;
     enter_and_wait(&mut session, "OK", b"UNICODE_OK")?;
     session.pty.type_text("/usr/bin/printf CTRLD_XOK")?;
@@ -788,7 +813,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
             rows: Some(18),
             columns: Some(120),
             path: Some(binary_dir),
-            index_dir: Some(index_dir),
+            index_dir: Some(index_dir.clone()),
             ..SessionOptions::default()
         },
     )?;
@@ -858,11 +883,22 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
             "source: external",
         ),
     ] {
-        wait_for_command_information(
+        if let Err(error) = wait_for_command_information(
             &mut session,
             command,
             &[summary, "Capabilities:", provenance],
-        )?;
+        ) {
+            let database = read_bounded_fixture(
+                &index_dir.join("catalog.sqlite3"),
+                DISCOVERY_ARTIFACT_BYTES_MAX,
+            )
+            .unwrap_or_default();
+            return Err(io::Error::other(format!(
+                "{error}; command={command:?}; database_has_command={}",
+                contains(&database, command.as_bytes())
+            ))
+            .into());
+        }
         session.pty.send(key::ESCAPE)?;
         wait_for_standard_status(&mut session)?;
         clear_editor(&mut session)?;
@@ -1775,6 +1811,94 @@ complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Prin
         0,
         "external command compatibility",
     )
+}
+
+fn check_local_completion_discovery(binary: &Path) -> Result<(), Box<dyn Error>> {
+    // Failure model: provider code is untrusted and editor revisions can repeat
+    // while one background generation is running. Fake shells make invocation,
+    // framing, and persistence deterministic without host rc files or binaries.
+    let fixtures = TempDirectory::new("quirl-local-completion")?;
+    let binary_dir = fixtures.path.join("bin");
+    let index_dir = fixtures.path.join("index");
+    create_private_directory(&binary_dir)?;
+    create_private_directory(&index_dir)?;
+    let calls = fixtures.path.join("provider-calls");
+    let provider = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nprintf 'QLB10000000400000013repomanage repositories0000000600000009--jsonemit JSON'\n",
+        shell_quote(&calls)
+    );
+    for shell in ["fish", "zsh"] {
+        write_executable(&binary_dir.join(shell), &provider)?;
+    }
+    write_executable(&binary_dir.join("ghq"), "#!/bin/sh\nexit 0\n")?;
+    let mut session = Session::new(
+        binary,
+        SessionOptions {
+            path: Some(binary_dir),
+            index_dir: Some(index_dir.clone()),
+            catalog_refresh_enabled: true,
+            fish_completion: Some("# dynamic provider fixture\n".to_owned()),
+            rows: Some(20),
+            columns: Some(200),
+            ..SessionOptions::default()
+        },
+    )?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    let catalog_path = index_dir.join("catalog.sqlite3");
+    if let Err(error) = wait_for_file_contents(&mut session, &catalog_path, b"manage repositories")
+    {
+        let calls = fs::read_to_string(&calls).unwrap_or_else(|_| "<no calls>".to_owned());
+        let database =
+            read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX).unwrap_or_default();
+        return Err(io::Error::other(format!(
+            "{error}; provider calls={calls:?}; database_has_ghq={} database_has_fish={} database_has_provider_identity={}; screen=\n{}",
+            contains(&database, b"ghq"),
+            contains(&database, b"ghq.fish"),
+            contains(&database, b"local_providers"),
+            session.pty.screen().text()
+        ))
+        .into());
+    }
+    wait_for_file_contents(&mut session, &catalog_path, b"emit JSON")?;
+    execute_and_resume(&mut session, "cd .")?;
+
+    session.pty.type_text("ghq ")?;
+    session.pty.send(b"\t")?;
+    session
+        .pty
+        .wait_for_screen("local provider root completion", |screen| {
+            let text = screen.text();
+            text.contains("repo") && text.contains("manage repositories")
+        })?;
+    session.pty.send(key::ESCAPE)?;
+    clear_editor(&mut session)?;
+
+    session.pty.type_text("ghq repo ")?;
+    session.pty.send(b"\t")?;
+    wait_for_file_contents(&mut session, &calls, b"repo")?;
+    session.pty.send(key::ESCAPE)?;
+    clear_editor(&mut session)?;
+    execute_and_resume(&mut session, "cd .")?;
+    session.pty.type_text("ghq repo --")?;
+    session.pty.send(b"\t")?;
+    session
+        .pty
+        .wait_for_screen("incremental nested provider completion", |screen| {
+            let text = screen.text();
+            text.contains("--json") && text.contains("emit JSON")
+        })?;
+
+    session.pty.send(key::ESCAPE)?;
+    clear_editor(&mut session)?;
+    let cleanup_start = session.pty.output().len();
+    session.pty.send(key::CTRL_D)?;
+    ensure_status(
+        session.pty.wait_exit()?,
+        0,
+        "local completion discovery EOF",
+    )?;
+    ensure_terminal_restored(&session, cleanup_start, "local completion discovery EOF")?;
+    assert_discovery_artifacts_bounded(&index_dir)
 }
 
 fn transcript_tail_flows_into_prompt(screen: &VirtualScreen, command: &str, output: &str) -> bool {

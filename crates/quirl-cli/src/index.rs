@@ -4,8 +4,9 @@ use crate::{
 };
 use clap::{ArgAction, Subcommand, ValueEnum};
 use quirl_catalog::{
-    Catalog, CommandSpec, Confidence, Effect, ImportDiagnostic, ImportReport, IoContract,
-    Provenance, ProvenanceInfo, import_bash, import_fish, import_help, import_man, import_zsh,
+    ArgumentKind, ArgumentSpec, Catalog, CommandSpec, Confidence, Effect, ImportDiagnostic,
+    ImportReport, IoContract, Provenance, ProvenanceInfo, Trust, import_bash, import_fish,
+    import_help, import_man, import_zsh,
 };
 use quirl_core::{
     AtomicReplaceOptions, ErrorCode, ShellError, escape_json_terminal_controls,
@@ -13,7 +14,7 @@ use quirl_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env,
     ffi::OsString,
     fs::{self, File, OpenOptions},
@@ -26,6 +27,13 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use quirl_process::local_completion::{
+    LocalCompletionLimits as ProcessCompletionLimits,
+    LocalCompletionOutcome as ProcessCompletionOutcome, LocalCompletionProcess,
+    LocalCompletionProvider as ProcessCompletionProvider, LocalCompletionRequest,
+};
+use quirl_syntax::parse_command_list;
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -48,11 +56,20 @@ const AUTOMATIC_MAN_DIAGNOSTICS_MAX: usize = 128;
 const MAN_CANDIDATE_PATH_BYTES_MAX: usize = 1024 * 1024;
 const INDEX_DIAGNOSTIC_ORIGIN_BYTES_MAX: usize = 1024;
 const INDEX_DIAGNOSTIC_MESSAGE_BYTES_MAX: usize = 512;
-const DISCOVERY_STATE_VERSION: u32 = 2;
+const DISCOVERY_STATE_VERSION: u32 = 3;
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DISCOVERY_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const DISCOVERY_DEADLINE: Duration = Duration::from_millis(750);
 const BACKGROUND_DISCOVERY_DEADLINE: Duration = Duration::from_secs(30);
+const LOCAL_PROBE_QUEUE_MAX: usize = 64;
+const LOCAL_PROBE_PATH_DEPTH_MAX: usize = 8;
+const LOCAL_PROBE_SEGMENT_BYTES_MAX: usize = 256;
+const LOCAL_INITIAL_PATHS_MAX: usize = 64;
+const LOCAL_PROVIDER_CONCURRENCY_MAX: usize = 2;
+const LOCAL_PROVIDER_DEADLINE: Duration = Duration::from_millis(400);
+const LOCAL_PROVIDER_OUTPUT_BYTES_MAX: usize = 256 * 1024;
+const LOCAL_PROVIDER_CANDIDATES_MAX: usize = 256;
+const LOCAL_PROVIDER_ROOTS_MAX: usize = 16;
 static NEXT_INDEX_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 /// A cancellable, bounded background refresh owned by one interactive session.
@@ -63,6 +80,7 @@ pub struct CatalogRefresh {
     changed: Arc<AtomicBool>,
     requested_generation: Arc<AtomicU64>,
     wake: Arc<(Mutex<()>, Condvar)>,
+    local_probes: Arc<Mutex<LocalProbeQueue>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -93,6 +111,30 @@ impl CatalogRefresh {
             &self.requested_generation,
             "catalog refresh request generation",
         )?;
+        self.wake.1.notify_one();
+        Ok(())
+    }
+
+    pub(crate) fn request_local_completion(
+        &self,
+        line: &str,
+        cursor: usize,
+    ) -> Result<(), ShellError> {
+        let Some(command_path) = command_path_for_probe(line, cursor)? else {
+            return Ok(());
+        };
+        let _guard = self.wake.0.lock().map_err(|_| {
+            ShellError::new(
+                ErrorCode::Io,
+                "the local completion request lock was poisoned",
+            )
+            .with_help("Restart Quirl to create a fresh catalog worker")
+        })?;
+        let mut probes = self.local_probes.lock().map_err(|_| {
+            ShellError::new(ErrorCode::Io, "the local completion queue was poisoned")
+                .with_help("Restart Quirl to create a fresh catalog worker")
+        })?;
+        probes.push(command_path)?;
         self.wake.1.notify_one();
         Ok(())
     }
@@ -134,10 +176,45 @@ struct CatalogRefreshWorker {
     changed: Arc<AtomicBool>,
     requested_generation: Arc<AtomicU64>,
     wake: Arc<(Mutex<()>, Condvar)>,
+    local_probes: Arc<Mutex<LocalProbeQueue>>,
     observer: Arc<dyn CatalogRefreshObserver>,
     refresh_interval: Duration,
     refresh_deadline: Duration,
     reload_environment: bool,
+}
+
+#[derive(Default)]
+struct LocalProbeQueue {
+    pending: VecDeque<Vec<String>>,
+    queued: BTreeSet<Vec<String>>,
+}
+
+impl LocalProbeQueue {
+    fn push(&mut self, command_path: Vec<String>) -> Result<(), ShellError> {
+        if self.queued.contains(&command_path) {
+            return Ok(());
+        }
+        if self.pending.len() >= LOCAL_PROBE_QUEUE_MAX {
+            return Err(index_limit_error(
+                "queued local completion paths",
+                LOCAL_PROBE_QUEUE_MAX,
+                self.pending.len().saturating_add(1),
+            ));
+        }
+        self.queued.insert(command_path.clone());
+        self.pending.push_back(command_path);
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Vec<Vec<String>> {
+        let pending = self.pending.drain(..).collect::<Vec<_>>();
+        self.queued.clear();
+        pending
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -186,8 +263,26 @@ struct DiscoveryState {
     source_fingerprint: String,
     catalog_fingerprint: String,
     sources: Vec<DiscoverySource>,
+    local_providers: Vec<LocalProviderIdentity>,
     #[serde(default)]
     diagnostics: Vec<ImportDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+struct LocalProviderIdentity {
+    provider: intelligence::LocalCompletionProvider,
+    shell_path: PathBuf,
+    provider_fingerprint: String,
+    environment_fingerprint: String,
+}
+
+#[derive(Clone)]
+struct LocalProviderContext {
+    identity: LocalProviderIdentity,
+    process_provider: ProcessCompletionProvider,
+    completion_roots: Vec<PathBuf>,
+    environment: Vec<(String, String)>,
 }
 
 struct DiscoverySnapshot {
@@ -678,12 +773,14 @@ fn start_catalog_refresh_with_config(
     let changed = Arc::new(AtomicBool::new(false));
     let requested_generation = Arc::new(AtomicU64::new(1));
     let wake = Arc::new((Mutex::new(()), Condvar::new()));
+    let local_probes = Arc::new(Mutex::new(LocalProbeQueue::default()));
     let worker_state = CatalogRefreshWorker {
         config,
         cancelled: Arc::clone(&cancelled),
         changed: Arc::clone(&changed),
         requested_generation: Arc::clone(&requested_generation),
         wake: Arc::clone(&wake),
+        local_probes: Arc::clone(&local_probes),
         observer,
         refresh_interval,
         refresh_deadline,
@@ -698,6 +795,7 @@ fn start_catalog_refresh_with_config(
         changed,
         requested_generation,
         wake,
+        local_probes,
         worker: Some(worker),
     })
 }
@@ -734,6 +832,7 @@ fn initialize_interactive_catalog_with_deadline(
             limit: DISCOVERY_DEADLINE,
         },
         &cancelled,
+        None,
     ) {
         Ok(refreshed) => Ok(refreshed),
         Err(discovery_error) => ensure_builtin_database(&config.index_path).map_err(|error| {
@@ -810,14 +909,15 @@ impl DiscoveryConfig {
 fn refresh_loop(worker: CatalogRefreshWorker) {
     let mut completed_generation = 0_u64;
     loop {
-        let requested = match wait_for_refresh_request(
+        let work = match wait_for_refresh_request(
             completed_generation,
             &worker.cancelled,
             &worker.requested_generation,
             &worker.wake,
+            &worker.local_probes,
             worker.refresh_interval,
         ) {
-            Ok(Some(requested)) => requested,
+            Ok(Some(work)) => work,
             Ok(None) | Err(_) => return,
         };
         let current = if worker.reload_environment {
@@ -826,11 +926,21 @@ fn refresh_loop(worker: CatalogRefreshWorker) {
             worker.config.clone()
         };
         worker.observer.refresh_started();
-        match refresh_catalog_cache(
-            &current,
-            RefreshDeadline::starting_now(worker.refresh_deadline),
-            &worker.cancelled,
-        ) {
+        let result = match &work {
+            RefreshWork::Full { .. } => refresh_catalog_cache(
+                &current,
+                RefreshDeadline::starting_now(worker.refresh_deadline),
+                &worker.cancelled,
+                Some(Arc::clone(&worker.cancelled)),
+            ),
+            RefreshWork::Local { command_paths } => refresh_local_completion_paths(
+                &current,
+                command_paths,
+                RefreshDeadline::starting_now(worker.refresh_deadline),
+                Arc::clone(&worker.cancelled),
+            ),
+        };
+        match result {
             Ok(true) => {
                 worker.changed.store(true, Ordering::Release);
                 worker.observer.refresh_published();
@@ -841,8 +951,15 @@ fn refresh_loop(worker: CatalogRefreshWorker) {
         if worker.cancelled.load(Ordering::Acquire) {
             return;
         }
-        completed_generation = requested;
+        if let RefreshWork::Full { generation } = work {
+            completed_generation = generation;
+        }
     }
+}
+
+enum RefreshWork {
+    Full { generation: u64 },
+    Local { command_paths: Vec<Vec<String>> },
 }
 
 fn wait_for_refresh_request(
@@ -850,8 +967,9 @@ fn wait_for_refresh_request(
     cancelled: &AtomicBool,
     requested_generation: &AtomicU64,
     wake: &(Mutex<()>, Condvar),
+    local_probes: &Mutex<LocalProbeQueue>,
     refresh_interval: Duration,
-) -> Result<Option<u64>, ShellError> {
+) -> Result<Option<RefreshWork>, ShellError> {
     let mut guard = wake.0.lock().map_err(|_| {
         ShellError::new(
             ErrorCode::Io,
@@ -865,8 +983,20 @@ fn wait_for_refresh_request(
         }
         let requested = requested_generation.load(Ordering::Acquire);
         if requested > completed_generation {
-            return Ok(Some(requested));
+            return Ok(Some(RefreshWork::Full {
+                generation: requested,
+            }));
         }
+        let mut probes = local_probes.lock().map_err(|_| {
+            ShellError::new(ErrorCode::Io, "the local completion queue was poisoned")
+                .with_help("Restart Quirl to create a fresh catalog worker")
+        })?;
+        if !probes.is_empty() {
+            return Ok(Some(RefreshWork::Local {
+                command_paths: probes.drain(),
+            }));
+        }
+        drop(probes);
         let (next_guard, wait) = wake.1.wait_timeout(guard, refresh_interval).map_err(|_| {
             ShellError::new(ErrorCode::Io, "the catalog refresh wait lock was poisoned")
                 .with_help("Restart Quirl to create a fresh catalog worker")
@@ -894,6 +1024,7 @@ fn refresh_catalog_cache(
     config: &DiscoveryConfig,
     deadline: RefreshDeadline,
     cancelled: &AtomicBool,
+    local_cancelled: Option<Arc<AtomicBool>>,
 ) -> Result<bool, ShellError> {
     let Some(_coordination) =
         acquire_catalog_coordination(&config.index_path, CoordinationWait::Background)?
@@ -911,41 +1042,94 @@ fn refresh_catalog_cache(
         .saturating_add(config.man_roots.len());
     ensure_index_limit("roots", budget.bounds.roots_max, budget.roots)?;
     let snapshot = discover_sources(config, &mut budget, deadline, cancelled)?;
-    if discovery_cache_is_current(config, &snapshot)? {
+    let provider_contexts = local_provider_contexts(config, &snapshot.sources)?;
+    let base_current = discovery_cache_is_current(
+        config,
+        &snapshot,
+        &provider_contexts
+            .iter()
+            .map(|context| context.identity.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    let (catalog, mut encoded, mut changed) = if base_current {
+        let encoded = read_index(&config.index_path)?;
+        let (catalog, _) = intelligence::decode_database(&encoded, &config.index_path)?;
+        (catalog, encoded, false)
+    } else {
+        ensure_refresh_active(deadline, cancelled, "before source import")?;
+        let (mut catalog, mut import_diagnostics) = catalog_from_files_checked(
+            &snapshot.fish_files,
+            &snapshot.bash_files,
+            &snapshot.zsh_files,
+            &snapshot.help_files,
+            &snapshot.man_files,
+            &mut budget,
+            || ensure_refresh_active(deadline, cancelled, "while importing sources"),
+        )?;
+        catalog.merge(external_commands(&snapshot.executables, &snapshot.sources));
+        ensure_refresh_active(deadline, cancelled, "before cache encoding")?;
+        let catalog_fingerprint = fingerprint_bytes(&encode_catalog(&catalog)?);
+        let mut diagnostics = snapshot.diagnostics.clone();
+        diagnostics.append(&mut import_diagnostics);
+        let state = DiscoveryState {
+            version: DISCOVERY_STATE_VERSION,
+            catalog_schema_version: catalog.schema_version,
+            native_catalog_identity: crate::native_catalog::embedded_database_identity().to_owned(),
+            refreshed_unix_ms: unix_time_ms(),
+            source_fingerprint: snapshot.fingerprint.clone(),
+            catalog_fingerprint,
+            sources: snapshot.sources.clone(),
+            local_providers: provider_contexts
+                .iter()
+                .map(|context| context.identity.clone())
+                .collect(),
+            diagnostics,
+        };
+        let state_json = serde_json::to_string(&state).map_err(json_error)?;
+        let fresh = intelligence::encode_database(&catalog, Some(&state_json))?;
+        let encoded = match read_index(&config.index_path) {
+            Ok(prior) if intelligence::decode_database(&prior, &config.index_path).is_ok() => {
+                intelligence::preserve_local_overlay(
+                    &prior,
+                    &config.index_path,
+                    &fresh,
+                    &config.index_path,
+                )?
+            }
+            Ok(_) | Err(_) => fresh,
+        };
+        (catalog, encoded, true)
+    };
+    if let Some(local_cancelled) = local_cancelled {
+        let command_paths = initial_local_probe_paths(&snapshot, &catalog);
+        let (updated, local_changed) = probe_local_completion_paths(
+            &encoded,
+            &config.index_path,
+            &snapshot.sources,
+            &provider_contexts,
+            &command_paths,
+            deadline,
+            local_cancelled,
+        )?;
+        encoded = updated;
+        changed |= local_changed;
+    }
+    if !changed {
         return Ok(false);
     }
-    ensure_refresh_active(deadline, cancelled, "before source import")?;
-    let (mut catalog, mut import_diagnostics) = catalog_from_files_checked(
-        &snapshot.fish_files,
-        &snapshot.bash_files,
-        &snapshot.zsh_files,
-        &snapshot.help_files,
-        &snapshot.man_files,
-        &mut budget,
-        || ensure_refresh_active(deadline, cancelled, "while importing sources"),
-    )?;
-    catalog.merge(external_commands(&snapshot.executables, &snapshot.sources));
     ensure_refresh_active(deadline, cancelled, "before cache commit")?;
-    let catalog_fingerprint = fingerprint_bytes(&encode_catalog(&catalog)?);
-    let mut diagnostics = snapshot.diagnostics;
-    diagnostics.append(&mut import_diagnostics);
-    let state = DiscoveryState {
-        version: DISCOVERY_STATE_VERSION,
-        catalog_schema_version: catalog.schema_version,
-        native_catalog_identity: crate::native_catalog::embedded_database_identity().to_owned(),
-        refreshed_unix_ms: unix_time_ms(),
-        source_fingerprint: snapshot.fingerprint,
-        catalog_fingerprint,
-        sources: snapshot.sources,
-        diagnostics,
-    };
-    write_catalog_atomically_unlocked(&config.index_path, &catalog, Some(&state))?;
+    write_index_bytes_atomically_unlocked(
+        &config.index_path,
+        &encoded,
+        intelligence::DATABASE_BYTES_MAX,
+    )?;
     Ok(true)
 }
 
 fn discovery_cache_is_current(
     config: &DiscoveryConfig,
     snapshot: &DiscoverySnapshot,
+    local_providers: &[LocalProviderIdentity],
 ) -> Result<bool, ShellError> {
     let Ok(bytes) = read_index(&config.index_path) else {
         return Ok(false);
@@ -967,6 +1151,7 @@ fn discovery_cache_is_current(
         || state.native_catalog_identity != crate::native_catalog::embedded_database_identity()
         || state.source_fingerprint != snapshot.fingerprint
         || state.sources != snapshot.sources
+        || state.local_providers != local_providers
         || age_ms >= stale_ms
     {
         return Ok(false);
@@ -975,6 +1160,569 @@ fn discovery_cache_is_current(
         return Ok(false);
     }
     Ok(true)
+}
+
+fn command_path_for_probe(line: &str, cursor: usize) -> Result<Option<Vec<String>>, ShellError> {
+    if cursor > line.len() || !line.is_char_boundary(cursor) {
+        return Err(ShellError::new(
+            ErrorCode::InvalidArgument,
+            "local completion cursor is outside the UTF-8 command line",
+        )
+        .with_help("Submit a cursor on a valid command-line character boundary"));
+    }
+    let prefix = &line[..cursor];
+    let Ok(parsed) = parse_command_list(prefix) else {
+        return Ok(None);
+    };
+    let Some(command) = parsed
+        .pipelines
+        .last()
+        .and_then(|pipeline| pipeline.commands.last())
+    else {
+        return Ok(None);
+    };
+    let mut words = command.words.clone();
+    if !prefix.chars().next_back().is_some_and(char::is_whitespace) {
+        words.pop();
+    }
+    let command_path = words
+        .into_iter()
+        .take_while(|word| !word.starts_with('-'))
+        .collect::<Vec<_>>();
+    if command_path.is_empty() || command_path[0].contains('/') {
+        return Ok(None);
+    }
+    validate_local_probe_path(&command_path)?;
+    Ok(Some(command_path))
+}
+
+fn validate_local_probe_path(command_path: &[String]) -> Result<(), ShellError> {
+    if command_path.len() > LOCAL_PROBE_PATH_DEPTH_MAX {
+        return Err(index_limit_error(
+            "local completion path depth",
+            LOCAL_PROBE_PATH_DEPTH_MAX,
+            command_path.len(),
+        ));
+    }
+    for segment in command_path {
+        if segment.is_empty()
+            || segment.len() > LOCAL_PROBE_SEGMENT_BYTES_MAX
+            || segment.chars().any(char::is_whitespace)
+            || segment.chars().any(char::is_control)
+            || segment.contains(['/', '\\'])
+        {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "local completion path contains an inadmissible segment",
+            )
+            .with_context(format!(
+                "segment bytes: {}; maximum: {LOCAL_PROBE_SEGMENT_BYTES_MAX}",
+                segment.len()
+            ))
+            .with_help("Use plain command and subcommand names without path separators"));
+        }
+    }
+    Ok(())
+}
+
+fn refresh_local_completion_paths(
+    config: &DiscoveryConfig,
+    command_paths: &[Vec<String>],
+    deadline: RefreshDeadline,
+    cancelled: Arc<AtomicBool>,
+) -> Result<bool, ShellError> {
+    if command_paths.len() > LOCAL_PROBE_QUEUE_MAX {
+        return Err(index_limit_error(
+            "local completion paths per worker turn",
+            LOCAL_PROBE_QUEUE_MAX,
+            command_paths.len(),
+        ));
+    }
+    let Some(_coordination) =
+        acquire_catalog_coordination(&config.index_path, CoordinationWait::Background)?
+    else {
+        return Ok(false);
+    };
+    let bytes = read_index(&config.index_path)?;
+    let (catalog, state_json) = intelligence::decode_database(&bytes, &config.index_path)?;
+    let state_json = state_json.ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "the command database has no discovery identity for local completion",
+        )
+        .with_help("Wait for background command discovery and retry completion")
+    })?;
+    let state: DiscoveryState = serde_json::from_str(&state_json).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "the command database has malformed discovery identity",
+        )
+        .with_context(error.to_string())
+        .with_help("Rebuild the command database")
+    })?;
+    if state.version != DISCOVERY_STATE_VERSION {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "the command database discovery identity is stale",
+        )
+        .with_help("Wait for the background catalog refresh to finish"));
+    }
+    let provider_contexts = local_provider_contexts(config, &state.sources)?;
+    let identities = provider_contexts
+        .iter()
+        .map(|context| context.identity.clone())
+        .collect::<Vec<_>>();
+    if identities != state.local_providers {
+        return Ok(false);
+    }
+    let paths = command_paths
+        .iter()
+        .filter(|path| should_probe_local_path(&catalog, path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let (updated, changed) = probe_local_completion_paths(
+        &bytes,
+        &config.index_path,
+        &state.sources,
+        &provider_contexts,
+        &paths,
+        deadline,
+        cancelled,
+    )?;
+    if changed {
+        write_index_bytes_atomically_unlocked(
+            &config.index_path,
+            &updated,
+            intelligence::DATABASE_BYTES_MAX,
+        )?;
+    }
+    Ok(changed)
+}
+
+fn should_probe_local_path(catalog: &Catalog, command_path: &[String]) -> bool {
+    let path = command_path.join(" ");
+    catalog
+        .commands
+        .iter()
+        .find(|command| command.path == path)
+        .is_none_or(|command| {
+            command.provenance.confidence < Confidence::High || command.options.is_empty()
+        })
+}
+
+fn initial_local_probe_paths(snapshot: &DiscoverySnapshot, catalog: &Catalog) -> Vec<Vec<String>> {
+    let executable_names = snapshot
+        .executables
+        .iter()
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    let mut names = BTreeSet::new();
+    for path in &snapshot.fish_files {
+        if let Some(name) = path.file_stem().and_then(|name| name.to_str())
+            && executable_names.contains(name)
+        {
+            names.insert(name.to_owned());
+        }
+    }
+    for path in &snapshot.zsh_files {
+        if let Some(name) = path.file_name().and_then(|name| name.to_str())
+            && let Some(name) = name.strip_prefix('_')
+            && executable_names.contains(name)
+        {
+            names.insert(name.to_owned());
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| vec![name])
+        .filter(|path| should_probe_local_path(catalog, path))
+        .take(LOCAL_INITIAL_PATHS_MAX)
+        .collect()
+}
+
+fn local_provider_contexts(
+    config: &DiscoveryConfig,
+    sources: &[DiscoverySource],
+) -> Result<Vec<LocalProviderContext>, ShellError> {
+    let path = env::join_paths(&config.path_roots).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "PATH cannot be represented in the controlled completion environment",
+        )
+        .with_context(error.to_string())
+        .with_help("Remove PATH entries containing the platform path separator")
+    })?;
+    let path = path.into_string().map_err(|_| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "PATH contains non-UTF-8 data unsupported by local completion providers",
+        )
+        .with_help("Use UTF-8 PATH entries for Fish and Zsh completion discovery")
+    })?;
+    let environment = vec![("PATH".to_owned(), path)];
+    let environment_fingerprint =
+        fingerprint_bytes(&serde_json::to_vec(&environment).map_err(json_error)?);
+    let mut contexts = Vec::new();
+    for (name, source_kind, process_provider, overlay_provider, roots) in [
+        (
+            "fish",
+            DiscoverySourceKind::Fish,
+            ProcessCompletionProvider::Fish,
+            intelligence::LocalCompletionProvider::Fish,
+            config.fish_roots.as_slice(),
+        ),
+        (
+            "zsh",
+            DiscoverySourceKind::Zsh,
+            ProcessCompletionProvider::Zsh,
+            intelligence::LocalCompletionProvider::Zsh,
+            config.zsh_roots.as_slice(),
+        ),
+    ] {
+        let Some(shell_source) = path_executable_source(name, &config.path_roots, sources) else {
+            continue;
+        };
+        let mut completion_roots = roots
+            .iter()
+            .filter(|root| fs::metadata(root).is_ok_and(|metadata| metadata.is_dir()))
+            .cloned()
+            .collect::<Vec<_>>();
+        completion_roots.sort();
+        completion_roots.dedup();
+        ensure_index_limit(
+            "local completion roots",
+            LOCAL_PROVIDER_ROOTS_MAX,
+            completion_roots.len(),
+        )?;
+        let mut fingerprint_input = Vec::new();
+        fingerprint_input.extend_from_slice(shell_source.fingerprint.as_bytes());
+        for source in sources.iter().filter(|source| source.kind == source_kind) {
+            fingerprint_input.extend_from_slice(source.path.as_os_str().as_encoded_bytes());
+            fingerprint_input.extend_from_slice(source.fingerprint.as_bytes());
+        }
+        for root in &completion_roots {
+            fingerprint_input.extend_from_slice(root.as_os_str().as_encoded_bytes());
+        }
+        contexts.push(LocalProviderContext {
+            identity: LocalProviderIdentity {
+                provider: overlay_provider,
+                shell_path: shell_source.path.clone(),
+                provider_fingerprint: fingerprint_bytes(&fingerprint_input),
+                environment_fingerprint: environment_fingerprint.clone(),
+            },
+            process_provider,
+            completion_roots,
+            environment: environment.clone(),
+        });
+    }
+    contexts.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(contexts)
+}
+
+fn path_executable_source<'a>(
+    name: &str,
+    path_roots: &[PathBuf],
+    sources: &'a [DiscoverySource],
+) -> Option<&'a DiscoverySource> {
+    path_roots.iter().find_map(|root| {
+        let candidate = root.join(name);
+        sources.iter().find(|source| {
+            source.kind == DiscoverySourceKind::PathExecutable && source.path == candidate
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_local_completion_paths(
+    bytes: &[u8],
+    database_path: &Path,
+    sources: &[DiscoverySource],
+    provider_contexts: &[LocalProviderContext],
+    command_paths: &[Vec<String>],
+    deadline: RefreshDeadline,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(Vec<u8>, bool), ShellError> {
+    if command_paths.is_empty() || provider_contexts.is_empty() {
+        return Ok((bytes.to_vec(), false));
+    }
+    let process = LocalCompletionProcess::new(LOCAL_PROVIDER_CONCURRENCY_MAX)?;
+    let now_unix_ms = unix_time_ms();
+    let native_catalog_fingerprint = crate::native_catalog::embedded_database_identity();
+    let mut queries = Vec::new();
+    for command_path in command_paths {
+        validate_local_probe_path(command_path)?;
+        let Some(executable_source) = command_executable_source(command_path, sources) else {
+            continue;
+        };
+        for context in provider_contexts {
+            queries.push(intelligence::LocalOverlayQuery {
+                native_catalog_fingerprint: native_catalog_fingerprint.to_owned(),
+                executable_fingerprint: executable_source.fingerprint.clone(),
+                provider_fingerprint: context.identity.provider_fingerprint.clone(),
+                cwd_class: intelligence::LocalCwdClass::Any,
+                environment_fingerprint: context.identity.environment_fingerprint.clone(),
+                now_unix_ms,
+            });
+        }
+    }
+    let cached = intelligence::read_local_overlays(bytes, database_path, &queries)?;
+    let mut records = Vec::new();
+    let mut negatives = Vec::new();
+    for command_path in command_paths {
+        ensure_refresh_active(deadline, &cancelled, "before local completion probe")?;
+        let Some(executable_source) = command_executable_source(command_path, sources) else {
+            continue;
+        };
+        let pending = provider_contexts
+            .iter()
+            .filter(|context| {
+                !local_probe_is_cached(
+                    &cached,
+                    command_path,
+                    context,
+                    &executable_source.fingerprint,
+                    now_unix_ms,
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            continue;
+        }
+        let remaining = deadline
+            .expires_at
+            .saturating_duration_since(Instant::now());
+        let request_deadline = remaining.min(LOCAL_PROVIDER_DEADLINE);
+        if request_deadline.is_zero() {
+            ensure_refresh_active(deadline, &cancelled, "before local completion spawn")?;
+        }
+        let outcomes = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for context in pending {
+                let request = LocalCompletionRequest {
+                    provider: context.process_provider,
+                    shell_path: context.identity.shell_path.clone(),
+                    command_path: command_path.clone(),
+                    arguments: vec![String::new()],
+                    completion_roots: context.completion_roots.clone(),
+                    completion_scripts: Vec::new(),
+                    environment: context.environment.clone(),
+                    deadline: request_deadline,
+                    cancelled: Arc::clone(&cancelled),
+                    limits: ProcessCompletionLimits {
+                        output_bytes_max: LOCAL_PROVIDER_OUTPUT_BYTES_MAX,
+                        record_count_max: LOCAL_PROVIDER_CANDIDATES_MAX,
+                        field_bytes_max: LOCAL_PROBE_SEGMENT_BYTES_MAX * 4,
+                        candidate_count_max: LOCAL_PROVIDER_CANDIDATES_MAX,
+                        path_depth_max: LOCAL_PROBE_PATH_DEPTH_MAX,
+                        argument_count_max: 1,
+                        completion_root_count_max: LOCAL_PROVIDER_ROOTS_MAX,
+                        completion_script_count_max: 1,
+                        environment_variable_count_max: 8,
+                        environment_bytes_max: 64 * 1024,
+                        input_bytes_max: 128 * 1024,
+                    },
+                };
+                let process = process.clone();
+                workers.push((context, scope.spawn(move || process.complete(request))));
+            }
+            let mut outcomes = Vec::new();
+            for (context, worker) in workers {
+                let result = worker.join().map_err(|_| {
+                    ShellError::new(ErrorCode::Io, "a local completion provider worker panicked")
+                        .with_help("Retry; report repeated provider worker failures")
+                })?;
+                outcomes.push((context, result));
+            }
+            Ok::<_, ShellError>(outcomes)
+        })?;
+        // The process boundary uses ResourceLimit for both provider-local
+        // limits and owner cancellation. Recheck the owner state before
+        // isolating errors so shutdown and the catalog deadline still abort.
+        ensure_refresh_active(
+            deadline,
+            &cancelled,
+            "after local completion provider workers",
+        )?;
+        for (context, outcome) in outcomes {
+            match outcome {
+                Ok(ProcessCompletionOutcome::Completed(result))
+                    if !result.candidates.is_empty() =>
+                {
+                    records.extend(normalize_local_candidates(
+                        command_path,
+                        &context,
+                        &executable_source.fingerprint,
+                        now_unix_ms,
+                        result.candidates,
+                    ));
+                }
+                Ok(ProcessCompletionOutcome::Completed(_))
+                | Ok(ProcessCompletionOutcome::Unavailable(_)) => {
+                    negatives.push(local_negative_observation(
+                        command_path,
+                        &context,
+                        &executable_source.fingerprint,
+                        now_unix_ms,
+                    ));
+                }
+                Err(error)
+                    if matches!(
+                        error.code,
+                        ErrorCode::Io
+                            | ErrorCode::ProcessSpawn
+                            | ErrorCode::Validation
+                            | ErrorCode::ResourceLimit
+                    ) =>
+                {
+                    negatives.push(local_negative_observation(
+                        command_path,
+                        &context,
+                        &executable_source.fingerprint,
+                        now_unix_ms,
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let mut unique = BTreeMap::new();
+    for record in records {
+        unique.insert(
+            (
+                record.command_path.clone(),
+                record.provider,
+                record.kind,
+                record.insertion_text.clone(),
+            ),
+            record,
+        );
+    }
+    let records = unique.into_values().collect::<Vec<_>>();
+    let mut updated = bytes.to_vec();
+    let mut changed = false;
+    if !records.is_empty() {
+        updated = intelligence::merge_local_provider_result(
+            &updated,
+            database_path,
+            native_catalog_fingerprint,
+            &records,
+        )?;
+        changed = true;
+    }
+    for observation in negatives {
+        updated = intelligence::record_local_negative_hit(
+            &updated,
+            database_path,
+            native_catalog_fingerprint,
+            &observation,
+        )?;
+        changed = true;
+    }
+    Ok((updated, changed))
+}
+
+fn local_negative_observation(
+    command_path: &[String],
+    context: &LocalProviderContext,
+    executable_fingerprint: &str,
+    observed_unix_ms: u64,
+) -> intelligence::LocalNegativeObservation {
+    intelligence::LocalNegativeObservation {
+        command_path: command_path.to_vec(),
+        provider: context.identity.provider,
+        executable_fingerprint: executable_fingerprint.to_owned(),
+        provider_fingerprint: context.identity.provider_fingerprint.clone(),
+        cwd_class: intelligence::LocalCwdClass::Any,
+        environment_fingerprint: context.identity.environment_fingerprint.clone(),
+        observed_unix_ms,
+    }
+}
+
+fn command_executable_source<'a>(
+    command_path: &[String],
+    sources: &'a [DiscoverySource],
+) -> Option<&'a DiscoverySource> {
+    let command = command_path.first()?;
+    sources.iter().find(|source| {
+        source.kind == DiscoverySourceKind::PathExecutable
+            && source.path.file_name().and_then(|name| name.to_str()) == Some(command)
+    })
+}
+
+fn local_probe_is_cached(
+    overlay: &intelligence::LocalOverlay,
+    command_path: &[String],
+    context: &LocalProviderContext,
+    executable_fingerprint: &str,
+    now_unix_ms: u64,
+) -> bool {
+    overlay.records.iter().any(|record| {
+        record.command_path == command_path
+            && record.provider == context.identity.provider
+            && record.executable_fingerprint == executable_fingerprint
+            && record.provider_fingerprint == context.identity.provider_fingerprint
+            && record.environment_fingerprint == context.identity.environment_fingerprint
+    }) || overlay.negative_hits.iter().any(|hit| {
+        hit.command_path == command_path
+            && hit.provider == context.identity.provider
+            && hit.executable_fingerprint == executable_fingerprint
+            && hit.provider_fingerprint == context.identity.provider_fingerprint
+            && hit.environment_fingerprint == context.identity.environment_fingerprint
+            && hit.retry_after_unix_ms > now_unix_ms
+    })
+}
+
+fn normalize_local_candidates(
+    command_path: &[String],
+    context: &LocalProviderContext,
+    executable_fingerprint: &str,
+    now_unix_ms: u64,
+    candidates: Vec<quirl_process::local_completion::LocalCompletionCandidate>,
+) -> Vec<intelligence::LocalCompletionRecord> {
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let value = candidate.value.trim();
+            if value.is_empty()
+                || value.len() > LOCAL_PROBE_SEGMENT_BYTES_MAX
+                || value.chars().any(char::is_control)
+                || value.chars().any(char::is_whitespace)
+                || value.contains(['/', '\\'])
+            {
+                return None;
+            }
+            let kind = if value.starts_with('-') {
+                intelligence::LocalCandidateKind::Flag
+            } else {
+                intelligence::LocalCandidateKind::Subcommand
+            };
+            Some(intelligence::LocalCompletionRecord {
+                command_path: command_path.to_vec(),
+                kind,
+                insertion_text: value.to_owned(),
+                display_text: value.to_owned(),
+                description: candidate.description.and_then(|description| {
+                    let description = description.trim();
+                    (!description.is_empty()
+                        && description.len() <= 4 * 1024
+                        && !description.chars().any(char::is_control))
+                    .then(|| description.to_owned())
+                }),
+                provider: context.identity.provider,
+                confidence: Confidence::High,
+                trust: Trust::Declared,
+                executable_fingerprint: executable_fingerprint.to_owned(),
+                provider_fingerprint: context.identity.provider_fingerprint.clone(),
+                cwd_class: intelligence::LocalCwdClass::Any,
+                environment_fingerprint: context.identity.environment_fingerprint.clone(),
+                observed_unix_ms: now_unix_ms,
+                refreshed_unix_ms: now_unix_ms,
+                refresh_state: intelligence::LocalRefreshState::Fresh,
+            })
+        })
+        .take(LOCAL_PROVIDER_CANDIDATES_MAX)
+        .collect()
 }
 
 fn ensure_refresh_active(
@@ -1006,13 +1754,204 @@ fn ensure_refresh_active(
 
 fn load_catalog_at(path: &Path) -> Catalog {
     let mut catalog = match read_index(path) {
-        Ok(bytes) => decode_catalog(&bytes, path)
+        Ok(bytes) => load_cached_catalog_with_local_overlay(&bytes, path)
+            .or_else(|_| decode_catalog(&bytes, path))
             .map(merge_cached_catalog)
             .unwrap_or_else(|_| Catalog::builtin()),
         Err(_) => Catalog::builtin(),
     };
     crate::native_catalog::merge_embedded(&mut catalog);
     catalog
+}
+
+fn load_cached_catalog_with_local_overlay(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<Catalog, ShellError> {
+    let (mut catalog, state_json) = intelligence::decode_database(bytes, path)?;
+    let Some(state_json) = state_json else {
+        return Ok(catalog);
+    };
+    let state: DiscoveryState = serde_json::from_str(&state_json).map_err(json_error)?;
+    if state.version != DISCOVERY_STATE_VERSION
+        || state.native_catalog_identity != crate::native_catalog::embedded_database_identity()
+    {
+        return Ok(catalog);
+    }
+    let now_unix_ms = unix_time_ms();
+    let mut queries = Vec::new();
+    for executable in state
+        .sources
+        .iter()
+        .filter(|source| source.kind == DiscoverySourceKind::PathExecutable)
+    {
+        for provider in &state.local_providers {
+            queries.push(intelligence::LocalOverlayQuery {
+                native_catalog_fingerprint: state.native_catalog_identity.clone(),
+                executable_fingerprint: executable.fingerprint.clone(),
+                provider_fingerprint: provider.provider_fingerprint.clone(),
+                cwd_class: intelligence::LocalCwdClass::Any,
+                environment_fingerprint: provider.environment_fingerprint.clone(),
+                now_unix_ms,
+            });
+        }
+    }
+    let overlay = intelligence::read_local_overlays(bytes, path, &queries)?;
+    merge_local_overlay_catalog(&mut catalog, &overlay.records);
+    Ok(catalog)
+}
+
+fn merge_local_overlay_catalog(
+    catalog: &mut Catalog,
+    records: &[intelligence::LocalCompletionRecord],
+) {
+    let mut grouped =
+        BTreeMap::<(Vec<String>, intelligence::LocalCandidateKind, String), Vec<_>>::new();
+    for record in records {
+        grouped
+            .entry((
+                record.command_path.clone(),
+                record.kind,
+                record.insertion_text.clone(),
+            ))
+            .or_default()
+            .push(record);
+    }
+    let mut commands = BTreeMap::<String, CommandSpec>::new();
+    for ((command_path, kind, insertion_text), observations) in grouped {
+        let owner_path = command_path.join(" ");
+        let selected = select_local_description(&observations);
+        let record = selected
+            .as_ref()
+            .map_or(observations[0], |(_, record)| *record);
+        let provenance = selected
+            .map(|(fact, _)| fact.provenance)
+            .unwrap_or_else(|| local_record_provenance(record));
+        match kind {
+            intelligence::LocalCandidateKind::Subcommand => {
+                let path = format!("{owner_path} {insertion_text}");
+                let summary = record
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("{insertion_text} subcommand"));
+                commands.entry(path.clone()).or_insert_with(|| CommandSpec {
+                    id: format!("local:{}", fingerprint_bytes(path.as_bytes())),
+                    version: None,
+                    path: path.clone(),
+                    aliases: Vec::new(),
+                    parent: catalog
+                        .commands
+                        .iter()
+                        .find(|command| command.path == owner_path)
+                        .map(|command| command.id.clone()),
+                    signature: path,
+                    summary: summary.clone(),
+                    details: summary,
+                    options: Vec::new(),
+                    examples: Vec::new(),
+                    io: IoContract::default(),
+                    effects: vec![Effect::SpawnProcess],
+                    exit_codes: Default::default(),
+                    provenance,
+                });
+            }
+            intelligence::LocalCandidateKind::Flag => {
+                let command = commands
+                    .entry(owner_path.clone())
+                    .or_insert_with(|| CommandSpec {
+                        id: format!("local-options:{}", fingerprint_bytes(owner_path.as_bytes())),
+                        version: None,
+                        path: owner_path.clone(),
+                        aliases: Vec::new(),
+                        parent: None,
+                        signature: owner_path.clone(),
+                        summary: String::new(),
+                        details: String::new(),
+                        options: Vec::new(),
+                        examples: Vec::new(),
+                        io: IoContract::default(),
+                        effects: Vec::new(),
+                        exit_codes: Default::default(),
+                        provenance: ProvenanceInfo {
+                            confidence: Confidence::Low,
+                            ..provenance.clone()
+                        },
+                    });
+                command.options.push(ArgumentSpec {
+                    names: vec![insertion_text],
+                    kind: ArgumentKind::Flag,
+                    value_type: "Bool".to_owned(),
+                    required: false,
+                    repeatable: false,
+                    values: None,
+                    conflicts: Vec::new(),
+                    documentation: record
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| "Local completion flag".to_owned()),
+                    examples: Vec::new(),
+                    provenance,
+                });
+            }
+            intelligence::LocalCandidateKind::Value => {}
+        }
+    }
+    catalog.merge(commands.into_values());
+}
+
+fn select_local_description<'a>(
+    records: &'a [&intelligence::LocalCompletionRecord],
+) -> Option<(
+    intelligence::CompletionDescriptionFact,
+    &'a intelligence::LocalCompletionRecord,
+)> {
+    let facts = records
+        .iter()
+        .filter_map(|record| {
+            Some((
+                intelligence::CompletionDescriptionFact {
+                    text: record.description.clone()?,
+                    provenance: local_record_provenance(record),
+                    tier: intelligence::CompletionCompositionTier::LocalCompletion,
+                },
+                *record,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let selected = intelligence::compose_primary_description(
+        &facts
+            .iter()
+            .map(|(fact, _)| fact.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    facts.into_iter().find(|(fact, _)| *fact == selected)
+}
+
+fn local_record_provenance(record: &intelligence::LocalCompletionRecord) -> ProvenanceInfo {
+    let source = match record.provider {
+        intelligence::LocalCompletionProvider::Fish => Provenance::Fish,
+        intelligence::LocalCompletionProvider::Bash => Provenance::Bash,
+        intelligence::LocalCompletionProvider::Zsh => Provenance::Zsh,
+    };
+    ProvenanceInfo {
+        source,
+        confidence: record.confidence,
+        trust: record.trust,
+        origin: Some(format!(
+            "local {} provider",
+            provider_display_name(record.provider)
+        )),
+        fingerprint: Some(record.provider_fingerprint.clone()),
+        generated_at: Some(record.refreshed_unix_ms.to_string()),
+    }
+}
+
+fn provider_display_name(provider: intelligence::LocalCompletionProvider) -> &'static str {
+    match provider {
+        intelligence::LocalCompletionProvider::Fish => "Fish",
+        intelligence::LocalCompletionProvider::Bash => "Bash (unavailable)",
+        intelligence::LocalCompletionProvider::Zsh => "Zsh",
+    }
 }
 
 fn merge_cached_catalog(mut cached: Catalog) -> Catalog {
@@ -2092,6 +3031,9 @@ fn fingerprint_bytes(bytes: &[u8]) -> String {
 }
 
 fn default_fish_roots() -> Vec<PathBuf> {
+    if let Some(roots) = configured_completion_roots("QUIRL_FISH_PATH") {
+        return roots;
+    }
     let mut roots = vec![
         PathBuf::from("/usr/share/fish/completions"),
         PathBuf::from("/usr/share/fish/vendor_completions.d"),
@@ -2107,6 +3049,9 @@ fn default_fish_roots() -> Vec<PathBuf> {
 }
 
 fn default_bash_roots() -> Vec<PathBuf> {
+    if let Some(roots) = configured_completion_roots("QUIRL_BASH_PATH") {
+        return roots;
+    }
     vec![
         PathBuf::from("/usr/share/bash-completion/completions"),
         PathBuf::from("/etc/bash_completion.d"),
@@ -2116,11 +3061,22 @@ fn default_bash_roots() -> Vec<PathBuf> {
 }
 
 fn default_zsh_roots() -> Vec<PathBuf> {
+    if let Some(roots) = configured_completion_roots("QUIRL_ZSH_PATH") {
+        return roots;
+    }
     vec![
         PathBuf::from("/usr/share/zsh/site-functions"),
         PathBuf::from("/usr/local/share/zsh/site-functions"),
         PathBuf::from("/opt/homebrew/share/zsh/site-functions"),
     ]
+}
+
+fn configured_completion_roots(variable: &str) -> Option<Vec<PathBuf>> {
+    env::var_os(variable).map(|value| {
+        env::split_paths(&value)
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect()
+    })
 }
 
 fn default_man_roots() -> Vec<PathBuf> {
@@ -2874,7 +3830,199 @@ mod tests {
             config,
             RefreshDeadline::starting_now(Duration::from_secs(5)),
             &AtomicBool::new(false),
+            None,
         )
+    }
+
+    fn refresh_with_local(config: &DiscoveryConfig) -> Result<bool, ShellError> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        refresh_catalog_cache(
+            config,
+            RefreshDeadline::starting_now(Duration::from_secs(5)),
+            &cancelled,
+            Some(Arc::clone(&cancelled)),
+        )
+    }
+
+    #[test]
+    fn editor_probe_paths_are_incremental_coalesced_and_bounded() {
+        assert_eq!(
+            command_path_for_probe("ghq re", 6).unwrap(),
+            Some(vec!["ghq".to_owned()])
+        );
+        assert_eq!(
+            command_path_for_probe("ghq repo ", 9).unwrap(),
+            Some(vec!["ghq".to_owned(), "repo".to_owned()])
+        );
+        assert!(
+            command_path_for_probe("/tmp/ghq repo ", 14)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut queue = LocalProbeQueue::default();
+        for _ in 0..32 {
+            queue.push(vec!["ghq".to_owned()]).unwrap();
+        }
+        assert_eq!(queue.pending.len(), 1);
+        for index in 1..LOCAL_PROBE_QUEUE_MAX {
+            queue.push(vec![format!("command-{index}")]).unwrap();
+        }
+        let error = queue.push(vec!["overflow".to_owned()]).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_eq!(queue.drain().len(), LOCAL_PROBE_QUEUE_MAX);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_fish_and_zsh_providers_persist_nested_flags_and_descriptions() {
+        let directory = temporary_directory();
+        let mut config = discovery_config(&directory);
+        let zsh = directory.join("zsh");
+        fs::create_dir_all(&zsh).unwrap();
+        config.zsh_roots = vec![zsh.clone()];
+        let binaries = &config.path_roots[0];
+        let marker = directory.join("provider-calls");
+        let provider = format!(
+            "#!/bin/sh\nprintf x >> '{}'\nprintf 'QLB10000000400000013repomanage repositories0000000600000009--jsonemit JSON'\n",
+            marker.display()
+        );
+        for shell in ["fish", "zsh"] {
+            let path = binaries.join(shell);
+            fs::write(&path, &provider).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        write_executable(&binaries.join("ghq"));
+        fs::write(config.fish_roots[0].join("ghq.fish"), "# dynamic fixture\n").unwrap();
+        fs::write(zsh.join("_ghq"), "# dynamic fixture\n").unwrap();
+
+        assert!(refresh_with_local(&config).unwrap());
+        let first_calls = fs::read(&marker).unwrap().len();
+        assert_eq!(first_calls, 2);
+        let catalog = load_catalog_at(&config.index_path);
+        let nested = catalog.find("ghq repo").unwrap();
+        assert_eq!(nested.summary, "manage repositories");
+        let ghq = catalog
+            .commands
+            .iter()
+            .find(|command| command.path == "ghq")
+            .unwrap();
+        assert!(
+            ghq.options.iter().any(|option| {
+                option.names == ["--json"] && option.documentation == "emit JSON"
+            })
+        );
+
+        assert!(!refresh_with_local(&config).unwrap());
+        assert_eq!(fs::read(&marker).unwrap().len(), first_calls);
+
+        assert!(
+            refresh_local_completion_paths(
+                &config,
+                &[vec!["ghq".to_owned(), "repo".to_owned()]],
+                RefreshDeadline::starting_now(Duration::from_secs(5)),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap()
+        );
+        let nested_catalog = load_catalog_at(&config.index_path);
+        let nested = nested_catalog
+            .commands
+            .iter()
+            .find(|command| command.path == "ghq repo")
+            .unwrap();
+        assert!(
+            nested
+                .options
+                .iter()
+                .any(|option| option.names == ["--json"])
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_provider_misses_are_warm_negative_cache_hits() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        let binaries = &config.path_roots[0];
+        let marker = directory.join("provider-misses");
+        let provider = format!("#!/bin/sh\nprintf x >> '{}'\nexit 78\n", marker.display());
+        let shell = binaries.join("fish");
+        fs::write(&shell, provider).unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&binaries.join("ghq"));
+        fs::write(config.fish_roots[0].join("ghq.fish"), "# dynamic fixture\n").unwrap();
+
+        assert!(refresh_with_local(&config).unwrap());
+        let calls = fs::read(&marker).unwrap().len();
+        assert_eq!(calls, 1);
+        assert!(!refresh_with_local(&config).unwrap());
+        assert_eq!(fs::read(&marker).unwrap().len(), calls);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_provider_isolated_failure_publishes_base_and_warms_negative_cache() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        let binaries = &config.path_roots[0];
+        let marker = directory.join("malformed-provider-calls");
+        let provider = format!(
+            "#!/bin/sh\nprintf x >> '{}'\nprintf 'QLB10000000300000000ab'\n",
+            marker.display()
+        );
+        let shell = binaries.join("fish");
+        fs::write(&shell, provider).unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&binaries.join("ghq"));
+        fs::write(
+            config.fish_roots[0].join("ghq.fish"),
+            "# malformed dynamic provider fixture\n",
+        )
+        .unwrap();
+
+        assert!(refresh_with_local(&config).unwrap());
+        assert_eq!(fs::read(&marker).unwrap().len(), 1);
+        let bytes = read_index(&config.index_path).unwrap();
+        let (catalog, state_json) =
+            intelligence::decode_database(&bytes, &config.index_path).unwrap();
+        assert!(catalog.find("cd").is_some());
+        assert!(catalog.find("ghq").is_some());
+        let state: DiscoveryState = serde_json::from_str(state_json.as_deref().unwrap()).unwrap();
+        let executable = state
+            .sources
+            .iter()
+            .find(|source| {
+                source.kind == DiscoverySourceKind::PathExecutable
+                    && source.path.file_name().and_then(|name| name.to_str()) == Some("ghq")
+            })
+            .unwrap();
+        let provider = state
+            .local_providers
+            .iter()
+            .find(|provider| provider.provider == intelligence::LocalCompletionProvider::Fish)
+            .unwrap();
+        let overlay = intelligence::read_local_overlay(
+            &bytes,
+            &config.index_path,
+            &intelligence::LocalOverlayQuery {
+                native_catalog_fingerprint: state.native_catalog_identity,
+                executable_fingerprint: executable.fingerprint.clone(),
+                provider_fingerprint: provider.provider_fingerprint.clone(),
+                cwd_class: intelligence::LocalCwdClass::Any,
+                environment_fingerprint: provider.environment_fingerprint.clone(),
+                now_unix_ms: unix_time_ms(),
+            },
+        )
+        .unwrap();
+        assert_eq!(overlay.negative_hits.len(), 1);
+        assert_eq!(overlay.negative_hits[0].command_path, ["ghq"]);
+
+        assert!(!refresh_with_local(&config).unwrap());
+        assert_eq!(fs::read(&marker).unwrap().len(), 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -3650,6 +4798,7 @@ mod tests {
             changed,
             requested_generation: Arc::new(AtomicU64::new(1)),
             wake,
+            local_probes: Arc::new(Mutex::new(LocalProbeQueue::default())),
             worker: Some(worker),
         });
 

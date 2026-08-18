@@ -175,12 +175,23 @@ descriptions rather than importer implementation names. Fixtures use no network
 and mark completion independently so a final-output-only renderer cannot pass
 by racing the assertion.
 
+`local-completion-discovery` uses the same GHQ shape with controlled fake Fish
+and Zsh executables. Neither host shell nor host completion root is consulted.
+The check proves that initial top-level discovery persists framed subcommands,
+flags, descriptions, and provider attribution, then that an editor-observed
+unknown nested path is coalesced, probed off the render thread, published, and
+adopted only after the next editor boundary. The focused CLI model tests cover
+warm positive and negative restarts, expiry and identity invalidation,
+malformed/excessive frames, deadlines, cancellation, descendant cleanup, and
+queue/concurrency limits without requiring Fish, Zsh, Carapace, or network.
+
 Run the harness model tests and one focused end-to-end interaction with:
 
 ```console
 cargo build -p quirl-cli
 cargo xtask rich-pty --check mode-switch-and-palette-screen
 cargo xtask rich-pty --check external-command-compatibility
+cargo xtask rich-pty --check local-completion-discovery
 ```
 
 The focused interaction sends the legacy-terminal encoding for Alt-Q and
