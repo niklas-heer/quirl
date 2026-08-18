@@ -1491,27 +1491,19 @@ fn check_cwd_history(binary: &Path) -> Result<(), Box<dyn Error>> {
     create_private_directory(&other_directory)?;
     session.pty.wait_for(STARTUP_MARKER)?;
 
-    execute_and_resume(
+    execute_cwd_history_command(
         &mut session,
         &format!("cd {}", shell_quote(&local_directory)),
     )?;
-    execute_and_resume_with_marker(
-        &mut session,
-        "/usr/bin/printf LOCAL_HISTORY_CHOICE",
-        b"LOCAL_HISTORY_CHOICE",
-    )?;
+    execute_cwd_history_command(&mut session, "/usr/bin/printf LOCAL_HISTORY_CHOICE")?;
 
-    execute_and_resume(
+    execute_cwd_history_command(
         &mut session,
         &format!("cd {}", shell_quote(&other_directory)),
     )?;
-    execute_and_resume_with_marker(
-        &mut session,
-        "/usr/bin/printf OTHER_HISTORY_CHOICE",
-        b"OTHER_HISTORY_CHOICE",
-    )?;
+    execute_cwd_history_command(&mut session, "/usr/bin/printf OTHER_HISTORY_CHOICE")?;
 
-    execute_and_resume(
+    execute_cwd_history_command(
         &mut session,
         &format!("cd {}", shell_quote(&local_directory)),
     )?;
@@ -1535,6 +1527,28 @@ fn check_cwd_history(binary: &Path) -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("cwd-aware SQLite history was not created").into());
     }
     Ok(())
+}
+
+fn execute_cwd_history_command(session: &mut Session, command: &str) -> Result<(), Box<dyn Error>> {
+    let output_start = session.pty.output().len();
+    session.pty.type_text(command)?;
+    let editor_line = format!("> {command}");
+    session
+        .pty
+        .wait_for_screen("complete cwd-history command in editor", |screen| {
+            screen.lines().iter().any(|line| line == &editor_line)
+        })?;
+    session.pty.send(key::ENTER)?;
+    let command_record = format!("❯ {command}");
+    session
+        .pty
+        .wait_for_screen("completed cwd-history command", |screen| {
+            let text = screen.text();
+            text.contains(&command_record)
+                && text.contains("── exit ")
+                && screen.bottom_line().contains("NORMAL")
+        })?;
+    ensure_alternate_screen_unchanged(session, output_start, "cwd-history command")
 }
 
 fn check_retained_output_cycles(binary: &Path) -> Result<(), Box<dyn Error>> {
