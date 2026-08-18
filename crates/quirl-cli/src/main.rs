@@ -490,7 +490,7 @@ fn execute_natural_command(query: &[String]) -> Result<i32, ShellError> {
         intelligence::SEARCH_RESULTS_MAX,
         intelligence::SearchDocumentKind::Command,
     )?;
-    let candidate = results.first().ok_or_else(|| {
+    let candidate = natural_command_candidate(&results).ok_or_else(|| {
         ShellError::new(
             ErrorCode::InvalidCommand,
             "natural command retrieval found no catalog command",
@@ -572,6 +572,14 @@ fn execute_natural_command(query: &[String]) -> Result<i32, ShellError> {
     let outcome = execute_execution_request(&mut NativeExecutor::default(), request, None)?;
     print_execution_outcome(&outcome)?;
     Ok(outcome.status_code())
+}
+
+fn natural_command_candidate(
+    results: &[intelligence::SearchResult],
+) -> Option<&intelligence::SearchResult> {
+    results
+        .iter()
+        .find(|result| result.command != "quirl ai run")
 }
 
 fn join_natural_query(query: &[String]) -> Result<String, ShellError> {
@@ -3735,6 +3743,25 @@ mod tests {
     static NEXT_DIFFERENTIAL_FIXTURE: AtomicUsize = AtomicUsize::new(0);
     const DEFAULT_DIFFERENTIAL_CASES: usize = 128;
     const DEFAULT_DIFFERENTIAL_SEED: u64 = 7_640_891_576_956_012_809;
+
+    #[test]
+    fn natural_command_never_selects_its_own_composition_entrypoint() {
+        let bytes = intelligence::encode_database(&Catalog::builtin(), None).unwrap();
+        let results = intelligence::search_kind(
+            &bytes,
+            Path::new("catalog.sqlite3"),
+            "show the current working directory",
+            intelligence::SEARCH_RESULTS_MAX,
+            None,
+            intelligence::SearchDocumentKind::Command,
+        )
+        .unwrap();
+        assert_eq!(results[0].command, "quirl ai run");
+        assert_ne!(
+            natural_command_candidate(&results).unwrap().command,
+            "quirl ai run"
+        );
+    }
 
     #[test]
     fn shared_picker_prefers_same_directory_history() {
