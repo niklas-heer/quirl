@@ -5,13 +5,17 @@ use quirl_catalog::{
     NativeDiagnosticKind, NativePlatform,
 };
 use quirl_core::{ErrorCode, ShellError};
-use std::sync::OnceLock;
+use std::{collections::BTreeSet, sync::OnceLock};
 
 const EMBEDDED_NATIVE_DATABASE: &[u8] =
     include_bytes!("../../../catalog/generated/catalog.sqlite3");
+const EMBEDDED_NATIVE_CHECKSUM: &str =
+    include_str!("../../../catalog/generated/catalog.sqlite3.sha256");
 const EMBEDDED_NATIVE_SOURCE: &str = "catalog/generated/catalog.sqlite3 (embedded)";
 const RUNTIME_LIMITS: NativeCatalogLimits = NativeCatalogLimits::embedded();
 static EMBEDDED_COMMANDS: OnceLock<Result<Vec<CommandSpec>, ShellError>> = OnceLock::new();
+static EMBEDDED_ROOT_COMMAND_NAMES: OnceLock<Result<BTreeSet<String>, ShellError>> =
+    OnceLock::new();
 
 #[cfg(not(any(
     target_os = "linux",
@@ -31,6 +35,29 @@ pub(crate) fn builtin_native_catalog() -> Catalog {
     let mut catalog = Catalog::builtin();
     merge_embedded(&mut catalog);
     catalog
+}
+
+/// Return every embedded root command name across supported platforms.
+///
+/// Automatic host discovery uses this platform-independent set to prioritize
+/// manual pages for known commands even when the embedded definition belongs
+/// to a different operating-system implementation.
+pub(crate) fn embedded_root_command_names() -> Result<BTreeSet<String>, ShellError> {
+    EMBEDDED_ROOT_COMMAND_NAMES
+        .get_or_init(|| {
+            let commands = load_commands(EMBEDDED_NATIVE_DATABASE, NativePlatform::Any)?;
+            Ok(commands
+                .iter()
+                .filter_map(|command| command.path.split_whitespace().next())
+                .map(str::to_owned)
+                .collect())
+        })
+        .clone()
+}
+
+/// Return the build-generated identity of the embedded native database.
+pub(crate) fn embedded_database_identity() -> &'static str {
+    EMBEDDED_NATIVE_CHECKSUM.trim()
 }
 
 fn merge_loaded(catalog: &mut Catalog, loaded: Result<Vec<CommandSpec>, ShellError>) {
@@ -128,6 +155,88 @@ mod tests {
                 .iter()
                 .any(|option| option.names.iter().any(|name| name == "--all"))
         );
+    }
+
+    #[test]
+    fn all_platform_root_names_are_available_to_host_discovery() {
+        let names = embedded_root_command_names().unwrap();
+
+        assert!(names.contains("cat"));
+        assert!(names.contains("ls"));
+        assert!(names.contains("tar"));
+        assert!(names.contains("where"));
+        assert!(!names.contains("docker compose"));
+    }
+
+    #[test]
+    fn every_platform_root_has_flags_unless_its_native_cli_is_flagless() {
+        for (platform, expected_flagless) in [
+            (NativePlatform::Linux, &["xdg-open"][..]),
+            (NativePlatform::Macos, &[][..]),
+            (NativePlatform::Windows, &["mkdir"][..]),
+            (NativePlatform::Freebsd, &[][..]),
+        ] {
+            let commands = load_commands(EMBEDDED_NATIVE_DATABASE, platform).unwrap();
+            let flagless = commands
+                .iter()
+                .filter(|command| !command.path.contains(' '))
+                .filter(|command| {
+                    command
+                        .options
+                        .iter()
+                        .all(|option| option.kind == ArgumentKind::Positional)
+                })
+                .map(|command| command.path.as_str())
+                .collect::<Vec<_>>();
+
+            assert_eq!(flagless, expected_flagless, "platform {platform:?}");
+        }
+    }
+
+    #[test]
+    fn macos_system_commands_do_not_leak_gnu_only_flags() {
+        let commands = load_commands(EMBEDDED_NATIVE_DATABASE, NativePlatform::Macos).unwrap();
+        for command_name in [
+            "cat", "cp", "diff", "grep", "head", "ls", "man", "mkdir", "mv", "nc", "pwd", "rm",
+            "rmdir", "tail", "tar",
+        ] {
+            let command = commands
+                .iter()
+                .find(|command| command.path == command_name)
+                .unwrap_or_else(|| panic!("missing macOS command {command_name}"));
+            assert!(
+                command
+                    .options
+                    .iter()
+                    .any(|option| option.kind != ArgumentKind::Positional),
+                "macOS command {command_name} has no named options"
+            );
+        }
+        for (command_name, forbidden) in [
+            ("cat", "--help"),
+            ("cp", "--archive"),
+            ("diff", "--color"),
+            ("grep", "--perl-regexp"),
+            ("ls", "--all"),
+            ("man", "--all"),
+            ("mv", "--backup"),
+            ("pwd", "--version"),
+            ("rm", "--preserve-root"),
+            ("tail", "--pid"),
+            ("tar", "--selinux"),
+        ] {
+            let command = commands
+                .iter()
+                .find(|command| command.path == command_name)
+                .unwrap();
+            assert!(
+                command
+                    .options
+                    .iter()
+                    .all(|option| !option.names.iter().any(|name| name == forbidden)),
+                "{command_name} leaked GNU-only flag {forbidden} into macOS"
+            );
+        }
     }
 
     #[test]

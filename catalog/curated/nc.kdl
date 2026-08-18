@@ -7,6 +7,184 @@ catalog "nc" {
         platform "linux"
         platform "macos"
         platform "freebsd"
+        flag "--apple-delegate-pid" summary="Delegate the socket to a process" description="Delegate the socket to the supplied macOS process identifier." value="pid" {
+            platform "macos"
+        }
+        flag "--apple-delegate-uuid" summary="Delegate the socket to a UUID" description="Delegate the socket to the supplied macOS process UUID." value="uuid" {
+            platform "macos"
+        }
+        flag "--apple-ecn" summary="Select explicit congestion notification" description="Set the macOS TCP ECN mode." value="mode" {
+            platform "macos"
+        }
+        flag "--apple-ext-bk-idle" summary="Allow extended background idle" description="Mark the socket for extended background idle time while suspended." {
+            platform "macos"
+        }
+        flag "--apple-nowakefromsleep" summary="Exclude the port from wake queries" description="Configure whether the local port participates in wake-from-sleep queries." value="mode" {
+            platform "macos"
+        }
+        flag "-4" summary="Use IPv4 only" description="Resolve and connect using IPv4 addresses only." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-4" summary="Use IPv4 only" description="Resolve and connect using IPv4 addresses only." {
+            platform "macos"
+        }
+        flag "-6" summary="Use IPv6 only" description="Resolve and connect using IPv6 addresses only." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-6" summary="Use IPv6 only" description="Resolve and connect using IPv6 addresses only." {
+            platform "macos"
+        }
+        flag "-A" summary="Receive on any interface" description="Enable the macOS receive-any-interface socket option." {
+            platform "macos"
+        }
+        flag "-C" summary="Avoid cellular data" description="Prevent the connection from using a cellular data context." {
+            platform "macos"
+        }
+        flag "-D" summary="Enable socket debugging" description="Enable debugging on the network socket." {
+            platform "macos"
+        }
+        flag "-G" summary="Set the connection timeout" description="Set the TCP connection timeout in seconds." value="seconds" {
+            platform "macos"
+        }
+        flag "-H" summary="Set the keepalive idle timeout" description="Set the initial TCP keepalive timeout in seconds." value="seconds" {
+            platform "macos"
+        }
+        flag "-I" summary="Set the keepalive interval" description="Set the interval between repeated TCP keepalive probes." value="seconds" {
+            platform "macos"
+        }
+        flag "-J" summary="Set the keepalive probe count" description="Set how many TCP keepalive packets may be sent." value="count" {
+            platform "macos"
+        }
+        flag "-L" summary="Set adaptive timeout probes" description="Set how many reachability probes may be sent before an adaptive timeout." value="count" {
+            platform "macos"
+        }
+        flag "-U" summary="Use Unix-domain sockets" description="Connect or listen using a Unix-domain socket instead of an Internet socket." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-U" summary="Use Unix-domain sockets" description="Connect or listen using a Unix-domain socket instead of an Internet socket." {
+            platform "macos"
+        }
+        flag "-X" summary="Select a proxy protocol" description="Select the protocol used to communicate with a configured proxy server." value="protocol" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-X" summary="Select a proxy protocol" description="Use SOCKS 4, SOCKS 5, or HTTPS CONNECT with the configured proxy." value="protocol" {
+            platform "macos"
+        }
+        flag "-b" summary="Bind to an interface" description="Bind the socket to the supplied interface." value="interface" {
+            platform "macos"
+        }
+        flag "-c" summary="Send CRLF line endings" description="Translate line endings to carriage-return plus line-feed." {
+            platform "macos"
+        }
+        flag "-d" summary="Do not read standard input" description="Open the connection without reading data from standard input." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-d" summary="Do not read standard input" description="Open the connection without reading data from standard input." {
+            platform "macos"
+        }
+        flag "-h" summary="Show help" description="Print netcat usage information and exit." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-h" summary="Show help" description="Print netcat usage information and exit." {
+            platform "macos"
+        }
+        flag "-i" summary="Set the line interval" description="Wait the supplied interval between transmitted lines or successive port connections." value="seconds" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-i" summary="Set the line interval" description="Wait the supplied interval between transmitted lines or successive port connections." value="seconds" {
+            platform "macos"
+        }
+        flag "-k" summary="Keep accepting connections" description="Remain in listening mode after the current connection closes." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-k" summary="Keep accepting connections" description="Remain in listening mode after the current connection closes." {
+            platform "macos"
+        }
+        flag "-l" summary="Listen for connections" description="Accept an incoming connection instead of connecting to a remote host." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-l" summary="Listen for connections" description="Accept an incoming connection instead of connecting to a remote host." {
+            platform "macos"
+        }
+        flag "-n" summary="Disable name lookups" description="Do not perform DNS or service-name lookups." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-n" summary="Disable name lookups" description="Do not perform DNS or service-name lookups." {
+            platform "macos"
+        }
+        flag "-p" summary="Select the source port" description="Bind outgoing connections to the supplied local source port." value="port" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-p" summary="Select the source port" description="Bind outgoing connections to the supplied local source port." value="port" {
+            platform "macos"
+        }
+        flag "-r" summary="Randomize ports" description="Choose source or destination ports randomly instead of sequentially." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-r" summary="Randomize ports" description="Choose source or destination ports randomly instead of sequentially." {
+            platform "macos"
+        }
+        flag "-s" summary="Select the source address" description="Send packets through the interface with the supplied source address." value="address" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-s" summary="Select the source address" description="Send packets through the interface with the supplied source address." value="address" {
+            platform "macos"
+        }
+        flag "-t" summary="Answer Telnet negotiation" description="Send negative responses to Telnet option negotiation requests." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-t" summary="Answer Telnet negotiation" description="Send negative responses to Telnet option negotiation requests." {
+            platform "macos"
+        }
+        flag "-u" summary="Use UDP" description="Use UDP instead of the default TCP transport." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-u" summary="Use UDP" description="Use UDP instead of the default TCP transport." {
+            platform "macos"
+        }
+        flag "-v" summary="Use verbose output" description="Print additional connection information." repeatable=#true {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-v" summary="Use verbose output" description="Print additional connection information." repeatable=#true {
+            platform "macos"
+        }
+        flag "-w" summary="Set the idle timeout" description="Close an idle connection after the supplied number of seconds." value="seconds" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-w" summary="Set the idle timeout" description="Close an idle connection after the supplied number of seconds." value="seconds" {
+            platform "macos"
+        }
+        flag "-x" summary="Select a proxy server" description="Connect through the supplied proxy address and optional port." value="proxy" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-x" summary="Select a proxy server" description="Connect through the supplied proxy address and optional port." value="proxy" {
+            platform "macos"
+        }
+        flag "-z" summary="Scan without sending data" description="Report listening services without opening an interactive data stream." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-z" summary="Scan without sending data" description="Report listening services without opening an interactive data stream." {
+            platform "macos"
+        }
         argument "host" summary="Remote host" description="Host name or address to connect to; listening modes may omit it." action="hostnames"
         argument "ports" summary="Port or port range" description="Network port numbers or service names." repeatable=#true
     }

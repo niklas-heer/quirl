@@ -208,6 +208,20 @@ bounded byte budgets. A large Fish, Bash, or Zsh installation therefore cannot
 consume the allowance needed to recover host-specific manual-page facts. Both
 budgets remain finite and are enforced before parsing; separation changes fair
 admission, not the overall requirement that discovery work be bounded.
+Within the bounded manual-page count, commands known to the embedded catalog
+across any platform are selected before otherwise alphabetical PATH entries.
+The selected priority is retained through import. Consequently, a large PATH
+cannot push a known macOS, Linux, Windows, or FreeBSD command beyond the page
+limit merely because its name sorts late, while unknown commands still use the
+remaining bounded capacity deterministically.
+
+The discovery-state envelope records the embedded SQLite checksum. A changed
+native database therefore invalidates an otherwise warm local cache. Cached
+copies whose command identifiers begin with `native:` are always discarded
+before composition, just like cached builtin records; the running binary then
+adds its current platform projection. This prevents removed or re-scoped flags
+from an older catalog generation from merging back into the authoritative KDL
+facts.
 
 ## Failure model and invariants
 
@@ -225,11 +239,14 @@ admission, not the overall requirement that discovery work be bounded.
 - Platform selection is metadata filtering. `any` is exclusive, command and
   flag support cannot exceed the parent scope, and an empty intersection is
   invalid. Duplicate flag spellings are valid only across disjoint effective
-  platform scopes.
+  platform scopes. Operating-system utilities are reviewed per projection;
+  shared command names do not imply shared option semantics.
 - Completion actions are closed declarations. Compilation and lookup never run
   them; a runtime provider applies its own bounds and capability policy.
 - The database is an all-or-nothing generation. Snapshot, normalized rows, and
   semantic documents cannot be mixed across builds.
+- Local cache composition cannot restore cached builtin, plugin, or `native:`
+  records over the running binary's current contracts.
 - Query bytes, semantic documents scanned, and returned rows are bounded before
   caller-controlled work can grow without limit.
 - A failed build or publication preserves the previous admitted database and

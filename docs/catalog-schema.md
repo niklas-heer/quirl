@@ -346,7 +346,10 @@ pinned revision update is reviewed as a supply-chain change:
    KDL diff. Do not accept invented or silently dropped facts.
 4. Review command shape, subcommands, aliases, flags, argument ordering,
    summaries, descriptions, intents, platforms, actions, and upstream version
-   meaning against authoritative documentation or the named executable.
+   meaning against authoritative documentation or the named executable. For
+   operating-system utilities, review every supported platform projection
+   independently: a shared command name does not make GNU, BSD, macOS, and
+   Windows flag spellings or meanings interchangeable.
 5. Review `author`, `license`, `revision`, and `source`; preserve any additional
    notices required by the upstream license.
 6. Copy only approved semantic changes into curated KDL, then run format check,
@@ -358,6 +361,10 @@ pinned revision update is reviewed as a supply-chain change:
 The initial reviewed runtime base contains 50 curated root commands. The wider
 90-file Carapace corpus remains checked in beside it as update and promotion
 proposals; draft count is deliberately reported separately from runtime count.
+Catalog regression tests enumerate the deliberately flagless root commands and
+require every other root to retain at least one named option on every declared
+platform. They also assert that representative GNU-only flags cannot enter the
+macOS projection.
 
 Run the implemented task-runner interface from the repository root:
 

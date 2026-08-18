@@ -5,9 +5,27 @@ catalog "pwd" {
         platform "linux"
         platform "macos"
         platform "freebsd"
-        flag "--help" summary="display this help and exit" description="display this help and exit"
-        flag "--logical" summary="use PWD from environment, even if it contains symlinks" description="use PWD from environment, even if it contains symlinks" short="-L"
-        flag "--physical" summary="avoid all symlinks" description="avoid all symlinks" short="-P"
-        flag "--version" summary="output version information and exit" description="output version information and exit"
+        flag "--help" summary="display this help and exit" description="display this help and exit" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--logical" summary="use PWD from environment, even if it contains symlinks" description="use PWD from environment, even if it contains symlinks" short="-L" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--physical" summary="avoid all symlinks" description="avoid all symlinks" short="-P" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--version" summary="output version information and exit" description="output version information and exit" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-L" summary="Print the logical directory" description="Print the logical working directory, retaining symbolic-link components." {
+            platform "macos"
+        }
+        flag "-P" summary="Print the physical directory" description="Print the physical working directory after resolving symbolic links." {
+            platform "macos"
+        }
     }
 }

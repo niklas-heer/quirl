@@ -113,6 +113,30 @@ Options:
 - `-w`, `--lgwin` — set LZ77 window size
 - `files` — Input files Files to compress or decompress; omit them to use standard input.
 
+## `cat [-b] [-e] [-l] [-n] [-s] [-t] [-u] [-v] [<files>...]`
+
+Print and concatenate files
+
+Writes each selected file to standard output in order; reads standard input when no file is supplied.
+
+Related intents: concatenate files; print a file.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-b` — Number nonblank lines Number nonblank output lines starting at one.
+- `-e` — Show line endings and nonprinting characters Display nonprinting characters visibly and mark each line ending with a dollar sign.
+- `-l` — Lock standard output Acquire an exclusive advisory lock on the standard output file descriptor before writing.
+- `-n` — Number all lines Number every output line starting at one.
+- `-s` — Squeeze adjacent empty lines Replace each run of adjacent empty lines with a single empty line.
+- `-t` — Show tabs and nonprinting characters Display nonprinting characters visibly and render tab characters as caret-I.
+- `-u` — Disable output buffering Write without output buffering.
+- `-v` — Show nonprinting characters Render control and non-ASCII characters using visible caret and meta notation.
+- `files` — Files to print Files to write to standard output; use - or omit the argument to read standard input.
+
 ## `cd [path]`
 
 Change the shell working directory
@@ -175,6 +199,39 @@ Options:
 - `-v`, `--version` — Print version.
 - `-w`, `--wait` — Wait for the files to be closed before returning.
 - `paths` — Files or folders to open Filesystem paths to open in the editor.
+
+## `cp [-H] [-L] [-N] [-P] [-R] [-S] [-X] [-a] [-c] [-f] [-i] [-l] [-n] [-p] [-s] [-v] [-x] <paths>...`
+
+Copy files and directories
+
+Copies one or more source paths to a destination file or directory.
+
+Related intents: copy a directory; copy a file.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-H` — Follow command-line symbolic links Follow symbolic links named on the command line during recursive copies.
+- `-L` — Follow all symbolic links Follow every symbolic link encountered during a recursive copy.
+- `-N` — Do not preserve file flags Suppress file-flag preservation when used with -p.
+- `-P` — Do not follow symbolic links Copy symbolic links themselves during recursive copies.
+- `-R` — Copy directories recursively Copy each directory and its complete subtree while preserving symbolic links.
+- `-S` — Do not preserve sparse holes Copy sparse files without attempting to preserve holes.
+- `-X` — Do not copy extended attributes Exclude extended attributes and resource forks from copied files.
+- `-a` — Use archive mode Preserve file structure and attributes using the macOS archive-copy behavior.
+- `-c` — Use clone copies Use clonefile when supported and fall back to copyfile otherwise.
+- `-f` — Force replacement Replace an existing destination without prompting when necessary.
+- `-i` — Prompt before overwriting Ask for confirmation before replacing an existing destination.
+- `-l` — Create hard links Create hard links to regular files instead of copying their contents.
+- `-n` — Do not overwrite existing files Skip a copy when its destination already exists.
+- `-p` — Preserve file attributes Preserve timestamps, flags, mode, ownership, ACLs, and extended attributes when permitted.
+- `-s` — Create symbolic links Create symbolic links to regular files instead of copying their contents.
+- `-v` — Show copied files Print files as they are copied.
+- `-x` — Stay on one filesystem Do not traverse filesystem mount points during recursive copies.
+- `paths` — Sources and destination Source paths followed by the destination path; the final path is the destination.
 
 ## `delta [--24-bit-color <value>] [--blame-code-style <value>] [--blame-format <value>] [--blame-palette <value>] [--blame-separator-format <value>] [--blame-separator-style <value>] [--blame-timestamp-format <value>] [--blame-timestamp-output-format <value>] [--color-only] [--commit-decoration-style <value>] [--commit-regex <value>] [--commit-style <value>] [--config <Path>] [--dark] [--default-language <value>] [--detect-dark-light <value>] [--diff-args <value>] [--diff-highlight] [--diff-so-fancy] [--diff-stat-align-width <value>] [--features <value>] [--file-added-label <value>] [--file-copied-label <value>] [--file-decoration-style <value>] [--file-modified-label <value>] [--file-removed-label <value>] [--file-renamed-label <value>] [--file-style <value>] [--file-transformation <value>] [--generate-completion <value>] [--grep-context-line-style <value>] [--grep-file-style <value>] [--grep-header-decoration-style <value>] [--grep-header-file-style <value>] [--grep-line-number-style <value>] [--grep-match-line-style <value>] [--grep-match-word-style <value>] [--grep-output-type <value>] [--grep-separator-symbol <value>] [--help] [--hunk-header-decoration-style <value>] [--hunk-header-file-style <value>] [--hunk-header-line-number-style <value>] [--hunk-header-style <value>] [--hunk-label <value>] [--hyperlinks] [--hyperlinks-commit-link-format <value>] [--hyperlinks-file-link-format <value>] [--inline-hint-style <value>] [--inspect-raw-lines <value>] [--keep-plus-minus-markers] [--light] [--line-buffer-size <value>] [--line-fill-method <value>] [--line-numbers] [--line-numbers-left-format <value>] [--line-numbers-left-style <value>] [--line-numbers-minus-style <value>] [--line-numbers-plus-style <value>] [--line-numbers-right-format <value>] [--line-numbers-right-style <value>] [--line-numbers-zero-style <value>] [--list-languages] [--list-syntax-themes] [--map-styles <value>] [--max-line-distance <value>] [--max-line-length <value>] [--max-syntax-highlighting-length <value>] [--merge-conflict-begin-symbol <value>] [--merge-conflict-end-symbol <value>] [--merge-conflict-ours-diff-header-decoration-style <value>] [--merge-conflict-ours-diff-header-style <value>] [--merge-conflict-theirs-diff-header-decoration-style <value>] [--merge-conflict-theirs-diff-header-style <value>] [--minus-emph-style <value>] [--minus-empty-line-marker-style <value>] [--minus-non-emph-style <value>] [--minus-style <value>] [--navigate] [--navigate-regex <value>] [--no-gitconfig] [--pager <value>] [--paging <value>] [--parse-ansi] [--plus-emph-style <value>] [--plus-empty-line-marker-style <value>] [--plus-non-emph-style <value>] [--plus-style <value>] [--raw] [--relative-paths] [--right-arrow <value>] [--show-colors] [--show-config] [--show-syntax-themes] [--show-themes] [--side-by-side] [--syntax-theme <value>] [--tabs <value>] [--true-color <value>] [--version] [--whitespace-error-style <value>] [--width <value>] [--word-diff-regex <value>] [--wrap-left-symbol <value>] [--wrap-max-lines <value>] [--wrap-right-percent <value>] [--wrap-right-prefix-symbol <value>] [--wrap-right-symbol <value>] [--zero-style <value>] [<files>...]`
 
@@ -301,7 +358,7 @@ Options:
 - `-w`, `--width` — The width of underline/overline decorations
 - `files` — Diff files Files containing diff data; omit them to read standard input.
 
-## `diff [--brief] [--changed-group-format <value>] [--color <value>] [--context <value>] [--ed] [--exclude <value>] [--exclude-from <Path>] [--expand-tabs] [--forward-ed] [--from-file <Path>] [--help] [--horizon-lines <value>] [--ifdef <value>] [--ignore-all-space] [--ignore-blank-lines] [--ignore-case] [--ignore-file-name-case] [--ignore-matching-lines <value>] [--ignore-space-change] [--ignore-tab-expansion] [--ignore-trailing-space] [--initial-tab] [--label <value>] [--left-column] [--line-format <value>] [--minimal] [--new-file] [--new-group-format <value>] [--new-line-format <value>] [--no-dereference] [--no-ignore-file-name-case] [--normal] [--old-group-format <value>] [--old-line-format <value>] [--paginate] [--palette <value>] [--rcs] [--recursive] [--report-identical-files] [--show-c-function] [--show-function-line <value>] [--side-by-side] [--speed-large-files] [--starting-file <value>] [--strip-trailing-cr] [--suppress-blank-empty] [--suppress-common-lines] [--tabsize <value>] [--text] [--to-file <Path>] [--unchanged-group-format <value>] [--unchanged-line-format <value>] [--unidirectional-new-file] [--unified <value>] [--version] [--width <value>] [-C <value>] [-U <value>] <paths>...`
+## `diff [--expand-tabs] [--help] [--ignore-blank-lines] [--ignore-case] [--minimal] [--no-ignore-case] [--no-ignore-file-name-case] [--normal] [--side-by-side] [--strip-trailing-cr] [--suppress-common-lines] [--tabsize <columns>] [--text] [--version] [--width <columns>] [-C <lines>] [-D <symbol>] [-F <pattern>] [-I <pattern>] [-L <label>...] [-N] [-P] [-S <name>] [-U <lines>] [-X <Path>] [-b] [-c] [-e] [-f] [-l] [-n] [-p] [-q] [-r] [-s] [-u] [-w] [-x <pattern>...] <paths>...`
 
 Compare files line by line
 
@@ -315,64 +372,44 @@ Related intents: compare directories; compare two files.
 
 Options:
 
-- `--changed-group-format` — set changed group format
-- `--color` — colorize the output
-- `--from-file` — compare FILE1 to all operands
-- `--help` — display this help and exit
-- `--horizon-lines` — keep NUM lines of the common prefix and suffix
-- `--ignore-file-name-case` — ignore case when comparing file names
-- `--left-column` — output only the left column of common lines
-- `--line-format` — format all input lines with LFMT
-- `--new-group-format` — set new group format
-- `--new-line-format` — set new line format
-- `--no-dereference` — don't follow symbolic links
-- `--no-ignore-file-name-case` — consider case when comparing file names
-- `--normal` — output a normal diff (the default)
-- `--old-group-format` — set old group format
-- `--old-line-format` — set old line format
-- `--palette` — the colors to use when --color is active
-- `--strip-trailing-cr` — strip trailing carriage return on input
-- `--suppress-blank-empty` — suppress space or tab before empty output lines
-- `--suppress-common-lines` — do not output common lines
-- `--tabsize` — tab stops every NUM (default 8) print columns
-- `--to-file` — compare all operands to FILE2
-- `--unchanged-group-format` — set unchanged group format
-- `--unchanged-line-format` — set unchanged line format
-- `-B`, `--ignore-blank-lines` — ignore changes where lines are all blank
-- `-C` — output NUM (default 3) lines of copied context
-- `-D`, `--ifdef` — output merged file with '#ifdef NAME' diffs
-- `-E`, `--ignore-tab-expansion` — ignore changes due to tab expansion
-- `-F`, `--show-function-line` — show the most recent line matching RE
-- `-H`, `--speed-large-files` — assume large files and many scattered small changes
-- `-I`, `--ignore-matching-lines` — ignore changes where all lines match RE
-- `-L`, `--label` — use LABEL instead of file name and timestamp
-- `-N`, `--new-file` — treat absent files as empty
-- `-P`, `--unidirectional-new-file` — treat absent first files as empty
-- `-S`, `--starting-file` — start with FILE when comparing directories
-- `-T`, `--initial-tab` — make tabs line up by prepending a tab
-- `-U` — output NUM (default 3) lines of unified context
-- `-W`, `--width` — output at most NUM (default 130) print columns
-- `-X`, `--exclude-from` — exclude files that match any pattern in FILE
-- `-Z`, `--ignore-trailing-space` — ignore white space at line end
-- `-a`, `--text` — treat all files as text
-- `-b`, `--ignore-space-change` — ignore changes in the amount of white space
-- `-c`, `--context` — output NUM (default 3) lines of copied context
-- `-d`, `--minimal` — try hard to find a smaller set of changes
-- `-e`, `--ed` — output an ed script
-- `-f`, `--forward-ed` — output a reversed ed script
-- `-i`, `--ignore-case` — ignore case differences in file contents
-- `-l`, `--paginate` — pass output through 'pr' to paginate it
-- `-n`, `--rcs` — output an RCS format diff
-- `-p`, `--show-c-function` — show which C function each change is in
-- `-q`, `--brief` — report only when files differ
-- `-r`, `--recursive` — recursively compare any subdirectories found
-- `-s`, `--report-identical-files` — report when two files are the same
-- `-t`, `--expand-tabs` — expand tabs to spaces in output
-- `-u`, `--unified` — output NUM (default 3) lines of unified context
-- `-v`, `--version` — output version information and exit
-- `-w`, `--ignore-all-space` — ignore all white space
-- `-x`, `--exclude` — exclude files that match PAT
-- `-y`, `--side-by-side` — output in two columns
+- `--help` — Show help Display diff usage information and exit.
+- `--no-ignore-case` — Compare content case Keep content comparisons case-sensitive.
+- `--no-ignore-file-name-case` — Compare file-name case Keep file-name comparisons case-sensitive.
+- `--normal` — Use normal diff output Produce the default normal difference format.
+- `--strip-trailing-cr` — Strip trailing carriage returns Ignore carriage returns at the end of input lines.
+- `--suppress-common-lines` — Hide common side-by-side lines Omit identical lines from side-by-side output.
+- `--tabsize` — Select tab width Use the supplied number of print columns for each tab stop.
+- `--version` — Show version information Display diff version information and exit.
+- `-B`, `--ignore-blank-lines` — Ignore blank-line changes Ignore changes whose affected lines are all blank.
+- `-C` — Set context size Produce a context diff with the supplied number of surrounding lines.
+- `-D` — Merge with preprocessor conditionals Create merged output guarded by the supplied preprocessor symbol.
+- `-F` — Show matching function lines Show the most recent line matching the supplied expression around each change.
+- `-I` — Ignore matching changed lines Ignore changes whose lines all match the supplied expression.
+- `-L` — Set an output label Use the supplied label instead of a file name and timestamp.
+- `-N` — Treat missing files as empty Compare absent files as though they were empty.
+- `-P` — Treat a missing first file as empty When comparing directories, treat an absent first-side file as empty.
+- `-S` — Start directory comparison at a name Begin directory comparison with the supplied file name.
+- `-U` — Set unified context size Produce a unified diff with the supplied number of surrounding lines.
+- `-W`, `--width` — Set side-by-side width Limit side-by-side output to the supplied number of columns.
+- `-X` — Read exclusion patterns Exclude names matching patterns read from the supplied file.
+- `-a`, `--text` — Treat all files as text Compare binary-looking inputs as text files.
+- `-b` — Ignore whitespace amount Ignore changes in the amount of whitespace.
+- `-c` — Use context output Produce a context-format difference listing.
+- `-d`, `--minimal` — Find a smaller change set Spend additional work to find a smaller set of differences.
+- `-e` — Produce an ed script Write an ed script that converts the first file into the second.
+- `-f` — Produce a forward ed script Write an ed script in forward order.
+- `-i`, `--ignore-case` — Ignore letter case Compare file contents without distinguishing letter case.
+- `-l` — Paginate output Pass difference output through pr for pagination.
+- `-n` — Use RCS output Produce an RCS-format difference listing.
+- `-p` — Show C function names Show the C function containing each change.
+- `-q` — Report only whether files differ Suppress difference details and report only differing files.
+- `-r` — Compare directories recursively Recursively compare subdirectories that occur on both sides.
+- `-s` — Report identical files Print a message when compared files are identical.
+- `-t`, `--expand-tabs` — Expand tabs in output Expand tab characters to spaces in generated output.
+- `-u` — Use unified output Produce a unified-format difference listing.
+- `-w` — Ignore all whitespace Ignore whitespace while comparing file contents.
+- `-x` — Exclude matching names Exclude files whose names match the supplied pattern.
+- `-y`, `--side-by-side` — Use side-by-side output Display corresponding file lines in two columns.
 - `paths` — Paths to compare Two files or directories to compare.
 
 ## `dig [-4] [-6] [-b <value>] [-c <value>] [-f <Path>] [-k <Path>] [-m] [-p <value>] [-q <value>] [-r] [-t <value>] [-u] [-v] [-x <value>] [-y <value>] [<queries>...]`
@@ -913,7 +950,7 @@ Options:
 
 - `-s`, `--short` — Use the compact status format
 
-## `grep [--after-context <value>] [--basic-regexp] [--before-context <value>] [--binary] [--binary-files <value>] [--byte-offset] [--colour <value>] [--context <value>] [--count] [--dereference-recursive] [--devices <value>] [--directories <value>] [--exclude <value>] [--exclude-dir <value>] [--exclude-from <Path>] [--extended-regexp] [--file <Path>] [--files-with-matches] [--files-without-match] [--fixed-strings] [--group-separator <value>] [--help] [--ignore-case] [--include <value>] [--initial-tab] [--invert-match] [--label <value>] [--line-buffered] [--line-number] [--line-regexp] [--max-count <value>] [--no-filename] [--no-group-separator] [--no-ignore-case] [--no-messages] [--null] [--null-data] [--only-matching] [--perl-regexp] [--quiet] [--recursive] [--regexp <value>] [--silent] [--text] [--version] [--with-filename] [--word-regexp] <pattern> [<files>...]`
+## `grep [--after-context <value>] [--basic-regexp] [--before-context <value>] [--binary] [--binary-files <value>] [--byte-offset] [--colour <value>] [--context <value>] [--count] [--devices <value>] [--directories <value>] [--exclude <value>] [--exclude-dir <value>] [--extended-regexp] [--file <Path>] [--files-with-matches] [--files-without-match] [--fixed-strings] [--help] [--ignore-case] [--include <value>] [--invert-match] [--label <value>] [--line-buffered] [--line-number] [--line-regexp] [--max-count <value>] [--no-filename] [--no-messages] [--null] [--null-data] [--only-matching] [--quiet] [--recursive] [--regexp <value>] [--silent] [--text] [--version] [--with-filename] [--word-regexp] [-R] <pattern> [<files>...]`
 
 Print lines matching a pattern
 
@@ -931,14 +968,10 @@ Options:
 - `--colour` — use markers to highlight the matching strings;
 - `--exclude` — skip files that match GLOB
 - `--exclude-dir` — skip directories that match GLOB
-- `--exclude-from` — skip files that match any file pattern from FILE
-- `--group-separator` — print SEP on line between matches with context
 - `--help` — display this help text and exit
 - `--include` — search only files that match GLOB (a file pattern)
 - `--label` — use LABEL as the standard input file name prefix
 - `--line-buffered` — flush output on every line
-- `--no-group-separator` — do not print separator for matches with context
-- `--no-ignore-case` — do not ignore case distinctions (default)
 - `--silent` — suppress all normal output
 - `-A`, `--after-context` — print NUM lines of trailing context
 - `-B`, `--before-context` — print NUM lines of leading context
@@ -949,10 +982,8 @@ Options:
 - `-G`, `--basic-regexp` — PATTERNS are basic regular expressions
 - `-H`, `--with-filename` — print file name with output lines
 - `-L`, `--files-without-match` — print only names of FILEs with no selected lines
-- `-P`, `--perl-regexp` — PATTERNS are Perl regular expressions
-- `-R`, `--dereference-recursive` — likewise, but follow all symlinks
-- `-T`, `--initial-tab` — make tabs line up (if needed)
-- `-U`, `--binary` — do not strip CR characters at EOL (MSDOS/Windows)
+- `-R` — Search directories recursively Recursively search each selected directory.
+- `-U`, `--binary` — Search binary input Search binary files without attempting to print their matching contents.
 - `-V`, `--version` — display version information and exit
 - `-Z`, `--null` — print 0 byte after FILE name
 - `-a`, `--text` — equivalent to --binary-files=text
@@ -1011,6 +1042,24 @@ Options:
 - `-t`, `--test` — test compressed file integrity
 - `-v`, `--verbose` — verbose mode
 - `files` — Input files Files to compress or decompress; omit them to use standard input.
+
+## `head [--bytes <bytes>] [--lines <count>] [<files>...]`
+
+Print the beginning of files
+
+Writes the first ten lines of each selected file by default, or reads standard input when no file is supplied.
+
+Related intents: show the start of a file.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-c`, `--bytes` — Print leading bytes Print the selected number of bytes from each input.
+- `-n`, `--lines` — Print leading lines Print the selected number of lines from each input.
+- `files` — Files to read Files whose leading content is printed; omit them to read standard input.
 
 ## `help [command]`
 
@@ -1297,7 +1346,7 @@ Options:
 - `-w`, `--print-directory` — Print the current directory.
 - `targets` — Targets or variable assignments Targets to update and optional name=value assignments.
 
-## `man [--all] [--apropos] [--ascii] [--catman] [--config-file <Path>] [--debug] [--default] [--ditroff] [--encoding <value>] [--extension <value>] [--global-apropos] [--gxditview <value>] [--help] [--html <value>] [--ignore-case] [--local-file] [--locale <value>] [--location] [--location-cat] [--manpath <Directory>] [--match-case] [--names-only] [--nh] [--nj] [--no-hyphenation] [--no-justification] [--no-subpages] [--pager <Path>] [--path] [--preprocessor <value>] [--prompt <value>] [--recode <value>] [--regex] [--sections <value>] [--systems <value>] [--troff] [--troff-device <value>] [--update] [--usage] [--version] [--warnings <value>] [--whatis] [--where] [--where-cat] [--wildcard] [-S] [<pages>...]`
+## `man [-M <manpath>] [-P <pager>] [-S <sections>] [-a] [-d...] [-f] [-h] [-k] [-m <architecture>] [-o] [-p <preprocessors>] [-t] [-w] [<pages>...]`
 
 Read system manual pages
 
@@ -1311,53 +1360,39 @@ Related intents: look up command documentation; read a manual page.
 
 Options:
 
-- `--help` — give this help list
-- `--location` — print physical location of man page(s)
-- `--location-cat` — print physical location of cat file(s)
-- `--names-only` — make --regex and --wildcard match page names only,
-- `--nh` — turn off hyphenation
-- `--nj` — turn off justification
-- `--no-hyphenation` — turn off hyphenation
-- `--no-justification` — turn off justification
-- `--no-subpages` — don't try subpages, e.g. 'man foo bar' => 'man
-- `--path` — print physical location of man page(s)
-- `--regex` — show all pages matching regex
-- `--usage` — give a short usage message
-- `--warnings` — enable warnings from groff
-- `--wildcard` — show all pages matching wildcard
-- `-7`, `--ascii` — display ASCII translation of certain latin1 chars
-- `-C`, `--config-file` — use this user configuration file
-- `-D`, `--default` — reset all options to their default values
-- `-E`, `--encoding` — use selected output encoding
-- `-H`, `--html` — use  or BROWSER to display HTML output
-- `-I`, `--match-case` — look for pages case-sensitively
-- `-K`, `--global-apropos` — search for text in all pages
-- `-L`, `--locale` — define the locale for this particular man search
-- `-M`, `--manpath` — set search path for manual pages to PATH
-- `-P`, `--pager` — use program PAGER to display output
-- `-R`, `--recode` — output source page encoded in ENCODING
-- `-S` — use colon separated section list
-- `-T`, `--troff-device` — use groff with selected device
-- `-V`, `--version` — print program version
-- `-W`, `--where-cat` — print physical location of cat file(s)
-- `-X`, `--gxditview` — use groff and display through gxditview
-- `-Z`, `--ditroff` — use groff and force it to produce ditroff
-- `-a`, `--all` — find all matching manual pages
-- `-c`, `--catman` — used by catman to reformat out of date cat pages
-- `-d`, `--debug` — emit debugging messages
-- `-e`, `--extension` — limit search to extension type EXTENSION
-- `-f`, `--whatis` — equivalent to whatis
-- `-i`, `--ignore-case` — look for pages case-insensitively (default)
-- `-k`, `--apropos` — equivalent to apropos
-- `-l`, `--local-file` — interpret PAGE argument(s) as local filename(s)
-- `-m`, `--systems` — use manual pages from other systems
-- `-p`, `--preprocessor` — STRING indicates which preprocessors to run
-- `-r`, `--prompt` — provide the `less' pager with a prompt
-- `-s`, `--sections` — use colon separated section list
-- `-t`, `--troff` — use groff to format pages
-- `-u`, `--update` — force a cache consistency check
-- `-w`, `--where` — print physical location of man page(s)
+- `-M` — Select the manual search path Use the supplied colon-separated manual-page search path.
+- `-P` — Select the pager Display manual pages with the supplied pager program.
+- `-S` — Select manual sections Restrict lookup to the supplied colon-separated section list.
+- `-a` — Show every matching page Display all matching manual pages instead of only the first.
+- `-d` — Show debugging information Print diagnostic lookup information without displaying the manual page.
+- `-f` — Search page names and descriptions Emulate whatis lookup for the supplied page names.
+- `-h` — Show help Display a short usage message and exit.
+- `-k` — Search manual-page descriptions Emulate apropos lookup for the supplied expression.
+- `-m` — Select an architecture Override the architecture and machine used for manual-page lookup.
+- `-o` — Use non-localized pages Force lookup to use non-localized manual pages.
+- `-p` — Select preprocessors Run the selected manual-page preprocessors before formatting.
+- `-t` — Format with troff Send the manual source through troff instead of the default formatter.
+- `-w` — Show the page location Print the selected manual page's filesystem location instead of its contents.
 - `pages` — Manual pages Page names or search expressions to display.
+
+## `mkdir [-m <mode>] [-p] [-v] <directories>...`
+
+Create directories
+
+Creates one or more directories, including missing parents when requested.
+
+Related intents: create a directory.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-m` — Set directory permissions Create the final directory with the supplied permission mode.
+- `-p` — Create missing parent directories Create intermediate path components and accept directories that already exist.
+- `-v` — Show created directories Print each directory as it is created.
+- `directories` — Directories to create One or more directory paths to create.
 
 ## `mode <normal|data|ai|toggle>`
 
@@ -1372,6 +1407,27 @@ Normal mode carries bytes and process status. Data mode evaluates Quirl's native
 Options:
 
 - `normal|data|ai|toggle` — Positional `normal|data|ai|toggle` declared by the builtin command signature.
+
+## `mv [-f] [-h] [-i] [-n] [-v] <paths>...`
+
+Move or rename files
+
+Moves one or more source paths to a destination file or directory.
+
+Related intents: move a file; rename a file.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-f` — Overwrite without prompting Do not prompt before overwriting the destination.
+- `-h` — Do not follow a target directory symlink Rename onto a symbolic-link target instead of moving the source into the referenced directory.
+- `-i` — Prompt before overwriting Ask for confirmation before replacing an existing destination.
+- `-n` — Do not overwrite existing files Skip a move when its destination already exists.
+- `-v` — Show moved files Print each file after it is moved.
+- `paths` — Sources and destination Source paths followed by the destination path; the final path is the destination.
 
 ## `nano [--afterends] [--atblanks] [--autoindent] [--backup] [--backupdir <Directory>] [--boldtext] [--bookstyle] [--breaklonglines] [--colonparsing] [--constantshow] [--cutfromcursor] [--emptyline] [--fill <value>] [--guidestripe <value>] [--help] [--historylog] [--ignorercfiles] [--indicator] [--jumpyscrolling] [--linenumbers] [--listsyntaxes] [--locking] [--magic] [--minibar] [--modernbindings] [--mouse] [--multibuffer] [--noconvert] [--nohelp] [--nonewlines] [--noread] [--nowrap] [--operatingdir <Directory>] [--positionlog] [--preserve] [--quickblank] [--quotestr <value>] [--rawsequences] [--rcfile <Path>] [--rebinddelete] [--restricted] [--saveonexit] [--showcursor] [--smarthome] [--softwrap] [--solosidescroll] [--speller <Path>] [--stateflags] [--syntax <value>] [--tabsize <value>] [--tabstospaces] [--trimblanks] [--unix] [--version] [--view] [--wordbounds] [--wordchars <value>] [--zap] [--zero] [<files>...]`
 
@@ -1448,7 +1504,7 @@ Options:
 - `-z`, `--listsyntaxes` — List the names of available syntaxes
 - `files` — Files to edit Text files to open in editor buffers.
 
-## `nc [<host>] [<ports>...]`
+## `nc [--apple-delegate-pid <pid>] [--apple-delegate-uuid <uuid>] [--apple-ecn <mode>] [--apple-ext-bk-idle] [--apple-nowakefromsleep <mode>] [-4] [-6] [-A] [-C] [-D] [-G <seconds>] [-H <seconds>] [-I <seconds>] [-J <count>] [-L <count>] [-U] [-X <protocol>] [-b <interface>] [-c] [-d] [-h] [-i <seconds>] [-k] [-l] [-n] [-p <port>] [-r] [-s <address>] [-t] [-u] [-v...] [-w <seconds>] [-x <proxy>] [-z] [<host>] [<ports>...]`
 
 Read and write network connections
 
@@ -1462,6 +1518,40 @@ Related intents: connect to a network port; listen on a network port.
 
 Options:
 
+- `--apple-delegate-pid` — Delegate the socket to a process Delegate the socket to the supplied macOS process identifier.
+- `--apple-delegate-uuid` — Delegate the socket to a UUID Delegate the socket to the supplied macOS process UUID.
+- `--apple-ecn` — Select explicit congestion notification Set the macOS TCP ECN mode.
+- `--apple-ext-bk-idle` — Allow extended background idle Mark the socket for extended background idle time while suspended.
+- `--apple-nowakefromsleep` — Exclude the port from wake queries Configure whether the local port participates in wake-from-sleep queries.
+- `-4` — Use IPv4 only Resolve and connect using IPv4 addresses only.
+- `-6` — Use IPv6 only Resolve and connect using IPv6 addresses only.
+- `-A` — Receive on any interface Enable the macOS receive-any-interface socket option.
+- `-C` — Avoid cellular data Prevent the connection from using a cellular data context.
+- `-D` — Enable socket debugging Enable debugging on the network socket.
+- `-G` — Set the connection timeout Set the TCP connection timeout in seconds.
+- `-H` — Set the keepalive idle timeout Set the initial TCP keepalive timeout in seconds.
+- `-I` — Set the keepalive interval Set the interval between repeated TCP keepalive probes.
+- `-J` — Set the keepalive probe count Set how many TCP keepalive packets may be sent.
+- `-L` — Set adaptive timeout probes Set how many reachability probes may be sent before an adaptive timeout.
+- `-U` — Use Unix-domain sockets Connect or listen using a Unix-domain socket instead of an Internet socket.
+- `-X` — Select a proxy protocol Use SOCKS 4, SOCKS 5, or HTTPS CONNECT with the configured proxy.
+- `-b` — Bind to an interface Bind the socket to the supplied interface.
+- `-c` — Send CRLF line endings Translate line endings to carriage-return plus line-feed.
+- `-d` — Do not read standard input Open the connection without reading data from standard input.
+- `-h` — Show help Print netcat usage information and exit.
+- `-i` — Set the line interval Wait the supplied interval between transmitted lines or successive port connections.
+- `-k` — Keep accepting connections Remain in listening mode after the current connection closes.
+- `-l` — Listen for connections Accept an incoming connection instead of connecting to a remote host.
+- `-n` — Disable name lookups Do not perform DNS or service-name lookups.
+- `-p` — Select the source port Bind outgoing connections to the supplied local source port.
+- `-r` — Randomize ports Choose source or destination ports randomly instead of sequentially.
+- `-s` — Select the source address Send packets through the interface with the supplied source address.
+- `-t` — Answer Telnet negotiation Send negative responses to Telnet option negotiation requests.
+- `-u` — Use UDP Use UDP instead of the default TCP transport.
+- `-v` — Use verbose output Print additional connection information.
+- `-w` — Set the idle timeout Close an idle connection after the supplied number of seconds.
+- `-x` — Select a proxy server Connect through the supplied proxy address and optional port.
+- `-z` — Scan without sending data Report listening services without opening an interactive data stream.
 - `host` — Remote host Host name or address to connect to; listening modes may omit it.
 - `ports` — Port or port range Network port numbers or service names.
 
@@ -1686,7 +1776,7 @@ Options:
 - `-a`, `--application` — Application to use Open the item with the named application.
 - `paths` — Items to open Files or directories opened by Launch Services.
 
-## `pwd [--help] [--logical] [--physical] [--version]`
+## `pwd [-L] [-P]`
 
 Print the working directory
 
@@ -1700,10 +1790,8 @@ Related intents: show current directory.
 
 Options:
 
-- `--help` — display this help and exit
-- `--version` — output version information and exit
-- `-L`, `--logical` — use PWD from environment, even if it contains symlinks
-- `-P`, `--physical` — avoid all symlinks
+- `-L` — Print the logical directory Print the logical working directory, retaining symbolic-link components.
+- `-P` — Print the physical directory Print the physical working directory after resolving symbolic links.
 
 ## `python [--check-hash-based-pycs <value>] [--help-all] [--help-env] [--help-xoptions] [-B] [-E] [-I] [-O...] [-P] [-S] [-V...] [-W <value>...] [-X <value>...] [-b] [-c <value>] [-d] [-h] [-i] [-m <value>] [-q] [-s] [-u] [-v...] [-x] [<script>] [<arguments>...]`
 
@@ -2748,6 +2836,50 @@ Options:
 - `paths` — Files or directories to search Search roots; defaults to the current directory.
 - `pattern` — Pattern to match Regular expression used to select matching lines; pattern flags may supply it instead.
 
+## `rm [-I] [-P] [-R] [-W] [-d] [-f] [-i] [-r] [-v] [-x] <paths>...`
+
+Remove files or directories
+
+Removes selected paths; directories require an explicit recursive or directory option.
+
+Related intents: delete a file; remove a directory.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-I` — Prompt once for risky removals Ask once before removing more than three files or recursively removing a directory.
+- `-P` — Retain historical compatibility Accept the historical secure-overwrite option without changing behavior.
+- `-R` — Remove directories recursively Remove each selected directory hierarchy and its contents.
+- `-W` — Attempt to undelete whiteouts Attempt to recover files represented by union-filesystem whiteouts.
+- `-d` — Remove directories Attempt to remove directories as well as other filesystem entries.
+- `-f` — Remove without prompting Ignore nonexistent paths and do not ask for confirmation.
+- `-i` — Prompt before each removal Ask for confirmation before removing every selected entry.
+- `-r` — Remove directories recursively Remove each selected directory hierarchy and its contents.
+- `-v` — Show removed paths Print each path as it is removed.
+- `-x` — Stay on one filesystem Do not cross mount points while recursively removing a hierarchy.
+- `paths` — Paths to remove Files or directories selected for removal.
+
+## `rmdir [-p] [-v] <directories>...`
+
+Remove empty directories
+
+Removes selected empty directories or, on Windows, complete directory trees when explicitly requested.
+
+Related intents: remove a directory.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-p` — Remove empty parent components Remove the directory and then each empty parent path component.
+- `-v` — Show removed directories Print each directory as it is removed.
+- `directories` — Directories to remove One or more directory paths to remove.
+
 ## `rsync [--8-bit-output] [--acls] [--address <value>] [--append] [--append-verify] [--archive] [--atimes] [--backup] [--backup-dir <Directory>] [--block-size <value>] [--blocking-io] [--bwlimit <value>] [--checksum] [--checksum-choice <value>] [--checksum-seed <value>] [--chmod <value>] [--chown <value>] [--compare-dest <value>] [--compress] [--compress-choice <value>] [--compress-level <value>] [--compress-threads <value>] [--contimeout <value>] [--copy-as <value>] [--copy-dest <value>] [--copy-devices] [--copy-dirlinks] [--copy-links] [--copy-unsafe-links] [--crtimes] [--cvs-exclude] [--debug <value>] [--del] [--delay-updates] [--delete] [--delete-after] [--delete-before] [--delete-delay] [--delete-during] [--delete-excluded] [--delete-missing-args] [--devices] [--dirs] [--dry-run] [--early-input <Path>] [--exclude <value>] [--exclude-from <Path>] [--executability] [--existing] [--fake-super] [--files-from <Path>] [--filter <value>] [--force] [--from0] [--fsync] [--fuzzy] [--group] [--groupmap <value>] [--hard-links] [--help] [--human-readable] [--iconv <value>] [--ignore-errors] [--ignore-existing] [--ignore-missing-args] [--ignore-times] [--include <value>] [--include-from <Path>] [--info <value>] [--inplace] [--ipv4] [--ipv6] [--itemize-changes] [--keep-dirlinks] [--link-dest <value>] [--links] [--list-only] [--log-file <Path>] [--log-file-format <value>] [--max-alloc <value>] [--max-delete <value>] [--max-size <value>] [--min-size <value>] [--mkpath] [--modify-window <value>] [--munge-links] [--no-implied-dirs] [--no-motd] [--numeric-ids] [--old-args] [--old-dirs] [--omit-dir-times] [--omit-link-times] [--one-file-system] [--only-write-batch <Path>] [--open-noatime] [--out-format <value>] [--outbuf <value>] [--owner] [--partial] [--partial-dir <Directory>] [--password-file <Path>] [--perms] [--port <value>] [--preallocate] [--progress] [--protocol <value>] [--prune-empty-dirs] [--quiet] [--read-batch <Path>] [--recursive] [--relative] [--remote-option <value>] [--remove-source-files] [--rsh <value>] [--rsync-path <value>] [--safe-links] [--secluded-args] [--size-only] [--skip-compress <Path>] [--sockopts <value>] [--sparse] [--specials] [--stats] [--stderr <value>] [--stop-after <value>] [--stop-at <value>] [--suffix <value>] [--super] [--temp-dir <Directory>] [--timeout <value>] [--times] [--trust-sender] [--update] [--usermap <value>] [--verbose] [--version] [--whole-file] [--write-batch <Path>] [--write-devices] [--xattrs] [-D] [-F] [-P] <paths>...`
 
 Synchronize local or remote files
@@ -3087,6 +3219,81 @@ Options:
 - `-y` — Send logs through syslog Send log information using the system log module.
 - `command` — Remote command Command and arguments to execute instead of starting an interactive login session.
 - `destination` — Remote destination Host name, optionally prefixed with a user name in user@host form.
+
+## `tail [--blocks <number>] [--bytes <number>] [--lines <number>] [--quiet] [--verbose] [-F] [-f] [-r] [<files>...]`
+
+Print the end of files
+
+Writes the last ten lines of each selected file by default and can continue following appended data.
+
+Related intents: follow a log file; show the end of a file.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-F` — Follow names across rotation Follow appended data and reopen a named file after replacement or rotation.
+- `-b`, `--blocks` — Select a block offset Start relative to the selected number of 512-byte blocks.
+- `-c`, `--bytes` — Select a byte offset Start relative to the selected number of bytes.
+- `-f` — Follow appended data Wait for and print data appended after the current end of the file.
+- `-n`, `--lines` — Select a line offset Start relative to the selected number of lines.
+- `-q`, `--quiet` — Suppress file headers Do not print headers when reading multiple files.
+- `-r` — Print lines in reverse Display the selected input in reverse line order.
+- `-v`, `--verbose` — Always show file headers Print a header before output from each file.
+- `files` — Files to read Files whose trailing content is printed; omit them to read standard input.
+
+## `tar [--append] [--auto-compress] [--block-size <records>] [--bzip2] [--cd <Directory>] [--check-links] [--create] [--dereference] [--exclude <pattern>...] [--exclude-vcs] [--extract] [--file <Path>] [--files-from <Path>] [--format <format>] [--gzip] [--help] [--interactive] [--keep-old-files] [--list] [--mac-metadata] [--modification-time] [--no-acls] [--no-fflags] [--no-mac-metadata] [--no-recursion] [--null] [--preserve-permissions] [--read-full-blocks] [--strip-components <count>] [--to-stdout] [--update] [--verbose...] [--version] [--xz] [--zstd] [<members>...]`
+
+Create and inspect archives
+
+Creates, extracts, lists, and modifies tar archives.
+
+Related intents: create an archive; extract an archive; list archive contents.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--exclude` — Exclude matching entries Do not process files or directories matching the supplied pattern.
+- `--exclude-vcs` — Exclude version-control metadata Do not process internal directories used by common version-control systems.
+- `--format` — Select the archive format Create the archive using the selected libarchive format.
+- `--help` — Show help Display tar usage information and exit.
+- `--mac-metadata` — Preserve macOS metadata Archive or extract extended ACLs and attributes using AppleDouble metadata.
+- `--no-acls` — Do not preserve ACLs Do not archive or extract access-control lists.
+- `--no-fflags` — Do not preserve file flags Do not archive or extract platform-specific file flags.
+- `--no-mac-metadata` — Do not preserve macOS metadata Do not archive or extract AppleDouble ACL and extended-attribute metadata.
+- `--null` — Read NUL-terminated names Treat names read with -I or -T as NUL-terminated instead of newline-terminated.
+- `--strip-components` — Strip leading path components Remove the supplied number of leading components from extracted member paths.
+- `--version` — Show version information Display the bsdtar and libarchive version information.
+- `--zstd` — Compress with zstd Compress a newly created archive with zstd.
+- `-B`, `--read-full-blocks` — Read full records Accept the compatibility option for reading full archive records.
+- `-C`, `--cd` — Change directory Change to the selected directory before processing subsequent archive members.
+- `-J`, `--xz` — Compress with xz Compress a newly created archive with xz.
+- `-L`, `--dereference` — Follow symbolic links Archive the targets of all symbolic links instead of the links themselves.
+- `-O`, `--to-stdout` — Extract to standard output Write extracted member contents to standard output instead of disk.
+- `-T`, `--files-from` — Read member names from a file Read member names or patterns from the selected file.
+- `-a`, `--auto-compress` — Select compression from the suffix Choose the archive format and compression from the output file suffix.
+- `-b`, `--block-size` — Set the tape block size Use the supplied number of 512-byte records for each tape I/O block.
+- `-c`, `--create` — Create an archive Create a new archive containing the selected entries.
+- `-f`, `--file` — Select the archive file Read the archive from or write it to the selected file.
+- `-j`, `--bzip2` — Compress with bzip2 Compress a newly created archive with bzip2.
+- `-k`, `--keep-old-files` — Keep existing files Do not overwrite files that already exist while extracting.
+- `-l`, `--check-links` — Check hard-link coverage Warn when an archived file has hard links that were not all included.
+- `-m`, `--modification-time` — Do not restore modification times Leave extracted files with their current modification times.
+- `-n`, `--no-recursion` — Do not recurse into directories Archive directory entries without recursively processing their contents.
+- `-p`, `--preserve-permissions` — Restore stored permissions Restore permissions, ACLs, ownership, and file flags while extracting.
+- `-r`, `--append` — Append files to an archive Append selected entries to an existing uncompressed archive.
+- `-t`, `--list` — List archive contents Print the selected members contained in an archive.
+- `-u`, `--update` — Append newer files Append selected files only when they are newer than the archived copies.
+- `-v`, `--verbose` — Show processed members Print archive members as they are processed.
+- `-w`, `--interactive` — Prompt before actions Ask for confirmation before each archive action.
+- `-x`, `--extract` — Extract archive members Extract selected members from an archive.
+- `-z`, `--gzip` — Compress with gzip Compress a newly created archive with gzip.
+- `members` — Files or archive members Paths to add when creating, or member names to select when reading an archive.
 
 ## `task [--color] [--completion <value>] [--concurrency <value>] [--dir <Directory>] [--disable-fuzzy] [--dry] [--exit-code] [--experiments] [--failfast] [--force] [--global] [--help] [--init] [--insecure] [--interval <value>] [--json] [--list] [--list-all] [--nested] [--no-status] [--output <value>] [--output-group-begin <value>] [--output-group-end <value>] [--output-group-error-only] [--parallel] [--silent] [--sort <value>] [--status] [--summary] [--taskfile <Path>] [--verbose] [--version] [--watch] [--yes] [<tasks>...]`
 

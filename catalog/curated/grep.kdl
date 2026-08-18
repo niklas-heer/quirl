@@ -9,28 +9,46 @@ catalog "grep" {
         flag "--after-context" summary="print NUM lines of trailing context" description="print NUM lines of trailing context" short="-A" value="value"
         flag "--basic-regexp" summary="PATTERNS are basic regular expressions" description="PATTERNS are basic regular expressions" short="-G"
         flag "--before-context" summary="print NUM lines of leading context" description="print NUM lines of leading context" short="-B" value="value"
-        flag "--binary" summary="do not strip CR characters at EOL (MSDOS/Windows)" description="do not strip CR characters at EOL (MSDOS/Windows)" short="-U"
+        flag "--binary" summary="do not strip CR characters at EOL (MSDOS/Windows)" description="do not strip CR characters at EOL (MSDOS/Windows)" short="-U" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--binary" summary="Search binary input" description="Search binary files without attempting to print their matching contents." short="-U" {
+            platform "macos"
+        }
         flag "--binary-files" summary="assume that binary files are TYPE;" description="assume that binary files are TYPE;" value="value"
         flag "--byte-offset" summary="print the byte offset with output lines" description="print the byte offset with output lines" short="-b"
         flag "--colour" summary="use markers to highlight the matching strings;" description="use markers to highlight the matching strings;" value="value"
         flag "--context" summary="print NUM lines of output context" description="print NUM lines of output context" short="-C" value="value"
         flag "--count" summary="print only a count of selected lines per FILE" description="print only a count of selected lines per FILE" short="-c"
-        flag "--dereference-recursive" summary="likewise, but follow all symlinks" description="likewise, but follow all symlinks" short="-R"
+        flag "--dereference-recursive" summary="likewise, but follow all symlinks" description="likewise, but follow all symlinks" short="-R" {
+            platform "linux"
+            platform "freebsd"
+        }
         flag "--devices" summary="how to handle devices, FIFOs and sockets;" description="how to handle devices, FIFOs and sockets;" short="-D" value="value"
         flag "--directories" summary="how to handle directories;" description="how to handle directories;" short="-d" value="value"
         flag "--exclude" summary="skip files that match GLOB" description="skip files that match GLOB" value="value"
         flag "--exclude-dir" summary="skip directories that match GLOB" description="skip directories that match GLOB" value="value"
-        flag "--exclude-from" summary="skip files that match any file pattern from FILE" description="skip files that match any file pattern from FILE" value="value" action="files"
+        flag "--exclude-from" summary="skip files that match any file pattern from FILE" description="skip files that match any file pattern from FILE" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
         flag "--extended-regexp" summary="PATTERNS are extended regular expressions" description="PATTERNS are extended regular expressions" short="-E"
         flag "--file" summary="take PATTERNS from FILE" description="take PATTERNS from FILE" short="-f" value="value" action="files"
         flag "--files-with-matches" summary="print only names of FILEs with selected lines" description="print only names of FILEs with selected lines" short="-l"
         flag "--files-without-match" summary="print only names of FILEs with no selected lines" description="print only names of FILEs with no selected lines" short="-L"
         flag "--fixed-strings" summary="PATTERNS are strings" description="PATTERNS are strings" short="-F"
-        flag "--group-separator" summary="print SEP on line between matches with context" description="print SEP on line between matches with context" value="value"
+        flag "--group-separator" summary="print SEP on line between matches with context" description="print SEP on line between matches with context" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
         flag "--help" summary="display this help text and exit" description="display this help text and exit"
         flag "--ignore-case" summary="ignore case distinctions in patterns and data" description="ignore case distinctions in patterns and data" short="-i"
         flag "--include" summary="search only files that match GLOB (a file pattern)" description="search only files that match GLOB (a file pattern)" value="value"
-        flag "--initial-tab" summary="make tabs line up (if needed)" description="make tabs line up (if needed)" short="-T"
+        flag "--initial-tab" summary="make tabs line up (if needed)" description="make tabs line up (if needed)" short="-T" {
+            platform "linux"
+            platform "freebsd"
+        }
         flag "--invert-match" summary="select non-matching lines" description="select non-matching lines" short="-v"
         flag "--label" summary="use LABEL as the standard input file name prefix" description="use LABEL as the standard input file name prefix" value="value"
         flag "--line-buffered" summary="flush output on every line" description="flush output on every line"
@@ -38,13 +56,22 @@ catalog "grep" {
         flag "--line-regexp" summary="match only whole lines" description="match only whole lines" short="-x"
         flag "--max-count" summary="stop after NUM selected lines" description="stop after NUM selected lines" short="-m" value="value"
         flag "--no-filename" summary="suppress the file name prefix on output" description="suppress the file name prefix on output" short="-h"
-        flag "--no-group-separator" summary="do not print separator for matches with context" description="do not print separator for matches with context"
-        flag "--no-ignore-case" summary="do not ignore case distinctions (default)" description="do not ignore case distinctions (default)"
+        flag "--no-group-separator" summary="do not print separator for matches with context" description="do not print separator for matches with context" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-ignore-case" summary="do not ignore case distinctions (default)" description="do not ignore case distinctions (default)" {
+            platform "linux"
+            platform "freebsd"
+        }
         flag "--no-messages" summary="suppress error messages" description="suppress error messages" short="-s"
         flag "--null" summary="print 0 byte after FILE name" description="print 0 byte after FILE name" short="-Z"
         flag "--null-data" summary="a data line ends in 0 byte, not newline" description="a data line ends in 0 byte, not newline" short="-z"
         flag "--only-matching" summary="show only nonempty parts of lines that match" description="show only nonempty parts of lines that match" short="-o"
-        flag "--perl-regexp" summary="PATTERNS are Perl regular expressions" description="PATTERNS are Perl regular expressions" short="-P"
+        flag "--perl-regexp" summary="PATTERNS are Perl regular expressions" description="PATTERNS are Perl regular expressions" short="-P" {
+            platform "linux"
+            platform "freebsd"
+        }
         flag "--quiet" summary="suppress all normal output" description="suppress all normal output" short="-q"
         flag "--recursive" summary="like --directories=recurse" description="like --directories=recurse" short="-r"
         flag "--regexp" summary="use PATTERNS for matching" description="use PATTERNS for matching" short="-e" value="value"
@@ -53,6 +80,9 @@ catalog "grep" {
         flag "--version" summary="display version information and exit" description="display version information and exit" short="-V"
         flag "--with-filename" summary="print file name with output lines" description="print file name with output lines" short="-H"
         flag "--word-regexp" summary="match only whole words" description="match only whole words" short="-w"
+        flag "-R" summary="Search directories recursively" description="Recursively search each selected directory." {
+            platform "macos"
+        }
         argument "pattern" summary="Pattern to match" description="Regular expression used to select matching lines." required=#true
         argument "files" summary="Files to search" description="Files to search; omit them to read standard input." repeatable=#true action="files"
     }

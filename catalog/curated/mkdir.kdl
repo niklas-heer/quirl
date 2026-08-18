@@ -1,8 +1,32 @@
 catalog "mkdir" {
     provenance author="Carapace contributors; curated by Quirl contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
-    command "mkdir" summary="Create directories" description="Creates one or more directories on Windows." {
+    command "mkdir" summary="Create directories" description="Creates one or more directories, including missing parents when requested." {
         intent "create a directory"
+        platform "linux"
+        platform "macos"
         platform "windows"
+        platform "freebsd"
+        flag "--mode" summary="Set directory permissions" description="Create the final directory with the supplied permission mode." short="-m" value="mode" {
+            platform "linux"
+        }
+        flag "--parents" summary="Create missing parent directories" description="Create intermediate path components and accept directories that already exist." short="-p" {
+            platform "linux"
+        }
+        flag "--verbose" summary="Show created directories" description="Print a message for each directory that is created." short="-v" {
+            platform "linux"
+        }
+        flag "-m" summary="Set directory permissions" description="Create the final directory with the supplied permission mode." value="mode" {
+            platform "macos"
+            platform "freebsd"
+        }
+        flag "-p" summary="Create missing parent directories" description="Create intermediate path components and accept directories that already exist." {
+            platform "macos"
+            platform "freebsd"
+        }
+        flag "-v" summary="Show created directories" description="Print each directory as it is created." {
+            platform "macos"
+            platform "freebsd"
+        }
         argument "directories" summary="Directories to create" description="One or more directory paths to create." required=#true repeatable=#true action="directories"
     }
 }

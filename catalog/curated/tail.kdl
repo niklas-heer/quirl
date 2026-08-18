@@ -4,21 +4,88 @@ catalog "tail" {
         intent "follow a log file"
         intent "show the end of a file"
         platform "linux"
+        platform "macos"
         platform "freebsd"
-        flag "--bytes" summary="output the last NUM bytes" description="output the last NUM bytes" short="-c" value="value"
-        flag "--debug" summary="indicate which --follow implementation is used" description="indicate which --follow implementation is used"
-        flag "--follow" summary="output appended data as the file grows" description="output appended data as the file grows" short="-f" value="value"
-        flag "--help" summary="display this help and exit" description="display this help and exit"
-        flag "--lines" summary="output the last NUM lines, instead of the last 10" description="output the last NUM lines, instead of the last 10" short="-n" value="value"
-        flag "--max-unchanged-stats" summary="reopen a FILE which has not changed size after N iterations" description="reopen a FILE which has not changed size after N iterations" value="value"
-        flag "--pid" summary="with -f, terminate after process ID, PID dies" description="with -f, terminate after process ID, PID dies" value="value"
-        flag "--quiet" summary="never output headers giving file names" description="never output headers giving file names" short="-q"
-        flag "--retry" summary="keep trying to open a file if it is inaccessible" description="keep trying to open a file if it is inaccessible"
-        flag "--silent" summary="never output headers giving file names" description="never output headers giving file names"
-        flag "--sleep-interval" summary="with -f, sleep for approximately N seconds" description="with -f, sleep for approximately N seconds" short="-s" value="value"
-        flag "--verbose" summary="always output headers giving file names" description="always output headers giving file names" short="-v"
-        flag "--version" summary="output version information and exit" description="output version information and exit"
-        flag "--zero-terminated" summary="line delimiter is NUL, not newline" description="line delimiter is NUL, not newline" short="-z"
+        flag "--blocks" summary="Select a block offset" description="Start relative to the selected number of 512-byte blocks." short="-b" value="number" {
+            platform "macos"
+        }
+        flag "--bytes" summary="output the last NUM bytes" description="output the last NUM bytes" short="-c" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--bytes" summary="Select a byte offset" description="Start relative to the selected number of bytes." short="-c" value="number" {
+            platform "macos"
+        }
+        flag "--debug" summary="indicate which --follow implementation is used" description="indicate which --follow implementation is used" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--follow" summary="output appended data as the file grows" description="output appended data as the file grows" short="-f" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--help" summary="display this help and exit" description="display this help and exit" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--lines" summary="output the last NUM lines, instead of the last 10" description="output the last NUM lines, instead of the last 10" short="-n" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--lines" summary="Select a line offset" description="Start relative to the selected number of lines." short="-n" value="number" {
+            platform "macos"
+        }
+        flag "--max-unchanged-stats" summary="reopen a FILE which has not changed size after N iterations" description="reopen a FILE which has not changed size after N iterations" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--pid" summary="with -f, terminate after process ID, PID dies" description="with -f, terminate after process ID, PID dies" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--quiet" summary="never output headers giving file names" description="never output headers giving file names" short="-q" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--quiet" summary="Suppress file headers" description="Do not print headers when reading multiple files." short="-q" {
+            platform "macos"
+        }
+        flag "--retry" summary="keep trying to open a file if it is inaccessible" description="keep trying to open a file if it is inaccessible" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--silent" summary="never output headers giving file names" description="never output headers giving file names" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--sleep-interval" summary="with -f, sleep for approximately N seconds" description="with -f, sleep for approximately N seconds" short="-s" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--verbose" summary="always output headers giving file names" description="always output headers giving file names" short="-v" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--verbose" summary="Always show file headers" description="Print a header before output from each file." short="-v" {
+            platform "macos"
+        }
+        flag "--version" summary="output version information and exit" description="output version information and exit" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--zero-terminated" summary="line delimiter is NUL, not newline" description="line delimiter is NUL, not newline" short="-z" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-F" summary="Follow names across rotation" description="Follow appended data and reopen a named file after replacement or rotation." {
+            platform "macos"
+        }
+        flag "-f" summary="Follow appended data" description="Wait for and print data appended after the current end of the file." {
+            platform "macos"
+        }
+        flag "-r" summary="Print lines in reverse" description="Display the selected input in reverse line order." {
+            platform "macos"
+        }
         argument "files" summary="Files to read" description="Files whose trailing content is printed; omit them to read standard input." repeatable=#true action="files"
     }
 }

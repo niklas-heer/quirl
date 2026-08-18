@@ -48,7 +48,7 @@ const AUTOMATIC_MAN_DIAGNOSTICS_MAX: usize = 128;
 const MAN_CANDIDATE_PATH_BYTES_MAX: usize = 1024 * 1024;
 const INDEX_DIAGNOSTIC_ORIGIN_BYTES_MAX: usize = 1024;
 const INDEX_DIAGNOSTIC_MESSAGE_BYTES_MAX: usize = 512;
-const DISCOVERY_STATE_VERSION: u32 = 1;
+const DISCOVERY_STATE_VERSION: u32 = 2;
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DISCOVERY_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const DISCOVERY_DEADLINE: Duration = Duration::from_millis(750);
@@ -181,6 +181,7 @@ struct DiscoverySource {
 struct DiscoveryState {
     version: u32,
     catalog_schema_version: u32,
+    native_catalog_identity: String,
     refreshed_unix_ms: u64,
     source_fingerprint: String,
     catalog_fingerprint: String,
@@ -206,6 +207,7 @@ struct ManCandidate {
     path: PathBuf,
     root_priority: usize,
     compressed: bool,
+    prioritized: bool,
 }
 
 // Failure cleanup preserves every armed name because identity validation plus
@@ -478,7 +480,7 @@ pub fn execute(command: IndexCommand) -> Result<i32, ShellError> {
 /// recoverable and falls back to those builtins.
 pub fn load_default_catalog() -> Catalog {
     let Some(path) = default_index_path() else {
-        return Catalog::builtin();
+        return crate::native_catalog::builtin_native_catalog();
     };
     load_catalog_at(&path)
 }
@@ -930,6 +932,7 @@ fn refresh_catalog_cache(
     let state = DiscoveryState {
         version: DISCOVERY_STATE_VERSION,
         catalog_schema_version: catalog.schema_version,
+        native_catalog_identity: crate::native_catalog::embedded_database_identity().to_owned(),
         refreshed_unix_ms: unix_time_ms(),
         source_fingerprint: snapshot.fingerprint,
         catalog_fingerprint,
@@ -961,6 +964,7 @@ fn discovery_cache_is_current(
     let stale_ms = u64::try_from(config.stale_after.as_millis()).unwrap_or(u64::MAX);
     if state.version != DISCOVERY_STATE_VERSION
         || state.catalog_schema_version != Catalog::builtin().schema_version
+        || state.native_catalog_identity != crate::native_catalog::embedded_database_identity()
         || state.source_fingerprint != snapshot.fingerprint
         || state.sources != snapshot.sources
         || age_ms >= stale_ms
@@ -1001,21 +1005,24 @@ fn ensure_refresh_active(
 }
 
 fn load_catalog_at(path: &Path) -> Catalog {
-    match read_index(path) {
+    let mut catalog = match read_index(path) {
         Ok(bytes) => decode_catalog(&bytes, path)
             .map(merge_cached_catalog)
             .unwrap_or_else(|_| Catalog::builtin()),
         Err(_) => Catalog::builtin(),
-    }
+    };
+    crate::native_catalog::merge_embedded(&mut catalog);
+    catalog
 }
 
 fn merge_cached_catalog(mut cached: Catalog) -> Catalog {
     // The index cache contains imported discovery facts, not authenticated
     // installation state. Only the validated plugin lock snapshot may confer
     // plugin provenance and make a command eligible for agent execution. A
-    // cached builtin is also an obsolete copy of the running binary's contract:
-    // discard it whole so removed flags and renamed mode values cannot merge
-    // back into the current authoritative record.
+    // Cached builtin and native records are obsolete copies of contracts
+    // compiled into the running binary. Discard them whole so removed flags,
+    // platform corrections, and renamed mode values cannot merge back into
+    // the current authoritative records.
     let mut current = Catalog::builtin();
     let builtin_ids = current
         .commands
@@ -1024,6 +1031,7 @@ fn merge_cached_catalog(mut cached: Catalog) -> Catalog {
         .collect::<BTreeSet<_>>();
     cached.commands.retain(|command| {
         command.provenance.source != Provenance::Plugin
+            && !command.id.starts_with("native:")
             && !(command.provenance.source == Provenance::Builtin
                 && builtin_ids.contains(&command.id))
     });
@@ -1502,6 +1510,7 @@ fn completion_files_checked(
 fn discover_man_files(
     roots: &[PathBuf],
     command_names: &BTreeSet<String>,
+    priority_command_names: &BTreeSet<String>,
     budget: &mut IndexBuildBudget,
     deadline: RefreshDeadline,
     cancelled: &AtomicBool,
@@ -1529,6 +1538,7 @@ fn discover_man_files(
                 root,
                 root_priority,
                 command_names,
+                priority_command_names,
                 &mut candidates,
                 &mut diagnostics,
                 &mut candidate_path_bytes,
@@ -1543,6 +1553,7 @@ fn discover_man_files(
             root,
             root_priority,
             command_names,
+            priority_command_names,
             &mut candidates,
             &mut diagnostics,
             &mut candidate_path_bytes,
@@ -1551,7 +1562,7 @@ fn discover_man_files(
             cancelled,
         )?;
     }
-    select_man_candidates(candidates, diagnostics, budget)
+    select_man_candidates(candidates, diagnostics, budget, AUTOMATIC_MAN_PAGES_MAX)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1559,6 +1570,7 @@ fn collect_man_root_candidates(
     root: &Path,
     root_priority: usize,
     command_names: &BTreeSet<String>,
+    priority_command_names: &BTreeSet<String>,
     candidates: &mut Vec<ManCandidate>,
     diagnostics: &mut Vec<ImportDiagnostic>,
     candidate_path_bytes: &mut usize,
@@ -1602,6 +1614,7 @@ fn collect_man_root_candidates(
             &entry.path(),
             root_priority,
             command_names,
+            priority_command_names,
             candidates,
             diagnostics,
             candidate_path_bytes,
@@ -1616,6 +1629,7 @@ fn admit_man_candidate(
     path: &Path,
     root_priority: usize,
     command_names: &BTreeSet<String>,
+    priority_command_names: &BTreeSet<String>,
     candidates: &mut Vec<ManCandidate>,
     diagnostics: &mut Vec<ImportDiagnostic>,
     candidate_path_bytes: &mut usize,
@@ -1646,11 +1660,13 @@ fn admit_man_candidate(
         observed,
     )?;
     *candidate_path_bytes = observed;
+    let prioritized = priority_command_names.contains(&command);
     candidates.push(ManCandidate {
         command,
         path: candidate_path,
         root_priority,
         compressed,
+        prioritized,
     });
     Ok(())
 }
@@ -1683,10 +1699,14 @@ fn select_man_candidates(
     mut candidates: Vec<ManCandidate>,
     mut diagnostics: Vec<ImportDiagnostic>,
     budget: &mut IndexBuildBudget,
+    pages_max: usize,
 ) -> Result<(Vec<PathBuf>, Vec<ImportDiagnostic>), ShellError> {
+    assert!(pages_max > 0, "man-page selection limit must be positive");
     candidates.sort_by(|left, right| {
-        left.command
-            .cmp(&right.command)
+        right
+            .prioritized
+            .cmp(&left.prioritized)
+            .then_with(|| left.command.cmp(&right.command))
             .then_with(|| left.compressed.cmp(&right.compressed))
             .then_with(|| left.root_priority.cmp(&right.root_priority))
             .then_with(|| left.path.cmp(&right.path))
@@ -1695,7 +1715,7 @@ fn select_man_candidates(
     let mut selected_commands = BTreeSet::new();
     let mut selected_targets = BTreeSet::new();
     for candidate in candidates {
-        if files.len() == AUTOMATIC_MAN_PAGES_MAX {
+        if files.len() == pages_max {
             break;
         }
         if !selected_commands.insert(candidate.command) {
@@ -1715,7 +1735,6 @@ fn select_man_candidates(
             files.push(candidate.path);
         }
     }
-    files.sort();
     Ok((files, diagnostics))
 }
 
@@ -1838,9 +1857,11 @@ fn discover_sources(
         .iter()
         .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
         .collect();
+    let priority_command_names = crate::native_catalog::embedded_root_command_names()?;
     let (man_files, mut diagnostics) = discover_man_files(
         &config.man_roots,
         &command_names,
+        &priority_command_names,
         budget,
         deadline,
         cancelled,
@@ -3166,6 +3187,10 @@ mod tests {
         let (_, state_json) = intelligence::decode_database(&bytes, &config.index_path).unwrap();
         let state: DiscoveryState = serde_json::from_str(&state_json.unwrap()).unwrap();
         assert_eq!(state.version, DISCOVERY_STATE_VERSION);
+        assert_eq!(
+            state.native_catalog_identity,
+            crate::native_catalog::embedded_database_identity()
+        );
         assert!(!state.sources.is_empty());
         assert!(state.source_fingerprint.starts_with("fnv1a64:"));
         assert!(state.catalog_fingerprint.starts_with("fnv1a64:"));
@@ -3346,7 +3371,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_man_discovery_merges_cp_intent_and_option_documents() {
+    fn automatic_man_discovery_indexes_cp_while_native_contract_stays_authoritative() {
         let directory = temporary_directory();
         let mut config = discovery_config(&directory);
         let man = directory.join("man1");
@@ -3359,14 +3384,19 @@ mod tests {
 
         let catalog = load_catalog_at(&config.index_path);
         let cp = catalog.find("cp").unwrap();
-        assert_eq!(cp.summary, "copy files");
+        assert_eq!(cp.summary, "Copy files and directories");
         assert!(cp.options.iter().any(|option| {
-            option.names == ["-R"] && option.documentation.contains("entire subtree")
+            option.names == ["-R"] && option.documentation.contains("complete subtree")
         }));
         assert!(cp.options.iter().any(|option| {
-            option.names == ["-p"] && option.documentation.contains("file mode")
+            option.names == ["-p"] && option.documentation.contains("timestamps")
         }));
         let bytes = read_index(&config.index_path).unwrap();
+        let (_, state_json) = intelligence::decode_database(&bytes, &config.index_path).unwrap();
+        let state: DiscoveryState = serde_json::from_str(&state_json.unwrap()).unwrap();
+        assert!(state.sources.iter().any(|source| {
+            source.kind == DiscoverySourceKind::Man && source.path == man.join("cp.1")
+        }));
         let results = intelligence::search(
             &bytes,
             &config.index_path,
@@ -3421,6 +3451,39 @@ mod tests {
         assert!(cp.options.iter().any(|option| option.names == ["-R"]));
         assert_eq!(budget.source_bytes, 4);
         assert_eq!(budget.man_source_bytes, bsd_cp_man_page().len());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn catalog_man_pages_cannot_be_starved_by_alphabetical_selection() {
+        let directory = temporary_directory();
+        let ordinary = directory.join("aa-ordinary.1");
+        let prioritized = directory.join("zz-prioritized.1");
+        fs::write(&ordinary, bsd_cp_man_page()).unwrap();
+        fs::write(&prioritized, bsd_cp_man_page()).unwrap();
+        let candidates = vec![
+            ManCandidate {
+                command: "aa-ordinary".to_owned(),
+                path: ordinary,
+                root_priority: 0,
+                compressed: false,
+                prioritized: false,
+            },
+            ManCandidate {
+                command: "zz-prioritized".to_owned(),
+                path: prioritized.clone(),
+                root_priority: 0,
+                compressed: false,
+                prioritized: true,
+            },
+        ];
+        let mut budget = test_budget();
+
+        let (selected, diagnostics) =
+            select_man_candidates(candidates, Vec::new(), &mut budget, 1).unwrap();
+
+        assert_eq!(selected, [prioritized]);
+        assert!(diagnostics.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3869,6 +3932,27 @@ mod tests {
                     .iter()
                     .any(|name| name == "--removed-stale-flag"))
         );
+    }
+
+    #[test]
+    fn compatible_stale_cache_cannot_restore_obsolete_native_platform_facts() {
+        let cached = crate::native_catalog::builtin_native_catalog();
+        assert!(
+            cached
+                .commands
+                .iter()
+                .any(|command| command.id.starts_with("native:"))
+        );
+
+        let merged = merge_cached_catalog(cached);
+
+        assert!(
+            merged
+                .commands
+                .iter()
+                .all(|command| !command.id.starts_with("native:"))
+        );
+        assert!(merged.find("quirl run").is_some());
     }
 
     #[test]

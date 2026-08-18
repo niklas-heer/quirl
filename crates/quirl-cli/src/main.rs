@@ -481,7 +481,6 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
 
 fn load_composed_catalog() -> Result<Catalog, ShellError> {
     let mut catalog = index::load_default_catalog();
-    native_catalog::merge_embedded(&mut catalog);
     merge_installed_catalog_snapshot(&mut catalog)?;
     Ok(catalog)
 }

@@ -3,15 +3,46 @@ catalog "head" {
     command "head" summary="Print the beginning of files" description="Writes the first ten lines of each selected file by default, or reads standard input when no file is supplied." {
         intent "show the start of a file"
         platform "linux"
+        platform "macos"
         platform "freebsd"
-        flag "--bytes" summary="print the first NUM bytes of each file;" description="print the first NUM bytes of each file;" short="-c" value="value"
-        flag "--help" summary="display this help and exit" description="display this help and exit"
-        flag "--lines" summary="print the first NUM lines instead of the first 10;" description="print the first NUM lines instead of the first 10;" short="-n" value="value"
-        flag "--quiet" summary="never print headers giving file names" description="never print headers giving file names" short="-q"
-        flag "--silent" summary="never print headers giving file names" description="never print headers giving file names"
-        flag "--verbose" summary="always print headers giving file names" description="always print headers giving file names" short="-v"
-        flag "--version" summary="output version information and exit" description="output version information and exit"
-        flag "--zero-terminated" summary="line delimiter is NUL, not newline" description="line delimiter is NUL, not newline" short="-z"
+        flag "--bytes" summary="print the first NUM bytes of each file;" description="print the first NUM bytes of each file;" short="-c" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--bytes" summary="Print leading bytes" description="Print the selected number of bytes from each input." short="-c" value="bytes" {
+            platform "macos"
+        }
+        flag "--help" summary="display this help and exit" description="display this help and exit" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--lines" summary="print the first NUM lines instead of the first 10;" description="print the first NUM lines instead of the first 10;" short="-n" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--lines" summary="Print leading lines" description="Print the selected number of lines from each input." short="-n" value="count" {
+            platform "macos"
+        }
+        flag "--quiet" summary="never print headers giving file names" description="never print headers giving file names" short="-q" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--silent" summary="never print headers giving file names" description="never print headers giving file names" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--verbose" summary="always print headers giving file names" description="always print headers giving file names" short="-v" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--version" summary="output version information and exit" description="output version information and exit" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--zero-terminated" summary="line delimiter is NUL, not newline" description="line delimiter is NUL, not newline" short="-z" {
+            platform "linux"
+            platform "freebsd"
+        }
         argument "files" summary="Files to read" description="Files whose leading content is printed; omit them to read standard input." repeatable=#true action="files"
     }
 }

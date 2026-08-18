@@ -4,41 +4,195 @@ catalog "cp" {
         intent "copy a directory"
         intent "copy a file"
         platform "linux"
+        platform "macos"
         platform "freebsd"
-        flag "--archive" summary="same as -dR --preserve=all" description="same as -dR --preserve=all" short="-a"
-        flag "--attributes-only" summary="don't copy the file data, just the attributes" description="don't copy the file data, just the attributes"
-        flag "--backup" summary="make a backup of each existing destination file" description="make a backup of each existing destination file" value="value"
-        flag "--context" summary="like -Z, or if CTX is specified then set the SELinux or SMACK security context to CTX" description="like -Z, or if CTX is specified then set the SELinux or SMACK security context to CTX" value="value"
-        flag "--copy-contents" summary="copy contents of special files when recursive" description="copy contents of special files when recursive"
-        flag "--debug" summary="explain how a file is copied" description="explain how a file is copied"
-        flag "--dereference" summary="always follow symbolic links in SOURCE" description="always follow symbolic links in SOURCE" short="-L"
-        flag "--force" summary="if an existing destination file cannot be opened, remove it and try again (this option is ignored when the -n option is also used)" description="if an existing destination file cannot be opened, remove it and try again (this option is ignored when the -n option is also used)" short="-f"
-        flag "--help" summary="display this help and exit" description="display this help and exit"
-        flag "--interactive" summary="prompt before overwrite (overrides a previous -n option)" description="prompt before overwrite (overrides a previous -n option)" short="-i"
-        flag "--keep-directory-symlink" summary="follow existing symlinks to directories" description="follow existing symlinks to directories"
-        flag "--link" summary="hard link files instead of copying" description="hard link files instead of copying" short="-l"
-        flag "--no-clobber" summary="(deprecated) silently skip existing files" description="(deprecated) silently skip existing files" short="-n"
-        flag "--no-dereference" summary="never follow symbolic links in SOURCE" description="never follow symbolic links in SOURCE" short="-P"
-        flag "--no-preserve" summary="don't preserve the specified attributes" description="don't preserve the specified attributes" value="value" repeatable=#true
-        flag "--no-target-directory" summary="treat DEST as a normal file" description="treat DEST as a normal file" short="-T"
-        flag "--one-file-system" summary="stay on this file system" description="stay on this file system" short="-x"
-        flag "--parents" summary="use full source file name under DIRECTORY" description="use full source file name under DIRECTORY"
-        flag "--preserve" summary="preserve the specified attributes" description="preserve the specified attributes" value="value" repeatable=#true
-        flag "--recursive" summary="copy directories recursively" description="copy directories recursively" short="-r"
-        flag "--reflink" summary="control clone/CoW copies" description="control clone/CoW copies" value="value"
-        flag "--remove-destination" summary="remove each existing destination file before attempting to open it (contrast with --force)" description="remove each existing destination file before attempting to open it (contrast with --force)"
-        flag "--sparse" summary="control creation of sparse files." description="control creation of sparse files." value="value"
-        flag "--strip-trailing-slashes" summary="remove any trailing slashes from each SOURCE argument" description="remove any trailing slashes from each SOURCE argument"
-        flag "--suffix" summary="override the usual backup suffix" description="override the usual backup suffix" short="-S" value="value"
-        flag "--symbolic-link" summary="make symbolic links instead of copying" description="make symbolic links instead of copying" short="-s"
-        flag "--target-directory" summary="copy all SOURCE arguments into DIRECTORY" description="copy all SOURCE arguments into DIRECTORY" short="-t" value="value" action="directories"
-        flag "--update" summary="control which existing files are updated" description="control which existing files are updated" value="value"
-        flag "--verbose" summary="explain what is being done" description="explain what is being done" short="-v"
-        flag "--version" summary="output version information and exit" description="output version information and exit"
-        flag "-b" summary="Back up overwritten destinations" description="Like --backup, but without accepting a backup-control value."
-        flag "-d" summary="Preserve symbolic links" description="Equivalent to --no-dereference --preserve=links."
-        flag "-p" summary="Preserve core file attributes" description="Equivalent to --preserve=mode,ownership,timestamps."
-        flag "-u" summary="Copy only newer or missing files" description="Equivalent to --update=older."
+        flag "--archive" summary="same as -dR --preserve=all" description="same as -dR --preserve=all" short="-a" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--attributes-only" summary="don't copy the file data, just the attributes" description="don't copy the file data, just the attributes" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--backup" summary="make a backup of each existing destination file" description="make a backup of each existing destination file" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--context" summary="like -Z, or if CTX is specified then set the SELinux or SMACK security context to CTX" description="like -Z, or if CTX is specified then set the SELinux or SMACK security context to CTX" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--copy-contents" summary="copy contents of special files when recursive" description="copy contents of special files when recursive" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--debug" summary="explain how a file is copied" description="explain how a file is copied" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--dereference" summary="always follow symbolic links in SOURCE" description="always follow symbolic links in SOURCE" short="-L" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--force" summary="if an existing destination file cannot be opened, remove it and try again (this option is ignored when the -n option is also used)" description="if an existing destination file cannot be opened, remove it and try again (this option is ignored when the -n option is also used)" short="-f" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--help" summary="display this help and exit" description="display this help and exit" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--interactive" summary="prompt before overwrite (overrides a previous -n option)" description="prompt before overwrite (overrides a previous -n option)" short="-i" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--keep-directory-symlink" summary="follow existing symlinks to directories" description="follow existing symlinks to directories" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--link" summary="hard link files instead of copying" description="hard link files instead of copying" short="-l" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-clobber" summary="(deprecated) silently skip existing files" description="(deprecated) silently skip existing files" short="-n" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-dereference" summary="never follow symbolic links in SOURCE" description="never follow symbolic links in SOURCE" short="-P" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-preserve" summary="don't preserve the specified attributes" description="don't preserve the specified attributes" value="value" repeatable=#true {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-target-directory" summary="treat DEST as a normal file" description="treat DEST as a normal file" short="-T" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--one-file-system" summary="stay on this file system" description="stay on this file system" short="-x" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--parents" summary="use full source file name under DIRECTORY" description="use full source file name under DIRECTORY" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--preserve" summary="preserve the specified attributes" description="preserve the specified attributes" value="value" repeatable=#true {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--recursive" summary="copy directories recursively" description="copy directories recursively" short="-r" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--reflink" summary="control clone/CoW copies" description="control clone/CoW copies" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--remove-destination" summary="remove each existing destination file before attempting to open it (contrast with --force)" description="remove each existing destination file before attempting to open it (contrast with --force)" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--sparse" summary="control creation of sparse files." description="control creation of sparse files." value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--strip-trailing-slashes" summary="remove any trailing slashes from each SOURCE argument" description="remove any trailing slashes from each SOURCE argument" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--suffix" summary="override the usual backup suffix" description="override the usual backup suffix" short="-S" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--symbolic-link" summary="make symbolic links instead of copying" description="make symbolic links instead of copying" short="-s" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--target-directory" summary="copy all SOURCE arguments into DIRECTORY" description="copy all SOURCE arguments into DIRECTORY" short="-t" value="value" action="directories" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--update" summary="control which existing files are updated" description="control which existing files are updated" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--verbose" summary="explain what is being done" description="explain what is being done" short="-v" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--version" summary="output version information and exit" description="output version information and exit" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-H" summary="Follow command-line symbolic links" description="Follow symbolic links named on the command line during recursive copies." {
+            platform "macos"
+        }
+        flag "-L" summary="Follow all symbolic links" description="Follow every symbolic link encountered during a recursive copy." {
+            platform "macos"
+        }
+        flag "-N" summary="Do not preserve file flags" description="Suppress file-flag preservation when used with -p." {
+            platform "macos"
+        }
+        flag "-P" summary="Do not follow symbolic links" description="Copy symbolic links themselves during recursive copies." {
+            platform "macos"
+        }
+        flag "-R" summary="Copy directories recursively" description="Copy each directory and its complete subtree while preserving symbolic links." {
+            platform "macos"
+        }
+        flag "-S" summary="Do not preserve sparse holes" description="Copy sparse files without attempting to preserve holes." {
+            platform "macos"
+        }
+        flag "-X" summary="Do not copy extended attributes" description="Exclude extended attributes and resource forks from copied files." {
+            platform "macos"
+        }
+        flag "-a" summary="Use archive mode" description="Preserve file structure and attributes using the macOS archive-copy behavior." {
+            platform "macos"
+        }
+        flag "-b" summary="Back up overwritten destinations" description="Like --backup, but without accepting a backup-control value." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-c" summary="Use clone copies" description="Use clonefile when supported and fall back to copyfile otherwise." {
+            platform "macos"
+        }
+        flag "-d" summary="Preserve symbolic links" description="Equivalent to --no-dereference --preserve=links." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-f" summary="Force replacement" description="Replace an existing destination without prompting when necessary." {
+            platform "macos"
+        }
+        flag "-i" summary="Prompt before overwriting" description="Ask for confirmation before replacing an existing destination." {
+            platform "macos"
+        }
+        flag "-l" summary="Create hard links" description="Create hard links to regular files instead of copying their contents." {
+            platform "macos"
+        }
+        flag "-n" summary="Do not overwrite existing files" description="Skip a copy when its destination already exists." {
+            platform "macos"
+        }
+        flag "-p" summary="Preserve core file attributes" description="Equivalent to --preserve=mode,ownership,timestamps." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-p" summary="Preserve file attributes" description="Preserve timestamps, flags, mode, ownership, ACLs, and extended attributes when permitted." {
+            platform "macos"
+        }
+        flag "-s" summary="Create symbolic links" description="Create symbolic links to regular files instead of copying their contents." {
+            platform "macos"
+        }
+        flag "-u" summary="Copy only newer or missing files" description="Equivalent to --update=older." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-v" summary="Show copied files" description="Print files as they are copied." {
+            platform "macos"
+        }
+        flag "-x" summary="Stay on one filesystem" description="Do not traverse filesystem mount points during recursive copies." {
+            platform "macos"
+        }
         argument "paths" summary="Sources and destination" description="Source paths followed by the destination path; the final path is the destination." required=#true repeatable=#true action="files"
     }
 }

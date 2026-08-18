@@ -5,178 +5,797 @@ catalog "tar" {
         intent "extract an archive"
         intent "list archive contents"
         platform "linux"
+        platform "macos"
         platform "freebsd"
-        flag "--absolute-names" summary="don't strip leading '/'s from file names" description="don't strip leading '/'s from file names" short="-P"
-        flag "--acls" summary="Enable the POSIX ACLs support" description="Enable the POSIX ACLs support"
-        flag "--add-file" summary="add given FILE to the archive" description="add given FILE to the archive" value="value" action="files"
-        flag "--after-date" summary="only store files older than DATE-OR-FILE" description="only store files older than DATE-OR-FILE" value="value" action="files"
-        flag "--anchored" summary="patterns match file name start" description="patterns match file name start"
-        flag "--append" summary="append files to the end of an archive" description="append files to the end of an archive" short="-r"
-        flag "--atime-preserve" summary="preserve access times on dumped files" description="preserve access times on dumped files" value="value"
-        flag "--auto-compress" summary="use archive suffix to determine the compression program" description="use archive suffix to determine the compression program" short="-a"
-        flag "--backup" summary="backup before removal" description="backup before removal" value="value"
-        flag "--block-number" summary="show block number within archive with each message" description="show block number within archive with each message" short="-R"
-        flag "--blocking-factor" summary="BLOCKS x 512 bytes per record" description="BLOCKS x 512 bytes per record" short="-b" value="value"
-        flag "--bzip2" summary="filter the archive through bzip2" description="filter the archive through bzip2" short="-j"
-        flag "--catenate" summary="append tar files to an archive" description="append tar files to an archive" short="-A"
-        flag "--check-device" summary="check device numbers when creating incremental archives" description="check device numbers when creating incremental archives"
-        flag "--check-links" summary="print a message if not all links are dumped" description="print a message if not all links are dumped" short="-l"
-        flag "--checkpoint" summary="display progress messages every NUMBERth record" description="display progress messages every NUMBERth record" value="value"
-        flag "--checkpoint-action" summary="execute ACTION on each checkpoint" description="execute ACTION on each checkpoint" value="value"
-        flag "--clamp-mtime" summary="only set time when the file is more recent than what was given with --mtime" description="only set time when the file is more recent than what was given with --mtime"
-        flag "--compare" summary="find differences between archive and file system" description="find differences between archive and file system"
-        flag "--compress" summary="filter the archive through compress" description="filter the archive through compress" short="-Z"
-        flag "--concatenate" summary="append tar files to an archive" description="append tar files to an archive"
-        flag "--confirmation" summary="ask for confirmation for every action" description="ask for confirmation for every action"
-        flag "--create" summary="create a new archive" description="create a new archive" short="-c"
-        flag "--delay-directory-restore" summary="delay setting modification times and permissions until the end of extraction" description="delay setting modification times and permissions until the end of extraction"
-        flag "--delete" summary="delete from the archive (not on mag tapes!)" description="delete from the archive (not on mag tapes!)"
-        flag "--dereference" summary="follow symlinks" description="follow symlinks" short="-h"
-        flag "--diff" summary="find differences between archive and file system" description="find differences between archive and file system" short="-d"
-        flag "--directory" summary="change to directory DIR" description="change to directory DIR" short="-C" value="value" action="directories"
-        flag "--exclude" summary="exclude files, given as a PATTERN" description="exclude files, given as a PATTERN" value="value"
-        flag "--exclude-backups" summary="exclude backup and lock files" description="exclude backup and lock files"
-        flag "--exclude-caches" summary="exclude contents of directories containing CACHEDIR.TAG" description="exclude contents of directories containing CACHEDIR.TAG"
-        flag "--exclude-caches-all" summary="exclude directories containing CACHEDIR.TAG" description="exclude directories containing CACHEDIR.TAG"
-        flag "--exclude-caches-under" summary="exclude everything under directories containing CACHEDIR.TAG" description="exclude everything under directories containing CACHEDIR.TAG"
-        flag "--exclude-from" summary="exclude patterns listed in FILE" description="exclude patterns listed in FILE" short="-X" value="value" action="files"
-        flag "--exclude-ignore" summary="read exclude patterns for each directory from FILE" description="read exclude patterns for each directory from FILE" value="value" action="files"
-        flag "--exclude-ignore-recursive" summary="read exclude patterns for each directory and its subdirectories from FILE" description="read exclude patterns for each directory and its subdirectories from FILE" value="value" action="files"
-        flag "--exclude-tag" summary="exclude contents of directories containing FILE" description="exclude contents of directories containing FILE" value="value" action="files"
-        flag "--exclude-tag-all" summary="exclude directories containing FILE" description="exclude directories containing FILE" value="value" action="files"
-        flag "--exclude-tag-under" summary="exclude everything under directories containing FILE" description="exclude everything under directories containing FILE" value="value" action="files"
-        flag "--exclude-vcs" summary="exclude version control system directories" description="exclude version control system directories"
-        flag "--exclude-vcs-ignores" summary="read exclude patterns from the VCS ignore files" description="read exclude patterns from the VCS ignore files"
-        flag "--extract" summary="extract files from an archive" description="extract files from an archive" short="-x"
-        flag "--file" summary="use archive file or device ARCHIVE" description="use archive file or device ARCHIVE" short="-f" value="value" action="files"
-        flag "--files-from" summary="get names to extract or create from FILE" description="get names to extract or create from FILE" short="-T" value="value" action="files"
-        flag "--force-local" summary="archive file is local even if it has a colon" description="archive file is local even if it has a colon"
-        flag "--format" summary="create archive of the given format" description="create archive of the given format" short="-H" value="value"
-        flag "--full-time" summary="print file time to its full resolution" description="print file time to its full resolution"
-        flag "--get" summary="extract files from an archive" description="extract files from an archive"
-        flag "--group" summary="force NAME as group for added files" description="force NAME as group for added files" value="value" action="groups"
-        flag "--group-map" summary="use FILE to map file owner GIDs and names" description="use FILE to map file owner GIDs and names" value="value" action="files"
-        flag "--gunzip" summary="filter the archive through gzip" description="filter the archive through gzip"
-        flag "--gzip" summary="filter the archive through gzip" description="filter the archive through gzip" short="-z"
-        flag "--hard-dereference" summary="follow hard links" description="follow hard links"
-        flag "--help" summary="give this help list" description="give this help list"
-        flag "--hole-detection" summary="technique to detect holes" description="technique to detect holes" value="value"
-        flag "--ignore-case" summary="ignore case" description="ignore case"
-        flag "--ignore-command-error" summary="ignore exit codes of children" description="ignore exit codes of children"
-        flag "--ignore-failed-read" summary="do not exit with nonzero on unreadable files" description="do not exit with nonzero on unreadable files"
-        flag "--ignore-zeros" summary="ignore zeroed blocks in archive (means EOF)" description="ignore zeroed blocks in archive (means EOF)" short="-i"
-        flag "--incremental" summary="handle old GNU-format incremental backup" description="handle old GNU-format incremental backup" short="-G"
-        flag "--index-file" summary="send verbose output to FILE" description="send verbose output to FILE" value="value" action="files"
-        flag "--info-script" summary="run script at end of each tape" description="run script at end of each tape" short="-F" value="value" action="files"
-        flag "--interactive" summary="ask for confirmation for every action" description="ask for confirmation for every action" short="-w"
-        flag "--keep-directory-symlink" summary="preserve existing symlinks to directories when extracting" description="preserve existing symlinks to directories when extracting"
-        flag "--keep-newer-files" summary="don't replace existing files that are newer than their archive copies" description="don't replace existing files that are newer than their archive copies"
-        flag "--keep-old-files" summary="don't replace existing files when extracting, treat them as errors" description="don't replace existing files when extracting, treat them as errors" short="-k"
-        flag "--label" summary="create archive with volume name TEXT" description="create archive with volume name TEXT" short="-V" value="value"
-        flag "--level" summary="dump level for created listed-incremental archive" description="dump level for created listed-incremental archive" value="value"
-        flag "--list" summary="list the contents of an archive" description="list the contents of an archive" short="-t"
-        flag "--listed-incremental" summary="handle new GNU-format incremental backup" description="handle new GNU-format incremental backup" short="-g" value="value"
-        flag "--lzip" summary="filter the archive through lzip" description="filter the archive through lzip"
-        flag "--lzma" summary="filter the archive through lzma" description="filter the archive through lzma"
-        flag "--lzop" summary="filter the archive through lzop" description="filter the archive through lzop"
-        flag "--mode" summary="force (symbolic) mode CHANGES for added files" description="force (symbolic) mode CHANGES for added files" value="value"
-        flag "--mtime" summary="set mtime for added files from DATE-OR-FILE" description="set mtime for added files from DATE-OR-FILE" value="value" action="files"
-        flag "--multi-volume" summary="create/list/extract multi-volume archive" description="create/list/extract multi-volume archive" short="-M"
-        flag "--new-volume-script" summary="run script at end of each tape" description="run script at end of each tape" value="value" action="files"
-        flag "--newer" summary="only store files newer than DATE-OR-FILE" description="only store files newer than DATE-OR-FILE" short="-N" value="value" action="files"
-        flag "--newer-mtime" summary="compare date and time when data changed only" description="compare date and time when data changed only" value="value"
-        flag "--no-acls" summary="Disable the POSIX ACLs support" description="Disable the POSIX ACLs support"
-        flag "--no-anchored" summary="patterns match after any '/'" description="patterns match after any '/'"
-        flag "--no-auto-compress" summary="do not use archive suffix to determine the compression program" description="do not use archive suffix to determine the compression program"
-        flag "--no-check-device" summary="do not check device numbers when creating" description="do not check device numbers when creating"
-        flag "--no-delay-directory-restore" summary="cancel the effect of --delay-directory-restore option" description="cancel the effect of --delay-directory-restore option"
-        flag "--no-ignore-case" summary="case sensitive matching (default)" description="case sensitive matching (default)"
-        flag "--no-ignore-command-error" summary="treat non-zero exit codes of children as error" description="treat non-zero exit codes of children as error"
-        flag "--no-null" summary="disable the effect of the previous --null option" description="disable the effect of the previous --null option"
-        flag "--no-overwrite-dir" summary="preserve metadata of existing directories" description="preserve metadata of existing directories"
-        flag "--no-quote-chars" summary="disable quoting for characters from STRING" description="disable quoting for characters from STRING" value="value"
-        flag "--no-recursion" summary="avoid descending automatically in directories" description="avoid descending automatically in directories"
-        flag "--no-same-owner" summary="extract files as yourself" description="extract files as yourself"
-        flag "--no-same-permissions" summary="apply the user's umask when extracting permissions from the archive" description="apply the user's umask when extracting permissions from the archive"
-        flag "--no-seek" summary="archive is not seekable" description="archive is not seekable"
-        flag "--no-selinux" summary="Disable the SELinux context support" description="Disable the SELinux context support"
-        flag "--no-unquote" summary="do not unquote input file or member names" description="do not unquote input file or member names"
-        flag "--no-verbatim-files-from" summary="treats file names starting with dash as options" description="treats file names starting with dash as options"
-        flag "--no-wildcards" summary="verbatim string matching" description="verbatim string matching"
-        flag "--no-wildcards-match-slash" summary="wildcards do not match '/'" description="wildcards do not match '/'"
-        flag "--no-xattrs" summary="Disable extended attributes support" description="Disable extended attributes support"
-        flag "--null" summary="reads null-terminated names; implies" description="reads null-terminated names; implies"
-        flag "--numeric-owner" summary="always use numbers for user/group names" description="always use numbers for user/group names"
-        flag "--occurrence" summary="process only the NUMBERth occurrence of each file in the archive" description="process only the NUMBERth occurrence of each file in the archive" value="value"
-        flag "--old-archive" summary="same as --format=v7" description="same as --format=v7"
-        flag "--one-file-system" summary="stay in local file system when creating archive" description="stay in local file system when creating archive"
-        flag "--one-top-level" summary="create a subdirectory to avoid having loose files extracted" description="create a subdirectory to avoid having loose files extracted" value="value"
-        flag "--overwrite" summary="overwrite existing files when extracting" description="overwrite existing files when extracting"
-        flag "--overwrite-dir" summary="overwrite metadata of existing directories when extracting" description="overwrite metadata of existing directories when extracting"
-        flag "--owner" summary="force NAME as owner for added files" description="force NAME as owner for added files" value="value" action="users"
-        flag "--owner-map" summary="use FILE to map file owner UIDs and names" description="use FILE to map file owner UIDs and names" value="value" action="files"
-        flag "--pax-option" summary="control pax keywords" description="control pax keywords" value="value"
-        flag "--portability" summary="same as --format=v7" description="same as --format=v7"
-        flag "--posix" summary="same as --format=posix" description="same as --format=posix"
-        flag "--preserve-order" summary="member arguments are listed in the same order" description="member arguments are listed in the same order" short="-s"
-        flag "--preserve-permissions" summary="extract information about file permissions" description="extract information about file permissions" short="-p"
-        flag "--quote-chars" summary="additionally quote characters from STRING" description="additionally quote characters from STRING" value="value"
-        flag "--quoting-style" summary="set name quoting style" description="set name quoting style" value="value"
-        flag "--read-full-records" summary="reblock as we read (for 4.2BSD pipes)" description="reblock as we read (for 4.2BSD pipes)" short="-B"
-        flag "--record-size" summary="NUMBER of bytes per record, multiple of 512" description="NUMBER of bytes per record, multiple of 512" value="value"
-        flag "--recursion" summary="recurse into directories (default)" description="recurse into directories (default)"
-        flag "--recursive-unlink" summary="empty hierarchies prior to extracting directory" description="empty hierarchies prior to extracting directory"
-        flag "--remove-files" summary="remove files after adding them to the archive" description="remove files after adding them to the archive"
-        flag "--restrict" summary="disable use of some potentially harmful options" description="disable use of some potentially harmful options"
-        flag "--rmt-command" summary="use given rmt COMMAND instead of rmt" description="use given rmt COMMAND instead of rmt" value="value"
-        flag "--rsh-command" summary="use remote COMMAND instead of rsh" description="use remote COMMAND instead of rsh" value="value"
-        flag "--same-order" summary="member arguments are listed in the same order" description="member arguments are listed in the same order"
-        flag "--same-owner" summary="try extracting files with the same ownership" description="try extracting files with the same ownership"
-        flag "--same-permissions" summary="extract information about file permissions" description="extract information about file permissions"
-        flag "--seek" summary="archive is seekable" description="archive is seekable" short="-n"
-        flag "--selinux" summary="Enable the SELinux context support" description="Enable the SELinux context support"
-        flag "--show-defaults" summary="show tar defaults" description="show tar defaults"
-        flag "--show-omitted-dirs" summary="list each directory that does not match search criteria" description="list each directory that does not match search criteria"
-        flag "--show-snapshot-field-ranges" summary="show valid ranges for snapshot-file fields" description="show valid ranges for snapshot-file fields"
-        flag "--show-stored-names" summary="show file or archive names after transformation" description="show file or archive names after transformation"
-        flag "--show-transformed-names" summary="show file or archive names after transformation" description="show file or archive names after transformation"
-        flag "--skip-old-files" summary="don't replace existing files when extracting" description="don't replace existing files when extracting"
-        flag "--sort" summary="directory sorting order" description="directory sorting order" value="value"
-        flag "--sparse" summary="handle sparse files efficiently" description="handle sparse files efficiently" short="-S"
-        flag "--sparse-version" summary="set version of the sparse format to use" description="set version of the sparse format to use" value="value"
-        flag "--starting-file" summary="begin at member MEMBER-NAME when reading the archive" description="begin at member MEMBER-NAME when reading the archive" short="-K" value="value"
-        flag "--strip-components" summary="strip NUMBER leading components from file names on extraction" description="strip NUMBER leading components from file names on extraction" value="value"
-        flag "--suffix" summary="backup before removal" description="backup before removal" value="value"
-        flag "--tape-length" summary="change tape after writing NUMBER x 1024 bytes" description="change tape after writing NUMBER x 1024 bytes" short="-L" value="value"
-        flag "--test-label" summary="test the archive volume label and exit" description="test the archive volume label and exit"
-        flag "--to-command" summary="pipe extracted files to another program" description="pipe extracted files to another program" value="value" action="files"
-        flag "--to-stdout" summary="extract files to standard output" description="extract files to standard output" short="-O"
-        flag "--totals" summary="print total bytes after processing the archive" description="print total bytes after processing the archive" value="value"
-        flag "--touch" summary="don't extract file modified time" description="don't extract file modified time" short="-m"
-        flag "--transform" summary="use sed replace EXPRESSION to transform file names" description="use sed replace EXPRESSION to transform file names" value="value"
-        flag "--uncompress" summary="filter the archive through compress" description="filter the archive through compress"
-        flag "--ungzip" summary="filter the archive through gzip" description="filter the archive through gzip"
-        flag "--unlink-first" summary="remove each file prior to extracting over it" description="remove each file prior to extracting over it" short="-U"
-        flag "--unquote" summary="unquote input file or member names (default)" description="unquote input file or member names (default)"
-        flag "--update" summary="only append files newer than copy in archive" description="only append files newer than copy in archive" short="-u"
-        flag "--usage" summary="give a short usage message" description="give a short usage message"
-        flag "--use-compress-program" summary="filter through PROG (must accept -d)" description="filter through PROG (must accept -d)" short="-I" value="value" action="files"
-        flag "--utc" summary="print file modification times in UTC" description="print file modification times in UTC"
-        flag "--verbatim-files-from" summary="reads file names verbatim" description="reads file names verbatim"
-        flag "--verbose" summary="verbosely list files processed" description="verbosely list files processed" short="-v"
-        flag "--verify" summary="attempt to verify the archive after writing it" description="attempt to verify the archive after writing it" short="-W"
-        flag "--version" summary="print program version" description="print program version"
-        flag "--volno-file" summary="use/update the volume number in FILE" description="use/update the volume number in FILE" value="value" action="files"
-        flag "--warning" summary="warning control" description="warning control" value="value"
-        flag "--wildcards" summary="use wildcards (default for exclusion)" description="use wildcards (default for exclusion)"
-        flag "--wildcards-match-slash" summary="wildcards match '/' (default for exclusion)" description="wildcards match '/' (default for exclusion)"
-        flag "--xattrs" summary="Enable extended attributes support" description="Enable extended attributes support"
-        flag "--xattrs-exclude" summary="specify the exclude pattern for xattr keys" description="specify the exclude pattern for xattr keys" value="value"
-        flag "--xattrs-include" summary="specify the include pattern for xattr keys" description="specify the include pattern for xattr keys" value="value"
-        flag "--xform" summary="use sed replace EXPRESSION to transform file names" description="use sed replace EXPRESSION to transform file names" value="value"
-        flag "--xz" summary="filter the archive through xz" description="filter the archive through xz" short="-J"
-        flag "--zstd" summary="filter the archive through zstd" description="filter the archive through zstd"
-        flag "-o" summary="Use legacy ownership behavior" description="When creating, use the old archive format; when extracting, do not restore stored ownership."
+        flag "--absolute-names" summary="don't strip leading '/'s from file names" description="don't strip leading '/'s from file names" short="-P" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--acls" summary="Enable the POSIX ACLs support" description="Enable the POSIX ACLs support" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--add-file" summary="add given FILE to the archive" description="add given FILE to the archive" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--after-date" summary="only store files older than DATE-OR-FILE" description="only store files older than DATE-OR-FILE" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--anchored" summary="patterns match file name start" description="patterns match file name start" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--append" summary="append files to the end of an archive" description="append files to the end of an archive" short="-r" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--append" summary="Append files to an archive" description="Append selected entries to an existing uncompressed archive." short="-r" {
+            platform "macos"
+        }
+        flag "--atime-preserve" summary="preserve access times on dumped files" description="preserve access times on dumped files" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--auto-compress" summary="use archive suffix to determine the compression program" description="use archive suffix to determine the compression program" short="-a" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--auto-compress" summary="Select compression from the suffix" description="Choose the archive format and compression from the output file suffix." short="-a" {
+            platform "macos"
+        }
+        flag "--backup" summary="backup before removal" description="backup before removal" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--block-number" summary="show block number within archive with each message" description="show block number within archive with each message" short="-R" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--block-size" summary="Set the tape block size" description="Use the supplied number of 512-byte records for each tape I/O block." short="-b" value="records" {
+            platform "macos"
+        }
+        flag "--blocking-factor" summary="BLOCKS x 512 bytes per record" description="BLOCKS x 512 bytes per record" short="-b" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--bzip2" summary="filter the archive through bzip2" description="filter the archive through bzip2" short="-j" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--bzip2" summary="Compress with bzip2" description="Compress a newly created archive with bzip2." short="-j" {
+            platform "macos"
+        }
+        flag "--catenate" summary="append tar files to an archive" description="append tar files to an archive" short="-A" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--cd" summary="Change directory" description="Change to the selected directory before processing subsequent archive members." short="-C" value="directory" action="directories" {
+            platform "macos"
+        }
+        flag "--check-device" summary="check device numbers when creating incremental archives" description="check device numbers when creating incremental archives" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--check-links" summary="print a message if not all links are dumped" description="print a message if not all links are dumped" short="-l" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--check-links" summary="Check hard-link coverage" description="Warn when an archived file has hard links that were not all included." short="-l" {
+            platform "macos"
+        }
+        flag "--checkpoint" summary="display progress messages every NUMBERth record" description="display progress messages every NUMBERth record" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--checkpoint-action" summary="execute ACTION on each checkpoint" description="execute ACTION on each checkpoint" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--clamp-mtime" summary="only set time when the file is more recent than what was given with --mtime" description="only set time when the file is more recent than what was given with --mtime" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--compare" summary="find differences between archive and file system" description="find differences between archive and file system" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--compress" summary="filter the archive through compress" description="filter the archive through compress" short="-Z" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--concatenate" summary="append tar files to an archive" description="append tar files to an archive" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--confirmation" summary="ask for confirmation for every action" description="ask for confirmation for every action" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--create" summary="create a new archive" description="create a new archive" short="-c" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--create" summary="Create an archive" description="Create a new archive containing the selected entries." short="-c" {
+            platform "macos"
+        }
+        flag "--delay-directory-restore" summary="delay setting modification times and permissions until the end of extraction" description="delay setting modification times and permissions until the end of extraction" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--delete" summary="delete from the archive (not on mag tapes!)" description="delete from the archive (not on mag tapes!)" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--dereference" summary="follow symlinks" description="follow symlinks" short="-h" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--dereference" summary="Follow symbolic links" description="Archive the targets of all symbolic links instead of the links themselves." short="-L" {
+            platform "macos"
+        }
+        flag "--diff" summary="find differences between archive and file system" description="find differences between archive and file system" short="-d" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--directory" summary="change to directory DIR" description="change to directory DIR" short="-C" value="value" action="directories" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude" summary="exclude files, given as a PATTERN" description="exclude files, given as a PATTERN" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude" summary="Exclude matching entries" description="Do not process files or directories matching the supplied pattern." value="pattern" repeatable=#true {
+            platform "macos"
+        }
+        flag "--exclude-backups" summary="exclude backup and lock files" description="exclude backup and lock files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude-caches" summary="exclude contents of directories containing CACHEDIR.TAG" description="exclude contents of directories containing CACHEDIR.TAG" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude-caches-all" summary="exclude directories containing CACHEDIR.TAG" description="exclude directories containing CACHEDIR.TAG" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude-caches-under" summary="exclude everything under directories containing CACHEDIR.TAG" description="exclude everything under directories containing CACHEDIR.TAG" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude-from" summary="exclude patterns listed in FILE" description="exclude patterns listed in FILE" short="-X" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude-ignore" summary="read exclude patterns for each directory from FILE" description="read exclude patterns for each directory from FILE" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude-ignore-recursive" summary="read exclude patterns for each directory and its subdirectories from FILE" description="read exclude patterns for each directory and its subdirectories from FILE" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude-tag" summary="exclude contents of directories containing FILE" description="exclude contents of directories containing FILE" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude-tag-all" summary="exclude directories containing FILE" description="exclude directories containing FILE" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude-tag-under" summary="exclude everything under directories containing FILE" description="exclude everything under directories containing FILE" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude-vcs" summary="exclude version control system directories" description="exclude version control system directories" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--exclude-vcs" summary="Exclude version-control metadata" description="Do not process internal directories used by common version-control systems." {
+            platform "macos"
+        }
+        flag "--exclude-vcs-ignores" summary="read exclude patterns from the VCS ignore files" description="read exclude patterns from the VCS ignore files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--extract" summary="extract files from an archive" description="extract files from an archive" short="-x" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--extract" summary="Extract archive members" description="Extract selected members from an archive." short="-x" {
+            platform "macos"
+        }
+        flag "--file" summary="use archive file or device ARCHIVE" description="use archive file or device ARCHIVE" short="-f" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--file" summary="Select the archive file" description="Read the archive from or write it to the selected file." short="-f" value="archive" action="files" {
+            platform "macos"
+        }
+        flag "--files-from" summary="get names to extract or create from FILE" description="get names to extract or create from FILE" short="-T" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--files-from" summary="Read member names from a file" description="Read member names or patterns from the selected file." short="-T" value="file" action="files" {
+            platform "macos"
+        }
+        flag "--force-local" summary="archive file is local even if it has a colon" description="archive file is local even if it has a colon" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--format" summary="create archive of the given format" description="create archive of the given format" short="-H" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--format" summary="Select the archive format" description="Create the archive using the selected libarchive format." value="format" {
+            platform "macos"
+        }
+        flag "--full-time" summary="print file time to its full resolution" description="print file time to its full resolution" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--get" summary="extract files from an archive" description="extract files from an archive" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--group" summary="force NAME as group for added files" description="force NAME as group for added files" value="value" action="groups" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--group-map" summary="use FILE to map file owner GIDs and names" description="use FILE to map file owner GIDs and names" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--gunzip" summary="filter the archive through gzip" description="filter the archive through gzip" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--gzip" summary="filter the archive through gzip" description="filter the archive through gzip" short="-z" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--gzip" summary="Compress with gzip" description="Compress a newly created archive with gzip." short="-z" {
+            platform "macos"
+        }
+        flag "--hard-dereference" summary="follow hard links" description="follow hard links" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--help" summary="give this help list" description="give this help list" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--help" summary="Show help" description="Display tar usage information and exit." {
+            platform "macos"
+        }
+        flag "--hole-detection" summary="technique to detect holes" description="technique to detect holes" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--ignore-case" summary="ignore case" description="ignore case" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--ignore-command-error" summary="ignore exit codes of children" description="ignore exit codes of children" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--ignore-failed-read" summary="do not exit with nonzero on unreadable files" description="do not exit with nonzero on unreadable files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--ignore-zeros" summary="ignore zeroed blocks in archive (means EOF)" description="ignore zeroed blocks in archive (means EOF)" short="-i" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--incremental" summary="handle old GNU-format incremental backup" description="handle old GNU-format incremental backup" short="-G" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--index-file" summary="send verbose output to FILE" description="send verbose output to FILE" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--info-script" summary="run script at end of each tape" description="run script at end of each tape" short="-F" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--interactive" summary="ask for confirmation for every action" description="ask for confirmation for every action" short="-w" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--interactive" summary="Prompt before actions" description="Ask for confirmation before each archive action." short="-w" {
+            platform "macos"
+        }
+        flag "--keep-directory-symlink" summary="preserve existing symlinks to directories when extracting" description="preserve existing symlinks to directories when extracting" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--keep-newer-files" summary="don't replace existing files that are newer than their archive copies" description="don't replace existing files that are newer than their archive copies" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--keep-old-files" summary="don't replace existing files when extracting, treat them as errors" description="don't replace existing files when extracting, treat them as errors" short="-k" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--keep-old-files" summary="Keep existing files" description="Do not overwrite files that already exist while extracting." short="-k" {
+            platform "macos"
+        }
+        flag "--label" summary="create archive with volume name TEXT" description="create archive with volume name TEXT" short="-V" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--level" summary="dump level for created listed-incremental archive" description="dump level for created listed-incremental archive" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--list" summary="list the contents of an archive" description="list the contents of an archive" short="-t" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--list" summary="List archive contents" description="Print the selected members contained in an archive." short="-t" {
+            platform "macos"
+        }
+        flag "--listed-incremental" summary="handle new GNU-format incremental backup" description="handle new GNU-format incremental backup" short="-g" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--lzip" summary="filter the archive through lzip" description="filter the archive through lzip" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--lzma" summary="filter the archive through lzma" description="filter the archive through lzma" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--lzop" summary="filter the archive through lzop" description="filter the archive through lzop" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--mac-metadata" summary="Preserve macOS metadata" description="Archive or extract extended ACLs and attributes using AppleDouble metadata." {
+            platform "macos"
+        }
+        flag "--mode" summary="force (symbolic) mode CHANGES for added files" description="force (symbolic) mode CHANGES for added files" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--modification-time" summary="Do not restore modification times" description="Leave extracted files with their current modification times." short="-m" {
+            platform "macos"
+        }
+        flag "--mtime" summary="set mtime for added files from DATE-OR-FILE" description="set mtime for added files from DATE-OR-FILE" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--multi-volume" summary="create/list/extract multi-volume archive" description="create/list/extract multi-volume archive" short="-M" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--new-volume-script" summary="run script at end of each tape" description="run script at end of each tape" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--newer" summary="only store files newer than DATE-OR-FILE" description="only store files newer than DATE-OR-FILE" short="-N" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--newer-mtime" summary="compare date and time when data changed only" description="compare date and time when data changed only" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-acls" summary="Disable the POSIX ACLs support" description="Disable the POSIX ACLs support" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-acls" summary="Do not preserve ACLs" description="Do not archive or extract access-control lists." {
+            platform "macos"
+        }
+        flag "--no-anchored" summary="patterns match after any '/'" description="patterns match after any '/'" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-auto-compress" summary="do not use archive suffix to determine the compression program" description="do not use archive suffix to determine the compression program" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-check-device" summary="do not check device numbers when creating" description="do not check device numbers when creating" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-delay-directory-restore" summary="cancel the effect of --delay-directory-restore option" description="cancel the effect of --delay-directory-restore option" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-fflags" summary="Do not preserve file flags" description="Do not archive or extract platform-specific file flags." {
+            platform "macos"
+        }
+        flag "--no-ignore-case" summary="case sensitive matching (default)" description="case sensitive matching (default)" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-ignore-command-error" summary="treat non-zero exit codes of children as error" description="treat non-zero exit codes of children as error" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-mac-metadata" summary="Do not preserve macOS metadata" description="Do not archive or extract AppleDouble ACL and extended-attribute metadata." {
+            platform "macos"
+        }
+        flag "--no-null" summary="disable the effect of the previous --null option" description="disable the effect of the previous --null option" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-overwrite-dir" summary="preserve metadata of existing directories" description="preserve metadata of existing directories" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-quote-chars" summary="disable quoting for characters from STRING" description="disable quoting for characters from STRING" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-recursion" summary="avoid descending automatically in directories" description="avoid descending automatically in directories" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-recursion" summary="Do not recurse into directories" description="Archive directory entries without recursively processing their contents." short="-n" {
+            platform "macos"
+        }
+        flag "--no-same-owner" summary="extract files as yourself" description="extract files as yourself" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-same-permissions" summary="apply the user's umask when extracting permissions from the archive" description="apply the user's umask when extracting permissions from the archive" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-seek" summary="archive is not seekable" description="archive is not seekable" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-selinux" summary="Disable the SELinux context support" description="Disable the SELinux context support" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-unquote" summary="do not unquote input file or member names" description="do not unquote input file or member names" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-verbatim-files-from" summary="treats file names starting with dash as options" description="treats file names starting with dash as options" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-wildcards" summary="verbatim string matching" description="verbatim string matching" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-wildcards-match-slash" summary="wildcards do not match '/'" description="wildcards do not match '/'" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--no-xattrs" summary="Disable extended attributes support" description="Disable extended attributes support" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--null" summary="reads null-terminated names; implies" description="reads null-terminated names; implies" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--null" summary="Read NUL-terminated names" description="Treat names read with -I or -T as NUL-terminated instead of newline-terminated." {
+            platform "macos"
+        }
+        flag "--numeric-owner" summary="always use numbers for user/group names" description="always use numbers for user/group names" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--occurrence" summary="process only the NUMBERth occurrence of each file in the archive" description="process only the NUMBERth occurrence of each file in the archive" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--old-archive" summary="same as --format=v7" description="same as --format=v7" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--one-file-system" summary="stay in local file system when creating archive" description="stay in local file system when creating archive" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--one-top-level" summary="create a subdirectory to avoid having loose files extracted" description="create a subdirectory to avoid having loose files extracted" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--overwrite" summary="overwrite existing files when extracting" description="overwrite existing files when extracting" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--overwrite-dir" summary="overwrite metadata of existing directories when extracting" description="overwrite metadata of existing directories when extracting" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--owner" summary="force NAME as owner for added files" description="force NAME as owner for added files" value="value" action="users" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--owner-map" summary="use FILE to map file owner UIDs and names" description="use FILE to map file owner UIDs and names" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--pax-option" summary="control pax keywords" description="control pax keywords" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--portability" summary="same as --format=v7" description="same as --format=v7" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--posix" summary="same as --format=posix" description="same as --format=posix" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--preserve-order" summary="member arguments are listed in the same order" description="member arguments are listed in the same order" short="-s" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--preserve-permissions" summary="extract information about file permissions" description="extract information about file permissions" short="-p" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--preserve-permissions" summary="Restore stored permissions" description="Restore permissions, ACLs, ownership, and file flags while extracting." short="-p" {
+            platform "macos"
+        }
+        flag "--quote-chars" summary="additionally quote characters from STRING" description="additionally quote characters from STRING" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--quoting-style" summary="set name quoting style" description="set name quoting style" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--read-full-blocks" summary="Read full records" description="Accept the compatibility option for reading full archive records." short="-B" {
+            platform "macos"
+        }
+        flag "--read-full-records" summary="reblock as we read (for 4.2BSD pipes)" description="reblock as we read (for 4.2BSD pipes)" short="-B" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--record-size" summary="NUMBER of bytes per record, multiple of 512" description="NUMBER of bytes per record, multiple of 512" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--recursion" summary="recurse into directories (default)" description="recurse into directories (default)" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--recursive-unlink" summary="empty hierarchies prior to extracting directory" description="empty hierarchies prior to extracting directory" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--remove-files" summary="remove files after adding them to the archive" description="remove files after adding them to the archive" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--restrict" summary="disable use of some potentially harmful options" description="disable use of some potentially harmful options" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--rmt-command" summary="use given rmt COMMAND instead of rmt" description="use given rmt COMMAND instead of rmt" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--rsh-command" summary="use remote COMMAND instead of rsh" description="use remote COMMAND instead of rsh" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--same-order" summary="member arguments are listed in the same order" description="member arguments are listed in the same order" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--same-owner" summary="try extracting files with the same ownership" description="try extracting files with the same ownership" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--same-permissions" summary="extract information about file permissions" description="extract information about file permissions" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--seek" summary="archive is seekable" description="archive is seekable" short="-n" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--selinux" summary="Enable the SELinux context support" description="Enable the SELinux context support" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--show-defaults" summary="show tar defaults" description="show tar defaults" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--show-omitted-dirs" summary="list each directory that does not match search criteria" description="list each directory that does not match search criteria" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--show-snapshot-field-ranges" summary="show valid ranges for snapshot-file fields" description="show valid ranges for snapshot-file fields" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--show-stored-names" summary="show file or archive names after transformation" description="show file or archive names after transformation" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--show-transformed-names" summary="show file or archive names after transformation" description="show file or archive names after transformation" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--skip-old-files" summary="don't replace existing files when extracting" description="don't replace existing files when extracting" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--sort" summary="directory sorting order" description="directory sorting order" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--sparse" summary="handle sparse files efficiently" description="handle sparse files efficiently" short="-S" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--sparse-version" summary="set version of the sparse format to use" description="set version of the sparse format to use" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--starting-file" summary="begin at member MEMBER-NAME when reading the archive" description="begin at member MEMBER-NAME when reading the archive" short="-K" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--strip-components" summary="strip NUMBER leading components from file names on extraction" description="strip NUMBER leading components from file names on extraction" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--strip-components" summary="Strip leading path components" description="Remove the supplied number of leading components from extracted member paths." value="count" {
+            platform "macos"
+        }
+        flag "--suffix" summary="backup before removal" description="backup before removal" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--tape-length" summary="change tape after writing NUMBER x 1024 bytes" description="change tape after writing NUMBER x 1024 bytes" short="-L" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--test-label" summary="test the archive volume label and exit" description="test the archive volume label and exit" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--to-command" summary="pipe extracted files to another program" description="pipe extracted files to another program" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--to-stdout" summary="extract files to standard output" description="extract files to standard output" short="-O" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--to-stdout" summary="Extract to standard output" description="Write extracted member contents to standard output instead of disk." short="-O" {
+            platform "macos"
+        }
+        flag "--totals" summary="print total bytes after processing the archive" description="print total bytes after processing the archive" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--touch" summary="don't extract file modified time" description="don't extract file modified time" short="-m" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--transform" summary="use sed replace EXPRESSION to transform file names" description="use sed replace EXPRESSION to transform file names" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--uncompress" summary="filter the archive through compress" description="filter the archive through compress" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--ungzip" summary="filter the archive through gzip" description="filter the archive through gzip" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--unlink-first" summary="remove each file prior to extracting over it" description="remove each file prior to extracting over it" short="-U" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--unquote" summary="unquote input file or member names (default)" description="unquote input file or member names (default)" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--update" summary="only append files newer than copy in archive" description="only append files newer than copy in archive" short="-u" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--update" summary="Append newer files" description="Append selected files only when they are newer than the archived copies." short="-u" {
+            platform "macos"
+        }
+        flag "--usage" summary="give a short usage message" description="give a short usage message" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--use-compress-program" summary="filter through PROG (must accept -d)" description="filter through PROG (must accept -d)" short="-I" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--utc" summary="print file modification times in UTC" description="print file modification times in UTC" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--verbatim-files-from" summary="reads file names verbatim" description="reads file names verbatim" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--verbose" summary="verbosely list files processed" description="verbosely list files processed" short="-v" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--verbose" summary="Show processed members" description="Print archive members as they are processed." short="-v" repeatable=#true {
+            platform "macos"
+        }
+        flag "--verify" summary="attempt to verify the archive after writing it" description="attempt to verify the archive after writing it" short="-W" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--version" summary="print program version" description="print program version" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--version" summary="Show version information" description="Display the bsdtar and libarchive version information." {
+            platform "macos"
+        }
+        flag "--volno-file" summary="use/update the volume number in FILE" description="use/update the volume number in FILE" value="value" action="files" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--warning" summary="warning control" description="warning control" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--wildcards" summary="use wildcards (default for exclusion)" description="use wildcards (default for exclusion)" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--wildcards-match-slash" summary="wildcards match '/' (default for exclusion)" description="wildcards match '/' (default for exclusion)" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--xattrs" summary="Enable extended attributes support" description="Enable extended attributes support" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--xattrs-exclude" summary="specify the exclude pattern for xattr keys" description="specify the exclude pattern for xattr keys" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--xattrs-include" summary="specify the include pattern for xattr keys" description="specify the include pattern for xattr keys" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--xform" summary="use sed replace EXPRESSION to transform file names" description="use sed replace EXPRESSION to transform file names" value="value" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--xz" summary="filter the archive through xz" description="filter the archive through xz" short="-J" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--xz" summary="Compress with xz" description="Compress a newly created archive with xz." short="-J" {
+            platform "macos"
+        }
+        flag "--zstd" summary="filter the archive through zstd" description="filter the archive through zstd" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--zstd" summary="Compress with zstd" description="Compress a newly created archive with zstd." {
+            platform "macos"
+        }
+        flag "-o" summary="Use legacy ownership behavior" description="When creating, use the old archive format; when extracting, do not restore stored ownership." {
+            platform "linux"
+            platform "freebsd"
+        }
         argument "members" summary="Files or archive members" description="Paths to add when creating, or member names to select when reading an archive." repeatable=#true action="files"
     }
 }

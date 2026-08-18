@@ -4,19 +4,80 @@ catalog "cat" {
         intent "concatenate files"
         intent "print a file"
         platform "linux"
+        platform "macos"
         platform "freebsd"
-        flag "--help" summary="display this help and exit" description="display this help and exit"
-        flag "--number" summary="number all output lines" description="number all output lines" short="-n"
-        flag "--number-nonblank" summary="number nonempty output lines, overrides -n" description="number nonempty output lines, overrides -n" short="-b"
-        flag "--show-all" summary="equivalent to -vET" description="equivalent to -vET" short="-A"
-        flag "--show-ends" summary="display $ or ^M$ at end of each line" description="display $ or ^M$ at end of each line" short="-E"
-        flag "--show-nonprinting" summary="use ^ and M- notation, except for LFD and TAB" description="use ^ and M- notation, except for LFD and TAB" short="-v"
-        flag "--show-tabs" summary="display TAB characters as ^I" description="display TAB characters as ^I" short="-T"
-        flag "--squeeze-blank" summary="suppress repeated empty output lines" description="suppress repeated empty output lines" short="-s"
-        flag "--version" summary="output version information and exit" description="output version information and exit"
-        flag "-e" summary="Show nonprinting characters and line endings" description="Equivalent to -vE."
-        flag "-t" summary="Show nonprinting characters and tabs" description="Equivalent to -vT."
-        flag "-u" summary="Accepted for compatibility" description="Accepted and ignored by GNU cat."
+        flag "--help" summary="display this help and exit" description="display this help and exit" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--number" summary="number all output lines" description="number all output lines" short="-n" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--number-nonblank" summary="number nonempty output lines, overrides -n" description="number nonempty output lines, overrides -n" short="-b" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--show-all" summary="equivalent to -vET" description="equivalent to -vET" short="-A" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--show-ends" summary="display $ or ^M$ at end of each line" description="display $ or ^M$ at end of each line" short="-E" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--show-nonprinting" summary="use ^ and M- notation, except for LFD and TAB" description="use ^ and M- notation, except for LFD and TAB" short="-v" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--show-tabs" summary="display TAB characters as ^I" description="display TAB characters as ^I" short="-T" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--squeeze-blank" summary="suppress repeated empty output lines" description="suppress repeated empty output lines" short="-s" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "--version" summary="output version information and exit" description="output version information and exit" {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-b" summary="Number nonblank lines" description="Number nonblank output lines starting at one." {
+            platform "macos"
+        }
+        flag "-e" summary="Show nonprinting characters and line endings" description="Equivalent to -vE." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-e" summary="Show line endings and nonprinting characters" description="Display nonprinting characters visibly and mark each line ending with a dollar sign." {
+            platform "macos"
+        }
+        flag "-l" summary="Lock standard output" description="Acquire an exclusive advisory lock on the standard output file descriptor before writing." {
+            platform "macos"
+        }
+        flag "-n" summary="Number all lines" description="Number every output line starting at one." {
+            platform "macos"
+        }
+        flag "-s" summary="Squeeze adjacent empty lines" description="Replace each run of adjacent empty lines with a single empty line." {
+            platform "macos"
+        }
+        flag "-t" summary="Show nonprinting characters and tabs" description="Equivalent to -vT." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-t" summary="Show tabs and nonprinting characters" description="Display nonprinting characters visibly and render tab characters as caret-I." {
+            platform "macos"
+        }
+        flag "-u" summary="Accepted for compatibility" description="Accepted and ignored by GNU cat." {
+            platform "linux"
+            platform "freebsd"
+        }
+        flag "-u" summary="Disable output buffering" description="Write without output buffering." {
+            platform "macos"
+        }
+        flag "-v" summary="Show nonprinting characters" description="Render control and non-ASCII characters using visible caret and meta notation." {
+            platform "macos"
+        }
         argument "files" summary="Files to print" description="Files to write to standard output; use - or omit the argument to read standard input." repeatable=#true action="files"
     }
 }
