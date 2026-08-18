@@ -35,9 +35,18 @@ pub const CATALOG_SCHEMA_DESCRIPTOR: &str = "quirl.catalog@4{Catalog{deny_unknow
 pub const COMPLETION_SCHEMA_DESCRIPTOR: &str = "quirl.completion@1{Completion{deny_unknown;value:string;display:string;summary:string;detail:string;replace_start:usize;replace_end:usize;match_indices:array<usize>};CompletionRequest{deny_unknown;protocol_version:u32;request_id:u64(strictly-increasing);line:utf8<=4096-bytes;cursor:usize(char-boundary);limit:usize<=1000;deadline_ms:1..250};CompletionCancellation{deny_unknown;protocol_version:u32;request_id:u64};CompletionResponse{deny_unknown;protocol_version:u32;request_id:u64;outcome:CompletionOutcome};CompletionOutcome:tag(status);content(data)[ready{items:array<Completion>}|cancelled{}|deadline_exceeded{}];policy:frozen-major-v1;ordering:score-desc-then-display-value;catalog_source:quirl.catalog@4;static_values:CompletionSource.static;dynamic_values:provider-identity-only;worker:newer-request-or-cancellation-never-overwrites-newer-result}";
 
 mod import;
+mod native;
 
 pub use import::{
     ImportDiagnostic, ImportReport, import_bash, import_fish, import_help, import_man, import_zsh,
+};
+pub use native::{
+    NATIVE_DATABASE_APPLICATION_ID, NATIVE_DATABASE_SCHEMA_VERSION, NativeArgument, NativeCatalog,
+    NativeCatalogDiagnostic, NativeCatalogLimits, NativeCatalogReader, NativeCommand,
+    NativeCompletionAction, NativeCompletionCandidate, NativeCompletionKind, NativeDiagnosticKind,
+    NativeFlag, NativePlatform, NativeProvenance, NativeSemanticHit, compile_native_catalog,
+    compile_native_catalog_source, parse_native_catalog, publish_native_catalog,
+    publish_native_catalog_source,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
