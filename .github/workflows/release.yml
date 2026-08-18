@@ -1,0 +1,242 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact SemVer tag verified by the release plan (for example, v0.1.0)
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the release state
+        env:
+          EXPECTED_TAG: ${{ inputs.tag }}
+        run: cargo xtask release verify --expected-tag "$EXPECTED_TAG"
+
+      - name: Run the canonical quality gate
+        run: cargo xtask check
+
+  package:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build and package the native binary
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: >-
+          cargo xtask release package
+          --target "$RELEASE_TARGET"
+          --output "${{ runner.temp }}/package"
+
+      - name: Preserve the candidate package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-${{ matrix.target }}
+          path: ${{ runner.temp }}/package
+          if-no-files-found: error
+          retention-days: 1
+
+  asset:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        kind:
+          - completion-database
+          - command-model
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build the downloadable asset
+        env:
+          ASSET_KIND: ${{ matrix.kind }}
+        run: >-
+          cargo xtask assets build
+          --kind "$ASSET_KIND"
+          --output "${{ runner.temp }}/asset"
+
+      - name: Preserve the downloadable asset
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: asset-${{ matrix.kind }}
+          path: ${{ runner.temp }}/asset
+          if-no-files-found: error
+          retention-days: 1
+
+  asset-manifest:
+    needs: asset
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore the downloadable assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: asset-*
+          path: ${{ runner.temp }}/assets
+          merge-multiple: true
+
+      - name: Describe the complete downloadable asset set
+        run: >-
+          cargo xtask assets manifest
+          --input "${{ runner.temp }}/assets"
+          --output "${{ runner.temp }}/asset-manifest-v1.json"
+
+      - name: Preserve the downloadable asset manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: asset-manifest
+          path: ${{ runner.temp }}/asset-manifest-v1.json
+          if-no-files-found: error
+          retention-days: 1
+
+  aggregate:
+    needs:
+      - package
+      - asset-manifest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore every candidate component
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: package-*
+          path: ${{ runner.temp }}/release-input/packages
+
+      - name: Restore the complete downloadable asset set and manifest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: asset-*
+          path: ${{ runner.temp }}/release-input/assets
+
+      - name: Aggregate and verify the release bundle
+        run: >-
+          cargo xtask release aggregate
+          --input "${{ runner.temp }}/release-input"
+          --output "${{ runner.temp }}/release-dist"
+
+      - name: Preserve the verified release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/release-dist
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: aggregate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Atomically publish the immutable candidate tag
+        env:
+          EXPECTED_TAG: ${{ inputs.tag }}
+        run: >-
+          cargo xtask release tag
+          --expected-tag "$EXPECTED_TAG"
+          --write
+
+      - name: Restore the verified release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/release-bundle
+
+      - name: Create the immutable tag and GitHub Release
+        uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+        with:
+          tag: ${{ inputs.tag }}
+          commit: ${{ github.sha }}
+          bodyFile: ${{ runner.temp }}/release-bundle/release-notes.md
+          artifacts: ${{ runner.temp }}/release-bundle/*
+          artifactErrorsFailBuild: true
+          allowUpdates: false
+          replacesArtifacts: false
+          immutableCreate: true
+          makeLatest: true
+
+  homebrew:
+    needs: publish
+    permissions:
+      contents: read
+    uses: ./.github/workflows/homebrew.yml
+    with:
+      tag: ${{ inputs.tag }}

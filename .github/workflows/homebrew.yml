@@ -1,0 +1,131 @@
+name: Homebrew
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing immutable Quirl release tag to publish to the tap
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing immutable Quirl release tag to publish to the tap
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  formula:
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the published Quirl source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Check out the Homebrew tap
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: niklas-heer/homebrew-tap
+          path: homebrew-tap
+          persist-credentials: false
+
+      - name: Download the published release manifest
+        uses: robinraju/release-downloader@28fc21f50d76778e7023361aa1f863e717d3d56f # v1.13
+        with:
+          repository: ${{ github.repository }}
+          tag: ${{ inputs.tag }}
+          fileName: release-manifest-v1.json
+          out-file-path: release
+          token: ${{ github.token }}
+
+      - name: Download the native package for the offline install test
+        uses: robinraju/release-downloader@28fc21f50d76778e7023361aa1f863e717d3d56f # v1.13
+        with:
+          repository: ${{ github.repository }}
+          tag: ${{ inputs.tag }}
+          fileName: "quirl-v*-aarch64-apple-darwin.tar"
+          out-file-path: release
+          token: ${{ github.token }}
+
+      - name: Render the formula from the release manifest
+        env:
+          EXPECTED_TAG: ${{ inputs.tag }}
+        run: >-
+          cargo xtask homebrew render
+          --release-manifest release/release-manifest-v1.json
+          --expected-tag "$EXPECTED_TAG"
+          --tap-root homebrew-tap
+          --write
+
+      - name: Verify the rendered tap
+        run: >-
+          cargo xtask homebrew check
+          --tap-root homebrew-tap
+          --release-manifest release/release-manifest-v1.json
+          --package-root release
+
+      - name: Preserve the verified formula
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: homebrew-formula
+          path: homebrew-tap/Formula/quirl.rb
+          if-no-files-found: error
+          retention-days: 7
+
+  pull-request:
+    needs: formula
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: homebrew-tap
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the Homebrew tap without credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: niklas-heer/homebrew-tap
+          path: homebrew-tap
+          persist-credentials: false
+
+      - name: Restore the verified formula
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: homebrew-formula
+          path: homebrew-tap/Formula
+
+      - name: Create a narrowly scoped tap token
+        id: tap-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: niklas-heer
+          repositories: homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open the tap pull request
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.tap-token.outputs.token }}
+          path: homebrew-tap
+          add-paths: Formula/quirl.rb
+          branch: codex/quirl-${{ inputs.tag }}
+          delete-branch: true
+          commit-message: "chore(quirl): update to ${{ inputs.tag }}"
+          title: "chore(quirl): update to ${{ inputs.tag }}"
+          body: Generated and checked from Quirl's immutable release manifest.
