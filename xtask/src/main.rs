@@ -1,9 +1,12 @@
 //! Reproducible development, documentation, test, and release tasks for Quirl.
 
 use clap::{Parser, Subcommand};
+mod assets;
 mod catalog;
+mod homebrew;
 #[cfg(unix)]
 mod pty;
+mod release;
 #[cfg(unix)]
 mod rich_pty;
 mod simulation;
@@ -34,6 +37,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Task {
+    /// Plan, prepare, verify, package, or aggregate an immutable release candidate.
+    Release {
+        #[command(subcommand)]
+        command: release::ReleaseCommand,
+    },
+    /// Build and describe separately downloadable runtime assets.
+    Assets {
+        #[command(subcommand)]
+        command: assets::AssetsCommand,
+    },
+    /// Render and validate the generated Homebrew formula.
+    Homebrew {
+        #[command(subcommand)]
+        command: homebrew::HomebrewCommand,
+    },
     /// Import, format, validate, and compile the build-time native command catalog.
     Catalog {
         #[command(subcommand)]
@@ -126,6 +144,9 @@ fn main() {
 fn execute(cli: Cli) -> Result<(), Box<dyn Error>> {
     let root = workspace_root()?;
     match cli.task {
+        Task::Release { command } => release::run(&root, command),
+        Task::Assets { command } => assets::run(&root, command),
+        Task::Homebrew { command } => homebrew::run(&root, command),
         Task::Catalog { command } => catalog::run(&root, command),
         Task::Fmt => task_fmt(&root),
         Task::Lint => task_lint(&root),
