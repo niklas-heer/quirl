@@ -8,10 +8,10 @@ use quirl_ui::{
     ACTIVITY_MESSAGE_BYTES_MAX, InteractiveActivityProvider, InteractiveActivitySnapshot,
 };
 use sha2::{Digest, Sha256};
-#[cfg(test)]
-use std::{fs::OpenOptions, io::Write, path::PathBuf, sync::mpsc};
 #[cfg(any(test, debug_assertions))]
 use std::time::Duration;
+#[cfg(test)]
+use std::{fs::OpenOptions, io::Write, path::PathBuf, sync::mpsc};
 use std::{
     fs::{self, File},
     io::{self, Read},
