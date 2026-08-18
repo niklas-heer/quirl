@@ -93,10 +93,32 @@ quirl ai index --format json
 quirl ai search "find the largest files" --format json
 ```
 
-The committed [TRAINING_RESULTS.md](TRAINING_RESULTS.md) records the first
-candidate's identities, benchmark deltas, and known regressions. Generated
-models and full reports remain ignored because they are local research
-artifacts, not source or an automatic product default.
+The committed [TRAINING_RESULTS.md](TRAINING_RESULTS.md) records every promotion
+version's identities, benchmark deltas, and known regressions. Intermediate
+models and full reports remain ignored. The selected v3 int8 artifact is the
+only model copied into `models/` and pinned as the automatic product default.
+
+Promotion-quality reproduction uses the whole-utility and product-aligned
+pipelines after the v1 run:
+
+```sh
+uv run python train_v2.py \
+  --database ../../target/retrieval-current.sqlite3 \
+  --model "$HOME/.local/share/quirl/models/potion-base-8M" \
+  --output training-output/v2-promotion \
+  --epochs 280
+uv run python train_v3.py \
+  --database ../../target/retrieval-current.sqlite3 \
+  --model "$HOME/.local/share/quirl/models/potion-base-8M" \
+  --output training-output/v3-promotion \
+  --epochs 180
+```
+
+`train_v3.py` exports seven independently identified int8 candidates and
+separate generated validation/test fixtures. Run the production evaluator on
+validation for every candidate, select exactly one, and only then read the test
+fixture. The complete frozen protocol and promotion exception are in
+[TRAINING_DESIGN.md](TRAINING_DESIGN.md) and ADR 0025.
 
 ## Bounds and interpretation
 

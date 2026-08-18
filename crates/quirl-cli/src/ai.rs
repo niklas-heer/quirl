@@ -55,7 +55,7 @@ pub(crate) enum AiCommand {
         #[arg(long, value_enum, default_value_t = AiOutputFormat::Text)]
         format: AiOutputFormat,
     },
-    /// Embed all current command and option documents with potion-base-8M.
+    /// Embed all current command and option documents with the pinned Quirl model.
     Index {
         /// Output representation for the build report.
         #[arg(long, value_enum, default_value_t = AiOutputFormat::Text)]
@@ -359,7 +359,7 @@ fn status(format: AiOutputFormat) -> Result<i32, ShellError> {
         model: model_identity
             .as_ref()
             .map(|identity| identity.repository.clone())
-            .unwrap_or_else(|| "minishlab/potion-base-8M".to_owned()),
+            .unwrap_or_else(|| crate::ai_bootstrap::MODEL_REPOSITORY.to_owned()),
         model_identity: model_identity.clone(),
         embedding_index_identity,
         model_ready: model_identity.is_some(),

@@ -641,7 +641,7 @@ pub(crate) fn default_model_path() -> Option<PathBuf> {
     env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-        .map(|data| data.join("quirl/models/potion-base-8M"))
+        .map(|data| data.join("quirl/models/quirl-command-v3-int8"))
 }
 
 pub(crate) fn explicit_model_path_configured() -> bool {
@@ -1260,7 +1260,7 @@ pub(crate) fn build_embeddings_cancellable(
                 ErrorCode::Validation,
                 "the local Model2Vec tokenizer failed",
             )
-            .with_help("Replace the model files with an intact potion-base-8M release")
+            .with_help("Replace the model files with the intact pinned Quirl command model")
         })?;
         if encoded.len() != batch.len() {
             return Err(ShellError::new(

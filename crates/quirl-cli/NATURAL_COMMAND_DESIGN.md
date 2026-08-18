@@ -57,9 +57,9 @@ of truth, and the existing process layer remains the sole native executor.
 Expected interactive work is one preloaded model query plus two linear scans of
 the admitted document count and bounded sorting of candidate pools. Catalog
 documents and their embeddings are generated once per catalog/model identity,
-never per keystroke. Model memory is expected to remain near the current
-potion-base-8M footprint (about 30 MiB for the automatic default or about 8 MiB
-for the experimental int8 files), plus bounded document and vector storage.
+never per keystroke. Model memory is expected to remain near the 8 MiB
+automatic int8 command-model footprint, plus bounded document and vector
+storage.
 
 ## Invariants
 

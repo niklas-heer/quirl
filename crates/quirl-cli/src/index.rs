@@ -639,7 +639,7 @@ pub(crate) fn open_default_search_session() -> Result<intelligence::SearchSessio
     intelligence::SearchSession::open(&bytes, &path, model_path.as_deref())
 }
 
-/// Rebuild potion-base-8M embeddings in one in-memory transaction and atomically
+/// Rebuild pinned Quirl-model embeddings in one in-memory transaction and atomically
 /// replace the database only after every vector passes validation.
 pub(crate) fn build_default_embeddings() -> Result<intelligence::EmbeddingReport, ShellError> {
     let path = default_database_path()?;

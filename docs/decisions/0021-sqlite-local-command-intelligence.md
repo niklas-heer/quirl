@@ -139,6 +139,11 @@ select deterministic lexical ranking. AI mode inserts a selected suggestion
 into normal mode for review, while AI subcommands only display suggestions;
 neither path executes one directly.
 
+ADR 0025 replaces only this initial automatic model identity and distribution
+with the fine-tuned 8.1 MB `quirl-command-v3-int8` artifact. All installation,
+resource, cancellation, persistence, lexical-fallback, and execution-safety
+contracts in this ADR remain in force.
+
 ## Failure model and invariants
 
 - Local completion code is untrusted local code. It may hang, fork descendants,

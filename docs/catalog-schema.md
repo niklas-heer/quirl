@@ -509,10 +509,10 @@ complete generations.
 ### Local semantic intelligence
 
 After initial catalog admission, a session-owned worker validates or installs
-the pinned `minishlab/potion-base-8M` model and builds embeddings automatically.
-The default installer fetches exactly `config.json`, `tokenizer.json`, and
-`model.safetensors` from pinned revision
-`bf8b056651a2c21b8d2565580b8569da283cab23` over bounded rustls HTTPS, verifies
+the pinned `niklas-heer/quirl-command-v3-int8` model and builds embeddings
+automatically. The default installer fetches exactly `config.json`,
+`tokenizer.json`, and `model.safetensors` from pinned revision
+`quirl-command-v3-9bc5efbd14096b54` over bounded rustls HTTPS, verifies
 exact byte counts and SHA-256 digests, and atomically publishes a private model
 directory. An explicit `QUIRL_MODEL_PATH` is never replaced automatically.
 Redirects, waits, retained chunks, staging attempts, directory depth, file

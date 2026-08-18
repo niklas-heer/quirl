@@ -81,3 +81,51 @@ automatic default.
 - The artifact remains retrieval-only. Catalog proposal validation, trusted
   command rendering, exact preview, ordinary acceptance, and distinct high-risk
   confirmation remain mandatory.
+
+## Promotion result: v3
+
+The v1 artifact above remains historical and is not the automatic default. A
+v2 whole-utility run trained against all 2,227 production command/option
+documents and improved its 225-query semantic holdout, but its production
+hybrid Recall@5 and MRR regressed. It was rejected.
+
+V3 advanced to seed 20260820, stratified product and auxiliary utilities, and
+trained six milder source-anchored candidates plus a quantized-stock control.
+The product validation fixture contained 51 queries across six product command
+groups. It selected `mild-lr-0.002-a0.10-d0.08` at epoch 130 without reading the
+test fixture. The selected immutable identity is:
+
+- revision: `quirl-command-v3-9bc5efbd14096b54`;
+- repository: `niklas-heer/quirl-command-v3-int8`;
+- model identity:
+  `sha256:500ec95ec5fdb144b8e5eab039dd887150558ea0897311e45499f81fbd318ca1`;
+- config SHA-256:
+  `24d184c2ccaf32274ad9f9be69dab83cb6ab4403b9b0dc2a8f7dc4c03608db8f`;
+- tokenizer SHA-256:
+  `273ca9e28ec6990aea6206b0364443754d87e87a5dd28e94026ea9999ba3bf62`;
+- weights SHA-256:
+  `1ea0c56bae3f10dd172f7e4997a7038193c4633fbe0fdeb0528f89d75b801c30`.
+
+### Final 61-query product test
+
+| Metric | Stock float32 | Tuned v3 int8 | Delta |
+| --- | ---: | ---: | ---: |
+| Recall@1 | 34.4% | 42.6% | +8.2 pp |
+| Recall@5 | 65.6% | 70.5% | +4.9 pp |
+| Recall@10 | 82.0% | 78.7% | -3.3 pp |
+| MRR | 0.490 | 0.543 | +0.053 |
+| Destructive Recall@5 | 61.5% | 61.5% | unchanged |
+| Multilingual Recall@10 | 100% | 100% | unchanged |
+| Cold latency p50 | 389.3 ms | 118.6 ms | -270.7 ms |
+| Peak child RSS | 143.4 MB | 119.4 MB | -24.0 MB |
+| Model-tree bytes | 30.9 MB | 8.1 MB | -22.8 MB |
+
+Recall@10 misses two additional deep results, concentrated in `head` and `mv`.
+This explicitly misses the initial no-R@10-regression sketch. Promotion is
+nevertheless accepted because the natural-command fallback consumes rank 1,
+not ten candidates; Recall@1, Recall@5, MRR, latency, RSS, and size improve;
+destructive and multilingual top-five/ten safety slices do not regress; and the
+proposal confirmation boundary is unchanged. ADR 0025 records this exception.
+
+The complete test fixture is consumed. Future model selection must use a new
+versioned split or external dataset rather than choosing another v3 candidate.

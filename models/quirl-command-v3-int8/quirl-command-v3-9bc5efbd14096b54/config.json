@@ -1,0 +1,146 @@
+{
+    "model_type": "model2vec",
+    "architectures": [
+        "StaticModel"
+    ],
+    "tokenizer_name": "baai/bge-base-en-v1.5",
+    "apply_pca": 256,
+    "apply_zipf": true,
+    "hidden_dim": 256,
+    "seq_length": 1000000,
+    "normalize": true,
+    "quirl_command_tuning": {
+        "schema_version": 3,
+        "seed": 20260820,
+        "candidate": "mild-lr-0.002-a0.10-d0.08",
+        "source_repository": "minishlab/potion-base-8M",
+        "source_revision": "bf8b056651a2c21b8d2565580b8569da283cab23",
+        "source_file_sha256": {
+            "config.json": "2a6ac0e9aaa356a68a5688070db78fc3a464fefe85d2f06a1905ce3718687553",
+            "model.safetensors": "f65d0f325faadc1e121c319e2faa41170d3fa07d8c89abd48ca5358d9a223de2",
+            "tokenizer.json": "e67e803f624fb4d67dea1c730d06e1067e1b14d830e2c2202569e3ef0f70bb50"
+        },
+        "training_pipeline": {
+            "schema_version": 3,
+            "files": {
+                "train_v3.py": {
+                    "bytes": 19556,
+                    "sha256": "55a4931e7ffce5920ddf13b6ec211c75fd1d6287857a12dcdf0de7262d63af71"
+                },
+                "train_v2.py": {
+                    "bytes": 37383,
+                    "sha256": "92018a970dceb820e0d2ef3997d95897891270acb614c00bacb19887c7f55b08"
+                },
+                "train.py": {
+                    "bytes": 35072,
+                    "sha256": "fa9d597b993aaf3c92507e42a4a4290afaba331a1c9338f5c85918e6fe61a0bd"
+                },
+                "pyproject.toml": {
+                    "bytes": 290,
+                    "sha256": "7b9e0ee94f21b9b4203d0a44559ad880ebd399b5660667953bf32da4444d3d2b"
+                },
+                "uv.lock": {
+                    "bytes": 52158,
+                    "sha256": "6cf150d8409c7257592f7cb8f792343ec7bb80213ed442aee1b214f5fcd3f9c4"
+                }
+            }
+        },
+        "split_identity": {
+            "training_utilities": [
+                "awk",
+                "basename",
+                "bind",
+                "brew",
+                "cal",
+                "cat",
+                "cd",
+                "chgrp",
+                "chown",
+                "column",
+                "comm",
+                "df",
+                "diff",
+                "file",
+                "find",
+                "groups",
+                "gunzip",
+                "gzip",
+                "history",
+                "ifconfig",
+                "jobs",
+                "join",
+                "kill",
+                "ln",
+                "md5sum",
+                "nl",
+                "od",
+                "pstree",
+                "rename",
+                "scp",
+                "screen",
+                "sed",
+                "seq",
+                "set",
+                "shopt",
+                "source",
+                "ssh",
+                "ssh-keygen",
+                "tmux",
+                "top",
+                "touch",
+                "tr",
+                "uname",
+                "wc"
+            ],
+            "validation_utilities": [
+                "alias",
+                "curl",
+                "date",
+                "grep",
+                "ls",
+                "mkdir",
+                "mktemp",
+                "mount",
+                "ps",
+                "read",
+                "readlink",
+                "rsync",
+                "tail",
+                "tar",
+                "unset",
+                "watch",
+                "which"
+            ],
+            "test_utilities": [
+                "bzip2",
+                "chmod",
+                "cp",
+                "crontab",
+                "dig",
+                "du",
+                "head",
+                "man",
+                "mv",
+                "paste",
+                "ping",
+                "rm",
+                "rmdir",
+                "shred",
+                "sort",
+                "split",
+                "su",
+                "tree",
+                "yum"
+            ]
+        },
+        "trial": {
+            "name": "mild-lr-0.002-a0.10-d0.08",
+            "learning_rate": 0.002,
+            "anchor_strength": 0.1,
+            "delta_strength": 0.08
+        },
+        "best_epoch": 130
+    },
+    "quirl_command_quantization": "global_int8_cosine",
+    "embedding_dtype": "int8"
+}

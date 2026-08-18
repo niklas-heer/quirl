@@ -1125,7 +1125,7 @@ impl Catalog {
                     "quirl ai index",
                     "quirl ai index [--format text|json]",
                     "Build local semantic command and option embeddings",
-                    "Loads potion-base-8M from local files, embeds bounded command and option documents, validates every vector, and atomically replaces the SQLite database only after a complete transaction.",
+                    "Loads the pinned Quirl command model from local files, embeds bounded command and option documents, validates every vector, and atomically replaces the SQLite database only after a complete transaction.",
                     vec![option(
                         &["--format"],
                         Some("text|json"),

@@ -114,7 +114,7 @@ Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unl
 | --- | --- | --- | --- |
 | Normal `❯` | Bytes and processes; commands resolve through the session `PATH`; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `ls -al`, `false \|\| echo recovered` | `mode normal` (legacy: `mode command`) |
 | Data `▦` | Unambiguous Quirl grammar; typed, lazy values; external programs require an adapter or `^command`; failures are `Result` values | `ps \| where cpu > 20 \| sort cpu desc`, `open users.json \| get users \| select name email` | `mode data`; one-shot `data { ... }` |
-| AI `✧` | Live command and option discovery over the SQLite catalog; the pinned potion-base-8M model downloads and indexes automatically after first paint. Enter inserts the selected suggestion into normal mode for review and never executes it directly. | `copy a directory while preserving permissions`, `find the option that follows symlinks` | `mode ai`; `Alt-Q i` selects it. `mode natural`, `mode nl`, and `mode human` remain aliases. |
+| AI `✧` | Live command and option discovery over the SQLite catalog; Quirl's pinned command-tuned int8 model downloads and indexes automatically after first paint. Enter inserts the selected suggestion into normal mode for review and never executes it directly. | `copy a directory while preserving permissions`, `find the option that follows symlinks` | `mode ai`; `Alt-Q i` selects it. `mode natural`, `mode nl`, and `mode human` remain aliases. |
 
 ```quirl
 ▦ http get /health | match {

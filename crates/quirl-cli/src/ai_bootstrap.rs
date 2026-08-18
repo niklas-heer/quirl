@@ -30,10 +30,11 @@ use nix::{
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 
-pub(crate) const MODEL_REPOSITORY: &str = "minishlab/potion-base-8M";
-pub(crate) const MODEL_REVISION: &str = "bf8b056651a2c21b8d2565580b8569da283cab23";
+pub(crate) const MODEL_REPOSITORY: &str = "niklas-heer/quirl-command-v3-int8";
+pub(crate) const MODEL_REVISION: &str = "quirl-command-v3-9bc5efbd14096b54";
 pub(crate) const MODEL_DIMENSIONS: usize = 256;
-const MODEL_BASE_URL: &str = "https://huggingface.co/minishlab/potion-base-8M/resolve";
+const MODEL_BASE_URL: &str =
+    "https://raw.githubusercontent.com/niklas-heer/quirl/main/models/quirl-command-v3-int8";
 const HTTP_REDIRECTS_MAX: u32 = 4;
 const HTTP_GLOBAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -66,18 +67,18 @@ struct ModelInstallOptions<'a> {
 const ASSETS: [AssetSpec; 3] = [
     AssetSpec {
         name: "config.json",
-        bytes: 202,
-        sha256: "2a6ac0e9aaa356a68a5688070db78fc3a464fefe85d2f06a1905ce3718687553",
+        bytes: 4_311,
+        sha256: "24d184c2ccaf32274ad9f9be69dab83cb6ab4403b9b0dc2a8f7dc4c03608db8f",
     },
     AssetSpec {
         name: "tokenizer.json",
-        bytes: 683_666,
-        sha256: "e67e803f624fb4d67dea1c730d06e1067e1b14d830e2c2202569e3ef0f70bb50",
+        bytes: 446_303,
+        sha256: "273ca9e28ec6990aea6206b0364443754d87e87a5dd28e94026ea9999ba3bf62",
     },
     AssetSpec {
         name: "model.safetensors",
-        bytes: 30_236_760,
-        sha256: "f65d0f325faadc1e121c319e2faa41170d3fa07d8c89abd48ca5358d9a223de2",
+        bytes: 7_677_440,
+        sha256: "1ea0c56bae3f10dd172f7e4997a7038193c4633fbe0fdeb0528f89d75b801c30",
     },
 ];
 
@@ -586,7 +587,7 @@ fn worker_loop(shared: &Shared) {
 fn run_generation(shared: &Shared, fetcher: &UreqFetcher, generation: u64) -> bool {
     #[cfg(debug_assertions)]
     if std::env::var_os("QUIRL_TEST_AI_BOOTSTRAP_FAKE").is_some() {
-        shared.publish("AI: downloading potion-base-8M (50%)".to_owned());
+        shared.publish("AI: downloading the Quirl command model (50%)".to_owned());
         if wait_test_stage(shared) {
             shared.publish("AI: indexing local commands".to_owned());
             if wait_test_stage(shared) {
@@ -608,7 +609,7 @@ fn run_generation(shared: &Shared, fetcher: &UreqFetcher, generation: u64) -> bo
             return true;
         }
     } else if validate_pinned_model(&model_path).is_err() {
-        shared.publish("AI: downloading potion-base-8M (0%)".to_owned());
+        shared.publish("AI: downloading the Quirl command model (0%)".to_owned());
         match install_model(fetcher, &model_path, shared) {
             Ok(true) => {}
             Ok(false) => {
@@ -794,7 +795,9 @@ fn install_model_with_assets(
         download_asset(reader.as_mut(), &path, asset, &shared.cancelled, |bytes| {
             let observed = completed_bytes.saturating_add(bytes);
             let percent = observed.saturating_mul(100) / total_bytes.max(1);
-            shared.publish(format!("AI: downloading potion-base-8M ({percent}%)"));
+            shared.publish(format!(
+                "AI: downloading the Quirl command model ({percent}%)"
+            ));
         })?;
         completed_bytes = completed_bytes.saturating_add(asset.bytes);
     }
@@ -939,7 +942,7 @@ impl ModelTemporary {
         for _ in 0..TEMPORARY_ATTEMPTS_MAX {
             let id = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!(
-                ".potion-base-8M.download-{}-{id}",
+                ".quirl-command-v3-int8.download-{}-{id}",
                 std::process::id()
             ));
             let mut builder = fs::DirBuilder::new();
@@ -962,7 +965,7 @@ impl ModelTemporary {
             "could not allocate a bounded model staging directory",
         )
         .with_context(format!("attempt limit: {TEMPORARY_ATTEMPTS_MAX}"))
-        .with_help("Remove stale .potion-base-8M.download-* entries and retry"))
+        .with_help("Remove stale .quirl-command-v3-int8.download-* entries and retry"))
     }
 }
 
@@ -994,7 +997,7 @@ fn quarantine_corrupt_model(destination: &Path, parent: &Path) -> Result<PathBuf
     for _ in 0..TEMPORARY_ATTEMPTS_MAX {
         let id = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
         let quarantine = parent.join(format!(
-            ".potion-base-8M.corrupt-{}-{id}",
+            ".quirl-command-v3-int8.corrupt-{}-{id}",
             std::process::id()
         ));
         match fs::symlink_metadata(&quarantine) {
@@ -1014,7 +1017,7 @@ fn quarantine_corrupt_model(destination: &Path, parent: &Path) -> Result<PathBuf
         "could not allocate a bounded corrupt-model quarantine name",
     )
     .with_context(format!("attempt limit: {TEMPORARY_ATTEMPTS_MAX}"))
-    .with_help("Remove stale .potion-base-8M.corrupt-* entries and retry"))
+    .with_help("Remove stale .quirl-command-v3-int8.corrupt-* entries and retry"))
 }
 
 enum DownloadMessage {
@@ -1187,6 +1190,20 @@ mod tests {
             sha256: "fa3ba64f2053ed06fc34ef5d5888983ca6ee22c7bd7d3d67d48b3faf8eac3a89",
         },
     ];
+
+    #[test]
+    fn checked_in_automatic_model_assets_match_runtime_pins() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let model = workspace
+            .join("models/quirl-command-v3-int8")
+            .join(MODEL_REVISION);
+        validate_pinned_model(&model).unwrap();
+        assert!(MODEL_BASE_URL.starts_with("https://"));
+        assert!(MODEL_BASE_URL.ends_with("models/quirl-command-v3-int8"));
+    }
 
     struct MockFetcher {
         bodies: Mutex<VecDeque<Vec<u8>>>,
@@ -1417,7 +1434,7 @@ mod tests {
             entry
                 .ok()
                 .and_then(|entry| entry.file_name().into_string().ok())
-                .is_some_and(|name| name.starts_with(".potion-base-8M.corrupt-"))
+                .is_some_and(|name| name.starts_with(".quirl-command-v3-int8.corrupt-"))
         }));
     }
 
@@ -1552,7 +1569,7 @@ mod tests {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(".potion-base-8M.download-"))
+                    .is_some_and(|name| name.starts_with(".quirl-command-v3-int8.download-"))
             })
             .collect()
     }

@@ -1105,7 +1105,7 @@ fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), Box<dyn Er
         .wait_for_screen("live AI download status", |screen| {
             screen
                 .bottom_line()
-                .contains("AI: downloading potion-base-8M")
+                .contains("AI: downloading the Quirl command model")
         })?;
     session
         .pty
@@ -1113,7 +1113,11 @@ fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), Box<dyn Er
             screen.bottom_line().contains("AI: indexing local commands")
         })?;
     wait_for_file_contents(&mut session, &catalog_path, b"idle-background-tool")?;
-    wait_for_file_contents(&mut session, &catalog_path, b"minishlab/potion-base-8M")?;
+    wait_for_file_contents(
+        &mut session,
+        &catalog_path,
+        b"niklas-heer/quirl-command-v3-int8",
+    )?;
     let cleanup_start = session.pty.output().len();
     session.pty.send(key::CTRL_D)?;
     ensure_status(session.pty.wait_exit()?, 0, "AI bootstrap activity EOF")?;
