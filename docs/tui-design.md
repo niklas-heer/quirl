@@ -255,20 +255,26 @@ navigation:
   the nearest retained logical anchor. A frame builds only visible rows and a
   bounded layout margin.
 
-Selection endpoints are logical transcript positions. Repaint, wrapping, and
-scrolling may change their cells but not the selected text while its source
-entry remains retained. Output-focus mode provides keyboard line selection;
-mouse dragging selects exact grapheme-safe character ranges and scrolls by one
-bounded logical line when held at a viewport edge. Releasing a completed mouse
-drag copies immediately while retaining the visible selection. Evicting source
-text clamps the selection to retained content.
+Quirl exposes two bounded selection models. Output-focus mode uses logical
+transcript positions for keyboard line selection. Repaint, wrapping, and
+scrolling may change those cells but not the selected text while its source
+entry remains retained; eviction clamps the selection to retained content.
 
-Copy serializes plain semantic text without color, scrollbar cells, or layout
-padding. One copy is capped at 1 MiB and fails before an oversized allocation.
-Mouse release, `y`, and delivered Ctrl/Cmd-C events use the same OSC 52
-transport; a clipboard error keeps the selection and never changes command
-status. Paste remains governed by the 64 KiB editor bound in §4 and is not a
-PTY input stream.
+A mouse drag instead selects exact grapheme-safe cells from the last complete
+rich frame. It may cross the transcript, context row (including Git and the
+right-side prompt), live input, completion or panel regions, and bottom status
+bar. This makes every visible user-facing value selectable even though Quirl
+owns the alternate screen. Releasing a completed drag copies immediately and
+returns keyboard focus to the prompt while keeping the highlight available.
+
+Copy removes Ratatui styling and terminal control sequences. Logical
+transcript copy emits semantic lines without layout padding; full-frame copy
+emits the selected visible text, preserves meaningful internal spacing, trims
+trailing row padding, and inserts one newline between selected rows. One copy
+is capped at 1 MiB and fails before an oversized allocation. Mouse release,
+`y`, and delivered Ctrl/Cmd-C events use the same OSC 52 transport; a clipboard
+error keeps the selection and never changes command status. Paste remains
+governed by the 64 KiB editor bound in §4 and is not a PTY input stream.
 
 ### 3.5 Event loop
 
@@ -354,14 +360,19 @@ enum EditAction {
 All mockups assume a 78-column terminal, `unicode` symbol profile, defaults.
 Glyphs come from `PromptSymbols` profiles: `auto` promotes to private-use icons
 only for terminals with documented built-in Nerd symbols, while `plain`
-substitutes ASCII (`D`, `AI`, `*`, `!`) and remains universally safe. Normal
-command input deliberately has no leading marker.
+substitutes ASCII (`D`, `AI`, `*`, `!`) and remains universally safe. The live
+input marker is `>` in the plain profile and the solid Unicode `❯` in the
+Unicode and Nerd profiles. No path, right-prompt, continuation, or status-bar
+separator uses a thin Powerline/Nerd chevron: Unicode and Nerd context segments
+use ` · `, continuation lines use `∙`, and status zones use ` │ `.
+Accepted transcript command records retain a solid `❯` as their semantic
+history marker; it is not profile-dependent chrome.
 
 ### 5.1 Frame at rest (command mode)
 
 ```
  ~/projects/quirl  main ✚2                                 1 job · 412ms · ✘1
-cargo build --release▌
+❯ cargo build --release▌
  NORMAL   Alt-Q Quirl · Tab complete · ↑ / Ctrl-R history             quirl
 ```
 
@@ -374,10 +385,12 @@ surface consumes escaped, rendered left/right `QuirlPrompt` strings and gives
 the branch suffix a secondary style rather than retaining one styled span per
 source segment.
 
-Row 2 — **input row**: normal input starts without a marker; Data (`▦`) and AI
-(`✧`) retain explicit indicators before the highlighted buffer and hardware
-cursor at the edit position (`Frame::set_cursor_position`). Inline history autosuggestion renders dim
-after the cursor.
+Row 2 — **input row**: the profile-appropriate `>` or `❯` always marks the
+editable buffer. Data (`▦`) and AI (`✧`) add their mode indicator after the
+chevron; the hardware cursor remains at the edit position
+(`Frame::set_cursor_position`). Inline history autosuggestion renders dim after
+the cursor. The simple/Reedline surface follows the same glyph policy after its
+textual mode label, for example `normal >` or `normal ❯`.
 
 Rows below the editor and any active overlay form the bounded transcript
 viewport (§3.4). The physical bottom row is always the **status bar** (§8).
@@ -595,8 +608,9 @@ later phase; ship the roles first.
 The status bar is Quirl-owned chrome. Plugin status items are a future protocol
 addition; current plugins do not contribute status-bar values and never draw.
 
-Layout: `left · center(flexible) · right`, single row, `chrome.dim` background
-tint when colors are on.
+Layout: `left │ center(flexible) │ right`, single row, `chrome.dim`
+background tint when colors are on. Unicode and Nerd profiles use the ordinary
+vertical bar, never a Powerline chevron; the plain profile uses ` | `.
 
 | Zone | Content | Rules |
 | --- | --- | --- |

@@ -158,6 +158,14 @@ font or a Nerd Font was used. A glyph difference must never change behavior.
 - [ ] `NO_COLOR=1` and `TERM=dumb` produce legible, control-safe text with ASCII
   separators and no dependence on patched-font glyphs. `NO_COLOR` retains the
   rich layout on a capable TTY; `TERM=dumb` uses the simple fallback.
+- [ ] Live input shows `>` in the plain profile and the solid `❯` in Unicode
+  and Nerd profiles. Path, right-prompt, continuation, and status-bar chrome
+  contain no thin Powerline chevrons; accepted transcript command records use
+  only the solid semantic `❯` marker.
+- [ ] Mouse dragging can select and copy one range across transcript output,
+  path and Git context, live input, right-side prompt data, panels, and the
+  bottom status bar. The copied text contains no styling controls and respects
+  the 1 MiB selection bound.
 - [ ] A narrow terminal, a resized terminal, and SSH or a comparable remote PTY
   remain usable without clipped essential state.
 

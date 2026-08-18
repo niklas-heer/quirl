@@ -117,9 +117,9 @@ Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unl
 
 | Mode | Contract | Examples | Explicit entry |
 | --- | --- | --- | --- |
-| Normal `❯` | Bytes and processes; commands resolve through the session `PATH`; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `ls -al`, `false \|\| echo recovered` | `mode normal` (legacy: `mode command`) |
+| Normal | Bytes and processes; commands resolve through the session `PATH`; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `ls -al`, `false \|\| echo recovered` | `mode normal` (legacy: `mode command`) |
 | Data `▦` | Unambiguous Quirl grammar; typed, lazy values; external programs require an adapter or `^command`; failures are `Result` values | `ps \| where cpu > 20 \| sort cpu desc`, `open users.json \| get users \| select name email` | `mode data`; one-shot `data { ... }` |
-| AI `✧` | Live command and option discovery over the SQLite catalog; the pinned potion-base-8M model downloads and indexes automatically after first paint. Enter inserts the selected suggestion into normal mode for review and never executes it directly. | `copy a directory while preserving permissions`, `find the option that follows symlinks` | `mode ai`; `Alt-Q i` selects it. `mode natural`, `mode nl`, and `mode human` remain aliases. |
+| AI `✧` | Live command and option discovery over the SQLite catalog; Quirl's pinned command-tuned int8 model downloads and indexes automatically after first paint. Enter inserts the selected suggestion into normal mode for review and never executes it directly. | `copy a directory while preserving permissions`, `find the option that follows symlinks` | `mode ai`; `Alt-Q i` selects it. `mode natural`, `mode nl`, and `mode human` remain aliases. |
 
 ```text title="Quirl"
 ▦ http get /health | match {
@@ -391,8 +391,8 @@ type Entry = {
 ▦ ls | where kind == directory # structured filter
 ▦ ls src | sort size desc    # typed path argument and transform
 ▦ ls | view tree             # renderer chosen explicitly
-❯ ls | grep Cargo            # command mode emits compatible text
-❯ ls -la                     # system flags pass through unchanged
+ls | grep Cargo              # command mode emits compatible text
+ls -la                       # system flags pass through unchanged
 ```
 
 - **Bounded fast path:** names, kind, size, modified time, hidden state, and
@@ -587,7 +587,7 @@ fzf proves fuzzy selection is a terminal primitive. Quirl includes a native, typ
 ```text title="Quirl"
 ▦ ls **/*.rs | pick --display path --preview source | open
 ▦ ps | where cpu > 5 | pick --multi --preview process | kill --confirm
-❯ git branch --format='%(refname:short)' | pick --query feature
+git branch --format='%(refname:short)' | pick --query feature
 ```
 
 ### Lua configuration with synchronized views
@@ -597,20 +597,16 @@ fzf proves fuzzy selection is a terminal primitive. Quirl includes a native, typ
 ```lua
 ---@type quirl.Config
 local config = quirl.config {
-  schema_version = 3,
+  schema_version = 4,
   editor = { keymap = "emacs", semantic_hints = true, banner = "full" },
   picker = { layout = "adaptive", preview = true },
   prompt = {
     symbols = "auto",
     left = { "directory", "git_branch", "git_state" },
-    right = { "jobs", "duration", "status" },
+    right = { "rust_version", "jobs", "duration", "status" },
   },
   ui = { theme = "tokyo-night" },
 }
-
-if quirl.project.is_rust() then
-  config.prompt.right = { "rust_version", "jobs", "duration", "status" }
-end
 
 return config
 ```
@@ -621,7 +617,7 @@ return config
 | Round trip | A concrete-syntax-tree patcher changes only recognized literal arguments, preserving comments, layout, unknown plugin forms, and surrounding code. Writes are atomic and retain a recoverable prior version. |
 | Live synchronization | Browser reads refresh from the authoritative file and saves re-check it before writing. Unsaved browser changes use a three-way merge; conflicts show a diff instead of silently winning. No background watcher is claimed. |
 | Validation | Versioned schema supplies types, ranges, deprecations, platform support, examples, plugin settings. `quirl config check` parses/lints Lua, validates known annotations and returned config through Rust schema, and never activates invalid state. |
-| Prompt symbols | `auto` chooses Unicode only for a UTF-8 locale and otherwise uses ASCII; `plain` and `unicode` are explicit; `nerd_font` opts into Powerline/private-use glyphs. Patched fonts are never required, and `TERM=dumb` always wins with the plain profile. |
+| Prompt symbols | `auto` selects Nerd icons for Kitty, WezTerm, and Ghostty because those terminals document bundled symbol fallbacks; it otherwise chooses Unicode for a UTF-8 locale and ASCII as the final fallback. `plain`, `unicode`, and `nerd_font` remain explicit overrides, and `TERM=dumb` always wins with the plain profile. Live input uses `>` for plain and the solid `❯` for Unicode/Nerd. Thin Powerline chevrons are never used in path, right-prompt, continuation, or status-bar chrome; accepted transcript commands retain a solid `❯` semantic history marker. |
 | Preview | Theme, prompt, keymap, completion, picker, accessibility changes render against sample and live contexts before Apply. |
 | Dynamic values | UI shows evaluated value, source span, documentation, and marks code-controlled expressions; “Open in code” never silently replaces one. |
 | Safe reload | Restricted evaluation with declared capabilities; parse/contract/runtime failures retain last-known-good config and show span diagnostic with rollback. |
@@ -668,7 +664,7 @@ Quirl ships an asynchronous prompt scheduler inspired by Starship and Oh My Posh
 ```yaml
 prompt:
   left: [directory, git_branch, git_state]
-  right: [jobs, duration, status]
+  right: [rust_version, jobs, duration, status]
   transient: true
   first_paint_budget: 8ms
   slow_segment_policy: stale_while_refresh

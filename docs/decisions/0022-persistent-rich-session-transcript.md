@@ -121,11 +121,19 @@ wrapping from retained logical text while preserving the nearest logical
 anchor. Only visible rows and bounded surrounding layout may be built for a
 frame.
 
-Selection is expressed in logical transcript coordinates and converted to
-screen cells during rendering. It survives repaint and scrolling while its
-retained source text exists. Dragging beyond the viewport may auto-scroll at a
-bounded rate. Copy emits plain semantic text without Ratatui styling and fails
-with an actionable resource-limit notice before allocating more than 1 MiB.
+Keyboard output-focus selection is expressed in logical transcript coordinates
+and converted to screen cells during rendering. It survives repaint and
+scrolling while its retained source text exists. A separate pointer selection
+maps exact grapheme-safe cells from the last complete frame, so one drag may
+include transcript output, path and Git context, right-side prompt data, live
+input, overlays or panels, and the bottom status bar. The pointer path copies on
+release and returns keyboard focus to the prompt; Ctrl/Cmd-C can copy the
+retained visible selection again.
+
+Copy emits control-safe plain text without Ratatui styling and fails with an
+actionable resource-limit notice before allocating more than 1 MiB. Logical
+transcript copy omits layout padding; visible-frame copy preserves selected
+internal spacing, trims trailing row padding, and separates rows with newlines.
 Clipboard integration may use OSC 52 and platform fallbacks, but clipboard
 failure never destroys the selection or changes command status.
 

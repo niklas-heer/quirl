@@ -77,7 +77,7 @@ the release checklist's named terminal or Linux signoffs.
 | Events and live views | Typed deny-unknown event documents, strictly increasing sequences, action capability validation, callback deadlines, regular-file-only 4 MiB trace input, bounded live buffers, and cooperative cancellation | core event/action tests, event trace bound/order tests, filesystem admission FIFO liveness test, UI live-buffer cancellation test |
 | Picker input | Standard input is UTF-8, at most 4 MiB, and at most 20,000 newline-delimited values before fuzzy selection | `picker_stdin_rejects_oversized_input_and_item_counts_before_selection` |
 | Terminal output | Untrusted diagnostic, catalog, completion, plugin, picker, rich-frame, agent, index, package, config, authoring documentation, recovery, and JSON text cannot emit active control bytes; JSON escaping preserves parsed values | core terminal escaping tests, picker C0/C1 test, author stdout C0/C1 test, Ratatui hostile editor/completion buffer test, UI hostile-error test, recovery ANSI/OSC test |
-| Accessibility | `auto` selects Ratatui only for a capable TTY; `simple`, non-TTY stderr, `TERM=dumb`, or height below five rows selects Reedline; `NO_COLOR` retains rich layout without color; dumb or non-UTF-8 terminals use ASCII automatically; patched-font glyphs require explicit opt-in; mode/editor state is textual; panels require a plain fallback; noninteractive structured output has no decoration | `explicit_simple_surface_always_degrades`; rich frame/status buffer tests; `terminal_styles_require_an_interactive_color_capable_terminal`; `auto_symbols_only_use_unicode_for_a_unicode_locale`; prompt injection/profile tests; panel fallback/control tests; manual capability checks below |
+| Accessibility | `auto` selects Ratatui only for a capable TTY; `simple`, non-TTY stderr, `TERM=dumb`, or height below five rows selects Reedline; `NO_COLOR` retains rich layout without color; dumb or non-UTF-8 terminals use ASCII automatically; private-use icons are automatic only for terminals with a documented bundled Nerd symbol fallback and otherwise require explicit opt-in; live input has an ASCII `>` or solid Unicode `❯`, while path/right/status/continuation chrome contains no thin Powerline chevrons; mode/editor state is textual; exact visible-frame selection makes transcript, path/Git context, input, right-side values, panels, and the status bar copyable; panels require a plain fallback; noninteractive structured output has no decoration | `explicit_simple_surface_always_degrades`; rich frame/status buffer tests; `mouse_drag_crosses_transcript_context_input_and_status_bar`; `terminal_styles_require_an_interactive_color_capable_terminal`; `auto_symbols_promote_only_with_unicode_and_bundled_nerd_font_evidence`; prompt injection/profile tests; panel fallback/control tests; manual capability checks below |
 
 Recovery state is private on Unix: Quirl forces the journal directory to mode
 `0700` and newly created snapshots to `0600`. Windows relies on the ACL inherited
@@ -145,10 +145,12 @@ printf 'return "plain"\n' | NO_COLOR=1 TERM=dumb cargo run -q -p quirl-cli
 ```
 
 The first two commands must contain no ANSI control sequences. `TERM=dumb`
-selects the Reedline fallback with ASCII separators/indicators. In a capable
-TTY, `NO_COLOR=1` keeps the Ratatui inline layout while removing color styling;
-mode and editor state remain textual. The piped command is noninteractive and
-prints only `plain` plus a newline.
+selects the Reedline fallback with ASCII separators and a `>` live-input
+marker. In a capable TTY, `NO_COLOR=1` keeps the Ratatui inline layout while
+removing color styling; mode and editor state remain textual. Unicode and Nerd
+profiles use the solid `❯` live-input marker, but path/right/status/continuation
+chrome never uses thin Powerline chevrons. The piped command is noninteractive
+and prints only `plain` plus a newline.
 
 The historical P14 candidate's release binary passed these three smoke checks.
 A Unicode-aware scan found zero active C0/C1 controls in all three outputs; the
