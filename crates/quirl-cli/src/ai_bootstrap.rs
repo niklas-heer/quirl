@@ -10,6 +10,8 @@ use quirl_ui::{
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::{fs::OpenOptions, io::Write, path::PathBuf, sync::mpsc};
+#[cfg(any(test, debug_assertions))]
+use std::time::Duration;
 use std::{
     fs::{self, File},
     io::{self, Read},
@@ -19,7 +21,6 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
 };
 
 #[cfg(unix)]
