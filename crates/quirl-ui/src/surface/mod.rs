@@ -62,7 +62,7 @@ use crossterm::{
     },
     execute,
     style::Print,
-    terminal::{self, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use quirl_catalog::Catalog;
 use quirl_core::{
@@ -1201,7 +1201,7 @@ impl RichSurface {
                             self.open_picker(kind, editor.buffer(), editor.cursor(), "picker");
                         }
                         EditAction::ClearScreen => {
-                            self.terminal.force_clear()?;
+                            self.terminal.force_repaint()?;
                         }
                         EditAction::Suspend => {
                             self.terminal.release()?;
@@ -1960,30 +1960,29 @@ impl SurfaceTerminal {
             )(error));
         }
         self.alternate_screen = true;
-        if let Some(terminal) = self.terminal.as_mut() {
-            terminal
-                .clear()
-                .map_err(terminal_error("repaint after a foreground takeover"))?;
-        }
-        Ok(())
+        self.force_repaint()
     }
 
     /// Wipe the real screen and force ratatui to repaint every cell on its
-    /// next draw.
+    /// next draw, without `Terminal::clear`'s blocking cursor-position query.
     ///
-    /// A raw ANSI clear alone desyncs ratatui's diff buffer from the actual
-    /// screen contents: the next draw would only rewrite cells ratatui
-    /// believes changed since the prior frame, leaving the freshly blanked
-    /// regions untouched until unrelated content happens to change there.
-    /// Invalidating the buffer here keeps Ctrl-L reliable even after screen
-    /// corruption a diff-based repaint would not otherwise correct.
-    fn force_clear(&mut self) -> Result<(), ShellError> {
-        execute!(io::stderr(), terminal::Clear(ClearType::All))
-            .map_err(terminal_error("clear the terminal"))?;
+    /// `Terminal::clear` snapshots the cursor position first by writing an
+    /// `ESC[6n` device-status-report and synchronously reading the
+    /// terminal's reply off stdin. That read races the real reply against
+    /// whatever the terminal, a just-exited child, or the user's very next
+    /// keystroke writes next, and can stall the whole session if the
+    /// terminal is slow, busy, or never answers — exactly the kind of
+    /// terminal-corrupting hang this call exists to recover from.
+    /// `Terminal::resize` clears the same fixed viewport using only the
+    /// already-known terminal size and local cursor-set/erase commands, with
+    /// no read from the terminal at all, so use it here and for the
+    /// full-screen takeover resume path instead.
+    fn force_repaint(&mut self) -> Result<(), ShellError> {
+        let size = terminal::size().map_err(terminal_error("measure the terminal for repaint"))?;
         if let Some(terminal) = self.terminal.as_mut() {
             terminal
-                .clear()
-                .map_err(terminal_error("repaint after clearing the terminal"))?;
+                .resize(Rect::new(0, 0, size.0, size.1))
+                .map_err(terminal_error("repaint the terminal"))?;
         }
         Ok(())
     }
@@ -2096,7 +2095,16 @@ impl SurfaceTerminal {
 
     fn reset_best_effort(&mut self) {
         if let Some(mut terminal) = self.terminal.take() {
-            let _ = terminal.clear();
+            // Not `terminal.clear()`: it snapshots the cursor position with
+            // a blocking `ESC[6n` read off stdin first, and this is the
+            // last-resort path Drop and fault handlers call when the
+            // terminal may already be unresponsive — the one place a hang
+            // here would strand the session with no way back to a prompt.
+            // `resize` clears the same viewport through already-known size
+            // and local cursor-set/erase calls only, with no read at all.
+            if let Ok(size) = terminal::size() {
+                let _ = terminal.resize(Rect::new(0, 0, size.0, size.1));
+            }
             let _ = terminal.show_cursor();
         }
         let _ = execute!(

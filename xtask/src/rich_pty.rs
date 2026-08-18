@@ -1554,6 +1554,20 @@ fn check_catalog_failure_restores_terminal(binary: &Path) -> Result<(), Box<dyn 
             );
         }
     }
+    // `reset_best_effort` is the last-resort cleanup Drop runs when unwinding
+    // through exactly this kind of fault, possibly with the terminal already
+    // in a bad state. It must never query the terminal for its cursor
+    // position (`ESC[6n`, answered synchronously off stdin) to repaint: a
+    // terminal that doesn't answer promptly would hang the exit this test
+    // just proved happens (`wait_exit` above already bounds that, but assert
+    // the cause directly rather than only its bounded symptom).
+    if contains(observed, b"\x1b[6n") {
+        return Err(io::Error::other(
+            "catalog failure cleanup queried the terminal's cursor position instead of \
+             repainting from already-known state",
+        )
+        .into());
+    }
     let modes = session.pty.terminal_modes()?;
     if !modes.local_flags.contains(LocalFlags::ICANON)
         || !modes.local_flags.contains(LocalFlags::ECHO)
@@ -2061,26 +2075,33 @@ fn check_full_screen_program_spawn_failure_restores_terminal(
 }
 
 fn check_ctrl_l_forces_full_repaint(binary: &Path) -> Result<(), Box<dyn Error>> {
-    // Failure model: `terminal::Clear(ClearType::All)` wipes the real screen
-    // but does not by itself invalidate ratatui's internal diff buffer.
-    // Without also resetting the `Terminal` object's buffer, the next draw
-    // compares against a buffer that still believes the prior frame is on
-    // screen and re-emits only cells whose modeled content changed — leaving
-    // the freshly wiped real terminal blank wherever nothing in the frame
-    // changed, even though Ctrl-L just erased it. Sending Ctrl-L with no
-    // other edit must still repaint the full frame, not leave a blank
-    // screen behind.
+    // Failure model: a raw ANSI clear wipes the real screen but does not by
+    // itself invalidate ratatui's internal diff buffer, so the next draw
+    // would re-emit only cells whose modeled content changed, leaving the
+    // freshly wiped screen blank wherever nothing changed. Ctrl-L must force
+    // a full repaint of the current frame instead. It must also do so
+    // without `Terminal::clear`'s blocking cursor-position query
+    // (`ESC[6n`, answered synchronously off stdin): this fixture's fake PTY
+    // never answers device-status reports, so a Ctrl-L implementation that
+    // depends on one would hang here rather than repaint.
     let mut session = Session::new(binary, SessionOptions::default())?;
     session.pty.wait_for(STARTUP_MARKER)?;
     let since = session.pty.output().len();
     session.pty.send(key::CTRL_L)?;
     session
         .pty
-        .wait_for_since(b"\x1b[2J", since, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[J", since, DEFAULT_TIMEOUT)?;
+    if contains(&session.pty.output()[since..], b"\x1b[6n") {
+        return Err(io::Error::other(
+            "Ctrl-L queried the terminal's cursor position instead of \
+             repainting from already-known state",
+        )
+        .into());
+    }
     session
         .pty
         .wait_for_screen("status bar repainted after Ctrl-L", |screen| {
-            screen.bottom_line().contains("Tab complete")
+            screen.bottom_line().contains("NORMAL")
         })?;
     session.pty.send(key::CTRL_D)?;
     ensure_status(session.pty.wait_exit()?, 0, "Ctrl-L full repaint")
