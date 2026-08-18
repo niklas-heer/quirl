@@ -1,0 +1,13 @@
+catalog "doas-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "doas" summary="execute a command as another user" description="execute a command as another user" {
+        platform "linux"
+        platform "macos"
+        platform "freebsd"
+        flag "-C" summary="Parse and check configuration file, do not execute command" description="Parse and check configuration file, do not execute command" value="value" action="files"
+        flag "-L" summary="Clear any persisted authentications and exit" description="Clear any persisted authentications and exit"
+        flag "-n" summary="Non interactive mode, fail if password entry is needed" description="Non interactive mode, fail if password entry is needed"
+        flag "-s" summary="Execute shell from $SHELL or /etc/passwd" description="Execute shell from $SHELL or /etc/passwd"
+        flag "-u" summary="Execute command as specified user" description="Execute command as specified user" value="value" action="users"
+    }
+}

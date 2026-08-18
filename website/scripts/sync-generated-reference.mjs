@@ -41,6 +41,30 @@ const references = [
   },
 ];
 
+function escapeMdxProse(markdown) {
+  let fenced = false;
+  return markdown
+    .split('\n')
+    .map((line) => {
+      if (line.trimStart().startsWith('```')) {
+        fenced = !fenced;
+        return line;
+      }
+      if (fenced) return line;
+      return line
+        .split(/(`[^`]*`)/g)
+        .map((segment, index) => {
+          if (index % 2 === 1) return segment;
+          return segment
+            .replaceAll(/<([A-Za-z][^>\n]*)>/g, '&lt;$1&gt;')
+            .replaceAll('{', '&#123;')
+            .replaceAll('}', '&#125;');
+        })
+        .join('');
+    })
+    .join('\n');
+}
+
 function generate(commandArguments) {
   const result = spawnSync(
     'cargo',
@@ -61,7 +85,12 @@ function generate(commandArguments) {
     );
   }
 
-  return result.stdout.replaceAll('\r\n', '\n').replace(/^#\s+.+\n+/, '').trim();
+  const markdown = result.stdout
+    .replaceAll('\r\n', '\n')
+    .replace(/^#\s+.+\n+/, '')
+    .trim();
+  // Angle-bracket and brace placeholders are prose, but MDX treats them as JSX.
+  return escapeMdxProse(markdown);
 }
 
 const driftedFiles = [];

@@ -1,0 +1,37 @@
+catalog "rustc" {
+    provenance author="Carapace contributors; curated by Quirl contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "rustc" summary="Compile Rust programs" description="Compiles a Rust crate from a source file and emits the selected outputs." {
+        intent "compile a rust program"
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--allow" summary="Set lint allowed" description="Set lint allowed" short="-A" value="value"
+        flag "--cap-lints" summary="Set the most restrictive lint level" description="Set the most restrictive lint level" value="value"
+        flag "--cfg" summary="Configure the compilation environment" description="Configure the compilation environment" value="value"
+        flag "--check-cfg" summary="Provide list of expected cfgs for checking" description="Provide list of expected cfgs for checking" value="value"
+        flag "--codegen" summary="Set a codegen option" description="Set a codegen option" short="-C" value="value"
+        flag "--crate-name" summary="Specify the name of the crate being built" description="Specify the name of the crate being built" value="value"
+        flag "--crate-type" summary="Comma separated list of types of crates for the compiler to emit" description="Comma separated list of types of crates for the compiler to emit" value="value"
+        flag "--deny" summary="Set lint denied" description="Set lint denied" short="-D" value="value"
+        flag "--edition" summary="Specify which edition of the compiler to use when compiling code" description="Specify which edition of the compiler to use when compiling code" value="value"
+        flag "--emit" summary="Comma separated list of types of output for the compiler to emit" description="Comma separated list of types of output for the compiler to emit" value="value"
+        flag "--explain" summary="Provide a detailed explanation of an error message" description="Provide a detailed explanation of an error message" value="value"
+        flag "--forbid" summary="Set lint forbidden" description="Set lint forbidden" short="-F" value="value"
+        flag "--force-warn" summary="Set lint force-warn" description="Set lint force-warn" value="value"
+        flag "--help" summary="Display this message" description="Display this message" short="-h"
+        flag "--out-dir" summary="Write output to compiler-chosen filename in DIR" description="Write output to compiler-chosen filename in DIR" value="value" action="directories"
+        flag "--print" summary="Compiler information to print on stdout" description="Compiler information to print on stdout" value="value"
+        flag "--target" summary="Target triple for which the code is compiled" description="Target triple for which the code is compiled" value="value"
+        flag "--test" summary="Build a test harness" description="Build a test harness"
+        flag "--verbose" summary="Use verbose output" description="Use verbose output" short="-v"
+        flag "--version" summary="Print version info and exit" description="Print version info and exit" short="-V"
+        flag "--warn" summary="Set lint warnings" description="Set lint warnings" short="-W" value="value"
+        flag "-L" summary="Add a directory to the library search path" description="Add a directory to the library search path" value="value" repeatable=#true
+        flag "-O" summary="Equivalent to -C opt-level=3" description="Equivalent to -C opt-level=3"
+        flag "-g" summary="Equivalent to -C debuginfo=2" description="Equivalent to -C debuginfo=2"
+        flag "-l" summary="Link the generated crate(s) to the specified native library NAME" description="Link the generated crate(s) to the specified native library NAME" value="value" repeatable=#true
+        flag "-o" summary="Write output to FILENAME" description="Write output to FILENAME" value="value" action="files"
+        argument "input" summary="Rust source file" description="Crate-root source file to compile." required=#true action="files"
+    }
+}

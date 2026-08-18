@@ -1,0 +1,35 @@
+catalog "ssh" {
+    provenance author="Carapace contributors; curated by Quirl contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "ssh" summary="Connect to a remote host" description="Opens an encrypted login session or runs a command on a remote host using OpenSSH." {
+        intent "connect to a remote server"
+        intent "run a remote command"
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "-4" summary="Use IPv4 only" description="Force address resolution and connections to use IPv4."
+        flag "-6" summary="Use IPv6 only" description="Force address resolution and connections to use IPv6."
+        flag "-a" summary="Disable authentication-agent forwarding" description="Do not forward the authentication agent connection."
+        flag "-b" summary="Select the local bind address" description="Use the selected local address as the source of the connection." value="address"
+        flag "-c" summary="Select encryption ciphers" description="Use a comma-separated cipher preference list for the session." value="ciphers"
+        flag "-e" summary="Set the escape character" description="Select the escape character for sessions with a pseudo-terminal." value="character"
+        flag "-f" summary="Run in the background" description="Request that ssh enter the background just before command execution."
+        flag "-g" summary="Allow remote access to local forwards" description="Permit remote hosts to connect to locally forwarded ports."
+        flag "-i" summary="Select an identity file" description="Read the private key used for public-key authentication from this file." value="identity_file" action="files"
+        flag "-k" summary="Disable GSSAPI credential forwarding" description="Do not forward GSSAPI credentials to the server."
+        flag "-l" summary="Select the remote user" description="Log in as this user on the remote machine." value="user" action="users"
+        flag "-m" summary="Select MAC algorithms" description="Use a comma-separated message-authentication-code preference list." value="macs"
+        flag "-n" summary="Redirect standard input" description="Read standard input from the null device."
+        flag "-o" summary="Set an SSH configuration option" description="Set one option using the same key-value format as the SSH configuration file." value="option" repeatable=#true
+        flag "-p" summary="Select the remote port" description="Connect to this port on the remote host." value="port"
+        flag "-q" summary="Suppress warnings" description="Enable quiet mode so most warnings and diagnostics are omitted."
+        flag "-s" summary="Invoke a remote subsystem" description="Treat the remote command as the name of a subsystem."
+        flag "-t" summary="Allocate a pseudo-terminal" description="Force pseudo-terminal allocation on the remote host."
+        flag "-v" summary="Enable verbose diagnostics" description="Print connection, authentication, and configuration diagnostics; repeat for more detail." repeatable=#true
+        flag "-w" summary="Forward tunnel devices" description="Request client and server tunnel-device forwarding." value="tunnel"
+        flag "-x" summary="Disable X11 forwarding" description="Do not forward X11 connections."
+        flag "-y" summary="Send logs through syslog" description="Send log information using the system log module."
+        argument "destination" summary="Remote destination" description="Host name, optionally prefixed with a user name in user@host form." required=#true action="hostnames"
+        argument "command" summary="Remote command" description="Command and arguments to execute instead of starting an interactive login session." repeatable=#true
+    }
+}

@@ -1,0 +1,10 @@
+catalog "rmdir" {
+    provenance author="Carapace contributors; curated by Quirl contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "rmdir" summary="Remove directories" description="Removes one or more directories on Windows." {
+        intent "remove a directory"
+        platform "windows"
+        flag "/q" summary="Do not prompt for confirmation" description="Use quiet mode when removing a directory tree."
+        flag "/s" summary="Remove an entire directory tree" description="Remove the selected directory together with all files and subdirectories."
+        argument "directories" summary="Directories to remove" description="One or more directory paths to remove." required=#true repeatable=#true action="directories"
+    }
+}

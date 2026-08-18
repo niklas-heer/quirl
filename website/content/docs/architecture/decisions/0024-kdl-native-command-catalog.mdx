@@ -57,7 +57,7 @@ authority.
 
 The native compiler parses and validates the complete KDL document, constructs
 a canonical typed tree, and compiles it in memory into SQLite application
-`QCNC`, schema version 1. One transaction writes both an exact typed snapshot
+`QCNC`, schema version 2. One transaction writes both an exact typed snapshot
 and normalized provenance, command, alias, platform, intent, flag, argument,
 and semantic-document projections. Canonical ordering, explicit identifiers,
 fixed schema pragmas, and the absence of wall-clock data make equal typed input
@@ -84,9 +84,10 @@ intelligence database remains a separate database identity and lifecycle.
 Carapace may be used only by an explicit build-time import operation at one
 pinned immutable upstream revision. Its repository, generators, and generated
 facts are untrusted inputs subject to source-byte, record, depth, duration, and
-output bounds. Import produces one deterministic draft KDL file per selected
-root command in the review workspace; it never writes directly to the curated
-source set or release database. Splitting roots keeps additions, removals,
+output bounds. Import produces one deterministic draft KDL file named for each
+selected root command in the review workspace; provenance and the import
+manifest identify its source ownership. It never writes directly to the
+curated source set or release database. Splitting roots keeps additions, removals,
 platform changes, and large flag sets reviewable instead of hiding them in one
 aggregate.
 
@@ -163,15 +164,17 @@ Draft generation and curated maintenance are separate states:
 4. Format the draft canonically, then review the KDL diff for schema meaning,
    command version, flag/argument shape, aliases, platform scope, completion
    actions, intent wording, provenance, and license obligations.
-5. Move only approved KDL changes into the curated source set. Run formatting,
-   strict checking, deterministic compilation, reader validation, and tests.
+5. Promote a named first version with the non-overwriting helper, then edit and
+   review it as curated KDL. Existing curated definitions are never overwritten
+   by import or promotion. Run formatting, strict checking, deterministic
+   compilation, reader validation, and tests.
 6. Review the compiled database checksum change alongside the KDL change. An
    unexplained checksum change with unchanged canonical input is a compiler
    defect, not a generated-file refresh.
 
 The integration tooling exposes distinct `cargo xtask catalog
-import-carapace`, `cargo xtask catalog fmt`, `cargo xtask catalog check`, and
-`cargo xtask catalog build` operations. Import requires an explicit local
+import-carapace`, `cargo xtask catalog promote`, `cargo xtask catalog fmt`,
+`cargo xtask catalog check`, and `cargo xtask catalog build` operations. Import requires an explicit local
 checkout and exact 40-character pinned revision; format supports the
 non-mutating `--check` mode. The concrete paths and contributor procedure live
 in [`../catalog-schema.md`](/docs/reference/catalog-schema).

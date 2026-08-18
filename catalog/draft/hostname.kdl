@@ -1,0 +1,21 @@
+catalog "hostname-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "hostname" summary="show or set system host name" description="show or set system host name" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--aliases" summary="alias names" description="alias names" short="-a"
+        flag "--domain" summary="DNS domain name" description="DNS domain name" short="-d"
+        flag "--file" summary="set host name or NIS domain name from FILE" description="set host name or NIS domain name from FILE" short="-F" value="value" action="files"
+        flag "--fqdn" summary="DNS host name or FQDN" description="DNS host name or FQDN" short="-f"
+        flag "--help" summary="give this help list" description="give this help list"
+        flag "--ip-addresses" summary="addresses for the host name" description="addresses for the host name" short="-i"
+        flag "--long" summary="DNS host name or FQDN" description="DNS host name or FQDN"
+        flag "--nis" summary="NIS/YP domain name" description="NIS/YP domain name"
+        flag "--short" summary="short host name" description="short host name" short="-s"
+        flag "--usage" summary="give a short usage message" description="give a short usage message"
+        flag "--version" summary="print program version" description="print program version" short="-V"
+        flag "--yp" summary="NIS/YP domain name" description="NIS/YP domain name" short="-y"
+    }
+}

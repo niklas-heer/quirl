@@ -1,0 +1,17 @@
+catalog "head" {
+    provenance author="Carapace contributors; curated by Quirl contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "head" summary="Print the beginning of files" description="Writes the first ten lines of each selected file by default, or reads standard input when no file is supplied." {
+        intent "show the start of a file"
+        platform "linux"
+        platform "freebsd"
+        flag "--bytes" summary="print the first NUM bytes of each file;" description="print the first NUM bytes of each file;" short="-c" value="value"
+        flag "--help" summary="display this help and exit" description="display this help and exit"
+        flag "--lines" summary="print the first NUM lines instead of the first 10;" description="print the first NUM lines instead of the first 10;" short="-n" value="value"
+        flag "--quiet" summary="never print headers giving file names" description="never print headers giving file names" short="-q"
+        flag "--silent" summary="never print headers giving file names" description="never print headers giving file names"
+        flag "--verbose" summary="always print headers giving file names" description="always print headers giving file names" short="-v"
+        flag "--version" summary="output version information and exit" description="output version information and exit"
+        flag "--zero-terminated" summary="line delimiter is NUL, not newline" description="line delimiter is NUL, not newline" short="-z"
+        argument "files" summary="Files to read" description="Files whose leading content is printed; omit them to read standard input." repeatable=#true action="files"
+    }
+}

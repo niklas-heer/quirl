@@ -1,0 +1,20 @@
+catalog "more-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "more" summary="display the contents of a file in a terminal" description="display the contents of a file in a terminal" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--clean-print" summary="do not scroll, clean screen and display text" description="do not scroll, clean screen and display text" short="-p"
+        flag "--exit-on-eof" summary="exit on end-of-file" description="exit on end-of-file" short="-e"
+        flag "--help" summary="display this help" description="display this help" short="-h"
+        flag "--lines" summary="the number of lines per screenful" description="the number of lines per screenful" short="-n" value="value"
+        flag "--logical" summary="count logical rather than screen lines" description="count logical rather than screen lines" short="-f"
+        flag "--no-pause" summary="suppress pause after form feed" description="suppress pause after form feed" short="-l"
+        flag "--plain" summary="suppress underlining and bold" description="suppress underlining and bold" short="-u"
+        flag "--print-over" summary="do not scroll, display text and clean line ends" description="do not scroll, display text and clean line ends" short="-c"
+        flag "--silent" summary="display help instead of ringing bell" description="display help instead of ringing bell" short="-d"
+        flag "--squeeze" summary="squeeze multiple blank lines into one" description="squeeze multiple blank lines into one" short="-s"
+        flag "--version" summary="display version" description="display version" short="-V"
+    }
+}

@@ -1,0 +1,26 @@
+catalog "htop-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "htop" summary="interactive process viewer" description="interactive process viewer" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--delay" summary="Set the delay between updates, in tenths of seconds" description="Set the delay between updates, in tenths of seconds" short="-d" value="value"
+        flag "--drop-capabilities" summary="Drop Linux capabilities when running as root" description="Drop Linux capabilities when running as root" value="value"
+        flag "--filter" summary="Show only the commands matching the given filter" description="Show only the commands matching the given filter" short="-F" value="value"
+        flag "--help" summary="Print this help screen" description="Print this help screen" short="-h"
+        flag "--highlight-changes" summary="Highlight new and old processes" description="Highlight new and old processes" short="-H" value="value"
+        flag "--max-iterations" summary="Exit htop after NUMBER iterations/frame updates" description="Exit htop after NUMBER iterations/frame updates" short="-n" value="value"
+        flag "--no-color" summary="Use a monochrome color scheme" description="Use a monochrome color scheme" short="-C"
+        flag "--no-function-bar" summary="Hide the function bar" description="Hide the function bar"
+        flag "--no-meters" summary="Hide meters" description="Hide meters"
+        flag "--no-mouse" summary="Disable the mouse" description="Disable the mouse" short="-M"
+        flag "--no-unicode" summary="Do not use unicode but plain ASCII" description="Do not use unicode but plain ASCII" short="-U"
+        flag "--pid" summary="Show only the given PIDs" description="Show only the given PIDs" short="-p" value="value"
+        flag "--readonly" summary="Disable all system and process changing feature" description="Disable all system and process changing feature"
+        flag "--sort-key" summary="Sort by COLUMN (try --sort-key=help for a list)" description="Sort by COLUMN (try --sort-key=help for a list)" short="-s" value="value"
+        flag "--tree" summary="Show the tree view by default" description="Show the tree view by default" short="-t"
+        flag "--user" summary="Show only processes for a given user (or $USER)" description="Show only processes for a given user (or $USER)" short="-u" value="value" action="users"
+        flag "--version" summary="Print version info" description="Print version info" short="-v"
+    }
+}

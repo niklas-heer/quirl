@@ -1,0 +1,24 @@
+catalog "mv-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "mv" summary="move (rename) files" description="move (rename) files" {
+        platform "linux"
+        platform "freebsd"
+        flag "--backup" summary="make a backup of each existing destination file" description="make a backup of each existing destination file" value="value"
+        flag "--context" summary="set SELinux security context of destination file to default type" description="set SELinux security context of destination file to default type" short="-Z"
+        flag "--debug" summary="explain how a file is copied" description="explain how a file is copied"
+        flag "--exchange" summary="exchange source and destination" description="exchange source and destination" short="-x"
+        flag "--force" summary="do not prompt before overwriting" description="do not prompt before overwriting" short="-f"
+        flag "--help" summary="display this help and exit" description="display this help and exit"
+        flag "--interactive" summary="prompt before overwrite" description="prompt before overwrite" short="-i"
+        flag "--no-clobber" summary="do not overwrite an existing file" description="do not overwrite an existing file" short="-n"
+        flag "--no-copy" summary="do not copy file" description="do not copy file"
+        flag "--no-target-directory" summary="treat DEST as a normal file" description="treat DEST as a normal file" short="-T"
+        flag "--strip-trailing-slashes" summary="remove any trailing slashes from each SOURCE argument" description="remove any trailing slashes from each SOURCE argument"
+        flag "--suffix" summary="override the usual backup suffix" description="override the usual backup suffix" short="-S" value="value"
+        flag "--target-directory" summary="move all SOURCE arguments into DIRECTORY" description="move all SOURCE arguments into DIRECTORY" short="-t" value="value" action="directories"
+        flag "--update" summary="move only when the SOURCE file is newer than the destination file or when the destination file is missing" description="move only when the SOURCE file is newer than the destination file or when the destination file is missing" short="-u"
+        flag "--verbose" summary="explain what is being done" description="explain what is being done" short="-v"
+        flag "--version" summary="output version information and exit" description="output version information and exit"
+        flag "-b" summary="like --backup but does not accept an argument" description="like --backup but does not accept an argument"
+    }
+}

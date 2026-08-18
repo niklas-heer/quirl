@@ -1,0 +1,24 @@
+catalog "tesseract-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "tesseract" summary="command-line OCR engine" description="command-line OCR engine" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--dpi" summary="Specify the resolution N in DPI for the input image(s)." description="Specify the resolution N in DPI for the input image(s)." value="value"
+        flag "--help" summary="Show help message." description="Show help message." short="-h"
+        flag "--help-extra" summary="Show extra help for advanced users." description="Show extra help for advanced users."
+        flag "--help-oem" summary="Show OCR Engine modes." description="Show OCR Engine modes."
+        flag "--help-psm" summary="Show page segmentation modes." description="Show page segmentation modes."
+        flag "--list-langs" summary="List available languages for tesseract engine." description="List available languages for tesseract engine."
+        flag "--oem" summary="Specify OCR Engine mode." description="Specify OCR Engine mode." value="value"
+        flag "--print-parameters" summary="Print tesseract parameters." description="Print tesseract parameters."
+        flag "--psm" summary="Set Tesseract to only run a subset of layout analysis and assume a certain form of image." description="Set Tesseract to only run a subset of layout analysis and assume a certain form of image." value="value"
+        flag "--tessdata-dir" summary="Specify the location of tessdata path." description="Specify the location of tessdata path." value="value" action="directories"
+        flag "--user-patterns" summary="Specify the location of user patterns file." description="Specify the location of user patterns file." value="value" action="files"
+        flag "--user-words" summary="Specify the location of user words file." description="Specify the location of user words file." value="value" action="files"
+        flag "--version" summary="Returns the current version of the tesseract(1) executable." description="Returns the current version of the tesseract(1) executable." short="-v"
+        flag "-c" summary="Set value for parameter CONFIGVAR to VALUE." description="Set value for parameter CONFIGVAR to VALUE." value="value"
+        flag "-l" summary="The language or script to use." description="The language or script to use." value="value"
+    }
+}

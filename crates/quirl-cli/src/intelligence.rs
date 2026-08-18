@@ -8,6 +8,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
     env,
     io::Cursor,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -248,27 +249,7 @@ impl SearchSession {
             .map(str::to_lowercase)
             .take(64)
             .collect::<Vec<_>>();
-        let mut results = self
-            .documents
-            .iter()
-            .filter_map(|document| {
-                let haystack = document.body.to_lowercase();
-                let matched = query_terms
-                    .iter()
-                    .filter(|term| haystack.contains(term.as_str()))
-                    .count();
-                (matched > 0).then(|| SearchResult {
-                    command: document.command.clone(),
-                    target: document.target.clone(),
-                    kind: document.kind.clone(),
-                    summary: document.title.clone(),
-                    score: matched as f32 / query_terms.len().max(1) as f32,
-                    semantic: false,
-                })
-            })
-            .collect::<Vec<_>>();
-        sort_and_limit(&mut results, limit);
-        Ok(results)
+        Ok(rank_lexical_documents(&self.documents, &query_terms, limit))
     }
 }
 
@@ -826,28 +807,79 @@ fn lexical_search(
         .map(str::to_lowercase)
         .take(64)
         .collect();
-    let mut results = Vec::new();
-    for document in read_documents(connection, path)? {
+    Ok(rank_lexical_documents(
+        &read_documents(connection, path)?,
+        &query_terms,
+        limit,
+    ))
+}
+
+fn rank_lexical_documents(
+    documents: &[SemanticDocument],
+    query_terms: &[String],
+    limit: usize,
+) -> Vec<SearchResult> {
+    let query_phrase = query_terms.join(" ");
+    let mut document_matches = Vec::with_capacity(documents.len());
+    let mut phrase_matches = Vec::with_capacity(documents.len());
+    for document in documents {
         let haystack = document.body.to_lowercase();
         let matched = query_terms
             .iter()
-            .filter(|term| haystack.contains(term.as_str()))
-            .count();
-        if matched == 0 {
+            .enumerate()
+            .filter_map(|(index, term)| haystack.contains(term.as_str()).then_some(index))
+            .collect::<BTreeSet<_>>();
+        document_matches.push(matched);
+        phrase_matches.push(!query_phrase.is_empty() && haystack.contains(&query_phrase));
+    }
+
+    let mut command_matches = BTreeMap::<&str, BTreeSet<usize>>::new();
+    for (document, matched) in documents.iter().zip(&document_matches) {
+        if document.kind == "command" {
+            command_matches.insert(&document.command, matched.clone());
+        }
+    }
+    for (document, matched) in documents.iter().zip(&document_matches) {
+        if document.kind == "command" {
             continue;
         }
-        let denominator = query_terms.len().max(1) as f32;
-        results.push(SearchResult {
-            command: document.command,
-            target: document.target,
-            kind: document.kind,
-            summary: document.title,
-            score: matched as f32 / denominator,
-            semantic: false,
-        });
+        let base = command_matches
+            .get(document.command.as_str())
+            .cloned()
+            .unwrap_or_default();
+        let mut candidate = base;
+        candidate.extend(matched);
+        let aggregate = command_matches.entry(&document.command).or_default();
+        if candidate.len() > aggregate.len() {
+            *aggregate = candidate;
+        }
     }
+
+    let denominator = query_terms.len().max(1) as f32;
+    let mut results = documents
+        .iter()
+        .zip(document_matches)
+        .zip(phrase_matches)
+        .filter_map(|((document, local_matches), phrase_match)| {
+            let matches = if document.kind == "command" {
+                command_matches
+                    .get(document.command.as_str())
+                    .map_or(0, BTreeSet::len)
+            } else {
+                local_matches.len()
+            };
+            (matches > 0).then(|| SearchResult {
+                command: document.command.clone(),
+                target: document.target.clone(),
+                kind: document.kind.clone(),
+                summary: document.title.clone(),
+                score: matches as f32 / denominator + if phrase_match { 1.0 } else { 0.0 },
+                semantic: false,
+            })
+        })
+        .collect::<Vec<_>>();
     sort_and_limit(&mut results, limit);
-    Ok(results)
+    results
 }
 
 fn read_embeddings(

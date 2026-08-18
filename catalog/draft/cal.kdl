@@ -1,0 +1,26 @@
+catalog "cal-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "cal" summary="display a calendar" description="display a calendar" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--color" summary="colorize messages" description="colorize messages" value="value"
+        flag "--columns" summary="amount of columns to use" description="amount of columns to use" short="-c" value="value"
+        flag "--help" summary="display this help" description="display this help" short="-h"
+        flag "--iso" summary="alias for --reform=iso" description="alias for --reform=iso"
+        flag "--julian" summary="use day-of-year for all calendars" description="use day-of-year for all calendars" short="-j"
+        flag "--monday" summary="Monday as first day of week" description="Monday as first day of week" short="-m"
+        flag "--months" summary="show num months starting with date's month" description="show num months starting with date's month" short="-n" value="value"
+        flag "--one" summary="show only a single month (default)" description="show only a single month (default)" short="-1"
+        flag "--reform" summary="Gregorian reform date" description="Gregorian reform date" value="value"
+        flag "--span" summary="span the date when displaying multiple months" description="span the date when displaying multiple months" short="-S"
+        flag "--sunday" summary="Sunday as first day of week" description="Sunday as first day of week" short="-s"
+        flag "--three" summary="show three months spanning the date" description="show three months spanning the date" short="-3"
+        flag "--twelve" summary="show the next twelve months" description="show the next twelve months" short="-Y"
+        flag "--version" summary="display version" description="display version" short="-V"
+        flag "--vertical" summary="show day vertically instead of line" description="show day vertically instead of line" short="-v"
+        flag "--week" summary="show US or ISO-8601 week numbers" description="show US or ISO-8601 week numbers" short="-w" value="value"
+        flag "--year" summary="show the whole year" description="show the whole year" short="-y"
+    }
+}

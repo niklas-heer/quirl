@@ -1,0 +1,22 @@
+catalog "age" {
+    provenance author="Carapace contributors; curated by Quirl contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "age" summary="Encrypt and decrypt files" description="Encrypts files to recipients or decrypts age-encrypted input using one or more identities." {
+        intent "decrypt a file"
+        intent "encrypt a file"
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--armor" summary="Encrypt to a PEM encoded format." description="Encrypt to a PEM encoded format." short="-a"
+        flag "--decrypt" summary="Decrypt the input to the output." description="Decrypt the input to the output." short="-d"
+        flag "--encrypt" summary="Encrypt the input to the output. Default if omitted." description="Encrypt the input to the output. Default if omitted." short="-e"
+        flag "--identity" summary="Use the identity file at PATH. Can be repeated." description="Use the identity file at PATH. Can be repeated." short="-i" value="value" repeatable=#true
+        flag "--output" summary="Write the result to the file at path OUTPUT." description="Write the result to the file at path OUTPUT." short="-o" value="value" action="files"
+        flag "--passphrase" summary="Encrypt with a passphrase." description="Encrypt with a passphrase." short="-p"
+        flag "--plugin" summary="Use the data-less plugin with name NAME. Can be repeated." description="Use the data-less plugin with name NAME. Can be repeated." short="-j" value="value" repeatable=#true
+        flag "--recipient" summary="Encrypt to the specified RECIPIENT. Can be repeated." description="Encrypt to the specified RECIPIENT. Can be repeated." short="-r" value="value" repeatable=#true
+        flag "--recipients-file" summary="Encrypt to recipients listed at PATH. Can be repeated." description="Encrypt to recipients listed at PATH. Can be repeated." short="-R" value="value" repeatable=#true
+        flag "--version" summary="Print the version." description="Print the version."
+        argument "input" summary="Input file" description="File to encrypt or decrypt; omit it to read standard input." action="files"
+    }
+}

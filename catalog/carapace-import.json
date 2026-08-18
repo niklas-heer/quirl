@@ -5,6 +5,11 @@
   "license_file": "LICENSE",
   "license_sha256": "25dbdc5c4265ee2983e2b2cd0b5073df0a24aecc0de14a49d01ec9c702f7f22c",
   "author": "Carapace contributors",
+  "coverage": {
+    "root_commands_min": 90,
+    "command_paths_min": 96,
+    "flags_min": 3400
+  },
   "roots": [
     {
       "variable": "rootCmd",
@@ -84,6 +89,181 @@
     {
       "variable": "rootCmd",
       "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/age_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/aria2c_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/bc_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/brotli_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/cal_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/code_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/delta_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/diff_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/dig_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "freebsd"],
+      "files": ["completers/common/doas_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/dos2unix_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/exa_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/eza_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/ffmpeg_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/fzf_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/gdb_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/gdu_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/gzip_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/jq_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/just_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/make_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "freebsd"],
+      "files": ["completers/common/man_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/micro_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "freebsd"],
+      "files": ["completers/common/nano_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "freebsd"],
+      "files": ["completers/common/nc_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/procs_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/python_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/rg_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "freebsd"],
+      "files": ["completers/common/rsync_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/tree_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/unzip_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "freebsd"],
+      "files": ["completers/common/vi_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/vim_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/wget_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/zip_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
       "files": [
         "completers/common/task_completer/cmd/completion.go",
         "completers/common/task_completer/cmd/completion_bash.go",
@@ -92,6 +272,52 @@
         "completers/common/task_completer/cmd/completion_zsh.go",
         "completers/common/task_completer/cmd/help.go",
         "completers/common/task_completer/cmd/root.go"
+      ]
+    }
+  ],
+  "flat_roots": [
+    {
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": [
+        "completers/common/autoconf_completer/cmd/root.go",
+        "completers/common/black_completer/cmd/root.go",
+        "completers/common/diff3_completer/cmd/root.go",
+        "completers/common/ftp_completer/cmd/root.go",
+        "completers/common/gofmt_completer/cmd/root.go",
+        "completers/common/gpg_completer/cmd/root.go",
+        "completers/common/gunzip_completer/cmd/root.go",
+        "completers/common/helix_completer/cmd/root.go",
+        "completers/common/hexdump_completer/cmd/root.go",
+        "completers/common/hostname_completer/cmd/root.go",
+        "completers/common/htop_completer/cmd/root.go",
+        "completers/common/hyperfine_completer/cmd/root.go",
+        "completers/common/java_completer/cmd/root.go",
+        "completers/common/javac_completer/cmd/root.go",
+        "completers/common/lazygit_completer/cmd/root.go",
+        "completers/common/lua_completer/cmd/root.go",
+        "completers/common/lzma_completer/cmd/root.go",
+        "completers/common/more_completer/cmd/root.go",
+        "completers/common/ncdu_completer/cmd/root.go",
+        "completers/common/node_completer/cmd/root.go",
+        "completers/common/nvim_completer/cmd/root.go",
+        "completers/common/pandoc_completer/cmd/root.go",
+        "completers/common/php_completer/cmd/root.go",
+        "completers/common/pigz_completer/cmd/root.go",
+        "completers/common/ping_completer/cmd/root.go",
+        "completers/common/pytest_completer/cmd/root.go",
+        "completers/common/redis-cli_completer/cmd/root.go",
+        "completers/common/rustc_completer/cmd/root.go",
+        "completers/common/scp_completer/cmd/root.go",
+        "completers/common/sftp_completer/cmd/root.go",
+        "completers/common/sqlite3_completer/cmd/root.go",
+        "completers/common/strings_completer/cmd/root.go",
+        "completers/common/telnet_completer/cmd/root.go",
+        "completers/common/tesseract_completer/cmd/root.go",
+        "completers/common/tinygo_completer/cmd/root.go",
+        "completers/common/watch_completer/cmd/root.go",
+        "completers/common/watchexec_completer/cmd/root.go",
+        "completers/common/xz_completer/cmd/root.go",
+        "completers/common/xzcat_completer/cmd/root.go"
       ]
     }
   ]

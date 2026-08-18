@@ -1,0 +1,16 @@
+catalog "gofmt-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "gofmt" summary="format Go source code" description="format Go source code" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--cpuprofile" summary="write cpu profile to this file" description="write cpu profile to this file" value="value" action="files"
+        flag "-d" summary="display diffs instead of rewriting files" description="display diffs instead of rewriting files"
+        flag "-e" summary="report all errors (not just the first 10 on different lines)" description="report all errors (not just the first 10 on different lines)"
+        flag "-l" summary="list files whose formatting differs from gofmt's" description="list files whose formatting differs from gofmt's"
+        flag "-r" summary="rewrite rule" description="rewrite rule" value="value"
+        flag "-s" summary="simplify code" description="simplify code"
+        flag "-w" summary="write result to (source) file instead of stdout" description="write result to (source) file instead of stdout"
+    }
+}

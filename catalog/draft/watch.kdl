@@ -1,0 +1,26 @@
+catalog "watch-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "watch" summary="execute a program periodically, showing output fullscreen" description="execute a program periodically, showing output fullscreen" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--beep" summary="beep if command has a non-zero exit" description="beep if command has a non-zero exit" short="-b"
+        flag "--chgexit" summary="exit when output from command changes" description="exit when output from command changes" short="-g"
+        flag "--color" summary="interpret ANSI color and style sequences" description="interpret ANSI color and style sequences" short="-c"
+        flag "--differences" summary="highlight changes between updates" description="highlight changes between updates" short="-d" value="value"
+        flag "--equexit" summary="exit when output from command does not change" description="exit when output from command does not change" short="-q" value="value"
+        flag "--errexit" summary="exit if command has a non-zero exit" description="exit if command has a non-zero exit" short="-e"
+        flag "--exec" summary="pass command to exec instead of \"sh -c\"" description="pass command to exec instead of \"sh -c\"" short="-x"
+        flag "--follow" summary="follow the output and don't clear screen" description="follow the output and don't clear screen" short="-f"
+        flag "--help" summary="display this help and exit" description="display this help and exit" short="-h"
+        flag "--interval" summary="seconds to wait between updates" description="seconds to wait between updates" short="-n" value="value"
+        flag "--no-color" summary="do not interpret ANSI color and style sequences" description="do not interpret ANSI color and style sequences" short="-C"
+        flag "--no-rerun" summary="do not rerun program on window resize" description="do not rerun program on window resize" short="-r"
+        flag "--no-title" summary="turn off header" description="turn off header" short="-t"
+        flag "--no-wrap" summary="turn off line wrapping" description="turn off line wrapping" short="-w"
+        flag "--precise" summary="attempt run command in precise intervals" description="attempt run command in precise intervals" short="-p"
+        flag "--shotsdir" summary="directory to store screenshots" description="directory to store screenshots" short="-s"
+        flag "--version" summary="output version information and exit" description="output version information and exit" short="-v"
+    }
+}

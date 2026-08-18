@@ -1,0 +1,8 @@
+catalog "nc-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "nc" summary="simple Unix utility which reads and writes data across network connections" description="simple Unix utility which reads and writes data across network connections" {
+        platform "linux"
+        platform "macos"
+        platform "freebsd"
+    }
+}

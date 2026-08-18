@@ -1,0 +1,32 @@
+catalog "scp-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "scp" summary="OpenSSH secure file copy" description="OpenSSH secure file copy" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "-3" summary="Copies between two remote hosts are transferred through the local host" description="Copies between two remote hosts are transferred through the local host"
+        flag "-4" summary="Forces scp to use IPv4 addresses only" description="Forces scp to use IPv4 addresses only"
+        flag "-6" summary="Forces scp to use IPv6 addresses only" description="Forces scp to use IPv6 addresses only"
+        flag "-A" summary="Allows forwarding of ssh-agent to the remote system" description="Allows forwarding of ssh-agent to the remote system"
+        flag "-B" summary="Selects batch mode" description="Selects batch mode"
+        flag "-C" summary="Compression enable" description="Compression enable"
+        flag "-D" summary="Connect directly to a local SFTP server program" description="Connect directly to a local SFTP server program" value="value" action="files"
+        flag "-F" summary="Specifies an alternative per-user configuration file for ssh" description="Specifies an alternative per-user configuration file for ssh" value="value" action="files"
+        flag "-J" summary="Connect to the target host by first making an scp connection to the jump host" description="Connect to the target host by first making an scp connection to the jump host" value="value" action="hostnames"
+        flag "-O" summary="Use the legacy SCP protocol for file transfers instead of the SFTP protocol" description="Use the legacy SCP protocol for file transfers instead of the SFTP protocol"
+        flag "-P" summary="Specifies the port to connect to on the remote host" description="Specifies the port to connect to on the remote host" value="value"
+        flag "-R" summary="Copies between two remote hosts are performed by connecting to the origin host and executing scp there" description="Copies between two remote hosts are performed by connecting to the origin host and executing scp there"
+        flag "-S" summary="Name of program to use for the encrypted connection" description="Name of program to use for the encrypted connection" value="value" action="files"
+        flag "-T" summary="Disable strict filename checking" description="Disable strict filename checking"
+        flag "-X" summary="Specify an option that controls aspects of SFTP protocol behaviour" description="Specify an option that controls aspects of SFTP protocol behaviour" value="value" repeatable=#true
+        flag "-c" summary="Selects the cipher to use for encrypting the data transfer" description="Selects the cipher to use for encrypting the data transfer" value="value"
+        flag "-i" summary="Selects the file from which the identity for public key authentication is read" description="Selects the file from which the identity for public key authentication is read" value="value"
+        flag "-l" summary="Limits the used bandwidth, specified in Kbit/s" description="Limits the used bandwidth, specified in Kbit/s" value="value"
+        flag "-o" summary="Can be used to pass options to ssh in the format used in ssh_config" description="Can be used to pass options to ssh in the format used in ssh_config" value="value" repeatable=#true
+        flag "-p" summary="Preserves modification times, access times, and file mode bits from the source file" description="Preserves modification times, access times, and file mode bits from the source file"
+        flag "-q" summary="Quiet mode" description="Quiet mode"
+        flag "-r" summary="Recursively copy entire directories" description="Recursively copy entire directories"
+        flag "-v" summary="Verbose mode" description="Verbose mode"
+    }
+}

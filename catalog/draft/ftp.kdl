@@ -1,0 +1,25 @@
+catalog "ftp-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "ftp" summary="File Transfer Protocol client" description="File Transfer Protocol client" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--active" summary="enable active mode transfer" description="enable active mode transfer" short="-A"
+        flag "--debug" summary="enable debugging output" description="enable debugging output" short="-d"
+        flag "--help" summary="give this help list" description="give this help list"
+        flag "--ipv4" summary="contact IPv4 hosts" description="contact IPv4 hosts" short="-4"
+        flag "--ipv6" summary="contact IPv6 hosts" description="contact IPv6 hosts" short="-6"
+        flag "--netrc" summary="select a specific initialization file" description="select a specific initialization file" short="-N" value="value" action="files"
+        flag "--no-edit" summary="disable command line editing" description="disable command line editing" short="-e"
+        flag "--no-glob" summary="turn off file name globbing" description="turn off file name globbing" short="-g"
+        flag "--no-login" summary="do not automatically login to the remote system" description="do not automatically login to the remote system" short="-n"
+        flag "--no-prompt" summary="do not prompt during multiple file transfers" description="do not prompt during multiple file transfers" short="-i"
+        flag "--passive" summary="enable passive mode transfer, default for `pftp'" description="enable passive mode transfer, default for `pftp'" short="-p"
+        flag "--prompt" summary="print a command line PROMPT (optionally), even if not on a tty" description="print a command line PROMPT (optionally), even if not on a tty" value="value"
+        flag "--trace" summary="enable packet tracing" description="enable packet tracing" short="-t"
+        flag "--usage" summary="give a short usage message" description="give a short usage message"
+        flag "--verbose" summary="verbose output" description="verbose output" short="-v"
+        flag "--version" summary="print program version" description="print program version" short="-V"
+    }
+}

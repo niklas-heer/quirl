@@ -1,0 +1,24 @@
+catalog "dig-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "dig" summary="DNS lookup utility" description="DNS lookup utility" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "-4" summary="This option indicates that only IPv4 should be used." description="This option indicates that only IPv4 should be used."
+        flag "-6" summary="This option indicates that only IPv6 should be used." description="This option indicates that only IPv6 should be used."
+        flag "-b" summary="This option sets the source IP address of the query." description="This option sets the source IP address of the query." value="value"
+        flag "-c" summary="This  option  sets the query class." description="This  option  sets the query class." value="value"
+        flag "-f" summary="This option sets batch mode." description="This option sets batch mode." value="value" action="files"
+        flag "-k" summary="This option tells named to sign queries using TSIG using a key read  from  the  given file." description="This option tells named to sign queries using TSIG using a key read  from  the  given file." value="value" action="files"
+        flag "-m" summary="This option enables memory usage debugging." description="This option enables memory usage debugging."
+        flag "-p" summary="This option sends the query to a non-standard port on the server." description="This option sends the query to a non-standard port on the server." value="value"
+        flag "-q" summary="This option specifies the domain name to query." description="This option specifies the domain name to query." value="value"
+        flag "-r" summary="This  option  indicates  that options from ${HOME}/.digrc should not be read." description="This  option  indicates  that options from ${HOME}/.digrc should not be read."
+        flag "-t" summary="This option indicates the resource record type to query." description="This option indicates the resource record type to query." value="value"
+        flag "-u" summary="This option indicates that print query times should be provided in  microseconds  instead of milliseconds." description="This option indicates that print query times should be provided in  microseconds  instead of milliseconds."
+        flag "-v" summary="This option prints the version number and exits." description="This option prints the version number and exits."
+        flag "-x" summary="This option sets simplified reverse lookups, for mapping addresses to names." description="This option sets simplified reverse lookups, for mapping addresses to names." value="value"
+        flag "-y" summary="This option signs queries using TSIG with the given authentication key." description="This option signs queries using TSIG with the given authentication key." value="value"
+    }
+}

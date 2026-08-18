@@ -24,7 +24,7 @@ use std::{
 /// SQLite application identity for native Quirl command catalogs (`QCNC`).
 pub const NATIVE_DATABASE_APPLICATION_ID: i64 = 0x5143_4e43;
 /// Current SQLite schema version for native Quirl command catalogs.
-pub const NATIVE_DATABASE_SCHEMA_VERSION: i64 = 1;
+pub const NATIVE_DATABASE_SCHEMA_VERSION: i64 = 2;
 
 const SOURCE_BYTES_HARD_MAX: usize = 4 * 1024 * 1024;
 const DATABASE_BYTES_HARD_MAX: usize = 128 * 1024 * 1024;
@@ -87,7 +87,7 @@ CREATE TABLE command_intents (
 CREATE TABLE flags (
     flag_id INTEGER PRIMARY KEY NOT NULL,
     command_id INTEGER NOT NULL,
-    long_name TEXT NOT NULL,
+    name TEXT NOT NULL,
     short_name TEXT,
     summary TEXT NOT NULL,
     description TEXT NOT NULL,
@@ -95,10 +95,10 @@ CREATE TABLE flags (
     required INTEGER NOT NULL CHECK (required IN (0, 1)),
     repeatable INTEGER NOT NULL CHECK (repeatable IN (0, 1)),
     action TEXT,
-    UNIQUE (command_id, long_name),
+    UNIQUE (command_id, name),
     UNIQUE (command_id, short_name)
 );
-CREATE INDEX flags_command_name ON flags(command_id, long_name, flag_id);
+CREATE INDEX flags_command_name ON flags(command_id, name, flag_id);
 CREATE TABLE arguments (
     argument_id INTEGER PRIMARY KEY NOT NULL,
     command_id INTEGER NOT NULL,
@@ -385,9 +385,9 @@ pub struct NativeArgument {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NativeFlag {
-    /// Canonical long name beginning with `--`.
-    pub long: String,
-    /// Optional single-character short name beginning with `-`.
+    /// Canonical spelling beginning with `--`, a short-only `-x`, or a Windows `/x`.
+    pub name: String,
+    /// Optional single-character short alias for a canonical long spelling.
     pub short: Option<String>,
     /// Short completion-facing description.
     pub summary: String,
@@ -894,13 +894,13 @@ fn parse_flag(
     ];
     validate_entries(node, 1, PROPERTIES, source_name)?;
     reject_children(node, source_name)?;
-    let long = required_argument_string(node, 0, "flag name", source_name, limits)?;
-    if !valid_long_flag(&long) {
+    let name = required_argument_string(node, 0, "flag name", source_name, limits)?;
+    if !valid_flag_name(&name) {
         return Err(node_diagnostic(
             node,
             source_name,
-            format!("invalid long flag `{long}`"),
-            "Use a lowercase long name such as --output-file",
+            format!("invalid flag `{name}`"),
+            "Use a lowercase long name such as --output-file, a short-only name such as -P, or a Windows name such as /q",
         ));
     }
     let short = optional_property_string(node, "short", source_name, limits)?;
@@ -913,6 +913,14 @@ fn parse_flag(
             source_name,
             "short flag must be `-` followed by one ASCII letter or digit",
             "Use a short name such as -o or remove the short property",
+        ));
+    }
+    if short.is_some() && valid_short_flag(&name) {
+        return Err(node_diagnostic(
+            node,
+            source_name,
+            "a short-only flag cannot declare another short alias",
+            "Remove the short property or use the long spelling as the canonical flag name",
         ));
     }
     let summary = required_property_string(node, "summary", source_name, limits)?;
@@ -933,7 +941,7 @@ fn parse_flag(
         ));
     }
     Ok(NativeFlag {
-        long,
+        name,
         short,
         summary,
         description,
@@ -1271,7 +1279,7 @@ fn validate_flag_set(
 ) -> Result<(), NativeCatalogDiagnostic> {
     let mut names = BTreeSet::new();
     for flag in flags.iter() {
-        for name in std::iter::once(&flag.long).chain(flag.short.iter()) {
+        for name in std::iter::once(&flag.name).chain(flag.short.iter()) {
             if !names.insert(name) {
                 return Err(node_diagnostic(
                     node,
@@ -1282,7 +1290,7 @@ fn validate_flag_set(
             }
         }
     }
-    flags.sort_by(|left, right| left.long.cmp(&right.long));
+    flags.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(())
 }
 
@@ -1419,6 +1427,20 @@ fn valid_long_flag(value: &str) -> bool {
 fn valid_short_flag(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 2 && bytes[0] == b'-' && bytes[1].is_ascii_alphanumeric()
+}
+
+fn valid_flag_name(value: &str) -> bool {
+    valid_long_flag(value) || valid_short_flag(value) || valid_windows_flag(value)
+}
+
+fn valid_windows_flag(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphanumeric()
+        && bytes[2..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
 fn valid_source_url(value: &str) -> bool {
@@ -1815,11 +1837,11 @@ fn insert_catalog(
         for flag in &flat.command.flags {
             transaction
                 .execute(
-                    "INSERT INTO flags(flag_id, command_id, long_name, short_name, summary, description, value_name, required, repeatable, action) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO flags(flag_id, command_id, name, short_name, summary, description, value_name, required, repeatable, action) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         next_flag_id,
                         command_id,
-                        flag.long,
+                        flag.name,
                         flag.short,
                         flag.summary,
                         flag.description,
@@ -1831,8 +1853,8 @@ fn insert_catalog(
                 )
                 .map_err(|error| database_diagnostic("<native catalog>", "insert flag", error))?;
             let title = flag.short.as_ref().map_or_else(
-                || flag.long.clone(),
-                |short| format!("{} {short}", flag.long),
+                || flag.name.clone(),
+                |short| format!("{} {short}", flag.name),
             );
             let body = format!(
                 "{} {} {} {} {}",
@@ -1847,7 +1869,7 @@ fn insert_catalog(
                 next_document_id,
                 "flag",
                 command_id,
-                &flag.long,
+                &flag.name,
                 &title,
                 &body,
             )?;
@@ -2158,20 +2180,31 @@ fn validate_typed_flags(
 ) -> Result<(), NativeCatalogDiagnostic> {
     let mut names = BTreeSet::new();
     for flag in flags {
-        if !valid_long_flag(&flag.long) {
+        if !valid_flag_name(&flag.name) {
             return Err(validation_diagnostic(
                 "<native catalog>",
                 None,
-                format!("invalid long flag `{}`", flag.long),
-                "Use a lowercase long name such as --output-file",
+                format!("invalid flag `{}`", flag.name),
+                "Use a lowercase long name such as --output-file, a short-only name such as -P, or a Windows name such as /q",
             ));
         }
-        if !names.insert(&flag.long) {
+        if !names.insert(&flag.name) {
             return Err(validation_diagnostic(
                 "<native catalog>",
                 None,
-                format!("duplicate flag `{}`", flag.long),
+                format!("duplicate flag `{}`", flag.name),
                 "Use each flag name at most once per command",
+            ));
+        }
+        if flag.short.is_some() && valid_short_flag(&flag.name) {
+            return Err(validation_diagnostic(
+                "<native catalog>",
+                None,
+                format!(
+                    "short-only flag `{}` declares another short alias",
+                    flag.name
+                ),
+                "Remove the short alias or use a long canonical spelling",
             ));
         }
         if let Some(short) = &flag.short
@@ -2193,7 +2226,7 @@ fn validate_typed_flags(
             return Err(validation_diagnostic(
                 "<native catalog>",
                 None,
-                format!("boolean flag `{}` declares a completion action", flag.long),
+                format!("boolean flag `{}` declares a completion action", flag.name),
                 "Add a value placeholder or remove the action",
             ));
         }
@@ -2425,7 +2458,7 @@ impl NativeCatalogReader {
             .prepare(
                 "SELECT n.token, f.summary, f.description, f.action
                  FROM (
-                    SELECT flag_id, long_name AS token FROM flags
+                    SELECT flag_id, name AS token FROM flags
                     UNION ALL
                     SELECT flag_id, short_name AS token FROM flags WHERE short_name IS NOT NULL
                  ) n
@@ -2699,7 +2732,7 @@ fn native_arguments(command: &NativeCommand, provenance: &ProvenanceInfo) -> Vec
                 .short
                 .iter()
                 .cloned()
-                .chain(std::iter::once(flag.long.clone()))
+                .chain(std::iter::once(flag.name.clone()))
                 .collect(),
             kind: if flag.value_name.is_some() {
                 ArgumentKind::Option
@@ -3189,6 +3222,7 @@ catalog "native-tools" {
         intent "work with source history"
         platform "linux"
         platform "macos"
+        flag "-C" summary="Select a working directory" description="Run as if started in this directory." value="directory" action="directories"
         flag "--verbose" short="-v" summary="Show detail" description="Print additional operation detail."
         argument "repository" summary="Repository directory" description="Select the repository to inspect." required=#true action="directories"
         command "commit" summary="Record changes" description="Create a new commit from staged changes." {
@@ -3200,7 +3234,7 @@ catalog "native-tools" {
     }
     command "winutil" summary="Inspect Windows" description="Inspect platform-specific Windows state." {
         platform "windows"
-        flag "--users" summary="List users" description="List bounded local user names."
+        flag "/users" summary="List users" description="List bounded local user names."
     }
 }
 "#;
@@ -3224,6 +3258,9 @@ catalog "native-tools" {
             vec![NativePlatform::Macos]
         );
         assert_eq!(catalog.commands[1].name, "winutil");
+        assert_eq!(catalog.commands[0].flags[0].name, "--verbose");
+        assert_eq!(catalog.commands[0].flags[1].name, "-C");
+        assert_eq!(catalog.commands[1].flags[0].name, "/users");
         assert_eq!(
             catalog.commands[0].arguments[0].action,
             Some(NativeCompletionAction::Directories)
@@ -3303,6 +3340,16 @@ catalog "native-tools" {
         )
         .unwrap_err();
         assert!(error.message.contains("boolean flag"));
+
+        let aliased_short_only =
+            FIXTURE.replace("flag \"-C\" summary=", "flag \"-C\" short=\"-c\" summary=");
+        let error = parse_native_catalog(
+            &aliased_short_only,
+            "short-only.kdl",
+            NativeCatalogLimits::default(),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("short-only flag"));
 
         let impossible_platform = FIXTURE.replace(
             "platform \"macos\"\n            flag \"--message\"",
@@ -3444,6 +3491,20 @@ catalog "native-tools" {
             .flags("git commit", NativePlatform::Macos, "--m", 10)
             .unwrap();
         assert_eq!(flags[0].value, "--message");
+        let short_only = reader
+            .flags("git", NativePlatform::Linux, "-C", 10)
+            .unwrap();
+        assert_eq!(short_only[0].value, "-C");
+        let windows_flag = reader
+            .flags("winutil", NativePlatform::Windows, "/", 10)
+            .unwrap();
+        assert_eq!(windows_flag[0].value, "/users");
+        assert!(
+            reader
+                .flags("winutil", NativePlatform::Linux, "/", 10)
+                .unwrap()
+                .is_empty()
+        );
         let arguments = reader
             .arguments("git", NativePlatform::Linux, "repo", 10)
             .unwrap();

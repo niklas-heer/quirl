@@ -1,0 +1,16 @@
+catalog "micro-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "micro" summary="A modern and intuitive terminal-based text editor" description="A modern and intuitive terminal-based text editor" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--clean" summary="Cleans the configuration directory" description="Cleans the configuration directory"
+        flag "--config-dir" summary="Specify a custom location for the configuration directory" description="Specify a custom location for the configuration directory" value="value" action="directories"
+        flag "--debug" summary="Enable debug mode" description="Enable debug mode"
+        flag "--options" summary="Show all option help" description="Show all option help"
+        flag "--plugin" summary="Manage plugins" description="Manage plugins" value="value"
+        flag "--profile" summary="Enable CPU profiling (writes profile info to ./micro.prof)" description="Enable CPU profiling (writes profile info to ./micro.prof)"
+        flag "--version" summary="Show the version number and information" description="Show the version number and information"
+    }
+}

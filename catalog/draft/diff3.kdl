@@ -1,0 +1,24 @@
+catalog "diff3-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "diff3" summary="compare three files line by line" description="compare three files line by line" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--diff-program" summary="use PROGRAM to compare files" description="use PROGRAM to compare files" value="value" action="files"
+        flag "--easy-only" summary="like -e, but incorporate only nonoverlapping changes" description="like -e, but incorporate only nonoverlapping changes" short="-3"
+        flag "--ed" summary="output ed script incorporating changes" description="output ed script incorporating changes" short="-e"
+        flag "--help" summary="display this help and exit" description="display this help and exit"
+        flag "--initial-tab" summary="make tabs line up by prepending a tab" description="make tabs line up by prepending a tab" short="-T"
+        flag "--label" summary="use LABEL instead of file name" description="use LABEL instead of file name" short="-L" value="value" repeatable=#true
+        flag "--merge" summary="output actual merged file" description="output actual merged file" short="-m"
+        flag "--overlap-only" summary="like -e, but incorporate only overlapping changes" description="like -e, but incorporate only overlapping changes" short="-x"
+        flag "--show-all" summary="output all changes, bracketing conflicts" description="output all changes, bracketing conflicts" short="-A"
+        flag "--show-overlap" summary="like -e, but bracket conflicts" description="like -e, but bracket conflicts" short="-E"
+        flag "--strip-trailing-cr" summary="strip trailing carriage return on input" description="strip trailing carriage return on input"
+        flag "--text" summary="treat all files as text" description="treat all files as text" short="-a"
+        flag "--version" summary="output version information and exit" description="output version information and exit" short="-v"
+        flag "-X" summary="like -x, but bracket conflicts" description="like -x, but bracket conflicts"
+        flag "-i" summary="append 'w' and 'q' commands to ed scripts" description="append 'w' and 'q' commands to ed scripts"
+    }
+}

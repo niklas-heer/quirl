@@ -1,9 +1,0 @@
-catalog "carapace-cd-draft" {
-    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
-    command "cd" summary="Change the shell working directory" description="Change the shell working directory" {
-        platform "linux"
-        platform "macos"
-        platform "freebsd"
-        flag "--e" summary="if the -P option is supplied, exit with a non-zero status if the current working directory cannot be determined successfully" description="if the -P option is supplied, exit with a non-zero status if the current working directory cannot be determined successfully" short="-e"
-    }
-}

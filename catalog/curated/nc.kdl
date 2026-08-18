@@ -1,0 +1,13 @@
+catalog "nc" {
+    provenance author="Carapace contributors; curated by Quirl contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "nc" summary="Read and write network connections" description="Connects, listens, scans ports, or relays byte streams over TCP or UDP." {
+        alias "netcat"
+        intent "connect to a network port"
+        intent "listen on a network port"
+        platform "linux"
+        platform "macos"
+        platform "freebsd"
+        argument "host" summary="Remote host" description="Host name or address to connect to; listening modes may omit it." action="hostnames"
+        argument "ports" summary="Port or port range" description="Network port numbers or service names." repeatable=#true
+    }
+}

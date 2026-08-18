@@ -5,6 +5,55 @@ description: "Generated documentation for every installed command in Quirl’s s
 
 {/* Generated from the compiled Quirl catalog. Run npm run sync:reference; do not edit this page by hand. */}
 
+## `age [--armor] [--decrypt] [--encrypt] [--identity <value>...] [--output <Path>] [--passphrase] [--plugin <value>...] [--recipient <value>...] [--recipients-file <value>...] [--version] [<input>]`
+
+Encrypt and decrypt files
+
+Encrypts files to recipients or decrypts age-encrypted input using one or more identities.
+
+Related intents: decrypt a file; encrypt a file.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--version` — Print the version.
+- `-R`, `--recipients-file` — Encrypt to recipients listed at PATH. Can be repeated.
+- `-a`, `--armor` — Encrypt to a PEM encoded format.
+- `-d`, `--decrypt` — Decrypt the input to the output.
+- `-e`, `--encrypt` — Encrypt the input to the output. Default if omitted.
+- `-i`, `--identity` — Use the identity file at PATH. Can be repeated.
+- `-j`, `--plugin` — Use the data-less plugin with name NAME. Can be repeated.
+- `-o`, `--output` — Write the result to the file at path OUTPUT.
+- `-p`, `--passphrase` — Encrypt with a passphrase.
+- `-r`, `--recipient` — Encrypt to the specified RECIPIENT. Can be repeated.
+- `input` — Input file File to encrypt or decrypt; omit it to read standard input.
+
+## `bc [--help] [--interactive] [--mathlib] [--quiet] [--standard] [--version] [--warn] [<files>...]`
+
+Evaluate arbitrary-precision calculations
+
+Reads and evaluates programs in the bc calculator language from files or standard input.
+
+Related intents: calculate an expression; run a bc program.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-h`, `--help` — print this usage and exit
+- `-i`, `--interactive` — force interactive mode
+- `-l`, `--mathlib` — use the predefined math routines
+- `-q`, `--quiet` — don't print initial banner
+- `-s`, `--standard` — non-standard bc constructs are errors
+- `-v`, `--version` — print version information and exit
+- `-w`, `--warn` — warn about non-standard bc constructs
+- `files` — Program files Files containing bc expressions and statements; standard input is read afterward.
+
 ## `bg [%job]`
 
 Resume a stopped job in the background
@@ -19,6 +68,51 @@ Options:
 
 - `%job` — Positional `%job` declared by the builtin command signature.
 
+## `brotli [--best] [--comment <value>] [--concatenated] [--decompress] [--dictionary <Path>] [--force] [--help] [--keep] [--lgwin <value>] [--no-copy-stat] [--output <Path>] [--quality <value>] [--rm] [--squash] [--stdout] [--suffix <value>] [--test] [--verbose] [--version] [-0] [-1] [-2] [-3] [-4] [-5] [-6] [-7] [-8] [-9] [<files>...]`
+
+Compress or decompress files with Brotli
+
+Compresses files into Brotli format or restores Brotli-compressed data.
+
+Related intents: compress a file; decompress a brotli file.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--concatenated` — allows concatenated brotli streams as input
+- `-0` — compression level
+- `-1` — compression level
+- `-2` — compression level
+- `-3` — compression level
+- `-4` — compression level
+- `-5` — compression level
+- `-6` — compression level
+- `-7` — compression level
+- `-8` — compression level
+- `-9` — compression level
+- `-C`, `--comment` — set comment; argument is base64-decoded first
+- `-D`, `--dictionary` — use FILE as raw (LZ77) dictionary
+- `-S`, `--suffix` — output file suffix (default:'.br')
+- `-V`, `--version` — display version and exit
+- `-Z`, `--best` — use best compression level (11) (default)
+- `-c`, `--stdout` — write on standard output
+- `-d`, `--decompress` — decompress
+- `-f`, `--force` — force output file overwrite
+- `-h`, `--help` — display this help and exit
+- `-j`, `--rm` — remove source file(s)
+- `-k`, `--keep` — keep source file(s) (default)
+- `-n`, `--no-copy-stat` — do not copy source file(s) attributes
+- `-o`, `--output` — output file (only if 1 input file)
+- `-q`, `--quality` — compression level (0-11)
+- `-s`, `--squash` — remove destination file if larger than source
+- `-t`, `--test` — test compressed file integrity
+- `-v`, `--verbose` — verbose mode
+- `-w`, `--lgwin` — set LZ77 window size
+- `files` — Input files Files to compress or decompress; omit them to use standard input.
+
 ## `cd [path]`
 
 Change the shell working directory
@@ -31,7 +125,286 @@ Changes Quirl's process directory so later commands and prompt context follow it
 
 Options:
 
+- `-L` — Follow symbolic links logically Resolve parent components after following symbolic links; this is the default.
+- `-P` — Use the physical directory structure Resolve symbolic links while changing directory.
+- `-e` — Fail when the physical directory cannot be determined With -P, return a nonzero status when the current working directory cannot be determined.
+- `directory` — Destination directory Directory to make current; omit it to select the shell's home directory.
 - `path` — Positional `path` declared by the builtin command signature.
+
+## `code [--add <Directory>] [--category <value>] [--diff] [--disable-extension <value>] [--disable-extensions] [--disable-gpu] [--enable-proposed-api <value>] [--extensions-dir <Directory>] [--goto <value>] [--help] [--inspect-brk-extensions <value>] [--inspect-extensions <value>] [--install-extension <value>] [--list-extensions] [--locale <value>] [--log <value>] [--max-memory <value>] [--new-window] [--prof-startup] [--reuse-window] [--show-versions] [--status] [--sync <value>] [--telemetry] [--uninstall-extension <value>] [--user-data-dir <Directory>] [--verbose] [--version] [--wait] [<paths>...]`
+
+Open Visual Studio Code
+
+Opens files, folders, workspaces, or editor-management operations in Visual Studio Code.
+
+Related intents: open a file in visual studio code; open a project in visual studio code.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--category` — Filters installed extensions by provided category, when using --list-extensions.
+- `--diff` — Compare two files with each other.
+- `--disable-extension` — Disable an extension.
+- `--disable-extensions` — Disable all installed extensions.
+- `--disable-gpu` — Disable GPU hardware acceleration.
+- `--enable-proposed-api` — Enables proposed API features for extensions.
+- `--extensions-dir` — Set the root path for extensions.
+- `--inspect-brk-extensions` — Allow debugging and profiling of extensions with the extension host being paused after start.
+- `--inspect-extensions` — Allow debugging and profiling of extensions.
+- `--install-extension` — Installs or updates the extension.
+- `--list-extensions` — List the installed extensions.
+- `--locale` — The locale to use (e.g. en-US or zh-TW).
+- `--log` — Log level to use.
+- `--max-memory` — Max memory size for a window (in Mbytes).
+- `--prof-startup` — Run CPU profiler during startup.
+- `--show-versions` — Show versions of installed extensions, when using --list-extensions.
+- `--sync` — Turn sync on or off.
+- `--telemetry` — Shows all telemetry events which VS code collects.
+- `--uninstall-extension` — Uninstalls an extension.
+- `--user-data-dir` — Specifies the directory that user data is kept in.
+- `--verbose` — Print verbose output (implies --wait).
+- `-a`, `--add` — Add folder(s) to the last active window.
+- `-g`, `--goto` — Open a file at the path on the specified line and character position.
+- `-h`, `--help` — Print usage.
+- `-n`, `--new-window` — Force to open a new window.
+- `-r`, `--reuse-window` — Force to open a file or folder in an already opened window.
+- `-s`, `--status` — Print process usage and diagnostics information.
+- `-v`, `--version` — Print version.
+- `-w`, `--wait` — Wait for the files to be closed before returning.
+- `paths` — Files or folders to open Filesystem paths to open in the editor.
+
+## `delta [--24-bit-color <value>] [--blame-code-style <value>] [--blame-format <value>] [--blame-palette <value>] [--blame-separator-format <value>] [--blame-separator-style <value>] [--blame-timestamp-format <value>] [--blame-timestamp-output-format <value>] [--color-only] [--commit-decoration-style <value>] [--commit-regex <value>] [--commit-style <value>] [--config <Path>] [--dark] [--default-language <value>] [--detect-dark-light <value>] [--diff-args <value>] [--diff-highlight] [--diff-so-fancy] [--diff-stat-align-width <value>] [--features <value>] [--file-added-label <value>] [--file-copied-label <value>] [--file-decoration-style <value>] [--file-modified-label <value>] [--file-removed-label <value>] [--file-renamed-label <value>] [--file-style <value>] [--file-transformation <value>] [--generate-completion <value>] [--grep-context-line-style <value>] [--grep-file-style <value>] [--grep-header-decoration-style <value>] [--grep-header-file-style <value>] [--grep-line-number-style <value>] [--grep-match-line-style <value>] [--grep-match-word-style <value>] [--grep-output-type <value>] [--grep-separator-symbol <value>] [--help] [--hunk-header-decoration-style <value>] [--hunk-header-file-style <value>] [--hunk-header-line-number-style <value>] [--hunk-header-style <value>] [--hunk-label <value>] [--hyperlinks] [--hyperlinks-commit-link-format <value>] [--hyperlinks-file-link-format <value>] [--inline-hint-style <value>] [--inspect-raw-lines <value>] [--keep-plus-minus-markers] [--light] [--line-buffer-size <value>] [--line-fill-method <value>] [--line-numbers] [--line-numbers-left-format <value>] [--line-numbers-left-style <value>] [--line-numbers-minus-style <value>] [--line-numbers-plus-style <value>] [--line-numbers-right-format <value>] [--line-numbers-right-style <value>] [--line-numbers-zero-style <value>] [--list-languages] [--list-syntax-themes] [--map-styles <value>] [--max-line-distance <value>] [--max-line-length <value>] [--max-syntax-highlighting-length <value>] [--merge-conflict-begin-symbol <value>] [--merge-conflict-end-symbol <value>] [--merge-conflict-ours-diff-header-decoration-style <value>] [--merge-conflict-ours-diff-header-style <value>] [--merge-conflict-theirs-diff-header-decoration-style <value>] [--merge-conflict-theirs-diff-header-style <value>] [--minus-emph-style <value>] [--minus-empty-line-marker-style <value>] [--minus-non-emph-style <value>] [--minus-style <value>] [--navigate] [--navigate-regex <value>] [--no-gitconfig] [--pager <value>] [--paging <value>] [--parse-ansi] [--plus-emph-style <value>] [--plus-empty-line-marker-style <value>] [--plus-non-emph-style <value>] [--plus-style <value>] [--raw] [--relative-paths] [--right-arrow <value>] [--show-colors] [--show-config] [--show-syntax-themes] [--show-themes] [--side-by-side] [--syntax-theme <value>] [--tabs <value>] [--true-color <value>] [--version] [--whitespace-error-style <value>] [--width <value>] [--word-diff-regex <value>] [--wrap-left-symbol <value>] [--wrap-max-lines <value>] [--wrap-right-percent <value>] [--wrap-right-prefix-symbol <value>] [--wrap-right-symbol <value>] [--zero-style <value>] [<files>...]`
+
+Render Git and diff output
+
+Reads diff data and renders syntax-highlighted, navigable output for terminals.
+
+Related intents: colorize git output; view a diff.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--24-bit-color` — Deprecated: use --true-color
+- `--blame-code-style` — Style string for the code section of a git blame line
+- `--blame-format` — Format string for git blame commit metadata
+- `--blame-palette` — Background colors used for git blame lines (space-separated string)
+- `--blame-separator-format` — Separator between the blame format and the code section of a git blame line
+- `--blame-separator-style` — Style string for the blame-separator-format
+- `--blame-timestamp-format` — Format of `git blame` timestamp in raw git output received by delta
+- `--blame-timestamp-output-format` — Format string for git blame timestamp output
+- `--color-only` — Do not alter the input structurally in any way
+- `--commit-decoration-style` — Style string for the commit hash decoration
+- `--commit-regex` — Regular expression used to identify the commit line when parsing git output
+- `--commit-style` — Style string for the commit hash line
+- `--config` — Load the config file at PATH instead of ~/.gitconfig
+- `--dark` — Use default colors appropriate for a dark terminal background
+- `--default-language` — Default language used for syntax highlighting
+- `--detect-dark-light` — Detect whether the terminal is dark or light by querying for its colors
+- `--diff-args` — Extra arguments to pass to `git diff` when using delta to diff two files
+- `--diff-highlight` — Emulate diff-highlight
+- `--diff-so-fancy` — Emulate diff-so-fancy
+- `--diff-stat-align-width` — Width allocated for file paths in a diff stat section
+- `--features` — Names of delta features to activate (space-separated)
+- `--file-added-label` — Text to display before an added file path
+- `--file-copied-label` — Text to display before a copied file path
+- `--file-decoration-style` — Style string for the file decoration
+- `--file-modified-label` — Text to display before a modified file path
+- `--file-removed-label` — Text to display before a removed file path
+- `--file-renamed-label` — Text to display before a renamed file path
+- `--file-style` — Style string for the file section
+- `--file-transformation` — Sed-style command transforming file paths for display
+- `--generate-completion` — Print completion file for the given shell
+- `--grep-context-line-style` — Style string for non-matching lines of grep output
+- `--grep-file-style` — Style string for file paths in grep output
+- `--grep-header-decoration-style` — Style string for the header decoration in grep output
+- `--grep-header-file-style` — Style string for the file path part of the header in grep output
+- `--grep-line-number-style` — Style string for line numbers in grep output
+- `--grep-match-line-style` — Style string for matching lines of grep output
+- `--grep-match-word-style` — Style string for the matching substrings within a matching line of grep output
+- `--grep-output-type` — Grep output format
+- `--grep-separator-symbol` — Separator symbol printed after the file path and line number in grep output
+- `--hunk-header-decoration-style` — Style string for the hunk-header decoration
+- `--hunk-header-file-style` — Style string for the file path part of the hunk-header
+- `--hunk-header-line-number-style` — Style string for the line number part of the hunk-header
+- `--hunk-header-style` — Style string for the hunk-header
+- `--hunk-label` — Text to display before a hunk header
+- `--hyperlinks` — Render commit hashes, file names, and line numbers as hyperlinks
+- `--hyperlinks-commit-link-format` — Format string for commit hyperlinks (requires --hyperlinks)
+- `--hyperlinks-file-link-format` — Format string for file hyperlinks (requires --hyperlinks)
+- `--inline-hint-style` — Style string for short inline hint text
+- `--inspect-raw-lines` — Kill-switch for --color-moved support
+- `--keep-plus-minus-markers` — Prefix added/removed lines with a +/- character, as git does
+- `--light` — Use default colors appropriate for a light terminal background
+- `--line-buffer-size` — Size of internal line buffer
+- `--line-fill-method` — Line-fill method in side-by-side mode
+- `--line-numbers-left-format` — Format string for the left column of line numbers
+- `--line-numbers-left-style` — Style string for the left column of line numbers
+- `--line-numbers-minus-style` — Style string for line numbers in the old (minus) version of the file
+- `--line-numbers-plus-style` — Style string for line numbers in the new (plus) version of the file
+- `--line-numbers-right-format` — Format string for the right column of line numbers
+- `--line-numbers-right-style` — Style string for the right column of line numbers
+- `--line-numbers-zero-style` — Style string for line numbers in unchanged (zero) lines
+- `--list-languages` — List supported languages and associated file extensions
+- `--list-syntax-themes` — List available syntax-highlighting color themes
+- `--map-styles` — Map styles encountered in raw input to desired output styles
+- `--max-line-distance` — Maximum line pair distance parameter in within-line diff algorithm
+- `--max-line-length` — Truncate lines longer than this
+- `--max-syntax-highlighting-length` — Stop syntax highlighting lines longer than this
+- `--merge-conflict-begin-symbol` — String marking the beginning of a merge conflict region
+- `--merge-conflict-end-symbol` — String marking the end of a merge conflict region
+- `--merge-conflict-ours-diff-header-decoration-style` — Style string for the decoration of the header above the 'ours' merge conflict diff
+- `--merge-conflict-ours-diff-header-style` — Style string for the header above the 'ours' branch merge conflict diff
+- `--merge-conflict-theirs-diff-header-decoration-style` — Style string for the decoration of the header above the 'theirs' merge conflict diff
+- `--merge-conflict-theirs-diff-header-style` — Style string for the header above the 'theirs' branch merge conflict diff
+- `--minus-emph-style` — Style string for emphasized sections of removed lines
+- `--minus-empty-line-marker-style` — Style string for removed empty line marker
+- `--minus-non-emph-style` — Style string for non-emphasized sections of removed lines that have an emphasized section
+- `--minus-style` — Style string for removed lines
+- `--navigate` — Activate diff navigation
+- `--navigate-regex` — Regular expression defining navigation stop points
+- `--no-gitconfig` — Do not read any settings from git config
+- `--pager` — Which pager to use
+- `--paging` — Whether to use a pager when displaying output
+- `--parse-ansi` — Display ANSI color escape sequences in human-readable form
+- `--plus-emph-style` — Style string for emphasized sections of added lines
+- `--plus-empty-line-marker-style` — Style string for added empty line marker
+- `--plus-non-emph-style` — Style string for non-emphasized sections of added lines that have an emphasized section
+- `--plus-style` — Style string for added lines
+- `--raw` — Do not alter the input in any way
+- `--relative-paths` — Output all file paths relative to the current directory
+- `--right-arrow` — Text to display with a changed file path
+- `--show-colors` — Show available named colors
+- `--show-config` — Display the active values for all Delta options
+- `--show-syntax-themes` — Show example diff for available syntax-highlighting themes
+- `--show-themes` — Show example diff for available delta themes
+- `--syntax-theme` — The syntax-highlighting theme to use
+- `--tabs` — The number of spaces to replace tab characters with
+- `--true-color` — Whether to emit 24-bit ("true color") RGB color codes
+- `--whitespace-error-style` — Style string for whitespace errors
+- `--word-diff-regex` — Regular expression defining a 'word' in within-line diff algorithm
+- `--wrap-left-symbol` — End-of-line wrapped content symbol (left-aligned)
+- `--wrap-max-lines` — How often a line should be wrapped if it does not fit
+- `--wrap-right-percent` — Threshold for right-aligning wrapped content
+- `--wrap-right-prefix-symbol` — Pre-wrapped content symbol (right-aligned)
+- `--wrap-right-symbol` — End-of-line wrapped content symbol (right-aligned)
+- `--zero-style` — Style string for unchanged lines
+- `-V`, `--version` — Print version information
+- `-h`, `--help` — Print help information
+- `-n`, `--line-numbers` — Display line numbers next to the diff
+- `-s`, `--side-by-side` — Display diffs in side-by-side layout
+- `-w`, `--width` — The width of underline/overline decorations
+- `files` — Diff files Files containing diff data; omit them to read standard input.
+
+## `diff [--brief] [--changed-group-format <value>] [--color <value>] [--context <value>] [--ed] [--exclude <value>] [--exclude-from <Path>] [--expand-tabs] [--forward-ed] [--from-file <Path>] [--help] [--horizon-lines <value>] [--ifdef <value>] [--ignore-all-space] [--ignore-blank-lines] [--ignore-case] [--ignore-file-name-case] [--ignore-matching-lines <value>] [--ignore-space-change] [--ignore-tab-expansion] [--ignore-trailing-space] [--initial-tab] [--label <value>] [--left-column] [--line-format <value>] [--minimal] [--new-file] [--new-group-format <value>] [--new-line-format <value>] [--no-dereference] [--no-ignore-file-name-case] [--normal] [--old-group-format <value>] [--old-line-format <value>] [--paginate] [--palette <value>] [--rcs] [--recursive] [--report-identical-files] [--show-c-function] [--show-function-line <value>] [--side-by-side] [--speed-large-files] [--starting-file <value>] [--strip-trailing-cr] [--suppress-blank-empty] [--suppress-common-lines] [--tabsize <value>] [--text] [--to-file <Path>] [--unchanged-group-format <value>] [--unchanged-line-format <value>] [--unidirectional-new-file] [--unified <value>] [--version] [--width <value>] [-C <value>] [-U <value>] <paths>...`
+
+Compare files line by line
+
+Compares files or directories and reports the changes needed to make them match.
+
+Related intents: compare directories; compare two files.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--changed-group-format` — set changed group format
+- `--color` — colorize the output
+- `--from-file` — compare FILE1 to all operands
+- `--help` — display this help and exit
+- `--horizon-lines` — keep NUM lines of the common prefix and suffix
+- `--ignore-file-name-case` — ignore case when comparing file names
+- `--left-column` — output only the left column of common lines
+- `--line-format` — format all input lines with LFMT
+- `--new-group-format` — set new group format
+- `--new-line-format` — set new line format
+- `--no-dereference` — don't follow symbolic links
+- `--no-ignore-file-name-case` — consider case when comparing file names
+- `--normal` — output a normal diff (the default)
+- `--old-group-format` — set old group format
+- `--old-line-format` — set old line format
+- `--palette` — the colors to use when --color is active
+- `--strip-trailing-cr` — strip trailing carriage return on input
+- `--suppress-blank-empty` — suppress space or tab before empty output lines
+- `--suppress-common-lines` — do not output common lines
+- `--tabsize` — tab stops every NUM (default 8) print columns
+- `--to-file` — compare all operands to FILE2
+- `--unchanged-group-format` — set unchanged group format
+- `--unchanged-line-format` — set unchanged line format
+- `-B`, `--ignore-blank-lines` — ignore changes where lines are all blank
+- `-C` — output NUM (default 3) lines of copied context
+- `-D`, `--ifdef` — output merged file with '#ifdef NAME' diffs
+- `-E`, `--ignore-tab-expansion` — ignore changes due to tab expansion
+- `-F`, `--show-function-line` — show the most recent line matching RE
+- `-H`, `--speed-large-files` — assume large files and many scattered small changes
+- `-I`, `--ignore-matching-lines` — ignore changes where all lines match RE
+- `-L`, `--label` — use LABEL instead of file name and timestamp
+- `-N`, `--new-file` — treat absent files as empty
+- `-P`, `--unidirectional-new-file` — treat absent first files as empty
+- `-S`, `--starting-file` — start with FILE when comparing directories
+- `-T`, `--initial-tab` — make tabs line up by prepending a tab
+- `-U` — output NUM (default 3) lines of unified context
+- `-W`, `--width` — output at most NUM (default 130) print columns
+- `-X`, `--exclude-from` — exclude files that match any pattern in FILE
+- `-Z`, `--ignore-trailing-space` — ignore white space at line end
+- `-a`, `--text` — treat all files as text
+- `-b`, `--ignore-space-change` — ignore changes in the amount of white space
+- `-c`, `--context` — output NUM (default 3) lines of copied context
+- `-d`, `--minimal` — try hard to find a smaller set of changes
+- `-e`, `--ed` — output an ed script
+- `-f`, `--forward-ed` — output a reversed ed script
+- `-i`, `--ignore-case` — ignore case differences in file contents
+- `-l`, `--paginate` — pass output through 'pr' to paginate it
+- `-n`, `--rcs` — output an RCS format diff
+- `-p`, `--show-c-function` — show which C function each change is in
+- `-q`, `--brief` — report only when files differ
+- `-r`, `--recursive` — recursively compare any subdirectories found
+- `-s`, `--report-identical-files` — report when two files are the same
+- `-t`, `--expand-tabs` — expand tabs to spaces in output
+- `-u`, `--unified` — output NUM (default 3) lines of unified context
+- `-v`, `--version` — output version information and exit
+- `-w`, `--ignore-all-space` — ignore all white space
+- `-x`, `--exclude` — exclude files that match PAT
+- `-y`, `--side-by-side` — output in two columns
+- `paths` — Paths to compare Two files or directories to compare.
+
+## `dig [-4] [-6] [-b <value>] [-c <value>] [-f <Path>] [-k <Path>] [-m] [-p <value>] [-q <value>] [-r] [-t <value>] [-u] [-v] [-x <value>] [-y <value>] [<queries>...]`
+
+Query DNS records
+
+Sends DNS queries for names, record types, and servers and prints the responses.
+
+Related intents: look up a dns record; resolve a domain name.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-4` — This option indicates that only IPv4 should be used.
+- `-6` — This option indicates that only IPv6 should be used.
+- `-b` — This option sets the source IP address of the query.
+- `-c` — This  option  sets the query class.
+- `-f` — This option sets batch mode.
+- `-k` — This option tells named to sign queries using TSIG using a key read  from  the  given file.
+- `-m` — This option enables memory usage debugging.
+- `-p` — This option sends the query to a non-standard port on the server.
+- `-q` — This option specifies the domain name to query.
+- `-r` — This  option  indicates  that options from $&#123;HOME&#125;/.digrc should not be read.
+- `-t` — This option indicates the resource record type to query.
+- `-u` — This option indicates that print query times should be provided in  microseconds  instead of milliseconds.
+- `-v` — This option prints the version number and exits.
+- `-x` — This option sets simplified reverse lookups, for mapping addresses to names.
+- `-y` — This option signs queries using TSIG with the given authentication key.
+- `queries` — DNS queries Names, record types, servers, or dig query modifiers.
 
 ## `docker [--config <Directory>] [--context <context>] [--debug]`
 
@@ -89,6 +462,45 @@ Options:
 
 - `command` — Compose command Command and arguments to evaluate without applying changes.
 
+## `dos2unix [--add-bom] [--allow-chown] [--convmode <value>] [--display-enc <value>] [--follow-symlink] [--force] [--help] [--info <value>] [--keep-bom] [--keep-utf16] [--keepdate] [--license] [--newfile] [--newline] [--no-allow-chown] [--oldfile] [--quiet] [--remove-bom] [--safe] [--skip-symlink] [--verbose] [--version] [-7] <files>...`
+
+Convert text files to Unix line endings
+
+Converts DOS or classic Mac text-file line endings to Unix format.
+
+Related intents: convert line endings to unix.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--allow-chown` — allow file ownership change
+- `--no-allow-chown` — don't allow file ownership change (default)
+- `-7` — convert 8 bit characters to 7 bit space
+- `-D`, `--display-enc` — Set encoding of displayed text.
+- `-F`, `--follow-symlink` — follow symbolic links and convert the targets
+- `-L`, `--license` — display software license
+- `-S`, `--skip-symlink` — keep symbolic links and targets unchanged (default)
+- `-V`, `--version` — display version number
+- `-b`, `--keep-bom` — keep Byte Order Mark
+- `-c`, `--convmode` — conversion mode
+- `-f`, `--force` — force conversion of binary files
+- `-h`, `--help` — display this help text
+- `-i`, `--info` — display file information
+- `-k`, `--keepdate` — keep output file date
+- `-l`, `--newline` — add additional newline
+- `-m`, `--add-bom` — add Byte Order Mark (default UTF-8)
+- `-n`, `--newfile` — write to new file
+- `-o`, `--oldfile` — write to old file (default)
+- `-q`, `--quiet` — quiet mode, suppress all warnings
+- `-r`, `--remove-bom` — remove Byte Order Mark (default)
+- `-s`, `--safe` — skip binary files (default)
+- `-u`, `--keep-utf16` — keep UTF-16 encoding
+- `-v`, `--verbose` — verbose operation
+- `files` — Text files Files whose line endings are converted.
+
 ## `export NAME=value...`
 
 Set environment variables for later commands
@@ -98,6 +510,158 @@ The Preview grammar accepts explicit NAME=value assignments without shell expans
 - Input: `Nothing`
 - Output: `Bytes`
 - Live streaming: `false`
+
+## `eza [--absolute <value>] [--accessed] [--across] [--all...] [--almost-all...] [--binary] [--blocksize] [--bytes] [--changed] [--classify <value>] [--color <value>] [--color-scale <value>] [--color-scale-mode <value>] [--colour <value>] [--colour-scale <value>] [--colour-scale-mode <value>] [--context] [--created] [--dereference] [--extended] [--flags] [--follow-symlinks] [--git] [--git-ignore] [--git-repos] [--git-repos-no-status] [--grid] [--group] [--group-directories-first] [--group-directories-last] [--header] [--help] [--hyperlink] [--icons <value>] [--ignore-glob <value>] [--inode] [--level <value>] [--links] [--long] [--modified] [--mounts] [--no-filesize] [--no-git] [--no-permissions] [--no-quotes] [--no-symlinks] [--no-time] [--no-user] [--numeric] [--octal-permissions] [--oneline] [--only-dirs] [--only-files] [--recurse] [--reverse] [--show-symlinks] [--smart-group] [--sort <value>] [--stdin] [--time <value>] [--time-style <value>] [--total-size] [--treat-dirs-as-files] [--tree] [--version] [--width <value>] [<paths>...]`
+
+List files with rich metadata
+
+Lists files and directories with color, icons, Git state, tree views, and extended metadata.
+
+Related intents: list files; show a directory tree.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--absolute` — display entries with their absolute path
+- `--changed` — use the changed timestamp field
+- `--color` — when to use terminal colours
+- `--color-scale` — highlight levels of 'field' distinctly
+- `--color-scale-mode` — use gradient or fixed colors in --color-scale
+- `--colour` — when to use terminal colours
+- `--colour-scale` — highlight levels of 'field' distinctly
+- `--colour-scale-mode` — use gradient or fixed colors in --color-scale
+- `--extended` — list each file's extended attributes and sizes
+- `--follow-symlinks` — drill down into symbolic links that point to directories
+- `--git` — list each file's Git status, if tracked or ignored
+- `--git-ignore` — ignore files mentioned in '.gitignore'
+- `--git-repos` — list root of git-tree status
+- `--git-repos-no-status` — list each git-repos branch name
+- `--group-directories-first` — list directories before other files
+- `--group-directories-last` — list directories after other files
+- `--help` — show list of command-line options
+- `--hyperlink` — display entries as hyperlinks
+- `--icons` — when to display icons
+- `--no-filesize` — suppress the filesize field
+- `--no-git` — suppress Git status
+- `--no-permissions` — suppress the permissions field
+- `--no-quotes` — don't quote file names with spaces
+- `--no-symlinks` — do not show symbolic links
+- `--no-time` — suppress the time field
+- `--no-user` — suppress the user field
+- `--show-symlinks` — explicitly show symbolic links
+- `--smart-group` — only show group if it has a different name from owner
+- `--stdin` — read file names from stdin
+- `--time-style` — how to format timestamps
+- `--total-size` — show the size of a directory as the size of all
+- `-1`, `--oneline` — display one entry per line
+- `-A`, `--almost-all` — equivalent to --all
+- `-B`, `--bytes` — list file sizes in bytes, without any prefixes
+- `-D`, `--only-dirs` — list only directories
+- `-F`, `--classify` — display type indicator by file names
+- `-G`, `--grid` — display entries as a grid
+- `-H`, `--links` — list each file's number of hard links
+- `-I`, `--ignore-glob` — glob patterns (pipe-separated) of files to ignore
+- `-L`, `--level` — limit the depth of recursion
+- `-M`, `--mounts` — show mount details
+- `-O`, `--flags` — list file flags
+- `-R`, `--recurse` — recurse into directories
+- `-S`, `--blocksize` — show size of allocated file system blocks
+- `-T`, `--tree` — recurse into directories as a tree
+- `-U`, `--created` — use the created timestamp field
+- `-X`, `--dereference` — dereference symbolic links when displaying information
+- `-Z`, `--context` — list each file's security context
+- `-a`, `--all` — show hidden and 'dot' files
+- `-b`, `--binary` — list file sizes with binary prefixes
+- `-d`, `--treat-dirs-as-files` — list directories as files
+- `-f`, `--only-files` — list only files
+- `-g`, `--group` — list each file's group
+- `-h`, `--header` — add a header row to each column
+- `-i`, `--inode` — list each file's inode number
+- `-l`, `--long` — display extended file metadata as a table
+- `-m`, `--modified` — use the modified timestamp field
+- `-n`, `--numeric` — list numeric user and group IDs
+- `-o`, `--octal-permissions` — list each file's permission in octal format
+- `-r`, `--reverse` — reverse the sort order
+- `-s`, `--sort` — which field to sort by
+- `-t`, `--time` — which timestamp field to list
+- `-u`, `--accessed` — use the accessed timestamp field
+- `-v`, `--version` — show version of eza
+- `-w`, `--width` — set screen width in columns
+- `-x`, `--across` — sort the grid across, rather than downwards
+- `paths` — Paths to list Files or directories to inspect; defaults to the current directory.
+
+## `fd [--absolute-path] [--and <value>] [--base-directory <Directory>] [--batch-size <value>] [--case-sensitive] [--change-newer-than <value>] [--change-older-than <value>] [--changed-after <value>] [--changed-before <value>] [--changed-within <value>] [--color <value>] [--exact-depth <value>] [--exclude <value>] [--exec <Path>] [--exec-batch <Path>] [--extension <Path>] [--fixed-strings] [--follow] [--format <value>] [--full-path] [--glob] [--help] [--hidden] [--hyperlink <value>] [--ignore-case] [--ignore-contain <value>] [--ignore-file <value>] [--list-details] [--max-depth <value>] [--max-results <value>] [--min-depth <value>] [--newer <value>] [--no-ignore] [--no-ignore-parent] [--no-ignore-vcs] [--no-require-git] [--older <value>] [--one-file-system] [--owner <value>] [--path-separator <value>] [--print0] [--prune] [--quiet] [--regex <value>] [--search-path <Directory>...] [--show-errors] [--size <value>] [--strip-cwd-prefix <value>] [--threads <value>] [--type <value>] [--unrestricted] [--version] [-1] [<pattern>] [<paths>...]`
+
+Find filesystem entries
+
+Searches directories in parallel for entries whose paths match a regular expression or glob.
+
+Related intents: find a file; search for a directory.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--and` — Add additional required search patterns
+- `--base-directory` — Change the base directory
+- `--batch-size` — Maximum number of arguments for batch commands
+- `--change-newer-than` — alias for --changed-within
+- `--change-older-than` — alias for --changed-before
+- `--changed-after` — alias for --changed-within
+- `--changed-before` — Filter by file modification time (older than)
+- `--changed-within` — Filter by file modification time (newer than)
+- `--exact-depth` — When to use colors
+- `--format` — Print results according to template
+- `--hyperlink` — When to add terminal hyperlinks
+- `--ignore-contain` — Ignore directories containing the named entry
+- `--ignore-file` — Add a custom ignore file.
+- `--max-results` — Limit the number of results
+- `--min-depth` — Set minimum search depth (default: none)
+- `--newer` — alias for --changed-within
+- `--no-ignore-parent` — Ignore parent directory's .gitignore
+- `--no-ignore-vcs` — Ignore .gitignore files
+- `--no-require-git` — Do not require a git repository to respect gitignores
+- `--older` — alias for --changed-before
+- `--one-file-system` — Stay within the same file system
+- `--path-separator` — Set the path separator
+- `--prune` — Do not recurse into matching directories
+- `--regex` — Regular expression search
+- `--search-path` — Provide paths to search
+- `--show-errors` — Show filesystem errors
+- `--strip-cwd-prefix` — Strip current working directory prefix
+- `-0`, `--print0` — Separate results by the null character
+- `-1` — Stop after the first result Limit output to the first matching path.
+- `-E`, `--exclude` — Exclude entries that match the given glob pattern
+- `-F`, `--fixed-strings` — fixed string search
+- `-H`, `--hidden` — Search hidden files and directories
+- `-I`, `--no-ignore` — Do not respect .(git|fd)ignore files
+- `-L`, `--follow` — Follow symbolic links
+- `-S`, `--size` — Limit results based on the size of files.
+- `-V`, `--version` — Prints version information
+- `-X`, `--exec-batch` — Execute a command with all search results at once
+- `-a`, `--absolute-path` — Show absolute instead of relative paths
+- `-c`, `--color` — When to use colors
+- `-d`, `--max-depth` — Set maximum search depth (default: none)
+- `-e`, `--extension` — Filter by file extension
+- `-g`, `--glob` — Glob-based search (default: regular expression)
+- `-h`, `--help` — Prints help information
+- `-i`, `--ignore-case` — Case-insensitive search (default: smart case)
+- `-j`, `--threads` — Set number of threads
+- `-l`, `--list-details` — Use a long listing format with file metadata
+- `-o`, `--owner` — Filter by owning user and/or group
+- `-p`, `--full-path` — Search full path (default: file-/dirname only)
+- `-q`, `--quiet` — Quiet mode
+- `-s`, `--case-sensitive` — Case-sensitive search (default: smart case)
+- `-t`, `--type` — Filter by type
+- `-u`, `--unrestricted` — Unrestricted Search
+- `-x`, `--exec` — Execute a command for each search result
+- `paths` — Search roots Directories in which to search; defaults to the current directory.
+- `pattern` — Search pattern Regular expression or glob used to match path names.
 
 ## `fg [%job]`
 
@@ -112,6 +676,143 @@ Transfers terminal ownership to the selected process group and waits until it ex
 Options:
 
 - `%job` — Positional `%job` declared by the builtin command signature.
+
+## `fzf [--accept-nth <value>] [--algo <value>] [--ansi] [--bash] [--bind <value>] [--border <value>] [--border-label <value>] [--border-label-pos <value>] [--color <value>] [--cycle] [--delimiter <value>] [--disabled] [--ellipsis <value>] [--exact] [--exit-0] [--expect <value>] [--extended] [--filepath-word] [--filter <value>] [--fish] [--footer <value>] [--footer-border <value>] [--footer-label <value>] [--footer-label-pos <value>] [--freeze-left <value>] [--freeze-right <value>] [--gap <value>] [--gap-line <value>] [--ghost <value>] [--gutter <value>] [--gutter-raw <value>] [--header <value>] [--header-border <value>] [--header-first] [--header-label <value>] [--header-label-pos <value>] [--header-lines <value>] [--header-lines-border <value>] [--height <value>] [--help] [--highlight-line] [--history <Path>] [--history-size <value>] [--hscroll-off <value>] [--id-nth <value>] [--ignore-case] [--info <value>] [--info-command <value>] [--input-border <value>] [--input-label <value>] [--input-label-pos <value>] [--jump-labels <value>] [--keep-right] [--layout <value>] [--list-border <value>] [--list-label <value>] [--list-label-pos <value>] [--listen <value>] [--listen-unsafe <value>] [--literal] [--man] [--margin <value>] [--marker <value>] [--marker-multi-line <value>] [--min-height <value>] [--multi <value>] [--no-bold] [--no-clear] [--no-color] [--no-extended] [--no-hscroll] [--no-ignore-case] [--no-info] [--no-input] [--no-mouse] [--no-multi] [--no-multi-line] [--no-scrollbar] [--no-separator] [--no-sort] [--no-tty-default] [--no-unicode] [--nth <value>] [--padding <value>] [--phony] [--pointer <value>] [--popup <value>] [--preview <value>] [--preview-border <value>] [--preview-label <value>] [--preview-label-pos <value>] [--preview-window <value>] [--preview-wrap-sign <value>] [--print-query] [--print0] [--prompt <value>] [--query <value>] [--raw] [--read0] [--scheme <value>] [--scroll-off <value>] [--scrollbar <value>] [--select-1] [--separator <value>] [--smart-case] [--style <value>] [--sync] [--tabstop <value>] [--tac] [--tail <value>] [--tiebreak <value>] [--tmux <value>] [--track] [--version] [--walker <value>] [--walker-root <value>] [--walker-skip <Directory>] [--with-nth <value>] [--with-shell <value>] [--wrap <value>] [--wrap-sign <value>] [--zsh]`
+
+Select items with fuzzy search
+
+Reads candidate lines, provides an interactive fuzzy finder, and writes the selected items.
+
+Related intents: fuzzy find an item; interactively filter lines.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--accept-nth` — Define which fields to print on accept
+- `--algo` — Fuzzy matching algorithm
+- `--ansi` — Enable processing of ANSI color codes
+- `--bash` — Print script to set up Bash shell integration
+- `--bind` — Custom key bindings
+- `--border` — Draw border around the finder
+- `--border-label` — Label to print on the border
+- `--border-label-pos` — Position of the border label
+- `--color` — Base scheme
+- `--cycle` — Enable cyclic scroll
+- `--disabled` — Do not perform search
+- `--ellipsis` — Ellipsis to show when line is truncated
+- `--expect` — Comma-separated list of keys to complete fzf
+- `--filepath-word` — Make word-wise movements respect path separators
+- `--fish` — Print script to set up Fish shell integration
+- `--footer` — String to print as footer
+- `--footer-border` — Draw border around the footer section
+- `--footer-label` — Label to print on the footer border
+- `--footer-label-pos` — Position of the footer label
+- `--freeze-left` — Number of fields to freeze on the left
+- `--freeze-right` — Number of fields to freeze on the right
+- `--gap` — Render empty lines between each item
+- `--gap-line` — Draw horizontal line on each gap using the string
+- `--ghost` — Ghost text to display when the input is empty
+- `--gutter` — Character used for the gutter column
+- `--gutter-raw` — Character used for the gutter column in raw mode
+- `--header` — String to print as header
+- `--header-border` — Draw border around the header section
+- `--header-first` — Print header before the prompt line
+- `--header-label` — Label to print on the header border
+- `--header-label-pos` — Position of the header label
+- `--header-lines` — The first N lines of the input are treated as header
+- `--header-lines-border` — Display header from --header-lines with a separate border
+- `--height` — Display fzf window below the cursor with the given height instead of using fullscreen
+- `--help` — Show this message
+- `--highlight-line` — Highlight the whole current line
+- `--history` — File to store fzf search history (*not* shell command history)
+- `--history-size` — Maximum number of history entries
+- `--hscroll-off` — Number of screen columns to keep to the right
+- `--id-nth` — Define item identity fields for cross-reload operations
+- `--info` — Finder info style
+- `--info-command` — Command to generate info line
+- `--input-border` — Draw border around the input section
+- `--input-label` — Label to print on the input border
+- `--input-label-pos` — Position of the input label
+- `--jump-labels` — Label characters for jump and jump-accept
+- `--keep-right` — Keep the right end of the line visible on overflow
+- `--layout` — Choose layout
+- `--list-border` — Draw border around the list section
+- `--list-label` — Label to print on the list border
+- `--list-label-pos` — Position of the list label
+- `--listen` — Start HTTP server to receive actions via TCP/Unix domain socket
+- `--listen-unsafe` — allow remote process execution
+- `--literal` — Do not normalize latin script letters before matching
+- `--man` — Show man page
+- `--margin` — Screen margin
+- `--marker` — Multi-select marker
+- `--marker-multi-line` — Multi-select marker for multi-line entries
+- `--min-height` — Minimum height when --height is given as a percentage
+- `--no-bold` — Do not use bold text
+- `--no-clear` — Do not clear finder interface on exit
+- `--no-color` — Disable colors
+- `--no-extended` — Disable extended-search mode
+- `--no-hscroll` — Disable horizontal scroll
+- `--no-ignore-case` — Case-sensitive match
+- `--no-info` — A synonym for --info=hidden
+- `--no-input` — Disable and hide the input section
+- `--no-mouse` — Disable mouse
+- `--no-multi` — Disable multi-select
+- `--no-multi-line` — Disable multi-line display of items when using --read0
+- `--no-scrollbar` — Hide scrollbar
+- `--no-separator` — Hide info line separator
+- `--no-sort` — Do not sort the result
+- `--no-tty-default` — Make fzf search for the current TTY device via standard error instead of defaulting to /dev/tty
+- `--no-unicode` — Use ASCII characters instead of Unicode drawing characters to draw borders, the spinner and the horizontal separator
+- `--padding` — Padding inside border
+- `--phony` — Do not perform search
+- `--pointer` — Pointer to the current line
+- `--popup` — Start fzf in a popup window (requires tmux 3.3+ or Zellij 0.44+)
+- `--preview` — Command to preview highlighted line
+- `--preview-border` — Short for --preview-window=border-STYLE
+- `--preview-label` — Label to print on the horizontal border line of the preview window
+- `--preview-label-pos` — Position of the border label on the border line of the preview window
+- `--preview-window` — Preview window layout
+- `--preview-wrap-sign` — Indicator for wrapped lines in the preview window
+- `--print-query` — Print query as the first line
+- `--print0` — Print output delimited by ASCII NUL characters
+- `--prompt` — Input prompt
+- `--raw` — Enable raw mode (show non-matching items)
+- `--read0` — Read input delimited by ASCII NUL characters
+- `--scheme` — Scoring scheme
+- `--scroll-off` — Number of screen lines to keep above or below when scrolling to the top or to the bottom
+- `--scrollbar` — Scrollbar character(s) (each for list section and preview window)
+- `--separator` — Draw horizontal separator on info line using the string
+- `--smart-case` — Smart-case match
+- `--style` — Apply a style preset
+- `--sync` — Synchronous search for multi-staged filtering
+- `--tabstop` — Number of spaces for a tab character
+- `--tac` — Reverse the order of the input
+- `--tail` — Maximum number of items to keep in memory
+- `--tiebreak` — Comma-separated list of sort criteria to apply
+- `--tmux` — Start fzf in a tmux popup
+- `--track` — Track the current selection when the result is updated
+- `--version` — Display version information and exit
+- `--walker` — Determines the behavior of the built-in directory walker
+- `--walker-root` — List of directories to walk
+- `--walker-skip` — Comma-separated list of directory names to skip
+- `--with-nth` — Transform the presentation of each line using field index expressions
+- `--with-shell` — Shell command and flags to start child processes with
+- `--wrap` — Enable line wrap
+- `--wrap-sign` — Indicator for wrapped lines
+- `--zsh` — Print script to set up Zsh shell integration
+- `-0`, `--exit-0` — Exit immediately when there's no match
+- `-1`, `--select-1` — Automatically select the only match
+- `-d`, `--delimiter` — Field delimiter regex
+- `-e`, `--exact` — Enable Exact-match
+- `-f`, `--filter` — Filter mode
+- `-i`, `--ignore-case` — Case-insensitive match
+- `-m`, `--multi` — Enable multi-select with tab/shift-tab
+- `-n`, `--nth` — Comma-separated list of field index expressions for limiting search scope
+- `-q`, `--query` — Start the finder with the given query
+- `-x`, `--extended` — Extended-search mode
 
 ## `git [--git-dir <Directory>] [--help] [--work-tree <Directory>]`
 
@@ -212,6 +913,105 @@ Options:
 
 - `-s`, `--short` — Use the compact status format
 
+## `grep [--after-context <value>] [--basic-regexp] [--before-context <value>] [--binary] [--binary-files <value>] [--byte-offset] [--colour <value>] [--context <value>] [--count] [--dereference-recursive] [--devices <value>] [--directories <value>] [--exclude <value>] [--exclude-dir <value>] [--exclude-from <Path>] [--extended-regexp] [--file <Path>] [--files-with-matches] [--files-without-match] [--fixed-strings] [--group-separator <value>] [--help] [--ignore-case] [--include <value>] [--initial-tab] [--invert-match] [--label <value>] [--line-buffered] [--line-number] [--line-regexp] [--max-count <value>] [--no-filename] [--no-group-separator] [--no-ignore-case] [--no-messages] [--null] [--null-data] [--only-matching] [--perl-regexp] [--quiet] [--recursive] [--regexp <value>] [--silent] [--text] [--version] [--with-filename] [--word-regexp] <pattern> [<files>...]`
+
+Print lines matching a pattern
+
+Searches selected files or standard input and prints lines that match a pattern.
+
+Related intents: find matching lines; search text.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--binary-files` — assume that binary files are TYPE;
+- `--colour` — use markers to highlight the matching strings;
+- `--exclude` — skip files that match GLOB
+- `--exclude-dir` — skip directories that match GLOB
+- `--exclude-from` — skip files that match any file pattern from FILE
+- `--group-separator` — print SEP on line between matches with context
+- `--help` — display this help text and exit
+- `--include` — search only files that match GLOB (a file pattern)
+- `--label` — use LABEL as the standard input file name prefix
+- `--line-buffered` — flush output on every line
+- `--no-group-separator` — do not print separator for matches with context
+- `--no-ignore-case` — do not ignore case distinctions (default)
+- `--silent` — suppress all normal output
+- `-A`, `--after-context` — print NUM lines of trailing context
+- `-B`, `--before-context` — print NUM lines of leading context
+- `-C`, `--context` — print NUM lines of output context
+- `-D`, `--devices` — how to handle devices, FIFOs and sockets;
+- `-E`, `--extended-regexp` — PATTERNS are extended regular expressions
+- `-F`, `--fixed-strings` — PATTERNS are strings
+- `-G`, `--basic-regexp` — PATTERNS are basic regular expressions
+- `-H`, `--with-filename` — print file name with output lines
+- `-L`, `--files-without-match` — print only names of FILEs with no selected lines
+- `-P`, `--perl-regexp` — PATTERNS are Perl regular expressions
+- `-R`, `--dereference-recursive` — likewise, but follow all symlinks
+- `-T`, `--initial-tab` — make tabs line up (if needed)
+- `-U`, `--binary` — do not strip CR characters at EOL (MSDOS/Windows)
+- `-V`, `--version` — display version information and exit
+- `-Z`, `--null` — print 0 byte after FILE name
+- `-a`, `--text` — equivalent to --binary-files=text
+- `-b`, `--byte-offset` — print the byte offset with output lines
+- `-c`, `--count` — print only a count of selected lines per FILE
+- `-d`, `--directories` — how to handle directories;
+- `-e`, `--regexp` — use PATTERNS for matching
+- `-f`, `--file` — take PATTERNS from FILE
+- `-h`, `--no-filename` — suppress the file name prefix on output
+- `-i`, `--ignore-case` — ignore case distinctions in patterns and data
+- `-l`, `--files-with-matches` — print only names of FILEs with selected lines
+- `-m`, `--max-count` — stop after NUM selected lines
+- `-n`, `--line-number` — print line number with output lines
+- `-o`, `--only-matching` — show only nonempty parts of lines that match
+- `-q`, `--quiet` — suppress all normal output
+- `-r`, `--recursive` — like --directories=recurse
+- `-s`, `--no-messages` — suppress error messages
+- `-v`, `--invert-match` — select non-matching lines
+- `-w`, `--word-regexp` — match only whole words
+- `-x`, `--line-regexp` — match only whole lines
+- `-z`, `--null-data` — a data line ends in 0 byte, not newline
+- `files` — Files to search Files to search; omit them to read standard input.
+- `pattern` — Pattern to match Regular expression used to select matching lines.
+
+## `gzip [--best] [--decompress] [--fast] [--force] [--help] [--keep] [--license] [--list] [--name] [--no-name] [--quiet] [--recursive] [--rsyncable] [--stdout] [--suffix <value>] [--synchronous] [--test] [--verbose] [--version] [<files>...]`
+
+Compress or decompress gzip files
+
+Compresses files with gzip or restores gzip-compressed data.
+
+Related intents: compress a file with gzip; decompress a gzip file.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--rsyncable` — make rsync-friendly archive
+- `--synchronous` — synchronous output (safer if system crashes, but slower)
+- `-1`, `--fast` — compress faster
+- `-9`, `--best` — compress better
+- `-L`, `--license` — display software license
+- `-N`, `--name` — save or restore the original name and timestamp
+- `-S`, `--suffix` — use suffix SUF on compressed files
+- `-V`, `--version` — display version number
+- `-c`, `--stdout` — write on standard output, keep original files unchanged
+- `-d`, `--decompress` — decompress
+- `-f`, `--force` — force overwrite of output file and compress links
+- `-h`, `--help` — give this help
+- `-k`, `--keep` — keep (don't delete) input files
+- `-l`, `--list` — list compressed file contents
+- `-n`, `--no-name` — do not save or restore the original name and timestamp
+- `-q`, `--quiet` — suppress all warnings
+- `-r`, `--recursive` — operate recursively on directories
+- `-t`, `--test` — test compressed file integrity
+- `-v`, `--verbose` — verbose mode
+- `files` — Input files Files to compress or decompress; omit them to use standard input.
+
 ## `help [command]`
 
 Explore commands and their contracts
@@ -236,6 +1036,136 @@ Shows Quirl job ids, running/stopped/done state, and the original command.
 - Output: `Bytes`
 - Live streaming: `false`
 
+## `jq [--arg] [--argjson] [--args] [--ascii-output] [--binary] [--build-configuration] [--color-output] [--compact-output] [--exit-status] [--from-file <Path>] [--indent <value>] [--join-output] [--jsonargs] [--library-path <Directory>] [--monochrome-output] [--null-input] [--raw-input] [--raw-output] [--raw-output0] [--rawfile] [--seq] [--slurp] [--slurpfile] [--sort-keys] [--stream] [--stream-errors] [--tab] [--unbuffered] [--version] [-L <Directory>] [<filter>] [<files>...]`
+
+Filter and transform JSON
+
+Parses JSON input, applies a jq filter, and writes the resulting JSON values.
+
+Related intents: query json; transform json.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--arg` — pre-set a variable to a string
+- `--argjson` — pre-set a variable to an object
+- `--args` — remaining arguments are string arguments, not files
+- `--build-configuration` — output the build configuration of jq and exit
+- `--indent` — indent output using given number of spaces
+- `--jsonargs` — remaining arguments are JSON arguments, not files
+- `--library-path` — prepend a directory to the module search path
+- `--raw-output0` — like -r but print NUL instead of newline after each output
+- `--rawfile` — pre-set a variable to the contents of a file
+- `--seq` — use application/json-seq ASCII RS/LF scheme in input and output
+- `--slurpfile` — pre-set a variable to an array of JSON texts read from a file
+- `--stream` — parse input streamily (changes output)
+- `--stream-errors` — like --stream, but invalid JSON inputs yield array values
+- `--tab` — indent output using TAB characters
+- `--unbuffered` — flush output after each JSON object
+- `--version` — output jq's version number
+- `-C`, `--color-output` — output in color
+- `-L` — prepend a directory to the module search path
+- `-M`, `--monochrome-output` — output without color
+- `-R`, `--raw-input` — consider each input line as a JSON strings
+- `-S`, `--sort-keys` — output object keys in sorted order
+- `-a`, `--ascii-output` — restrict output to ASCII
+- `-b`, `--binary` — force binary mode on Windows
+- `-c`, `--compact-output` — don't pretty-print
+- `-e`, `--exit-status` — report "false" and "null" results via exit code
+- `-f`, `--from-file` — read filter from file
+- `-j`, `--join-output` — like -r, without newlines between outputs
+- `-n`, `--null-input` — input is ignored
+- `-r`, `--raw-output` — don't JSON-quote output if it's a string
+- `-s`, `--slurp` — join input JSON objects to array before filtering
+- `files` — JSON input files Files containing JSON values; omit them to read standard input.
+- `filter` — jq filter Expression applied to each JSON input value; defaults to the identity filter when omitted.
+
+## `just [--alias-style <value>] [--allow-missing] [--ceiling <value>] [--changelog] [--check] [--choose] [--chooser <value>] [--clear-shell-args] [--color <value>] [--command <value>...] [--command-color <value>] [--complete-aliases] [--completions <value>] [--cygpath <Directory>] [--dotenv-filename <value>] [--dotenv-path <Directory>] [--dry-run] [--dump] [--dump-format <value>] [--edit] [--eval] [--evaluate] [--evaluate-format <value>] [--explain] [--fmt] [--format] [--global-justfile] [--group <value>...] [--groups] [--help] [--highlight] [--indentation <value>] [--init] [--initialize] [--json] [--justfile <Path>] [--justfile-name <value>...] [--list <Path>...] [--list-heading <value>] [--list-prefix <value>] [--list-submodules] [--man] [--no-aliases] [--no-dependencies] [--no-deps] [--no-dotenv] [--no-highlight] [--one] [--quiet] [--set <value>...] [--shell <value>] [--shell-arg <value>...] [--shell-command] [--show <value>...] [--summary] [--tempdir <Directory>] [--time] [--timestamp] [--timestamp-format <value>] [--unsorted] [--unstable] [--usage <Path>...] [--variables] [--verbose...] [--version] [--working-directory <Directory>] [--yes] [<recipes>...]`
+
+Run recipes from a justfile
+
+Lists or executes named recipes and arguments defined in a justfile.
+
+Related intents: list just recipes; run a project recipe.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--alias-style` — Set list command alias display style
+- `--allow-missing` — Ignore missing recipe and module errors
+- `--ceiling` — Do not ascend above &lt;CEILING&gt; directory when searching for a justfile.
+- `--changelog` — Print changelog
+- `--check` — Run `--fmt` in 'check' mode. Exits with 0 if justfile is formatted correctly. Exits with 1 and prints a diff if formatting is required.
+- `--choose` — Select one or more recipes to run using a binary chooser. If `--chooser` is not passed the chooser defaults to the value of $JUST_CHOOSER, falling back to `fzf`
+- `--chooser` — Override binary invoked by `--choose`
+- `--clear-shell-args` — Clear shell arguments
+- `--color` — Print colorful output
+- `--command-color` — Echo recipe lines in &lt;COMMAND-COLOR&gt;
+- `--complete-aliases` — Auto-complete recipe aliases
+- `--completions` — Print shell completion script for &lt;SHELL&gt;
+- `--cygpath` — Use binary at &lt;CYGPATH&gt; to convert between unix and Windows paths.
+- `--dotenv-filename` — Search for environment file named &lt;DOTENV-FILENAME&gt; instead of `.env`
+- `--dump` — Print justfile
+- `--dump-format` — Dump justfile as &lt;FORMAT&gt;
+- `--eval` — Evaluate and print all variables. If a variable name is given as an argument, only print that variable's value.
+- `--evaluate` — Evaluate and print all variables. If a variable name is given as an argument, only print that variable's value.
+- `--evaluate-format` — Print evaluated variables in &lt;FORMAT&gt;
+- `--explain` — Print recipe doc comment before running it
+- `--fmt` — Format and overwrite justfile
+- `--format` — Format and overwrite justfile
+- `--group` — Only list recipes in &lt;GROUP&gt;
+- `--groups` — List recipe groups
+- `--highlight` — Highlight echoed recipe lines in bold
+- `--indentation` — Indent recipes bodies with &lt;INDENTATION&gt;
+- `--init` — Initialize new justfile in project root
+- `--initialize` — Initialize new justfile in project root
+- `--json` — Print justfile as JSON
+- `--justfile-name` — Search for justfile named &lt;NAME&gt;
+- `--list-heading` — Print &lt;TEXT&gt; before list
+- `--list-prefix` — Print &lt;TEXT&gt; before each list item
+- `--list-submodules` — List recipes in submodules
+- `--man` — Print man page
+- `--no-aliases` — Don't show aliases in list
+- `--no-dependencies` — Don't run recipe dependencies
+- `--no-deps` — Don't run recipe dependencies
+- `--no-dotenv` — Don't load `.env` file
+- `--no-highlight` — Don't highlight echoed recipe lines in bold
+- `--one` — Forbid multiple recipes from being invoked on the command line
+- `--set` — Override &lt;VARIABLE&gt; with &lt;VALUE&gt;
+- `--shell` — Invoke &lt;SHELL&gt; to run recipes
+- `--shell-arg` — Invoke shell with &lt;SHELL-ARG&gt; as an argument
+- `--shell-command` — Invoke &lt;COMMAND&gt; with the shell used to run recipe lines and backticks
+- `--summary` — List names of available recipes
+- `--tempdir` — Save temporary files to &lt;TEMPDIR&gt;.
+- `--time` — Print recipe execution time
+- `--timestamp` — Print recipe command timestamps
+- `--timestamp-format` — Timestamp format string
+- `--unstable` — Enable unstable features
+- `--usage` — Print recipe usage information
+- `--variables` — List names of variables
+- `--yes` — Automatically confirm all recipes.
+- `-E`, `--dotenv-path` — Load &lt;DOTENV-PATH&gt; as environment file instead of searching for one
+- `-V`, `--version` — Print version
+- `-c`, `--command` — Run an arbitrary command with the working directory, `.env`, overrides, and exports set
+- `-d`, `--working-directory` — Use &lt;WORKING-DIRECTORY&gt; as working directory. --justfile must also be set
+- `-e`, `--edit` — Edit justfile with editor given by $VISUAL or $EDITOR, falling back to `vim`
+- `-f`, `--justfile` — Use &lt;JUSTFILE&gt; as justfile
+- `-g`, `--global-justfile` — Use global justfile
+- `-h`, `--help` — Print help
+- `-l`, `--list` — List available recipes in &lt;MODULE&gt; or root if omitted
+- `-n`, `--dry-run` — Print what just would do without doing it
+- `-q`, `--quiet` — Suppress all output
+- `-s`, `--show` — Show recipe at &lt;PATH&gt;
+- `-u`, `--unsorted` — Return list and summary entries in source order
+- `-v`, `--verbose` — Use verbose output
+- `recipes` — Recipes and arguments Recipe names followed by values for their declared parameters.
+
 ## `lua <expression>`
 
 Evaluate Lua without leaving command mode
@@ -250,6 +1180,126 @@ Options:
 
 - `expression` — Positional `expression` declared by the builtin command signature.
 
+## `make [--always-make] [--assume-new <Path>] [--assume-old <Path>] [--check-symlink-times] [--debug <value>] [--directory <Directory>] [--dry-run] [--environment-overrides] [--eval <value>] [--file <Path>] [--help] [--ignore-errors] [--include-dir <Directory>] [--jobs <value>] [--jobserver-style <value>] [--just-print] [--keep-going] [--load-average <value>] [--makefile <value>] [--max-load <value>] [--new-file <Path>] [--no-builtin-rules] [--no-builtin-variables] [--no-keep-going] [--no-print-directory] [--no-silent] [--old-file <Path>] [--output-sync <value>] [--print-data-base] [--print-directory] [--question] [--quiet] [--recon] [--shuffle <value>] [--silent] [--stop] [--touch] [--trace] [--version] [--warn-undefined-variables] [--what-if <Path>] [-d] [<targets>...]`
+
+Build targets from makefiles
+
+Updates named targets by evaluating dependencies and recipes from makefiles.
+
+Related intents: build a project; run a make target.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--assume-new` — Consider FILE to be infinitely new.
+- `--assume-old` — Consider FILE to be very old and don't remake it.
+- `--debug` — Print various types of debugging information.
+- `--dry-run` — Don't actually run any recipe; just print them.
+- `--jobserver-style` — Select the style of jobserver to use.
+- `--makefile` — Read FILE as a makefile.
+- `--max-load` — Don't start multiple jobs unless load is below N.
+- `--new-file` — Consider FILE to be infinitely new.
+- `--no-print-directory` — Turn off -w, even if it was turned on implicitly.
+- `--no-silent` — Echo recipes (disable --silent mode).
+- `--quiet` — Don't echo recipes.
+- `--recon` — Don't actually run any recipe; just print them.
+- `--shuffle` — Perform shuffle of prerequisites and goals.
+- `--stop` — Turns off -k.
+- `--trace` — Print tracing information.
+- `--warn-undefined-variables` — Warn when an undefined variable is referenced.
+- `-B`, `--always-make` — Unconditionally make all targets.
+- `-C`, `--directory` — Change to DIRECTORY before doing anything.
+- `-E`, `--eval` — Evaluate STRING as a makefile statement.
+- `-I`, `--include-dir` — Search DIRECTORY for included makefiles.
+- `-L`, `--check-symlink-times` — Use the latest mtime between symlinks and target.
+- `-O`, `--output-sync` — Synchronize output of parallel jobs by TYPE.
+- `-R`, `--no-builtin-variables` — Disable the built-in variable settings.
+- `-S`, `--no-keep-going` — Turns off -k.
+- `-W`, `--what-if` — Consider FILE to be infinitely new.
+- `-d` — Print lots of debugging information.
+- `-e`, `--environment-overrides` — Environment variables override makefiles.
+- `-f`, `--file` — Read FILE as a makefile.
+- `-h`, `--help` — Print this message and exit.
+- `-i`, `--ignore-errors` — Ignore errors from recipes.
+- `-j`, `--jobs` — Allow N jobs at once; infinite jobs with no arg.
+- `-k`, `--keep-going` — Keep going when some targets can't be made.
+- `-l`, `--load-average` — Don't start multiple jobs unless load is below N.
+- `-n`, `--just-print` — Don't actually run any recipe; just print them.
+- `-o`, `--old-file` — Consider FILE to be very old and don't remake it.
+- `-p`, `--print-data-base` — Print make's internal database.
+- `-q`, `--question` — Run no recipe; exit status says if up to date.
+- `-r`, `--no-builtin-rules` — Disable the built-in implicit rules.
+- `-s`, `--silent` — Don't echo recipes.
+- `-t`, `--touch` — Touch targets instead of remaking them.
+- `-v`, `--version` — Print the version number of make and exit.
+- `-w`, `--print-directory` — Print the current directory.
+- `targets` — Targets or variable assignments Targets to update and optional name=value assignments.
+
+## `man [--all] [--apropos] [--ascii] [--catman] [--config-file <Path>] [--debug] [--default] [--ditroff] [--encoding <value>] [--extension <value>] [--global-apropos] [--gxditview <value>] [--help] [--html <value>] [--ignore-case] [--local-file] [--locale <value>] [--location] [--location-cat] [--manpath <Directory>] [--match-case] [--names-only] [--nh] [--nj] [--no-hyphenation] [--no-justification] [--no-subpages] [--pager <Path>] [--path] [--preprocessor <value>] [--prompt <value>] [--recode <value>] [--regex] [--sections <value>] [--systems <value>] [--troff] [--troff-device <value>] [--update] [--usage] [--version] [--warnings <value>] [--whatis] [--where] [--where-cat] [--wildcard] [-S] [<pages>...]`
+
+Read system manual pages
+
+Finds and displays reference manual pages for commands, APIs, formats, and configuration files.
+
+Related intents: look up command documentation; read a manual page.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--help` — give this help list
+- `--location` — print physical location of man page(s)
+- `--location-cat` — print physical location of cat file(s)
+- `--names-only` — make --regex and --wildcard match page names only,
+- `--nh` — turn off hyphenation
+- `--nj` — turn off justification
+- `--no-hyphenation` — turn off hyphenation
+- `--no-justification` — turn off justification
+- `--no-subpages` — don't try subpages, e.g. 'man foo bar' => 'man
+- `--path` — print physical location of man page(s)
+- `--regex` — show all pages matching regex
+- `--usage` — give a short usage message
+- `--warnings` — enable warnings from groff
+- `--wildcard` — show all pages matching wildcard
+- `-7`, `--ascii` — display ASCII translation of certain latin1 chars
+- `-C`, `--config-file` — use this user configuration file
+- `-D`, `--default` — reset all options to their default values
+- `-E`, `--encoding` — use selected output encoding
+- `-H`, `--html` — use  or BROWSER to display HTML output
+- `-I`, `--match-case` — look for pages case-sensitively
+- `-K`, `--global-apropos` — search for text in all pages
+- `-L`, `--locale` — define the locale for this particular man search
+- `-M`, `--manpath` — set search path for manual pages to PATH
+- `-P`, `--pager` — use program PAGER to display output
+- `-R`, `--recode` — output source page encoded in ENCODING
+- `-S` — use colon separated section list
+- `-T`, `--troff-device` — use groff with selected device
+- `-V`, `--version` — print program version
+- `-W`, `--where-cat` — print physical location of cat file(s)
+- `-X`, `--gxditview` — use groff and display through gxditview
+- `-Z`, `--ditroff` — use groff and force it to produce ditroff
+- `-a`, `--all` — find all matching manual pages
+- `-c`, `--catman` — used by catman to reformat out of date cat pages
+- `-d`, `--debug` — emit debugging messages
+- `-e`, `--extension` — limit search to extension type EXTENSION
+- `-f`, `--whatis` — equivalent to whatis
+- `-i`, `--ignore-case` — look for pages case-insensitively (default)
+- `-k`, `--apropos` — equivalent to apropos
+- `-l`, `--local-file` — interpret PAGE argument(s) as local filename(s)
+- `-m`, `--systems` — use manual pages from other systems
+- `-p`, `--preprocessor` — STRING indicates which preprocessors to run
+- `-r`, `--prompt` — provide the `less' pager with a prompt
+- `-s`, `--sections` — use colon separated section list
+- `-t`, `--troff` — use groff to format pages
+- `-u`, `--update` — force a cache consistency check
+- `-w`, `--where` — print physical location of man page(s)
+- `pages` — Manual pages Page names or search expressions to display.
+
 ## `mode <normal|data|ai|toggle>`
 
 Switch the visible interactive grammar
@@ -263,6 +1313,302 @@ Normal mode carries bytes and process status. Data mode evaluates Quirl's native
 Options:
 
 - `normal|data|ai|toggle` — Positional `normal|data|ai|toggle` declared by the builtin command signature.
+
+## `nano [--afterends] [--atblanks] [--autoindent] [--backup] [--backupdir <Directory>] [--boldtext] [--bookstyle] [--breaklonglines] [--colonparsing] [--constantshow] [--cutfromcursor] [--emptyline] [--fill <value>] [--guidestripe <value>] [--help] [--historylog] [--ignorercfiles] [--indicator] [--jumpyscrolling] [--linenumbers] [--listsyntaxes] [--locking] [--magic] [--minibar] [--modernbindings] [--mouse] [--multibuffer] [--noconvert] [--nohelp] [--nonewlines] [--noread] [--nowrap] [--operatingdir <Directory>] [--positionlog] [--preserve] [--quickblank] [--quotestr <value>] [--rawsequences] [--rcfile <Path>] [--rebinddelete] [--restricted] [--saveonexit] [--showcursor] [--smarthome] [--softwrap] [--solosidescroll] [--speller <Path>] [--stateflags] [--syntax <value>] [--tabsize <value>] [--tabstospaces] [--trimblanks] [--unix] [--version] [--view] [--wordbounds] [--wordchars <value>] [--zap] [--zero] [<files>...]`
+
+Edit text in the terminal
+
+Opens files in the interactive GNU nano terminal text editor.
+
+Related intents: edit a text file.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--colonparsing` — Accept 'filename:linenumber' notation
+- `--magic` — Also try magic to determine syntax
+- `--minibar` — Show a feedback bar at the bottom
+- `--modernbindings` — Use better-known key bindings
+- `--stateflags` — Show some states on the title bar
+- `-0`, `--zero` — Hide all bars, use whole terminal
+- `-1`, `--solosidescroll` — Scroll only the current line sideways
+- `-A`, `--smarthome` — Enable smart home key
+- `-B`, `--backup` — Save backups of existing files
+- `-C`, `--backupdir` — Directory for saving unique backup files
+- `-D`, `--boldtext` — Use bold instead of reverse video text
+- `-E`, `--tabstospaces` — Convert typed tabs to spaces
+- `-F`, `--multibuffer` — Read a file into a new buffer by default
+- `-G`, `--locking` — Use (vim-style) lock files
+- `-H`, `--historylog` — Save & reload old search/replace strings
+- `-I`, `--ignorercfiles` — Don't look at nanorc files
+- `-J`, `--guidestripe` — Show a guiding bar at this column
+- `-K`, `--rawsequences` — Fix numeric keypad key confusion problem
+- `-L`, `--nonewlines` — Don't add an automatic newline
+- `-M`, `--trimblanks` — Trim tail spaces when hard-wrapping
+- `-N`, `--noconvert` — Don't convert files from DOS/Mac format
+- `-O`, `--bookstyle` — Leading whitespace means new paragraph
+- `-P`, `--positionlog` — Save & restore position of the cursor
+- `-Q`, `--quotestr` — Regular expression to match quoting
+- `-R`, `--restricted` — Restrict access to the filesystem
+- `-S`, `--softwrap` — Display overlong lines on multiple rows
+- `-T`, `--tabsize` — Make a tab this number of columns wide
+- `-U`, `--quickblank` — Wipe status bar upon next keystroke
+- `-V`, `--version` — Print version information and exit
+- `-W`, `--wordbounds` — Detect word boundaries more accurately
+- `-X`, `--wordchars` — Which other characters are word parts
+- `-Y`, `--syntax` — Syntax definition to use for coloring
+- `-Z`, `--zap` — Let Bsp and Del erase a marked region
+- `-a`, `--atblanks` — When soft-wrapping, do it at whitespace
+- `-b`, `--breaklonglines` — Automatically hard-wrap overlong lines
+- `-c`, `--constantshow` — Constantly show cursor position
+- `-d`, `--rebinddelete` — Fix Backspace/Delete confusion problem
+- `-e`, `--emptyline` — Keep the line below the title bar empty
+- `-f`, `--rcfile` — Use only this file for configuring nano
+- `-g`, `--showcursor` — Show cursor in file browser & help text
+- `-h`, `--help` — Show this help text and exit
+- `-i`, `--autoindent` — Automatically indent new lines
+- `-j`, `--jumpyscrolling` — Scroll per half-screen, not per line
+- `-k`, `--cutfromcursor` — Cut from cursor to end of line
+- `-l`, `--linenumbers` — Show line numbers in front of the text
+- `-m`, `--mouse` — Enable the use of the mouse
+- `-n`, `--noread` — Do not read the file (only write it)
+- `-o`, `--operatingdir` — Set operating directory
+- `-p`, `--preserve` — Preserve XON (^Q) and XOFF (^S) keys
+- `-q`, `--indicator` — Show a position+portion indicator
+- `-r`, `--fill` — Set width for hard-wrap and justify
+- `-s`, `--speller` — Use this alternative spell checker
+- `-t`, `--saveonexit` — Save changes on exit, don't prompt
+- `-u`, `--unix` — Save a file by default in Unix format
+- `-v`, `--view` — View mode (read-only)
+- `-w`, `--nowrap` — Don't hard-wrap long lines [default]
+- `-x`, `--nohelp` — Don't show the two help lines
+- `-y`, `--afterends` — Make Ctrl+Right stop at word ends
+- `-z`, `--listsyntaxes` — List the names of available syntaxes
+- `files` — Files to edit Text files to open in editor buffers.
+
+## `nc [<host>] [<ports>...]`
+
+Read and write network connections
+
+Connects, listens, scans ports, or relays byte streams over TCP or UDP.
+
+Related intents: connect to a network port; listen on a network port.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `host` — Remote host Host name or address to connect to; listening modes may omit it.
+- `ports` — Port or port range Network port numbers or service names.
+
+## `node [--abort-on-uncaught-exception] [--allow-addons] [--allow-child-process] [--allow-ffi] [--allow-fs-read <value>] [--allow-fs-write <value>] [--allow-inspector] [--allow-net] [--allow-wasi] [--allow-worker] [--build-sea] [--build-snapshot] [--build-snapshot-config <Path>] [--check] [--completion-bash] [--conditions <value>] [--cpu-prof] [--cpu-prof-dir <Directory>] [--cpu-prof-interval <value>] [--cpu-prof-name <value>] [--debug-port] [--diagnostic-dir <Directory>] [--disable-proto <value>] [--disable-sigusr1] [--disable-warning <value>] [--disable-wasm-trap-handler] [--disallow-code-generation-from-strings] [--dns-result-order <value>] [--enable-etw-stack-walking] [--enable-fips] [--enable-network-family-autoselection] [--enable-source-maps] [--entry-url] [--env-file <Path>] [--env-file-if-exists <Path>] [--eval <value>] [--experimental-addon-modules] [--experimental-config-file <Path>] [--experimental-default-config-file] [--experimental-eventsource] [--experimental-ffi] [--experimental-import-meta-resolve] [--experimental-inspector-network-resource] [--experimental-network-inspection] [--experimental-print-required-tla] [--experimental-sea-config <value>] [--experimental-storage-inspection] [--experimental-stream-iter] [--experimental-strip-types] [--experimental-test-coverage] [--experimental-test-isolation] [--experimental-test-module-mocks] [--experimental-test-tag-filter <value>] [--experimental-transform-types] [--experimental-vm-modules] [--experimental-webstorage] [--experimental-worker-inspection] [--expose-gc] [--force-context-aware] [--force-fips] [--force-node-api-uncaught-exceptions-policy] [--frozen-intrinsics] [--heap-prof] [--heap-prof-dir <Directory>] [--heap-prof-interval <value>] [--heap-prof-name <value>] [--heapsnapshot-near-heap-limit <value>] [--heapsnapshot-signal <value>] [--help] [--icu-data-dir <Directory>] [--import <value>] [--input-type <value>] [--insecure-http-parser] [--inspect <value>] [--inspect-brk <value>] [--inspect-port <value>] [--inspect-publish-uid <value>] [--inspect-wait <value>] [--interactive] [--interpreted-frames-native-stack] [--jitless] [--loader <value>] [--localstorage-file <Path>] [--max-http-header-size <value>] [--max-old-space-size <value>] [--max-old-space-size-percentage <value>] [--network-family-autoselection-attempt-timeout <value>] [--no-addons] [--no-async-context-frame] [--no-deprecation] [--no-experimental-detect-module] [--no-experimental-global-navigator] [--no-experimental-repl-await] [--no-experimental-require-module] [--no-experimental-sqlite] [--no-experimental-strip-types] [--no-experimental-websocket] [--no-extra-info-on-fatal-exception] [--no-force-async-hooks-checks] [--no-global-search-paths] [--no-network-family-autoselection] [--no-require-module] [--no-warnings] [--node-memory-debug] [--openssl-config <Path>] [--openssl-legacy-provider] [--openssl-shared-config] [--pending-deprecation] [--permission] [--permission-audit] [--preserve-symlinks] [--preserve-symlinks-main] [--print <value>] [--prof] [--prof-process] [--redirect-warnings <Path>] [--report-compact] [--report-dir <Directory>] [--report-directory <Directory>] [--report-exclude-env] [--report-exclude-network] [--report-filename <value>] [--report-on-fatalerror] [--report-on-signal] [--report-signal <value>] [--report-uncaught-exception] [--require <value>] [--require-module] [--run <value>] [--secure-heap <value>] [--secure-heap-min <value>] [--snapshot-blob <value>] [--test] [--test-concurrency <value>] [--test-coverage-branches <value>] [--test-coverage-exclude <value>] [--test-coverage-functions <value>] [--test-coverage-include <value>] [--test-coverage-lines <value>] [--test-force-exit] [--test-global-setup <value>] [--test-isolation <value>] [--test-name-pattern <value>] [--test-only] [--test-random-seed <value>] [--test-randomize] [--test-reporter <value>] [--test-reporter-destination <value>] [--test-rerun-failures <Path>] [--test-shard <value>] [--test-skip-pattern <value>] [--test-timeout <value>] [--test-update-snapshots] [--throw-deprecation] [--title <value>] [--tls-cipher-list <value>] [--tls-keylog <Path>] [--trace-deprecation] [--trace-env] [--trace-env-js-stack] [--trace-env-native-stack] [--trace-event-categories <value>] [--trace-event-file-pattern <value>] [--trace-exit] [--trace-promises] [--trace-require-module <value>] [--trace-sigint] [--trace-sync-io] [--trace-tls] [--trace-uncaught] [--trace-warnings] [--track-heap-objects] [--unhandled-rejections <value>] [--use-bundled-ca] [--use-env-proxy] [--use-largepages <value>] [--use-openssl-ca] [--use-system-ca] [--v8-options] [--v8-pool-size <value>] [--version] [--watch] [--watch-kill-signal <value>] [--watch-path <Directory>] [--watch-preserve-output] [--webstorage] [--zero-fill-buffers] [<script>] [<arguments>...]`
+
+Run JavaScript with Node.js
+
+Evaluates JavaScript, executes a script or module, or starts an interactive Node.js session.
+
+Related intents: run a javascript file; start a node repl.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--abort-on-uncaught-exception` — aborting instead of exiting causes a core file to be generated for analysis
+- `--allow-addons` — allow use of addons when any permissions are set
+- `--allow-child-process` — allow use of child process when any permissions are set
+- `--allow-ffi` — allow use of FFI when any permissions are set
+- `--allow-fs-read` — allow permissions to read the filesystem
+- `--allow-fs-write` — allow permissions to write in the filesystem
+- `--allow-inspector` — allow use of inspector when any permissions are set
+- `--allow-net` — allow network access when any permissions are set
+- `--allow-wasi` — allow wasi when any permissions are set
+- `--allow-worker` — allow worker threads when any permissions are set
+- `--build-sea` — Generate a single executable application from the current script
+- `--build-snapshot` — Generate a snapshot blob when the process exits
+- `--build-snapshot-config` — specify the path to the snapshot configuration file
+- `--completion-bash` — print source-able bash completion script
+- `--cpu-prof` — Start the V8 CPU profiler on start up
+- `--cpu-prof-dir` — Directory where the V8 profiles generated by --cpu-prof will be placed
+- `--cpu-prof-interval` — specified sampling interval in microseconds for the V8 CPU profile
+- `--cpu-prof-name` — specified file name of the V8 CPU profile generated with --cpu-prof
+- `--debug-port` — set host:port for inspector
+- `--diagnostic-dir` — set dir for all output files
+- `--disable-proto` — disable Object.prototype.__proto__
+- `--disable-sigusr1` — Disable inspector thread to be listening for SIGUSR1 signal
+- `--disable-warning` — silence specific process warnings
+- `--disable-wasm-trap-handler` — disable Wasm trap handler support
+- `--disallow-code-generation-from-strings` — disallow eval and friends
+- `--dns-result-order` — set default value of verbatim in dns.lookup
+- `--enable-etw-stack-walking` — provides heap data to ETW Windows native tracing
+- `--enable-fips` — enable FIPS crypto at startup
+- `--enable-network-family-autoselection` — Enable network address family autodetection algorithm
+- `--enable-source-maps` — Source Map V3 support for stack traces
+- `--entry-url` — Treat the entrypoint as a URL
+- `--env-file` — set environment variables from supplied file
+- `--env-file-if-exists` — set environment variables from supplied file
+- `--experimental-addon-modules` — experimental import support for addons
+- `--experimental-config-file` — set config file from supplied file
+- `--experimental-default-config-file` — set config file from default config file
+- `--experimental-eventsource` — experimental EventSource API
+- `--experimental-ffi` — experimental FFI support
+- `--experimental-import-meta-resolve` — experimental ES Module import.meta.resolve() parentURL support
+- `--experimental-inspector-network-resource` — experimental load network resources via the inspector
+- `--experimental-network-inspection` — experimental network inspection support
+- `--experimental-print-required-tla` — Print pending top-level await
+- `--experimental-sea-config` — Generate a blob that can be embedded into the single executable application
+- `--experimental-storage-inspection` — experimental storage inspection support
+- `--experimental-stream-iter` — experimental async iterator support for streams
+- `--experimental-strip-types` — experimental type stripping for TypeScript files
+- `--experimental-test-coverage` — enable code coverage in the test runner
+- `--experimental-test-isolation` — configures the type of test isolation used in the test runner
+- `--experimental-test-module-mocks` — enable module mocking in the test runner
+- `--experimental-test-tag-filter` — run tests whose tags match this filter
+- `--experimental-transform-types` — enable transformation of TypeScript-onlysyntax into JavaScript code
+- `--experimental-vm-modules` — experimental ES Module support in vm module
+- `--experimental-webstorage` — experimental Web Storage API
+- `--experimental-worker-inspection` — experimental worker inspection support
+- `--expose-gc` — expose gc extension
+- `--force-context-aware` — disable loading non-context-aware addons
+- `--force-fips` — force FIPS crypto (cannot be disabled)
+- `--force-node-api-uncaught-exceptions-policy` — enforces 'uncaughtException' event on Node API asynchronous callbacks
+- `--frozen-intrinsics` — experimental frozen intrinsics support
+- `--heap-prof` — Start the V8 heap profiler on start up, and write the heap profile to disk before exit
+- `--heap-prof-dir` — Directory where the V8 heap profiles generated by --heap-prof will be placed
+- `--heap-prof-interval` — specified sampling interval in bytes for the V8 heap profile generated
+- `--heap-prof-name` — specified file name of the V8 heap profile generated with --heap-prof
+- `--heapsnapshot-near-heap-limit` — Generate heap snapshots whenever V8 is approaching the heap limit
+- `--heapsnapshot-signal` — Generate heap snapshot on specified signal
+- `--icu-data-dir` — set ICU data load path to dir
+- `--import` — ES module to preload
+- `--input-type` — set module type for string input
+- `--insecure-http-parser` — use an insecure HTTP parser that accepts invalid HTTP headers
+- `--inspect` — activate inspector on host:port
+- `--inspect-brk` — activate inspector on host:port and break before user code starts
+- `--inspect-port` — set host:port for inspector
+- `--inspect-publish-uid` — comma separated list of destinations for inspector
+- `--inspect-wait` — activate inspector on host:port and wait for debugger to be attached
+- `--interpreted-frames-native-stack` — help system profilers to translate JavaScript interpreted frames
+- `--jitless` — disable runtime allocation of executable memory
+- `--loader` — use the specified module as a custom loader
+- `--localstorage-file` — file used to persist localStorage data
+- `--max-http-header-size` — set the maximum size of HTTP headers
+- `--max-old-space-size` — set V8's max old space size in MB
+- `--max-old-space-size-percentage` — set V8's max old space size as a percentage of available memory
+- `--network-family-autoselection-attempt-timeout` — Sets the default value for the network family autoselection attempt timeout
+- `--no-addons` — disable loading native addons
+- `--no-async-context-frame` — Improve AsyncLocalStorage performance with AsyncContextFrame
+- `--no-deprecation` — silence deprecation warnings
+- `--no-experimental-detect-module` — when ambiguous modules fail to evaluate because they contain ES module syntax, try again to evaluate them as ES modules
+- `--no-experimental-global-navigator` — expose experimental Navigator API on the global scope
+- `--no-experimental-repl-await` — experimental await keyword support in REPL
+- `--no-experimental-require-module` — Allow loading synchronous ES Modules in require()
+- `--no-experimental-sqlite` — experimental node:sqlite module
+- `--no-experimental-strip-types` — Experimental type-stripping for TypeScript files
+- `--no-experimental-websocket` — experimental WebSocket API
+- `--no-extra-info-on-fatal-exception` — hide extra information on fatal exception that causes exit
+- `--no-force-async-hooks-checks` — disable checks for async_hooks
+- `--no-global-search-paths` — disable global module search paths
+- `--no-network-family-autoselection` — Disable network address family autodetection algorithm
+- `--no-require-module` — disable loading synchronous ES Modules in require()
+- `--no-warnings` — silence all process warnings
+- `--node-memory-debug` — Run with extra debug checks for memory leaks in Node.js itself
+- `--openssl-config` — load OpenSSL configuration from the specified file
+- `--openssl-legacy-provider` — enable OpenSSL 3.0 legacy provider
+- `--openssl-shared-config` — enable OpenSSL shared configuration
+- `--pending-deprecation` — emit pending deprecation warnings
+- `--permission` — enable the permission system
+- `--permission-audit` — enable permission audit logging
+- `--preserve-symlinks` — preserve symbolic links when resolving
+- `--preserve-symlinks-main` — preserve symbolic links when resolving the main module
+- `--prof` — Generate V8 profiler output
+- `--prof-process` — process V8 profiler output generated using --prof
+- `--redirect-warnings` — write warnings to file instead of stderr
+- `--report-compact` — output compact single-line JSON
+- `--report-dir` — define custom report pathname
+- `--report-directory` — define custom report pathname
+- `--report-exclude-env` — Exclude environment variables when generating report
+- `--report-exclude-network` — exclude network interface diagnostics
+- `--report-filename` — define custom report file name
+- `--report-on-fatalerror` — generate diagnostic report on fatal (internal) errors
+- `--report-on-signal` — generate diagnostic report upon receiving signals
+- `--report-signal` — causes diagnostic report to be produced on provided signal
+- `--report-uncaught-exception` — generate diagnostic report on uncaught exceptions
+- `--require-module` — Allow loading synchronous ES Modules in require()
+- `--run` — Run a script specified in package.json
+- `--secure-heap` — total size of the OpenSSL secure heap
+- `--secure-heap-min` — minimum allocation size from the OpenSSL secure heap
+- `--snapshot-blob` — Path to the snapshot blob that's either the result of snapshotbuilding
+- `--test` — launch test runner on startup
+- `--test-concurrency` — specify test runner concurrency
+- `--test-coverage-branches` — the branch coverage minimum threshold
+- `--test-coverage-exclude` — exclude files from coverage report that match this glob pattern
+- `--test-coverage-functions` — the function coverage minimum threshold
+- `--test-coverage-include` — include files in coverage report that match this glob pattern
+- `--test-coverage-lines` — the line coverage minimum threshold
+- `--test-force-exit` — force test runner to exit upon completion
+- `--test-global-setup` — specifies the path to the global setup file
+- `--test-isolation` — configures the type of test isolation used in the test runner
+- `--test-name-pattern` — run tests whose name matches this regular expression
+- `--test-only` — run tests with 'only' option set
+- `--test-random-seed` — seed for randomizing test execution order
+- `--test-randomize` — randomize test execution order
+- `--test-reporter` — report test output using the given reporter
+- `--test-reporter-destination` — report given reporter to the given destination
+- `--test-rerun-failures` — specifies the path to the rerun state file
+- `--test-shard` — run test at specific shard
+- `--test-skip-pattern` — run tests whose name do not match this regular expression
+- `--test-timeout` — specify test runner timeout
+- `--test-update-snapshots` — regenerate test snapshots
+- `--throw-deprecation` — throw an exception on deprecations
+- `--title` — the process title to use on startup
+- `--tls-cipher-list` — use an alternative default TLS cipher list
+- `--tls-keylog` — log TLS decryption keys to named file for traffic analysis
+- `--trace-deprecation` — show stack traces on deprecations
+- `--trace-env` — Print accesses to the environment variables
+- `--trace-env-js-stack` — Print accesses to the environment variables and the JavaScript stack trace
+- `--trace-env-native-stack` — Print accesses to the environment variables and the native stack trace
+- `--trace-event-categories` — comma separated list of trace event categories to record
+- `--trace-event-file-pattern` — Template string specifying the filepath for the trace-events data
+- `--trace-exit` — show stack trace when an environment exits
+- `--trace-promises` — show stack traces on promise initialization and resolution
+- `--trace-require-module` — Print access to require(esm)
+- `--trace-sigint` — enable printing JavaScript stacktrace on SIGINT
+- `--trace-sync-io` — show stack trace when use of sync IO is detected after the first tick
+- `--trace-tls` — prints TLS packet trace information to stderr
+- `--trace-uncaught` — show stack traces for the `throw` behind uncaught exceptions
+- `--trace-warnings` — show stack traces on process warnings
+- `--track-heap-objects` — track heap object allocations for heap snapshots
+- `--unhandled-rejections` — define unhandled rejections behavior
+- `--use-bundled-ca` — use bundled CA store (default)
+- `--use-env-proxy` — parse proxy settings from HTTP_PROXY/HTTPS_PROXY/NO_PROXYenvironment variables
+- `--use-largepages` — Map the Node.js static code to large pages
+- `--use-openssl-ca` — use OpenSSL's default CA store
+- `--use-system-ca` — use system's CA store
+- `--v8-options` — print V8 command line options
+- `--v8-pool-size` — set V8's thread pool size
+- `--watch` — run in watch mode
+- `--watch-kill-signal` — kill signal to send to the process on watch mode restarts
+- `--watch-path` — path to watch
+- `--watch-preserve-output` — preserve outputs on watch mode restart
+- `--webstorage` — experimental Web Storage API
+- `--zero-fill-buffers` — automatically zero-fill all newly allocated Buffer and SlowBuffer instances
+- `-C`, `--conditions` — additional user conditions for conditional exports and imports
+- `-c`, `--check` — syntax check script without executing
+- `-e`, `--eval` — evaluate script
+- `-h`, `--help` — print node command line options
+- `-i`, `--interactive` — always enter the REPL even if stdin does not appear to be a terminal
+- `-p`, `--print` — evaluate script and print result
+- `-r`, `--require` — CommonJS module to preload
+- `-v`, `--version` — print Node.js version
+- `arguments` — Script arguments Values exposed to the executed program after the entry file.
+- `script` — JavaScript entry file Script or module to execute; omit it to read input or start an interactive session.
 
 ## `open [--application <application>] <paths>...`
 
@@ -280,6 +1626,66 @@ Options:
 
 - `-a`, `--application` — Application to use Open the item with the named application.
 - `paths` — Items to open Files or directories opened by Launch Services.
+
+## `pwd [--help] [--logical] [--physical] [--version]`
+
+Print the working directory
+
+Writes the absolute pathname of the shell's current working directory.
+
+Related intents: show current directory.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--help` — display this help and exit
+- `--version` — output version information and exit
+- `-L`, `--logical` — use PWD from environment, even if it contains symlinks
+- `-P`, `--physical` — avoid all symlinks
+
+## `python [--check-hash-based-pycs <value>] [--help-all] [--help-env] [--help-xoptions] [-B] [-E] [-I] [-O...] [-P] [-S] [-V...] [-W <value>...] [-X <value>...] [-b] [-c <value>] [-d] [-h] [-i] [-m <value>] [-q] [-s] [-u] [-v...] [-x] [<script>] [<arguments>...]`
+
+Run Python code
+
+Executes a Python script, module, command string, or interactive interpreter session.
+
+Related intents: run a python script; start a python repl.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--check-hash-based-pycs` — control how Python invalidates hash-based .pyc files
+- `--help-all` — print complete help information and exit
+- `--help-env` — print help about Python environment variables and exit
+- `--help-xoptions` — print help about implementation-specific -X options and exit
+- `-B` — don't write .pyc files on import
+- `-E` — ignore PYTHON* environment variables
+- `-I` — isolate Python from the user's environment
+- `-O` — remove assert and __debug__-dependent statements
+- `-P` — don't prepend a potentially unsafe path to sys.path
+- `-S` — don't imply 'import site' on initialization
+- `-V` — print the Python version number and exit
+- `-W` — warning control
+- `-X` — set implementation-specific option
+- `-b` — issue warnings about str(bytes_instance), str(bytearray_instance) and comparing bytes/bytearray with str
+- `-c` — program passed in as string
+- `-d` — turn on parser debugging output
+- `-h` — print this help message and exit
+- `-i` — inspect interactively after running script
+- `-m` — run library module as a script
+- `-q` — don't print version and copyright messages on interactive startup
+- `-s` — don't add user site directory to sys.path
+- `-u` — force the stdout and stderr streams to be unbuffered
+- `-v` — verbose (trace import statements)
+- `-x` — skip first line of source
+- `arguments` — Script arguments Values exposed to the executed program after the entry file.
+- `script` — Python entry file Script to execute; omit it to read input or start an interactive session.
 
 ## `quirl agent catalog [--format text|json]`
 
@@ -1159,3 +2565,1006 @@ Options:
 - `--format` — Choose live lines or a bounded JSON snapshot
 - `--interval-ms` — Set the cancellable refresh interval
 - `--samples` — Set a bounded sample count
+
+## `rg [--after-context <value>] [--auto-hybrid-regex] [--before-context <value>] [--binary] [--block-buffered] [--byte-offset] [--case-sensitive] [--color <value>] [--colors <value>] [--column] [--context <value>] [--context-separator <value>] [--count] [--count-matches] [--crlf] [--debug] [--dfa-size-limit <value>] [--encoding <value>] [--engine <value>] [--field-context-separator <value>] [--field-match-separator <value>] [--file <Path>] [--files] [--files-with-matches] [--files-without-match] [--fixed-strings] [--follow] [--generate <value>] [--glob <value>] [--glob-case-insensitive] [--heading] [--help] [--hidden] [--hostname-bin <value>] [--hyperlink-format <value>] [--iglob <value>] [--ignore-case] [--ignore-file <Path>] [--ignore-file-case-insensitive] [--include-zero] [--invert-match] [--json] [--line-buffered] [--line-number] [--line-regexp] [--max-columns <value>] [--max-columns-preview] [--max-count <value>] [--max-depth <value>] [--max-filesize <value>] [--mmap] [--multiline] [--multiline-dotall] [--no-config] [--no-context-separator] [--no-filename] [--no-heading] [--no-ignore] [--no-ignore-dot] [--no-ignore-exclude] [--no-ignore-files] [--no-ignore-global] [--no-ignore-messages] [--no-ignore-parent] [--no-ignore-vcs] [--no-line-number] [--no-messages] [--no-mmap] [--no-pcre2-unicode] [--no-require-git] [--no-unicode] [--null] [--null-data] [--one-file-system] [--only-matching] [--passthru] [--path-separator <value>] [--pcre2] [--pcre2-version] [--pre <value>] [--pre-glob <value>] [--pretty] [--quiet] [--regexp <value>] [--replace <value>] [--search-zip] [--smart-case] [--sort <value>] [--sort-files] [--sortr <value>] [--stats] [--stop-on-nonmatch] [--text] [--threads <value>] [--trace] [--trim] [--type <value>] [--type-add <value>] [--type-clear <value>] [--type-list] [--type-not <value>] [--unrestricted] [--version] [--vimgrep] [--with-filename] [--word-regexp] [<pattern>] [<paths>...]`
+
+Search files with ripgrep
+
+Recursively searches selected paths for lines matching a regular expression while respecting configured ignore rules.
+
+Related intents: find matching lines in files; search text recursively.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--auto-hybrid-regex` — DEPRECATED. Use --engine instead.
+- `--binary` — Enabling this flag will cause ripgrep to search binary files
+- `--block-buffered` — When enabled, ripgrep will use block buffering
+- `--color` — When to use colors
+- `--colors` — Color settings for use in the output
+- `--column` — Show column numbers (1-based)
+- `--context-separator` — The string used to separate non-contiguous context lines in the output
+- `--count-matches` — Suppress normal output and show the number of individual matches
+- `--crlf` — When enabled, ripgrep will treat CRLF as a line terminator instead
+- `--debug` — Show debug messages
+- `--dfa-size-limit` — The upper size limit of the regex DFA. The default limit is 10M
+- `--engine` — Specify which regular expression engine to use
+- `--field-context-separator` — Set the field context separator for contextual lines
+- `--field-match-separator` — Set the field match separator for matching lines
+- `--files` — Print each file that would be searched without actually performing the search
+- `--files-without-match` — Only print the paths that contain zero matches
+- `--generate` — Generate special output of man pages and completion scripts
+- `--glob-case-insensitive` — Process glob patterns given with the -g/--glob flag case insensitively
+- `--heading` — Print the file path above clusters of matches from each file instead
+- `--hidden` — Search hidden files and directories
+- `--hostname-bin` — Control how ripgrep determines this system's hostname
+- `--hyperlink-format` — Set the format of hyperlinks to use when printing results
+- `--iglob` — Include or exclude files and directories for searching that match the given
+- `--ignore-file` — Specifies a path to one or more .gitignore format rules files
+- `--ignore-file-case-insensitive` — Process ignore files (.gitignore, .ignore, etc.) case insensitively
+- `--include-zero` — When used with --count or --count-matches, print the number of matches for
+- `--json` — Enable printing results in a JSON Lines format
+- `--line-buffered` — When enabled, ripgrep will use line buffering
+- `--max-columns-preview` — When the '--max-columns' flag is used, ripgrep will by default completely
+- `--max-filesize` — Ignore files larger than NUM in size. This does not apply to directories
+- `--mmap` — Search using memory maps when possible
+- `--multiline-dotall` — Enable "dot all" mode, which causes '.' to match line terminators
+- `--no-config` — Never read configuration files
+- `--no-context-separator` — Disable the context separator when printing context
+- `--no-heading` — Don't group matches by each file
+- `--no-ignore` — Don't respect ignore files (.gitignore, .ignore, etc.)
+- `--no-ignore-dot` — Don't respect .ignore files
+- `--no-ignore-exclude` — Don't respect ignore files that are manually configured for the repository
+- `--no-ignore-files` — When set, any --ignore-file flags, even ones that come after this flag, are
+- `--no-ignore-global` — Don't respect ignore files that come from "global" sources such as git's
+- `--no-ignore-messages` — Suppresses all error messages related to parsing ignore files such as .ignore
+- `--no-ignore-parent` — Don't respect ignore files (.gitignore, .ignore, etc.) in parent directories
+- `--no-ignore-vcs` — Don't respect version control ignore files (.gitignore, etc.)
+- `--no-messages` — Suppress all error messages related to opening and reading files
+- `--no-mmap` — Never use memory maps, even when they might be faster
+- `--no-pcre2-unicode` — DEPRECATED. Use --no-unicode instead
+- `--no-require-git` — Respect source control ignore files even if no git repository is present
+- `--no-unicode` — By default, ripgrep will enable "Unicode mode" in all of its regexes
+- `--null-data` — Enabling this option causes ripgrep to use NUL as a line terminator instead of
+- `--one-file-system` — Do not cross file system boundaries relative to where the search started from
+- `--passthru` — Print both matching and non-matching lines
+- `--path-separator` — Set the path separator to use when printing file paths
+- `--pcre2-version` — When this flag is present, ripgrep will print the version of PCRE2 in use,
+- `--pre` — Search the standard output of COMMAND PATH instead of the contents of PATH
+- `--pre-glob` — Works in conjunction with the --pre flag to limit which files a preprocessor is run with
+- `--sort` — Sort results in ascending order
+- `--sort-files` — DEPRECATED. Use --sort=path instead.
+- `--sortr` — Sort results in descending order
+- `--stats` — Print aggregate statistics about this ripgrep search
+- `--stop-on-nonmatch` — Stop searching after a non-match
+- `--trace` — Show trace messages with even more detail than --debug
+- `--trim` — When set, all ASCII whitespace at the beginning of each line printed will be
+- `--type-add` — Add a new glob for a particular file type
+- `--type-clear` — Clear the file type globs previously defined for TYPE
+- `--type-list` — Show all supported file types and their corresponding globs
+- `--vimgrep` — Show results with every match on its own line, including line numbers and
+- `-0`, `--null` — Whenever a file path is printed, follow it with a NUL byte
+- `-A`, `--after-context` — Show NUM lines after each match
+- `-B`, `--before-context` — Show NUM lines before each match
+- `-C`, `--context` — Show NUM lines before and after each match
+- `-E`, `--encoding` — Specify the text encoding that ripgrep will use on all files searched
+- `-F`, `--fixed-strings` — Treat the pattern as a literal string instead of a regular expression
+- `-H`, `--with-filename` — Display the file path for matches
+- `-I`, `--no-filename` — Never print the file path with the matched lines
+- `-L`, `--follow` — When this flag is enabled, ripgrep will follow symbolic links while traversing
+- `-M`, `--max-columns` — Don't print lines longer than this limit in bytes
+- `-N`, `--no-line-number` — Suppress line numbers. This is enabled by default when not searching in a
+- `-P`, `--pcre2` — When this flag is present, ripgrep will use the PCRE2 regex engine instead of
+- `-S`, `--smart-case` — Searches case insensitively if the pattern is all lowercase
+- `-T`, `--type-not` — Do not search files matching TYPE
+- `-U`, `--multiline` — Enable matching across multiple lines
+- `-V`, `--version` — Prints version information
+- `-a`, `--text` — Search binary files as if they were text
+- `-b`, `--byte-offset` — Print the 0-based byte offset within the input file before each line of output
+- `-c`, `--count` — Suppress normal output and show the number of lines that match
+- `-d`, `--max-depth` — Limit the depth of directory traversal to NUM levels beyond the paths given
+- `-e`, `--regexp` — A pattern to search for
+- `-f`, `--file` — Search for patterns from the given file, with one pattern per line
+- `-g`, `--glob` — Include or exclude files and directories for searching that match the given
+- `-h`, `--help` — Prints help information
+- `-i`, `--ignore-case` — When this flag is provided, the given patterns will be searched case
+- `-j`, `--threads` — The approximate number of threads to use
+- `-l`, `--files-with-matches` — Only print the paths with at least one match
+- `-m`, `--max-count` — Limit the number of matching lines per file searched to NUM
+- `-n`, `--line-number` — Show line numbers (1-based)
+- `-o`, `--only-matching` — Print only the matched (non-empty) parts of a matching line, with each such
+- `-p`, `--pretty` — This is a convenience alias for '--color always --heading --line-number'
+- `-q`, `--quiet` — Do not print anything to stdout
+- `-r`, `--replace` — Replace every match with the text given when printing results
+- `-s`, `--case-sensitive` — Search case sensitively
+- `-t`, `--type` — Only search files matching TYPE
+- `-u`, `--unrestricted` — Reduce the level of smart searching
+- `-v`, `--invert-match` — Show lines that do not match the given patterns
+- `-w`, `--word-regexp` — Only show matches surrounded by word boundaries
+- `-x`, `--line-regexp` — Only show matches surrounded by line boundaries
+- `-z`, `--search-zip` — Search in compressed files
+- `paths` — Files or directories to search Search roots; defaults to the current directory.
+- `pattern` — Pattern to match Regular expression used to select matching lines; pattern flags may supply it instead.
+
+## `rsync [--8-bit-output] [--acls] [--address <value>] [--append] [--append-verify] [--archive] [--atimes] [--backup] [--backup-dir <Directory>] [--block-size <value>] [--blocking-io] [--bwlimit <value>] [--checksum] [--checksum-choice <value>] [--checksum-seed <value>] [--chmod <value>] [--chown <value>] [--compare-dest <value>] [--compress] [--compress-choice <value>] [--compress-level <value>] [--compress-threads <value>] [--contimeout <value>] [--copy-as <value>] [--copy-dest <value>] [--copy-devices] [--copy-dirlinks] [--copy-links] [--copy-unsafe-links] [--crtimes] [--cvs-exclude] [--debug <value>] [--del] [--delay-updates] [--delete] [--delete-after] [--delete-before] [--delete-delay] [--delete-during] [--delete-excluded] [--delete-missing-args] [--devices] [--dirs] [--dry-run] [--early-input <Path>] [--exclude <value>] [--exclude-from <Path>] [--executability] [--existing] [--fake-super] [--files-from <Path>] [--filter <value>] [--force] [--from0] [--fsync] [--fuzzy] [--group] [--groupmap <value>] [--hard-links] [--help] [--human-readable] [--iconv <value>] [--ignore-errors] [--ignore-existing] [--ignore-missing-args] [--ignore-times] [--include <value>] [--include-from <Path>] [--info <value>] [--inplace] [--ipv4] [--ipv6] [--itemize-changes] [--keep-dirlinks] [--link-dest <value>] [--links] [--list-only] [--log-file <Path>] [--log-file-format <value>] [--max-alloc <value>] [--max-delete <value>] [--max-size <value>] [--min-size <value>] [--mkpath] [--modify-window <value>] [--munge-links] [--no-implied-dirs] [--no-motd] [--numeric-ids] [--old-args] [--old-dirs] [--omit-dir-times] [--omit-link-times] [--one-file-system] [--only-write-batch <Path>] [--open-noatime] [--out-format <value>] [--outbuf <value>] [--owner] [--partial] [--partial-dir <Directory>] [--password-file <Path>] [--perms] [--port <value>] [--preallocate] [--progress] [--protocol <value>] [--prune-empty-dirs] [--quiet] [--read-batch <Path>] [--recursive] [--relative] [--remote-option <value>] [--remove-source-files] [--rsh <value>] [--rsync-path <value>] [--safe-links] [--secluded-args] [--size-only] [--skip-compress <Path>] [--sockopts <value>] [--sparse] [--specials] [--stats] [--stderr <value>] [--stop-after <value>] [--stop-at <value>] [--suffix <value>] [--super] [--temp-dir <Directory>] [--timeout <value>] [--times] [--trust-sender] [--update] [--usermap <value>] [--verbose] [--version] [--whole-file] [--write-batch <Path>] [--write-devices] [--xattrs] [-D] [-F] [-P] <paths>...`
+
+Synchronize local or remote files
+
+Copies and synchronizes file trees efficiently between local paths or remote rsync endpoints.
+
+Related intents: copy files to a remote host; synchronize directories.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--address` — bind address for outgoing socket to daemon
+- `--append` — append data onto shorter files
+- `--append-verify` — --append w/old data in file checksum
+- `--backup-dir` — make backups into hierarchy based in DIR
+- `--blocking-io` — use blocking I/O for the remote shell
+- `--bwlimit` — limit socket I/O bandwidth
+- `--checksum-choice` — choose the checksum algorithm (aka --cc)
+- `--checksum-seed` — set block/file checksum seed (advanced)
+- `--chmod` — affect file and/or directory permissions
+- `--chown` — simple username/groupname mapping
+- `--compare-dest` — also compare destination files relative to DIR
+- `--compress-choice` — choose the compression algorithm (aka --zc)
+- `--compress-level` — explicitly set compression level (aka --zl)
+- `--compress-threads` — explicitly set compression threads (aka --zt)
+- `--contimeout` — set daemon connection timeout in seconds
+- `--copy-as` — specify user & optional group for the copy
+- `--copy-dest` — ... and include copies of unchanged files
+- `--copy-devices` — copy device contents as a regular file
+- `--copy-unsafe-links` — only "unsafe" symlinks are transformed
+- `--debug` — fine-grained debug verbosity
+- `--del` — an alias for --delete-during
+- `--delay-updates` — put all updated files into place at end
+- `--delete` — delete extraneous files from dest dirs
+- `--delete-after` — receiver deletes after transfer, not during
+- `--delete-before` — receiver deletes before xfer, not during
+- `--delete-delay` — find deletions during, delete after
+- `--delete-during` — receiver deletes during the transfer
+- `--delete-excluded` — also delete excluded files from dest dirs
+- `--delete-missing-args` — delete missing source args from destination
+- `--devices` — preserve device files (super-user only)
+- `--early-input` — use FILE for daemon's early exec input
+- `--exclude` — exclude files matching PATTERN
+- `--exclude-from` — read exclude patterns from FILE
+- `--existing` — skip creating new files on receiver
+- `--fake-super` — store/recover privileged attrs using xattrs
+- `--files-from` — read list of source-file names from FILE
+- `--force` — force deletion of dirs even if not empty
+- `--fsync` — fsync every written file
+- `--groupmap` — custom groupname mapping
+- `--human-readable` — output numbers in a human-readable format
+- `--iconv` — request charset conversion of filenames
+- `--ignore-errors` — delete even if there are I/O errors
+- `--ignore-existing` — skip updating files that exist on receiver
+- `--ignore-missing-args` — ignore missing source args without error
+- `--include` — don't exclude files matching PATTERN
+- `--include-from` — read include patterns from FILE
+- `--info` — fine-grained informational verbosity
+- `--inplace` — update destination files in-place
+- `--link-dest` — hardlink to files in DIR when unchanged
+- `--list-only` — list the files instead of copying them
+- `--log-file` — log what we're doing to the specified FILE
+- `--log-file-format` — log updates using the specified FMT
+- `--max-alloc` — change a limit relating to memory alloc
+- `--max-delete` — don't delete more than NUM files
+- `--max-size` — don't transfer any file larger than SIZE
+- `--min-size` — don't transfer any file smaller than SIZE
+- `--mkpath` — create the destination's path component
+- `--modify-window` — set the accuracy for mod-time comparisons
+- `--munge-links` — munge symlinks to make them safe & unusable
+- `--no-implied-dirs` — don't send implied dirs with --relative
+- `--no-motd` — suppress daemon-mode MOTD
+- `--numeric-ids` — don't map uid/gid values by user/group name
+- `--old-args` — disable the modern arg-protection idiom
+- `--old-dirs` — works like --dirs when talking to old rsync
+- `--only-write-batch` — like --write-batch but w/o updating dest
+- `--open-noatime` — avoid changing the atime on opened files
+- `--out-format` — output updates using the specified FORMAT
+- `--outbuf` — set out buffering to None, Line, or Block
+- `--partial` — keep partially transferred files
+- `--partial-dir` — put a partially transferred file into DIR
+- `--password-file` — read daemon-access password from FILE
+- `--port` — specify double-colon alternate port number
+- `--preallocate` — allocate dest files before writing them
+- `--progress` — show progress during transfer
+- `--protocol` — force an older protocol version to be used
+- `--read-batch` — read a batched update from FILE
+- `--remove-source-files` — sender removes synchronized files (non-dir)
+- `--rsync-path` — specify the rsync to run on remote machine
+- `--safe-links` — ignore symlinks that point outside the tree
+- `--size-only` — skip files that match in size
+- `--skip-compress` — skip compressing files with suffix in LIST
+- `--sockopts` — specify custom TCP options
+- `--specials` — preserve special files
+- `--stats` — give some file-transfer stats
+- `--stderr` — change stderr output mode (default: errors)
+- `--stop-after` — Stop rsync after MINS minutes have elapsed
+- `--stop-at` — Stop rsync at the specified point in time
+- `--suffix` — backup suffix (default ~ w/o --backup-dir)
+- `--super` — receiver attempts super-user activities
+- `--timeout` — set I/O timeout in seconds
+- `--trust-sender` — trust the remote sender's file list
+- `--usermap` — custom username mapping
+- `--write-batch` — write a batched update to FILE
+- `--write-devices` — write to devices as files (implies --inplace)
+- `-0`, `--from0` — all *-from/filter files are delimited by 0s
+- `-4`, `--ipv4` — prefer IPv4
+- `-6`, `--ipv6` — prefer IPv6
+- `-8`, `--8-bit-output` — leave high-bit chars unescaped in output
+- `-A`, `--acls` — preserve ACLs (implies --perms)
+- `-B`, `--block-size` — force a fixed checksum block-size
+- `-C`, `--cvs-exclude` — auto-ignore files in the same way CVS does
+- `-D` — same as --devices --specials
+- `-E`, `--executability` — preserve executability
+- `-F` — same as --filter='dir-merge /.rsync-filter'
+- `-H`, `--hard-links` — preserve hard links
+- `-I`, `--ignore-times` — don't skip files that match size and time
+- `-J`, `--omit-link-times` — omit symlinks from --times
+- `-K`, `--keep-dirlinks` — treat symlinked dir on receiver as dir
+- `-L`, `--copy-links` — transform symlink into referent file/dir
+- `-M`, `--remote-option` — send OPTION to the remote side only
+- `-N`, `--crtimes` — preserve create times (newness)
+- `-O`, `--omit-dir-times` — omit directories from --times
+- `-P` — same as --partial --progress
+- `-R`, `--relative` — use relative path names
+- `-S`, `--sparse` — turn sequences of nulls into sparse blocks
+- `-T`, `--temp-dir` — create temporary files in directory DIR
+- `-U`, `--atimes` — preserve access (use) times
+- `-V`, `--version` — print the version + other info and exit
+- `-W`, `--whole-file` — copy files whole (w/o delta-xfer algorithm)
+- `-X`, `--xattrs` — preserve extended attributes
+- `-a`, `--archive` — archive mode; equals -rlptgoD (no -H,-A,-X)
+- `-b`, `--backup` — make backups (see --suffix & --backup-dir)
+- `-c`, `--checksum` — skip based on checksum, not mod-time & size
+- `-d`, `--dirs` — transfer directories without recursing
+- `-e`, `--rsh` — specify the remote shell to use
+- `-f`, `--filter` — add a file-filtering RULE
+- `-g`, `--group` — preserve group
+- `-h`, `--help` — show this help (* -h is help only on its own)
+- `-i`, `--itemize-changes` — output a change-summary for all updates
+- `-k`, `--copy-dirlinks` — transform symlink to dir into referent dir
+- `-l`, `--links` — copy symlinks as symlinks
+- `-m`, `--prune-empty-dirs` — prune empty directory chains from file-list
+- `-n`, `--dry-run` — perform a trial run with no changes made
+- `-o`, `--owner` — preserve owner (super-user only)
+- `-p`, `--perms` — preserve permissions
+- `-q`, `--quiet` — suppress non-error messages
+- `-r`, `--recursive` — recurse into directories
+- `-s`, `--secluded-args` — use the protocol to safely send the args
+- `-t`, `--times` — preserve modification times
+- `-u`, `--update` — skip files that are newer on the receiver
+- `-v`, `--verbose` — increase verbosity
+- `-x`, `--one-file-system` — don't cross filesystem boundaries
+- `-y`, `--fuzzy` — find similar file for basis if no dest file
+- `-z`, `--compress` — compress file data during the transfer
+- `paths` — Sources and destination One or more source paths followed by a local or remote destination.
+
+## `rustc [--allow <value>] [--cap-lints <value>] [--cfg <value>] [--check-cfg <value>] [--codegen <value>] [--crate-name <value>] [--crate-type <value>] [--deny <value>] [--edition <value>] [--emit <value>] [--explain <value>] [--forbid <value>] [--force-warn <value>] [--help] [--out-dir <Directory>] [--print <value>] [--target <value>] [--test] [--verbose] [--version] [--warn <value>] [-L <value>...] [-O] [-g] [-l <value>...] [-o <Path>] <input>`
+
+Compile Rust programs
+
+Compiles a Rust crate from a source file and emits the selected outputs.
+
+Related intents: compile a rust program.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--cap-lints` — Set the most restrictive lint level
+- `--cfg` — Configure the compilation environment
+- `--check-cfg` — Provide list of expected cfgs for checking
+- `--crate-name` — Specify the name of the crate being built
+- `--crate-type` — Comma separated list of types of crates for the compiler to emit
+- `--edition` — Specify which edition of the compiler to use when compiling code
+- `--emit` — Comma separated list of types of output for the compiler to emit
+- `--explain` — Provide a detailed explanation of an error message
+- `--force-warn` — Set lint force-warn
+- `--out-dir` — Write output to compiler-chosen filename in DIR
+- `--print` — Compiler information to print on stdout
+- `--target` — Target triple for which the code is compiled
+- `--test` — Build a test harness
+- `-A`, `--allow` — Set lint allowed
+- `-C`, `--codegen` — Set a codegen option
+- `-D`, `--deny` — Set lint denied
+- `-F`, `--forbid` — Set lint forbidden
+- `-L` — Add a directory to the library search path
+- `-O` — Equivalent to -C opt-level=3
+- `-V`, `--version` — Print version info and exit
+- `-W`, `--warn` — Set lint warnings
+- `-g` — Equivalent to -C debuginfo=2
+- `-h`, `--help` — Display this message
+- `-l` — Link the generated crate(s) to the specified native library NAME
+- `-o` — Write output to FILENAME
+- `-v`, `--verbose` — Use verbose output
+- `input` — Rust source file Crate-root source file to compile.
+
+## `scp [-3] [-4] [-6] [-A] [-B] [-C] [-D <Path>] [-F <Path>] [-J <Hostname>] [-O] [-P <value>] [-R] [-S <Path>] [-T] [-X <value>...] [-c <value>] [-i <value>] [-l <value>] [-o <value>...] [-p] [-q] [-r] [-v] <paths>...`
+
+Copy files over SSH
+
+Copies files between local and remote hosts using SSH for transport and authentication.
+
+Related intents: copy a file to a remote host; download a file over ssh.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-3` — Copies between two remote hosts are transferred through the local host
+- `-4` — Forces scp to use IPv4 addresses only
+- `-6` — Forces scp to use IPv6 addresses only
+- `-A` — Allows forwarding of ssh-agent to the remote system
+- `-B` — Selects batch mode
+- `-C` — Compression enable
+- `-D` — Connect directly to a local SFTP server program
+- `-F` — Specifies an alternative per-user configuration file for ssh
+- `-J` — Connect to the target host by first making an scp connection to the jump host
+- `-O` — Use the legacy SCP protocol for file transfers instead of the SFTP protocol
+- `-P` — Specifies the port to connect to on the remote host
+- `-R` — Copies between two remote hosts are performed by connecting to the origin host and executing scp there
+- `-S` — Name of program to use for the encrypted connection
+- `-T` — Disable strict filename checking
+- `-X` — Specify an option that controls aspects of SFTP protocol behaviour
+- `-c` — Selects the cipher to use for encrypting the data transfer
+- `-i` — Selects the file from which the identity for public key authentication is read
+- `-l` — Limits the used bandwidth, specified in Kbit/s
+- `-o` — Can be used to pass options to ssh in the format used in ssh_config
+- `-p` — Preserves modification times, access times, and file mode bits from the source file
+- `-q` — Quiet mode
+- `-r` — Recursively copy entire directories
+- `-v` — Verbose mode
+- `paths` — Sources and destination Local paths or remote [user@]host:path locations; the final value is the destination.
+
+## `sqlite3 [--append] [--ascii] [--bail] [--batch] [--box] [--cmd <value>] [--column] [--csv] [--deserialize] [--echo] [--header] [--help] [--html] [--init <Path>] [--interactive] [--json] [--line] [--list] [--lookaside <value>] [--markdown] [--maxsize <value>] [--memtrace] [--mmap <value>] [--newline <value>] [--no-rowid-in-view] [--nofollow] [--nonce <value>] [--nullvalue <value>] [--pagecache <value>] [--pcachetrace] [--quote] [--readonly] [--safe] [--separator <value>] [--stats] [--table] [--tabs] [--unsafe-testing] [--version] [--vfs <value>] [--vfstrace] [--zip] [-A <value>] [<database>] [<commands>...]`
+
+Query and manage SQLite databases
+
+Opens a SQLite database for interactive use or executes SQL and dot commands non-interactively.
+
+Related intents: open a sqlite database; query a sqlite database.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--append` — Append the database to the end of the file
+- `--ascii` — Set output mode to 'ascii'
+- `--bail` — Stop after hitting an error
+- `--batch` — Force batch I/O
+- `--box` — Set output mode to 'box'
+- `--cmd` — run "COMMAND" before reading stdin
+- `--column` — Set output mode to 'column'
+- `--csv` — Set output mode to 'csv'
+- `--deserialize` — open the database using sqlite3_deserialize()
+- `--echo` — print inputs before execution
+- `--header` — turn headers on or off
+- `--help` — show this message
+- `--html` — set output mode to HTML
+- `--init` — read/process named file
+- `--interactive` — force interactive I/O
+- `--json` — set output mode to 'json'
+- `--line` — set output mode to 'line'
+- `--list` — set output mode to 'list'
+- `--lookaside` — use N entries of SZ bytes for lookaside memory
+- `--markdown` — set output mode to 'markdown'
+- `--maxsize` — maximum size for a --deserialize database
+- `--memtrace` — trace all memory allocations and deallocations
+- `--mmap` — default mmap size set to N
+- `--newline` — set output row separator. Default: '\n'
+- `--no-rowid-in-view` — Disable rowid-in-view using sqlite3_config()
+- `--nofollow` — refuse to open symbolic links to database files
+- `--nonce` — set the safe-mode escape nonce
+- `--nullvalue` — set text string for NULL values. Default ''
+- `--pagecache` — use N slots of SZ bytes each for page cache memory
+- `--pcachetrace` — trace all page cache operations
+- `--quote` — set output mode to 'quote'
+- `--readonly` — open the database read-only
+- `--safe` — enable safe-mode
+- `--separator` — set output column separator. Default: '|
+- `--stats` — print memory stats before each finalize
+- `--table` — set output mode to 'table'
+- `--tabs` — set output mode to 'tabs'
+- `--unsafe-testing` — allow unsafe commands and modes for testing
+- `--version` — show SQLite version
+- `--vfs` — use NAME as the default VFS
+- `--vfstrace` — enable tracing of all VFS calls
+- `--zip` — open the file as a ZIP Archive
+- `-A` — run ".archive ARGS" and exit
+- `commands` — SQL or dot commands Commands to execute before exiting instead of starting the interactive shell.
+- `database` — Database file SQLite database to open; omit it for a transient in-memory database.
+
+## `ssh [-4] [-6] [-a] [-b <address>] [-c <ciphers>] [-e <character>] [-f] [-g] [-i <Path>] [-k] [-l <User>] [-m <macs>] [-n] [-o <option>...] [-p <port>] [-q] [-s] [-t] [-v...] [-w <tunnel>] [-x] [-y] <destination> [<command>...]`
+
+Connect to a remote host
+
+Opens an encrypted login session or runs a command on a remote host using OpenSSH.
+
+Related intents: connect to a remote server; run a remote command.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-4` — Use IPv4 only Force address resolution and connections to use IPv4.
+- `-6` — Use IPv6 only Force address resolution and connections to use IPv6.
+- `-a` — Disable authentication-agent forwarding Do not forward the authentication agent connection.
+- `-b` — Select the local bind address Use the selected local address as the source of the connection.
+- `-c` — Select encryption ciphers Use a comma-separated cipher preference list for the session.
+- `-e` — Set the escape character Select the escape character for sessions with a pseudo-terminal.
+- `-f` — Run in the background Request that ssh enter the background just before command execution.
+- `-g` — Allow remote access to local forwards Permit remote hosts to connect to locally forwarded ports.
+- `-i` — Select an identity file Read the private key used for public-key authentication from this file.
+- `-k` — Disable GSSAPI credential forwarding Do not forward GSSAPI credentials to the server.
+- `-l` — Select the remote user Log in as this user on the remote machine.
+- `-m` — Select MAC algorithms Use a comma-separated message-authentication-code preference list.
+- `-n` — Redirect standard input Read standard input from the null device.
+- `-o` — Set an SSH configuration option Set one option using the same key-value format as the SSH configuration file.
+- `-p` — Select the remote port Connect to this port on the remote host.
+- `-q` — Suppress warnings Enable quiet mode so most warnings and diagnostics are omitted.
+- `-s` — Invoke a remote subsystem Treat the remote command as the name of a subsystem.
+- `-t` — Allocate a pseudo-terminal Force pseudo-terminal allocation on the remote host.
+- `-v` — Enable verbose diagnostics Print connection, authentication, and configuration diagnostics; repeat for more detail.
+- `-w` — Forward tunnel devices Request client and server tunnel-device forwarding.
+- `-x` — Disable X11 forwarding Do not forward X11 connections.
+- `-y` — Send logs through syslog Send log information using the system log module.
+- `command` — Remote command Command and arguments to execute instead of starting an interactive login session.
+- `destination` — Remote destination Host name, optionally prefixed with a user name in user@host form.
+
+## `task [--color] [--completion <value>] [--concurrency <value>] [--dir <Directory>] [--disable-fuzzy] [--dry] [--exit-code] [--experiments] [--failfast] [--force] [--global] [--help] [--init] [--insecure] [--interval <value>] [--json] [--list] [--list-all] [--nested] [--no-status] [--output <value>] [--output-group-begin <value>] [--output-group-end <value>] [--output-group-error-only] [--parallel] [--silent] [--sort <value>] [--status] [--summary] [--taskfile <Path>] [--verbose] [--version] [--watch] [--yes] [<tasks>...]`
+
+Run Taskfile tasks
+
+Runs named tasks from a Taskfile and provides listing, status, watch, and completion utilities.
+
+Related intents: list project tasks; run a task.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--completion` — Generates shell completion script.
+- `--disable-fuzzy` — Disables fuzzy matching for task names.
+- `--experiments` — Lists all the available experiments and whether or not they are enabled.
+- `--insecure` — Forces Task to download Taskfiles over insecure connections.
+- `--nested` — Nest namespaces when listing tasks as JSON
+- `--no-status` — Ignore status when listing tasks as JSON
+- `--output-group-begin` — Message template to print before a task's grouped output.
+- `--output-group-end` — Message template to print after a task's grouped output.
+- `--output-group-error-only` — Swallow output from successful tasks.
+- `--sort` — Changes the order of the tasks when listed. [default|alphanumeric|none].
+- `--status` — Exits with non-zero exit code if any of the given tasks is not up-to-date.
+- `--summary` — Show summary about a task.
+- `--version` — Show Task version.
+- `-C`, `--concurrency` — Limit number of tasks to run concurrently.
+- `-F`, `--failfast` — When running tasks in parallel, stop all tasks if one fails.
+- `-I`, `--interval` — Interval to watch for changes.
+- `-a`, `--list-all` — Lists tasks with or without a description.
+- `-c`, `--color` — Colored output. Enabled by default. Set flag to false or use NO_COLOR=1 to disable.
+- `-d`, `--dir` — Sets the directory in which Task will execute and look for a Taskfile.
+- `-f`, `--force` — Forces execution even when the task is up-to-date.
+- `-g`, `--global` — Runs global Taskfile, from $HOME/&#123;T,t&#125;askfile.&#123;yml,yaml&#125;.
+- `-h`, `--help` — Shows Task usage.
+- `-i`, `--init` — Creates a new Taskfile.yml in the current folder.
+- `-j`, `--json` — Formats task list as JSON.
+- `-l`, `--list` — Lists tasks with description of current Taskfile.
+- `-n`, `--dry` — Compiles and prints tasks in the order that they would be run, without executing them.
+- `-o`, `--output` — Sets output style: [interleaved|group|prefixed].
+- `-p`, `--parallel` — Executes tasks provided on command line in parallel.
+- `-s`, `--silent` — Disables echoing.
+- `-t`, `--taskfile` — Choose which Taskfile to run. Defaults to "Taskfile.yml".
+- `-v`, `--verbose` — Enables verbose mode.
+- `-w`, `--watch` — Enables watch of the given task.
+- `-x`, `--exit-code` — Pass-through the exit code of the task command.
+- `-y`, `--yes` — Assume "yes" as answer to all prompts.
+- `tasks` — Tasks to run Task names followed by any task-specific arguments.
+
+## `task completion`
+
+Generate the autocompletion script for the specified shell
+
+Generate the autocompletion script for the specified shell
+
+Related intents: generate shell completions.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+## `task completion bash [--no-descriptions]`
+
+Generate the autocompletion script for bash
+
+Generate the autocompletion script for bash
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--no-descriptions` — disable completion descriptions
+
+## `task completion fish [--no-descriptions]`
+
+Generate the autocompletion script for fish
+
+Generate the autocompletion script for fish
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--no-descriptions` — disable completion descriptions
+
+## `task completion powershell [--no-descriptions]`
+
+Generate the autocompletion script for powershell
+
+Generate the autocompletion script for powershell
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--no-descriptions` — disable completion descriptions
+
+## `task completion zsh [--no-descriptions]`
+
+Generate the autocompletion script for zsh
+
+Generate the autocompletion script for zsh
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--no-descriptions` — disable completion descriptions
+
+## `task help [<commands>...]`
+
+Help about any command
+
+Help about any command
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `commands` — Command path Command or subcommand path for which to display help.
+
+## `tree [--acl] [--authority <value>] [--charset <value>] [--compress <value>] [--condense] [--device] [--dirsfirst] [--du] [--fflinks] [--filelimit <value>] [--filesfirst] [--fromfile] [--fromtabfile] [--gitfile <Path>] [--gitignore] [--help] [--hintro <Path>] [--houtro <Path>] [--hyperlink] [--ignore-case] [--info] [--infofile <Path>] [--inodes] [--matchdirs] [--metafirst] [--nolinks] [--noreport] [--opt-toggle] [--prune] [--scheme <value>] [--selinux] [--si] [--sort <value>] [--timefmt <value>] [--version] [-A] [-C] [-D] [-F] [-H <value>] [-I <value>] [-J] [-L <value>] [-N] [-P <value>] [-Q] [-R] [-S] [-T <value>] [-U] [-X] [-a] [-c] [-d] [-f] [-g] [-h] [-i] [-l] [-n] [-o <Path>] [-p] [-q] [-r] [-s] [-t] [-u] [-v] [-x] [<directories>...]`
+
+List directory trees
+
+Recursively displays directory contents in an indented tree, with optional metadata and alternate output formats.
+
+Related intents: show a directory tree.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--acl` — Print permissions with a + if an ACL is present.
+- `--authority` — Set OSC 8 hyperlink authority/hostname.
+- `--charset` — Use charset X for terminal/HTML and indentation line output.
+- `--compress` — Compress indentation lines.
+- `--condense` — Condense directory singletons to a single line of output.
+- `--device` — Print device ID number to which each file belongs.
+- `--dirsfirst` — List directories before files (-U disables).
+- `--du` — Compute size of directories by their contents.
+- `--fflinks` — Process link information when using --fromfile.
+- `--filelimit` — Do not descend dirs with more than # files in them.
+- `--filesfirst` — List files before directories (-U disables).
+- `--fromfile` — Reads paths from files (.=stdin)
+- `--fromtabfile` — Reads trees from tab indented files (.=stdin)
+- `--gitfile` — Explicitly read a gitignore file.
+- `--gitignore` — Filter by using .gitignore files.
+- `--help` — Print usage and this help message and exit.
+- `--hintro` — Use file X as the HTML intro.
+- `--houtro` — Use file X as the HTML outro.
+- `--hyperlink` — Turn on OSC 8 terminal hyperlinks.
+- `--ignore-case` — Ignore case when pattern matching.
+- `--info` — Print information about files found in .info files.
+- `--infofile` — Explicitly read info file.
+- `--inodes` — Print inode number of each file.
+- `--matchdirs` — Include directory names in -P pattern matching.
+- `--metafirst` — Print meta-data at the beginning of each line.
+- `--nolinks` — Turn off hyperlinks in HTML output.
+- `--noreport` — Turn off file/directory count at end of tree listing.
+- `--opt-toggle` — Enable option toggling.
+- `--prune` — Prune empty directories from the output.
+- `--scheme` — Set OSC 8 hyperlink scheme, default file://
+- `--selinux` — Print the selinux security label if present.
+- `--si` — Like -h, but use in SI units (powers of 1000).
+- `--sort` — Select sort: name,version,size,mtime,ctime,none.
+- `--timefmt` — Print and format time according to the format fmt.
+- `--version` — Print version and exit.
+- `-A` — Print ANSI lines graphic indentation lines.
+- `-C` — Turn colorization on always.
+- `-D` — Print the date of last modification or (-c) status change.
+- `-F` — Appends '/', '=', '*', '@', '|' or '>' as per ls -F.
+- `-H` — Prints out HTML format with baseHREF as top directory.
+- `-I` — Do not list files that match the given pattern.
+- `-J` — Prints out an JSON representation of the tree.
+- `-L` — Descend only level directories deep.
+- `-N` — Print non-printable characters as is.
+- `-P` — List only those files that match the pattern given.
+- `-Q` — Quote filenames with double quotes.
+- `-R` — Rerun tree when max dir level reached.
+- `-S` — Print with CP437 (console) graphics indentation lines.
+- `-T` — Replace the default HTML title and H1 header with string.
+- `-U` — Leave files unsorted.
+- `-X` — Prints out an XML representation of the tree.
+- `-a` — All files are listed.
+- `-c` — Sort files by last status change time.
+- `-d` — List directories only.
+- `-f` — Print the full path prefix for each file.
+- `-g` — Displays file group owner or GID number.
+- `-h` — Print the size in a more human readable way.
+- `-i` — Don't print indentation lines.
+- `-l` — Follow symbolic links like directories.
+- `-n` — Turn colorization off always (-C overrides).
+- `-o` — Output to file instead of stdout.
+- `-p` — Print the protections for each file.
+- `-q` — Print non-printable characters as '?'.
+- `-r` — Reverse the order of the sort.
+- `-s` — Print the size in bytes of each file.
+- `-t` — Sort files by last modification time.
+- `-u` — Displays file owner or UID number.
+- `-v` — Sort files alphanumerically by version.
+- `-x` — Stay on current filesystem only.
+- `directories` — Directory roots Directories to display; defaults to the current directory.
+
+## `unzip [--aa] [-C] [-I <value>] [-K] [-L] [-M] [-O <value>] [-T] [-U] [-V] [-X] [-Z] [-a] [-d <Directory>] [-f] [-j] [-l] [-n] [-o] [-p] [-q] [-t] [-u] [-v] [-x <value>] [-z] <archive> [<members>...]`
+
+Extract or inspect ZIP archives
+
+Lists, tests, or extracts selected members from a ZIP archive.
+
+Related intents: extract a zip archive; list zip archive contents.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--aa` — treat ALL files as text
+- `-C` — match filenames case-insensitively
+- `-I` — specify a character encoding for UNIX and other archives
+- `-K` — keep setuid/setgid/tacky permissions
+- `-L` — make (some) names lowercase
+- `-M` — pipe through "more" pager
+- `-O` — specify a character encoding for DOS, Windows and OS/2 archives
+- `-T` — timestamp archive to latest
+- `-U` — use escapes for all non-ASCII Unicode
+- `-V` — retain VMS version numbers
+- `-X` — restore UID/GID info
+- `-Z` — ZipInfo mode
+- `-a` — auto-convert any text files
+- `-d` — extract files into exdir
+- `-f` — freshen existing files, create none
+- `-j` — junk paths (do not make directories)
+- `-l` — list files (short format)
+- `-n` — never overwrite existing files
+- `-o` — overwrite files WITHOUT prompting
+- `-p` — extract files to pipe, no messages
+- `-q` — quiet mode (-qq => quieter)
+- `-t` — test compressed archive data
+- `-u` — update files, create if necessary
+- `-v` — list verbosely/show version info
+- `-x` — exclude files that follow (in xlist)
+- `-z` — display archive comment only
+- `archive` — ZIP archive Archive file to read.
+- `members` — Archive members Member names or patterns to select; defaults to all members.
+
+## `vim [--clean] [--cmd <value>] [--help] [--log <Path>] [--noplugin] [--not-a-term] [--remote <Path>] [--remote-expr <value>] [--remote-send <value>] [--remote-silent] [--remote-tab <Path>] [--remote-tab-silent <Path>] [--remote-tab-wait <Path>] [--remote-tab-wait-silent <Path>] [--remote-wait <Path>] [--remote-wait-silent <Path>] [--serverlist] [--servername <value>] [--startuptime <Path>] [--ttyfail] [--version] [-A] [-C] [-D] [-E] [-H] [-L] [-M] [-N] [-O <value>] [-R] [-S <Path>] [-T <value>] [-V <value>] [-W <Path>] [-Z] [-b] [-c <value>] [-d] [-e] [-i <Path>] [-l] [-m] [-n] [-o <value>] [-p <value>] [-r] [-s <Path>] [-u <Path>] [-v] [-w <Path>] [-x] [-y] [<files>...]`
+
+Edit text with Vim
+
+Opens files and commands in the interactive Vim terminal editor.
+
+Related intents: edit a text file.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--clean` — 'nocompatible', Vim defaults, no plugins, no viminfo
+- `--cmd` — Execute &lt;command&gt; before loading any vimrc file
+- `--log` — Start logging to &lt;file&gt; early
+- `--noplugin` — Do not load plugin scripts
+- `--not-a-term` — Skip warning for input/output not being a terminal
+- `--remote` — Edit &lt;files&gt; in a Vim server if possible
+- `--remote-expr` — Evaluate &lt;expr&gt; in a Vim server and print result
+- `--remote-send` — Send &lt;keys&gt; to a Vim server and exit
+- `--remote-silent` — Same as --remote, do not complain if there is no server
+- `--remote-tab` — As --remote but use tab page per file
+- `--remote-tab-silent` — As --remote-silent but use tab page per file
+- `--remote-tab-wait` — As --remote-wait but use tab page per file
+- `--remote-tab-wait-silent` — As --remote-wait-silent but use tab page per file
+- `--remote-wait` — As --remote but wait for files to have been edited
+- `--remote-wait-silent` — Same as --remote-wait, do not complain if there is no server
+- `--serverlist` — List available Vim server names and exit
+- `--servername` — Send to/become the Vim server &lt;name&gt;
+- `--startuptime` — Write startup timing messages to &lt;file&gt;
+- `--ttyfail` — Exit if input or output is not a terminal
+- `--version` — Print version information and exit
+- `-A` — Start in Arabic mode
+- `-C` — Compatible with Vi: 'compatible'
+- `-D` — Debugging mode
+- `-E` — Improved Ex mode
+- `-H` — Start in Hebrew mode
+- `-L` — Same as -r
+- `-M` — Modifications in text not allowed
+- `-N` — Not fully Vi compatible: 'nocompatible'
+- `-O` — Like -o but split vertically
+- `-R` — Readonly mode
+- `-S` — Source file &lt;session&gt; after loading the first file
+- `-T` — Set terminal type to &lt;terminal&gt;
+- `-V` — Be verbose
+- `-W` — Write all typed commands to file &lt;scriptout&gt;
+- `-Z` — Restricted mode
+- `-b` — Binary mode
+- `-c` — Execute &lt;command&gt; after loading the first file
+- `-d` — Diff mode
+- `-e` — Ex mode
+- `-h`, `--help` — Print Help (this message) and exit
+- `-i` — Use &lt;viminfo&gt; instead of .viminfo
+- `-l` — Lisp mode
+- `-m` — Modifications (writing files) not allowed
+- `-n` — No swap file, use memory only
+- `-o` — Open N windows
+- `-p` — Open N tab pages
+- `-r` — List swap files or recover crashed session
+- `-s` — Read Normal mode commands from file &lt;scriptin&gt;
+- `-u` — Use &lt;vimrc&gt; instead of any .vimrc
+- `-v` — Vi mode
+- `-w` — Append all typed commands to file &lt;scriptout&gt;
+- `-x` — Edit encrypted files
+- `-y` — Easy mode
+- `files` — Files to edit Files to open in editor buffers.
+
+## `wget [--accept <Path>] [--accept-regex <value>] [--adjust-extension] [--append-output <Path>] [--ask-password] [--auth-no-challenge] [--background] [--backup-converted] [--backups <value>] [--base <value>] [--bind-address <value>] [--body-data <value>] [--body-file <Path>] [--ca-certificate <Path>] [--ca-directory <Directory>] [--certificate <Path>] [--certificate-type <value>] [--ciphers <value>] [--compression <value>] [--config <Path>] [--connect-timeout <value>] [--content-disposition] [--content-on-error] [--continue] [--convert-file-only] [--convert-links] [--crl-file <Path>] [--cut-dirs <value>] [--debug] [--default-page <value>] [--delete-after] [--directory-prefix <Directory>] [--dns-timeout <value>] [--domains <value>] [--exclude-directories <value>] [--exclude-domains <value>] [--execute <value>] [--follow-ftp] [--follow-tags <value>] [--force-directories] [--force-html] [--ftp-password <value>] [--ftp-user <value>] [--ftps-clear-data-connection] [--ftps-fallback-to-ftp] [--ftps-implicit] [--ftps-resume-ssl] [--header <value>...] [--help] [--hsts-file] [--http-password <value>] [--http-user <value>] [--https-only] [--ignore-case] [--ignore-length] [--ignore-tags <value>] [--include-directories <value>] [--inet4-only] [--inet6-only] [--input-file <Path>] [--keep-session-cookies] [--level <value>] [--limit-rate <value>] [--load-cookies <Path>] [--local-encoding <value>] [--max-redirect] [--method <value>] [--mirror] [--no-cache] [--no-check-certificate] [--no-clobber] [--no-config] [--no-cookies] [--no-directories] [--no-dns-cache] [--no-glob] [--no-host-directories] [--no-hsts] [--no-http-keep-alive] [--no-if-modified-since] [--no-iri] [--no-netrc] [--no-parent] [--no-passive-ftp] [--no-proxy] [--no-remove-listing] [--no-use-server-timestamps] [--no-verbose] [--no-warc-compression] [--no-warc-digests] [--no-warc-keep-log] [--output-document <Path>] [--output-file <Path>] [--page-requisites] [--password <value>] [--pinnedpubkey <value>] [--post-data <value>] [--post-file <Path>] [--prefer-family <value>] [--preserve-permissions] [--private-key <Path>] [--private-key-type <value>] [--progress <value>] [--protocol-directories] [--proxy-password <value>] [--proxy-user <value>] [--quiet] [--quota <value>] [--random-wait] [--read-timeout <value>] [--recursive] [--referer <value>] [--regex-type <value>] [--reject <Path>] [--reject-regex <value>] [--rejected-log <Path>] [--relative] [--remote-encoding <value>] [--report-speed <value>] [--restrict-file-names <value>] [--retr-symlinks] [--retry-connrefused] [--retry-on-host-error] [--retry-on-http-error <value>] [--save-cookies <Path>] [--save-headers] [--secure-protocol <value>] [--server-response] [--show-progress] [--span-hosts] [--spider] [--start-pos <value>] [--strict-comments] [--timeout <value>] [--timestamping] [--tries <value>] [--trust-server-names] [--unlink] [--use-askpass <value>] [--user <value>] [--user-agent <value>] [--verbose] [--version] [--wait <value>] [--waitretry <value>] [--warc-cdx] [--warc-dedup <Path>] [--warc-file <Path>] [--warc-header <value>] [--warc-max-size <value>] [--warc-tempdir <Directory>] [--xattr] <urls>...`
+
+Download files from URLs
+
+Retrieves resources non-interactively over HTTP, HTTPS, and supported transfer protocols.
+
+Related intents: download a file; mirror a website.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `--accept-regex` — regex matching accepted URLs
+- `--ask-password` — prompt for passwords
+- `--auth-no-challenge` — send Basic HTTP authentication information without first waiting for the server's challenge
+- `--backups` — before writing file X, rotate up to N backup files
+- `--bind-address` — bind to ADDRESS (hostname or IP) on local host
+- `--body-data` — send STRING as data. --method MUST be set
+- `--body-file` — send contents of FILE. --method MUST be set
+- `--ca-certificate` — file with the bundle of CAs
+- `--ca-directory` — directory where hash list of CAs is stored
+- `--certificate` — client certificate file
+- `--certificate-type` — client certificate type, PEM or DER
+- `--ciphers` — Set the priority string (GnuTLS) or cipher list string (OpenSSL) directly.
+- `--compression` — choose compression
+- `--config` — specify config file to use
+- `--connect-timeout` — set the connect timeout to SECS
+- `--content-disposition` — honor the Content-Disposition header when choosing local file names
+- `--content-on-error` — output the received content on server errors
+- `--convert-file-only` — convert the file part of the URLs only (usually known as the basename)
+- `--crl-file` — file with bundle of CRLs
+- `--cut-dirs` — ignore NUMBER remote directory components
+- `--default-page` — change the default page name
+- `--delete-after` — delete files locally after downloading them
+- `--dns-timeout` — set the DNS lookup timeout to SECS
+- `--exclude-domains` — comma-separated list of rejected domains
+- `--follow-ftp` — follow FTP links from HTML documents
+- `--follow-tags` — comma-separated list of followed HTML tags
+- `--ftp-password` — set ftp password to PASS
+- `--ftp-user` — set ftp user to USER
+- `--ftps-clear-data-connection` — cipher the control channel only; all the data will be in plaintext
+- `--ftps-fallback-to-ftp` — fall back to FTP if FTPS is not supported in the target server
+- `--ftps-implicit` — use implicit FTPS (default port is 990)
+- `--ftps-resume-ssl` — resume the SSL/TLS session started in the control connection
+- `--header` — insert STRING among the headers
+- `--hsts-file` — path of HSTS database (will override default)
+- `--http-password` — set http password to PASS
+- `--http-user` — set http user to USER
+- `--https-only` — only follow secure HTTPS links
+- `--ignore-case` — ignore case when matching files/directories
+- `--ignore-length` — ignore 'Content-Length' header field
+- `--ignore-tags` — comma-separated list of ignored HTML tags
+- `--keep-session-cookies` — load and save session (non-permanent) cookies
+- `--limit-rate` — limit download rate to RATE
+- `--load-cookies` — load cookies from FILE before session
+- `--local-encoding` — use ENC as the local encoding for IRIs
+- `--max-redirect` — maximum redirections allowed per page
+- `--method` — use method "HTTPMethod" in the request
+- `--no-cache` — disallow server-cached data
+- `--no-check-certificate` — don't validate the server's certificate
+- `--no-clobber` — skip downloads that would download to existing files
+- `--no-config` — do not read any config file
+- `--no-cookies` — don't use cookies
+- `--no-directories` — don't create directories
+- `--no-dns-cache` — disable caching DNS lookups
+- `--no-glob` — turn off FTP file name globbing
+- `--no-host-directories` — don't create host directories
+- `--no-hsts` — disable HSTS
+- `--no-http-keep-alive` — disable HTTP keep-alive (persistent connections)
+- `--no-if-modified-since` — don't use conditional if-modified-since get requests in timestamping mode
+- `--no-iri` — turn off IRI support
+- `--no-netrc` — don't try to obtain credentials from .netrc
+- `--no-parent` — don't ascend to the parent directory
+- `--no-passive-ftp` — disable the "passive" transfer mode
+- `--no-proxy` — explicitly turn off proxy
+- `--no-remove-listing` — don't remove '.listing' files
+- `--no-use-server-timestamps` — don't set the local file's timestamp by the one on the server
+- `--no-verbose` — turn off verboseness, without being quiet
+- `--no-warc-compression` — do not compress WARC files with GZIP
+- `--no-warc-digests` — do not calculate SHA1 digests
+- `--no-warc-keep-log` — do not store the log file in a WARC record
+- `--password` — set both ftp and http password to PASS
+- `--pinnedpubkey` — Public key (PEM/DER) file, or any number of base64 encoded sha256 hashes
+- `--post-data` — use the POST method; send STRING as the data
+- `--post-file` — use the POST method; send contents of FILE
+- `--prefer-family` — connect first to addresses of specified family
+- `--preserve-permissions` — preserve remote file permissions
+- `--private-key` — private key file
+- `--private-key-type` — private key type, PEM or DER
+- `--progress` — select progress gauge type
+- `--protocol-directories` — use protocol name in directories
+- `--proxy-password` — set PASS as proxy password
+- `--proxy-user` — set USER as proxy username
+- `--random-wait` — wait from 0.5*WAIT...1.5*WAIT secs between retrievals
+- `--read-timeout` — set the read timeout to SECS
+- `--referer` — include 'Referer: URL' header in HTTP request
+- `--regex-type` — regex type (posix|pcre)
+- `--reject-regex` — regex matching rejected URLs
+- `--rejected-log` — log reasons for URL rejection to FILE
+- `--remote-encoding` — use ENC as the default remote encoding
+- `--report-speed` — output bandwidth as TYPE.  TYPE can be bits
+- `--restrict-file-names` — restrict chars in file names to ones OS allows
+- `--retr-symlinks` — when recursing, get linked-to files (not dir)
+- `--retry-connrefused` — retry even if connection is refused
+- `--retry-on-host-error` — retry if a DNS resolution error occurs
+- `--retry-on-http-error` — comma-separated list of HTTP errors to retry
+- `--save-cookies` — save cookies to FILE after session
+- `--save-headers` — save the HTTP headers to file
+- `--secure-protocol` — choose secure protocol, one of auto, SSLv2,
+- `--show-progress` — display the progress bar in any verbosity mode
+- `--spider` — don't download anything
+- `--start-pos` — start downloading from zero-based position OFFSET
+- `--strict-comments` — turn on strict (SGML) handling of HTML comments
+- `--trust-server-names` — use the name specified by the redirection URL's last component
+- `--unlink` — remove file before clobber
+- `--use-askpass` — specify credential handler for requesting username and password
+- `--user` — set both ftp and http user to USER
+- `--waitretry` — wait 1..SECONDS between retries of a retrieval
+- `--warc-cdx` — write CDX index files
+- `--warc-dedup` — do not store records listed in this CDX file
+- `--warc-file` — save request/response data to a .warc.gz file
+- `--warc-header` — insert STRING into the warcinfo record
+- `--warc-max-size` — set maximum size of WARC files to NUMBER
+- `--warc-tempdir` — location for temporary files created by the
+- `--xattr` — turn on storage of metadata in extended file attributes
+- `-4`, `--inet4-only` — connect only to IPv4 addresses
+- `-6`, `--inet6-only` — connect only to IPv6 addresses
+- `-A`, `--accept` — comma-separated list of accepted extensions
+- `-B`, `--base` — resolves HTML input-file links relative to URL
+- `-D`, `--domains` — comma-separated list of accepted domains
+- `-E`, `--adjust-extension` — save HTML/CSS documents with proper extensions
+- `-F`, `--force-html` — treat input file as HTML
+- `-H`, `--span-hosts` — go to foreign hosts when recursive
+- `-I`, `--include-directories` — list of allowed directories
+- `-K`, `--backup-converted` — before converting file X, back up as X.orig
+- `-L`, `--relative` — follow relative links only
+- `-N`, `--timestamping` — don't re-retrieve files unless newer than local
+- `-O`, `--output-document` — write documents to FILE
+- `-P`, `--directory-prefix` — save files to PREFIX/..
+- `-Q`, `--quota` — set retrieval quota to NUMBER
+- `-R`, `--reject` — comma-separated list of rejected extensions
+- `-S`, `--server-response` — print server response
+- `-T`, `--timeout` — set all timeout values to SECONDS
+- `-U`, `--user-agent` — identify as AGENT instead of Wget/VERSION
+- `-V`, `--version` — display the version of Wget and exit
+- `-X`, `--exclude-directories` — list of excluded directories
+- `-a`, `--append-output` — append messages to FILE
+- `-b`, `--background` — go to background after startup
+- `-c`, `--continue` — resume getting a partially-downloaded file
+- `-d`, `--debug` — print lots of debugging information
+- `-e`, `--execute` — execute a `.wgetrc'-style command
+- `-h`, `--help` — print this help
+- `-i`, `--input-file` — download URLs found in local or external FILE
+- `-k`, `--convert-links` — make links in downloaded HTML or CSS point to local files
+- `-l`, `--level` — maximum recursion depth (inf or 0 for infinite)
+- `-m`, `--mirror` — shortcut for -N -r -l inf --no-remove-listing
+- `-o`, `--output-file` — log messages to FILE
+- `-p`, `--page-requisites` — get all images, etc. needed to display HTML page
+- `-q`, `--quiet` — quiet (no output)
+- `-r`, `--recursive` — specify recursive download
+- `-t`, `--tries` — set number of retries to NUMBER (0 unlimits)
+- `-v`, `--verbose` — be verbose (this is the default)
+- `-w`, `--wait` — wait SECONDS between retrievals
+- `-x`, `--force-directories` — force creation of directories
+- `urls` — Resources to retrieve One or more URLs to download.
+
+## `zip [-0] [-1] [-9] [-A] [-D] [-F] [-J] [-T] [-X] [-c] [-d] [-e] [-f] [-i] [-j] [-l] [-m] [-n <value>] [-o] [-q] [-r] [-u] [-v] [-x] [-y] [-z] <archive> [<files>...]`
+
+Create or update ZIP archives
+
+Packages and compresses files into a ZIP archive or updates an existing archive.
+
+Related intents: add files to a zip archive; create a zip archive.
+
+- Input: `Unknown`
+- Output: `Unknown`
+- Live streaming: `false`
+
+Options:
+
+- `-0` — store only
+- `-1` — compress faster
+- `-9` — compress better
+- `-A` — adjust self-extracting exe
+- `-D` — do not add directory entries
+- `-F` — fix zipfile (-FF try harder)
+- `-J` — junk zipfile prefix (unzipsfx)
+- `-T` — test zipfile integrity
+- `-X` — eXclude eXtra file attributes
+- `-c` — add one-line comments
+- `-d` — delete entries in zipfile
+- `-e` — encrypt
+- `-f` — freshen: only changed files
+- `-i` — include only the following names
+- `-j` — junk (don't record) directory names
+- `-l` — convert LF to CR LF
+- `-m` — move into zipfile (delete OS files)
+- `-n` — don't compress these suffixes
+- `-o` — make zipfile as old as latest entry
+- `-q` — quiet operation
+- `-r` — recurse into directories
+- `-u` — update: only changed or new files
+- `-v` — verbose operation/print version info
+- `-x` — exclude the following names
+- `-y` — store symbolic links as the link instead of the referenced file
+- `-z` — add zipfile comment
+- `archive` — ZIP archive Archive file to create or update.
+- `files` — Files to archive Files or directories to add to the archive.

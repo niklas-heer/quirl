@@ -1,0 +1,19 @@
+catalog "cat-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "cat" summary="concatenate files and print on the standard output" description="concatenate files and print on the standard output" {
+        platform "linux"
+        platform "freebsd"
+        flag "--help" summary="display this help and exit" description="display this help and exit"
+        flag "--number" summary="number all output lines" description="number all output lines" short="-n"
+        flag "--number-nonblank" summary="number nonempty output lines, overrides -n" description="number nonempty output lines, overrides -n" short="-b"
+        flag "--show-all" summary="equivalent to -vET" description="equivalent to -vET" short="-A"
+        flag "--show-ends" summary="display $ or ^M$ at end of each line" description="display $ or ^M$ at end of each line" short="-E"
+        flag "--show-nonprinting" summary="use ^ and M- notation, except for LFD and TAB" description="use ^ and M- notation, except for LFD and TAB" short="-v"
+        flag "--show-tabs" summary="display TAB characters as ^I" description="display TAB characters as ^I" short="-T"
+        flag "--squeeze-blank" summary="suppress repeated empty output lines" description="suppress repeated empty output lines" short="-s"
+        flag "--version" summary="output version information and exit" description="output version information and exit"
+        flag "-e" summary="equivalent to -vE" description="equivalent to -vE"
+        flag "-t" summary="equivalent to -vT" description="equivalent to -vT"
+        flag "-u" summary="(ignored)" description="(ignored)"
+    }
+}

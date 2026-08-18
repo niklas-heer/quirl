@@ -1,0 +1,28 @@
+catalog "gzip-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "gzip" summary="Compress or uncompress files" description="Compress or uncompress files" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--best" summary="compress better" description="compress better" short="-9"
+        flag "--decompress" summary="decompress" description="decompress" short="-d"
+        flag "--fast" summary="compress faster" description="compress faster" short="-1"
+        flag "--force" summary="force overwrite of output file and compress links" description="force overwrite of output file and compress links" short="-f"
+        flag "--help" summary="give this help" description="give this help" short="-h"
+        flag "--keep" summary="keep (don't delete) input files" description="keep (don't delete) input files" short="-k"
+        flag "--license" summary="display software license" description="display software license" short="-L"
+        flag "--list" summary="list compressed file contents" description="list compressed file contents" short="-l"
+        flag "--name" summary="save or restore the original name and timestamp" description="save or restore the original name and timestamp" short="-N"
+        flag "--no-name" summary="do not save or restore the original name and timestamp" description="do not save or restore the original name and timestamp" short="-n"
+        flag "--quiet" summary="suppress all warnings" description="suppress all warnings" short="-q"
+        flag "--recursive" summary="operate recursively on directories" description="operate recursively on directories" short="-r"
+        flag "--rsyncable" summary="make rsync-friendly archive" description="make rsync-friendly archive"
+        flag "--stdout" summary="write on standard output, keep original files unchanged" description="write on standard output, keep original files unchanged" short="-c"
+        flag "--suffix" summary="use suffix SUF on compressed files" description="use suffix SUF on compressed files" short="-S" value="value"
+        flag "--synchronous" summary="synchronous output (safer if system crashes, but slower)" description="synchronous output (safer if system crashes, but slower)"
+        flag "--test" summary="test compressed file integrity" description="test compressed file integrity" short="-t"
+        flag "--verbose" summary="verbose mode" description="verbose mode" short="-v"
+        flag "--version" summary="display version number" description="display version number" short="-V"
+    }
+}

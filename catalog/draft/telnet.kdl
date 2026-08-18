@@ -1,0 +1,25 @@
+catalog "telnet-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "telnet" summary="User interface to TELNET" description="User interface to TELNET" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--binary" summary="use an 8-bit data transmission" description="use an 8-bit data transmission" short="-8"
+        flag "--binary-output" summary="use an 8-bit data transmission for output only" description="use an 8-bit data transmission for output only" short="-L"
+        flag "--debug" summary="turn on debugging" description="turn on debugging" short="-d"
+        flag "--escape" summary="use CHAR as an escape character" description="use CHAR as an escape character" short="-e" value="value"
+        flag "--help" summary="give this help list" description="give this help list"
+        flag "--ipv4" summary="use only IPv4" description="use only IPv4" short="-4"
+        flag "--ipv6" summary="use only IPv6" description="use only IPv6" short="-6"
+        flag "--login" summary="attempt automatic login" description="attempt automatic login" short="-a"
+        flag "--no-escape" summary="use no escape character" description="use no escape character" short="-E"
+        flag "--no-login" summary="do not automatically login to the remote system" description="do not automatically login to the remote system" short="-K"
+        flag "--no-rc" summary="do not read the user's .telnetrc file" description="do not read the user's .telnetrc file" short="-c"
+        flag "--rlogin" summary="use a user-interface similar to rlogin" description="use a user-interface similar to rlogin" short="-r"
+        flag "--trace" summary="record trace information into FILE" description="record trace information into FILE" short="-n" value="value" action="files"
+        flag "--usage" summary="give a short usage message" description="give a short usage message"
+        flag "--user" summary="attempt automatic login as USER" description="attempt automatic login as USER" short="-l" value="value" action="users"
+        flag "--version" summary="print program version" description="print program version" short="-V"
+    }
+}

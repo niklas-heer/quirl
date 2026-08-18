@@ -101,7 +101,7 @@ Each command may contain only these child nodes:
 | `alias "token"` | Zero or more alternate invocation tokens, unique within the sibling scope. |
 | `intent "phrase"` | Zero or more unique task-language phrases included in semantic search. |
 | `platform "selector"` | Zero or more effective-platform selectors; omission inherits the parent. |
-| `flag "--long" ...` | Zero or more named options, with unique long and short spellings per command. |
+| `flag "--long" ...` | Zero or more named options, with unique canonical and short-alias spellings per command. |
 | `argument "name" ...` | Zero or more ordered positional arguments. |
 | `command "name" ...` | Zero or more recursively bounded subcommands. |
 
@@ -112,22 +112,24 @@ derive one from the other and does not interpret markup.
 
 ### Flags
 
-A `flag` has exactly one positional canonical long name. A valid long name
-starts with `--`; the remaining nonempty spelling uses lowercase ASCII letters,
-digits, and hyphens and begins with a lowercase letter or digit. Flags have no
-child block.
+A `flag` has exactly one positional canonical spelling. A long spelling starts
+with `--`; its nonempty remainder uses lowercase ASCII letters, digits, and
+hyphens and begins with a lowercase letter or digit. A POSIX short-only
+spelling is `-` followed by one ASCII letter or digit. A Windows spelling
+starts with `/` and then uses one or more ASCII letters, digits, or hyphens.
+Flags have no child block.
 
 | Property | Required | Contract |
 | --- | --- | --- |
 | `summary` | yes | Nonempty short description. |
 | `description` | yes | Nonempty behavioral explanation. |
-| `short` | no | `-` followed by exactly one ASCII letter or digit. |
+| `short` | no | `-` followed by exactly one ASCII letter or digit; valid only when the canonical spelling is long. |
 | `value` | no | Identifier naming the consumed value; absence makes this a boolean flag. |
 | `required` | no | Boolean, default `#false`; whether invocation requires the flag. |
 | `repeatable` | no | Boolean, default `#false`; whether the flag may occur more than once. |
 | `action` | no | Closed native completion action for the consumed value; invalid on a boolean flag. |
 
-Long and short spellings share one uniqueness namespace within a command. The
+Canonical and short-alias spellings share one uniqueness namespace within a command. The
 schema does not currently express conflicts, static enum values, defaults,
 deprecation, types, or dynamic providers; none may be inferred from upstream
 syntax.
@@ -264,7 +266,7 @@ One transaction writes the exact typed JSON snapshot and all normalized rows;
 no timestamp, random value, absolute build path, locale-dependent comparison,
 filesystem iteration order, or network result enters the image. Compiling the
 same typed catalog twice must yield identical bytes. `application_id` is
-`QCNC` (`0x51434e43`) and `user_version` is `1`.
+`QCNC` (`0x51434e43`) and `user_version` is `2`.
 
 A reader validates the application identity, schema version, `quick_check(1)`,
 deny-unknown typed snapshot, all semantic limits, and exact deterministic
@@ -331,10 +333,12 @@ pinned revision update is reviewed as a supply-chain change:
 1. Change the tooling-owned pin to one immutable upstream revision and verify
    the fetched/provided source identity.
 2. Run the bounded import operation for explicitly selected commands into a
-   separate draft area. The checked-in selection includes common filesystem and
-   shell commands (`ls`, `cd`, `cp`, `mv`, `rm`, `pwd`, `cat`, `head`, `tail`,
-   `tar`), utilities (`fd`, `grep`, `ssh`), Windows variants (`mkdir`, `rmdir`),
-   and the nested `task completion <shell>` tree.
+   separate draft area. The checked-in selection currently contains 90 root
+   command files and 96 command paths, including common filesystem and shell
+   commands, development tools, editors, network utilities, archive tools,
+   Windows-specific commands, and the nested `task completion <shell>` tree.
+   Explicit coverage floors in `catalog/carapace-import.json` prevent silent
+   corpus shrinkage.
 3. Run the canonical format operation on the draft, then inspect the complete
    KDL diff. Do not accept invented or silently dropped facts.
 4. Review command shape, subcommands, aliases, flags, argument ordering,
@@ -348,10 +352,15 @@ pinned revision update is reviewed as a supply-chain change:
 7. Review the resulting checksum change. Unchanged canonical KDL must not
    produce a different database.
 
+The initial reviewed runtime base contains 50 curated root commands. The wider
+90-file Carapace corpus remains checked in beside it as update and promotion
+proposals; draft count is deliberately reported separately from runtime count.
+
 Run the implemented task-runner interface from the repository root:
 
 ```sh
 cargo xtask catalog import-carapace --source <checkout> --revision <40-character-pin>
+cargo xtask catalog promote --command <reviewed-command>
 cargo xtask catalog fmt
 cargo xtask catalog fmt --check
 cargo xtask catalog check
@@ -366,14 +375,28 @@ never executed. The upstream and retained license files must both match the
 reviewed SHA-256 pin. Unsupported completion constructs are omitted rather than
 invented and are listed explicitly in `carapace.import.json` with their source
 file and Cobra variable for review. Each selected root is written to
-`catalog/draft/carapace-<command>.kdl`; obsolete importer-owned aggregate or
-per-command drafts are removed only after every replacement has rendered and
-validated. The operation updates only `catalog/draft` and refuses any imported
-root that collides with `catalog/curated`. `fmt --check` is non-mutating.
+`catalog/draft/<command>.kdl`; provenance in the KDL and the exact path list in
+the import manifest identify ownership, so a redundant source prefix is
+unnecessary. Obsolete importer-owned aggregate or per-command drafts are
+removed only after every replacement has rendered and validated. The operation
+updates only `catalog/draft`; a draft may intentionally share a root name with
+curated KDL because that is how upstream updates remain reviewable. `catalog
+promote` is an explicit first-promotion helper: it accepts named commands only,
+requires matching reviewed provenance, and refuses to overwrite an existing
+curated file. Subsequent changes are applied by reviewing the semantic diff and
+editing curated KDL. `fmt --check` is non-mutating.
 `check` validates formatting, schema, provenance, license retention,
 curated/draft separation, generated database bytes, the checksum, and
 hardened-reader admission using the same embedded limits as runtime. `build`
 refreshes the generated SQLite image and checksum from curated KDL only.
+
+The importer does not read whichever Zsh completion functions happen to be
+installed on the build host. Those files vary by operating system and package
+set and therefore cannot be a reproducible catalog input. A future Zsh-source
+import must pin an immutable source revision and license, retain its own
+per-command provenance, and pass through the same draft review boundary.
+Catalog development commands admit at most 256 total curated and draft KDL
+files, so expanding the source set remains an explicit bounded change.
 
 ## Runtime lookup and fallback
 

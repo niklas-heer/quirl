@@ -65,7 +65,7 @@ jobs:
             catalog/generated/catalog.sqlite3
             catalog/generated/catalog.sqlite3.sha256
             catalog/provenance
-            catalog/draft/carapace-*.kdl
+            catalog/draft/*.kdl
             catalog/draft/carapace.import.json
           if-no-files-found: error
           retention-days: 14

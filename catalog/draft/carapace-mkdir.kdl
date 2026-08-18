@@ -1,6 +1,0 @@
-catalog "carapace-mkdir-draft" {
-    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
-    command "mkdir" summary="create a directory" description="create a directory" {
-        platform "windows"
-    }
-}

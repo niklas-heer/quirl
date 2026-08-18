@@ -1,0 +1,17 @@
+catalog "vi-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "vi" summary="screen oriented (visual) display editor based on ex" description="screen oriented (visual) display editor based on ex" {
+        platform "linux"
+        platform "macos"
+        platform "freebsd"
+        flag "-L" summary="temporary file to open in recovery mode" description="temporary file to open in recovery mode" value="value"
+        flag "-R" summary="Files are opened read-only when this option is given" description="Files are opened read-only when this option is given"
+        flag "-V" summary="Echo command input to standard error, unless it originates from a terminal" description="Echo command input to standard error, unless it originates from a terminal"
+        flag "-c" summary="Execute command when editing begins" description="Execute command when editing begins" value="value"
+        flag "-l" summary="Start in a special mode useful for the Lisp programming language" description="Start in a special mode useful for the Lisp programming language"
+        flag "-r" summary="temporary file to open in recovery mode" description="temporary file to open in recovery mode" value="value"
+        flag "-s" summary="Script mode, all feedback for interactive editing is disabled" description="Script mode, all feedback for interactive editing is disabled"
+        flag "-t" summary="Read the tags file, then choose the file and position specified by tagstring for editing" description="Read the tags file, then choose the file and position specified by tagstring for editing" value="value"
+        flag "-w" summary="Specify the size of the editing window for visual mode" description="Specify the size of the editing window for visual mode" value="value"
+    }
+}

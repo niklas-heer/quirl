@@ -1,0 +1,22 @@
+catalog "strings-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "strings" summary="print the sequences of printable characters in files" description="print the sequences of printable characters in files" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--all" summary="Scan the entire file, not just the data section [default]" description="Scan the entire file, not just the data section [default]" short="-a"
+        flag "--bytes" summary="Locate & print any NUL-terminated sequence of at" description="Locate & print any NUL-terminated sequence of at" short="-n" value="value"
+        flag "--data" summary="Only scan the data sections in the file" description="Only scan the data sections in the file" short="-d"
+        flag "--encoding" summary="Select character size and endianness:" description="Select character size and endianness:" short="-e" value="value"
+        flag "--help" summary="Display this information" description="Display this information" short="-h"
+        flag "--include-all-whitespace" summary="Include all whitespace as valid string characters" description="Include all whitespace as valid string characters" short="-w"
+        flag "--output-separator" summary="String used to separate strings in output." description="String used to separate strings in output." short="-s" value="value"
+        flag "--print-file-name" summary="Print the name of the file before each string" description="Print the name of the file before each string" short="-f"
+        flag "--radix" summary="Print the location of the string in base 8, 10 or 16" description="Print the location of the string in base 8, 10 or 16" short="-t" value="value"
+        flag "--target" summary="Specify the binary file format" description="Specify the binary file format" short="-T" value="value"
+        flag "--unicode" summary="Specify how to treat UTF-8 encoded unicode characters" description="Specify how to treat UTF-8 encoded unicode characters" short="-U" value="value"
+        flag "--version" summary="Print the program's version number" description="Print the program's version number" short="-v"
+        flag "-o" summary="An alias for --radix=o" description="An alias for --radix=o"
+    }
+}

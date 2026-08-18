@@ -1,0 +1,38 @@
+catalog "python" {
+    provenance author="Carapace contributors; curated by Quirl contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "python" summary="Run Python code" description="Executes a Python script, module, command string, or interactive interpreter session." {
+        alias "python3"
+        intent "run a python script"
+        intent "start a python repl"
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--check-hash-based-pycs" summary="control how Python invalidates hash-based .pyc files" description="control how Python invalidates hash-based .pyc files" value="value"
+        flag "--help-all" summary="print complete help information and exit" description="print complete help information and exit"
+        flag "--help-env" summary="print help about Python environment variables and exit" description="print help about Python environment variables and exit"
+        flag "--help-xoptions" summary="print help about implementation-specific -X options and exit" description="print help about implementation-specific -X options and exit"
+        flag "-B" summary="don't write .pyc files on import" description="don't write .pyc files on import"
+        flag "-E" summary="ignore PYTHON* environment variables" description="ignore PYTHON* environment variables"
+        flag "-I" summary="isolate Python from the user's environment" description="isolate Python from the user's environment"
+        flag "-O" summary="remove assert and __debug__-dependent statements" description="remove assert and __debug__-dependent statements" repeatable=#true
+        flag "-P" summary="don't prepend a potentially unsafe path to sys.path" description="don't prepend a potentially unsafe path to sys.path"
+        flag "-S" summary="don't imply 'import site' on initialization" description="don't imply 'import site' on initialization"
+        flag "-V" summary="print the Python version number and exit" description="print the Python version number and exit" repeatable=#true
+        flag "-W" summary="warning control" description="warning control" value="value" repeatable=#true
+        flag "-X" summary="set implementation-specific option" description="set implementation-specific option" value="value" repeatable=#true
+        flag "-b" summary="issue warnings about str(bytes_instance), str(bytearray_instance) and comparing bytes/bytearray with str" description="issue warnings about str(bytes_instance), str(bytearray_instance) and comparing bytes/bytearray with str"
+        flag "-c" summary="program passed in as string" description="program passed in as string" value="value"
+        flag "-d" summary="turn on parser debugging output" description="turn on parser debugging output"
+        flag "-h" summary="print this help message and exit" description="print this help message and exit"
+        flag "-i" summary="inspect interactively after running script" description="inspect interactively after running script"
+        flag "-m" summary="run library module as a script" description="run library module as a script" value="value"
+        flag "-q" summary="don't print version and copyright messages on interactive startup" description="don't print version and copyright messages on interactive startup"
+        flag "-s" summary="don't add user site directory to sys.path" description="don't add user site directory to sys.path"
+        flag "-u" summary="force the stdout and stderr streams to be unbuffered" description="force the stdout and stderr streams to be unbuffered"
+        flag "-v" summary="verbose (trace import statements)" description="verbose (trace import statements)" repeatable=#true
+        flag "-x" summary="skip first line of source" description="skip first line of source"
+        argument "script" summary="Python entry file" description="Script to execute; omit it to read input or start an interactive session." action="files"
+        argument "arguments" summary="Script arguments" description="Values exposed to the executed program after the entry file." repeatable=#true
+    }
+}

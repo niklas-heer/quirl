@@ -1,0 +1,21 @@
+catalog "lazygit-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "lazygit" summary="simple terminal UI for git commands" description="simple terminal UI for git commands" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--config" summary="Print the default config" description="Print the default config" short="-c"
+        flag "--debug" summary="Run in debug mode with logging (see --logs flag below). Use the LOG_LEVEL env var to set the log level (debug/info/warn/error)" description="Run in debug mode with logging (see --logs flag below). Use the LOG_LEVEL env var to set the log level (debug/info/warn/error)" short="-d"
+        flag "--filter" summary="Path to filter on in `git log -- <path>`." description="Path to filter on in `git log -- <path>`." short="-f" value="value"
+        flag "--git-dir" summary="equivalent of the --git-dir git argument" description="equivalent of the --git-dir git argument" short="-g" value="value" action="directories"
+        flag "--help" summary="Displays help with available flag, subcommand, and positional value parameters." description="Displays help with available flag, subcommand, and positional value parameters." short="-h"
+        flag "--logs" summary="Tail lazygit logs (intended to be used when `lazygit --debug` is called in a separate terminal tab)" description="Tail lazygit logs (intended to be used when `lazygit --debug` is called in a separate terminal tab)" short="-l"
+        flag "--path" summary="Path of git repo." description="Path of git repo." short="-p" value="value" action="directories"
+        flag "--print-config-dir" summary="Print the config directory" description="Print the config directory"
+        flag "--use-config-dir" summary="override default config directory with provided directory" description="override default config directory with provided directory" value="value" action="directories"
+        flag "--use-config-file" summary="Comma seperated list to custom config file(s)" description="Comma seperated list to custom config file(s)" value="value"
+        flag "--version" summary="Print the current version" description="Print the current version" short="-v"
+        flag "--work-tree" summary="equivalent of the --work-tree git argument" description="equivalent of the --work-tree git argument" short="-w" value="value"
+    }
+}

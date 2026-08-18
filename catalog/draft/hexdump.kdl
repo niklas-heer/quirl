@@ -1,0 +1,24 @@
+catalog "hexdump-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "hexdump" summary="Display file contents in hexadecimal, decimal, octal, or ascii" description="Display file contents in hexadecimal, decimal, octal, or ascii" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--canonical" summary="canonical hex+ASCII display" description="canonical hex+ASCII display" short="-C"
+        flag "--color" summary="interpret color formatting specifiers" description="interpret color formatting specifiers" short="-L" value="value"
+        flag "--format" summary="format string to be used for displaying data" description="format string to be used for displaying data" short="-e" value="value"
+        flag "--format-file" summary="file that contains format strings" description="file that contains format strings" short="-f" value="value"
+        flag "--help" summary="display this help" description="display this help" short="-h"
+        flag "--length" summary="interpret only length bytes of input" description="interpret only length bytes of input" short="-n" value="value"
+        flag "--no-squeezing" summary="output identical lines" description="output identical lines" short="-v"
+        flag "--one-byte-char" summary="one-byte character display" description="one-byte character display" short="-c"
+        flag "--one-byte-hex" summary="one-byte hexadecimal display" description="one-byte hexadecimal display" short="-X"
+        flag "--one-byte-octal" summary="one-byte octal display" description="one-byte octal display" short="-b"
+        flag "--skip" summary="skip offset bytes from the beginning" description="skip offset bytes from the beginning" short="-s" value="value"
+        flag "--two-bytes-decimal" summary="two-byte decimal display" description="two-byte decimal display" short="-d"
+        flag "--two-bytes-hex" summary="two-byte hexadecimal display" description="two-byte hexadecimal display" short="-x"
+        flag "--two-bytes-octal" summary="two-byte octal display" description="two-byte octal display" short="-o"
+        flag "--version" summary="display version" description="display version" short="-V"
+    }
+}

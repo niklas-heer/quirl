@@ -1,0 +1,16 @@
+catalog "bc-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "bc" summary="An arbitrary precision calculator language" description="An arbitrary precision calculator language" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--help" summary="print this usage and exit" description="print this usage and exit" short="-h"
+        flag "--interactive" summary="force interactive mode" description="force interactive mode" short="-i"
+        flag "--mathlib" summary="use the predefined math routines" description="use the predefined math routines" short="-l"
+        flag "--quiet" summary="don't print initial banner" description="don't print initial banner" short="-q"
+        flag "--standard" summary="non-standard bc constructs are errors" description="non-standard bc constructs are errors" short="-s"
+        flag "--version" summary="print version information and exit" description="print version information and exit" short="-v"
+        flag "--warn" summary="warn about non-standard bc constructs" description="warn about non-standard bc constructs" short="-w"
+    }
+}

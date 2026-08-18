@@ -1,0 +1,20 @@
+catalog "autoconf-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "autoconf" summary="Generate a configuration script from a TEMPLATE-FILE" description="Generate a configuration script from a TEMPLATE-FILE" {
+        platform "linux"
+        platform "macos"
+        platform "windows"
+        platform "freebsd"
+        flag "--debug" summary="don't remove temporary files" description="don't remove temporary files" short="-d"
+        flag "--force" summary="consider all files obsolete" description="consider all files obsolete" short="-f"
+        flag "--help" summary="print this help, then exit" description="print this help, then exit" short="-h"
+        flag "--include" summary="append directory DIR to search path" description="append directory DIR to search path" short="-I" value="value" action="directories"
+        flag "--initialization" summary="also trace Autoconf's initialization process" description="also trace Autoconf's initialization process" short="-i"
+        flag "--output" summary="save output in FILE (stdout is the default)" description="save output in FILE (stdout is the default)" short="-o" value="value" action="files"
+        flag "--prepend-include" summary="prepend directory DIR to search path" description="prepend directory DIR to search path" short="-B" value="value" action="directories"
+        flag "--trace" summary="report the list of calls to MACRO" description="report the list of calls to MACRO" short="-t" value="value"
+        flag "--verbose" summary="verbosely report processing" description="verbosely report processing" short="-v"
+        flag "--version" summary="print version number, then exit" description="print version number, then exit" short="-V"
+        flag "--warnings" summary="report the warnings falling in CATEGORY" description="report the warnings falling in CATEGORY" short="-W" value="value"
+    }
+}
