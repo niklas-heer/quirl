@@ -5,17 +5,12 @@ use quirl_catalog::{
     NativeDiagnosticKind, NativePlatform,
 };
 use quirl_core::{ErrorCode, ShellError};
-use std::{collections::BTreeSet, sync::OnceLock};
+use std::collections::BTreeSet;
 
-const EMBEDDED_NATIVE_DATABASE: &[u8] =
-    include_bytes!("../../../catalog/generated/catalog.sqlite3");
-const EMBEDDED_NATIVE_CHECKSUM: &str =
-    include_str!("../../../catalog/generated/catalog.sqlite3.sha256");
-const EMBEDDED_NATIVE_SOURCE: &str = "catalog/generated/catalog.sqlite3 (embedded)";
+#[cfg(test)]
+const TEST_NATIVE_DATABASE: &[u8] = include_bytes!("../../../catalog/generated/catalog.sqlite3");
+const DOWNLOADABLE_NATIVE_SOURCE: &str = "downloaded runtime asset completion-database";
 const RUNTIME_LIMITS: NativeCatalogLimits = NativeCatalogLimits::embedded();
-static EMBEDDED_COMMANDS: OnceLock<Result<Vec<CommandSpec>, ShellError>> = OnceLock::new();
-static EMBEDDED_ROOT_COMMAND_NAMES: OnceLock<Result<BTreeSet<String>, ShellError>> =
-    OnceLock::new();
 
 #[cfg(not(any(
     target_os = "linux",
@@ -43,24 +38,27 @@ pub(crate) fn builtin_native_catalog() -> Catalog {
 /// manual pages for known commands even when the embedded definition belongs
 /// to a different operating-system implementation.
 pub(crate) fn embedded_root_command_names() -> Result<BTreeSet<String>, ShellError> {
-    EMBEDDED_ROOT_COMMAND_NAMES
-        .get_or_init(|| {
-            let commands = load_commands(EMBEDDED_NATIVE_DATABASE, NativePlatform::Any)?;
-            Ok(commands
-                .iter()
-                .filter_map(|command| command.path.split_whitespace().next())
-                .map(str::to_owned)
-                .collect())
-        })
-        .clone()
+    let commands = match crate::assets::current_asset_path("completion-database") {
+        Ok(_) => {
+            let bytes = crate::assets::read_current_asset("completion-database")?;
+            load_commands(&bytes, NativePlatform::Any)?
+        }
+        #[cfg(test)]
+        Err(_) => load_commands(TEST_NATIVE_DATABASE, NativePlatform::Any)?,
+        #[cfg(not(test))]
+        Err(_) => Vec::new(),
+    };
+    Ok(commands
+        .iter()
+        .filter_map(|command| command.path.split_whitespace().next())
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Return the build-generated identity of the embedded native database.
-pub(crate) fn embedded_database_identity() -> &'static str {
-    EMBEDDED_NATIVE_CHECKSUM
-        .split_ascii_whitespace()
-        .next()
-        .unwrap_or(EMBEDDED_NATIVE_CHECKSUM.trim())
+pub(crate) fn embedded_database_identity() -> String {
+    crate::assets::current_asset_identity("completion-database")
+        .unwrap_or_else(|| "downloadable-native-catalog-unavailable-v1".to_owned())
 }
 
 fn merge_loaded(catalog: &mut Catalog, loaded: Result<Vec<CommandSpec>, ShellError>) {
@@ -70,9 +68,18 @@ fn merge_loaded(catalog: &mut Catalog, loaded: Result<Vec<CommandSpec>, ShellErr
 }
 
 fn embedded_commands() -> Result<Vec<CommandSpec>, ShellError> {
-    EMBEDDED_COMMANDS
-        .get_or_init(|| load_commands(EMBEDDED_NATIVE_DATABASE, current_platform()))
-        .clone()
+    match downloaded_commands() {
+        Ok(commands) => Ok(commands),
+        #[cfg(test)]
+        Err(_) => load_commands(TEST_NATIVE_DATABASE, current_platform()),
+        #[cfg(not(test))]
+        Err(error) => Err(error),
+    }
+}
+
+fn downloaded_commands() -> Result<Vec<CommandSpec>, ShellError> {
+    let bytes = crate::assets::read_current_asset("completion-database")?;
+    load_commands(&bytes, current_platform())
 }
 
 fn load_commands(bytes: &[u8], platform: NativePlatform) -> Result<Vec<CommandSpec>, ShellError> {
@@ -102,7 +109,7 @@ fn native_catalog_error(diagnostic: NativeCatalogDiagnostic) -> ShellError {
     };
     let mut error = ShellError::new(code, diagnostic.message)
         .with_context(format!("native catalog source: {}", diagnostic.source_name))
-        .with_context(format!("embedded artifact: {EMBEDDED_NATIVE_SOURCE}"))
+        .with_context(format!("runtime artifact: {DOWNLOADABLE_NATIVE_SOURCE}"))
         .with_help(diagnostic.help);
     for context in diagnostic.context {
         error = error.with_context(context);
@@ -130,8 +137,8 @@ mod tests {
 
     #[test]
     fn embedded_catalog_is_deterministic_platform_filtered_and_deeply_projected() {
-        let first = load_commands(EMBEDDED_NATIVE_DATABASE, NativePlatform::Macos).unwrap();
-        let second = load_commands(EMBEDDED_NATIVE_DATABASE, NativePlatform::Macos).unwrap();
+        let first = load_commands(TEST_NATIVE_DATABASE, NativePlatform::Macos).unwrap();
+        let second = load_commands(TEST_NATIVE_DATABASE, NativePlatform::Macos).unwrap();
         assert_eq!(first, second);
         assert!(first.iter().any(|command| command.path == "open"));
         assert!(!first.iter().any(|command| command.path == "where"));
@@ -150,7 +157,7 @@ mod tests {
                 .iter()
                 .all(|option| !option.names.iter().any(|name| name == "--all"))
         );
-        let linux = load_commands(EMBEDDED_NATIVE_DATABASE, NativePlatform::Linux).unwrap();
+        let linux = load_commands(TEST_NATIVE_DATABASE, NativePlatform::Linux).unwrap();
         let linux_ls = linux.iter().find(|command| command.path == "ls").unwrap();
         assert!(
             linux_ls
@@ -179,7 +186,7 @@ mod tests {
             (NativePlatform::Windows, &["mkdir"][..]),
             (NativePlatform::Freebsd, &[][..]),
         ] {
-            let commands = load_commands(EMBEDDED_NATIVE_DATABASE, platform).unwrap();
+            let commands = load_commands(TEST_NATIVE_DATABASE, platform).unwrap();
             let flagless = commands
                 .iter()
                 .filter(|command| !command.path.contains(' '))
@@ -198,7 +205,7 @@ mod tests {
 
     #[test]
     fn macos_system_commands_do_not_leak_gnu_only_flags() {
-        let commands = load_commands(EMBEDDED_NATIVE_DATABASE, NativePlatform::Macos).unwrap();
+        let commands = load_commands(TEST_NATIVE_DATABASE, NativePlatform::Macos).unwrap();
         for command_name in [
             "cat", "cp", "diff", "grep", "head", "ls", "man", "mkdir", "mv", "nc", "pwd", "rm",
             "rmdir", "tail", "tar",
@@ -319,7 +326,7 @@ mod tests {
 
     #[test]
     fn actions_are_closed_inert_provider_metadata() {
-        let commands = load_commands(EMBEDDED_NATIVE_DATABASE, NativePlatform::Linux).unwrap();
+        let commands = load_commands(TEST_NATIVE_DATABASE, NativePlatform::Linux).unwrap();
         let xdg_open = commands
             .iter()
             .find(|command| command.path == "xdg-open")

@@ -1199,6 +1199,62 @@ impl Catalog {
                     Provenance::Builtin,
                 ),
                 command(
+                    "quirl assets status",
+                    "quirl assets status [--format text|json]",
+                    "Inspect separately downloaded runtime assets",
+                    "Validates installed completion-database and command-model receipts and payloads without network access, and reports degraded operation plus bounded retry state.",
+                    vec![option(
+                        &["--format"],
+                        Some("text|json"),
+                        "Choose accessible text or stable machine JSON",
+                    )],
+                    &["quirl assets status --format json"],
+                    &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl assets update",
+                    "quirl assets update [--manifest path] [--format text|json]",
+                    "Install compatible runtime assets from a verified manifest",
+                    "Reads the versioned deny-unknown asset manifest, downloads bounded HTTPS payloads without a shell, verifies compatibility, format, byte size, and SHA-256, then atomically switches the current receipt while preserving the prior valid generation.",
+                    vec![
+                        option(
+                            &["--manifest"],
+                            Some("path"),
+                            "Use a local manifest for offline or mirror-managed installation",
+                        ),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose accessible text or stable machine JSON",
+                        ),
+                    ],
+                    &["quirl assets update --format json"],
+                    &[Effect::ReadFilesystem, Effect::WriteFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl assets retry",
+                    "quirl assets retry [--manifest path] [--format text|json]",
+                    "Explicitly retry deferred runtime assets",
+                    "Clears bounded backoff and permanent-failure state, then performs the same verified update transaction. Core shell operation remains available if the retry fails.",
+                    vec![
+                        option(
+                            &["--manifest"],
+                            Some("path"),
+                            "Use a local manifest for offline or mirror-managed installation",
+                        ),
+                        option(
+                            &["--format"],
+                            Some("text|json"),
+                            "Choose accessible text or stable machine JSON",
+                        ),
+                    ],
+                    &["quirl assets retry"],
+                    &[Effect::ReadFilesystem, Effect::WriteFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
                     "quirl package manifest",
                     "quirl package manifest [--manifest path] [--format text|json]",
                     "Parse a versioned project package manifest",
@@ -2920,6 +2976,9 @@ mod tests {
             "quirl package manifest",
             "quirl package build",
             "quirl package publish",
+            "quirl assets status",
+            "quirl assets update",
+            "quirl assets retry",
         ] {
             let command = catalog
                 .commands

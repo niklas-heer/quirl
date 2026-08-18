@@ -638,6 +638,9 @@ pub(crate) fn default_model_path() -> Option<PathBuf> {
     if let Some(path) = env::var_os("QUIRL_MODEL_PATH") {
         return Some(PathBuf::from(path));
     }
+    if let Some(path) = crate::assets::current_command_model_path() {
+        return Some(path);
+    }
     env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
@@ -650,6 +653,11 @@ pub(crate) fn explicit_model_path_configured() -> bool {
 
 pub(crate) fn model_is_installed(path: &Path) -> bool {
     load_model(path).is_ok()
+}
+
+/// Fully admit an extracted managed model through the explicit-model contract.
+pub(crate) fn validate_managed_model(path: &Path) -> Result<(), ShellError> {
+    load_model_selected(path, true).map(|_| ())
 }
 
 pub(crate) fn model_identity(path: &Path) -> Option<ModelIdentity> {
@@ -2755,7 +2763,10 @@ fn serialize_database(connection: &Connection) -> Result<Vec<u8>, ShellError> {
 fn load_model(path: &Path) -> Result<LoadedModel, ShellError> {
     let explicit = env::var_os("QUIRL_MODEL_PATH")
         .map(PathBuf::from)
-        .is_some_and(|configured| configured == path);
+        .is_some_and(|configured| configured == path)
+        || crate::assets::current_command_model_path()
+            .as_deref()
+            .is_some_and(|managed| managed == path);
     load_model_selected(path, explicit)
 }
 
@@ -3963,14 +3974,14 @@ mod tests {
         let left = merge_local_provider_result(
             &base,
             path,
-            native,
+            &native,
             &[local_record("zebra"), local_record("alpha")],
         )
         .unwrap();
         let right = merge_local_provider_result(
             &base,
             path,
-            native,
+            &native,
             &[local_record("alpha"), local_record("zebra")],
         )
         .unwrap();
@@ -3993,7 +4004,7 @@ mod tests {
         let bytes = merge_local_provider_result(
             &base,
             path,
-            crate::native_catalog::embedded_database_identity(),
+            &crate::native_catalog::embedded_database_identity(),
             &[local_record("alpha")],
         )
         .unwrap();
@@ -4012,9 +4023,9 @@ mod tests {
         let base = encode_database(&Catalog::builtin(), Some("{\"generation\":1}")).unwrap();
         let native = crate::native_catalog::embedded_database_identity();
         let positive =
-            merge_local_provider_result(&base, path, native, &[local_record("alpha")]).unwrap();
+            merge_local_provider_result(&base, path, &native, &[local_record("alpha")]).unwrap();
         let prior =
-            record_local_negative_hit(&positive, path, native, &local_negative(2_000)).unwrap();
+            record_local_negative_hit(&positive, path, &native, &local_negative(2_000)).unwrap();
         let fresh = encode_database(&Catalog::builtin(), Some("{\"generation\":2}")).unwrap();
         let preserved = preserve_local_overlay(&prior, path, &fresh, path).unwrap();
         let overlay = read_local_overlays(&preserved, path, &[local_query(3_000)]).unwrap();
@@ -4033,7 +4044,7 @@ mod tests {
         let bytes = merge_local_provider_result(
             &base,
             path,
-            crate::native_catalog::embedded_database_identity(),
+            &crate::native_catalog::embedded_database_identity(),
             &[local_record("alpha")],
         )
         .unwrap();
@@ -4072,7 +4083,7 @@ mod tests {
         let bytes = merge_local_provider_result(
             &base,
             path,
-            crate::native_catalog::embedded_database_identity(),
+            &crate::native_catalog::embedded_database_identity(),
             &[local_record("alpha")],
         )
         .unwrap();
@@ -4115,9 +4126,10 @@ mod tests {
         let path = Path::new("catalog.sqlite3");
         let native = crate::native_catalog::embedded_database_identity();
         let base = encode_database(&Catalog::builtin(), None).unwrap();
-        let once = record_local_negative_hit(&base, path, native, &local_negative(10_000)).unwrap();
+        let once =
+            record_local_negative_hit(&base, path, &native, &local_negative(10_000)).unwrap();
         let twice =
-            record_local_negative_hit(&once, path, native, &local_negative(20_000)).unwrap();
+            record_local_negative_hit(&once, path, &native, &local_negative(20_000)).unwrap();
         let current = read_local_overlay(&twice, path, &local_query(21_000)).unwrap();
         assert_eq!(current.negative_hits[0].failure_count, 2);
         assert_eq!(current.negative_hits[0].retry_after_unix_ms, 22_000);
@@ -4140,7 +4152,7 @@ mod tests {
             .map(|index| format!("s{index}"))
             .collect();
         assert_eq!(
-            merge_local_provider_result(&base, path, native, &[deep])
+            merge_local_provider_result(&base, path, &native, &[deep])
                 .unwrap_err()
                 .code,
             ErrorCode::ResourceLimit
@@ -4150,7 +4162,7 @@ mod tests {
             .map(|index| local_record(&format!("candidate-{index}")))
             .collect::<Vec<_>>();
         assert_eq!(
-            merge_local_provider_result(&base, path, native, &records)
+            merge_local_provider_result(&base, path, &native, &records)
                 .unwrap_err()
                 .code,
             ErrorCode::ResourceLimit

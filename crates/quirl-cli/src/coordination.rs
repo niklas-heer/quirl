@@ -25,14 +25,19 @@ pub(crate) enum CoordinationKind {
     /// Coordinate catalog indexing, encoding, and atomic publication.
     Catalog,
     /// Coordinate model validation, download, quarantine, and installation.
+    #[cfg(test)]
     Model,
+    /// Coordinate provider-neutral runtime-asset state and installation.
+    Asset,
 }
 
 impl CoordinationKind {
     fn label(self) -> &'static str {
         match self {
             Self::Catalog => "command-database",
+            #[cfg(test)]
             Self::Model => "AI-model",
+            Self::Asset => "runtime-asset",
         }
     }
 }

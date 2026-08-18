@@ -3,6 +3,7 @@
 mod agent;
 mod ai;
 mod ai_bootstrap;
+mod assets;
 mod author;
 mod bounded_file;
 mod config;
@@ -27,6 +28,7 @@ mod script;
 use agent::AgentCommand;
 use ai::AiCommand;
 use ai_bootstrap::{InteractiveAiBootstrap, LocalCompletionRequester};
+use assets::AssetsCommand;
 use author::{DescribeCommand, DocCommand, NewCommand};
 use clap::{Parser, Subcommand, ValueEnum};
 use config::ConfigCommand;
@@ -185,6 +187,11 @@ enum Command {
     Ai {
         #[command(subcommand)]
         command: AiCommand,
+    },
+    /// Inspect, retry, or update separately downloaded runtime assets.
+    Assets {
+        #[command(subcommand)]
+        command: AssetsCommand,
     },
     /// Inspect, validate, build, or dry-run publication of a Quirl package.
     Package {
@@ -435,6 +442,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             command: AiCommand::Run { query },
         }) => execute_natural_command(&query),
         Some(Command::Ai { command }) => ai::execute(command),
+        Some(Command::Assets { command }) => assets::execute(command),
         Some(Command::Package { command }) => package::execute(command, &load_composed_catalog()?),
         Some(Command::Describe { command }) => author::describe(command, &load_composed_catalog()?),
         Some(Command::Doc { command }) => author::doc(command, &load_composed_catalog()?),
@@ -721,6 +729,7 @@ impl Command {
             Self::Plugin { command } => plugin::wants_json(command),
             Self::Agent { command } => agent::wants_json(command),
             Self::Ai { command } => ai::wants_json(command),
+            Self::Assets { command } => assets::wants_json(command),
             Self::Package { command } => package::wants_json(command),
             Self::Describe { command } => {
                 matches!(command.format, author::DocumentationFormat::Json)
@@ -1938,6 +1947,9 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         &history_path,
     )?;
     print_banner(&active_config);
+    // Scheduling returns immediately; the guard only joins after cancellation
+    // during shell shutdown, so no download can delay the first prompt.
+    let _asset_refresh = assets::schedule_background_update();
     let mut mode = Mode::Command;
     // Recovery snapshots are only needed once a native command is accepted.
     // Environment capture can be deferred past the first interactive paint.

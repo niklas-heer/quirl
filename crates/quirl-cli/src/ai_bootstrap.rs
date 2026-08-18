@@ -1,22 +1,22 @@
 //! Bounded background installation and indexing for local command intelligence.
 
-use crate::{
-    coordination::{self, CoordinationKind, CoordinationWait},
-    index, intelligence,
-};
+#[cfg(test)]
+use crate::coordination::{self, CoordinationKind, CoordinationWait};
+use crate::{index, intelligence};
 use quirl_core::{ErrorCode, ShellError, escape_terminal_line};
 use quirl_ui::{
     ACTIVITY_MESSAGE_BYTES_MAX, InteractiveActivityProvider, InteractiveActivitySnapshot,
 };
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::{fs::OpenOptions, io::Write, path::PathBuf, sync::mpsc};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
-    path::{Path, PathBuf},
+    fs::{self, File},
+    io::{self, Read},
+    path::Path,
     sync::{
         Arc, Condvar, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -28,24 +28,24 @@ use nix::{
     sys::stat::Mode as FileMode,
 };
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
+#[cfg(all(test, unix))]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 pub(crate) const MODEL_REPOSITORY: &str = "niklas-heer/quirl-command-v3-int8";
 pub(crate) const MODEL_REVISION: &str = "quirl-command-v3-9bc5efbd14096b54";
 pub(crate) const MODEL_DIMENSIONS: usize = 256;
-const MODEL_BASE_URL: &str =
-    "https://raw.githubusercontent.com/niklas-heer/quirl/main/models/quirl-command-v3-int8";
-const HTTP_REDIRECTS_MAX: u32 = 4;
-const HTTP_GLOBAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const HTTP_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 const DOWNLOAD_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(test)]
 const DOWNLOAD_CHANNEL_CHUNKS_MAX: usize = 2;
+#[cfg(test)]
 const DOWNLOAD_CHANNEL_POLL: Duration = Duration::from_millis(25);
+#[cfg(test)]
 const TEMPORARY_ATTEMPTS_MAX: u64 = 64;
 const ACTIVITY_ERROR_MESSAGE_BYTES_MAX: usize = 256;
 const ACTIVITY_ERROR_CONTEXT_BYTES_MAX: usize = 192;
 const MODEL_FILE_READ_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(test)]
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
@@ -55,6 +55,7 @@ struct AssetSpec {
     sha256: &'static str,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 struct ModelInstallOptions<'a> {
     assets: &'a [AssetSpec],
@@ -551,13 +552,6 @@ fn automatic_catalog_refresh_disabled() -> bool {
 }
 
 fn worker_loop(shared: &Shared) {
-    let fetcher = match UreqFetcher::new() {
-        Ok(fetcher) => fetcher,
-        Err(error) => {
-            shared.publish(format!("AI unavailable: {}", error.message));
-            return;
-        }
-    };
     let mut completed_generation = 0_u64;
     loop {
         let requested = {
@@ -578,13 +572,13 @@ fn worker_loop(shared: &Shared) {
                 guard = next_guard;
             }
         };
-        if run_generation(shared, &fetcher, requested) {
+        if run_generation(shared, requested) {
             completed_generation = requested;
         }
     }
 }
 
-fn run_generation(shared: &Shared, fetcher: &UreqFetcher, generation: u64) -> bool {
+fn run_generation(shared: &Shared, generation: u64) -> bool {
     #[cfg(debug_assertions)]
     if std::env::var_os("QUIRL_TEST_AI_BOOTSTRAP_FAKE").is_some() {
         shared.publish("AI: downloading the Quirl command model (50%)".to_owned());
@@ -608,19 +602,12 @@ fn run_generation(shared: &Shared, fetcher: &UreqFetcher, generation: u64) -> bo
             );
             return true;
         }
-    } else if validate_pinned_model(&model_path).is_err() {
-        shared.publish("AI: downloading the Quirl command model (0%)".to_owned());
-        match install_model(fetcher, &model_path, shared) {
-            Ok(true) => {}
-            Ok(false) => {
-                shared.publish("AI setup deferred: another Quirl instance is active".to_owned());
-                return true;
-            }
-            Err(error) => {
-                shared.publish(format!("AI download failed: {}", error.message));
-                return true;
-            }
-        }
+    } else if !intelligence::model_is_installed(&model_path) {
+        shared.publish(
+            "AI unavailable: command-model runtime asset is missing; run `quirl assets update`"
+                .to_owned(),
+        );
+        return true;
     }
     if shared.cancelled.load(Ordering::Acquire) {
         return true;
@@ -688,6 +675,7 @@ fn wait_test_discovery_stage(shared: &Shared) -> bool {
     true
 }
 
+#[cfg(test)]
 trait Fetcher {
     fn open(
         &self,
@@ -696,66 +684,7 @@ trait Fetcher {
     ) -> Result<Box<dyn Read + Send>, ShellError>;
 }
 
-struct UreqFetcher {
-    agent: ureq::Agent,
-}
-
-impl UreqFetcher {
-    fn new() -> Result<Self, ShellError> {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .max_redirects(HTTP_REDIRECTS_MAX)
-            .max_redirects_will_error(true)
-            .timeout_global(Some(HTTP_GLOBAL_TIMEOUT))
-            .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
-            .timeout_recv_body(Some(HTTP_BODY_TIMEOUT))
-            .build();
-        Ok(Self {
-            agent: config.into(),
-        })
-    }
-}
-
-impl Fetcher for UreqFetcher {
-    fn open(
-        &self,
-        url: &str,
-        cancelled: Arc<AtomicBool>,
-    ) -> Result<Box<dyn Read + Send>, ShellError> {
-        let (sender, receiver) = mpsc::sync_channel(DOWNLOAD_CHANNEL_CHUNKS_MAX);
-        let agent = self.agent.clone();
-        let url = url.to_owned();
-        thread::Builder::new()
-            .name("quirl-ai-https".to_owned())
-            .spawn(move || stream_https(agent, &url, &sender))
-            .map_err(|error| {
-                ShellError::new(ErrorCode::Io, "could not start the bounded HTTPS reader")
-                    .with_context(error.to_string())
-                    .with_help("Retry automatic model setup in a running Quirl session")
-            })?;
-        Ok(Box::new(ChannelReader::new(receiver, cancelled)))
-    }
-}
-
-fn install_model(
-    fetcher: &dyn Fetcher,
-    destination: &Path,
-    shared: &Shared,
-) -> Result<bool, ShellError> {
-    install_model_with_assets(
-        fetcher,
-        destination,
-        shared,
-        ModelInstallOptions {
-            assets: &ASSETS,
-            base_url: MODEL_BASE_URL,
-            revision: MODEL_REVISION,
-            recover_corrupt: std::env::var_os("QUIRL_MODEL_PATH").is_none(),
-            wait: CoordinationWait::Background,
-        },
-    )
-}
-
+#[cfg(test)]
 fn install_model_with_assets(
     fetcher: &dyn Fetcher,
     destination: &Path,
@@ -809,6 +738,7 @@ fn install_model_with_assets(
     Ok(true)
 }
 
+#[cfg(test)]
 fn download_asset(
     reader: &mut dyn Read,
     destination: &Path,
@@ -931,12 +861,14 @@ fn open_model_file(path: &Path) -> Result<File, ShellError> {
     File::open(path).map_err(|error| model_io_error("open", path, error))
 }
 
+#[cfg(test)]
 struct ModelTemporary {
     path: PathBuf,
     asset_names: Vec<&'static str>,
     installed: bool,
 }
 
+#[cfg(test)]
 impl ModelTemporary {
     fn create(parent: &Path, assets: &[AssetSpec]) -> Result<Self, ShellError> {
         for _ in 0..TEMPORARY_ATTEMPTS_MAX {
@@ -969,6 +901,7 @@ impl ModelTemporary {
     }
 }
 
+#[cfg(test)]
 impl Drop for ModelTemporary {
     fn drop(&mut self) {
         if self.installed {
@@ -981,10 +914,12 @@ impl Drop for ModelTemporary {
     }
 }
 
+#[cfg(test)]
 fn create_private_directories(path: &Path) -> Result<(), ShellError> {
     index::create_index_directories(path)
 }
 
+#[cfg(test)]
 fn path_entry_exists(path: &Path) -> Result<bool, ShellError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -993,6 +928,7 @@ fn path_entry_exists(path: &Path) -> Result<bool, ShellError> {
     }
 }
 
+#[cfg(test)]
 fn quarantine_corrupt_model(destination: &Path, parent: &Path) -> Result<PathBuf, ShellError> {
     for _ in 0..TEMPORARY_ATTEMPTS_MAX {
         let id = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
@@ -1020,44 +956,14 @@ fn quarantine_corrupt_model(destination: &Path, parent: &Path) -> Result<PathBuf
     .with_help("Remove stale .quirl-command-v3-int8.corrupt-* entries and retry"))
 }
 
+#[cfg(test)]
 enum DownloadMessage {
     Data(Vec<u8>),
     End,
     Error(String),
 }
 
-fn stream_https(agent: ureq::Agent, url: &str, sender: &mpsc::SyncSender<DownloadMessage>) {
-    let response = match agent.get(url).call() {
-        Ok(response) => response,
-        Err(error) => {
-            let _ = sender.send(DownloadMessage::Error(error.to_string()));
-            return;
-        }
-    };
-    let mut reader = response.into_body().into_reader();
-    let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => {
-                let _ = sender.send(DownloadMessage::End);
-                return;
-            }
-            Ok(count) => {
-                if sender
-                    .send(DownloadMessage::Data(buffer[..count].to_vec()))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            Err(error) => {
-                let _ = sender.send(DownloadMessage::Error(error.to_string()));
-                return;
-            }
-        }
-    }
-}
-
+#[cfg(test)]
 struct ChannelReader {
     receiver: mpsc::Receiver<DownloadMessage>,
     cancelled: Arc<AtomicBool>,
@@ -1065,6 +971,7 @@ struct ChannelReader {
     finished: bool,
 }
 
+#[cfg(test)]
 impl ChannelReader {
     fn new(receiver: mpsc::Receiver<DownloadMessage>, cancelled: Arc<AtomicBool>) -> Self {
         Self {
@@ -1076,6 +983,7 @@ impl ChannelReader {
     }
 }
 
+#[cfg(test)]
 impl Read for ChannelReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -1192,7 +1100,7 @@ mod tests {
     ];
 
     #[test]
-    fn checked_in_automatic_model_assets_match_runtime_pins() {
+    fn checked_in_model_assets_match_runtime_pins() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
@@ -1201,8 +1109,6 @@ mod tests {
             .join("models/quirl-command-v3-int8")
             .join(MODEL_REVISION);
         validate_pinned_model(&model).unwrap();
-        assert!(MODEL_BASE_URL.starts_with("https://"));
-        assert!(MODEL_BASE_URL.ends_with("models/quirl-command-v3-int8"));
     }
 
     struct MockFetcher {
@@ -1527,6 +1433,11 @@ mod tests {
 
     #[test]
     fn stalled_https_channel_observes_cancellation_promptly() {
+        let _covered_messages = (
+            DownloadMessage::Data(Vec::new()),
+            DownloadMessage::End,
+            DownloadMessage::Error(String::new()),
+        );
         let (_sender, receiver) = mpsc::sync_channel(DOWNLOAD_CHANNEL_CHUNKS_MAX);
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);

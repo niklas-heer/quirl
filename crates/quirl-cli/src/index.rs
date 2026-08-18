@@ -1629,7 +1629,7 @@ fn probe_local_completion_paths(
         updated = intelligence::merge_local_provider_result(
             &updated,
             database_path,
-            native_catalog_fingerprint,
+            &native_catalog_fingerprint,
             &records,
         )?;
         changed = true;
@@ -1638,7 +1638,7 @@ fn probe_local_completion_paths(
         updated = intelligence::record_local_negative_hit(
             &updated,
             database_path,
-            native_catalog_fingerprint,
+            &native_catalog_fingerprint,
             &observation,
         )?;
         changed = true;
