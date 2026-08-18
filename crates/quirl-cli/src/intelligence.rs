@@ -369,6 +369,27 @@ pub(crate) enum RetrievalMode {
     Hybrid,
 }
 
+/// Document class admitted to a bounded retrieval ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchDocumentKind {
+    /// Rank command and option documents together.
+    All,
+    /// Return only command documents while retaining option terms for command aggregation.
+    Command,
+    /// Return only option documents.
+    Option,
+}
+
+impl SearchDocumentKind {
+    fn admits(self, document: &SemanticDocument) -> bool {
+        match self {
+            Self::All => true,
+            Self::Command => document.kind == "command",
+            Self::Option => document.kind == "option",
+        }
+    }
+}
+
 /// One ranked command or option returned by local command intelligence.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct SearchResult {
@@ -392,6 +413,21 @@ pub(crate) struct EmbeddingReport {
     pub(crate) document_generation_version: u32,
     pub(crate) documents: usize,
     pub(crate) dimensions: usize,
+}
+
+/// Exact identity persisted with one complete document-embedding generation.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct EmbeddingIndexIdentity {
+    pub(crate) model_identity: String,
+    pub(crate) repository: String,
+    pub(crate) revision: String,
+    pub(crate) config_sha256: String,
+    pub(crate) tokenizer_sha256: String,
+    pub(crate) weights_sha256: String,
+    pub(crate) dimensions: usize,
+    pub(crate) document_generation_version: u32,
+    pub(crate) index_fingerprint: String,
+    pub(crate) document_count: usize,
 }
 
 /// Bounded row counts used to report database readiness.
@@ -508,8 +544,18 @@ impl SearchSession {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, ShellError> {
+        self.search_kind(query, limit, SearchDocumentKind::All)
+    }
+
+    /// Rank only the requested document class before applying the result limit.
+    pub(crate) fn search_kind(
+        &self,
+        query: &str,
+        limit: usize,
+        kind: SearchDocumentKind,
+    ) -> Result<Vec<SearchResult>, ShellError> {
         let started = Instant::now();
-        self.search_cancellable(query, limit, || {
+        self.search_cancellable(query, limit, kind, || {
             if started.elapsed() > SEARCH_DEADLINE {
                 return Err(ShellError::new(
                     ErrorCode::ResourceLimit,
@@ -526,6 +572,7 @@ impl SearchSession {
         &self,
         query: &str,
         limit: usize,
+        kind: SearchDocumentKind,
         mut check_cancelled: impl FnMut() -> Result<(), ShellError>,
     ) -> Result<Vec<SearchResult>, ShellError> {
         validate_query(query, limit)?;
@@ -536,6 +583,7 @@ impl SearchSession {
             &query_terms,
             query,
             DOCUMENTS_MAX,
+            kind,
             &mut check_cancelled,
         )?;
         if let Some(model) = &self.model {
@@ -558,6 +606,9 @@ impl SearchSession {
                 }
                 if embedding.vector.len() != query_vector.len() {
                     return Ok(limit_lexical(lexical, limit));
+                }
+                if !kind.admits(&embedding.document) {
+                    continue;
                 }
                 semantic.push(SearchResult {
                     document_id: embedding.document.id.clone(),
@@ -614,6 +665,55 @@ pub(crate) fn database_stats(bytes: &[u8], path: &Path) -> Result<DatabaseStats,
         documents: count_rows(&connection, path, "semantic_documents")?,
         embeddings: count_rows(&connection, path, "embeddings")?,
     })
+}
+
+pub(crate) fn embedding_index_identity(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<Option<EmbeddingIndexIdentity>, ShellError> {
+    let connection = deserialize_database(bytes, path)?;
+    validate_schema(&connection, path)?;
+    let stored = connection
+        .query_row(
+            "SELECT model_identity, repository, revision, config_sha256, tokenizer_sha256, weights_sha256, dimensions, document_generation_version, index_fingerprint, document_count FROM embedding_index WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| invalid_database(path, error))?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let dimensions = embedding_identity_usize(path, "embedding dimensions", stored.6)?;
+    validate_dimensions(dimensions)?;
+    let document_generation_version = u32::try_from(stored.7)
+        .map_err(|_| invalid_embedding_identity(path, "document generation version", stored.7))?;
+    let document_count = embedding_identity_usize(path, "embedding document count", stored.9)?;
+    Ok(Some(EmbeddingIndexIdentity {
+        model_identity: stored.0,
+        repository: stored.1,
+        revision: stored.2,
+        config_sha256: stored.3,
+        tokenizer_sha256: stored.4,
+        weights_sha256: stored.5,
+        dimensions,
+        document_generation_version,
+        index_fingerprint: stored.8,
+        document_count,
+    }))
 }
 
 pub(crate) fn embeddings_are_current(bytes: &[u8], path: &Path) -> Result<bool, ShellError> {
@@ -1275,6 +1375,17 @@ pub(crate) fn search(
     model_path: Option<&Path>,
 ) -> Result<Vec<SearchResult>, ShellError> {
     SearchSession::open(bytes, path, model_path)?.search(query, limit)
+}
+
+pub(crate) fn search_kind(
+    bytes: &[u8],
+    path: &Path,
+    query: &str,
+    limit: usize,
+    model_path: Option<&Path>,
+    kind: SearchDocumentKind,
+) -> Result<Vec<SearchResult>, ShellError> {
+    SearchSession::open(bytes, path, model_path)?.search_kind(query, limit, kind)
 }
 
 struct StoredLocalOverlay {
@@ -2365,6 +2476,7 @@ fn rank_lexical_documents_cancellable(
     query_terms: &[String],
     query: &str,
     limit: usize,
+    kind: SearchDocumentKind,
     check_cancelled: &mut impl FnMut() -> Result<(), ShellError>,
 ) -> Result<Vec<SearchResult>, ShellError> {
     let query_phrase = normalize_document_field(query).to_lowercase();
@@ -2418,6 +2530,9 @@ fn rank_lexical_documents_cancellable(
         .zip(phrase_matches)
         .zip(exact_boosts)
         .filter_map(|(((document, local_matches), phrase_match), exact_boost)| {
+            if !kind.admits(document) {
+                return None;
+            }
             let matches = if document.kind == "command" {
                 command_matches
                     .get(document.command.as_str())
@@ -2920,6 +3035,19 @@ fn count_rows(connection: &Connection, path: &Path, table: &str) -> Result<usize
         .with_context(format!("table: {table}; observed: {count}"))
         .with_help("Rebuild it with `quirl index build`")
     })
+}
+
+fn embedding_identity_usize(path: &Path, label: &str, value: i64) -> Result<usize, ShellError> {
+    usize::try_from(value).map_err(|_| invalid_embedding_identity(path, label, value))
+}
+
+fn invalid_embedding_identity(path: &Path, label: &str, value: i64) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        format!("{} contains an invalid {label}", path.display()),
+    )
+    .with_context(format!("observed: {value}"))
+    .with_help("Run `quirl ai index` to rebuild the embedding identity")
 }
 
 fn validate_query(query: &str, limit: usize) -> Result<(), ShellError> {
@@ -3496,6 +3624,28 @@ mod tests {
     }
 
     #[test]
+    fn stored_embedding_identity_reports_the_complete_generation() {
+        let path = Path::new("catalog.sqlite3");
+        let bytes = encode_database(&Catalog::builtin(), None).unwrap();
+        assert_eq!(embedding_index_identity(&bytes, path).unwrap(), None);
+        let bytes = mark_embeddings_current_for_test(&bytes, path).unwrap();
+        let identity = embedding_index_identity(&bytes, path).unwrap().unwrap();
+        assert_eq!(identity.model_identity, TEST_MODEL_IDENTITY);
+        assert_eq!(
+            identity.document_generation_version,
+            DOCUMENT_GENERATION_VERSION
+        );
+        assert_eq!(
+            identity.document_count,
+            database_stats(&bytes, path).unwrap().documents
+        );
+        assert!(identity.index_fingerprint.starts_with("sha256:"));
+        assert_eq!(identity.config_sha256, "sha256:test-config");
+        assert_eq!(identity.tokenizer_sha256, "sha256:test-tokenizer");
+        assert_eq!(identity.weights_sha256, "sha256:test-model");
+    }
+
+    #[test]
     fn exact_path_and_option_names_receive_deterministic_lexical_boosts() {
         let bytes = encode_database(&Catalog::builtin(), None).unwrap();
         let session = SearchSession::open(&bytes, Path::new("catalog.sqlite3"), None).unwrap();
@@ -3511,6 +3661,22 @@ mod tests {
                     .split_whitespace()
                     .any(|part| part == "--format")
         }));
+    }
+
+    #[test]
+    fn document_kind_filter_is_applied_before_the_result_limit() {
+        let bytes = encode_database(&Catalog::builtin(), None).unwrap();
+        let session = SearchSession::open(&bytes, Path::new("catalog.sqlite3"), None).unwrap();
+        let option = session
+            .search_kind("--format", 1, SearchDocumentKind::Option)
+            .unwrap();
+        let command = session
+            .search_kind("--format", 1, SearchDocumentKind::Command)
+            .unwrap();
+        assert_eq!(option.len(), 1);
+        assert_eq!(option[0].kind, "option");
+        assert_eq!(command.len(), 1);
+        assert_eq!(command[0].kind, "command");
     }
 
     #[test]
@@ -3590,7 +3756,7 @@ mod tests {
         };
         let mut checks = 0_usize;
         let results = session
-            .search_cancellable("search catalog", 1, || {
+            .search_cancellable("search catalog", 1, SearchDocumentKind::All, || {
                 checks = checks.saturating_add(1);
                 if checks >= 4 {
                     Err(ShellError::new(

@@ -1111,7 +1111,7 @@ impl Catalog {
                     "quirl ai status",
                     "quirl ai status [--format text|json]",
                     "Inspect local command-intelligence readiness",
-                    "Reports the SQLite command database and potion-base-8M file locations without loading a model or contacting the network.",
+                    "Reports the SQLite command database, local model manifest, and complete stored embedding-index identity—including hashes, dimensions, document-generation version, and index fingerprint—without contacting the network.",
                     vec![option(
                         &["--format"],
                         Some("text|json"),

@@ -116,6 +116,7 @@ struct AiStatus {
     database_bytes: Option<u64>,
     model: String,
     model_identity: Option<intelligence::ModelIdentity>,
+    embedding_index_identity: Option<intelligence::EmbeddingIndexIdentity>,
     model_path: Option<PathBuf>,
     model_ready: bool,
     commands: Option<usize>,
@@ -158,17 +159,12 @@ pub(crate) fn execute(command: AiCommand) -> Result<i32, ShellError> {
             kind,
             format,
         } => {
-            let retrieval_limit = match kind {
-                SearchKind::All => limit,
-                SearchKind::Command | SearchKind::Option => intelligence::SEARCH_RESULTS_MAX,
+            let kind = match kind {
+                SearchKind::All => intelligence::SearchDocumentKind::All,
+                SearchKind::Command => intelligence::SearchDocumentKind::Command,
+                SearchKind::Option => intelligence::SearchDocumentKind::Option,
             };
-            let mut results = index::search_default_database(&query.join(" "), retrieval_limit)?;
-            results.retain(|result| match kind {
-                SearchKind::All => true,
-                SearchKind::Command => result.kind == "command",
-                SearchKind::Option => result.kind == "option",
-            });
-            results.truncate(limit);
+            let results = index::search_default_database_kind(&query.join(" "), limit, kind)?;
             present_results(&results, format)?;
             Ok(i32::from(results.is_empty()))
         }
@@ -348,6 +344,11 @@ fn status(format: AiOutputFormat) -> Result<i32, ShellError> {
     let database_path = index::default_database_path()?;
     let database_metadata = fs::metadata(&database_path).ok();
     let stats = index::default_database_stats().ok();
+    let embedding_index_identity = if stats.is_some() {
+        index::default_embedding_index_identity()?
+    } else {
+        None
+    };
     let model_path = intelligence::default_model_path();
     let model_identity = model_path.as_deref().and_then(intelligence::model_identity);
     let semantic_ready = index::default_embeddings_are_current().unwrap_or(false);
@@ -360,6 +361,7 @@ fn status(format: AiOutputFormat) -> Result<i32, ShellError> {
             .map(|identity| identity.repository.clone())
             .unwrap_or_else(|| "minishlab/potion-base-8M".to_owned()),
         model_identity: model_identity.clone(),
+        embedding_index_identity,
         model_ready: model_identity.is_some(),
         commands: stats.as_ref().map(|stats| stats.commands),
         options: stats.as_ref().map(|stats| stats.arguments),
@@ -401,6 +403,18 @@ fn status(format: AiOutputFormat) -> Result<i32, ShellError> {
                 println!(
                     "model identity: {}",
                     escape_terminal_controls(&identity.identity)
+                );
+            }
+            if let Some(identity) = &status.embedding_index_identity {
+                println!(
+                    "embedding index: {} documents, generation {}, fingerprint {}",
+                    identity.document_count,
+                    identity.document_generation_version,
+                    escape_terminal_controls(&identity.index_fingerprint)
+                );
+                println!(
+                    "embedding model identity: {}",
+                    escape_terminal_controls(&identity.model_identity)
                 );
             }
             if let Some(stats) = stats {

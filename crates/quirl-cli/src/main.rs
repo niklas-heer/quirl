@@ -485,19 +485,18 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
 
 fn execute_natural_command(query: &[String]) -> Result<i32, ShellError> {
     let intent = join_natural_query(query)?;
-    let results = index::search_default_database(&intent, intelligence::SEARCH_RESULTS_MAX)?;
-    let candidate = results
-        .iter()
-        .find(|result| result.kind == "command")
-        .ok_or_else(|| {
-            ShellError::new(
-                ErrorCode::InvalidCommand,
-                "natural command retrieval found no catalog command",
-            )
-            .with_help(
-                "Refresh the local index or describe the task with more command-specific words",
-            )
-        })?;
+    let results = index::search_default_database_kind(
+        &intent,
+        intelligence::SEARCH_RESULTS_MAX,
+        intelligence::SearchDocumentKind::Command,
+    )?;
+    let candidate = results.first().ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::InvalidCommand,
+            "natural command retrieval found no catalog command",
+        )
+        .with_help("Refresh the local index or describe the task with more command-specific words")
+    })?;
     let catalog = load_composed_catalog()?;
     let command = catalog
         .commands

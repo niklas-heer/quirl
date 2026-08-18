@@ -605,6 +605,30 @@ pub(crate) fn search_default_database(
     intelligence::search(&bytes, &path, query, limit, model_path.as_deref())
 }
 
+/// Search one document class before applying the bounded result limit.
+pub(crate) fn search_default_database_kind(
+    query: &str,
+    limit: usize,
+    kind: intelligence::SearchDocumentKind,
+) -> Result<Vec<intelligence::SearchResult>, ShellError> {
+    let path = default_database_path()?;
+    let bytes = read_index(&path).map_err(|error| {
+        error.with_help("Run `quirl index build` to create the command database")
+    })?;
+    let model_path = intelligence::default_model_path();
+    intelligence::search_kind(&bytes, &path, query, limit, model_path.as_deref(), kind)
+}
+
+/// Return the exact embedding generation persisted in the current database.
+pub(crate) fn default_embedding_index_identity()
+-> Result<Option<intelligence::EmbeddingIndexIdentity>, ShellError> {
+    let path = default_database_path()?;
+    let bytes = read_index(&path).map_err(|error| {
+        error.with_help("Run `quirl index build` to create the command database")
+    })?;
+    intelligence::embedding_index_identity(&bytes, &path)
+}
+
 /// Open one validated, reusable search generation for interactive AI mode.
 pub(crate) fn open_default_search_session() -> Result<intelligence::SearchSession, ShellError> {
     let path = default_database_path()?;
