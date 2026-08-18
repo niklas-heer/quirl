@@ -54,17 +54,19 @@ use quirl_data::{DataEnvelope, DataOutput, DataRenderFormat, DataRuntime};
 use quirl_lua::{LuaPolicy, MAX_LUA_SOURCE_BYTES, QuirlConfig, sdk_json, sdk_lua, sdk_markdown};
 use quirl_picker::{ItemKind, MAX_PICKER_ITEMS, PickItem, Picker};
 use quirl_process::{
-    DEFAULT_CAPTURE_BYTES, JobStatus, NativeExecutor, OutputObserver, sandboxed_process_host,
+    DEFAULT_CAPTURE_BYTES, DeveloperContextProbe, JobStatus, NativeExecutor, OutputObserver,
+    sandboxed_process_host,
 };
 use quirl_syntax::{InteractiveLine, Mode, classify, parse_command_list};
 use quirl_ui::{
     CatalogLoader, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, ExtensionCompleter,
     ExtensionSuggestion, InteractiveDataSnapshot, InteractiveHistoryEntry, InteractiveJobAction,
     InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
-    InteractiveRuntimeSnapshot, InteractiveSignal, MODE_TOGGLE_HOST_COMMAND, PickerItem,
-    PickerItemKind, PickerMatch, PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface,
-    SurfaceKind, editor_with_extensions_config_history_and_picker, history_path, render_error,
-    select_surface, set_product_identity, terminal_supports_unicode, terminal_width,
+    InteractiveRuntimeSnapshot, InteractiveSignal, MODE_TOGGLE_HOST_COMMAND, NativeProjectContext,
+    PROMPT_FIRST_PAINT_BUDGET, PickerItem, PickerItemKind, PickerMatch, PickerRanker,
+    PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind,
+    editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
+    set_product_identity, terminal_supports_unicode, terminal_width,
 };
 use recovery::RecoveryCommand;
 use script::ScriptLanguage;
@@ -73,7 +75,7 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{Arc, Mutex, atomic::AtomicBool, mpsc},
+    sync::{Arc, Mutex, RwLock, atomic::AtomicBool, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -1952,7 +1954,11 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     // The first prompt already renders the current directory from
     // `QuirlPrompt::new`. Start Git/filesystem refresh after that prompt has
     // returned so an idle worker thread is not on the cold-paint boundary.
-    let mut prompt_context: Option<PromptContextScheduler> = None;
+    let mut prompt_context: Option<(
+        PromptContextScheduler,
+        Arc<RwLock<DeveloperContextProbe>>,
+        u64,
+    )> = None;
     let mut first_prompt = true;
     loop {
         if !first_prompt {
@@ -2048,7 +2054,15 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             .with_status(last_status)
             .with_jobs(active_jobs)
             .with_named_extension_segments(extension_segments);
-        if let Some(scheduler) = &prompt_context {
+        if let Some((scheduler, probe, environment_generation)) = &mut prompt_context {
+            let current_generation = executor.environment_generation();
+            if current_generation != *environment_generation {
+                let mut probe = probe
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *probe = executor.developer_context_probe();
+                *environment_generation = current_generation;
+            }
             prompt = prompt.with_native_context(scheduler.sample_current_dir().context);
         }
         if let Some(duration) = last_duration {
@@ -2084,11 +2098,28 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         // paint and does not depend on reaching this prompt boundary.
         ai_bootstrap.request_catalog_refresh();
         if prompt_context.is_none() {
-            let scheduler = PromptContextScheduler::default();
+            let environment_generation = executor.environment_generation();
+            let probe = Arc::new(RwLock::new(executor.developer_context_probe()));
+            let worker_probe = Arc::clone(&probe);
+            let scheduler = PromptContextScheduler::with_project_context_loader(
+                PROMPT_FIRST_PAINT_BUDGET,
+                move |cwd| {
+                    let probe = worker_probe
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    let snapshot = probe.probe(cwd);
+                    NativeProjectContext {
+                        git_branch: snapshot.git_branch,
+                        git_state: snapshot.git_state,
+                        rust_version: snapshot.rust_version,
+                    }
+                },
+            );
             // Start the bounded refresh after the first input so command execution can
             // overlap it and the second prompt can consume the completed snapshot.
             let _ = scheduler.sample_current_dir();
-            prompt_context = Some(scheduler);
+            prompt_context = Some((scheduler, probe, environment_generation));
         }
         match signal {
             Ok(InteractiveSignal::Success(buffer)) => {

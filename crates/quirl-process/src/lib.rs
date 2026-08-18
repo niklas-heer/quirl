@@ -9,7 +9,10 @@
 )]
 
 mod builtin;
+mod developer_context;
 pub mod local_completion;
+
+pub use developer_context::{DeveloperContextProbe, DeveloperContextSnapshot};
 
 use std::{
     collections::BTreeMap,
@@ -25,9 +28,11 @@ pub const SESSION_ENVIRONMENT_BYTES_MAX: usize = 16 * 1024 * 1024;
 pub type OutputObserver<'a> =
     dyn FnMut(quirl_core::OutputStream, &[u8]) -> Result<(), quirl_core::ShellError> + 'a;
 
+#[derive(Clone)]
 pub(crate) struct SessionEnvironment {
     variables: BTreeMap<OsString, OsString>,
     initialization_error: Option<quirl_core::ShellError>,
+    generation: u64,
 }
 
 impl Default for SessionEnvironment {
@@ -54,10 +59,12 @@ impl SessionEnvironment {
             Ok(variables) => Self {
                 variables,
                 initialization_error: None,
+                generation: 0,
             },
             Err(error) => Self {
                 variables: BTreeMap::new(),
                 initialization_error: Some(error),
+                generation: 0,
             },
         }
     }
@@ -105,6 +112,24 @@ impl SessionEnvironment {
             .unwrap_or_default()
     }
 
+    fn resolve_executable(&self, program: &str) -> Option<std::path::PathBuf> {
+        let path = self.variables.get(OsStr::new("PATH"))?;
+        std::env::split_paths(path).find_map(|directory| {
+            let candidate = directory.join(program);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            #[cfg(windows)]
+            {
+                let candidate = directory.join(format!("{program}.exe"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            None
+        })
+    }
+
     fn set_variables(
         &mut self,
         assignments: &[(String, String)],
@@ -132,7 +157,17 @@ impl SessionEnvironment {
                 retained_bytes,
             ));
         }
-        self.variables = staged;
+        if staged != self.variables {
+            let generation = self.generation.checked_add(1).ok_or_else(|| {
+                quirl_core::ShellError::new(
+                    quirl_core::ErrorCode::ResourceLimit,
+                    "session environment generation counter was exhausted",
+                )
+                .with_help("Restart Quirl before applying another environment update")
+            })?;
+            self.variables = staged;
+            self.generation = generation;
+        }
         Ok(())
     }
 }
@@ -1130,6 +1165,16 @@ mod platform {
         /// Apply this executor's complete environment snapshot to a child command.
         pub fn configure_child(&self, command: &mut Command) -> Result<(), ShellError> {
             self.environment.configure(command)
+        }
+
+        /// Snapshot this executor's private environment for background prompt probes.
+        pub fn developer_context_probe(&self) -> crate::DeveloperContextProbe {
+            crate::DeveloperContextProbe::new(self.environment.clone())
+        }
+
+        /// Generation of the private environment observed by future children.
+        pub const fn environment_generation(&self) -> u64 {
+            self.environment.generation
         }
 
         #[cfg(test)]
@@ -5310,6 +5355,16 @@ mod platform {
         /// Apply this executor's complete environment snapshot to a child command.
         pub fn configure_child(&self, command: &mut Command) -> Result<(), ShellError> {
             self.environment.configure(command)
+        }
+
+        /// Snapshot this executor's private environment for background prompt probes.
+        pub fn developer_context_probe(&self) -> crate::DeveloperContextProbe {
+            crate::DeveloperContextProbe::new(self.environment.clone())
+        }
+
+        /// Generation of the private environment observed by future children.
+        pub const fn environment_generation(&self) -> u64 {
+            self.environment.generation
         }
 
         #[cfg(test)]

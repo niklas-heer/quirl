@@ -734,8 +734,9 @@ transcript scrolling/copy, and Ctrl-D on a real Unix PTY.
 
 Additions to `QuirlConfig` (Lua `config.lua`). The config schema fingerprint
 is frozen under ADR 0008. The interactive-surface fields shipped as config
-schema v2; theme selection and bounded custom palettes advance the contract to
-v3 with a deterministic v0/v1/v2-to-v3 migration:
+schema v2; theme selection and bounded custom palettes advanced v3, and the
+default active Rust toolchain segment advances v4 with a deterministic
+v0/v1/v2/v3-to-v4 migration:
 
 ```lua
 local config = quirl.config {
@@ -744,7 +745,7 @@ local config = quirl.config {
   prompt = {
     symbols = "auto",                                      -- existing
     left  = { "directory", "git_branch", "git_state" },
-    right = { "jobs", "duration", "status" },
+    right = { "rust_version", "jobs", "duration", "status" },
     transient = true,  -- schema-v2 compatibility; simple surface only (§5.5)
   },
   ui = {                                                   -- new

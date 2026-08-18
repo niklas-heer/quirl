@@ -592,20 +592,16 @@ fzf proves fuzzy selection is a terminal primitive. Quirl includes a native, typ
 ```lua
 ---@type quirl.Config
 local config = quirl.config {
-  schema_version = 3,
+  schema_version = 4,
   editor = { keymap = "emacs", semantic_hints = true, banner = "full" },
   picker = { layout = "adaptive", preview = true },
   prompt = {
     symbols = "auto",
     left = { "directory", "git_branch", "git_state" },
-    right = { "jobs", "duration", "status" },
+    right = { "rust_version", "jobs", "duration", "status" },
   },
   ui = { theme = "tokyo-night" },
 }
-
-if quirl.project.is_rust() then
-  config.prompt.right = { "rust_version", "jobs", "duration", "status" }
-end
 
 return config
 ```
@@ -663,7 +659,7 @@ Quirl ships an asynchronous prompt scheduler inspired by Starship and Oh My Posh
 ```yaml
 prompt:
   left: [directory, git_branch, git_state]
-  right: [jobs, duration, status]
+  right: [rust_version, jobs, duration, status]
   transient: true
   first_paint_budget: 8ms
   slow_segment_policy: stale_while_refresh

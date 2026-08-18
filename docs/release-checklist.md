@@ -51,8 +51,8 @@ evidence, not a human signoff.
   platform facts, and has a recorded byte length and cryptographic checksum for
   this exact candidate. This artifact is distinct from the mutable local
   intelligence cache and from `Catalog::builtin()` metadata.
-- [ ] The reviewed config descriptor is schema v3, its golden fingerprint
-  matches the candidate, and v0/v1/v2-to-v3 migration tests pass.
+- [ ] The reviewed config descriptor is schema v4, its golden fingerprint
+  matches the candidate, and v0/v1/v2/v3-to-v4 migration tests pass.
 - [ ] The supported compatibility boundary is unchanged: C0/C1-core is native
   on Linux/macOS; here-documents, process substitution, loops, functions,
   conditionals, and dialect control forms are explicit Bash/Zsh islands.
@@ -270,9 +270,9 @@ Before publishing the capture:
 - [ ] Draft release notes with supported platforms, native compatibility scope,
   reference-shell behavior, known residual risks, and upgrade/migration notes.
   For 0.1, note that config schema v3 adds shared semantic themes on top of the
-  v2 rich-surface settings; legacy unversioned v0 and explicit v1/v2 config
-  migrate to v3 defaults, and no published config contract is being silently
-  reinterpreted.
+  v2 rich-surface settings and v4 adds the default active Rust toolchain prompt
+  segment; legacy unversioned v0 and explicit v1/v2/v3 config migrate to v4
+  defaults, and no published config contract is being silently reinterpreted.
 - [ ] Create an annotated version tag only after every required Linux/macOS gate
   above is signed off, and point it explicitly at A, even if HEAD has moved to
   evidence commit B: `git tag -a v0.1.0 "$QUIRL_CANDIDATE_COMMIT"`.

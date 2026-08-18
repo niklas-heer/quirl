@@ -1029,6 +1029,19 @@ pub struct NativePromptContext {
     pub git_branch: Option<String>,
     /// Bounded native state label such as `dirty`, `merging`, or `rebasing`.
     pub git_state: Option<String>,
+    /// Version reported by the active Rust compiler for this directory.
+    pub rust_version: Option<String>,
+}
+
+/// Process-probed project values supplied by the product composition root.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NativeProjectContext {
+    /// Current Git branch or abbreviated detached object identifier.
+    pub git_branch: Option<String>,
+    /// Compact bounded Git worktree and synchronization state.
+    pub git_state: Option<String>,
+    /// Version reported by the active Rust compiler when this is a Rust project.
+    pub rust_version: Option<String>,
 }
 
 /// Instrumentation for one non-blocking native prompt context lookup.
@@ -1076,7 +1089,7 @@ struct WorktreeStamp {
     truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PromptDependencies {
     git_dir: Option<PathBuf>,
     head: Option<String>,
@@ -1146,6 +1159,31 @@ impl PromptContextScheduler {
     /// and each Git worktree scan inspects at most 4,096 entries.
     pub fn new(first_paint_budget: Duration) -> Self {
         Self::with_context_loader(first_paint_budget, Arc::new(load_prompt_context))
+    }
+
+    /// Start a scheduler whose background worker uses a process-owned project probe.
+    ///
+    /// The caller owns process containment and must bound probe duration and output.
+    /// Quirl invokes the probe only on the scheduler worker, never on first paint.
+    pub fn with_project_context_loader<F>(first_paint_budget: Duration, loader: F) -> Self
+    where
+        F: Fn(&Path) -> NativeProjectContext + Send + Sync + 'static,
+    {
+        Self::with_context_loader(
+            first_paint_budget,
+            Arc::new(move |cwd, _previous| {
+                let project = loader(&cwd);
+                PromptCacheEntry {
+                    context: NativePromptContext {
+                        directory: display_directory(&cwd),
+                        git_branch: project.git_branch,
+                        git_state: project.git_state,
+                        rust_version: project.rust_version,
+                    },
+                    dependencies: PromptDependencies::default(),
+                }
+            }),
+        )
     }
 
     fn with_context_loader(first_paint_budget: Duration, loader: Arc<PromptContextLoader>) -> Self {
@@ -1380,6 +1418,7 @@ fn load_prompt_context(cwd: PathBuf, previous: Option<PromptCacheEntry>) -> Prom
             directory: display_directory(&cwd),
             git_branch,
             git_state,
+            rust_version: None,
         },
         dependencies,
     }
@@ -1509,6 +1548,7 @@ pub struct QuirlPrompt {
     cwd: String,
     git_branch: Option<String>,
     git_state: Option<String>,
+    rust_version: Option<String>,
     status: Option<i32>,
     jobs: usize,
     duration: Option<Duration>,
@@ -1613,6 +1653,13 @@ impl PromptSymbols {
         }
     }
 
+    fn rust_version(self, value: &str) -> String {
+        match self {
+            Self::NerdFont => format!("\u{e7a8} {value}"),
+            Self::Plain | Self::Unicode => format!("rust {value}"),
+        }
+    }
+
     fn status(self, value: i32) -> String {
         match self {
             Self::NerdFont => format!("\u{f057} {value}"),
@@ -1659,6 +1706,7 @@ impl QuirlPrompt {
             cwd,
             git_branch: None,
             git_state: None,
+            rust_version: None,
             status: None,
             jobs: 0,
             duration: None,
@@ -1674,9 +1722,9 @@ impl QuirlPrompt {
 
     /// Create a prompt whose visible segments and order are selected by Lua config.
     ///
-    /// Known native segments are `directory`, `git_branch`, and `mode`; `status` and
-    /// `duration` are available after their builder methods receive session values.
-    /// `jobs` and `git_state` are skipped until the interactive host provides them.
+    /// Known native segments include `directory`, `git_branch`, `git_state`,
+    /// `rust_version`, and `mode`; status, duration, and jobs are skipped until the
+    /// interactive host supplies values.
     pub fn with_config(mode: Mode, config: &QuirlConfig) -> Self {
         let mut prompt = Self::new(mode);
         prompt.configured_left = Some(config.prompt.left.clone());
@@ -1720,6 +1768,9 @@ impl QuirlPrompt {
         self.cwd = safe_prompt_text(&context.directory);
         self.git_branch = context.git_branch.map(|branch| safe_prompt_text(&branch));
         self.git_state = context.git_state.map(|state| safe_prompt_text(&state));
+        self.rust_version = context
+            .rust_version
+            .map(|version| safe_prompt_text(&version));
         self
     }
 
@@ -1794,6 +1845,10 @@ impl QuirlPrompt {
                 .git_state
                 .as_ref()
                 .map(|state| symbols.git_state(state)),
+            "rust_version" => self
+                .rust_version
+                .as_ref()
+                .map(|version| symbols.rust_version(version)),
             _ => self.named_extension_segments.get(name).cloned(),
         }
     }
@@ -3420,6 +3475,7 @@ mod tests {
             directory: hostile.to_owned(),
             git_branch: Some(hostile.to_owned()),
             git_state: Some(hostile.to_owned()),
+            rust_version: Some(hostile.to_owned()),
         };
         let original = context.clone();
         let config = QuirlConfig {
@@ -3505,6 +3561,7 @@ mod tests {
                     directory: "quirl".to_owned(),
                     git_branch: Some("main".to_owned()),
                     git_state: Some("dirty".to_owned()),
+                    rust_version: None,
                 })
                 .with_jobs(2)
                 .with_duration(Duration::from_millis(42))
@@ -3817,6 +3874,29 @@ mod tests {
     }
 
     #[test]
+    fn rust_version_is_default_context_and_omitted_outside_rust_projects() {
+        let config = QuirlConfig::default();
+        assert_eq!(
+            config.prompt.right.first().map(String::as_str),
+            Some("rust_version")
+        );
+        assert_eq!(
+            QuirlPrompt::with_config(Mode::Command, &config).render_prompt_right(),
+            ""
+        );
+
+        let prompt = QuirlPrompt::with_config(Mode::Command, &config).with_native_context(
+            NativePromptContext {
+                directory: "quirl".to_owned(),
+                git_branch: None,
+                git_state: None,
+                rust_version: Some("1.97.1".to_owned()),
+            },
+        );
+        assert_eq!(prompt.render_prompt_right(), "rust 1.97.1");
+    }
+
+    #[test]
     fn prompt_jobs_segment_only_renders_active_jobs() {
         let config = QuirlConfig {
             prompt: PromptConfig {
@@ -3844,6 +3924,7 @@ mod tests {
                 directory: display_directory(cwd),
                 git_branch: Some(branch.to_owned()),
                 git_state: state.map(str::to_owned),
+                rust_version: None,
             },
             dependencies: PromptDependencies {
                 git_dir: None,
@@ -4073,6 +4154,7 @@ mod tests {
                 directory: "quirl".to_owned(),
                 git_branch: Some("main".to_owned()),
                 git_state: Some("dirty".to_owned()),
+                rust_version: None,
             })
             .with_named_extension_segments(vec![("project".to_owned(), "quirl".to_owned())]);
 
@@ -4119,6 +4201,7 @@ mod tests {
                 directory: "~/P/g/n/quirl".to_owned(),
                 git_branch: Some("main".to_owned()),
                 git_state: Some("dirty".to_owned()),
+                rust_version: None,
             },
         );
         prompt.styled = true;
