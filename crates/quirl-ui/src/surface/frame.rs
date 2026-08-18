@@ -969,7 +969,7 @@ mod tests {
     fn rest_frame_has_context_input_and_persistent_status_rows() {
         let terminal = rendered_model(78, 3, "git status", None, |_| {});
         assert!(row(&terminal, 0).contains("~/P/q  on main"));
-        assert!(row(&terminal, 1).contains("❯ git status"));
+        assert!(row(&terminal, 1).contains("git status"));
         assert!(row(&terminal, 2).contains("NORMAL"));
         assert_eq!(
             terminal.backend().buffer().cell((2, 1)).unwrap().fg,
@@ -1081,20 +1081,17 @@ mod tests {
                 .render(frame);
             })
             .unwrap();
-        assert!(row(&terminal, 1).contains("> git"));
+        assert!(row(&terminal, 1).starts_with("git"));
         assert!(!row(&terminal, 1).contains("status"));
         assert_eq!(
-            terminal.backend().buffer().cell((2, 1)).unwrap().fg,
+            terminal.backend().buffer().cell((0, 1)).unwrap().fg,
             Color::Rgb(158, 206, 106)
         );
     }
 
     #[test]
     fn nerd_font_profile_applies_icons_across_rich_surface_chrome() {
-        assert_eq!(
-            SurfaceSymbols::NerdFont.input_indicator(Mode::Command),
-            "\u{f105} "
-        );
+        assert_eq!(SurfaceSymbols::NerdFont.input_indicator(Mode::Command), "");
         assert_eq!(
             SurfaceSymbols::NerdFont.status_mode_icon(Mode::Data),
             "\u{f1c0}"
@@ -1200,7 +1197,7 @@ mod tests {
 
         draw_runtime_model(&mut terminal, &editor, &completion, &runtime);
         let cursor_at_rest = terminal.get_cursor_position().unwrap();
-        assert!(row(&terminal, 1).contains("❯ git st"));
+        assert!(row(&terminal, 1).contains("git st"));
         assert!(row(&terminal, 2).contains("demo · status"));
 
         completion.open_manual(
@@ -1220,13 +1217,13 @@ mod tests {
         );
         draw_runtime_model(&mut terminal, &editor, &completion, &runtime);
         assert_eq!(terminal.get_cursor_position().unwrap(), cursor_at_rest);
-        assert!(row(&terminal, 1).contains("❯ git st"));
+        assert!(row(&terminal, 1).contains("git st"));
         assert!(row(&terminal, 2).contains("completions"));
 
         completion.dismiss();
         draw_runtime_model(&mut terminal, &editor, &completion, &runtime);
         assert_eq!(terminal.get_cursor_position().unwrap(), cursor_at_rest);
-        assert!(row(&terminal, 1).contains("❯ git st"));
+        assert!(row(&terminal, 1).contains("git st"));
         assert!(row(&terminal, 2).contains("demo · status"));
         assert!(row(&terminal, 11).contains("NORMAL"));
     }
@@ -1359,7 +1356,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(78, 12)).unwrap();
         terminal.draw(|frame| model.render(frame)).unwrap();
         assert!(row(&terminal, 0).contains("~/project"));
-        assert!(row(&terminal, 1).contains('❯'));
+        assert!(row(&terminal, 1).trim().is_empty());
         assert!(row(&terminal, 11).contains("NORMAL"));
         assert!(row(&terminal, 3).trim().is_empty());
         assert!(row(&terminal, 10).trim().is_empty());
@@ -1367,7 +1364,7 @@ mod tests {
         terminal.backend_mut().resize(52, 6);
         terminal.draw(|frame| model.render(frame)).unwrap();
         assert!(row(&terminal, 0).contains("~/project"));
-        assert!(row(&terminal, 1).contains('❯'));
+        assert!(row(&terminal, 1).trim().is_empty());
         assert!(row(&terminal, 5).contains("NORMAL"));
         assert!(row(&terminal, 4).trim().is_empty());
     }
@@ -1422,7 +1419,7 @@ mod tests {
         draw(&mut terminal, &transcript);
         assert!(row(&terminal, 0).contains("❯ pwd"));
         assert!(row(&terminal, 2).contains("~/workspace"));
-        assert!(row(&terminal, 3).contains('❯'));
+        assert!(row(&terminal, 3).trim().is_empty());
         assert!(row(&terminal, 7).contains("NORMAL"));
 
         for index in 0..10 {
@@ -1431,7 +1428,7 @@ mod tests {
         draw(&mut terminal, &transcript);
         assert!(row(&terminal, 4).contains("output-9"));
         assert!(row(&terminal, 5).contains("~/workspace"));
-        assert!(row(&terminal, 6).contains('❯'));
+        assert!(row(&terminal, 6).trim().is_empty());
         assert!(row(&terminal, 7).contains("NORMAL"));
 
         assert!(transcript.page_up(7));
@@ -1611,7 +1608,7 @@ mod tests {
         assert_eq!(terminal.get_cursor_position().unwrap(), cursor_at_rest);
         let rendered = (0..12).map(|y| row(&terminal, y)).collect::<String>();
         assert!(rendered.contains("completions"));
-        assert!(row(&terminal, 10).contains("❯ git st"));
+        assert!(row(&terminal, 10).contains("git st"));
         assert!(row(&terminal, 11).contains("NORMAL"));
     }
 
@@ -1761,7 +1758,7 @@ mod tests {
             .unwrap();
 
         assert!(row(&terminal, 0).contains("~/project"));
-        assert!(row(&terminal, 1).contains('❯'));
+        assert!(row(&terminal, 1).trim().is_empty());
         assert!(row(&terminal, 2).contains("picker"));
         assert!(row(&terminal, 19).trim().is_empty());
         assert!(row(&terminal, 29).contains("NORMAL"));

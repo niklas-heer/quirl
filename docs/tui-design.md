@@ -354,14 +354,15 @@ enum EditAction {
 All mockups assume a 78-column terminal, `unicode` symbol profile, defaults.
 Glyphs come from `PromptSymbols` profiles: `auto` promotes to private-use icons
 only for terminals with documented built-in Nerd symbols, while `plain`
-substitutes ASCII (`>`, `data>`, `*`, `!`) and remains universally safe.
+substitutes ASCII (`D`, `AI`, `*`, `!`) and remains universally safe. Normal
+command input deliberately has no leading marker.
 
 ### 5.1 Frame at rest (command mode)
 
 ```
  ~/projects/quirl  main ✚2                                 1 job · 412ms · ✘1
-❯ cargo build --release▌
- ❯ NORMAL   Alt-Q Quirl · Tab complete · ↑ / Ctrl-R history           quirl
+cargo build --release▌
+ NORMAL   Alt-Q Quirl · Tab complete · ↑ / Ctrl-R history             quirl
 ```
 
 Row 1 — **context row**: existing prompt segments. Left list (`directory`,
@@ -373,9 +374,9 @@ surface consumes escaped, rendered left/right `QuirlPrompt` strings and gives
 the branch suffix a secondary style rather than retaining one styled span per
 source segment.
 
-Row 2 — **input row**: mode indicator (`❯` normal / `▦` data / `✧` AI), one space,
-the highlighted buffer, hardware cursor at the edit position
-(`Frame::set_cursor_position`). Inline history autosuggestion renders dim
+Row 2 — **input row**: normal input starts without a marker; Data (`▦`) and AI
+(`✧`) retain explicit indicators before the highlighted buffer and hardware
+cursor at the edit position (`Frame::set_cursor_position`). Inline history autosuggestion renders dim
 after the cursor.
 
 Rows below the editor and any active overlay form the bounded transcript
@@ -385,7 +386,7 @@ viewport (§3.4). The physical bottom row is always the **status bar** (§8).
 
 ```
  ~/projects/quirl  main                                            412ms
-❯ git che▌
+git che▌
   ┌ completions ────────────────────────┬ git checkout ─────────────────────┐
   │ ▸ checkout     switch branches      │ git checkout <branch>             │
   │   cherry       find unmerged commits│                                   │
@@ -422,7 +423,7 @@ viewport (§3.4). The physical bottom row is always the **status bar** (§8).
 ### 5.3 Diagnostics row
 
 ```
-❯ gti status▌
+gti status▌
   ✘ unknown command `gti` — did you mean `git`?                 quirl.invalid-command
  NOR · command …
 ```
@@ -452,12 +453,12 @@ transcript entry, and a fresh editor remains at the top:
 
 ```
  ~/projects/quirl  main                                            2.31s
-❯ ▌
+▌
   ┌ cargo build --release                                  ✔ 0 · 2.31s
   │ Compiling quirl-core v0.1.0 ...
   └ Finished `release` profile
 
- ❯ NORMAL   Alt-Q Quirl · PgUp scroll · copy selection             quirl
+ NORMAL   Alt-Q Quirl · PgUp scroll · copy selection               quirl
 ```
 
 The header records the terminal-safe accepted command, exit status, and
@@ -570,7 +571,7 @@ patching the lexer style with a diagnostic severity style.
 
 | Role | Default | Used by |
 | --- | --- | --- |
-| `accent.command` | green | indicator `❯`, popup selection, match highlights |
+| `accent.command` | green | popup selection and match highlights |
 | `accent.data` | magenta | indicator `▦` and all accent uses in data mode |
 | `command.known` / `command.unknown` | green / red | input row |
 | `flag` | cyan | input row |

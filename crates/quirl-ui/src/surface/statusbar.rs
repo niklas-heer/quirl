@@ -28,10 +28,12 @@ impl StatusBarModel<'_> {
             left.push(label.to_owned());
         }
         let mode_icon = self.symbols.status_mode_icon(self.mode);
-        left.push(format!(
-            " {mode_icon} {} ",
-            self.mode.to_string().to_uppercase()
-        ));
+        let mode_label = self.mode.to_string().to_uppercase();
+        left.push(if mode_icon.is_empty() {
+            format!(" {mode_label} ")
+        } else {
+            format!(" {mode_icon} {mode_label} ")
+        });
 
         let center = if let Some(notice) = self.notice {
             notice.to_owned()

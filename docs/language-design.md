@@ -112,7 +112,7 @@ Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unl
 
 | Mode | Contract | Examples | Explicit entry |
 | --- | --- | --- | --- |
-| Normal `❯` | Bytes and processes; commands resolve through the session `PATH`; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `ls -al`, `false \|\| echo recovered` | `mode normal` (legacy: `mode command`) |
+| Normal | Bytes and processes; commands resolve through the session `PATH`; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `ls -al`, `false \|\| echo recovered` | `mode normal` (legacy: `mode command`) |
 | Data `▦` | Unambiguous Quirl grammar; typed, lazy values; external programs require an adapter or `^command`; failures are `Result` values | `ps \| where cpu > 20 \| sort cpu desc`, `open users.json \| get users \| select name email` | `mode data`; one-shot `data { ... }` |
 | AI `✧` | Live command and option discovery over the SQLite catalog; Quirl's pinned command-tuned int8 model downloads and indexes automatically after first paint. Enter inserts the selected suggestion into normal mode for review and never executes it directly. | `copy a directory while preserving permissions`, `find the option that follows symlinks` | `mode ai`; `Alt-Q i` selects it. `mode natural`, `mode nl`, and `mode human` remain aliases. |
 
@@ -386,8 +386,8 @@ type Entry = {
 ▦ ls | where kind == directory # structured filter
 ▦ ls src | sort size desc    # typed path argument and transform
 ▦ ls | view tree             # renderer chosen explicitly
-❯ ls | grep Cargo            # command mode emits compatible text
-❯ ls -la                     # system flags pass through unchanged
+ls | grep Cargo              # command mode emits compatible text
+ls -la                       # system flags pass through unchanged
 ```
 
 - **Bounded fast path:** names, kind, size, modified time, hidden state, and
@@ -582,7 +582,7 @@ fzf proves fuzzy selection is a terminal primitive. Quirl includes a native, typ
 ```quirl
 ▦ ls **/*.rs | pick --display path --preview source | open
 ▦ ps | where cpu > 5 | pick --multi --preview process | kill --confirm
-❯ git branch --format='%(refname:short)' | pick --query feature
+git branch --format='%(refname:short)' | pick --query feature
 ```
 
 ### Lua configuration with synchronized views

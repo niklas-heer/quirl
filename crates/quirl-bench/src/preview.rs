@@ -555,12 +555,10 @@ fn measure_pty_sample(
     let started = Instant::now();
     let mut session = PtySession::spawn(path, fixture)?;
     let result = (|| {
-        // The welcome banner also teaches with a prompt glyph, so `❯` alone
-        // does not prove that the rich editor has entered raw mode. The
-        // textual status row is the accessibility contract for an editable
+        // The textual status row is the accessibility contract for an editable
         // command frame and cannot be confused with terminal echo.
         session.wait_for_screen(
-            "❯ NORMAL · Alt-Q Quirl",
+            "NORMAL · Alt-Q Quirl",
             timeout,
             "first editable command frame",
         )?;

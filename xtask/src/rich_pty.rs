@@ -712,7 +712,7 @@ fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Err
     for (leader_key, expected_mode, expected_indicator) in [
         (b"d", "DATA", "D echo MODE_BUFFER_RETAINED"),
         (b"i", "AI", "AI echo MODE_BUFFER_RETAINED"),
-        (b"n", "NORMAL", "> echo MODE_BUFFER_RETAINED"),
+        (b"n", "NORMAL", "echo MODE_BUFFER_RETAINED"),
         (b"d", "DATA", "D echo MODE_BUFFER_RETAINED"),
     ] {
         let output_start = session.pty.output().len();
@@ -939,11 +939,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session
         .pty
         .wait_for_screen("fresh blank Normal prompt after ls", |screen| {
-            screen.lines().iter().any(|line| line.trim() == ">")
-                && !screen
-                    .lines()
-                    .iter()
-                    .any(|line| line.trim_start().starts_with("> ls -al"))
+            !screen.lines().iter().any(|line| line.trim() == "ls -al")
                 && screen.bottom_line().contains("NORMAL")
         })?;
     write_fixture(
@@ -1536,7 +1532,7 @@ fn check_cwd_history(binary: &Path) -> Result<(), Box<dyn Error>> {
 fn execute_cwd_history_command(session: &mut Session, command: &str) -> Result<(), Box<dyn Error>> {
     let output_start = session.pty.output().len();
     session.pty.type_text(command)?;
-    let editor_line = format!("> {command}");
+    let editor_line = command.to_owned();
     session
         .pty
         .wait_for_screen("complete cwd-history command in editor", |screen| {
@@ -1929,11 +1925,15 @@ fn transcript_tail_flows_into_prompt(screen: &VirtualScreen, command: &str, outp
         .iter()
         .rposition(|line| line.trim_start().starts_with(output));
     let exit_row = lines.iter().rposition(|line| line.contains("── exit "));
-    let prompt_row = lines.iter().rposition(|line| line.trim() == ">");
+    let status_row = lines
+        .iter()
+        .rposition(|line| line.contains("NORMAL") || line.contains("DATA") || line.contains("AI"));
     matches!(
-        (command_row, output_row, exit_row, prompt_row),
-        (Some(command_row), Some(output_row), Some(exit_row), Some(prompt_row))
-            if command_row < output_row && output_row < exit_row && exit_row < prompt_row
+        (command_row, output_row, exit_row, status_row),
+        (Some(command_row), Some(output_row), Some(exit_row), Some(status_row))
+            if command_row < output_row
+                && output_row < exit_row
+                && exit_row.saturating_add(2) <= status_row
     )
 }
 
@@ -2158,7 +2158,7 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
     session
         .pty
         .wait_for_screen("simple-surface job-control prompt", |screen| {
-            screen.lines().iter().any(|line| line.contains('>'))
+            screen.lines().iter().any(|line| line.trim() == "normal")
         })?;
     let prompt_modes = session.pty.terminal_modes()?;
     let child = session

@@ -1635,14 +1635,13 @@ impl SurfaceSymbols {
 
     pub(crate) const fn input_indicator(self, mode: Mode) -> &'static str {
         match (self, mode) {
-            (Self::Plain, Mode::Command) => "> ",
+            (Self::Plain, Mode::Command) => "",
             (Self::Plain, Mode::Data) => "D ",
             (Self::Plain, Mode::Natural) => "AI ",
-            (Self::Unicode, Mode::Command) => "❯ ",
+            (Self::Unicode, Mode::Command) => "",
             (Self::Unicode, Mode::Data) => "▦ ",
             (Self::Unicode, Mode::Natural) => "✧ ",
-            // These private-use glyphs are restricted to the explicit patched-font profile.
-            (Self::NerdFont, Mode::Command) => "\u{f105} ",
+            (Self::NerdFont, Mode::Command) => "",
             (Self::NerdFont, Mode::Data) => "\u{f1b2} ",
             (Self::NerdFont, Mode::Natural) => "\u{f544} ",
         }
@@ -1658,10 +1657,10 @@ impl SurfaceSymbols {
 
     pub(crate) const fn status_mode_icon(self, mode: Mode) -> &'static str {
         match (self, mode) {
-            (Self::Plain, Mode::Command) => ">",
+            (Self::Plain, Mode::Command) => "",
             (Self::Plain, Mode::Data) => "D",
             (Self::Plain, Mode::Natural) => "AI",
-            (Self::Unicode, Mode::Command) => "❯",
+            (Self::Unicode, Mode::Command) => "",
             (Self::Unicode, Mode::Data) => "▦",
             (Self::Unicode, Mode::Natural) => "✧",
             (Self::NerdFont, Mode::Command) => "\u{f120}",
@@ -2110,13 +2109,13 @@ impl Prompt for QuirlPrompt {
         };
         let indicator = if self.symbols() == PromptSymbols::Plain {
             match self.mode {
-                Mode::Command => "normal >",
-                Mode::Data => "data >",
-                Mode::Natural => "AI >",
+                Mode::Command => "normal",
+                Mode::Data => "data",
+                Mode::Natural => "AI",
             }
         } else {
             match self.mode {
-                Mode::Command => "normal ❯",
+                Mode::Command => "normal",
                 Mode::Data => "data ▦",
                 Mode::Natural => "AI ✧",
             }
@@ -2141,12 +2140,16 @@ impl Prompt for QuirlPrompt {
     ) -> Cow<'_, str> {
         let indicator = if self.symbols() == PromptSymbols::Plain {
             match self.mode {
-                Mode::Command => ">",
-                Mode::Data => "data>",
-                Mode::Natural => "AI>",
+                Mode::Command => "normal",
+                Mode::Data => "data",
+                Mode::Natural => "AI",
             }
         } else {
-            self.mode.prompt()
+            match self.mode {
+                Mode::Command => "normal",
+                Mode::Data => "data ▦",
+                Mode::Natural => "AI ✧",
+            }
         };
         Cow::Owned(format!(
             "search `{}` {indicator} ",
@@ -3783,23 +3786,23 @@ mod tests {
         let prompt = QuirlPrompt::with_config(Mode::Command, &config);
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Default),
-            "normal > "
+            "normal "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Emacs),
-            "normal > "
+            "normal "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Normal)),
-            "normal normal > "
+            "normal normal "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Insert)),
-            "insert normal > "
+            "insert normal "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Visual)),
-            "visual normal > "
+            "visual normal "
         );
         let cursors = editor_cursor_config();
         assert_eq!(cursors.vi_insert, Some(SetCursorStyle::SteadyBar));
