@@ -1139,7 +1139,7 @@ impl Catalog {
                     "quirl ai search",
                     "quirl ai search <query...> [--limit count] [--kind all|command|option] [--format text|json]",
                     "Find commands and options by task intent",
-                    "Ranks local potion-base-8M embeddings when the model and semantic index are ready, otherwise uses deterministic bounded lexical search. Results are suggestions and are never executed.",
+                    "Always ranks the complete bounded lexical document set and fuses it with matching local Model2Vec embeddings when the exact model, document-generation version, dimensions, and index fingerprint agree. Missing, stale, cancelled, invalid, or mismatched semantic state falls back to lexical results. Search is local, CPU-only, network-free, and never executes a result.",
                     vec![
                         option(
                             &["--limit"],
@@ -1160,6 +1160,21 @@ impl Catalog {
                     ],
                     &["quirl ai search 'copy a directory preserving permissions'"],
                     &[Effect::ReadFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl ai run",
+                    "quirl ai run <query...>",
+                    "Preview and explicitly confirm one catalog-backed command",
+                    "Uses bounded hybrid retrieval and the retrieval-only CommandProposal fallback to select a current catalog command ID. Trusted Rust code revalidates the ID, renders the exact quoted command, and requires explicit acceptance before the existing execution path is entered. Filesystem writes and process-spawning commands require a distinct second high-risk confirmation. Commands with unresolved required arguments fail without execution; a future local planner may fill only typed catalog argument slots, never arbitrary shell text.",
+                    vec![],
+                    &["quirl ai run 'show the current working directory'"],
+                    &[
+                        Effect::ReadFilesystem,
+                        Effect::WriteFilesystem,
+                        Effect::SpawnProcess,
+                        Effect::ChangeDirectory,
+                    ],
                     Provenance::Builtin,
                 ),
                 command(

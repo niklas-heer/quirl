@@ -41,7 +41,8 @@ use package::PackageCommand;
 use pick::PickCommand;
 use platform::{EventsCommand, ViewCommand, WatchCommand};
 use plugin::PluginCommand;
-use quirl_catalog::{Catalog, CommandSpec, Completion};
+use quirl_catalog::{Catalog, CommandSpec, Completion, Effect as CatalogEffect};
+use quirl_contract::CommandProposal;
 use quirl_core::{
     CommandOutcome, ErrorCode, ExecutionCancellation, ExecutionCleanupState, ExecutionEffect,
     ExecutionEffects, ExecutionInput, ExecutionMode, ExecutionOutcome, ExecutionOutput,
@@ -429,6 +430,9 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             Ok(0)
         }
         Some(Command::Agent { command }) => agent::execute(command, &load_composed_catalog()?),
+        Some(Command::Ai {
+            command: AiCommand::Run { query },
+        }) => execute_natural_command(&query),
         Some(Command::Ai { command }) => ai::execute(command),
         Some(Command::Package { command }) => package::execute(command, &load_composed_catalog()?),
         Some(Command::Describe { command }) => author::describe(command, &load_composed_catalog()?),
@@ -477,6 +481,120 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             repl(Arc::new(Mutex::new(host)))
         }
     }
+}
+
+fn execute_natural_command(query: &[String]) -> Result<i32, ShellError> {
+    let intent = join_natural_query(query)?;
+    let results = index::search_default_database(&intent, intelligence::SEARCH_RESULTS_MAX)?;
+    let candidate = results
+        .iter()
+        .find(|result| result.kind == "command")
+        .ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::InvalidCommand,
+                "natural command retrieval found no catalog command",
+            )
+            .with_help(
+                "Refresh the local index or describe the task with more command-specific words",
+            )
+        })?;
+    let catalog = load_composed_catalog()?;
+    let command = catalog
+        .commands
+        .iter()
+        .find(|command| command.path == candidate.command)
+        .ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::Validation,
+                "the ranked command is absent from the current catalog",
+            )
+            .with_context(format!("ranked path: {}", candidate.command))
+            .with_help("Refresh the command index and retry the natural-language request")
+        })?;
+    let proposal = CommandProposal::retrieval_fallback(
+        &catalog,
+        command.id.clone(),
+        format!("retrieved `{}` for the supplied task", command.path),
+        "quirl-bounded-hybrid-retrieval-v1",
+    )?;
+    let validated = proposal.validate(&catalog)?;
+    let preview = validated.render_trusted()?;
+    let risk = validated.risk();
+    let effects = validated.effects().to_vec();
+    let mut input = io::stdin().lock();
+    let mut output = io::stderr().lock();
+    if !ai::confirm_natural_command(&preview, risk, &mut input, &mut output)? {
+        writeln!(output, "natural command cancelled").map_err(|error| {
+            ShellError::new(
+                ErrorCode::Io,
+                "could not report natural command cancellation",
+            )
+            .with_context(error.to_string())
+            .with_help("Check that standard error is writable")
+        })?;
+        return Ok(1);
+    }
+    drop(output);
+    drop(input);
+
+    let current_catalog = load_composed_catalog()?;
+    let current = proposal.validate(&current_catalog)?;
+    let current_preview = current.render_trusted()?;
+    if current_preview != preview || current.risk() != risk || current.effects() != effects {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "the catalog command changed after confirmation",
+        )
+        .with_help("Review the refreshed preview and confirm it again"));
+    }
+    let request = execution_request(
+        "<natural-command>",
+        &current_preview,
+        ExecutionMode::NativeCommand,
+        ExecutionOutputTarget::Inherit,
+        natural_execution_effects(current.effects()),
+    )?;
+    let outcome = execute_execution_request(&mut NativeExecutor::default(), request, None)?;
+    print_execution_outcome(&outcome)?;
+    Ok(outcome.status_code())
+}
+
+fn join_natural_query(query: &[String]) -> Result<String, ShellError> {
+    let mut bytes = 0_usize;
+    for part in query {
+        bytes = bytes
+            .checked_add(part.len())
+            .and_then(|value| value.checked_add(usize::from(bytes > 0)))
+            .ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "natural command query byte count overflowed",
+                )
+                .with_help("Use a shorter natural-language request")
+            })?;
+        if bytes > intelligence::QUERY_BYTES_MAX {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "natural command query exceeded its byte limit",
+            )
+            .with_context(format!(
+                "limit: {}; observed: {bytes}",
+                intelligence::QUERY_BYTES_MAX
+            ))
+            .with_help("Use a shorter natural-language request"));
+        }
+    }
+    Ok(query.join(" "))
+}
+
+fn natural_execution_effects(effects: &[CatalogEffect]) -> ExecutionEffects {
+    let effects = effects.iter().map(|effect| match effect {
+        CatalogEffect::ReadFilesystem => ExecutionEffect::ReadFilesystem,
+        CatalogEffect::WriteFilesystem => ExecutionEffect::WriteFilesystem,
+        CatalogEffect::SpawnProcess => ExecutionEffect::SpawnProcess,
+        CatalogEffect::ChangeDirectory => ExecutionEffect::ChangeDirectory,
+    });
+    ExecutionEffects::from_effects(&effects.collect::<Vec<_>>())
 }
 
 fn load_composed_catalog() -> Result<Catalog, ShellError> {

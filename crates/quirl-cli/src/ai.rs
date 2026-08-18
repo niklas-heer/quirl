@@ -2,9 +2,17 @@
 
 use crate::{index, intelligence};
 use clap::{Subcommand, ValueEnum};
+use quirl_contract::CommandProposalRisk;
 use quirl_core::{ErrorCode, ShellError, escape_json_terminal_controls, escape_terminal_controls};
 use serde::Serialize;
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    io::{Read, Write},
+    path::PathBuf,
+};
+
+const CONFIRMATION_BYTES_MAX: usize = 64;
+pub(crate) const NATURAL_PREVIEW_BYTES_MAX: usize = 16 * 1024;
 
 /// Local command-intelligence operations. None execute suggested commands.
 #[derive(Debug, Subcommand)]
@@ -35,6 +43,12 @@ pub(crate) enum AiCommand {
         /// Output representation for ranked results.
         #[arg(long, value_enum, default_value_t = AiOutputFormat::Text)]
         format: AiOutputFormat,
+    },
+    /// Propose, preview, confirm, and run one catalog-backed command.
+    Run {
+        /// Natural-language task description. Retrieval never invents shell text.
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
     },
     /// Suggest commands and options related to an installed command.
     Related {
@@ -68,7 +82,8 @@ struct AiStatus {
     database_path: PathBuf,
     database_ready: bool,
     database_bytes: Option<u64>,
-    model: &'static str,
+    model: String,
+    model_identity: Option<intelligence::ModelIdentity>,
     model_path: Option<PathBuf>,
     model_ready: bool,
     commands: Option<usize>,
@@ -85,6 +100,7 @@ pub(crate) fn wants_json(command: &AiCommand) -> bool {
         | AiCommand::Index { format }
         | AiCommand::Search { format, .. }
         | AiCommand::Related { format, .. } => matches!(format, AiOutputFormat::Json),
+        AiCommand::Run { .. } => false,
     }
 }
 
@@ -110,12 +126,17 @@ pub(crate) fn execute(command: AiCommand) -> Result<i32, ShellError> {
             kind,
             format,
         } => {
-            let mut results = index::search_default_database(&query.join(" "), limit)?;
+            let retrieval_limit = match kind {
+                SearchKind::All => limit,
+                SearchKind::Command | SearchKind::Option => intelligence::SEARCH_RESULTS_MAX,
+            };
+            let mut results = index::search_default_database(&query.join(" "), retrieval_limit)?;
             results.retain(|result| match kind {
                 SearchKind::All => true,
                 SearchKind::Command => result.kind == "command",
                 SearchKind::Option => result.kind == "option",
             });
+            results.truncate(limit);
             present_results(&results, format)?;
             Ok(i32::from(results.is_empty()))
         }
@@ -147,7 +168,92 @@ pub(crate) fn execute(command: AiCommand) -> Result<i32, ShellError> {
             present_results(&results, format)?;
             Ok(i32::from(results.is_empty()))
         }
+        AiCommand::Run { .. } => Err(ShellError::new(
+            ErrorCode::Validation,
+            "natural command execution was not routed through the composition root",
+        )
+        .with_help("Run the command through the Quirl CLI dispatcher")),
     }
+}
+
+pub(crate) fn confirm_natural_command(
+    preview: &str,
+    risk: CommandProposalRisk,
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+) -> Result<bool, ShellError> {
+    if preview.len() > NATURAL_PREVIEW_BYTES_MAX {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "natural command preview exceeded its byte limit",
+        )
+        .with_context(format!(
+            "limit: {NATURAL_PREVIEW_BYTES_MAX}; observed: {}",
+            preview.len()
+        ))
+        .with_help("Choose a command with fewer or shorter arguments"));
+    }
+    writeln!(writer, "exact command preview:")
+        .and_then(|_| writeln!(writer, "{}", escape_terminal_controls(preview)))
+        .and_then(|_| write!(writer, "type `yes` to accept this generated command: "))
+        .and_then(|_| writer.flush())
+        .map_err(confirmation_io_error)?;
+    if read_confirmation(reader)? != "yes" {
+        return Ok(false);
+    }
+    if risk == CommandProposalRisk::High {
+        write!(
+            writer,
+            "high-risk effects detected; type `run high-risk` to confirm: "
+        )
+        .and_then(|_| writer.flush())
+        .map_err(confirmation_io_error)?;
+        if read_confirmation(reader)? != "run high-risk" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn read_confirmation(reader: &mut impl Read) -> Result<String, ShellError> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        let count = reader.read(&mut byte).map_err(confirmation_io_error)?;
+        if count == 0 || byte[0] == b'\n' {
+            break;
+        }
+        if bytes.len() == CONFIRMATION_BYTES_MAX {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "natural command confirmation exceeded its byte limit",
+            )
+            .with_context(format!(
+                "limit: {CONFIRMATION_BYTES_MAX}; observed: at least {}",
+                bytes.len() + 1
+            ))
+            .with_help("Type exactly the short confirmation phrase shown in the prompt"));
+        }
+        bytes.push(byte[0]);
+    }
+    let value = String::from_utf8(bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "natural command confirmation is not valid UTF-8",
+        )
+        .with_context(error.to_string())
+        .with_help("Type the confirmation phrase as UTF-8 text")
+    })?;
+    Ok(value.trim_end_matches('\r').to_owned())
+}
+
+fn confirmation_io_error(error: std::io::Error) -> ShellError {
+    ShellError::new(
+        ErrorCode::Io,
+        "could not read or display natural command confirmation",
+    )
+    .with_context(error.to_string())
+    .with_help("Check terminal input and output, then retry")
 }
 
 fn status(format: AiOutputFormat) -> Result<i32, ShellError> {
@@ -155,19 +261,23 @@ fn status(format: AiOutputFormat) -> Result<i32, ShellError> {
     let database_metadata = fs::metadata(&database_path).ok();
     let stats = index::default_database_stats().ok();
     let model_path = intelligence::default_model_path();
+    let model_identity = model_path.as_deref().and_then(intelligence::model_identity);
+    let semantic_ready = index::default_embeddings_are_current().unwrap_or(false);
     let status = AiStatus {
         database_path,
         database_ready: stats.is_some(),
         database_bytes: database_metadata.map(|metadata| metadata.len()),
-        model: "minishlab/potion-base-8M",
-        model_ready: model_path
-            .as_deref()
-            .is_some_and(intelligence::model_is_installed),
+        model: model_identity
+            .as_ref()
+            .map(|identity| identity.repository.clone())
+            .unwrap_or_else(|| "minishlab/potion-base-8M".to_owned()),
+        model_identity: model_identity.clone(),
+        model_ready: model_identity.is_some(),
         commands: stats.as_ref().map(|stats| stats.commands),
         options: stats.as_ref().map(|stats| stats.arguments),
         semantic_documents: stats.as_ref().map(|stats| stats.documents),
         embeddings: stats.as_ref().map(|stats| stats.embeddings),
-        semantic_ready: stats.as_ref().is_some_and(|stats| stats.embeddings > 0),
+        semantic_ready,
         model_path,
         network_loading: false,
     };
@@ -190,7 +300,7 @@ fn status(format: AiOutputFormat) -> Result<i32, ShellError> {
                 .unwrap_or_else(|| "unconfigured".to_owned());
             println!(
                 "model: {} at {} ({})",
-                status.model,
+                escape_terminal_controls(&status.model),
                 escape_terminal_controls(&model_path),
                 if status.model_ready {
                     "ready"
@@ -199,6 +309,12 @@ fn status(format: AiOutputFormat) -> Result<i32, ShellError> {
                 }
             );
             println!("network loading: disabled");
+            if let Some(identity) = &status.model_identity {
+                println!(
+                    "model identity: {}",
+                    escape_terminal_controls(&identity.identity)
+                );
+            }
             if let Some(stats) = stats {
                 println!(
                     "knowledge: {} commands, {} options, {} documents, {} embeddings",
@@ -232,10 +348,9 @@ pub(crate) fn render_results_text(results: &[intelligence::SearchResult]) -> Str
             "{:<36} {:>6.3}  {}{}",
             escape_terminal_controls(&result.target),
             result.score,
-            if result.semantic {
-                "semantic · "
-            } else {
-                "lexical · "
+            match result.mode {
+                intelligence::RetrievalMode::Lexical => "lexical · ",
+                intelligence::RetrievalMode::Hybrid => "hybrid · ",
             },
             escape_terminal_controls(&result.kind)
         );
@@ -251,4 +366,106 @@ fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<(), ShellError> {
     })?;
     println!("{}", escape_json_terminal_controls(&json));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quirl_catalog::Catalog;
+    use std::path::Path;
+
+    #[test]
+    fn text_results_name_the_actual_retrieval_mode() {
+        let bytes = intelligence::encode_database(&Catalog::builtin(), None).unwrap();
+        let results = intelligence::search(
+            &bytes,
+            Path::new("catalog.sqlite3"),
+            "change directory",
+            8,
+            None,
+        )
+        .unwrap();
+        let rendered = render_results_text(&results);
+        assert!(rendered.contains("lexical · command"));
+        assert!(!rendered.contains("semantic ·"));
+    }
+
+    #[test]
+    fn ordinary_generated_command_requires_exact_acceptance() {
+        let mut output = Vec::new();
+        assert!(
+            confirm_natural_command(
+                "'pwd'",
+                CommandProposalRisk::Ordinary,
+                &mut &b"yes\n"[..],
+                &mut output,
+            )
+            .unwrap()
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("exact command preview")
+        );
+
+        assert!(
+            !confirm_natural_command(
+                "'pwd'",
+                CommandProposalRisk::Ordinary,
+                &mut &b"no\n"[..],
+                &mut Vec::new(),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn high_risk_generated_command_requires_a_distinct_second_confirmation() {
+        assert!(
+            confirm_natural_command(
+                "'rm'",
+                CommandProposalRisk::High,
+                &mut &b"yes\nrun high-risk\n"[..],
+                &mut Vec::new(),
+            )
+            .unwrap()
+        );
+        assert!(
+            !confirm_natural_command(
+                "'rm'",
+                CommandProposalRisk::High,
+                &mut &b"yes\nyes\n"[..],
+                &mut Vec::new(),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn confirmation_input_and_preview_are_bounded() {
+        let oversized = "x".repeat(NATURAL_PREVIEW_BYTES_MAX + 1);
+        assert_eq!(
+            confirm_natural_command(
+                &oversized,
+                CommandProposalRisk::Ordinary,
+                &mut &b"yes\n"[..],
+                &mut Vec::new(),
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::ResourceLimit
+        );
+        let input = vec![b'x'; CONFIRMATION_BYTES_MAX + 1];
+        assert_eq!(
+            confirm_natural_command(
+                "'pwd'",
+                CommandProposalRisk::Ordinary,
+                &mut input.as_slice(),
+                &mut Vec::new(),
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::ResourceLimit
+        );
+    }
 }

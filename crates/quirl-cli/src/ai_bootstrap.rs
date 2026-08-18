@@ -30,7 +30,9 @@ use nix::{
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 
-const MODEL_REVISION: &str = "bf8b056651a2c21b8d2565580b8569da283cab23";
+pub(crate) const MODEL_REPOSITORY: &str = "minishlab/potion-base-8M";
+pub(crate) const MODEL_REVISION: &str = "bf8b056651a2c21b8d2565580b8569da283cab23";
+pub(crate) const MODEL_DIMENSIONS: usize = 256;
 const MODEL_BASE_URL: &str = "https://huggingface.co/minishlab/potion-base-8M/resolve";
 const HTTP_REDIRECTS_MAX: u32 = 4;
 const HTTP_GLOBAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -42,6 +44,7 @@ const DOWNLOAD_CHANNEL_POLL: Duration = Duration::from_millis(25);
 const TEMPORARY_ATTEMPTS_MAX: u64 = 64;
 const ACTIVITY_ERROR_MESSAGE_BYTES_MAX: usize = 256;
 const ACTIVITY_ERROR_CONTEXT_BYTES_MAX: usize = 192;
+const MODEL_FILE_READ_BUFFER_BYTES: usize = 64 * 1024;
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
@@ -78,9 +81,103 @@ const ASSETS: [AssetSpec; 3] = [
     },
 ];
 
+pub(crate) fn pinned_asset_sha256(name: &str) -> Option<&'static str> {
+    ASSETS
+        .iter()
+        .find(|asset| asset.name == name)
+        .map(|asset| asset.sha256)
+}
+
 /// Validate exact pinned file sizes and hashes before Model2Vec consumes them.
 pub(crate) fn validate_pinned_model(path: &Path) -> Result<(), ShellError> {
     validate_model_assets(path, &ASSETS)
+}
+
+/// Read one bounded model input through the same no-follow admission used by
+/// the downloader. The returned bytes come from the exact validated handle.
+pub(crate) fn read_model_input(path: &Path, bytes_max: u64) -> Result<Vec<u8>, ShellError> {
+    let path_metadata =
+        fs::symlink_metadata(path).map_err(|error| model_io_error("inspect", path, error))?;
+    if !path_metadata.file_type().is_file() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!("local AI input {} is not a regular file", path.display()),
+        )
+        .with_help("Use unlinked regular files in a private model directory"));
+    }
+    if path_metadata.len() == 0 || path_metadata.len() > bytes_max {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!("local AI input {} exceeds its size limit", path.display()),
+        )
+        .with_context(format!(
+            "limit: {bytes_max}; observed: {}",
+            path_metadata.len()
+        ))
+        .with_help("Replace the model input with a bounded complete file"));
+    }
+    let mut file = open_model_file(path)?;
+    let file_metadata = file
+        .metadata()
+        .map_err(|error| model_io_error("inspect", path, error))?;
+    #[cfg(unix)]
+    {
+        if path_metadata.dev() != file_metadata.dev()
+            || path_metadata.ino() != file_metadata.ino()
+            || file_metadata.nlink() != 1
+        {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!("local AI input {} changed during admission", path.display()),
+            )
+            .with_help("Use unlinked regular files in a private model directory"));
+        }
+        if file_metadata.mode() & 0o022 != 0 {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!("local AI input {} has unsafe permissions", path.display()),
+            )
+            .with_context(format!("mode: {:#o}", file_metadata.mode() & 0o777))
+            .with_help("Remove group/other write access from the model input"));
+        }
+    }
+    let capacity = usize::try_from(path_metadata.len()).map_err(|_| {
+        ShellError::new(
+            ErrorCode::ResourceLimit,
+            "local AI input size exceeds this platform",
+        )
+        .with_help("Use a smaller local model")
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut buffer = [0_u8; MODEL_FILE_READ_BUFFER_BYTES];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| model_io_error("read", path, error))?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(count) > capacity {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                format!("local AI input {} changed while being read", path.display()),
+            )
+            .with_help("Retry with an immutable private model directory"));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    if bytes.len() != capacity {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!("local AI input {} changed while being read", path.display()),
+        )
+        .with_context(format!(
+            "expected bytes: {capacity}; observed: {}",
+            bytes.len()
+        ))
+        .with_help("Retry with an immutable private model directory"));
+    }
+    Ok(bytes)
 }
 
 fn validate_model_assets(path: &Path, assets: &[AssetSpec]) -> Result<(), ShellError> {
@@ -503,7 +600,14 @@ fn run_generation(shared: &Shared, fetcher: &UreqFetcher, generation: u64) -> bo
         shared.publish("AI unavailable: local model path is not configured".to_owned());
         return true;
     };
-    if validate_pinned_model(&model_path).is_err() {
+    if intelligence::explicit_model_path_configured() {
+        if !intelligence::model_is_installed(&model_path) {
+            shared.publish(
+                "AI unavailable: explicit local model manifest or assets are invalid".to_owned(),
+            );
+            return true;
+        }
+    } else if validate_pinned_model(&model_path).is_err() {
         shared.publish("AI: downloading potion-base-8M (0%)".to_owned());
         match install_model(fetcher, &model_path, shared) {
             Ok(true) => {}
@@ -1188,6 +1292,18 @@ mod tests {
         install_fixture(&valid_fetcher(), &destination, false).unwrap();
         validate_model_assets(&destination, &TEST_ASSETS).unwrap();
         assert!(staging_entries(&directory.0).is_empty());
+    }
+
+    #[test]
+    fn bounded_model_input_reads_exact_handle_bytes_and_rejects_oversize() {
+        let directory = TestDirectory::new("bounded-input");
+        let path = directory.0.join("asset.bin");
+        fs::write(&path, b"int8").unwrap();
+        assert_eq!(read_model_input(&path, 4).unwrap(), b"int8");
+        assert_eq!(
+            read_model_input(&path, 3).unwrap_err().code,
+            ErrorCode::ResourceLimit
+        );
     }
 
     #[test]

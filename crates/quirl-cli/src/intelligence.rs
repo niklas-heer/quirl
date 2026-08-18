@@ -13,22 +13,35 @@ use std::{
     io::Cursor,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 pub(crate) const DATABASE_BYTES_MAX: usize = 128 * 1024 * 1024;
 pub(crate) const QUERY_BYTES_MAX: usize = 4 * 1024;
 pub(crate) const SEARCH_RESULTS_MAX: usize = 100;
-const DATABASE_SCHEMA_VERSION: i64 = 2;
+const DATABASE_SCHEMA_VERSION: i64 = 3;
 const DATABASE_APPLICATION_ID: i64 = 0x5155_4952;
 const DOCUMENTS_MAX: usize = 65_536;
 const DOCUMENT_BYTES_MAX: usize = 16 * 1024;
+const DOCUMENTS_RETAINED_BYTES_MAX: usize = 32 * 1024 * 1024;
+const DOCUMENT_GENERATION_VERSION: u32 = 1;
 const EMBEDDING_DIMENSIONS_MAX: usize = 2_048;
+const EMBEDDINGS_RETAINED_BYTES_MAX: usize = 128 * 1024 * 1024;
 const EMBEDDING_BATCH_SIZE: usize = 256;
 pub(crate) const AUTOMATIC_EMBEDDING_BATCH_SIZE: usize = 32;
-const MODEL_ID: &str = "minishlab/potion-base-8M";
 const MODEL_CONFIG_BYTES_MAX: u64 = 1024 * 1024;
 const MODEL_TOKENIZER_BYTES_MAX: u64 = 4 * 1024 * 1024;
 const MODEL_WEIGHTS_BYTES_MAX: u64 = 64 * 1024 * 1024;
+const MODEL_FILES_BYTES_MAX: usize = 69 * 1024 * 1024;
+const MODEL_MANIFEST_BYTES_MAX: u64 = 16 * 1024;
+const MODEL_IDENTITY_TEXT_BYTES_MAX: usize = 512;
+const MODEL_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const MODEL_INFERENCE_PROTOCOL: &str = "quirl-model2vec@1:normalize=true:max_tokens=256";
+const FUSION_RANK_CONSTANT: f32 = 60.0;
+const CANCELLATION_CHECK_INTERVAL: usize = 256;
+const SEARCH_DEADLINE: Duration = Duration::from_millis(750);
+#[cfg(debug_assertions)]
+const TEST_MODEL_IDENTITY: &str = "sha256:test-model-identity";
 
 const LOCAL_OVERLAY_SCHEMA_VERSION: u32 = 1;
 const LOCAL_RECORDS_MAX: usize = 4_096;
@@ -45,7 +58,7 @@ const LOCAL_NEGATIVE_EXPIRY_MS: u64 = 60 * 60 * 1_000;
 
 const SCHEMA: &str = r#"
 PRAGMA application_id = 1364543826;
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 CREATE TABLE metadata (
     key TEXT PRIMARY KEY NOT NULL,
     value TEXT NOT NULL
@@ -126,9 +139,24 @@ CREATE TABLE semantic_documents (
     target_id TEXT NOT NULL,
     title TEXT NOT NULL,
     body TEXT NOT NULL,
-    fingerprint TEXT NOT NULL
+    fingerprint TEXT NOT NULL,
+    lexical_features_json TEXT NOT NULL,
+    provenance_json TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX semantic_documents_command ON semantic_documents(command_id);
+CREATE TABLE embedding_index (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+    model_identity TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    config_sha256 TEXT NOT NULL,
+    tokenizer_sha256 TEXT NOT NULL,
+    weights_sha256 TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    document_generation_version INTEGER NOT NULL,
+    index_fingerprint TEXT NOT NULL,
+    document_count INTEGER NOT NULL
+);
 CREATE TABLE embeddings (
     document_id TEXT NOT NULL,
     model_id TEXT NOT NULL,
@@ -334,20 +362,34 @@ pub(crate) struct CompletionDescriptionFact {
 }
 
 /// One ranked command or option returned by local command intelligence.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetrievalMode {
+    Lexical,
+    Hybrid,
+}
+
+/// One ranked command or option returned by local command intelligence.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct SearchResult {
+    #[serde(skip)]
+    document_id: String,
     pub(crate) command: String,
     pub(crate) target: String,
     pub(crate) kind: String,
     pub(crate) summary: String,
     pub(crate) score: f32,
     pub(crate) semantic: bool,
+    pub(crate) mode: RetrievalMode,
 }
 
 /// Outcome of building the persistent embedding index.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct EmbeddingReport {
     pub(crate) model: String,
+    pub(crate) model_identity: String,
+    pub(crate) index_fingerprint: String,
+    pub(crate) document_generation_version: u32,
     pub(crate) documents: usize,
     pub(crate) dimensions: usize,
 }
@@ -361,7 +403,16 @@ pub(crate) struct DatabaseStats {
     pub(crate) embeddings: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LexicalFeatures {
+    paths: Vec<String>,
+    aliases: Vec<String>,
+    names: Vec<String>,
+    types: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct SemanticDocument {
     id: String,
     kind: String,
@@ -370,12 +421,48 @@ struct SemanticDocument {
     title: String,
     body: String,
     fingerprint: String,
+    lexical_features: LexicalFeatures,
+    provenance_json: String,
 }
 
 #[derive(Debug)]
 struct StoredEmbedding {
     document: SemanticDocument,
     vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ModelManifestAssets {
+    config_sha256: String,
+    tokenizer_sha256: String,
+    model_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ModelManifest {
+    schema_version: u32,
+    repository: String,
+    revision: String,
+    dimensions: usize,
+    assets: ModelManifestAssets,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct ModelIdentity {
+    pub(crate) identity: String,
+    pub(crate) repository: String,
+    pub(crate) revision: String,
+    pub(crate) config_sha256: String,
+    pub(crate) tokenizer_sha256: String,
+    pub(crate) weights_sha256: String,
+    pub(crate) dimensions: usize,
+}
+
+struct LoadedModel {
+    model: StaticModel,
+    identity: ModelIdentity,
 }
 
 /// In-memory, bounded search state reused across interactive AI-mode edits.
@@ -399,13 +486,14 @@ impl SearchSession {
         let connection = deserialize_database(bytes, path)?;
         validate_schema(&connection, path)?;
         let documents = read_documents(&connection, path)?;
-        let embeddings = read_embeddings(&connection, path)?;
-        let model = if embeddings.is_empty() {
-            None
-        } else if let Some(model_path) = model_path.filter(|path| model_is_installed(path)) {
-            Some(load_model(model_path)?)
+        let loaded = model_path.and_then(|model_path| load_model(model_path).ok());
+        let (model, embeddings) = if let Some(loaded) = loaded {
+            match read_complete_embeddings(&connection, &documents, &loaded.identity) {
+                Some(embeddings) => (Some(loaded.model), embeddings),
+                None => (None, Vec::new()),
+            }
         } else {
-            None
+            (None, Vec::new())
         };
         Ok(Self {
             documents,
@@ -420,43 +508,78 @@ impl SearchSession {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchResult>, ShellError> {
+        let started = Instant::now();
+        self.search_cancellable(query, limit, || {
+            if started.elapsed() > SEARCH_DEADLINE {
+                return Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "local command retrieval exceeded its deadline",
+                )
+                .with_context(format!("deadline_ms: {}", SEARCH_DEADLINE.as_millis()))
+                .with_help("Use a shorter query or retry with lexical-only model state"));
+            }
+            Ok(())
+        })
+    }
+
+    fn search_cancellable(
+        &self,
+        query: &str,
+        limit: usize,
+        mut check_cancelled: impl FnMut() -> Result<(), ShellError>,
+    ) -> Result<Vec<SearchResult>, ShellError> {
         validate_query(query, limit)?;
+        check_cancelled()?;
+        let query_terms = query_terms(query);
+        let lexical = rank_lexical_documents_cancellable(
+            &self.documents,
+            &query_terms,
+            query,
+            DOCUMENTS_MAX,
+            &mut check_cancelled,
+        )?;
         if let Some(model) = &self.model {
-            let query_vector = catch_unwind(AssertUnwindSafe(|| model.encode_single(query)))
-                .map_err(|_| {
-                    ShellError::new(
-                        ErrorCode::Validation,
-                        "the local Model2Vec tokenizer failed",
-                    )
-                    .with_help("Replace the model files with an intact potion-base-8M release")
-                })?;
-            validate_dimensions(query_vector.len())?;
-            let mut ranked = self
-                .embeddings
-                .iter()
-                .filter(|embedding| embedding.vector.len() == query_vector.len())
-                .map(|embedding| SearchResult {
+            let Ok(query_vector) = catch_unwind(AssertUnwindSafe(|| encode_query(model, query)))
+            else {
+                return Ok(limit_lexical(lexical, limit));
+            };
+            if check_cancelled().is_err() {
+                return Ok(limit_lexical(lexical, limit));
+            }
+            if validate_dimensions(query_vector.len()).is_err()
+                || query_vector.iter().any(|value| !value.is_finite())
+            {
+                return Ok(limit_lexical(lexical, limit));
+            }
+            let mut semantic = Vec::with_capacity(self.embeddings.len());
+            for (index, embedding) in self.embeddings.iter().enumerate() {
+                if index % CANCELLATION_CHECK_INTERVAL == 0 && check_cancelled().is_err() {
+                    return Ok(limit_lexical(lexical, limit));
+                }
+                if embedding.vector.len() != query_vector.len() {
+                    return Ok(limit_lexical(lexical, limit));
+                }
+                semantic.push(SearchResult {
+                    document_id: embedding.document.id.clone(),
                     command: embedding.document.command.clone(),
                     target: embedding.document.target.clone(),
                     kind: embedding.document.kind.clone(),
                     summary: embedding.document.title.clone(),
                     score: cosine_similarity(&query_vector, &embedding.vector),
                     semantic: true,
-                })
-                .collect::<Vec<_>>();
-            sort_and_limit(&mut ranked, limit);
-            if !ranked.is_empty() {
-                return Ok(ranked);
+                    mode: RetrievalMode::Hybrid,
+                });
             }
+            sort_and_limit(&mut semantic, DOCUMENTS_MAX);
+            if check_cancelled().is_err() {
+                return Ok(limit_lexical(lexical, limit));
+            }
+            return match fuse_rankings(lexical.clone(), semantic, limit, &mut check_cancelled) {
+                Ok(results) => Ok(results),
+                Err(_) => Ok(limit_lexical(lexical, limit)),
+            };
         }
-
-        let query_terms = query
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|term| !term.is_empty())
-            .map(str::to_lowercase)
-            .take(64)
-            .collect::<Vec<_>>();
-        Ok(rank_lexical_documents(&self.documents, &query_terms, limit))
+        Ok(limit_lexical(lexical, limit))
     }
 }
 
@@ -470,8 +593,16 @@ pub(crate) fn default_model_path() -> Option<PathBuf> {
         .map(|data| data.join("quirl/models/potion-base-8M"))
 }
 
+pub(crate) fn explicit_model_path_configured() -> bool {
+    env::var_os("QUIRL_MODEL_PATH").is_some()
+}
+
 pub(crate) fn model_is_installed(path: &Path) -> bool {
-    crate::ai_bootstrap::validate_pinned_model(path).is_ok()
+    load_model(path).is_ok()
+}
+
+pub(crate) fn model_identity(path: &Path) -> Option<ModelIdentity> {
+    load_model(path).ok().map(|loaded| loaded.identity)
 }
 
 pub(crate) fn database_stats(bytes: &[u8], path: &Path) -> Result<DatabaseStats, ShellError> {
@@ -488,22 +619,18 @@ pub(crate) fn database_stats(bytes: &[u8], path: &Path) -> Result<DatabaseStats,
 pub(crate) fn embeddings_are_current(bytes: &[u8], path: &Path) -> Result<bool, ShellError> {
     let connection = deserialize_database(bytes, path)?;
     validate_schema(&connection, path)?;
-    let documents = count_rows(&connection, path, "semantic_documents")?;
-    let current = connection
-        .query_row(
-            "SELECT count(*) FROM semantic_documents d JOIN embeddings e ON e.document_id = d.document_id AND e.model_id = ?1 AND e.document_fingerprint = d.fingerprint",
-            params![MODEL_ID],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| invalid_database(path, error))?;
-    let current = usize::try_from(current).map_err(|_| {
-        ShellError::new(
-            ErrorCode::Validation,
-            "the command database contains an invalid current-embedding count",
-        )
-        .with_help("Rebuild the local command database")
-    })?;
-    Ok(current == documents)
+    let documents = read_documents(&connection, path)?;
+    #[cfg(debug_assertions)]
+    if stored_model_identity(&connection).as_deref() == Some(TEST_MODEL_IDENTITY) {
+        return Ok(read_complete_test_embeddings(&connection, &documents));
+    }
+    let Some(model_path) = default_model_path() else {
+        return Ok(false);
+    };
+    let Ok(loaded) = load_model(&model_path) else {
+        return Ok(false);
+    };
+    Ok(read_complete_embeddings(&connection, &documents, &loaded.identity).is_some())
 }
 
 #[cfg(debug_assertions)]
@@ -517,9 +644,27 @@ pub(crate) fn mark_embeddings_current_for_test(
         .execute("DELETE FROM embeddings", [])
         .map_err(database_error)?;
     connection
+        .execute("DELETE FROM embedding_index", [])
+        .map_err(database_error)?;
+    let documents = read_documents(&connection, path)?;
+    let index_fingerprint = document_index_fingerprint(&documents);
+    connection
+        .execute(
+            "INSERT INTO embedding_index(singleton, model_identity, repository, revision, config_sha256, tokenizer_sha256, weights_sha256, dimensions, document_generation_version, index_fingerprint, document_count) VALUES (1, ?1, ?2, ?3, 'sha256:test-config', 'sha256:test-tokenizer', 'sha256:test-model', 1, ?4, ?5, ?6)",
+            params![
+                TEST_MODEL_IDENTITY,
+                crate::ai_bootstrap::MODEL_REPOSITORY,
+                crate::ai_bootstrap::MODEL_REVISION,
+                i64::from(DOCUMENT_GENERATION_VERSION),
+                index_fingerprint,
+                sqlite_integer(documents.len())?
+            ],
+        )
+        .map_err(database_error)?;
+    connection
         .execute(
             "INSERT INTO embeddings(document_id, model_id, dimensions, vector_le_f32, document_fingerprint) SELECT document_id, ?1, 1, x'00000000', fingerprint FROM semantic_documents",
-            params![MODEL_ID],
+            params![TEST_MODEL_IDENTITY],
         )
         .map_err(database_error)?;
     serialize_database(&connection)
@@ -993,7 +1138,9 @@ pub(crate) fn build_embeddings_cancellable(
     let mut connection = deserialize_database(bytes, path)?;
     validate_schema(&connection, path)?;
     let documents = read_documents(&connection, path)?;
-    let model = load_model(model_path)?;
+    check_cancelled()?;
+    let loaded = load_model(model_path)?;
+    let model = &loaded.model;
     if batch_size == 0 || batch_size > EMBEDDING_BATCH_SIZE {
         return Err(resource_limit(
             "embedding batch size",
@@ -1044,11 +1191,47 @@ pub(crate) fn build_embeddings_cancellable(
     }
     let dimensions = vectors.first().map_or(0, Vec::len);
     validate_dimensions(dimensions)?;
+    if dimensions != loaded.identity.dimensions {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "the local Model2Vec output dimension changed after admission",
+        )
+        .with_context(format!(
+            "admitted: {}; observed: {dimensions}",
+            loaded.identity.dimensions
+        ))
+        .with_help("Replace the model files and retry"));
+    }
+    check_cancelled()?;
+    let index_fingerprint = document_index_fingerprint(&documents);
     let transaction = connection.transaction().map_err(database_error)?;
     transaction
         .execute("DELETE FROM embeddings", [])
         .map_err(database_error)?;
-    for (document, vector) in documents.iter().zip(vectors) {
+    transaction
+        .execute("DELETE FROM embedding_index", [])
+        .map_err(database_error)?;
+    transaction
+        .execute(
+            "INSERT INTO embedding_index(singleton, model_identity, repository, revision, config_sha256, tokenizer_sha256, weights_sha256, dimensions, document_generation_version, index_fingerprint, document_count) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                loaded.identity.identity,
+                loaded.identity.repository,
+                loaded.identity.revision,
+                loaded.identity.config_sha256,
+                loaded.identity.tokenizer_sha256,
+                loaded.identity.weights_sha256,
+                sqlite_integer(dimensions)?,
+                i64::from(DOCUMENT_GENERATION_VERSION),
+                index_fingerprint,
+                sqlite_integer(documents.len())?,
+            ],
+        )
+        .map_err(database_error)?;
+    for (index, (document, vector)) in documents.iter().zip(vectors).enumerate() {
+        if index % CANCELLATION_CHECK_INTERVAL == 0 {
+            check_cancelled()?;
+        }
         if vector.len() != dimensions || vector.iter().any(|value| !value.is_finite()) {
             return Err(ShellError::new(
                 ErrorCode::Validation,
@@ -1061,16 +1244,23 @@ pub(crate) fn build_embeddings_cancellable(
         transaction
             .execute(
                 "INSERT INTO embeddings(document_id, model_id, dimensions, vector_le_f32, document_fingerprint) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![document.id, MODEL_ID, sqlite_integer(dimensions)?, blob, document.fingerprint],
+                params![document.id, loaded.identity.identity, sqlite_integer(dimensions)?, blob, document.fingerprint],
             )
             .map_err(database_error)?;
     }
+    check_cancelled()?;
     transaction.commit().map_err(database_error)?;
     let encoded = serialize_database(&connection)?;
     Ok((
         encoded,
         EmbeddingReport {
-            model: MODEL_ID.to_owned(),
+            model: format!(
+                "{}@{}",
+                loaded.identity.repository, loaded.identity.revision
+            ),
+            model_identity: loaded.identity.identity,
+            index_fingerprint,
+            document_generation_version: DOCUMENT_GENERATION_VERSION,
             documents: documents.len(),
             dimensions,
         },
@@ -1084,18 +1274,7 @@ pub(crate) fn search(
     limit: usize,
     model_path: Option<&Path>,
 ) -> Result<Vec<SearchResult>, ShellError> {
-    validate_query(query, limit)?;
-    let connection = deserialize_database(bytes, path)?;
-    validate_schema(&connection, path)?;
-    let semantic = if let Some(model_path) = model_path.filter(|path| model_is_installed(path)) {
-        semantic_search(&connection, path, query, limit, model_path)?
-    } else {
-        Vec::new()
-    };
-    if !semantic.is_empty() {
-        return Ok(semantic);
-    }
-    lexical_search(&connection, path, query, limit)
+    SearchSession::open(bytes, path, model_path)?.search(query, limit)
 }
 
 struct StoredLocalOverlay {
@@ -1852,6 +2031,13 @@ fn insert_catalog(transaction: &Transaction<'_>, catalog: &Catalog) -> Result<()
         let command_document = command_document(command);
         insert_document(transaction, &command_document)?;
         document_count = document_count.saturating_add(1);
+        if document_count > DOCUMENTS_MAX {
+            return Err(resource_limit(
+                "semantic documents",
+                DOCUMENTS_MAX,
+                document_count,
+            ));
+        }
         for (ordinal, argument) in command.options.iter().enumerate() {
             let argument_id = format!("{}:{ordinal}", command.id);
             let (dynamic_provider, static_values) = match &argument.values {
@@ -1946,52 +2132,133 @@ fn insert_document(
     }
     transaction
         .execute(
-            "INSERT INTO semantic_documents(document_id, document_kind, command_id, target_id, title, body, fingerprint) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![document.id, document.kind, document.command, document.target, document.title, document.body, document.fingerprint],
+            "INSERT INTO semantic_documents(document_id, document_kind, command_id, target_id, title, body, fingerprint, lexical_features_json, provenance_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                document.id,
+                document.kind,
+                document.command,
+                document.target,
+                document.title,
+                document.body,
+                document.fingerprint,
+                serde_json::to_string(&document.lexical_features).map_err(json_error)?,
+                document.provenance_json,
+            ],
         )
         .map_err(database_error)?;
     Ok(())
 }
 
 fn command_document(command: &quirl_catalog::CommandSpec) -> SemanticDocument {
-    let aliases = command.aliases.join(" ");
-    let examples = command.examples.join(" ");
-    let body = format!(
-        "{} {} {} {} {} {}",
-        command.path, aliases, command.signature, command.summary, command.details, examples
-    );
+    let mut aliases = command.aliases.clone();
+    aliases.sort();
+    aliases.dedup();
+    let mut examples = command.examples.clone();
+    examples.sort();
+    examples.dedup();
+    let mut effects = command
+        .effects
+        .iter()
+        .filter_map(|effect| serde_json::to_string(effect).ok())
+        .collect::<Vec<_>>();
+    effects.sort();
+    let provenance_json = serde_json::to_string(&command.provenance).unwrap_or_default();
+    let body = tagged_document_body(&[
+        ("kind", "command".to_owned()),
+        ("path", command.path.clone()),
+        ("aliases", aliases.join(" ")),
+        ("usage", command.signature.clone()),
+        ("summary", command.summary.clone()),
+        ("intent", command.details.clone()),
+        ("examples", examples.join(" | ")),
+        ("input_type", command.io.input.clone()),
+        ("output_type", command.io.output.clone()),
+        ("effects", effects.join(" ")),
+        ("provenance", provenance_json.clone()),
+    ]);
+    let id = format!("command:{}", command.id);
+    let lexical_features = LexicalFeatures {
+        paths: vec![normalize_document_field(&command.path)],
+        aliases: aliases
+            .into_iter()
+            .map(|value| normalize_document_field(&value))
+            .collect(),
+        names: command
+            .path
+            .split_whitespace()
+            .next_back()
+            .map(normalize_document_field)
+            .into_iter()
+            .collect(),
+        types: vec![
+            normalize_document_field(&command.io.input),
+            normalize_document_field(&command.io.output),
+        ],
+    };
     SemanticDocument {
-        id: format!("command:{}", command.id),
+        fingerprint: semantic_document_fingerprint(&id, &body),
+        id,
         kind: "command".to_owned(),
         command: command.path.clone(),
         target: command.path.clone(),
-        title: command.path.clone(),
-        fingerprint: fingerprint(body.as_bytes()),
+        title: command.summary.clone(),
         body,
+        lexical_features,
+        provenance_json,
     }
 }
 
 fn argument_document(command: &quirl_catalog::CommandSpec, ordinal: usize) -> SemanticDocument {
     let argument = &command.options[ordinal];
-    let names = argument.names.join(" ");
-    let examples = argument.examples.join(" ");
+    let mut option_names = argument.names.clone();
+    option_names.sort();
+    option_names.dedup();
+    let names = option_names.join(" ");
+    let mut examples = argument.examples.clone();
+    examples.sort();
+    examples.dedup();
+    let examples = examples.join(" ");
     let values = match &argument.values {
-        Some(CompletionSource::Static { values }) => values.join(" "),
+        Some(CompletionSource::Static { values }) => {
+            let mut values = values.clone();
+            values.sort();
+            values.dedup();
+            values.join(" ")
+        }
         Some(CompletionSource::Dynamic { provider }) => provider.clone(),
         None => String::new(),
     };
-    let body = format!(
-        "{} {} {} {} {} {}",
-        command.path, names, argument.value_type, argument.documentation, values, examples
-    );
+    let provenance_json = serde_json::to_string(&argument.provenance).unwrap_or_default();
+    let body = tagged_document_body(&[
+        ("kind", argument_kind(argument.kind).to_owned()),
+        ("path", command.path.clone()),
+        ("option", names.clone()),
+        ("value_type", argument.value_type.clone()),
+        ("summary", argument.documentation.clone()),
+        ("values", values.clone()),
+        ("examples", examples),
+        ("provenance", provenance_json.clone()),
+    ]);
+    let id = format!("argument:{}:{ordinal}", command.id);
+    let lexical_features = LexicalFeatures {
+        paths: vec![normalize_document_field(&command.path)],
+        aliases: Vec::new(),
+        names: option_names
+            .into_iter()
+            .map(|value| normalize_document_field(&value))
+            .collect(),
+        types: vec![normalize_document_field(&argument.value_type)],
+    };
     SemanticDocument {
-        id: format!("argument:{}:{ordinal}", command.id),
+        fingerprint: semantic_document_fingerprint(&id, &body),
+        id,
         kind: "option".to_owned(),
         command: command.path.clone(),
         target: format!("{} {}", command.path, names),
-        title: names,
-        fingerprint: fingerprint(body.as_bytes()),
+        title: argument.documentation.clone(),
         body,
+        lexical_features,
+        provenance_json,
     }
 }
 
@@ -2000,12 +2267,21 @@ fn read_documents(
     path: &Path,
 ) -> Result<Vec<SemanticDocument>, ShellError> {
     let mut statement = connection
-        .prepare("SELECT document_id, document_kind, command_id, target_id, title, body, fingerprint FROM semantic_documents ORDER BY document_id LIMIT ?1")
+        .prepare("SELECT document_id, document_kind, command_id, target_id, title, body, fingerprint, lexical_features_json, provenance_json FROM semantic_documents ORDER BY document_id LIMIT ?1")
         .map_err(|error| invalid_database(path, error))?;
     let rows = statement
         .query_map(
             params![sqlite_integer(DOCUMENTS_MAX.saturating_add(1))?],
             |row| {
+                let lexical_features_json: String = row.get(7)?;
+                let lexical_features =
+                    serde_json::from_str(&lexical_features_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            lexical_features_json.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
                 Ok(SemanticDocument {
                     id: row.get(0)?,
                     kind: row.get(1)?,
@@ -2014,13 +2290,40 @@ fn read_documents(
                     title: row.get(4)?,
                     body: row.get(5)?,
                     fingerprint: row.get(6)?,
+                    lexical_features,
+                    provenance_json: row.get(8)?,
                 })
             },
         )
         .map_err(|error| invalid_database(path, error))?;
     let mut documents = Vec::new();
+    let mut retained_bytes = 0_usize;
     for row in rows {
-        documents.push(row.map_err(|error| invalid_database(path, error))?);
+        let document = row.map_err(|error| invalid_database(path, error))?;
+        if document.body.len() > DOCUMENT_BYTES_MAX {
+            return Err(resource_limit(
+                "semantic document bytes",
+                DOCUMENT_BYTES_MAX,
+                document.body.len(),
+            ));
+        }
+        retained_bytes = retained_bytes.saturating_add(semantic_document_retained_bytes(&document));
+        if retained_bytes > DOCUMENTS_RETAINED_BYTES_MAX {
+            return Err(resource_limit(
+                "retained semantic document bytes",
+                DOCUMENTS_RETAINED_BYTES_MAX,
+                retained_bytes,
+            ));
+        }
+        if semantic_document_fingerprint(&document.id, &document.body) != document.fingerprint {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "the command database contains a stale semantic document fingerprint",
+            )
+            .with_context(format!("document: {}", document.id))
+            .with_help("Rebuild it with `quirl index build`"));
+        }
+        documents.push(document);
         if documents.len() > DOCUMENTS_MAX {
             return Err(resource_limit(
                 "semantic documents",
@@ -2032,71 +2335,46 @@ fn read_documents(
     Ok(documents)
 }
 
-fn semantic_search(
-    connection: &Connection,
-    path: &Path,
-    query: &str,
-    limit: usize,
-    model_path: &Path,
-) -> Result<Vec<SearchResult>, ShellError> {
-    let embeddings = read_embeddings(connection, path)?;
-    if embeddings.is_empty() {
-        return Ok(Vec::new());
-    }
-    let model = load_model(model_path)?;
-    let query_vector =
-        catch_unwind(AssertUnwindSafe(|| model.encode_single(query))).map_err(|_| {
-            ShellError::new(
-                ErrorCode::Validation,
-                "the local Model2Vec tokenizer failed",
-            )
-            .with_help("Replace the model files with an intact potion-base-8M release")
-        })?;
-    validate_dimensions(query_vector.len())?;
-    let mut ranked: Vec<_> = embeddings
-        .into_iter()
-        .filter(|embedding| embedding.vector.len() == query_vector.len())
-        .map(|embedding| SearchResult {
-            command: embedding.document.command,
-            target: embedding.document.target,
-            kind: embedding.document.kind,
-            summary: embedding.document.title,
-            score: cosine_similarity(&query_vector, &embedding.vector),
-            semantic: true,
-        })
-        .collect();
-    sort_and_limit(&mut ranked, limit);
-    Ok(ranked)
+fn semantic_document_retained_bytes(document: &SemanticDocument) -> usize {
+    [
+        document.id.len(),
+        document.kind.len(),
+        document.command.len(),
+        document.target.len(),
+        document.title.len(),
+        document.body.len(),
+        document.fingerprint.len(),
+        document.provenance_json.len(),
+    ]
+    .into_iter()
+    .chain(
+        document
+            .lexical_features
+            .paths
+            .iter()
+            .chain(&document.lexical_features.aliases)
+            .chain(&document.lexical_features.names)
+            .chain(&document.lexical_features.types)
+            .map(String::len),
+    )
+    .fold(0_usize, usize::saturating_add)
 }
 
-fn lexical_search(
-    connection: &Connection,
-    path: &Path,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<SearchResult>, ShellError> {
-    let query_terms: Vec<String> = query
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|term| !term.is_empty())
-        .map(str::to_lowercase)
-        .take(64)
-        .collect();
-    Ok(rank_lexical_documents(
-        &read_documents(connection, path)?,
-        &query_terms,
-        limit,
-    ))
-}
-
-fn rank_lexical_documents(
+fn rank_lexical_documents_cancellable(
     documents: &[SemanticDocument],
     query_terms: &[String],
+    query: &str,
     limit: usize,
-) -> Vec<SearchResult> {
-    let query_phrase = query_terms.join(" ");
+    check_cancelled: &mut impl FnMut() -> Result<(), ShellError>,
+) -> Result<Vec<SearchResult>, ShellError> {
+    let query_phrase = normalize_document_field(query).to_lowercase();
     let mut document_matches = Vec::with_capacity(documents.len());
     let mut phrase_matches = Vec::with_capacity(documents.len());
-    for document in documents {
+    let mut exact_boosts = Vec::with_capacity(documents.len());
+    for (index, document) in documents.iter().enumerate() {
+        if index % CANCELLATION_CHECK_INTERVAL == 0 {
+            check_cancelled()?;
+        }
         let haystack = document.body.to_lowercase();
         let matched = query_terms
             .iter()
@@ -2105,6 +2383,10 @@ fn rank_lexical_documents(
             .collect::<BTreeSet<_>>();
         document_matches.push(matched);
         phrase_matches.push(!query_phrase.is_empty() && haystack.contains(&query_phrase));
+        exact_boosts.push(exact_lexical_boost(
+            &document.lexical_features,
+            &query_phrase,
+        ));
     }
 
     let mut command_matches = BTreeMap::<&str, BTreeSet<usize>>::new();
@@ -2134,7 +2416,8 @@ fn rank_lexical_documents(
         .iter()
         .zip(document_matches)
         .zip(phrase_matches)
-        .filter_map(|((document, local_matches), phrase_match)| {
+        .zip(exact_boosts)
+        .filter_map(|(((document, local_matches), phrase_match), exact_boost)| {
             let matches = if document.kind == "command" {
                 command_matches
                     .get(document.command.as_str())
@@ -2142,77 +2425,138 @@ fn rank_lexical_documents(
             } else {
                 local_matches.len()
             };
-            (matches > 0).then(|| SearchResult {
+            (matches > 0 || exact_boost > 0.0).then(|| SearchResult {
+                document_id: document.id.clone(),
                 command: document.command.clone(),
                 target: document.target.clone(),
                 kind: document.kind.clone(),
                 summary: document.title.clone(),
-                score: matches as f32 / denominator + if phrase_match { 1.0 } else { 0.0 },
+                score: matches as f32 / denominator
+                    + if phrase_match { 1.0 } else { 0.0 }
+                    + exact_boost,
                 semantic: false,
+                mode: RetrievalMode::Lexical,
             })
         })
         .collect::<Vec<_>>();
     sort_and_limit(&mut results, limit);
-    results
+    check_cancelled()?;
+    Ok(results)
 }
 
-fn read_embeddings(
+fn read_complete_embeddings(
     connection: &Connection,
-    path: &Path,
-) -> Result<Vec<StoredEmbedding>, ShellError> {
-    let mut statement = connection
-        .prepare(
-            "SELECT d.document_id, d.document_kind, d.command_id, d.target_id, d.title, d.body, d.fingerprint, e.dimensions, e.vector_le_f32
-             FROM semantic_documents d JOIN embeddings e ON e.document_id = d.document_id
-             WHERE e.model_id = ?1 AND e.document_fingerprint = d.fingerprint
-             ORDER BY d.document_id LIMIT ?2",
-        )
-        .map_err(|error| invalid_database(path, error))?;
-    let rows = statement
-        .query_map(
-            params![MODEL_ID, sqlite_integer(DOCUMENTS_MAX.saturating_add(1))?],
+    documents: &[SemanticDocument],
+    identity: &ModelIdentity,
+) -> Option<Vec<StoredEmbedding>> {
+    let generation = connection
+        .query_row(
+            "SELECT model_identity, repository, revision, config_sha256, tokenizer_sha256, weights_sha256, dimensions, document_generation_version, index_fingerprint, document_count FROM embedding_index WHERE singleton = 1",
+            [],
             |row| {
-                let dimensions: i64 = row.get(7)?;
-                let bytes: Vec<u8> = row.get(8)?;
                 Ok((
-                    SemanticDocument {
-                        id: row.get(0)?,
-                        kind: row.get(1)?,
-                        command: row.get(2)?,
-                        target: row.get(3)?,
-                        title: row.get(4)?,
-                        body: row.get(5)?,
-                        fingerprint: row.get(6)?,
-                    },
-                    dimensions,
-                    bytes,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             },
         )
-        .map_err(|error| invalid_database(path, error))?;
-    let mut embeddings = Vec::new();
-    for row in rows {
-        let (document, dimensions, bytes) = row.map_err(|error| invalid_database(path, error))?;
-        let dimensions = usize::try_from(dimensions).map_err(|_| {
-            ShellError::new(
-                ErrorCode::Validation,
-                "the command database contains an invalid embedding dimension",
-            )
-            .with_context(format!("observed: {dimensions}"))
-            .with_help("Run `quirl ai index` to rebuild semantic embeddings")
-        })?;
-        validate_dimensions(dimensions)?;
-        let vector = bytes_to_vector(&bytes, dimensions)?;
-        embeddings.push(StoredEmbedding { document, vector });
-        if embeddings.len() > DOCUMENTS_MAX {
-            return Err(resource_limit(
-                "stored embeddings",
-                DOCUMENTS_MAX,
-                embeddings.len(),
-            ));
-        }
+        .ok()?;
+    let dimensions = usize::try_from(generation.6).ok()?;
+    let generation_version = u32::try_from(generation.7).ok()?;
+    let document_count = usize::try_from(generation.9).ok()?;
+    if generation.0 != identity.identity
+        || generation.1 != identity.repository
+        || generation.2 != identity.revision
+        || generation.3 != identity.config_sha256
+        || generation.4 != identity.tokenizer_sha256
+        || generation.5 != identity.weights_sha256
+        || dimensions != identity.dimensions
+        || generation_version != DOCUMENT_GENERATION_VERSION
+        || generation.8 != document_index_fingerprint(documents)
+        || document_count != documents.len()
+    {
+        return None;
     }
-    Ok(embeddings)
+    let stored_count = connection
+        .query_row(
+            "SELECT count(*) FROM embeddings WHERE model_id = ?1",
+            params![identity.identity],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .and_then(|count| usize::try_from(count).ok())?;
+    if stored_count != documents.len() {
+        return None;
+    }
+    let read_limit = sqlite_integer(DOCUMENTS_MAX.saturating_add(1)).ok()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT document_id, dimensions, vector_le_f32, document_fingerprint FROM embeddings WHERE model_id = ?1 ORDER BY document_id LIMIT ?2",
+        )
+        .ok()?;
+    let rows = statement
+        .query_map(params![identity.identity, read_limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .ok()?;
+    let mut embeddings = Vec::with_capacity(documents.len());
+    let mut retained_bytes = 0_usize;
+    for (document, row) in documents.iter().zip(rows) {
+        let (document_id, stored_dimensions, bytes, document_fingerprint) = row.ok()?;
+        if document_id != document.id
+            || document_fingerprint != document.fingerprint
+            || usize::try_from(stored_dimensions).ok()? != dimensions
+        {
+            return None;
+        }
+        retained_bytes = retained_bytes.saturating_add(bytes.len());
+        if retained_bytes > EMBEDDINGS_RETAINED_BYTES_MAX {
+            return None;
+        }
+        let vector = bytes_to_vector(&bytes, dimensions).ok()?;
+        embeddings.push(StoredEmbedding {
+            document: document.clone(),
+            vector,
+        });
+    }
+    (embeddings.len() == documents.len()).then_some(embeddings)
+}
+
+fn stored_model_identity(connection: &Connection) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT model_identity FROM embedding_index WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()
+}
+
+#[cfg(debug_assertions)]
+fn read_complete_test_embeddings(connection: &Connection, documents: &[SemanticDocument]) -> bool {
+    let identity = ModelIdentity {
+        identity: TEST_MODEL_IDENTITY.to_owned(),
+        repository: crate::ai_bootstrap::MODEL_REPOSITORY.to_owned(),
+        revision: crate::ai_bootstrap::MODEL_REVISION.to_owned(),
+        config_sha256: "sha256:test-config".to_owned(),
+        tokenizer_sha256: "sha256:test-tokenizer".to_owned(),
+        weights_sha256: "sha256:test-model".to_owned(),
+        dimensions: 1,
+    };
+    read_complete_embeddings(connection, documents, &identity).is_some()
 }
 
 fn deserialize_database(bytes: &[u8], path: &Path) -> Result<Connection, ShellError> {
@@ -2292,61 +2636,268 @@ fn serialize_database(connection: &Connection) -> Result<Vec<u8>, ShellError> {
     Ok(data.to_vec())
 }
 
-fn load_model(path: &Path) -> Result<StaticModel, ShellError> {
-    validate_model_files(path)?;
-    catch_unwind(AssertUnwindSafe(|| {
-        StaticModel::from_pretrained(path, None, Some(true), None)
+fn load_model(path: &Path) -> Result<LoadedModel, ShellError> {
+    let explicit = env::var_os("QUIRL_MODEL_PATH")
+        .map(PathBuf::from)
+        .is_some_and(|configured| configured == path);
+    load_model_selected(path, explicit)
+}
+
+fn load_model_selected(path: &Path, explicit: bool) -> Result<LoadedModel, ShellError> {
+    validate_model_root(path)?;
+    let manifest = if explicit {
+        read_explicit_model_manifest(path)?
+    } else {
+        crate::ai_bootstrap::validate_pinned_model(path)?;
+        pinned_model_manifest()?
+    };
+    validate_model_manifest(&manifest)?;
+    let config =
+        crate::ai_bootstrap::read_model_input(&path.join("config.json"), MODEL_CONFIG_BYTES_MAX)?;
+    let tokenizer = crate::ai_bootstrap::read_model_input(
+        &path.join("tokenizer.json"),
+        MODEL_TOKENIZER_BYTES_MAX,
+    )?;
+    let weights = crate::ai_bootstrap::read_model_input(
+        &path.join("model.safetensors"),
+        MODEL_WEIGHTS_BYTES_MAX,
+    )?;
+    let model_files_bytes = config
+        .len()
+        .saturating_add(tokenizer.len())
+        .saturating_add(weights.len());
+    if model_files_bytes > MODEL_FILES_BYTES_MAX {
+        return Err(resource_limit(
+            "aggregate model file bytes",
+            MODEL_FILES_BYTES_MAX,
+            model_files_bytes,
+        ));
+    }
+    let config_sha256 = fingerprint(&config);
+    let tokenizer_sha256 = fingerprint(&tokenizer);
+    let weights_sha256 = fingerprint(&weights);
+    validate_asset_digest(
+        "config.json",
+        &config_sha256,
+        &manifest.assets.config_sha256,
+    )?;
+    validate_asset_digest(
+        "tokenizer.json",
+        &tokenizer_sha256,
+        &manifest.assets.tokenizer_sha256,
+    )?;
+    validate_asset_digest(
+        "model.safetensors",
+        &weights_sha256,
+        &manifest.assets.model_sha256,
+    )?;
+    let model = catch_unwind(AssertUnwindSafe(|| {
+        StaticModel::from_bytes(&tokenizer, &weights, &config, Some(true))
     }))
     .map_err(|_| {
         ShellError::new(ErrorCode::Validation, "the local Model2Vec loader failed")
-            .with_help("Replace the model files with an intact potion-base-8M release")
+            .with_help("Replace the local model with intact bounded Model2Vec assets")
     })?
     .map_err(|error| {
         ShellError::new(
             ErrorCode::Validation,
-            format!("could not load potion-base-8M from {}", path.display()),
+            format!(
+                "could not load the local Model2Vec model from {}",
+                path.display()
+            ),
         )
         .with_context(error.to_string())
-        .with_help("Replace the model files or set QUIRL_MODEL_PATH to an intact local model")
+        .with_help("Replace the model files or correct quirl-model.json")
+    })?;
+    let probe = catch_unwind(AssertUnwindSafe(|| {
+        encode_query(&model, "bounded model identity probe")
+    }))
+    .map_err(|_| {
+        ShellError::new(
+            ErrorCode::Validation,
+            "the local Model2Vec model failed its dimension probe",
+        )
+        .with_help("Replace the local model with intact Model2Vec assets")
+    })?;
+    validate_dimensions(probe.len())?;
+    if probe.len() != manifest.dimensions || probe.iter().any(|value| !value.is_finite()) {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "the local model does not match its declared dimensions",
+        )
+        .with_context(format!(
+            "declared: {}; observed: {}",
+            manifest.dimensions,
+            probe.len()
+        ))
+        .with_help("Regenerate quirl-model.json from the exact local model assets"));
+    }
+    let identity = ModelIdentity {
+        identity: model_identity_fingerprint(
+            &manifest.repository,
+            &manifest.revision,
+            &config_sha256,
+            &tokenizer_sha256,
+            &weights_sha256,
+            manifest.dimensions,
+        ),
+        repository: manifest.repository,
+        revision: manifest.revision,
+        config_sha256,
+        tokenizer_sha256,
+        weights_sha256,
+        dimensions: manifest.dimensions,
+    };
+    Ok(LoadedModel { model, identity })
+}
+
+fn validate_model_root(path: &Path) -> Result<(), ShellError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Io,
+            format!(
+                "local Model2Vec directory {} is unavailable",
+                path.display()
+            ),
+        )
+        .with_context(error.to_string())
+        .with_help("Install the pinned model or set QUIRL_MODEL_PATH to a private directory")
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "local Model2Vec root {} is not a real directory",
+                path.display()
+            ),
+        )
+        .with_help("Use a private directory without symbolic links"));
+    }
+    crate::index::create_index_directories(path)
+}
+
+fn pinned_model_manifest() -> Result<ModelManifest, ShellError> {
+    let digest = |name| {
+        crate::ai_bootstrap::pinned_asset_sha256(name)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::Validation,
+                    "the compiled pinned-model asset table is incomplete",
+                )
+                .with_help("Rebuild Quirl from a complete source tree")
+            })
+    };
+    Ok(ModelManifest {
+        schema_version: MODEL_MANIFEST_SCHEMA_VERSION,
+        repository: crate::ai_bootstrap::MODEL_REPOSITORY.to_owned(),
+        revision: crate::ai_bootstrap::MODEL_REVISION.to_owned(),
+        dimensions: crate::ai_bootstrap::MODEL_DIMENSIONS,
+        assets: ModelManifestAssets {
+            config_sha256: digest("config.json")?,
+            tokenizer_sha256: digest("tokenizer.json")?,
+            model_sha256: digest("model.safetensors")?,
+        },
     })
 }
 
-fn validate_model_files(path: &Path) -> Result<(), ShellError> {
-    crate::ai_bootstrap::validate_pinned_model(path)?;
-    for (name, bytes_max) in [
-        ("config.json", MODEL_CONFIG_BYTES_MAX),
-        ("tokenizer.json", MODEL_TOKENIZER_BYTES_MAX),
-        ("model.safetensors", MODEL_WEIGHTS_BYTES_MAX),
+fn read_explicit_model_manifest(path: &Path) -> Result<ModelManifest, ShellError> {
+    let manifest_path = path.join("quirl-model.json");
+    let bytes = crate::ai_bootstrap::read_model_input(&manifest_path, MODEL_MANIFEST_BYTES_MAX)?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        ShellError::new(
+            ErrorCode::Validation,
+            format!(
+                "{} is not a valid local-model manifest",
+                manifest_path.display()
+            ),
+        )
+        .with_context(error.to_string())
+        .with_help("Use the deny-unknown quirl-model.json schema version 1")
+    })
+}
+
+fn validate_model_manifest(manifest: &ModelManifest) -> Result<(), ShellError> {
+    if manifest.schema_version != MODEL_MANIFEST_SCHEMA_VERSION {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "the local-model manifest uses an unsupported schema version",
+        )
+        .with_context(format!(
+            "observed: {}; expected: {MODEL_MANIFEST_SCHEMA_VERSION}",
+            manifest.schema_version
+        ))
+        .with_help("Regenerate quirl-model.json with schema_version 1"));
+    }
+    for (label, value) in [
+        ("repository", manifest.repository.as_str()),
+        ("revision", manifest.revision.as_str()),
     ] {
-        let file = path.join(name);
-        let metadata = std::fs::symlink_metadata(&file).map_err(|error| {
-            ShellError::new(
-                ErrorCode::Io,
-                format!("potion-base-8M is not installed at {}", path.display()),
-            )
-            .with_context(error.to_string())
-            .with_help("Place config.json, tokenizer.json, and model.safetensors in that directory or set QUIRL_MODEL_PATH")
-        })?;
-        if !metadata.file_type().is_file() {
+        if value.trim().is_empty()
+            || value.len() > MODEL_IDENTITY_TEXT_BYTES_MAX
+            || value.chars().any(char::is_control)
+        {
+            return Err(resource_limit(
+                label,
+                MODEL_IDENTITY_TEXT_BYTES_MAX,
+                value.len(),
+            ));
+        }
+    }
+    validate_dimensions(manifest.dimensions)?;
+    for (label, digest) in [
+        ("config_sha256", manifest.assets.config_sha256.as_str()),
+        (
+            "tokenizer_sha256",
+            manifest.assets.tokenizer_sha256.as_str(),
+        ),
+        ("model_sha256", manifest.assets.model_sha256.as_str()),
+    ] {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
             return Err(ShellError::new(
                 ErrorCode::Validation,
-                format!("local model input {} is not a regular file", file.display()),
+                format!("the local-model manifest has an invalid {label}"),
             )
-            .with_help("Install potion-base-8M as three unlinked regular files"));
-        }
-        if metadata.len() > bytes_max {
-            return Err(ShellError::new(
-                ErrorCode::ResourceLimit,
-                format!(
-                    "local model input {} exceeds its size limit",
-                    file.display()
-                ),
-            )
-            .with_context(format!("limit: {bytes_max}; observed: {}", metadata.len()))
-            .with_help("Replace the model file with the official potion-base-8M artifact"));
+            .with_help("Use exactly 64 lowercase hexadecimal SHA-256 digits"));
         }
     }
     Ok(())
+}
+
+fn validate_asset_digest(
+    label: &str,
+    observed: &str,
+    expected_hex: &str,
+) -> Result<(), ShellError> {
+    if observed.strip_prefix("sha256:") != Some(expected_hex) {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!("local model asset {label} does not match its identity manifest"),
+        )
+        .with_context(format!(
+            "expected: sha256:{expected_hex}; observed: {observed}"
+        ))
+        .with_help("Regenerate the manifest or restore the exact declared model asset"));
+    }
+    Ok(())
+}
+
+fn model_identity_fingerprint(
+    repository: &str,
+    revision: &str,
+    config_sha256: &str,
+    tokenizer_sha256: &str,
+    weights_sha256: &str,
+    dimensions: usize,
+) -> String {
+    let material = format!(
+        "{MODEL_INFERENCE_PROTOCOL}\nrepository={repository}\nrevision={revision}\nconfig={config_sha256}\ntokenizer={tokenizer_sha256}\nweights={weights_sha256}\ndimensions={dimensions}\n"
+    );
+    fingerprint(material.as_bytes())
 }
 
 fn count_rows(connection: &Connection, path: &Path, table: &str) -> Result<usize, ShellError> {
@@ -2452,15 +3003,142 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     }
 }
 
+fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase)
+        .take(64)
+        .collect()
+}
+
+fn encode_query(model: &StaticModel, query: &str) -> Vec<f32> {
+    model
+        .encode_with_args(&[query.to_owned()], Some(256), 1)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+fn exact_lexical_boost(features: &LexicalFeatures, query: &str) -> f32 {
+    let equals = |value: &str| value.to_lowercase() == query;
+    let path_exact = features.paths.iter().any(|value| equals(value));
+    let alias_exact = features.aliases.iter().any(|value| equals(value));
+    let name_exact = features.names.iter().any(|value| equals(value));
+    let path_name_exact = features.paths.iter().any(|path| {
+        features
+            .names
+            .iter()
+            .any(|name| format!("{} {}", path.to_lowercase(), name.to_lowercase()) == query)
+    });
+    let type_match = features.types.iter().any(|value| {
+        let value = value.to_lowercase();
+        !value.is_empty() && value == query
+    });
+    if path_exact {
+        12.0
+    } else if alias_exact {
+        10.0
+    } else if path_name_exact {
+        9.0
+    } else if name_exact {
+        8.0
+    } else if type_match {
+        2.0
+    } else {
+        0.0
+    }
+}
+
+fn limit_lexical(mut results: Vec<SearchResult>, limit: usize) -> Vec<SearchResult> {
+    results.truncate(limit);
+    results
+}
+
+fn fuse_rankings(
+    lexical: Vec<SearchResult>,
+    semantic: Vec<SearchResult>,
+    limit: usize,
+    check_cancelled: &mut impl FnMut() -> Result<(), ShellError>,
+) -> Result<Vec<SearchResult>, ShellError> {
+    if semantic.len() > DOCUMENTS_MAX || lexical.len() > DOCUMENTS_MAX {
+        return Err(resource_limit(
+            "fusion candidates",
+            DOCUMENTS_MAX,
+            semantic.len().max(lexical.len()),
+        ));
+    }
+    let mut fused = BTreeMap::<String, (SearchResult, f32)>::new();
+    for (ranking_index, ranking) in [lexical, semantic].into_iter().enumerate() {
+        for (position, mut result) in ranking.into_iter().enumerate() {
+            if position % CANCELLATION_CHECK_INTERVAL == 0 {
+                check_cancelled()?;
+            }
+            let contribution = 1.0 / (FUSION_RANK_CONSTANT + position.saturating_add(1) as f32);
+            result.semantic = true;
+            result.mode = RetrievalMode::Hybrid;
+            let entry = fused
+                .entry(result.document_id.clone())
+                .or_insert_with(|| (result.clone(), 0.0));
+            if ranking_index == 1 {
+                entry.0 = result;
+            }
+            entry.1 += contribution;
+        }
+    }
+    let mut results = fused
+        .into_values()
+        .map(|(mut result, score)| {
+            result.score = score;
+            result
+        })
+        .collect::<Vec<_>>();
+    sort_and_limit(&mut results, limit);
+    check_cancelled()?;
+    Ok(results)
+}
+
 fn sort_and_limit(results: &mut Vec<SearchResult>, limit: usize) {
     results.sort_by(|left, right| {
         right
             .score
             .partial_cmp(&left.score)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| left.target.cmp(&right.target))
+            .then_with(|| left.document_id.cmp(&right.document_id))
     });
     results.truncate(limit);
+}
+
+fn tagged_document_body(fields: &[(&str, String)]) -> String {
+    fields
+        .iter()
+        .map(|(label, value)| format!("{label}: {}", normalize_document_field(value)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn normalize_document_field(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn semantic_document_fingerprint(document_id: &str, body: &str) -> String {
+    let material =
+        format!("quirl-semantic-document@{DOCUMENT_GENERATION_VERSION}\nid={document_id}\n{body}");
+    fingerprint(material.as_bytes())
+}
+
+fn document_index_fingerprint(documents: &[SemanticDocument]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!(
+        "quirl-semantic-index@{DOCUMENT_GENERATION_VERSION}\n"
+    ));
+    for document in documents {
+        hasher.update(document.id.len().to_le_bytes());
+        hasher.update(document.id.as_bytes());
+        hasher.update(document.fingerprint.len().to_le_bytes());
+        hasher.update(document.fingerprint.as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn argument_kind(kind: ArgumentKind) -> &'static str {
@@ -2704,6 +3382,75 @@ impl<T> OptionalRow<T> for Result<T, rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+    };
+
+    static NEXT_MODEL_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    struct ModelFixture(PathBuf);
+
+    impl ModelFixture {
+        fn int8() -> Self {
+            let id = NEXT_MODEL_FIXTURE.fetch_add(1, AtomicOrdering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("quirl-int8-model-test-{}-{id}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            let path = fs::canonicalize(path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let config = br#"{"normalize":true}"#;
+            let tokenizer = br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"[UNK]":0,"bounded":1,"model":2,"identity":3,"probe":4},"unk_token":"[UNK]"}}"#;
+            let weights = int8_safetensors(5, 2);
+            fs::write(path.join("config.json"), config).unwrap();
+            fs::write(path.join("tokenizer.json"), tokenizer).unwrap();
+            fs::write(path.join("model.safetensors"), &weights).unwrap();
+            let digest = |bytes: &[u8]| fingerprint(bytes).trim_start_matches("sha256:").to_owned();
+            let manifest = ModelManifest {
+                schema_version: MODEL_MANIFEST_SCHEMA_VERSION,
+                repository: "minishlab/potion-base-8M".to_owned(),
+                revision: "experimental-int8".to_owned(),
+                dimensions: 2,
+                assets: ModelManifestAssets {
+                    config_sha256: digest(config),
+                    tokenizer_sha256: digest(tokenizer),
+                    model_sha256: digest(&weights),
+                },
+            };
+            fs::write(
+                path.join("quirl-model.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ModelFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn int8_safetensors(rows: usize, columns: usize) -> Vec<u8> {
+        let data_bytes = rows * columns;
+        let mut header = format!(
+            "{{\"embeddings\":{{\"dtype\":\"I8\",\"shape\":[{rows},{columns}],\"data_offsets\":[0,{data_bytes}]}}}}"
+        )
+        .into_bytes();
+        while header.len() % 8 != 0 {
+            header.push(b' ');
+        }
+        let mut bytes = Vec::with_capacity(8 + header.len() + data_bytes);
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend((0..data_bytes).map(|index| u8::try_from(index + 1).unwrap()));
+        bytes
+    }
 
     #[test]
     fn database_round_trips_catalog_and_discovery_state() {
@@ -2728,6 +3475,156 @@ mod tests {
         )
         .unwrap();
         assert!(results.iter().any(|result| result.command == "cd"));
+    }
+
+    #[test]
+    fn semantic_documents_are_deterministic_versioned_and_provenanced() {
+        let catalog = Catalog::builtin();
+        let command = catalog.find("cd").unwrap();
+        let first = command_document(command);
+        let second = command_document(command);
+        assert_eq!(first.body, second.body);
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert!(first.body.contains("summary:"));
+        assert!(first.body.contains("intent:"));
+        assert!(first.body.contains("provenance:"));
+        assert_eq!(
+            first.fingerprint,
+            semantic_document_fingerprint(&first.id, &first.body)
+        );
+    }
+
+    #[test]
+    fn exact_path_and_option_names_receive_deterministic_lexical_boosts() {
+        let bytes = encode_database(&Catalog::builtin(), None).unwrap();
+        let session = SearchSession::open(&bytes, Path::new("catalog.sqlite3"), None).unwrap();
+        let commands = session.search("cd", 8).unwrap();
+        assert_eq!(commands[0].command, "cd");
+        assert_eq!(commands[0].mode, RetrievalMode::Lexical);
+
+        let options = session.search("--format", 100).unwrap();
+        assert!(options.iter().any(|result| {
+            result.kind == "option"
+                && result
+                    .target
+                    .split_whitespace()
+                    .any(|part| part == "--format")
+        }));
+    }
+
+    #[test]
+    fn reciprocal_rank_fusion_is_deterministic_and_uses_both_rankings() {
+        let result = |id: &str, score: f32, mode| SearchResult {
+            document_id: id.to_owned(),
+            command: id.to_owned(),
+            target: id.to_owned(),
+            kind: "command".to_owned(),
+            summary: id.to_owned(),
+            score,
+            semantic: matches!(mode, RetrievalMode::Hybrid),
+            mode,
+        };
+        let lexical = vec![
+            result("lexical-only", 2.0, RetrievalMode::Lexical),
+            result("shared", 1.0, RetrievalMode::Lexical),
+        ];
+        let semantic = vec![
+            result("semantic-only", 0.9, RetrievalMode::Hybrid),
+            result("shared", 0.8, RetrievalMode::Hybrid),
+        ];
+        let first = fuse_rankings(lexical.clone(), semantic.clone(), 3, &mut || Ok(())).unwrap();
+        let second = fuse_rankings(lexical, semantic, 3, &mut || Ok(())).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first[0].document_id, "shared");
+        assert!(
+            first
+                .iter()
+                .all(|result| result.mode == RetrievalMode::Hybrid)
+        );
+    }
+
+    #[test]
+    fn cancelled_hybrid_work_returns_no_partial_ranking() {
+        let result = |id: &str| SearchResult {
+            document_id: id.to_owned(),
+            command: id.to_owned(),
+            target: id.to_owned(),
+            kind: "command".to_owned(),
+            summary: id.to_owned(),
+            score: 1.0,
+            semantic: false,
+            mode: RetrievalMode::Lexical,
+        };
+        let mut checks = 0;
+        let error = fuse_rankings(vec![result("one")], vec![result("one")], 1, &mut || {
+            checks += 1;
+            if checks > 1 {
+                Err(ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "test cancellation",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn cancelled_semantic_phase_preserves_complete_lexical_fallback() {
+        let fixture = ModelFixture::int8();
+        let loaded = load_model_selected(&fixture.0, true).unwrap();
+        let command = Catalog::builtin()
+            .commands
+            .into_iter()
+            .find(|command| command.path == "quirl ai search")
+            .unwrap();
+        let document = command_document(&command);
+        let vector = encode_query(&loaded.model, &document.body);
+        let session = SearchSession {
+            documents: vec![document.clone()],
+            embeddings: vec![StoredEmbedding { document, vector }],
+            model: Some(loaded.model),
+        };
+        let mut checks = 0_usize;
+        let results = session
+            .search_cancellable("search catalog", 1, || {
+                checks = checks.saturating_add(1);
+                if checks >= 4 {
+                    Err(ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "test cancellation",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].command, "quirl ai search");
+        assert_eq!(results[0].mode, RetrievalMode::Lexical);
+        assert!(!results[0].semantic);
+    }
+
+    #[test]
+    fn invalid_model_input_preserves_complete_lexical_fallback() {
+        let bytes = encode_database(&Catalog::builtin(), None).unwrap();
+        let results = search(
+            &bytes,
+            Path::new("catalog.sqlite3"),
+            "change directory",
+            8,
+            Some(Path::new("missing-model")),
+        )
+        .unwrap();
+        assert!(results.iter().any(|result| result.command == "cd"));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.mode == RetrievalMode::Lexical)
+        );
     }
 
     #[test]
@@ -2764,15 +3661,9 @@ mod tests {
         let path = Path::new("catalog.sqlite3");
         let bytes = encode_database(&Catalog::builtin(), None).unwrap();
         assert!(!embeddings_are_current(&bytes, path).unwrap());
-        let connection = deserialize_database(&bytes, path).unwrap();
-        connection
-            .execute(
-                "INSERT INTO embeddings(document_id, model_id, dimensions, vector_le_f32, document_fingerprint) SELECT document_id, ?1, 1, x'00000000', fingerprint FROM semantic_documents",
-                params![MODEL_ID],
-            )
-            .unwrap();
-        let current = serialize_database(&connection).unwrap();
+        let current = mark_embeddings_current_for_test(&bytes, path).unwrap();
         assert!(embeddings_are_current(&current, path).unwrap());
+        let connection = deserialize_database(&current, path).unwrap();
         connection
             .execute(
                 "UPDATE embeddings SET document_fingerprint = 'stale' WHERE document_id = (SELECT min(document_id) FROM embeddings)",
@@ -2781,6 +3672,76 @@ mod tests {
             .unwrap();
         let stale = serialize_database(&connection).unwrap();
         assert!(!embeddings_are_current(&stale, path).unwrap());
+    }
+
+    #[test]
+    fn embedding_generation_rejects_partial_and_model_mismatched_sets() {
+        let path = Path::new("catalog.sqlite3");
+        let base = encode_database(&Catalog::builtin(), None).unwrap();
+        let current = mark_embeddings_current_for_test(&base, path).unwrap();
+        let connection = deserialize_database(&current, path).unwrap();
+        let documents = read_documents(&connection, path).unwrap();
+        assert!(read_complete_test_embeddings(&connection, &documents));
+
+        connection
+            .execute(
+                "DELETE FROM embeddings WHERE document_id = (SELECT min(document_id) FROM embeddings)",
+                [],
+            )
+            .unwrap();
+        assert!(!read_complete_test_embeddings(&connection, &documents));
+
+        let mismatched = deserialize_database(&current, path).unwrap();
+        mismatched
+            .execute(
+                "UPDATE embedding_index SET model_identity = 'sha256:different'",
+                [],
+            )
+            .unwrap();
+        assert!(!read_complete_test_embeddings(&mismatched, &documents));
+
+        let malformed = deserialize_database(&current, path).unwrap();
+        malformed
+            .execute(
+                "UPDATE embeddings SET vector_le_f32 = x'00' WHERE document_id = (SELECT min(document_id) FROM embeddings)",
+                [],
+            )
+            .unwrap();
+        assert!(!read_complete_test_embeddings(&malformed, &documents));
+    }
+
+    #[test]
+    fn explicit_model_manifest_is_bounded_versioned_and_deny_unknown() {
+        let digest = "a".repeat(64);
+        let valid = format!(
+            "{{\"schema_version\":1,\"repository\":\"minishlab/potion-base-8M\",\"revision\":\"experimental-int8\",\"dimensions\":256,\"assets\":{{\"config_sha256\":\"{digest}\",\"tokenizer_sha256\":\"{digest}\",\"model_sha256\":\"{digest}\"}}}}"
+        );
+        let manifest: ModelManifest = serde_json::from_str(&valid).unwrap();
+        validate_model_manifest(&manifest).unwrap();
+
+        let unknown = valid.replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":1,\"unknown\":true",
+            1,
+        );
+        assert!(serde_json::from_str::<ModelManifest>(&unknown).is_err());
+
+        let mut excessive = manifest;
+        excessive.repository = "x".repeat(MODEL_IDENTITY_TEXT_BYTES_MAX + 1);
+        assert_eq!(
+            validate_model_manifest(&excessive).unwrap_err().code,
+            ErrorCode::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn explicit_manifest_admits_int8_model_without_pinned_asset_identity() {
+        let fixture = ModelFixture::int8();
+        let loaded = load_model_selected(&fixture.0, true).unwrap();
+        assert_eq!(loaded.identity.repository, "minishlab/potion-base-8M");
+        assert_eq!(loaded.identity.revision, "experimental-int8");
+        assert_eq!(loaded.identity.dimensions, 2);
+        assert_eq!(encode_query(&loaded.model, "bounded model").len(), 2);
     }
 
     fn local_record(insertion_text: &str) -> LocalCompletionRecord {

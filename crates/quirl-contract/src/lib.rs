@@ -14,6 +14,7 @@
 
 mod agent;
 mod package;
+mod proposal;
 
 pub use agent::{
     AGENT_CATALOG_SCHEMA_DESCRIPTOR, AGENT_CONTEXT_SCHEMA_DESCRIPTOR,
@@ -32,6 +33,16 @@ pub use package::{
     PackageManifest, PackageMetadata, PackagePublishPlan, PackageSourceAudit, build_package,
     package_build_schema_hash, package_manifest_schema_hash, parse_package_manifest,
     validate_package_manifest,
+};
+pub use proposal::{
+    COMMAND_PLANNING_INTENT_BYTES_MAX, COMMAND_PROPOSAL_ARGUMENTS_MAX,
+    COMMAND_PROPOSAL_CATALOG_ARGUMENTS_MAX, COMMAND_PROPOSAL_EXPLANATION_BYTES_MAX,
+    COMMAND_PROPOSAL_PRODUCER_BYTES_MAX, COMMAND_PROPOSAL_RENDER_BYTES_MAX,
+    COMMAND_PROPOSAL_SCHEMA_DESCRIPTOR, COMMAND_PROPOSAL_SCHEMA_VERSION,
+    COMMAND_PROPOSAL_SOURCE_BYTES_MAX, COMMAND_PROPOSAL_VALUE_BYTES_MAX,
+    COMMAND_PROPOSAL_VALUES_BYTES_MAX, CommandPlanner, CommandPlanningRequest, CommandProposal,
+    CommandProposalArgument, CommandProposalProvenance, CommandProposalRisk, CommandProposalSource,
+    CommandProposalValue, ValidatedCommandProposal, command_proposal_schema_hash,
 };
 
 /// Stable, dependency-free hash used in versioned schema identifiers.
