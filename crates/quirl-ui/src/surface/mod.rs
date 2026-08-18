@@ -1,4 +1,4 @@
-mod completion;
+pub(crate) mod completion;
 mod degrade;
 mod editor;
 mod frame;
@@ -1289,6 +1289,10 @@ impl RichSurface {
                     if dragged && self.terminal.input_active {
                         let _ = self.copy_output_selection();
                     }
+                    // Mouse selection is transient pointer interaction, not a transfer of
+                    // keyboard ownership. Keep the selected text visible while returning
+                    // subsequent keys to the live prompt immediately after button release.
+                    self.output_focus = false;
                 } else if self.mouse_drag == Some(MouseDrag::Scrollbar) {
                     self.scrollbar_to_row(mouse.row);
                     self.mouse_drag = None;
@@ -2276,6 +2280,10 @@ fn should_open_automatic_completion(
     if mode == Mode::Natural {
         return false;
     }
+    if completion::should_open_automatic_filesystem_completion(Some(catalog), buffer, cursor, mode)
+    {
+        return true;
+    }
     if mode == Mode::Data && before.trim_end().len() == before.len() && before.trim_start() == "ls"
     {
         return true;
@@ -2393,6 +2401,40 @@ mod tests {
             .unwrap();
         assert!(!surface.completion.open);
         assert!(!surface.completion.streaming);
+    }
+
+    #[test]
+    fn directory_and_explicit_path_contexts_open_automatically() {
+        let catalog = Catalog::builtin();
+        let auto = false;
+        let min_chars = 2;
+
+        for line in ["cd ", "cd sr", "cat ./sr"] {
+            assert!(should_open_automatic_completion(
+                &catalog,
+                line,
+                line.len(),
+                Mode::Command,
+                auto,
+                min_chars,
+            ));
+        }
+        assert!(!should_open_automatic_completion(
+            &catalog,
+            "echo ordinary",
+            "echo ordinary".len(),
+            Mode::Command,
+            auto,
+            min_chars,
+        ));
+        assert!(!should_open_automatic_completion(
+            &catalog,
+            "cd sr",
+            "cd sr".len(),
+            Mode::Natural,
+            auto,
+            min_chars,
+        ));
     }
 
     #[test]
@@ -2708,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_drag_selects_exact_visible_utf8_text() {
+    fn mouse_drag_selects_utf8_text_then_returns_keyboard_focus_to_prompt() {
         let mut surface = RichSurface::new(
             Arc::new(Catalog::builtin()),
             None,
@@ -2739,7 +2781,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
 
-        assert!(surface.output_focus);
+        assert!(!surface.output_focus);
         assert_eq!(
             surface
                 .transcript
@@ -2747,6 +2789,21 @@ mod tests {
             Ok(Some("βeta".to_owned()))
         );
         assert_eq!(surface.mouse_drag, None);
+
+        surface.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(!surface.output_focus);
+        assert_eq!(
+            surface
+                .transcript
+                .selected_text_bounded(TRANSCRIPT_COPY_BYTES_MAX),
+            Ok(None)
+        );
     }
 
     #[test]

@@ -2398,12 +2398,21 @@ impl Completer for CatalogCompleter {
                 )
             };
         }
-        let mut suggestions = self
-            .catalog
-            .complete(line, pos)
-            .into_iter()
-            .map(catalog_suggestion)
-            .collect::<Vec<_>>();
+        let mut suggestions = surface::completion::filesystem_completion_items(
+            Some(&self.catalog),
+            line,
+            pos,
+            Mode::Command,
+        )
+        .into_iter()
+        .map(filesystem_suggestion)
+        .collect::<Vec<_>>();
+        suggestions.extend(
+            self.catalog
+                .complete(line, pos)
+                .into_iter()
+                .map(catalog_suggestion),
+        );
         if let Some(extensions) = &mut self.extensions {
             suggestions.extend(
                 extensions
@@ -2553,6 +2562,24 @@ fn catalog_suggestion(completion: quirl_catalog::Completion) -> Suggestion {
         span: Span::new(completion.replace_start, completion.replace_end),
         append_whitespace: true,
         match_indices: Some(match_indices),
+        ..Suggestion::default()
+    }
+}
+
+fn filesystem_suggestion(completion: surface::completion::CompletionItem) -> Suggestion {
+    let append_whitespace = !completion.display.ends_with('/');
+    let display = bounded_terminal_line(&completion.display);
+    let summary = bounded_terminal_text(&completion.summary);
+    let detail = bounded_terminal_text(&completion.detail);
+    Suggestion {
+        value: completion.value,
+        display_override: Some(format!("{display}  [path]")),
+        description: Some(format!(
+            "{summary}\nkind: path | source: filesystem\n{detail}"
+        )),
+        extra: Some(vec!["kind: path | source: filesystem".to_owned(), detail]),
+        span: Span::new(completion.replace_start, completion.replace_end),
+        append_whitespace,
         ..Suggestion::default()
     }
 }
@@ -3200,6 +3227,36 @@ mod tests {
                 .unwrap()
                 .contains("source: catalog")
         );
+    }
+
+    #[test]
+    fn simple_surface_completes_cd_with_directories_only() {
+        let root = test_history_path("simple-path-completion");
+        fs::create_dir_all(root.join("source tree")).unwrap();
+        fs::write(root.join("source.txt"), b"file").unwrap();
+        let line = format!("cd {}/sou", root.display());
+
+        let mut completer = CatalogCompleter::new(Catalog::builtin());
+        let result = completer.complete(&line, line.len());
+        let directory = result
+            .iter()
+            .find(|suggestion| suggestion.value.ends_with("source\\ tree/"))
+            .unwrap();
+
+        assert_eq!(directory.span, Span::new(3, line.len()));
+        assert!(!directory.append_whitespace);
+        assert!(
+            directory
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("source: filesystem"))
+        );
+        assert!(
+            result
+                .iter()
+                .all(|suggestion| !suggestion.value.ends_with("source.txt"))
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

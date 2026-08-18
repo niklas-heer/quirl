@@ -423,11 +423,8 @@ impl CompletionState {
         self.request_id = self.request_id.saturating_add(1);
         self.items.clear();
         self.extension_pending = None;
-        self.filesystem_pending = if automatic {
-            Vec::new()
-        } else {
-            filesystem_completion_items(self.catalog.as_deref(), line, cursor, mode)
-        };
+        self.filesystem_pending =
+            filesystem_completion_items(self.catalog.as_deref(), line, cursor, mode);
         self.items.clone_from(&self.filesystem_pending);
         self.catalog_ready = false;
         self.extension_ready = self.extension_worker.is_none();
@@ -671,52 +668,36 @@ struct ShellWord<'a> {
     raw: &'a str,
 }
 
-fn filesystem_completion_items(
+struct FilesystemCompletionContext {
+    replace_start: usize,
+    raw_token: String,
+    decoded: String,
+    directories_only: bool,
+}
+
+pub(crate) fn should_open_automatic_filesystem_completion(
+    catalog: Option<&Catalog>,
+    line: &str,
+    cursor: usize,
+    mode: Mode,
+) -> bool {
+    filesystem_completion_context(catalog, line, cursor, mode)
+        .is_some_and(|context| context.directories_only || shell_path_is_explicit(&context.decoded))
+}
+
+pub(crate) fn filesystem_completion_items(
     catalog: Option<&Catalog>,
     line: &str,
     cursor: usize,
     mode: Mode,
 ) -> Vec<CompletionItem> {
-    if mode == Mode::Natural {
+    let Some(context) = filesystem_completion_context(catalog, line, cursor, mode) else {
         return Vec::new();
-    }
+    };
     let cursor = clamped_utf8_cursor(line, cursor);
-    let before = &line[..cursor];
-    let segment_start = shell_segment_start(before);
-    let segment = &before[segment_start..];
-    let words = shell_words(segment, segment_start);
-    let trailing_space = segment.chars().next_back().is_some_and(char::is_whitespace);
-    let Some(command) = words.first().map(|word| decode_shell_word(word.raw)) else {
-        return Vec::new();
-    };
-    let (replace_start, raw_token, is_argument) = if trailing_space {
-        (cursor, "", !words.is_empty())
-    } else {
-        let Some(current) = words.last() else {
-            return Vec::new();
-        };
-        (
-            current.start,
-            current.raw,
-            words.len() > 1 || shell_path_is_explicit(&decode_shell_word(current.raw)),
-        )
-    };
-    if !is_argument {
-        return Vec::new();
-    }
-
-    let decoded = decode_shell_word(raw_token);
-    let explicit_path = shell_path_is_explicit(&decoded);
-    if decoded.starts_with('-') && !explicit_path {
-        return Vec::new();
-    }
-    if !explicit_path && catalog_has_subcommand_prefix(catalog, segment, raw_token) {
-        return Vec::new();
-    }
-
-    let directories_only = command == "cd";
-    let style = path_word_style(raw_token);
-    let Some((scan_directory, shown_directory, name_prefix)) = path_scan_parts(&decoded) else {
+    let style = path_word_style(&context.raw_token);
+    let Some((scan_directory, shown_directory, name_prefix)) = path_scan_parts(&context.decoded)
+    else {
         return Vec::new();
     };
     let entries = match fs::read_dir(&scan_directory) {
@@ -740,7 +721,7 @@ fn filesystem_completion_items(
             || fs::metadata(&entry_path)
                 .map(|metadata| metadata.is_dir())
                 .unwrap_or(false);
-        if directories_only && !is_directory {
+        if context.directories_only && !is_directory {
             continue;
         }
         let mut display = name.clone();
@@ -755,7 +736,7 @@ fn filesystem_completion_items(
             value,
             summary: summary.to_owned(),
             detail: format!("{summary}\n\n{}", entry_path.display()),
-            replace_start,
+            replace_start: context.replace_start,
             replace_end: cursor,
             match_indices: Vec::new(),
             kind: CompletionKind::Path,
@@ -765,6 +746,59 @@ fn filesystem_completion_items(
     }
     items.sort_by(|left, right| left.display.cmp(&right.display));
     bounded_items(items)
+}
+
+fn filesystem_completion_context(
+    catalog: Option<&Catalog>,
+    line: &str,
+    cursor: usize,
+    mode: Mode,
+) -> Option<FilesystemCompletionContext> {
+    if mode == Mode::Natural || line.len() > quirl_catalog::MAX_COMPLETION_QUERY_BYTES {
+        return None;
+    }
+    let cursor = clamped_utf8_cursor(line, cursor);
+    let before = &line[..cursor];
+    let segment_start = shell_segment_start(before);
+    let segment = &before[segment_start..];
+    let words = shell_words(segment, segment_start);
+    let trailing_space = segment.chars().next_back().is_some_and(char::is_whitespace);
+    let command = words.first().map(|word| decode_shell_word(word.raw))?;
+    let (replace_start, raw_token, is_argument) = if trailing_space {
+        (cursor, "", !words.is_empty())
+    } else {
+        let current = words.last()?;
+        (
+            current.start,
+            current.raw,
+            words.len() > 1 || shell_path_is_explicit(&decode_shell_word(current.raw)),
+        )
+    };
+    if !is_argument {
+        return None;
+    }
+
+    let decoded = decode_shell_word(raw_token);
+    let explicit_path = shell_path_is_explicit(&decoded);
+    if decoded.starts_with('-') && !explicit_path {
+        return None;
+    }
+    if !explicit_path && catalog_has_subcommand_prefix(catalog, segment, raw_token) {
+        return None;
+    }
+
+    let directories_only = catalog.is_some_and(|catalog| {
+        catalog.commands.iter().any(|spec| {
+            (spec.path == command || spec.aliases.iter().any(|alias| alias == &command))
+                && spec.effects.contains(&Effect::ChangeDirectory)
+        })
+    });
+    Some(FilesystemCompletionContext {
+        replace_start,
+        raw_token: raw_token.to_owned(),
+        decoded,
+        directories_only,
+    })
 }
 
 fn clamped_utf8_cursor(line: &str, cursor: usize) -> usize {
@@ -1345,6 +1379,26 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_completion_rejects_queries_over_the_shared_protocol_bound() {
+        let line = format!(
+            "cd /{}",
+            "x".repeat(quirl_catalog::MAX_COMPLETION_QUERY_BYTES)
+        );
+        let catalog = Catalog::builtin();
+
+        assert!(
+            filesystem_completion_items(Some(&catalog), &line, line.len(), Mode::Command)
+                .is_empty()
+        );
+        assert!(!should_open_automatic_filesystem_completion(
+            Some(&catalog),
+            &line,
+            line.len(),
+            Mode::Command,
+        ));
+    }
+
+    #[test]
     fn rich_extension_worker_discards_invalid_utf8_replacement_boundaries() {
         let mut state =
             CompletionState::new(Catalog::builtin(), Some(Box::new(InvalidSpanCompleter)));
@@ -1436,6 +1490,34 @@ mod tests {
 
         state.next();
         assert!(state.accepts_enter());
+    }
+
+    #[test]
+    fn automatic_completion_retains_filesystem_candidates() {
+        let root = std::env::temp_dir().join(format!(
+            "quirl-automatic-path-completion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("source")).unwrap();
+        let line = format!("cd {}/sou", root.display());
+
+        let mut state = CompletionState::new(Catalog::builtin(), None);
+        state
+            .request_automatic(&line, line.len(), Mode::Command)
+            .unwrap();
+
+        assert!(state.automatic);
+        assert!(
+            state
+                .items
+                .iter()
+                .any(|item| item.value.ends_with("source/"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
