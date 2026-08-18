@@ -67,7 +67,7 @@
 ---@field preview? boolean
 
 ---@class quirl.PromptConfig
----@field symbols? quirl.PromptSymbols Auto never assumes a patched font; nerd_font enables Powerline glyphs explicitly.
+---@field symbols? quirl.PromptSymbols Auto detects terminals with bundled Nerd symbols; nerd_font enables them explicitly elsewhere.
 ---@field left? string[] Ordered prompt segments before the input.
 ---@field right? string[] Ordered prompt segments aligned on the right.
 ---@field transient? boolean Collapse accepted input to one scrollback line before execution.

@@ -1,14 +1,14 @@
 ---@type quirl.Config
 local config = quirl.config {
-  schema_version = 3,
+  schema_version = 4,
   editor = { keymap = "emacs", semantic_hints = true, banner = "full" },
   picker = { layout = "adaptive", preview = true },
   prompt = {
-    -- auto is Unicode-safe and never assumes a patched font. Use "plain" for
-    -- ASCII everywhere, or opt in to Powerline/Nerd Font glyphs with "nerd_font".
+    -- auto detects terminals with bundled Nerd symbols and otherwise uses safe
+    -- Unicode. Use "plain" for ASCII or "nerd_font" for other patched fonts.
     symbols = "auto",
     left = { "directory", "git_branch", "git_state" },
-    right = { "jobs", "duration", "status" },
+    right = { "rust_version", "jobs", "duration", "status" },
     transient = true,
   },
   ui = { theme = "tokyo-night", surface = "auto", statusline = { hints = true } },
