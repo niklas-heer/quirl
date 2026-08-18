@@ -1,0 +1,10 @@
+catalog "carapace-draft" {
+    provenance author="Fixture authors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://example.invalid/fixture"
+    command "fd" summary="find entries in the filesystem" description="find entries in the filesystem" {
+        platform "any"
+        flag "--absolute-path" summary="Show absolute instead of relative paths" description="Show absolute instead of relative paths" short="-a"
+        flag "--exclude" summary="Exclude entries that match the given glob pattern" description="Exclude entries that match the given glob pattern" short="-E" value="value"
+        flag "--search-path" summary="Provide paths to search" description="Provide paths to search" value="value" repeatable=#true action="directories"
+        argument "values" summary="Additional values" description="Additional positional values accepted by the command." repeatable=#true action="directories"
+    }
+}

@@ -1,0 +1,13 @@
+{
+  "source_url": "https://github.com/carapace-sh/carapace-bin",
+  "revision": "ebfb9beda84fdf057dc9a89b59527158d23d323c",
+  "license": "MIT",
+  "author": "Carapace contributors",
+  "roots": [
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/fd_completer/cmd/root.go"]
+    }
+  ]
+}

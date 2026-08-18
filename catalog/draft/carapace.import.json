@@ -1,0 +1,14 @@
+{
+  "source_url": "https://github.com/carapace-sh/carapace-bin",
+  "revision": "ebfb9beda84fdf057dc9a89b59527158d23d323c",
+  "license": "MIT",
+  "source_files": [
+    "completers/common/fd_completer/cmd/root.go"
+  ],
+  "command_paths": [
+    "fd"
+  ],
+  "command_count": 1,
+  "flag_count": 53,
+  "semantic_diff": []
+}
