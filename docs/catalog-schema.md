@@ -326,7 +326,10 @@ pinned revision update is reviewed as a supply-chain change:
 1. Change the tooling-owned pin to one immutable upstream revision and verify
    the fetched/provided source identity.
 2. Run the bounded import operation for explicitly selected commands into a
-   separate draft area.
+   separate draft area. The checked-in selection includes common filesystem and
+   shell commands (`ls`, `cd`, `cp`, `mv`, `rm`, `pwd`, `cat`, `head`, `tail`,
+   `tar`), utilities (`fd`, `grep`, `ssh`), Windows variants (`mkdir`, `rmdir`),
+   and the nested `task completion <shell>` tree.
 3. Run the canonical format operation on the draft, then inspect the complete
    KDL diff. Do not accept invented or silently dropped facts.
 4. Review command shape, subcommands, aliases, flags, argument ordering,
@@ -356,13 +359,16 @@ local Git to prove that every manifest-listed file exists at that commit and
 has no worktree changes; Git is bounded to ten seconds and upstream code is
 never executed. The upstream and retained license files must both match the
 reviewed SHA-256 pin. Unsupported completion constructs are omitted rather than
-invented and are listed explicitly in `carapace.import.json` for review. The
-operation updates only `catalog/draft` and refuses any imported root that
-collides with `catalog/curated`. `fmt --check` is non-mutating. `check` validates
-formatting, schema, provenance, license retention, curated/draft separation,
-generated database bytes, the checksum, and hardened-reader admission using the
-same embedded limits as runtime. `build` refreshes the generated SQLite image
-and checksum from curated KDL only.
+invented and are listed explicitly in `carapace.import.json` with their source
+file and Cobra variable for review. Each selected root is written to
+`catalog/draft/carapace-<command>.kdl`; obsolete importer-owned aggregate or
+per-command drafts are removed only after every replacement has rendered and
+validated. The operation updates only `catalog/draft` and refuses any imported
+root that collides with `catalog/curated`. `fmt --check` is non-mutating.
+`check` validates formatting, schema, provenance, license retention,
+curated/draft separation, generated database bytes, the checksum, and
+hardened-reader admission using the same embedded limits as runtime. `build`
+refreshes the generated SQLite image and checksum from curated KDL only.
 
 ## Runtime lookup and fallback
 

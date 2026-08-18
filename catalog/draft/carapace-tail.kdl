@@ -1,0 +1,21 @@
+catalog "carapace-tail-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "tail" summary="output the last part of files" description="output the last part of files" {
+        platform "linux"
+        platform "freebsd"
+        flag "--bytes" summary="output the last NUM bytes" description="output the last NUM bytes" short="-c" value="value"
+        flag "--debug" summary="indicate which --follow implementation is used" description="indicate which --follow implementation is used"
+        flag "--follow" summary="output appended data as the file grows" description="output appended data as the file grows" short="-f" value="value"
+        flag "--help" summary="display this help and exit" description="display this help and exit"
+        flag "--lines" summary="output the last NUM lines, instead of the last 10" description="output the last NUM lines, instead of the last 10" short="-n" value="value"
+        flag "--max-unchanged-stats" summary="reopen a FILE which has not changed size after N iterations" description="reopen a FILE which has not changed size after N iterations" value="value"
+        flag "--pid" summary="with -f, terminate after process ID, PID dies" description="with -f, terminate after process ID, PID dies" value="value"
+        flag "--quiet" summary="never output headers giving file names" description="never output headers giving file names" short="-q"
+        flag "--retry" summary="keep trying to open a file if it is inaccessible" description="keep trying to open a file if it is inaccessible"
+        flag "--silent" summary="never output headers giving file names" description="never output headers giving file names"
+        flag "--sleep-interval" summary="with -f, sleep for approximately N seconds" description="with -f, sleep for approximately N seconds" short="-s" value="value"
+        flag "--verbose" summary="always output headers giving file names" description="always output headers giving file names" short="-v"
+        flag "--version" summary="output version information and exit" description="output version information and exit"
+        flag "--zero-terminated" summary="line delimiter is NUL, not newline" description="line delimiter is NUL, not newline" short="-z"
+    }
+}

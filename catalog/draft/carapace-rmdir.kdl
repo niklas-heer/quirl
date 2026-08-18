@@ -1,0 +1,8 @@
+catalog "carapace-rmdir-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "rmdir" summary="remove a directory" description="remove a directory" {
+        platform "windows"
+        flag "--q" summary="quiet mode, do not prompt for confirmation" description="quiet mode, do not prompt for confirmation" short="-q"
+        flag "--s" summary="remove all files and subdirectories in the specified directory" description="remove all files and subdirectories in the specified directory" short="-s"
+    }
+}

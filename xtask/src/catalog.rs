@@ -28,8 +28,10 @@ const GENERATED_DIRECTORY: &str = "catalog/generated";
 const IMPORT_CONFIGURATION: &str = "catalog/carapace-import.json";
 const DATABASE_FILE: &str = "catalog/generated/catalog.sqlite3";
 const CHECKSUM_FILE: &str = "catalog/generated/catalog.sqlite3.sha256";
-const DRAFT_FILE: &str = "catalog/draft/carapace.kdl";
 const DRAFT_MANIFEST_FILE: &str = "catalog/draft/carapace.import.json";
+const DRAFT_FILE_PREFIX: &str = "carapace-";
+const DRAFT_FILE_SUFFIX: &str = ".kdl";
+const LEGACY_DRAFT_FILE: &str = "catalog/draft/carapace.kdl";
 const PROVENANCE_FILE: &str = "catalog/provenance/carapace.json";
 const LICENSE_FILE: &str = "catalog/provenance/CARAPACE_LICENSE";
 const SOURCE_FILE_BYTES_MAX: usize = 512 * 1024;
@@ -151,6 +153,11 @@ struct ParsedFlags {
     omissions: Vec<String>,
 }
 
+struct RenderedDraft {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
 fn import_carapace(root: &Path, source: &Path, revision: &str) -> Result<(), Box<dyn Error>> {
     validate_revision(revision)?;
     let configuration_path = root.join(IMPORT_CONFIGURATION);
@@ -174,19 +181,8 @@ fn import_carapace(root: &Path, source: &Path, revision: &str) -> Result<(), Box
     let parsed = parse_carapace_checkout(source, &configuration)?;
     let catalog = parsed.catalog;
     reject_curated_collisions(root, &catalog)?;
-    let rendered = render_catalog(&catalog)?;
-    if rendered.len() > IMPORT_OUTPUT_BYTES_MAX {
-        return Err(resource_error(
-            "generated draft bytes",
-            IMPORT_OUTPUT_BYTES_MAX,
-            rendered.len(),
-        ));
-    }
-    parse_native_catalog(&rendered, DRAFT_FILE, NativeCatalogLimits::default())
-        .map_err(map_diagnostic)?;
-
-    let draft_path = root.join(DRAFT_FILE);
-    let previous = read_optional_catalog(&draft_path)?;
+    let rendered = render_imported_drafts(root, &catalog)?;
+    let previous = read_existing_carapace_drafts(root)?;
     let semantic_diff = semantic_diff(previous.as_ref(), &catalog);
     let (command_paths, command_count, flag_count) = catalog_statistics(&catalog);
     let manifest = ImportManifest {
@@ -203,10 +199,139 @@ fn import_carapace(root: &Path, source: &Path, revision: &str) -> Result<(), Box
         semantic_diff,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-    atomic_write(&draft_path, rendered.as_bytes())?;
+    publish_imported_drafts(root, &rendered)?;
     atomic_write(&root.join(DRAFT_MANIFEST_FILE), &manifest_bytes)?;
     println!("{}", serde_json::to_string_pretty(&manifest)?);
     Ok(())
+}
+
+fn render_imported_drafts(
+    root: &Path,
+    catalog: &NativeCatalog,
+) -> Result<Vec<RenderedDraft>, Box<dyn Error>> {
+    let mut rendered = Vec::with_capacity(catalog.commands.len());
+    let mut output_bytes = 0_usize;
+    let mut root_names = BTreeSet::new();
+    for command in &catalog.commands {
+        if !root_names.insert(command.name.as_str()) {
+            return Err(input_error(format!(
+                "duplicate imported root command {}",
+                command.name
+            )));
+        }
+        let draft = NativeCatalog {
+            name: format!("carapace-{}-draft", command.name),
+            provenance: catalog.provenance.clone(),
+            commands: vec![command.clone()],
+        };
+        let bytes = render_catalog(&draft)?.into_bytes();
+        output_bytes = output_bytes.saturating_add(bytes.len());
+        if output_bytes > IMPORT_OUTPUT_BYTES_MAX {
+            return Err(resource_error(
+                "generated draft bytes",
+                IMPORT_OUTPUT_BYTES_MAX,
+                output_bytes,
+            ));
+        }
+        let relative = format!(
+            "{DRAFT_DIRECTORY}/{DRAFT_FILE_PREFIX}{}{DRAFT_FILE_SUFFIX}",
+            command.name
+        );
+        parse_native_catalog(
+            std::str::from_utf8(&bytes)?,
+            &relative,
+            NativeCatalogLimits::default(),
+        )
+        .map_err(map_diagnostic)?;
+        rendered.push(RenderedDraft {
+            path: root.join(relative),
+            bytes,
+        });
+    }
+    rendered.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(rendered)
+}
+
+fn publish_imported_drafts(root: &Path, rendered: &[RenderedDraft]) -> Result<(), Box<dyn Error>> {
+    let expected = rendered
+        .iter()
+        .map(|draft| draft.path.clone())
+        .collect::<BTreeSet<_>>();
+    for draft in rendered {
+        atomic_write(&draft.path, &draft.bytes)?;
+    }
+    for path in managed_carapace_draft_paths(root)? {
+        if !expected.contains(&path) {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn managed_carapace_draft_paths(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let draft_directory = root.join(DRAFT_DIRECTORY);
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(&draft_directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(input_error(format!(
+                "catalog source symlink is not allowed: {}",
+                path.display()
+            )));
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let managed = path == root.join(LEGACY_DRAFT_FILE)
+            || (file_type.is_file()
+                && name.starts_with(DRAFT_FILE_PREFIX)
+                && name.ends_with(DRAFT_FILE_SUFFIX));
+        if managed {
+            validate_input_metadata(
+                &path,
+                &fs::symlink_metadata(&path)?,
+                CATALOG_TOTAL_BYTES_MAX,
+            )?;
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn read_existing_carapace_drafts(root: &Path) -> Result<Option<NativeCatalog>, Box<dyn Error>> {
+    let mut commands = Vec::new();
+    let mut provenance = None;
+    for path in managed_carapace_draft_paths(root)? {
+        let draft = load_one_catalog(root, &path, false)?;
+        if !is_carapace_draft_name(&draft.name) {
+            return Err(input_error(format!(
+                "managed Carapace draft has unexpected catalog identity {}",
+                draft.name
+            )));
+        }
+        if let Some(expected) = &provenance {
+            if expected != &draft.provenance {
+                return Err(input_error(
+                    "managed Carapace drafts have inconsistent provenance",
+                ));
+            }
+        } else {
+            provenance = Some(draft.provenance.clone());
+        }
+        commands.extend(draft.commands);
+    }
+    commands.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(provenance.map(|provenance| NativeCatalog {
+        name: "carapace-draft".to_owned(),
+        provenance,
+        commands,
+    }))
+}
+
+fn is_carapace_draft_name(name: &str) -> bool {
+    name == "carapace-draft" || (name.starts_with(DRAFT_FILE_PREFIX) && name.ends_with("-draft"))
 }
 
 fn validate_import_configuration(
@@ -403,7 +528,7 @@ fn parse_go_file(source: &str, source_name: &str) -> Result<Vec<ParsedGoCommand>
             .filter(|value| !value.starts_with("http://") && !value.starts_with("https://"))
             .unwrap_or_else(|| summary.clone());
         let aliases = keyed_go_string_slice(body, "Aliases")?;
-        let parsed_flags = parse_go_flags(source, &variable)?;
+        let parsed_flags = parse_go_flags(source, source_name, &variable)?;
         let flags = parsed_flags.flags;
         let mut omitted_constructs = parsed_flags.omissions;
         let arguments = Vec::new();
@@ -614,8 +739,15 @@ fn quoted_go_strings(input: &str) -> Result<Vec<String>, Box<dyn Error>> {
     Ok(values)
 }
 
-fn parse_go_flags(source: &str, variable: &str) -> Result<ParsedFlags, Box<dyn Error>> {
-    let parsed_actions = parse_go_flag_actions(source, variable)?;
+fn parse_go_flags(
+    source: &str,
+    source_name: &str,
+    variable: &str,
+) -> Result<ParsedFlags, Box<dyn Error>> {
+    let ParsedFlagActions {
+        actions,
+        mut omissions,
+    } = parse_go_flag_actions(source, source_name, variable)?;
     let prefixes = [
         format!("{variable}.Flags()."),
         format!("{variable}.PersistentFlags()."),
@@ -658,14 +790,23 @@ fn parse_go_flags(source: &str, variable: &str) -> Result<ParsedFlags, Box<dyn E
             )));
         }
         let name = values[0].clone();
-        validate_long_name(&name)?;
+        if validate_long_name(&name).is_err() {
+            omissions.push(format!(
+                "{source_name}:{variable}: flag {name} omitted because its long name is outside the strict native catalog identifier grammar"
+            ));
+            continue;
+        }
         let has_short = method.ends_with('P') || method.ends_with('S');
         let short = if has_short && values.get(1).is_some_and(|value| !value.is_empty()) {
             let value = format!("-{}", values[1]);
-            if value.len() != 2 {
-                return Err(input_error(format!("invalid short flag {value}")));
+            if value.len() == 2 && value.as_bytes()[1].is_ascii_alphanumeric() {
+                Some(value)
+            } else {
+                omissions.push(format!(
+                    "{source_name}:{variable}: short flag {value} on {name} omitted because it is outside the strict native short-name grammar"
+                ));
+                None
             }
-            Some(value)
         } else {
             None
         };
@@ -673,7 +814,13 @@ fn parse_go_flags(source: &str, variable: &str) -> Result<ParsedFlags, Box<dyn E
             .last()
             .cloned()
             .ok_or_else(|| input_error("flag description is missing"))?;
-        let action = parsed_actions.actions.get(&name).copied();
+        if summary.trim().is_empty() || summary.chars().any(char::is_control) {
+            omissions.push(format!(
+                "{source_name}:{variable}: flag {name} omitted because upstream does not provide the non-empty single-line description required by the native schema"
+            ));
+            continue;
+        }
+        let action = actions.get(&name).copied();
         flags.push(NativeFlag {
             long: format!("--{name}"),
             short,
@@ -697,14 +844,12 @@ fn parse_go_flags(source: &str, variable: &str) -> Result<ParsedFlags, Box<dyn E
             }
         }
     }
-    Ok(ParsedFlags {
-        flags,
-        omissions: parsed_actions.omissions,
-    })
+    Ok(ParsedFlags { flags, omissions })
 }
 
 fn parse_go_flag_actions(
     source: &str,
+    source_name: &str,
     variable: &str,
 ) -> Result<ParsedFlagActions, Box<dyn Error>> {
     let marker = format!("carapace.Gen({variable}).FlagCompletion(");
@@ -743,7 +888,7 @@ fn parse_go_flag_actions(
                 }
             } else if action_source.contains(':') {
                 omissions.push(format!(
-                    "{variable}: completion action for {name} omitted because it is outside the closed native action set"
+                    "{source_name}:{variable}: completion action for {name} omitted because it is outside the closed native action set"
                 ));
             }
         }
@@ -1049,19 +1194,65 @@ fn validate_separation(
 fn validate_import_artifacts(root: &Path, drafts: &[NativeCatalog]) -> Result<(), Box<dyn Error>> {
     let configuration: ImportConfiguration = read_json_bounded(&root.join(IMPORT_CONFIGURATION))?;
     validate_import_configuration(&configuration)?;
-    let draft = drafts
+    let mut imported_commands = Vec::new();
+    let mut imported_catalog_count = 0_usize;
+    for draft in drafts
         .iter()
-        .find(|catalog| catalog.name == "carapace-draft")
-        .ok_or_else(|| input_error("catalog/draft must contain carapace-draft"))?;
-    if draft.provenance.author != configuration.author
-        || draft.provenance.license != configuration.license
-        || draft.provenance.revision != configuration.revision
-        || draft.provenance.source_url != configuration.source_url
+        .filter(|catalog| is_carapace_draft_name(&catalog.name))
     {
+        imported_catalog_count = imported_catalog_count.saturating_add(1);
+        if draft.provenance.author != configuration.author
+            || draft.provenance.license != configuration.license
+            || draft.provenance.revision != configuration.revision
+            || draft.provenance.source_url != configuration.source_url
+        {
+            return Err(input_error(
+                "Carapace draft provenance does not match catalog/carapace-import.json",
+            ));
+        }
+        if draft.commands.len() != 1 {
+            return Err(input_error(format!(
+                "Carapace draft {} must contain exactly one root command",
+                draft.name
+            )));
+        }
+        let command = &draft.commands[0];
+        let expected_catalog_name = format!("carapace-{}-draft", command.name);
+        if draft.name != expected_catalog_name {
+            return Err(input_error(format!(
+                "Carapace draft {} must use catalog identity {expected_catalog_name}",
+                draft.name
+            )));
+        }
+        let expected_path = root.join(DRAFT_DIRECTORY).join(format!(
+            "{DRAFT_FILE_PREFIX}{}{DRAFT_FILE_SUFFIX}",
+            command.name
+        ));
+        if !expected_path.is_file() {
+            return Err(input_error(format!(
+                "Carapace draft {} is not stored at {}",
+                command.name,
+                expected_path.display()
+            )));
+        }
+        imported_commands.push(command.clone());
+    }
+    if imported_catalog_count == 0 {
         return Err(input_error(
-            "Carapace draft provenance does not match catalog/carapace-import.json",
+            "catalog/draft must contain per-command Carapace drafts",
         ));
     }
+    imported_commands.sort_by(|left, right| left.name.cmp(&right.name));
+    let draft = NativeCatalog {
+        name: "carapace-draft".to_owned(),
+        provenance: quirl_catalog::NativeProvenance {
+            author: configuration.author.clone(),
+            license: configuration.license.clone(),
+            revision: configuration.revision.clone(),
+            source_url: configuration.source_url.clone(),
+        },
+        commands: imported_commands,
+    };
     let manifest: ImportManifest = read_json_bounded(&root.join(DRAFT_MANIFEST_FILE))?;
     let mut configured_files = configuration
         .roots
@@ -1069,7 +1260,7 @@ fn validate_import_artifacts(root: &Path, drafts: &[NativeCatalog]) -> Result<()
         .flat_map(|import_root| import_root.files.iter().cloned())
         .collect::<Vec<_>>();
     configured_files.sort();
-    let (command_paths, command_count, flag_count) = catalog_statistics(draft);
+    let (command_paths, command_count, flag_count) = catalog_statistics(&draft);
     if manifest.source_url != configuration.source_url
         || manifest.revision != configuration.revision
         || manifest.license != configuration.license
@@ -1418,24 +1609,6 @@ fn read_catalog_source(path: &Path) -> Result<String, Box<dyn Error>> {
         ));
     }
     Ok(source)
-}
-
-fn read_optional_catalog(path: &Path) -> Result<Option<NativeCatalog>, Box<dyn Error>> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {
-            let source = read_catalog_source(path)?;
-            Ok(Some(
-                parse_native_catalog(
-                    &source,
-                    &path.display().to_string(),
-                    NativeCatalogLimits::default(),
-                )
-                .map_err(map_diagnostic)?,
-            ))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
 }
 
 fn read_json_bounded<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Box<dyn Error>> {
@@ -2062,7 +2235,7 @@ mod tests {
 
     #[test]
     fn parser_rejects_unreviewed_cobra_flag_methods() {
-        let source = r#"
+        let source = r##"
 var rootCmd = &cobra.Command{
     Use: "tool",
     Short: "Tool",
@@ -2070,7 +2243,7 @@ var rootCmd = &cobra.Command{
 func init() {
     rootCmd.Flags().Uint("count", 0, "Count")
 }
-"#;
+"##;
         let error = parse_go_file(source, "unsupported.go").unwrap_err();
         assert!(
             error
@@ -2093,6 +2266,32 @@ func init() {
 "#;
         let error = parse_go_file(source, "duplicate.go").unwrap_err();
         assert!(error.to_string().contains("duplicate imported flag"));
+    }
+
+    #[test]
+    fn incompatible_upstream_flag_spellings_are_recorded_as_omissions() {
+        let source = r##"
+var rootCmd = &cobra.Command{
+    Use: "tool",
+    Short: "Tool",
+}
+func init() {
+    rootCmd.Flags().BoolP("valid", "#", false, "Valid flag")
+    rootCmd.Flags().Bool("UPPER", false, "Uppercase flag")
+    rootCmd.Flags().Bool("empty", false, "")
+}
+"##;
+        let parsed = parse_go_file(source, "flags.go").unwrap();
+        assert_eq!(parsed[0].command.flags.len(), 1);
+        assert_eq!(parsed[0].command.flags[0].long, "--valid");
+        assert_eq!(parsed[0].command.flags[0].short, None);
+        assert_eq!(parsed[0].omitted_constructs.len(), 3);
+        assert!(
+            parsed[0]
+                .omitted_constructs
+                .iter()
+                .all(|omission| omission.starts_with("flags.go:rootCmd:"))
+        );
     }
 
     #[test]
@@ -2258,17 +2457,129 @@ func init() {
     }
 
     #[test]
+    fn imported_roots_render_as_separate_review_files() {
+        let directory = TestDirectory::new("per-command-drafts");
+        fs::create_dir_all(directory.0.join(DRAFT_DIRECTORY)).unwrap();
+        let mut catalog = fixture_catalog();
+        catalog.commands.push(NativeCommand {
+            name: "second".to_owned(),
+            aliases: Vec::new(),
+            summary: "Second tool".to_owned(),
+            description: "Use the second fixture tool.".to_owned(),
+            intents: Vec::new(),
+            platforms: vec![NativePlatform::Any],
+            flags: Vec::new(),
+            arguments: Vec::new(),
+            subcommands: Vec::new(),
+        });
+        let rendered = render_imported_drafts(&directory.0, &catalog).unwrap();
+        let names = rendered
+            .iter()
+            .map(|draft| {
+                draft
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["carapace-second.kdl", "carapace-tool.kdl"]);
+        for draft in rendered {
+            let source = std::str::from_utf8(&draft.bytes).unwrap();
+            let parsed = parse_native_catalog(
+                source,
+                &draft.path.display().to_string(),
+                NativeCatalogLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(parsed.commands.len(), 1);
+        }
+    }
+
+    #[test]
+    fn publishing_per_command_drafts_removes_the_legacy_aggregate() {
+        let directory = TestDirectory::new("legacy-draft");
+        fs::create_dir_all(directory.0.join(DRAFT_DIRECTORY)).unwrap();
+        let legacy = directory.0.join(LEGACY_DRAFT_FILE);
+        fs::write(&legacy, b"legacy aggregate").unwrap();
+        let rendered = render_imported_drafts(&directory.0, &fixture_catalog()).unwrap();
+        publish_imported_drafts(&directory.0, &rendered).unwrap();
+        assert!(!legacy.exists());
+        assert!(
+            directory
+                .0
+                .join("catalog/draft/carapace-tool.kdl")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn checked_in_carapace_drafts_cover_core_platforms_and_nested_commands() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let mut catalogs = kdl_files(&workspace.join(DRAFT_DIRECTORY))
+            .unwrap()
+            .into_iter()
+            .map(|path| load_one_catalog(&workspace, &path, true))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        catalogs.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(catalogs.len(), 16);
+        let roots = catalogs
+            .iter()
+            .map(|catalog| catalog.commands[0].name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(roots.is_superset(&BTreeSet::from([
+            "cat", "cd", "cp", "fd", "grep", "head", "ls", "mkdir", "mv", "pwd", "rm", "rmdir",
+            "ssh", "tail", "tar", "task",
+        ])));
+
+        let ls = catalogs
+            .iter()
+            .find(|catalog| catalog.commands[0].name == "ls")
+            .unwrap();
+        assert_eq!(
+            ls.commands[0].platforms,
+            [NativePlatform::Linux, NativePlatform::Freebsd]
+        );
+        let mkdir = catalogs
+            .iter()
+            .find(|catalog| catalog.commands[0].name == "mkdir")
+            .unwrap();
+        assert_eq!(mkdir.commands[0].platforms, [NativePlatform::Windows]);
+
+        let task = catalogs
+            .iter()
+            .find(|catalog| catalog.commands[0].name == "task")
+            .unwrap();
+        let completion = task.commands[0]
+            .subcommands
+            .iter()
+            .find(|command| command.name == "completion")
+            .unwrap();
+        assert_eq!(
+            completion
+                .subcommands
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            ["bash", "fish", "powershell", "zsh"]
+        );
+    }
+
+    #[test]
     fn importer_e2e_is_deterministic_and_preserves_curated_source() {
         let (directory, source, curated_before, revision) = prepare_import_workspace();
         import_carapace(&directory.0, &source, &revision).unwrap();
         import_carapace(&directory.0, &source, &revision).unwrap();
-        let draft_second = fs::read(directory.0.join(DRAFT_FILE)).unwrap();
+        let draft_path = directory.0.join("catalog/draft/carapace-fd.kdl");
+        let draft_second = fs::read(&draft_path).unwrap();
         let manifest_second = fs::read(directory.0.join(DRAFT_MANIFEST_FILE)).unwrap();
         import_carapace(&directory.0, &source, &revision).unwrap();
-        assert_eq!(
-            fs::read(directory.0.join(DRAFT_FILE)).unwrap(),
-            draft_second
-        );
+        assert_eq!(fs::read(&draft_path).unwrap(), draft_second);
         assert_eq!(
             fs::read(directory.0.join(DRAFT_MANIFEST_FILE)).unwrap(),
             manifest_second
@@ -2288,7 +2599,11 @@ func init() {
         let wrong_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let error = import_carapace(&directory.0, &source, wrong_revision).unwrap_err();
         assert!(error.to_string().contains("does not match pinned revision"));
-        assert!(!directory.0.join(DRAFT_FILE).exists());
+        assert!(
+            managed_carapace_draft_paths(&directory.0)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             fs::read(directory.0.join("catalog/curated/native.kdl")).unwrap(),
             curated_before
@@ -2308,7 +2623,11 @@ func init() {
                 .to_string()
                 .contains("differ from the pinned revision")
         );
-        assert!(!directory.0.join(DRAFT_FILE).exists());
+        assert!(
+            managed_carapace_draft_paths(&directory.0)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             fs::read(directory.0.join("catalog/curated/native.kdl")).unwrap(),
             curated_before

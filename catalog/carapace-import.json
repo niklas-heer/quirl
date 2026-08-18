@@ -10,6 +10,89 @@
       "variable": "rootCmd",
       "platforms": ["linux", "macos", "windows", "freebsd"],
       "files": ["completers/common/fd_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "freebsd"],
+      "files": ["completers/unix/ls_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "freebsd"],
+      "files": ["completers/bash/cd_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "freebsd"],
+      "files": ["completers/unix/cp_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "freebsd"],
+      "files": ["completers/unix/mv_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "freebsd"],
+      "files": ["completers/unix/rm_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "freebsd"],
+      "files": ["completers/unix/pwd_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "freebsd"],
+      "files": ["completers/unix/cat_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "freebsd"],
+      "files": ["completers/unix/head_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "freebsd"],
+      "files": ["completers/unix/tail_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "freebsd"],
+      "files": ["completers/unix/tar_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "freebsd"],
+      "files": ["completers/common/grep_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": ["completers/common/ssh_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["windows"],
+      "files": ["completers/cmd/mkdir_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["windows"],
+      "files": ["completers/cmd/rmdir_completer/cmd/root.go"]
+    },
+    {
+      "variable": "rootCmd",
+      "platforms": ["linux", "macos", "windows", "freebsd"],
+      "files": [
+        "completers/common/task_completer/cmd/completion.go",
+        "completers/common/task_completer/cmd/completion_bash.go",
+        "completers/common/task_completer/cmd/completion_fish.go",
+        "completers/common/task_completer/cmd/completion_powershell.go",
+        "completers/common/task_completer/cmd/completion_zsh.go",
+        "completers/common/task_completer/cmd/help.go",
+        "completers/common/task_completer/cmd/root.go"
+      ]
     }
   ]
 }

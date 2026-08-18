@@ -1,0 +1,12 @@
+catalog "carapace-pwd-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "pwd" summary="Print the full filename of the current working directory" description="Print the full filename of the current working directory" {
+        platform "linux"
+        platform "macos"
+        platform "freebsd"
+        flag "--help" summary="display this help and exit" description="display this help and exit"
+        flag "--logical" summary="use PWD from environment, even if it contains symlinks" description="use PWD from environment, even if it contains symlinks" short="-L"
+        flag "--physical" summary="avoid all symlinks" description="avoid all symlinks" short="-P"
+        flag "--version" summary="output version information and exit" description="output version information and exit"
+    }
+}

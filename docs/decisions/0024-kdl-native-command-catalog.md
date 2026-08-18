@@ -79,8 +79,11 @@ intelligence database remains a separate database identity and lifecycle.
 Carapace may be used only by an explicit build-time import operation at one
 pinned immutable upstream revision. Its repository, generators, and generated
 facts are untrusted inputs subject to source-byte, record, depth, duration, and
-output bounds. Import produces a draft KDL file in a review workspace; it never
-writes directly to the curated source set or release database.
+output bounds. Import produces one deterministic draft KDL file per selected
+root command in the review workspace; it never writes directly to the curated
+source set or release database. Splitting roots keeps additions, removals,
+platform changes, and large flag sets reviewable instead of hiding them in one
+aggregate.
 
 There is no runtime Carapace dependency, subprocess, plugin, data lookup,
 fallback, schema intermediary, or compatibility promise. The compiled database

@@ -1,4 +1,4 @@
-catalog "carapace-draft" {
+catalog "carapace-fd-draft" {
     provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
     command "fd" summary="find entries in the filesystem" description="find entries in the filesystem" {
         platform "linux"

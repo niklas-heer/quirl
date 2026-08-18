@@ -1,0 +1,18 @@
+catalog "carapace-rm-draft" {
+    provenance author="Carapace contributors" license="MIT" revision="ebfb9beda84fdf057dc9a89b59527158d23d323c" source="https://github.com/carapace-sh/carapace-bin"
+    command "rm" summary="remove files or directories" description="remove files or directories" {
+        platform "linux"
+        platform "freebsd"
+        flag "--dir" summary="remove empty directories" description="remove empty directories" short="-d"
+        flag "--force" summary="ignore nonexistent files and arguments, never prompt" description="ignore nonexistent files and arguments, never prompt" short="-f"
+        flag "--help" summary="display this help and exit" description="display this help and exit"
+        flag "--i" summary="prompt before every removal" description="prompt before every removal" short="-i"
+        flag "--interactive" summary="prompt according to WHEN: never, once (-I), or always (-i); without WHEN, prompt always" description="prompt according to WHEN: never, once (-I), or always (-i); without WHEN, prompt always" value="value"
+        flag "--no-preserve-root" summary="do not treat '/' specially" description="do not treat '/' specially"
+        flag "--one-file-system" summary="when removing a hierarchy recursively, skip any directory that is on a file system different from that of the corresponding command line argument" description="when removing a hierarchy recursively, skip any directory that is on a file system different from that of the corresponding command line argument"
+        flag "--preserve-root" summary="do not remove '/' (default); with 'all', reject any command line argument on a separate device from its parent" description="do not remove '/' (default); with 'all', reject any command line argument on a separate device from its parent" value="value"
+        flag "--recursive" summary="remove directories and their contents recursively" description="remove directories and their contents recursively" short="-r"
+        flag "--verbose" summary="explain what is being done" description="explain what is being done" short="-v"
+        flag "--version" summary="output version information and exit" description="output version information and exit"
+    }
+}
