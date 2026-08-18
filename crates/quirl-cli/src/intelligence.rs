@@ -2535,6 +2535,7 @@ fn read_complete_embeddings(
     (embeddings.len() == documents.len()).then_some(embeddings)
 }
 
+#[cfg(debug_assertions)]
 fn stored_model_identity(connection: &Connection) -> Option<String> {
     connection
         .query_row(
