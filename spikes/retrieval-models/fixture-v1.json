@@ -1,0 +1,176 @@
+{
+  "schema_version": 1,
+  "name": "quirl_retrieval_v1",
+  "description": "Small held-out command-retrieval fixture. Queries are original paraphrases and are rejected if copied into the evaluated database's semantic documents.",
+  "splits": [
+    {
+      "name": "development",
+      "command_groups": [
+        "list_directory",
+        "current_directory",
+        "search_text"
+      ]
+    },
+    {
+      "name": "held_out",
+      "command_groups": [
+        "first_lines",
+        "last_lines",
+        "create_directory"
+      ]
+    },
+    {
+      "name": "unseen_command",
+      "command_groups": [
+        "remove_file",
+        "remove_directory",
+        "dns_lookup"
+      ]
+    }
+  ],
+  "command_groups": [
+    {
+      "id": "list_directory",
+      "expected_targets": [
+        "ls"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "current_directory",
+      "expected_targets": [
+        "pwd"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "search_text",
+      "expected_targets": [
+        "grep"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "first_lines",
+      "expected_targets": [
+        "head"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "last_lines",
+      "expected_targets": [
+        "tail"
+      ],
+      "destructive": false
+    },
+    {
+      "id": "create_directory",
+      "expected_targets": [
+        "mkdir"
+      ],
+      "destructive": true
+    },
+    {
+      "id": "remove_file",
+      "expected_targets": [
+        "rm"
+      ],
+      "destructive": true
+    },
+    {
+      "id": "remove_directory",
+      "expected_targets": [
+        "rmdir"
+      ],
+      "destructive": true
+    },
+    {
+      "id": "dns_lookup",
+      "expected_targets": [
+        "dig"
+      ],
+      "destructive": false
+    }
+  ],
+  "queries": [
+    {
+      "id": "dev_list_en",
+      "command_group": "list_directory",
+      "language": "en",
+      "text": "Which utility gives me a quick inventory of entries in this folder?"
+    },
+    {
+      "id": "dev_list_de",
+      "command_group": "list_directory",
+      "language": "de",
+      "text": "Welches Werkzeug zeigt mir knapp die Einträge dieses Ordners an?"
+    },
+    {
+      "id": "dev_pwd_en",
+      "command_group": "current_directory",
+      "language": "en",
+      "text": "I forgot my location; print the absolute folder I am standing in."
+    },
+    {
+      "id": "dev_pwd_es",
+      "command_group": "current_directory",
+      "language": "es",
+      "text": "Necesito ver la ruta absoluta del directorio en el que estoy ahora."
+    },
+    {
+      "id": "dev_grep_en",
+      "command_group": "search_text",
+      "language": "en",
+      "text": "Find every line containing a chosen phrase inside several text files."
+    },
+    {
+      "id": "held_head_en",
+      "command_group": "first_lines",
+      "language": "en",
+      "text": "Show only the opening portion of a long text file for inspection."
+    },
+    {
+      "id": "held_tail_de",
+      "command_group": "last_lines",
+      "language": "de",
+      "text": "Zeige mir nur die letzten Zeilen einer langen Protokolldatei an."
+    },
+    {
+      "id": "held_tail_es",
+      "command_group": "last_lines",
+      "language": "es",
+      "text": "Quiero leer solamente las líneas finales de un archivo de registro."
+    },
+    {
+      "id": "held_mkdir_en",
+      "command_group": "create_directory",
+      "language": "en",
+      "text": "Create a fresh nested folder where upcoming project artifacts can be stored."
+    },
+    {
+      "id": "unseen_rm_en",
+      "command_group": "remove_file",
+      "language": "en",
+      "text": "Permanently remove an unwanted file after I have reviewed its exact path."
+    },
+    {
+      "id": "unseen_rm_de",
+      "command_group": "remove_file",
+      "language": "de",
+      "text": "Entferne eine unerwünschte Datei dauerhaft nach genauer Prüfung ihres Pfads."
+    },
+    {
+      "id": "unseen_rmdir_en",
+      "command_group": "remove_directory",
+      "language": "en",
+      "text": "Delete an empty directory that is no longer needed by the project."
+    },
+    {
+      "id": "unseen_dig_es",
+      "command_group": "dns_lookup",
+      "language": "es",
+      "text": "Consulta los registros DNS publicados para un nombre de dominio concreto."
+    }
+  ]
+}
