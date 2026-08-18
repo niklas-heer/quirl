@@ -5,6 +5,7 @@ mod frame;
 pub(crate) mod highlight;
 mod overlay;
 mod runtime;
+mod screen_selection;
 mod statusbar;
 mod transcript;
 
@@ -45,6 +46,7 @@ use self::{
     highlight::InputAnalyzer,
     overlay::{PickerLayout, PickerOverlay, contextual_help_query},
     runtime::RuntimeSurfaceState,
+    screen_selection::{ScreenPosition, ScreenSelection, VisibleScreen, style_selection},
     transcript::{TextPosition, Transcript, TranscriptLimits},
 };
 use super::{
@@ -72,6 +74,7 @@ use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::{Backend, CrosstermBackend},
     layout::Rect,
+    style::Style,
 };
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -146,7 +149,10 @@ fn product_identity() -> &'static str {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MouseDrag {
-    Selection { anchor: TextPosition, dragged: bool },
+    ScreenSelection {
+        anchor: ScreenPosition,
+        dragged: bool,
+    },
     Scrollbar,
 }
 
@@ -338,6 +344,9 @@ pub struct RichSurface {
     output_anchor_line: Option<usize>,
     output_notice: Option<String>,
     transcript_area: Rect,
+    visible_screen: VisibleScreen,
+    screen_selection: Option<ScreenSelection>,
+    screen_copy_pending: bool,
     mouse_drag: Option<MouseDrag>,
     intent_completion: IntentCompletionState,
     stream_stdout: StreamingText,
@@ -396,6 +405,9 @@ impl RichSurface {
             output_anchor_line: None,
             output_notice: None,
             transcript_area: Rect::default(),
+            visible_screen: VisibleScreen::default(),
+            screen_selection: None,
+            screen_copy_pending: false,
             mouse_drag: None,
             intent_completion: IntentCompletionState::default(),
             stream_stdout: StreamingText::default(),
@@ -453,6 +465,9 @@ impl RichSurface {
             output_anchor_line: None,
             output_notice: None,
             transcript_area: Rect::default(),
+            visible_screen: VisibleScreen::default(),
+            screen_selection: None,
+            screen_copy_pending: false,
             mouse_drag: None,
             intent_completion: IntentCompletionState::default(),
             stream_stdout: StreamingText::default(),
@@ -585,7 +600,10 @@ impl RichSurface {
         };
         self.transcript_area =
             model.transcript_area(Rect::new(0, 0, terminal_width, terminal_height));
-        self.terminal.draw(&model)
+        self.visible_screen =
+            self.terminal
+                .draw(&model, self.screen_selection, theme.selected(prompt.mode))?;
+        Ok(())
     }
 
     fn append_transcript_bytes(&mut self, bytes: &[u8]) {
@@ -756,7 +774,11 @@ impl RichSurface {
                 let transcript_area =
                     model.transcript_area(Rect::new(0, 0, terminal_width, terminal_height));
                 let started = Instant::now();
-                self.terminal.draw(&model)?;
+                self.visible_screen = self.terminal.draw(
+                    &model,
+                    self.screen_selection,
+                    theme.selected(prompt.mode),
+                )?;
                 self.transcript_area = transcript_area;
                 let draw_elapsed = started.elapsed();
                 // Ratatui flushes the backend before `draw` returns. Catalog
@@ -764,7 +786,7 @@ impl RichSurface {
                 // remains queued until this complete generation is published.
                 self.admit_catalog()?;
                 self.record_draw(draw_elapsed);
-                dirty = false;
+                dirty = self.copy_pending_screen_selection()?;
             }
 
             if self.semantic_hints && self.input_analysis.poll_path() {
@@ -826,6 +848,15 @@ impl RichSurface {
                     continue;
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if self.screen_selection.is_some()
+                        && key.code == KeyCode::Char('c')
+                        && key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+                    {
+                        self.copy_output_selection()?;
+                        continue;
+                    }
                     if self.output_focus {
                         self.handle_output_key(key.code, key.modifiers)?;
                         continue;
@@ -1179,6 +1210,8 @@ impl RichSurface {
     }
 
     fn open_output_focus(&mut self) {
+        self.screen_selection = None;
+        self.screen_copy_pending = false;
         self.output_focus = true;
         self.output_notice = None;
         self.output_cursor_line = self.transcript.line_count().saturating_sub(1);
@@ -1260,16 +1293,20 @@ impl RichSurface {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.mouse_is_on_scrollbar(mouse.column, mouse.row) {
+                    self.screen_selection = None;
+                    self.screen_copy_pending = false;
                     self.mouse_drag = Some(MouseDrag::Scrollbar);
                     self.scrollbar_to_row(mouse.row);
-                } else if let Some((before, after)) = self.transcript_hit(mouse.column, mouse.row) {
+                } else if let Some((before, after)) =
+                    self.visible_screen.hit_test(mouse.column, mouse.row)
+                {
+                    self.transcript.clear_selection();
                     self.output_focus = true;
                     self.output_notice = None;
                     self.output_anchor_line = None;
-                    self.output_cursor_line = before.line_index;
-                    self.transcript.begin_selection(before);
-                    self.transcript.update_selection(after);
-                    self.mouse_drag = Some(MouseDrag::Selection {
+                    self.screen_selection = Some(ScreenSelection::new(before, after));
+                    self.screen_copy_pending = false;
+                    self.mouse_drag = Some(MouseDrag::ScreenSelection {
                         anchor: before,
                         dragged: false,
                     });
@@ -1278,10 +1315,9 @@ impl RichSurface {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => match self.mouse_drag {
-                Some(MouseDrag::Selection { anchor, .. }) => {
-                    self.autoscroll_mouse_selection(mouse.row);
-                    self.update_mouse_selection(anchor, mouse.column, mouse.row);
-                    self.mouse_drag = Some(MouseDrag::Selection {
+                Some(MouseDrag::ScreenSelection { anchor, .. }) => {
+                    self.update_screen_selection(anchor, mouse.column, mouse.row);
+                    self.mouse_drag = Some(MouseDrag::ScreenSelection {
                         anchor,
                         dragged: true,
                     });
@@ -1290,15 +1326,12 @@ impl RichSurface {
                 None => {}
             },
             MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(MouseDrag::Selection { anchor, dragged }) = self.mouse_drag {
-                    self.update_mouse_selection(anchor, mouse.column, mouse.row);
+                if let Some(MouseDrag::ScreenSelection { anchor, dragged }) = self.mouse_drag {
+                    self.update_screen_selection(anchor, mouse.column, mouse.row);
                     self.mouse_drag = None;
-                    if dragged && self.terminal.input_active {
-                        let _ = self.copy_output_selection();
-                    }
-                    // Mouse selection is transient pointer interaction, not a transfer of
-                    // keyboard ownership. Keep the selected text visible while returning
-                    // subsequent keys to the live prompt immediately after button release.
+                    // The final pointer coordinate must be rendered before copy so the
+                    // bounded snapshot and the highlighted cells describe one frame.
+                    self.screen_copy_pending = dragged && self.terminal.input_active;
                     self.output_focus = false;
                 } else if self.mouse_drag == Some(MouseDrag::Scrollbar) {
                     self.scrollbar_to_row(mouse.row);
@@ -1307,19 +1340,6 @@ impl RichSurface {
             }
             _ => {}
         }
-    }
-
-    fn transcript_hit(&self, column: u16, row: u16) -> Option<(TextPosition, TextPosition)> {
-        let area = self.transcript_area;
-        if column < area.x || column >= area.right() || row < area.y || row >= area.bottom() {
-            return None;
-        }
-        let visible = self.transcript.visible_range(usize::from(area.height));
-        let line_index = visible
-            .start
-            .saturating_add(usize::from(row.saturating_sub(area.y)));
-        self.transcript
-            .hit_test(line_index, usize::from(column.saturating_sub(area.x)))
     }
 
     fn mouse_is_on_scrollbar(&self, column: u16, row: u16) -> bool {
@@ -1355,23 +1375,14 @@ impl RichSurface {
         self.transcript.scroll_to(start, visible_rows);
     }
 
-    fn autoscroll_mouse_selection(&mut self, row: u16) {
-        let area = self.transcript_area;
-        let visible_rows = usize::from(area.height);
-        if row <= area.y {
-            self.transcript.scroll_up(1, visible_rows);
-        } else if row >= area.bottom().saturating_sub(1) {
-            self.transcript.scroll_down(1, visible_rows);
-        }
-    }
-
-    fn update_mouse_selection(&mut self, anchor: TextPosition, column: u16, row: u16) {
-        let Some((before, after)) = self.transcript_hit(column, row) else {
+    fn update_screen_selection(&mut self, anchor: ScreenPosition, column: u16, row: u16) {
+        let Some((before, after)) = self.visible_screen.hit_test(column, row) else {
             return;
         };
         let head = if before < anchor { before } else { after };
-        self.output_cursor_line = head.line_index;
-        self.transcript.update_selection(head);
+        if let Some(selection) = self.screen_selection.as_mut() {
+            selection.update(head);
+        }
     }
 
     fn dismiss_output_selection(&mut self) {
@@ -1379,6 +1390,8 @@ impl RichSurface {
         self.output_anchor_line = None;
         self.output_notice = None;
         self.mouse_drag = None;
+        self.screen_selection = None;
+        self.screen_copy_pending = false;
         self.transcript.clear_selection();
     }
 
@@ -1410,10 +1423,15 @@ impl RichSurface {
     }
 
     fn copy_output_selection(&mut self) -> Result<(), ShellError> {
-        let text = match self
-            .transcript
-            .selected_text_bounded(TRANSCRIPT_COPY_BYTES_MAX)
-        {
+        let selected = if self.screen_selection.is_some() {
+            self.visible_screen
+                .selected_text_bounded()
+                .map(|text| text.map(str::to_owned))
+        } else {
+            self.transcript
+                .selected_text_bounded(TRANSCRIPT_COPY_BYTES_MAX)
+        };
+        let text = match selected {
             Ok(Some(text)) if !text.is_empty() => text,
             Ok(Some(_)) | Ok(None) => {
                 self.output_notice = Some("nothing selected to copy".to_owned());
@@ -1435,6 +1453,15 @@ impl RichSurface {
             text.len()
         ));
         Ok(())
+    }
+
+    fn copy_pending_screen_selection(&mut self) -> Result<bool, ShellError> {
+        if !self.screen_copy_pending {
+            return Ok(false);
+        }
+        self.screen_copy_pending = false;
+        self.copy_output_selection()?;
+        Ok(true)
     }
 
     fn refresh_completion_after_text(
@@ -1781,7 +1808,12 @@ impl SurfaceTerminal {
         Ok(())
     }
 
-    fn draw(&mut self, model: &FrameModel<'_>) -> Result<(), ShellError> {
+    fn draw(
+        &mut self,
+        model: &FrameModel<'_>,
+        selection: Option<ScreenSelection>,
+        selection_style: Style,
+    ) -> Result<VisibleScreen, ShellError> {
         let size = match terminal::size() {
             Ok(size) => size,
             Err(error) => {
@@ -1809,12 +1841,21 @@ impl SurfaceTerminal {
                 return Err(error);
             }
         }
-        let result = terminal.draw(|frame| model.render(frame)).map(|_| ());
+        let mut visible_screen = VisibleScreen::default();
+        let result = terminal
+            .draw(|frame| {
+                model.render(frame);
+                let buffer = frame.buffer_mut();
+                visible_screen =
+                    VisibleScreen::capture(buffer, selection, TRANSCRIPT_COPY_BYTES_MAX);
+                style_selection(buffer, selection, selection_style);
+            })
+            .map(|_| ());
         if let Err(error) = result {
             self.reset_best_effort();
             return Err(terminal_error("draw the interactive frame")(error));
         }
-        Ok(())
+        Ok(visible_screen)
     }
 
     fn copy_to_clipboard(&mut self, text: &str) -> Result<(), ShellError> {
@@ -2803,6 +2844,8 @@ mod tests {
 
     #[test]
     fn mouse_drag_selects_utf8_text_then_returns_keyboard_focus_to_prompt() {
+        use ratatui::buffer::Buffer;
+
         let mut surface = RichSurface::new(
             Arc::new(Catalog::builtin()),
             None,
@@ -2811,8 +2854,9 @@ mod tests {
             PathBuf::new(),
         )
         .unwrap();
-        surface.append_transcript_line("alpha βeta omega");
-        surface.transcript_area = Rect::new(0, 0, 40, 1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 1));
+        buffer.set_string(0, 0, "alpha βeta omega", Style::default());
+        surface.visible_screen = VisibleScreen::capture(&buffer, None, 1_024);
 
         surface.handle_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -2832,13 +2876,13 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         });
+        surface.visible_screen =
+            VisibleScreen::capture(&buffer, surface.screen_selection, TRANSCRIPT_COPY_BYTES_MAX);
 
         assert!(!surface.output_focus);
         assert_eq!(
-            surface
-                .transcript
-                .selected_text_bounded(TRANSCRIPT_COPY_BYTES_MAX),
-            Ok(Some("βeta".to_owned()))
+            surface.visible_screen.selected_text_bounded(),
+            Ok(Some("βeta"))
         );
         assert_eq!(surface.mouse_drag, None);
 
@@ -2850,11 +2894,57 @@ mod tests {
         });
 
         assert!(!surface.output_focus);
+        assert!(surface.screen_selection.is_none());
+    }
+
+    #[test]
+    fn mouse_drag_crosses_transcript_context_input_and_status_bar() {
+        use ratatui::buffer::Buffer;
+
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface.append_transcript_line("build output");
+        surface.transcript_area = Rect::new(0, 0, 20, 1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 4));
+        buffer.set_string(0, 0, "build output", Style::default());
+        buffer.set_string(0, 1, "~/work   on main", Style::default());
+        buffer.set_string(0, 2, "❯ git status", Style::default());
+        buffer.set_string(0, 3, "NORMAL      v0.1", Style::default());
+        surface.visible_screen = VisibleScreen::capture(&buffer, None, 1_024);
+
+        surface.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        surface.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 15,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        surface.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 15,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        surface.visible_screen =
+            VisibleScreen::capture(&buffer, surface.screen_selection, TRANSCRIPT_COPY_BYTES_MAX);
+
+        assert!(!surface.output_focus);
         assert_eq!(
-            surface
-                .transcript
-                .selected_text_bounded(TRANSCRIPT_COPY_BYTES_MAX),
-            Ok(None)
+            surface.visible_screen.selected_text_bounded(),
+            Ok(Some(
+                "build output\n~/work   on main\n❯ git status\nNORMAL      v0.1"
+            ))
         );
     }
 

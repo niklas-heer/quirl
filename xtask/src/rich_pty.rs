@@ -531,6 +531,13 @@ fn enter_and_wait(
     session.pty.wait_for(marker)
 }
 
+fn wait_for_rich_input_since(session: &mut Session, start: usize) -> Result<(), Box<dyn Error>> {
+    session
+        .pty
+        .wait_for_since(b"\x1b[?1000h", start, DEFAULT_TIMEOUT)?;
+    Ok(())
+}
+
 fn execute_and_resume(session: &mut Session, command: &str) -> Result<(), Box<dyn Error>> {
     let output_start = session.pty.output().len();
     session.pty.type_text(command)?;
@@ -565,6 +572,9 @@ fn execute_and_resume_with_marker(
         &format!("command marker {marker:?} in persistent viewport"),
         |screen| screen.text().contains(marker) && screen.bottom_line().contains("NORMAL"),
     )?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[?1000h", output_start, DEFAULT_TIMEOUT)?;
     ensure_alternate_screen_unchanged(session, output_start, "marked command")
 }
 
@@ -618,24 +628,32 @@ fn check_rich_editing(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.wait_for(STARTUP_MARKER)?;
     session.pty.type_text("/usr/bin/printf BACKSPACE_BAD")?;
     session.pty.send(b"\x7f\x7f\x7f")?;
+    let backspace_start = session.pty.output().len();
     enter_and_wait(&mut session, "OK", b"BACKSPACE_OK")?;
+    wait_for_rich_input_since(&mut session, backspace_start)?;
     session.pty.type_text("/usr/bin/printf DELETE_XOK")?;
     session.pty.send(b"\x1b[D\x1b[D\x1b[D\x1b[3~")?;
+    let delete_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session.pty.drain_for(Duration::from_millis(100))?;
     session.pty.send(key::ENTER)?;
     session.pty.wait_for_screen_text("DELETE_OK")?;
+    wait_for_rich_input_since(&mut session, delete_start)?;
     session.pty.type_text("/usr/bin/printf UNICODE_e\u{301}")?;
     session.pty.drain_for(Duration::from_millis(50))?;
     session.pty.send(b"\x7f")?;
+    let unicode_start = session.pty.output().len();
     enter_and_wait(&mut session, "OK", b"UNICODE_OK")?;
+    wait_for_rich_input_since(&mut session, unicode_start)?;
     session.pty.type_text("/usr/bin/printf CTRLD_XOK")?;
+    let ctrl_d_start = session.pty.output().len();
     session.pty.send(b"\x1b[D\x1b[D\x1b[D\x04\r")?;
     session.pty.wait_for(b"CTRLD_OK")?;
+    wait_for_rich_input_since(&mut session, ctrl_d_start)?;
     session.pty.type_text("/usr/bin/printf SHOULD_NOT_RUN")?;
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"^C")?;
-    enter_and_wait(&mut session, "/usr/bin/printf AFTER_CTRLC", b"AFTER_CTRLC")?;
+    execute_and_resume_with_marker(&mut session, "/usr/bin/printf AFTER_CTRLC", b"AFTER_CTRLC")?;
     session.pty.send(key::ALT_Q)?;
     session.pty.send(b"d")?;
     session
@@ -677,7 +695,7 @@ fn check_rich_editing(binary: &Path) -> Result<(), Box<dyn Error>> {
             let text = screen.text();
             text.contains("MULTI_ONE") && text.contains("_TWO")
         })?;
-    enter_and_wait(
+    execute_and_resume_with_marker(
         &mut session,
         "/bin/sh -c 'printf STDOUT_OK; printf STDERR_OK >&2'",
         b"STDERR_OK",
@@ -836,7 +854,11 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     ) {
         return Err(io::Error::other("resize released alternate-screen ownership").into());
     }
+    let restored_startup_width_start = session.pty.output().len();
     session.pty.resize(18, 120)?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[J", restored_startup_width_start, DEFAULT_TIMEOUT)?;
     session
         .pty
         .wait_for_screen("bottom status after resize restoration", |screen| {
@@ -869,7 +891,11 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.send(key::ESCAPE)?;
     wait_for_standard_status(&mut session)?;
     clear_editor(&mut session)?;
+    let wide_provenance_resize_start = session.pty.output().len();
     session.pty.resize(18, 400)?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[J", wide_provenance_resize_start, DEFAULT_TIMEOUT)?;
     session
         .pty
         .wait_for_screen("wide provenance frame", |screen| {
@@ -909,7 +935,11 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
         wait_for_standard_status(&mut session)?;
         clear_editor(&mut session)?;
     }
+    let normal_width_resize_start = session.pty.output().len();
     session.pty.resize(18, 120)?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[J", normal_width_resize_start, DEFAULT_TIMEOUT)?;
     session
         .pty
         .wait_for_screen("normal-width flag frame", |screen| {
@@ -917,6 +947,11 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
         })?;
 
     session.pty.type_text("ls -al")?;
+    session
+        .pty
+        .wait_for_screen("complete Normal ls command in editor", |screen| {
+            screen.lines().iter().any(|line| line == "> ls -al")
+        })?;
     let normal_ls_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session
@@ -959,7 +994,11 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
         .wait_for_screen("Data mode before typed ls checks", |screen| {
             screen.bottom_line().contains("DATA")
         })?;
+    let wide_data_resize_start = session.pty.output().len();
     session.pty.resize(18, 400)?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[J", wide_data_resize_start, DEFAULT_TIMEOUT)?;
     wait_for_command_information(
         &mut session,
         "ls",
@@ -981,13 +1020,24 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.send(key::ESCAPE)?;
     wait_for_mode_status(&mut session, "DATA")?;
     clear_editor_in_mode(&mut session, "DATA")?;
+    let data_width_resize_start = session.pty.output().len();
     session.pty.resize(18, 120)?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[J", data_width_resize_start, DEFAULT_TIMEOUT)?;
     session
         .pty
         .wait_for_screen("normal-width typed ls frame", |screen| {
             screen.bottom_line().contains("DATA")
         })?;
     session.pty.type_text("ls")?;
+    session
+        .pty
+        .wait_for_screen("complete Data ls command in editor", |screen| {
+            // The retained Normal-mode `ls -al` history entry may appear as
+            // dim suggestion text after the exact `ls` editor buffer.
+            screen.lines().iter().any(|line| line.starts_with("> D ls"))
+        })?;
     let execution_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session
@@ -1058,7 +1108,11 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
         .wait_for_screen("compact bottom status", |screen| {
             screen.bottom_line().contains("NORMAL")
         })?;
+    let restored_cleanup_width_start = session.pty.output().len();
     session.pty.resize(18, 120)?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[J", restored_cleanup_width_start, DEFAULT_TIMEOUT)?;
     session
         .pty
         .wait_for_screen("restored bottom status", |screen| {
@@ -1538,7 +1592,7 @@ fn check_cwd_history(binary: &Path) -> Result<(), Box<dyn Error>> {
 fn execute_cwd_history_command(session: &mut Session, command: &str) -> Result<(), Box<dyn Error>> {
     let output_start = session.pty.output().len();
     session.pty.type_text(command)?;
-    let editor_line = command.to_owned();
+    let editor_line = format!("> {command}");
     session
         .pty
         .wait_for_screen("complete cwd-history command in editor", |screen| {
@@ -2164,7 +2218,7 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
     session
         .pty
         .wait_for_screen("simple-surface job-control prompt", |screen| {
-            screen.lines().iter().any(|line| line.trim() == "normal")
+            screen.lines().iter().any(|line| line.trim() == "normal >")
         })?;
     let prompt_modes = session.pty.terminal_modes()?;
     let child = session

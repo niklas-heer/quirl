@@ -20,8 +20,7 @@ impl StatusBarModel<'_> {
         let unicode = self.symbols.uses_unicode();
         let separator = match self.symbols {
             SurfaceSymbols::Plain => " | ",
-            SurfaceSymbols::Unicode => " │ ",
-            SurfaceSymbols::NerdFont => " \u{e0b1} ",
+            SurfaceSymbols::Unicode | SurfaceSymbols::NerdFont => " │ ",
         };
         let mut left = Vec::new();
         if let Some(label) = self.editor.mode().label() {

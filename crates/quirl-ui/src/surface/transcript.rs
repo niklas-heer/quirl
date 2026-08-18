@@ -1,7 +1,9 @@
 //! Bounded logical output retained by the full-screen terminal surface.
 
 use std::{collections::VecDeque, ops::Range};
+#[cfg(test)]
 use unicode_segmentation::UnicodeSegmentation;
+#[cfg(test)]
 use unicode_width::UnicodeWidthStr;
 
 /// Explicit memory and collection limits for one transcript.
@@ -229,6 +231,7 @@ impl Transcript {
     /// The first position is immediately before the hit grapheme and the second
     /// is immediately after it. Wide graphemes map every occupied cell to the
     /// same pair. Columns at or beyond line end map to the final byte boundary.
+    #[cfg(test)]
     pub(super) fn hit_test(
         &self,
         line_index: usize,

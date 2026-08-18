@@ -1635,15 +1635,15 @@ impl SurfaceSymbols {
 
     pub(crate) const fn input_indicator(self, mode: Mode) -> &'static str {
         match (self, mode) {
-            (Self::Plain, Mode::Command) => "",
-            (Self::Plain, Mode::Data) => "D ",
-            (Self::Plain, Mode::Natural) => "AI ",
-            (Self::Unicode, Mode::Command) => "",
-            (Self::Unicode, Mode::Data) => "▦ ",
-            (Self::Unicode, Mode::Natural) => "✧ ",
-            (Self::NerdFont, Mode::Command) => "",
-            (Self::NerdFont, Mode::Data) => "\u{f1b2} ",
-            (Self::NerdFont, Mode::Natural) => "\u{f544} ",
+            (Self::Plain, Mode::Command) => "> ",
+            (Self::Plain, Mode::Data) => "> D ",
+            (Self::Plain, Mode::Natural) => "> AI ",
+            (Self::Unicode, Mode::Command) => "❯ ",
+            (Self::Unicode, Mode::Data) => "❯ ▦ ",
+            (Self::Unicode, Mode::Natural) => "❯ ✧ ",
+            (Self::NerdFont, Mode::Command) => "❯ ",
+            (Self::NerdFont, Mode::Data) => "❯ \u{f1b2} ",
+            (Self::NerdFont, Mode::Natural) => "❯ \u{f544} ",
         }
     }
 
@@ -1651,7 +1651,7 @@ impl SurfaceSymbols {
         match self {
             Self::Plain => ". ",
             Self::Unicode => "∙ ",
-            Self::NerdFont => "\u{f105} ",
+            Self::NerdFont => "∙ ",
         }
     }
 
@@ -1694,9 +1694,14 @@ impl PromptSymbols {
         match self {
             Self::Plain => " | ",
             Self::Unicode => " · ",
-            // U+E0B1 is the slim Powerline separator. It is restricted to the
-            // explicit Nerd Font profile so auto mode never displays tofu.
-            Self::NerdFont => " \u{e0b1} ",
+            Self::NerdFont => " · ",
+        }
+    }
+
+    const fn input_chevron(self) -> &'static str {
+        match self {
+            Self::Plain => ">",
+            Self::Unicode | Self::NerdFont => "❯",
         }
     }
 
@@ -2151,9 +2156,10 @@ impl Prompt for QuirlPrompt {
                 Mode::Natural => "AI ✧",
             }
         };
+        let chevron = self.symbols().input_chevron();
         Cow::Owned(match edit_mode {
-            Some(edit_mode) => format!("{edit_mode} {indicator} "),
-            None => format!("{indicator} "),
+            Some(edit_mode) => format!("{edit_mode} {indicator} {chevron} "),
+            None => format!("{indicator} {chevron} "),
         })
     }
 
@@ -3560,7 +3566,7 @@ mod tests {
         );
         assert_eq!(
             join_prompt_parts(&parts, PromptSymbols::NerdFont),
-            "project \u{e0b1} command \u{e0b1} git:main"
+            "project · command · git:main"
         );
     }
 
@@ -3771,7 +3777,8 @@ mod tests {
         }
         let nerd = PromptSymbols::NerdFont;
         assert!(nerd.git_branch("main").contains('\u{e0a0}'));
-        assert!(nerd.separator().contains('\u{e0b1}'));
+        assert_eq!(nerd.separator(), " · ");
+        assert_eq!(nerd.input_chevron(), "❯");
         assert!(nerd.directory("quirl").contains('\u{f07c}'));
     }
 
@@ -3839,23 +3846,23 @@ mod tests {
         let prompt = QuirlPrompt::with_config(Mode::Command, &config);
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Default),
-            "normal "
+            "normal > "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Emacs),
-            "normal "
+            "normal > "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Normal)),
-            "normal normal "
+            "normal normal > "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Insert)),
-            "insert normal "
+            "insert normal > "
         );
         assert_eq!(
             prompt.render_prompt_indicator(PromptEditMode::Vi(PromptViMode::Visual)),
-            "visual normal "
+            "visual normal > "
         );
         let cursors = editor_cursor_config();
         assert_eq!(cursors.vi_insert, Some(SetCursorStyle::SteadyBar));
