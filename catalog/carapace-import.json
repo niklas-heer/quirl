@@ -2,6 +2,8 @@
   "source_url": "https://github.com/carapace-sh/carapace-bin",
   "revision": "ebfb9beda84fdf057dc9a89b59527158d23d323c",
   "license": "MIT",
+  "license_file": "LICENSE",
+  "license_sha256": "25dbdc5c4265ee2983e2b2cd0b5073df0a24aecc0de14a49d01ec9c702f7f22c",
   "author": "Carapace contributors",
   "roots": [
     {

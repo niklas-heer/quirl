@@ -10,19 +10,7 @@ use std::sync::OnceLock;
 const EMBEDDED_NATIVE_DATABASE: &[u8] =
     include_bytes!("../../../catalog/generated/catalog.sqlite3");
 const EMBEDDED_NATIVE_SOURCE: &str = "catalog/generated/catalog.sqlite3 (embedded)";
-const RUNTIME_LIMITS: NativeCatalogLimits = NativeCatalogLimits {
-    source_bytes_max: 1024 * 1024,
-    database_bytes_max: 2 * 1024 * 1024,
-    command_count_max: 2_048,
-    command_depth_max: 16,
-    flag_count_max: 8_192,
-    argument_count_max: 8_192,
-    values_per_command_max: 256,
-    string_bytes_max: 16 * 1024,
-    semantic_document_count_max: 24_576,
-    query_bytes_max: 4 * 1024,
-    query_results_max: 256,
-};
+const RUNTIME_LIMITS: NativeCatalogLimits = NativeCatalogLimits::embedded();
 static EMBEDDED_COMMANDS: OnceLock<Result<Vec<CommandSpec>, ShellError>> = OnceLock::new();
 
 #[cfg(not(any(
@@ -33,17 +21,22 @@ static EMBEDDED_COMMANDS: OnceLock<Result<Vec<CommandSpec>, ShellError>> = OnceL
 )))]
 compile_error!("the embedded native catalog has no platform projection for this target");
 
-/// Merge the admitted platform projection under facts already present in `catalog`.
-pub(crate) fn merge_embedded(catalog: &mut Catalog) -> Result<(), ShellError> {
-    catalog.merge(embedded_commands()?);
-    Ok(())
+/// Merge admitted native facts while preserving builtin-only operation on failure.
+pub(crate) fn merge_embedded(catalog: &mut Catalog) {
+    merge_loaded(catalog, embedded_commands());
 }
 
 /// Build the immutable builtin-plus-native catalog without local cache or plugins.
-pub(crate) fn builtin_native_catalog() -> Result<Catalog, ShellError> {
+pub(crate) fn builtin_native_catalog() -> Catalog {
     let mut catalog = Catalog::builtin();
-    merge_embedded(&mut catalog)?;
-    Ok(catalog)
+    merge_embedded(&mut catalog);
+    catalog
+}
+
+fn merge_loaded(catalog: &mut Catalog, loaded: Result<Vec<CommandSpec>, ShellError>) {
+    if let Ok(commands) = loaded {
+        catalog.merge(commands);
+    }
 }
 
 fn embedded_commands() -> Result<Vec<CommandSpec>, ShellError> {
@@ -122,7 +115,7 @@ mod tests {
 
     #[test]
     fn native_facts_reach_completion_help_and_agent_surfaces() {
-        let catalog = builtin_native_catalog().unwrap();
+        let catalog = builtin_native_catalog();
         let line = "docker compose alpha d";
         let completions = catalog.complete(line, line.len());
         assert!(
@@ -157,7 +150,7 @@ mod tests {
 
     #[test]
     fn native_facts_reach_the_lsp_catalog_surface() {
-        let catalog = builtin_native_catalog().unwrap();
+        let catalog = builtin_native_catalog();
         let mut service = quirl_lsp::LanguageService::new(catalog);
         let line = "docker compose alpha d";
         service.handle(serde_json::json!({
@@ -239,27 +232,29 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_embedded_shape_is_never_an_optional_fallback() {
-        let error = load_commands(b"not sqlite", NativePlatform::Linux).unwrap_err();
+    fn corrupt_embedded_shape_falls_back_to_builtins() {
+        let loaded = load_commands(b"not sqlite", NativePlatform::Linux);
+        let error = loaded.clone().unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
         assert!(error.message.contains("SQLite") || error.message.contains("database"));
+
+        let mut catalog = Catalog::builtin();
+        let expected = catalog.clone();
+        merge_loaded(&mut catalog, loaded);
+        assert_eq!(catalog, expected);
     }
 
     #[test]
     fn exact_builtins_keep_precedence_over_curated_external_facts() {
         let mut catalog = Catalog::builtin();
         let builtin = catalog.find("git commit").unwrap().clone();
-        merge_embedded(&mut catalog).unwrap();
+        merge_embedded(&mut catalog);
         assert_eq!(catalog.find("git commit"), Some(&builtin));
     }
 
     #[test]
     fn cache_ties_and_trusted_plugins_keep_precedence() {
-        let mut cached = builtin_native_catalog()
-            .unwrap()
-            .find("docker")
-            .unwrap()
-            .clone();
+        let mut cached = builtin_native_catalog().find("docker").unwrap().clone();
         cached.summary = "Locally admitted Docker metadata".to_owned();
         cached.provenance = ProvenanceInfo {
             source: Provenance::Fish,
@@ -271,7 +266,7 @@ mod tests {
         };
         let mut catalog = Catalog::builtin();
         catalog.merge([cached]);
-        merge_embedded(&mut catalog).unwrap();
+        merge_embedded(&mut catalog);
         assert_eq!(
             catalog.find("docker").unwrap().summary,
             "Locally admitted Docker metadata"

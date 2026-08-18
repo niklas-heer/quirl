@@ -54,8 +54,10 @@ prove all of the following:
   admitted image and removes the current staging file; contention and unsafe
   file shapes fail without partial publication; and
 - a pinned Carapace import is bounded and writes only a review draft. Tests must
-  show that a partial/invalid import cannot change curated KDL, formatting is
-  byte-idempotent, unchanged canonical KDL preserves the database checksum, and
+  show that dirty pinned files, duplicate facts, cross-command action leakage,
+  and invented positional metadata fail or become explicit omissions; a
+  partial/invalid import cannot change curated KDL; formatting is
+  byte-idempotent; unchanged canonical KDL preserves the database checksum; and
   no runtime test requires Carapace or network access.
 
 CI should run the implemented format-check, strict-check, and build operations,

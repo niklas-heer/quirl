@@ -2,9 +2,9 @@
 
 use clap::Subcommand;
 use quirl_catalog::{
-    NativeArgument, NativeCatalog, NativeCatalogDiagnostic, NativeCatalogLimits, NativeCommand,
-    NativeCompletionAction, NativeFlag, NativePlatform, compile_native_catalog,
-    parse_native_catalog,
+    NativeArgument, NativeCatalog, NativeCatalogDiagnostic, NativeCatalogLimits,
+    NativeCatalogReader, NativeCommand, NativeCompletionAction, NativeFlag, NativePlatform,
+    compile_native_catalog, parse_native_catalog,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,7 +16,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    process::{Command, ExitStatus, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 const CURATED_DIRECTORY: &str = "catalog/curated";
@@ -38,6 +41,7 @@ const IMPORT_OUTPUT_BYTES_MAX: usize = 4 * 1024 * 1024;
 const CATALOG_FILE_COUNT_MAX: usize = 128;
 const CATALOG_TOTAL_BYTES_MAX: usize = 8 * 1024 * 1024;
 const TEMPORARY_ATTEMPTS_MAX: usize = 32;
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 /// One native-catalog development action.
@@ -81,6 +85,8 @@ struct ImportConfiguration {
     source_url: String,
     revision: String,
     license: String,
+    license_file: String,
+    license_sha256: String,
     author: String,
     roots: Vec<ImportRoot>,
 }
@@ -94,15 +100,31 @@ struct ImportRoot {
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct ImportManifest {
     source_url: String,
     revision: String,
     license: String,
+    license_file: String,
+    license_sha256: String,
     source_files: Vec<String>,
     command_paths: Vec<String>,
     command_count: usize,
     flag_count: usize,
+    omitted_constructs: Vec<String>,
     semantic_diff: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvenanceRecord {
+    source_url: String,
+    revision: String,
+    license: String,
+    license_file: String,
+    license_sha256: String,
+    import_policy: String,
+    curation: String,
 }
 
 #[derive(Debug)]
@@ -110,6 +132,23 @@ struct ParsedGoCommand {
     variable: String,
     parent: Option<String>,
     command: NativeCommand,
+    omitted_constructs: Vec<String>,
+}
+
+struct ParsedCheckout {
+    catalog: NativeCatalog,
+    source_files: Vec<String>,
+    omitted_constructs: Vec<String>,
+}
+
+struct ParsedFlagActions {
+    actions: BTreeMap<String, NativeCompletionAction>,
+    omissions: Vec<String>,
+}
+
+struct ParsedFlags {
+    flags: Vec<NativeFlag>,
+    omissions: Vec<String>,
 }
 
 fn import_carapace(root: &Path, source: &Path, revision: &str) -> Result<(), Box<dyn Error>> {
@@ -130,7 +169,10 @@ fn import_carapace(root: &Path, source: &Path, revision: &str) -> Result<(), Box
         )));
     }
     validate_import_configuration(&configuration)?;
-    let (catalog, source_files) = parse_carapace_checkout(source, &configuration)?;
+    verify_checkout_sources(source, revision, &configuration)?;
+    validate_upstream_license(source, &configuration)?;
+    let parsed = parse_carapace_checkout(source, &configuration)?;
+    let catalog = parsed.catalog;
     reject_curated_collisions(root, &catalog)?;
     let rendered = render_catalog(&catalog)?;
     if rendered.len() > IMPORT_OUTPUT_BYTES_MAX {
@@ -151,10 +193,13 @@ fn import_carapace(root: &Path, source: &Path, revision: &str) -> Result<(), Box
         source_url: configuration.source_url,
         revision: configuration.revision,
         license: configuration.license,
-        source_files,
+        license_file: configuration.license_file,
+        license_sha256: configuration.license_sha256,
+        source_files: parsed.source_files,
         command_paths,
         command_count,
         flag_count,
+        omitted_constructs: parsed.omitted_constructs,
         semantic_diff,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -173,6 +218,17 @@ fn validate_import_configuration(
     if configuration.license != "MIT" {
         return Err(input_error(
             "pinned Carapace input must retain its MIT license",
+        ));
+    }
+    validate_normalized_relative_path(&configuration.license_file, "Carapace license path")?;
+    if configuration.license_sha256.len() != 64
+        || !configuration
+            .license_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(input_error(
+            "Carapace license_sha256 must be exactly 64 hexadecimal characters",
         ));
     }
     if configuration.roots.is_empty() || configuration.roots.len() > SOURCE_FILE_COUNT_MAX {
@@ -209,10 +265,27 @@ fn validate_import_configuration(
     Ok(())
 }
 
+fn validate_upstream_license(
+    source: &Path,
+    configuration: &ImportConfiguration,
+) -> Result<(), Box<dyn Error>> {
+    validate_no_symlink_components(source, &configuration.license_file)?;
+    let path = source.join(&configuration.license_file);
+    let bytes = read_regular_file_bounded(&path, 64 * 1024)?;
+    let observed = sha256_hex(&bytes);
+    if observed != configuration.license_sha256.to_ascii_lowercase() {
+        return Err(input_error(format!(
+            "Carapace license checksum mismatch: expected {}, observed {observed}",
+            configuration.license_sha256
+        )));
+    }
+    Ok(())
+}
+
 fn parse_carapace_checkout(
     source: &Path,
     configuration: &ImportConfiguration,
-) -> Result<(NativeCatalog, Vec<String>), Box<dyn Error>> {
+) -> Result<ParsedCheckout, Box<dyn Error>> {
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.file_type().is_dir() {
         return Err(input_error("Carapace source must be a directory"));
@@ -222,6 +295,7 @@ fn parse_carapace_checkout(
     let mut roots = Vec::new();
     let mut command_count = 0_usize;
     let mut flag_count = 0_usize;
+    let mut omitted_constructs = Vec::new();
     for root in &configuration.roots {
         let platforms = parse_platforms(&root.platforms)?;
         let mut parsed = BTreeMap::<String, ParsedGoCommand>::new();
@@ -241,6 +315,7 @@ fn parse_carapace_checkout(
                 input_error(format!("Carapace source is not UTF-8: {}", path.display()))
             })?;
             for command in parse_go_file(text, relative)? {
+                omitted_constructs.extend(command.omitted_constructs.iter().cloned());
                 flag_count = flag_count.saturating_add(command.command.flags.len());
                 command_count = command_count.saturating_add(1);
                 if command_count > IMPORT_COMMAND_COUNT_MAX {
@@ -270,8 +345,9 @@ fn parse_carapace_checkout(
     }
     roots.sort_by(|left, right| left.name.cmp(&right.name));
     source_files.sort();
-    Ok((
-        NativeCatalog {
+    omitted_constructs.sort();
+    Ok(ParsedCheckout {
+        catalog: NativeCatalog {
             name: "carapace-draft".to_owned(),
             provenance: quirl_catalog::NativeProvenance {
                 author: configuration.author.clone(),
@@ -282,7 +358,8 @@ fn parse_carapace_checkout(
             commands: roots,
         },
         source_files,
-    ))
+        omitted_constructs,
+    })
 }
 
 fn parse_go_file(source: &str, source_name: &str) -> Result<Vec<ParsedGoCommand>, Box<dyn Error>> {
@@ -293,6 +370,8 @@ fn parse_go_file(source: &str, source_name: &str) -> Result<Vec<ParsedGoCommand>
             source.len(),
         ));
     }
+    let source = strip_go_comments(source)?;
+    let source = source.as_str();
     let mut commands = Vec::new();
     let mut offset = 0_usize;
     while let Some(relative) = source[offset..].find("= &cobra.Command{") {
@@ -324,12 +403,21 @@ fn parse_go_file(source: &str, source_name: &str) -> Result<Vec<ParsedGoCommand>
             .filter(|value| !value.starts_with("http://") && !value.starts_with("https://"))
             .unwrap_or_else(|| summary.clone());
         let aliases = keyed_go_string_slice(body, "Aliases")?;
-        let flags = parse_go_flags(source, &variable)?;
-        let arguments = parse_go_arguments(source, &variable);
+        let parsed_flags = parse_go_flags(source, &variable)?;
+        let flags = parsed_flags.flags;
+        let mut omitted_constructs = parsed_flags.omissions;
+        let arguments = Vec::new();
+        let positional_marker = format!("carapace.Gen({variable}).PositionalAnyCompletion(");
+        if source.contains(&positional_marker) {
+            omitted_constructs.push(format!(
+                "{source_name}:{variable}: PositionalAnyCompletion omitted because upstream does not declare the names and documentation required by the native argument schema"
+            ));
+        }
         let parent = find_parent_variable(source, &variable);
         commands.push(ParsedGoCommand {
             variable,
             parent,
+            omitted_constructs,
             command: NativeCommand {
                 name,
                 aliases,
@@ -352,6 +440,67 @@ fn parse_go_file(source: &str, source_name: &str) -> Result<Vec<ParsedGoCommand>
     Ok(commands)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GoLexState {
+    Code,
+    LineComment,
+    BlockComment,
+    InterpretedString,
+    RawString,
+    Rune,
+}
+
+fn strip_go_comments(source: &str) -> Result<String, Box<dyn Error>> {
+    let mut bytes = source.as_bytes().to_vec();
+    let mut state = GoLexState::Code;
+    let mut escaped = false;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index.saturating_add(1)).copied();
+        match state {
+            GoLexState::Code if byte == b'/' && next == Some(b'/') => {
+                bytes[index] = b' ';
+                bytes[index + 1] = b' ';
+                state = GoLexState::LineComment;
+                index = index.saturating_add(2);
+                continue;
+            }
+            GoLexState::Code if byte == b'/' && next == Some(b'*') => {
+                bytes[index] = b' ';
+                bytes[index + 1] = b' ';
+                state = GoLexState::BlockComment;
+                index = index.saturating_add(2);
+                continue;
+            }
+            GoLexState::Code if byte == b'"' => state = GoLexState::InterpretedString,
+            GoLexState::Code if byte == b'`' => state = GoLexState::RawString,
+            GoLexState::Code if byte == b'\'' => state = GoLexState::Rune,
+            GoLexState::LineComment if byte == b'\n' => state = GoLexState::Code,
+            GoLexState::LineComment => bytes[index] = b' ',
+            GoLexState::BlockComment if byte == b'*' && next == Some(b'/') => {
+                bytes[index] = b' ';
+                bytes[index + 1] = b' ';
+                state = GoLexState::Code;
+                index = index.saturating_add(2);
+                continue;
+            }
+            GoLexState::BlockComment if byte != b'\n' => bytes[index] = b' ',
+            GoLexState::InterpretedString | GoLexState::Rune if escaped => escaped = false,
+            GoLexState::InterpretedString | GoLexState::Rune if byte == b'\\' => escaped = true,
+            GoLexState::InterpretedString if byte == b'"' => state = GoLexState::Code,
+            GoLexState::Rune if byte == b'\'' => state = GoLexState::Code,
+            GoLexState::RawString if byte == b'`' => state = GoLexState::Code,
+            _ => {}
+        }
+        index = index.saturating_add(1);
+    }
+    if state == GoLexState::BlockComment {
+        return Err(input_error("unterminated Go block comment"));
+    }
+    String::from_utf8(bytes).map_err(|_| input_error("comment filtering produced invalid UTF-8"))
+}
+
 fn variable_before_marker(source: &str, marker: usize) -> Result<String, Box<dyn Error>> {
     let line_start = source[..marker].rfind('\n').map_or(0, |index| index + 1);
     let prefix = source[line_start..marker].trim();
@@ -369,21 +518,27 @@ fn matching_brace(source: &str, open: usize) -> Result<usize, Box<dyn Error>> {
         return Err(input_error("Cobra command marker has no opening brace"));
     }
     let mut depth = 0_usize;
-    let mut quoted = false;
+    let mut quote = None;
     let mut escaped = false;
     for (index, byte) in bytes.iter().enumerate().skip(open) {
-        if quoted {
+        if let Some(delimiter) = quote {
+            if delimiter == b'`' {
+                if *byte == delimiter {
+                    quote = None;
+                }
+                continue;
+            }
             if escaped {
                 escaped = false;
             } else if *byte == b'\\' {
                 escaped = true;
-            } else if *byte == b'"' {
-                quoted = false;
+            } else if *byte == delimiter {
+                quote = None;
             }
             continue;
         }
         match byte {
-            b'"' => quoted = true,
+            b'"' | b'\'' | b'`' => quote = Some(*byte),
             b'{' => depth = depth.saturating_add(1),
             b'}' => {
                 depth = depth.saturating_sub(1);
@@ -416,7 +571,11 @@ fn keyed_go_string_slice(body: &str, key: &str) -> Result<Vec<String>, Box<dyn E
     };
     let mut values = quoted_go_strings(line)?;
     values.sort();
-    values.dedup();
+    if values.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(input_error(format!(
+            "duplicate literal in Cobra {key} list"
+        )));
+    }
     for value in &values {
         validate_catalog_identifier(value)?;
     }
@@ -455,18 +614,8 @@ fn quoted_go_strings(input: &str) -> Result<Vec<String>, Box<dyn Error>> {
     Ok(values)
 }
 
-fn parse_go_flags(source: &str, variable: &str) -> Result<Vec<NativeFlag>, Box<dyn Error>> {
-    let mut actions = BTreeMap::<String, NativeCompletionAction>::new();
-    for line in source.lines() {
-        let trimmed = line.trim();
-        let Some((name, consumed)) = first_go_string(trimmed).transpose()? else {
-            continue;
-        };
-        let action_source = &trimmed[consumed..];
-        if let Some(action) = action_from_source(action_source) {
-            actions.insert(name, action);
-        }
-    }
+fn parse_go_flags(source: &str, variable: &str) -> Result<ParsedFlags, Box<dyn Error>> {
+    let parsed_actions = parse_go_flag_actions(source, variable)?;
     let prefixes = [
         format!("{variable}.Flags()."),
         format!("{variable}.PersistentFlags()."),
@@ -486,7 +635,18 @@ fn parse_go_flags(source: &str, variable: &str) -> Result<Vec<NativeFlag>, Box<d
             )));
         };
         let method = &rest[..open];
-        if !method.starts_with("Bool") && !method.starts_with("String") {
+        let is_bool = matches!(method, "Bool" | "BoolP" | "BoolS");
+        let is_string = matches!(
+            method,
+            "String"
+                | "StringP"
+                | "StringS"
+                | "StringArray"
+                | "StringArrayP"
+                | "StringSlice"
+                | "StringSliceP"
+        );
+        if !is_bool && !is_string {
             return Err(input_error(format!(
                 "unsupported Cobra flag method {method} for {variable}; extend the bounded importer before accepting this upstream shape"
             )));
@@ -513,8 +673,7 @@ fn parse_go_flags(source: &str, variable: &str) -> Result<Vec<NativeFlag>, Box<d
             .last()
             .cloned()
             .ok_or_else(|| input_error("flag description is missing"))?;
-        let is_bool = method.starts_with("Bool");
-        let action = actions.get(&name).copied();
+        let action = parsed_actions.actions.get(&name).copied();
         flags.push(NativeFlag {
             long: format!("--{name}"),
             short,
@@ -527,26 +686,70 @@ fn parse_go_flags(source: &str, variable: &str) -> Result<Vec<NativeFlag>, Box<d
         });
     }
     flags.sort_by(|left, right| left.long.cmp(&right.long));
-    let mut names = BTreeSet::new();
-    flags.retain(|flag| names.insert(flag.long.clone()));
-    Ok(flags)
+    let mut names = BTreeMap::<String, String>::new();
+    for flag in &flags {
+        for name in std::iter::once(&flag.long).chain(flag.short.iter()) {
+            if let Some(previous) = names.insert(name.clone(), flag.long.clone()) {
+                return Err(input_error(format!(
+                    "duplicate imported flag name {name} on {variable}: {previous} and {}",
+                    flag.long
+                )));
+            }
+        }
+    }
+    Ok(ParsedFlags {
+        flags,
+        omissions: parsed_actions.omissions,
+    })
 }
 
-fn parse_go_arguments(source: &str, variable: &str) -> Vec<NativeArgument> {
-    let marker = format!("carapace.Gen({variable}).PositionalAnyCompletion(");
-    let Some(start) = source.find(&marker) else {
-        return Vec::new();
-    };
-    let tail = &source[start + marker.len()..];
-    let action = action_from_source(tail.lines().take(4).collect::<String>().as_str());
-    vec![NativeArgument {
-        name: "values".to_owned(),
-        summary: "Additional values".to_owned(),
-        description: "Additional positional values accepted by the command.".to_owned(),
-        required: false,
-        repeatable: true,
-        action,
-    }]
+fn parse_go_flag_actions(
+    source: &str,
+    variable: &str,
+) -> Result<ParsedFlagActions, Box<dyn Error>> {
+    let marker = format!("carapace.Gen({variable}).FlagCompletion(");
+    let mut actions = BTreeMap::new();
+    let mut omissions = Vec::new();
+    let mut offset = 0_usize;
+    while let Some(relative) = source[offset..].find(&marker) {
+        let call_start = offset + relative;
+        let tail = &source[call_start + marker.len()..];
+        let action_map_relative = tail.find("carapace.ActionMap{").ok_or_else(|| {
+            input_error(format!(
+                "unsupported non-literal FlagCompletion for {variable}"
+            ))
+        })?;
+        if tail
+            .find("carapace.Gen(")
+            .is_some_and(|next_call| next_call < action_map_relative)
+        {
+            return Err(input_error(format!(
+                "unsupported non-literal FlagCompletion for {variable}"
+            )));
+        }
+        let open = call_start + marker.len() + action_map_relative + "carapace.ActionMap".len();
+        let close = matching_brace(source, open)?;
+        for line in source[open + 1..close].lines() {
+            let trimmed = line.trim();
+            let Some((name, consumed)) = first_go_string(trimmed).transpose()? else {
+                continue;
+            };
+            let action_source = &trimmed[consumed..];
+            if let Some(action) = action_from_source(action_source) {
+                if actions.insert(name.clone(), action).is_some() {
+                    return Err(input_error(format!(
+                        "duplicate completion action for flag {name} on {variable}"
+                    )));
+                }
+            } else if action_source.contains(':') {
+                omissions.push(format!(
+                    "{variable}: completion action for {name} omitted because it is outside the closed native action set"
+                ));
+            }
+        }
+        offset = close.saturating_add(1);
+    }
+    Ok(ParsedFlagActions { actions, omissions })
 }
 
 fn action_from_source(source: &str) -> Option<NativeCompletionAction> {
@@ -686,10 +889,9 @@ fn check_catalog(root: &Path) -> Result<(), Box<dyn Error>> {
     let (curated, drafts) = load_and_validate_sources(root, true)?;
     validate_separation(&curated, &drafts)?;
     validate_import_artifacts(root, &drafts)?;
-    let bytes =
-        compile_native_catalog(&curated, NativeCatalogLimits::default()).map_err(map_diagnostic)?;
-    let repeated =
-        compile_native_catalog(&curated, NativeCatalogLimits::default()).map_err(map_diagnostic)?;
+    let limits = NativeCatalogLimits::embedded();
+    let bytes = compile_native_catalog(&curated, limits).map_err(map_diagnostic)?;
+    let repeated = compile_native_catalog(&curated, limits).map_err(map_diagnostic)?;
     if bytes != repeated {
         return Err(input_error(
             "native catalog compiler output is not deterministic",
@@ -698,16 +900,14 @@ fn check_catalog(root: &Path) -> Result<(), Box<dyn Error>> {
     let checksum = checksum_line(&bytes);
     let database_path = root.join(DATABASE_FILE);
     let checksum_path = root.join(CHECKSUM_FILE);
-    let observed_database = read_regular_file_bounded(
-        &database_path,
-        NativeCatalogLimits::default().database_bytes_max,
-    )?;
+    let observed_database = read_regular_file_bounded(&database_path, limits.database_bytes_max)?;
     let observed_checksum = read_regular_file_bounded(&checksum_path, 256)?;
     if observed_database != bytes || observed_checksum != checksum.as_bytes() {
         return Err(input_error(
             "compiled catalog artifacts drifted; run `cargo xtask catalog build`",
         ));
     }
+    NativeCatalogReader::from_bytes(&observed_database, limits).map_err(map_diagnostic)?;
     println!(
         "catalog check: {} curated command(s), {} draft catalog(s), checksum {}",
         curated.commands.len(),
@@ -724,8 +924,9 @@ fn build_catalog(root: &Path) -> Result<(), Box<dyn Error>> {
     let (curated, drafts) = load_and_validate_sources(root, true)?;
     validate_separation(&curated, &drafts)?;
     validate_import_artifacts(root, &drafts)?;
-    let bytes =
-        compile_native_catalog(&curated, NativeCatalogLimits::default()).map_err(map_diagnostic)?;
+    let limits = NativeCatalogLimits::embedded();
+    let bytes = compile_native_catalog(&curated, limits).map_err(map_diagnostic)?;
+    NativeCatalogReader::from_bytes(&bytes, limits).map_err(map_diagnostic)?;
     let checksum = checksum_line(&bytes);
     let generated = root.join(GENERATED_DIRECTORY);
     fs::create_dir_all(&generated)?;
@@ -872,6 +1073,8 @@ fn validate_import_artifacts(root: &Path, drafts: &[NativeCatalog]) -> Result<()
     if manifest.source_url != configuration.source_url
         || manifest.revision != configuration.revision
         || manifest.license != configuration.license
+        || manifest.license_file != configuration.license_file
+        || manifest.license_sha256 != configuration.license_sha256
         || manifest.source_files != configured_files
         || manifest.command_paths != command_paths
         || manifest.command_count != command_count
@@ -882,29 +1085,26 @@ fn validate_import_artifacts(root: &Path, drafts: &[NativeCatalog]) -> Result<()
             "Carapace import manifest drifted from the pinned configuration or draft; rerun the importer and review its semantic diff",
         ));
     }
-    let provenance: serde_json::Value = read_json_bounded(&root.join(PROVENANCE_FILE))?;
-    if provenance
-        .get("source_url")
-        .and_then(serde_json::Value::as_str)
-        != Some(configuration.source_url.as_str())
-        || provenance
-            .get("revision")
-            .and_then(serde_json::Value::as_str)
-            != Some(configuration.revision.as_str())
-        || provenance
-            .get("license")
-            .and_then(serde_json::Value::as_str)
-            != Some(configuration.license.as_str())
+    let provenance: ProvenanceRecord = read_json_bounded(&root.join(PROVENANCE_FILE))?;
+    if provenance.source_url != configuration.source_url
+        || provenance.revision != configuration.revision
+        || provenance.license != configuration.license
+        || provenance.license_file != LICENSE_FILE
+        || provenance.license_sha256 != configuration.license_sha256
+        || provenance.import_policy.trim().is_empty()
+        || provenance.curation.trim().is_empty()
     {
         return Err(input_error(
             "catalog/provenance/carapace.json does not match the pinned import configuration",
         ));
     }
     let license = read_regular_file_bounded(&root.join(LICENSE_FILE), 64 * 1024)?;
-    if !license.starts_with(b"MIT License\n")
-        || !license.windows(14).any(|part| part == b"Copyright (c) ")
-    {
-        return Err(input_error("retained Carapace MIT license is incomplete"));
+    let observed_license = sha256_hex(&license);
+    if observed_license != configuration.license_sha256.to_ascii_lowercase() {
+        return Err(input_error(format!(
+            "retained Carapace license checksum mismatch: expected {}, observed {observed_license}",
+            configuration.license_sha256
+        )));
     }
     Ok(())
 }
@@ -1129,12 +1329,17 @@ fn catalog_statistics(catalog: &NativeCatalog) -> (Vec<String>, usize, usize) {
 }
 
 fn checksum_line(bytes: &[u8]) -> String {
+    let mut output = sha256_hex(bytes);
+    output.push_str("  catalog.sqlite3\n");
+    output
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut output = String::with_capacity(64 + "  catalog.sqlite3\n".len());
     for byte in digest {
         let _ = write!(output, "{byte:02x}");
     }
-    output.push_str("  catalog.sqlite3\n");
     output
 }
 
@@ -1240,18 +1445,11 @@ fn read_json_bounded<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Box
 
 fn read_regular_file_bounded(path: &Path, bytes_max: usize) -> Result<Vec<u8>, Box<dyn Error>> {
     let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() {
-        return Err(input_error(format!(
-            "input is not a regular file: {}",
-            path.display()
-        )));
-    }
+    validate_input_metadata(path, &metadata, bytes_max)?;
     let observed = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
-    if observed > bytes_max {
-        return Err(resource_error("input file bytes", bytes_max, observed));
-    }
     let mut file = File::open(path)?;
     let handle_metadata = file.metadata()?;
+    validate_input_metadata(path, &handle_metadata, bytes_max)?;
     if !same_file_metadata(&metadata, &handle_metadata) {
         return Err(input_error(format!(
             "input path changed while opening: {}",
@@ -1270,6 +1468,7 @@ fn read_regular_file_bounded(path: &Path, bytes_max: usize) -> Result<Vec<u8>, B
         return Err(resource_error("input file bytes", bytes_max, bytes.len()));
     }
     let final_metadata = fs::symlink_metadata(path)?;
+    validate_input_metadata(path, &final_metadata, bytes_max)?;
     if !same_file_metadata(&metadata, &final_metadata) {
         return Err(input_error(format!(
             "input path changed while reading: {}",
@@ -1277,6 +1476,42 @@ fn read_regular_file_bounded(path: &Path, bytes_max: usize) -> Result<Vec<u8>, B
         )));
     }
     Ok(bytes)
+}
+
+fn validate_input_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    bytes_max: usize,
+) -> Result<(), Box<dyn Error>> {
+    if !metadata.file_type().is_file() {
+        return Err(input_error(format!(
+            "input is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let observed = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    if observed > bytes_max {
+        return Err(resource_error("input file bytes", bytes_max, observed));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(input_error(format!(
+                "input has {} hard links: {}",
+                metadata.nlink(),
+                path.display()
+            )));
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(input_error(format!(
+                "input has unsafe mode {mode:#o}: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1332,6 +1567,91 @@ fn checkout_revision(source: &Path) -> Result<String, Box<dyn Error>> {
     Ok(revision.to_ascii_lowercase())
 }
 
+fn verify_checkout_sources(
+    source: &Path,
+    revision: &str,
+    configuration: &ImportConfiguration,
+) -> Result<(), Box<dyn Error>> {
+    let mut files = configuration
+        .roots
+        .iter()
+        .flat_map(|root| root.files.iter().map(String::as_str))
+        .chain(std::iter::once(configuration.license_file.as_str()))
+        .collect::<Vec<_>>();
+    files.sort();
+    for relative in &files {
+        let object = format!("{revision}:{relative}");
+        let arguments = vec!["cat-file".to_owned(), "-e".to_owned(), object];
+        let status = run_bounded_git(source, &arguments)?;
+        if !status.success() {
+            return Err(input_error(format!(
+                "manifest-listed Carapace source is absent from pinned revision: {relative}"
+            )));
+        }
+    }
+
+    let mut arguments = vec![
+        "diff".to_owned(),
+        "--no-ext-diff".to_owned(),
+        "--no-textconv".to_owned(),
+        "--quiet".to_owned(),
+        revision.to_owned(),
+        "--".to_owned(),
+    ];
+    arguments.extend(files.into_iter().map(str::to_owned));
+    let status = run_bounded_git(source, &arguments)?;
+    if status.success() {
+        return Ok(());
+    }
+    if status.code() == Some(1) {
+        return Err(input_error(
+            "manifest-listed Carapace sources differ from the pinned revision",
+        ));
+    }
+    Err(input_error(format!(
+        "could not verify manifest-listed Carapace sources at the pinned revision: {status}"
+    )))
+}
+
+fn run_bounded_git(source: &Path, arguments: &[String]) -> Result<ExitStatus, Box<dyn Error>> {
+    let mut child = Command::new("git")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .arg("-C")
+        .arg(source)
+        .args(arguments)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(input_error(format!(
+                "Git checkout verification exceeded {} seconds",
+                GIT_TIMEOUT.as_secs()
+            )));
+        }
+        // Git receives no stdin and cannot invoke external diff, hooks, or an
+        // fsmonitor; this short poll makes cancellation and reaping explicit.
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn validate_revision(revision: &str) -> Result<(), Box<dyn Error>> {
     if revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
@@ -1359,7 +1679,9 @@ fn parse_platforms(values: &[String]) -> Result<Vec<NativePlatform>, Box<dyn Err
         platforms.push(platform);
     }
     platforms.sort_unstable();
-    platforms.dedup();
+    if platforms.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(input_error("duplicate import platform"));
+    }
     if platforms.contains(&NativePlatform::Any) && platforms.len() != 1 {
         return Err(input_error(
             "platform any cannot be combined with specific platforms",
@@ -1370,13 +1692,24 @@ fn parse_platforms(values: &[String]) -> Result<Vec<NativePlatform>, Box<dyn Err
 
 fn validate_relative_source_path(value: &str) -> Result<(), Box<dyn Error>> {
     let path = Path::new(value);
-    if path.extension() != Some(OsStr::new("go"))
+    validate_normalized_relative_path(value, "Carapace source path")?;
+    if path.extension() != Some(OsStr::new("go")) {
+        return Err(input_error(format!(
+            "Carapace source path must be a normalized relative .go path: {value}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_normalized_relative_path(value: &str, label: &str) -> Result<(), Box<dyn Error>> {
+    let path = Path::new(value);
+    if path.as_os_str().is_empty()
         || path
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(input_error(format!(
-            "Carapace source path must be a normalized relative .go path: {value}"
+            "{label} must be a normalized relative path: {value}"
         )));
     }
     Ok(())
@@ -1604,7 +1937,7 @@ mod tests {
         }
     }
 
-    fn prepare_import_workspace() -> (TestDirectory, PathBuf, Vec<u8>) {
+    fn prepare_import_workspace() -> (TestDirectory, PathBuf, Vec<u8>, String) {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -1618,10 +1951,46 @@ mod tests {
         let curated_path = catalog_root.join("curated/native.kdl");
         fs::write(&curated_path, curated).unwrap();
         let curated_before = fs::read(&curated_path).unwrap();
+        let source = directory.0.join("carapace");
+        let source_file = source.join("completers/common/fd_completer/cmd/root.go");
+        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        fs::copy(fixture.join("fd-root.go"), source_file).unwrap();
+        fs::copy(fixture.join("LICENSE"), source.join("LICENSE")).unwrap();
+        for arguments in [
+            vec!["init".to_owned(), "--quiet".to_owned()],
+            vec!["add".to_owned(), ".".to_owned()],
+            vec![
+                "-c".to_owned(),
+                "user.name=Quirl test".to_owned(),
+                "-c".to_owned(),
+                "user.email=quirl@example.invalid".to_owned(),
+                "commit".to_owned(),
+                "--quiet".to_owned(),
+                "-m".to_owned(),
+                "fixture".to_owned(),
+            ],
+        ] {
+            assert!(run_bounded_git(&source, &arguments).unwrap().success());
+        }
+        let head = fs::read_to_string(source.join(".git/HEAD")).unwrap();
+        let reference = head.trim().strip_prefix("ref: ").unwrap();
+        let revision = fs::read_to_string(source.join(".git").join(reference))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let detach = vec![
+            "switch".to_owned(),
+            "--detach".to_owned(),
+            "--quiet".to_owned(),
+            revision.clone(),
+        ];
+        assert!(run_bounded_git(&source, &detach).unwrap().success());
         let configuration = serde_json::json!({
             "source_url": "https://github.com/carapace-sh/carapace-bin",
-            "revision": REVISION,
+            "revision": revision,
             "license": "MIT",
+            "license_file": "LICENSE",
+            "license_sha256": "25dbdc5c4265ee2983e2b2cd0b5073df0a24aecc0de14a49d01ec9c702f7f22c",
             "author": "Carapace contributors",
             "roots": [{
                 "variable": "rootCmd",
@@ -1634,14 +2003,7 @@ mod tests {
             serde_json::to_vec_pretty(&configuration).unwrap(),
         )
         .unwrap();
-
-        let source = directory.0.join("carapace");
-        let source_file = source.join("completers/common/fd_completer/cmd/root.go");
-        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
-        fs::copy(fixture.join("fd-root.go"), source_file).unwrap();
-        fs::create_dir(source.join(".git")).unwrap();
-        fs::write(source.join(".git/HEAD"), format!("{REVISION}\n")).unwrap();
-        (directory, source, curated_before)
+        (directory, source, curated_before, revision)
     }
 
     #[test]
@@ -1715,6 +2077,99 @@ func init() {
                 .to_string()
                 .contains("unsupported Cobra flag method Uint")
         );
+    }
+
+    #[test]
+    fn parser_rejects_duplicate_flags_instead_of_silently_dropping_one() {
+        let source = r#"
+var rootCmd = &cobra.Command{
+    Use: "tool",
+    Short: "Tool",
+}
+func init() {
+    rootCmd.Flags().Bool("verbose", false, "First")
+    rootCmd.Flags().Bool("verbose", false, "Second")
+}
+"#;
+        let error = parse_go_file(source, "duplicate.go").unwrap_err();
+        assert!(error.to_string().contains("duplicate imported flag"));
+    }
+
+    #[test]
+    fn parser_ignores_commented_out_go_constructs() {
+        let source = r#"
+/*
+var fakeCmd = &cobra.Command{
+    Use: "fake",
+    Short: "Fake",
+}
+fakeCmd.Flags().Bool("fabricated", false, "Fabricated")
+*/
+var rootCmd = &cobra.Command{
+    Use: "tool",
+    Short: "Tool",
+}
+// rootCmd.Flags().Bool("commented", false, "Commented")
+func init() {
+    rootCmd.Flags().Bool("real", false, "Real")
+}
+"#;
+        let parsed = parse_go_file(source, "comments.go").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].command.name, "tool");
+        assert_eq!(parsed[0].command.flags[0].long, "--real");
+    }
+
+    #[test]
+    fn completion_actions_are_scoped_to_their_cobra_command() {
+        let source = r#"
+var firstCmd = &cobra.Command{
+    Use: "first",
+    Short: "First",
+}
+var secondCmd = &cobra.Command{
+    Use: "second",
+    Short: "Second",
+}
+func init() {
+    firstCmd.Flags().String("path", "", "First path")
+    secondCmd.Flags().String("path", "", "Second path")
+    carapace.Gen(firstCmd).FlagCompletion(carapace.ActionMap{
+        "path": carapace.ActionFiles(),
+    })
+}
+"#;
+        let parsed = parse_go_file(source, "scoped.go").unwrap();
+        let first = parsed
+            .iter()
+            .find(|command| command.variable == "firstCmd")
+            .unwrap();
+        let second = parsed
+            .iter()
+            .find(|command| command.variable == "secondCmd")
+            .unwrap();
+        assert_eq!(
+            first.command.flags[0].action,
+            Some(NativeCompletionAction::Files)
+        );
+        assert_eq!(second.command.flags[0].action, None);
+    }
+
+    #[test]
+    fn positional_completion_is_recorded_as_an_omission_not_invented_metadata() {
+        let source = r#"
+var rootCmd = &cobra.Command{
+    Use: "tool",
+    Short: "Tool",
+}
+func init() {
+    carapace.Gen(rootCmd).PositionalAnyCompletion(carapace.ActionFiles())
+}
+"#;
+        let parsed = parse_go_file(source, "positionals.go").unwrap();
+        assert!(parsed[0].command.arguments.is_empty());
+        assert_eq!(parsed[0].omitted_constructs.len(), 1);
+        assert!(parsed[0].omitted_constructs[0].contains("PositionalAnyCompletion"));
     }
 
     #[test]
@@ -1804,12 +2259,12 @@ func init() {
 
     #[test]
     fn importer_e2e_is_deterministic_and_preserves_curated_source() {
-        let (directory, source, curated_before) = prepare_import_workspace();
-        import_carapace(&directory.0, &source, REVISION).unwrap();
-        import_carapace(&directory.0, &source, REVISION).unwrap();
+        let (directory, source, curated_before, revision) = prepare_import_workspace();
+        import_carapace(&directory.0, &source, &revision).unwrap();
+        import_carapace(&directory.0, &source, &revision).unwrap();
         let draft_second = fs::read(directory.0.join(DRAFT_FILE)).unwrap();
         let manifest_second = fs::read(directory.0.join(DRAFT_MANIFEST_FILE)).unwrap();
-        import_carapace(&directory.0, &source, REVISION).unwrap();
+        import_carapace(&directory.0, &source, &revision).unwrap();
         assert_eq!(
             fs::read(directory.0.join(DRAFT_FILE)).unwrap(),
             draft_second
@@ -1824,11 +2279,12 @@ func init() {
         );
         let manifest: ImportManifest = serde_json::from_slice(&manifest_second).unwrap();
         assert!(manifest.semantic_diff.is_empty());
+        assert_eq!(manifest.omitted_constructs.len(), 1);
     }
 
     #[test]
     fn importer_rejects_a_revision_other_than_the_explicit_pin() {
-        let (directory, source, curated_before) = prepare_import_workspace();
+        let (directory, source, curated_before, _revision) = prepare_import_workspace();
         let wrong_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let error = import_carapace(&directory.0, &source, wrong_revision).unwrap_err();
         assert!(error.to_string().contains("does not match pinned revision"));
@@ -1837,5 +2293,47 @@ func init() {
             fs::read(directory.0.join("catalog/curated/native.kdl")).unwrap(),
             curated_before
         );
+    }
+
+    #[test]
+    fn importer_rejects_dirty_manifest_listed_sources() {
+        let (directory, source, curated_before, revision) = prepare_import_workspace();
+        let source_file = source.join("completers/common/fd_completer/cmd/root.go");
+        let mut modified = fs::read(&source_file).unwrap();
+        modified.extend_from_slice(b"\n// modified after checkout\n");
+        fs::write(&source_file, modified).unwrap();
+        let error = import_carapace(&directory.0, &source, &revision).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("differ from the pinned revision")
+        );
+        assert!(!directory.0.join(DRAFT_FILE).exists());
+        assert_eq!(
+            fs::read(directory.0.join("catalog/curated/native.kdl")).unwrap(),
+            curated_before
+        );
+    }
+
+    #[test]
+    fn importer_rejects_a_license_outside_the_reviewed_digest() {
+        let (directory, source, _curated_before, _revision) = prepare_import_workspace();
+        let configuration: ImportConfiguration =
+            read_json_bounded(&directory.0.join(IMPORT_CONFIGURATION)).unwrap();
+        fs::write(source.join("LICENSE"), b"MIT License\ntruncated\n").unwrap();
+        let error = validate_upstream_license(&source, &configuration).unwrap_err();
+        assert!(error.to_string().contains("license checksum mismatch"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn importer_file_admission_rejects_hard_links() {
+        let directory = TestDirectory::new("hard-link");
+        let source = directory.0.join("source.go");
+        let alias = directory.0.join("alias.go");
+        fs::write(&source, b"package cmd\n").unwrap();
+        fs::hard_link(&source, &alias).unwrap();
+        let error = read_regular_file_bounded(&source, 1024).unwrap_err();
+        assert!(error.to_string().contains("hard links"));
     }
 }

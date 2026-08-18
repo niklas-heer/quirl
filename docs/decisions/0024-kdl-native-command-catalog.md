@@ -144,10 +144,14 @@ Draft generation and curated maintenance are separate states:
 1. Update the importer pin to an immutable Carapace revision in the tooling's
    reviewed pin source. Do not use a floating branch, tag resolution at runtime,
    or an unrecorded local checkout.
-2. Fetch or provide that exact source through the build-time tooling and verify
-   its expected identity before parsing it.
+2. Fetch or provide that exact source through the build-time tooling. Verify a
+   detached HEAD and prove every manifest-listed file is tracked by and
+   byte-clean against that exact commit before parsing it. Match the upstream
+   and retained license text to the reviewed cryptographic digest.
 3. Import selected commands into a separate draft area under all importer
-   bounds. A partial import is a failure and cannot modify curated KDL.
+   bounds. Record unsupported constructs explicitly rather than inventing
+   required metadata or silently assigning facts across commands. A partial
+   import is a failure and cannot modify curated KDL.
 4. Format the draft canonically, then review the KDL diff for schema meaning,
    command version, flag/argument shape, aliases, platform scope, completion
    actions, intent wording, provenance, and license obligations.

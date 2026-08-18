@@ -58,6 +58,5 @@ catalog "carapace-draft" {
         flag "--type" summary="Filter by type" description="Filter by type" short="-t" value="value"
         flag "--unrestricted" summary="Unrestricted Search" description="Unrestricted Search" short="-u"
         flag "--version" summary="Prints version information" description="Prints version information" short="-V"
-        argument "values" summary="Additional values" description="Additional positional values accepted by the command." repeatable=#true action="directories"
     }
 }

@@ -435,7 +435,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
         Some(Command::Doc { command }) => author::doc(command, &load_composed_catalog()?),
         Some(Command::Lsp) => lsp::execute(load_composed_catalog()?),
         Some(Command::Serve { command }) => {
-            mcp::execute(command, native_catalog::builtin_native_catalog()?)
+            mcp::execute(command, native_catalog::builtin_native_catalog())
         }
         Some(Command::Index { command }) => index::execute(command),
         Some(Command::Complete { input, format }) => {
@@ -481,7 +481,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
 
 fn load_composed_catalog() -> Result<Catalog, ShellError> {
     let mut catalog = index::load_default_catalog();
-    native_catalog::merge_embedded(&mut catalog)?;
+    native_catalog::merge_embedded(&mut catalog);
     merge_installed_catalog_snapshot(&mut catalog)?;
     Ok(catalog)
 }

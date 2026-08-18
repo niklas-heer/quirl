@@ -210,6 +210,12 @@ Callers may lower defaults but cannot set zero or exceed the hard maximum. The
 same limit object applies to parse, typed validation, compilation, publication,
 opening, and query operations.
 
+The checked-in embedded artifact uses the public `NativeCatalogLimits::embedded`
+profile: 2 MiB of database bytes, 2,048 commands, 8,192 flags, 8,192 arguments,
+and 24,576 semantic documents, with the other defaults below unchanged. Both
+`xtask` and the CLI use that one profile, so CI cannot accept an artifact that
+the executable will reject for exceeding a duplicated lower limit.
+
 | Resource | Default | Hard maximum | Enforcement |
 | --- | ---: | ---: | --- |
 | KDL source bytes | 1 MiB | 4 MiB | Before KDL parsing. |
@@ -291,10 +297,11 @@ execute a candidate.
 ## Publication, artifacts, and cleanup
 
 Publication compiles and validates in memory before creating a staging file.
-The destination parent must already be a directory. Existing destinations must
-be admitted regular, unlinked, bounded, permission-safe databases; on Unix,
-group/other writable modes and link counts other than one are rejected.
-Path/handle identity is checked across reading.
+The destination parent must already be a directory and, on Unix, must not be
+group- or other-writable. Existing destinations must be admitted regular,
+unlinked, bounded, permission-safe databases; on Unix, group/other writable
+modes and link counts other than one are rejected. Path/handle identity, size,
+modification time, link count, type, and permissions are checked across reading.
 
 The publisher creates a unique sibling with exclusive creation and Unix mode
 `0600`, writes and content-syncs the complete image, rereads it, and compares
@@ -344,12 +351,18 @@ cargo xtask catalog build
 ```
 
 `import-carapace` requires the revision to match both
-`catalog/carapace-import.json` and the detached local checkout. It atomically
-updates only `catalog/draft`; it refuses any imported root that collides with
-`catalog/curated`. `fmt --check` is non-mutating. `check` validates formatting,
-schema, provenance, license retention, curated/draft separation, generated
-database bytes, and the checksum. `build` atomically refreshes the generated
-SQLite image and checksum from curated KDL only.
+`catalog/carapace-import.json` and the detached local checkout. It also asks
+local Git to prove that every manifest-listed file exists at that commit and
+has no worktree changes; Git is bounded to ten seconds and upstream code is
+never executed. The upstream and retained license files must both match the
+reviewed SHA-256 pin. Unsupported completion constructs are omitted rather than
+invented and are listed explicitly in `carapace.import.json` for review. The
+operation updates only `catalog/draft` and refuses any imported root that
+collides with `catalog/curated`. `fmt --check` is non-mutating. `check` validates
+formatting, schema, provenance, license retention, curated/draft separation,
+generated database bytes, the checksum, and hardened-reader admission using the
+same embedded limits as runtime. `build` refreshes the generated SQLite image
+and checksum from curated KDL only.
 
 ## Runtime lookup and fallback
 
@@ -367,12 +380,12 @@ completion, help and docs, agent discovery, LSP, and the capability-limited MCP
 catalog. Closed completion actions remain inert provider identities; the catalog
 never contains or executes provider code.
 
-The embedded artifact is a required product input. Corruption, incompatibility,
-projection mismatch, or a compiled resource-limit violation is an actionable
-startup error and a build/test failure, not optional knowledge that is silently
-dropped. This is separate from ADR 0021's mutable local intelligence database:
-missing, unsafe, oversized, corrupt, or incompatible local cache data still
-falls back to current builtins plus the admitted embedded native catalog.
+The embedded artifact is a required build and release input. Corruption,
+incompatibility, projection mismatch, or a compiled resource-limit violation is
+an actionable loader diagnostic and a build/test failure. At runtime it remains
+unavailable knowledge rather than startup authority: composition omits the
+native projection and continues with builtins plus any independently admitted
+local intelligence. It never invokes Carapace or parses KDL as a fallback.
 
 ## Composed semantic catalog schema v4
 
