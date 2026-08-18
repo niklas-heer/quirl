@@ -15,6 +15,7 @@ mod intelligence;
 mod lsp;
 mod lua_worker;
 mod mcp;
+mod native_catalog;
 mod package;
 mod pick;
 mod platform;
@@ -433,11 +434,12 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
         Some(Command::Describe { command }) => author::describe(command, &load_composed_catalog()?),
         Some(Command::Doc { command }) => author::doc(command, &load_composed_catalog()?),
         Some(Command::Lsp) => lsp::execute(load_composed_catalog()?),
-        Some(Command::Serve { command }) => mcp::execute(command),
+        Some(Command::Serve { command }) => {
+            mcp::execute(command, native_catalog::builtin_native_catalog()?)
+        }
         Some(Command::Index { command }) => index::execute(command),
         Some(Command::Complete { input, format }) => {
-            let mut catalog = index::load_default_catalog();
-            merge_installed_catalog_snapshot(&mut catalog)?;
+            let catalog = load_composed_catalog()?;
             let mut extensions = LuaExtensionHost::discover();
             let mut completions = catalog.complete(&input, input.len());
             completions.extend(
@@ -479,6 +481,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
 
 fn load_composed_catalog() -> Result<Catalog, ShellError> {
     let mut catalog = index::load_default_catalog();
+    native_catalog::merge_embedded(&mut catalog)?;
     merge_installed_catalog_snapshot(&mut catalog)?;
     Ok(catalog)
 }

@@ -5,6 +5,10 @@
     reason = "the public inert diagnostic intentionally retains source identity, spans, help, and bounded context inline"
 )]
 
+use crate::{
+    ArgumentKind, ArgumentSpec, CommandSpec, CompletionSource, Confidence, Effect, IoContract,
+    Provenance, ProvenanceInfo, Trust,
+};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 use rusqlite::{Connection, MAIN_DB, Transaction, limits::Limit, params, serialize::Data};
 use serde::{Deserialize, Serialize};
@@ -295,6 +299,30 @@ impl NativeCompletionAction {
             Self::Groups => "groups",
             Self::Hostnames => "hostnames",
             Self::EnvironmentVariables => "environment_variables",
+        }
+    }
+
+    fn provider_identity(self) -> &'static str {
+        match self {
+            Self::Files => "quirl.native.files",
+            Self::Directories => "quirl.native.directories",
+            Self::Executables => "quirl.native.executables",
+            Self::Users => "quirl.native.users",
+            Self::Groups => "quirl.native.groups",
+            Self::Hostnames => "quirl.native.hostnames",
+            Self::EnvironmentVariables => "quirl.native.environment_variables",
+        }
+    }
+
+    fn value_type(self) -> &'static str {
+        match self {
+            Self::Files => "Path",
+            Self::Directories => "Directory",
+            Self::Executables => "Executable",
+            Self::Users => "User",
+            Self::Groups => "Group",
+            Self::Hostnames => "Hostname",
+            Self::EnvironmentVariables => "EnvironmentVariable",
         }
     }
 }
@@ -2254,6 +2282,68 @@ impl NativeCatalogReader {
         &self.snapshot
     }
 
+    /// Project the validated native tree into Quirl's shared semantic catalog model.
+    ///
+    /// Commands outside `platform` are omitted together with their descendants.
+    /// Curated facts use high-confidence declared provenance, so exact builtin and
+    /// trusted-plugin records retain precedence when callers merge this result.
+    /// Completion actions become inert provider identities; projection and ordinary
+    /// catalog lookup never execute a provider or catalog-supplied code.
+    pub fn project_commands(&self, platform: NativePlatform) -> Vec<CommandSpec> {
+        let provenance = native_provenance(&self.snapshot);
+        let mut projected = Vec::new();
+        let mut stack = self
+            .snapshot
+            .commands
+            .iter()
+            .rev()
+            .map(|command| (command, None::<String>, None::<String>))
+            .collect::<Vec<_>>();
+        while let Some((command, parent_path, parent_id)) = stack.pop() {
+            if !native_command_supports(command, platform) {
+                continue;
+            }
+            let path = parent_path.as_ref().map_or_else(
+                || command.name.clone(),
+                |parent| format!("{parent} {}", command.name),
+            );
+            let id = format!("native:{}:{path}", self.snapshot.name);
+            let options = native_arguments(command, &provenance);
+            projected.push(CommandSpec {
+                id: id.clone(),
+                version: Some(self.snapshot.provenance.revision.clone()),
+                path: path.clone(),
+                aliases: command
+                    .aliases
+                    .iter()
+                    .map(|alias| {
+                        parent_path
+                            .as_ref()
+                            .map_or_else(|| alias.clone(), |parent| format!("{parent} {alias}"))
+                    })
+                    .collect(),
+                parent: parent_id,
+                signature: native_signature(&path, &options),
+                summary: command.summary.clone(),
+                details: native_details(command),
+                options,
+                examples: Vec::new(),
+                io: IoContract::default(),
+                effects: Vec::<Effect>::new(),
+                exit_codes: BTreeMap::new(),
+                provenance: provenance.clone(),
+            });
+            stack.extend(
+                command
+                    .subcommands
+                    .iter()
+                    .rev()
+                    .map(|child| (child, Some(path.clone()), Some(id.clone()))),
+            );
+        }
+        projected
+    }
+
     /// Query root or nested child-command tokens for one platform.
     pub fn subcommands(
         &self,
@@ -2559,6 +2649,115 @@ impl NativeCatalogReader {
 
     fn query_error(&self, action: &str, error: impl fmt::Display) -> NativeCatalogDiagnostic {
         database_diagnostic("<native catalog database>", action, error)
+    }
+}
+
+fn native_provenance(catalog: &NativeCatalog) -> ProvenanceInfo {
+    ProvenanceInfo {
+        source: Provenance::External,
+        confidence: Confidence::High,
+        trust: Trust::Declared,
+        origin: Some(catalog.provenance.source_url.clone()),
+        fingerprint: Some(catalog.provenance.revision.clone()),
+        generated_at: None,
+    }
+}
+
+fn native_command_supports(command: &NativeCommand, platform: NativePlatform) -> bool {
+    command.platforms.contains(&NativePlatform::Any) || command.platforms.contains(&platform)
+}
+
+fn native_arguments(command: &NativeCommand, provenance: &ProvenanceInfo) -> Vec<ArgumentSpec> {
+    let flags = command.flags.iter().map(|flag| {
+        let action = flag.action;
+        ArgumentSpec {
+            names: flag
+                .short
+                .iter()
+                .cloned()
+                .chain(std::iter::once(flag.long.clone()))
+                .collect(),
+            kind: if flag.value_name.is_some() {
+                ArgumentKind::Option
+            } else {
+                ArgumentKind::Flag
+            },
+            value_type: action.map_or_else(
+                || flag.value_name.clone().unwrap_or_else(|| "Bool".to_owned()),
+                |action| action.value_type().to_owned(),
+            ),
+            required: flag.required,
+            repeatable: flag.repeatable,
+            values: action.map(|action| CompletionSource::Dynamic {
+                provider: action.provider_identity().to_owned(),
+            }),
+            conflicts: Vec::new(),
+            documentation: native_documentation(&flag.summary, &flag.description),
+            examples: Vec::new(),
+            provenance: provenance.clone(),
+        }
+    });
+    let positional = command.arguments.iter().map(|argument| {
+        let action = argument.action;
+        ArgumentSpec {
+            names: vec![argument.name.clone()],
+            kind: ArgumentKind::Positional,
+            value_type: action
+                .map_or("String", NativeCompletionAction::value_type)
+                .to_owned(),
+            required: argument.required,
+            repeatable: argument.repeatable,
+            values: action.map(|action| CompletionSource::Dynamic {
+                provider: action.provider_identity().to_owned(),
+            }),
+            conflicts: Vec::new(),
+            documentation: native_documentation(&argument.summary, &argument.description),
+            examples: Vec::new(),
+            provenance: provenance.clone(),
+        }
+    });
+    flags.chain(positional).collect()
+}
+
+fn native_signature(path: &str, arguments: &[ArgumentSpec]) -> String {
+    let mut signature = path.to_owned();
+    for argument in arguments {
+        let name = argument.names.last().map_or("value", String::as_str);
+        let value = match argument.kind {
+            ArgumentKind::Flag => name.to_owned(),
+            ArgumentKind::Option => format!("{name} <{}>", argument.value_type),
+            ArgumentKind::Positional => format!("<{}>", name),
+        };
+        let value = if argument.repeatable {
+            format!("{value}...")
+        } else {
+            value
+        };
+        if argument.required {
+            signature.push_str(&format!(" {value}"));
+        } else {
+            signature.push_str(&format!(" [{value}]"));
+        }
+    }
+    signature
+}
+
+fn native_details(command: &NativeCommand) -> String {
+    if command.intents.is_empty() {
+        return command.description.clone();
+    }
+    format!(
+        "{}\n\nRelated intents: {}.",
+        command.description,
+        command.intents.join("; ")
+    )
+}
+
+fn native_documentation(summary: &str, description: &str) -> String {
+    if summary == description {
+        summary.to_owned()
+    } else {
+        format!("{summary} {description}")
     }
 }
 

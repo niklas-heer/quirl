@@ -353,18 +353,26 @@ SQLite image and checksum from curated KDL only.
 
 ## Runtime lookup and fallback
 
-The composition root selects curated facts by the reader's effective platform
-projection and then normalizes admitted facts into the composed command
-intelligence graph. Curated external facts do not overwrite exact Quirl builtin
-contracts or trusted plugin declarations merely because names collide; normal
-schema-v4 provenance and deterministic merge policy still apply.
+The checked-in SQLite image is compiled into the Quirl executable. At first use,
+the composition root opens and validates a bounded in-memory copy through
+`NativeCatalogReader`, selects the compile target's effective platform, and
+normalizes admitted facts into the schema-v4 command graph. No runtime path reads
+KDL, invokes Carapace, downloads a replacement, or opens a native-catalog file.
 
-A missing, unsafe, oversized, corrupt, incompatible, projection-mismatched, or
-wrong-platform native database is treated as unavailable optional knowledge.
-Quirl retains `Catalog::builtin()` and the bounded local discovery/intelligence
-cache. It does not parse draft KDL, download a replacement, invoke Carapace, or
-weaken database checks on the interactive path. Failure must not block startup,
-execution, cancellation, terminal restoration, or clean shutdown.
+Curated external facts are declared, high-confidence metadata. Exact Quirl
+builtin contracts and trusted plugin declarations therefore retain precedence
+when names collide; mutable local intelligence already admitted at equal or
+greater confidence also remains authoritative. The same composed records feed
+completion, help and docs, agent discovery, LSP, and the capability-limited MCP
+catalog. Closed completion actions remain inert provider identities; the catalog
+never contains or executes provider code.
+
+The embedded artifact is a required product input. Corruption, incompatibility,
+projection mismatch, or a compiled resource-limit violation is an actionable
+startup error and a build/test failure, not optional knowledge that is silently
+dropped. This is separate from ADR 0021's mutable local intelligence database:
+missing, unsafe, oversized, corrupt, or incompatible local cache data still
+falls back to current builtins plus the admitted embedded native catalog.
 
 ## Composed semantic catalog schema v4
 

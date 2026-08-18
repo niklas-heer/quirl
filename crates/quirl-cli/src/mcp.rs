@@ -53,12 +53,12 @@ impl McpCapability {
     }
 }
 
-pub fn execute(command: ServeCommand) -> Result<i32, ShellError> {
+pub fn execute(command: ServeCommand, catalog: Catalog) -> Result<i32, ShellError> {
     match command {
         ServeCommand::Mcp { capabilities } => {
             let stdin = io::stdin();
             let stdout = io::stdout();
-            serve(&mut stdin.lock(), &mut stdout.lock(), capabilities)?;
+            serve(&mut stdin.lock(), &mut stdout.lock(), capabilities, catalog)?;
             Ok(0)
         }
     }
@@ -68,8 +68,9 @@ fn serve(
     reader: &mut impl BufRead,
     writer: &mut impl Write,
     capabilities: Vec<McpCapability>,
+    catalog: Catalog,
 ) -> Result<(), ShellError> {
-    let mut server = McpServer::new(capabilities);
+    let mut server = McpServer::new(capabilities, catalog);
     while let Some(bytes) = read_message(reader)? {
         if bytes.is_empty() {
             continue;
@@ -104,15 +105,16 @@ struct McpServer {
 }
 
 impl McpServer {
-    fn new(mut capabilities: Vec<McpCapability>) -> Self {
+    fn new(mut capabilities: Vec<McpCapability>, catalog: Catalog) -> Self {
         capabilities.sort();
         capabilities.dedup();
         Self {
             era: None,
             capabilities,
-            // Plugins and user configuration are intentionally not loaded: an
-            // MCP process is an authority boundary, not an interactive shell.
-            catalog: Catalog::builtin(),
+            // Plugins, mutable cache data, and user configuration are intentionally
+            // not loaded: an MCP process is an authority boundary. The caller may
+            // supply only immutable compiled command metadata.
+            catalog,
         }
     }
 
@@ -554,12 +556,12 @@ fn tool_definition(capability: McpCapability) -> Value {
     match capability {
         McpCapability::Catalog => json!({
             "name": "quirl_catalog",
-            "description": "Return Quirl's deterministic built-in semantic catalog.",
+            "description": "Return Quirl's deterministic immutable compiled semantic catalog.",
             "inputSchema": { "type": "object", "additionalProperties": false }
         }),
         McpCapability::Complete => json!({
             "name": "quirl_complete",
-            "description": "Return deterministic built-in catalog completions for bounded input.",
+            "description": "Return deterministic compiled catalog completions for bounded input.",
             "inputSchema": { "type": "object", "additionalProperties": false,
                 "properties": { "input": { "type": "string", "maxLength": MAX_TOOL_INPUT_BYTES }, "cursor": { "type": "integer", "minimum": 0 } },
                 "required": ["input"] }
@@ -703,7 +705,7 @@ mod tests {
     }
 
     fn initialized_server(capabilities: Vec<McpCapability>) -> McpServer {
-        let mut server = McpServer::new(capabilities);
+        let mut server = McpServer::new(capabilities, Catalog::builtin());
         let response = server.handle_bytes(
             request(
                 1,
@@ -717,9 +719,16 @@ mod tests {
     }
 
     #[test]
-    fn mcp_metadata_is_truthfully_builtin_only_and_nonexecuting() {
-        let server = McpServer::new(vec![McpCapability::Catalog]);
-        assert_eq!(server.catalog, Catalog::builtin());
+    fn mcp_metadata_is_truthfully_immutable_and_nonexecuting() {
+        let catalog = crate::native_catalog::builtin_native_catalog().unwrap();
+        let server = McpServer::new(vec![McpCapability::Catalog], catalog.clone());
+        assert_eq!(server.catalog, catalog);
+        assert!(
+            server
+                .catalog
+                .find("docker compose alpha dry-run")
+                .is_some()
+        );
         assert!(
             server
                 .catalog
@@ -731,7 +740,7 @@ mod tests {
 
     #[test]
     fn modern_discovery_requires_metadata_on_every_request_and_stamps_responses() {
-        let mut server = McpServer::new(vec![McpCapability::Catalog]);
+        let mut server = McpServer::new(vec![McpCapability::Catalog], Catalog::builtin());
         let discovery = server
             .handle_bytes(request(1, "server/discover", modern_params(json!({}))).as_bytes())
             .unwrap();
@@ -836,6 +845,7 @@ mod tests {
             &mut Cursor::new(input),
             &mut output,
             vec![McpCapability::Complete],
+            Catalog::builtin(),
         )
         .unwrap();
         let responses = std::str::from_utf8(&output)
@@ -867,6 +877,7 @@ mod tests {
             &mut Cursor::new(input),
             &mut output,
             vec![McpCapability::Catalog],
+            Catalog::builtin(),
         )
         .unwrap();
 
@@ -894,7 +905,7 @@ mod tests {
         assert!(valid_id(&exact_id));
         assert!(!valid_id(&oversized_id));
 
-        let mut exact_server = McpServer::new(vec![McpCapability::Catalog]);
+        let mut exact_server = McpServer::new(vec![McpCapability::Catalog], Catalog::builtin());
         let exact_response = exact_server
             .handle_bytes(
                 json!({
@@ -910,7 +921,7 @@ mod tests {
         assert_eq!(serialized_size(&exact_response.id), MAX_REQUEST_ID_BYTES);
         assert!(exact_response.error.is_none());
 
-        let mut oversized_server = McpServer::new(vec![McpCapability::Catalog]);
+        let mut oversized_server = McpServer::new(vec![McpCapability::Catalog], Catalog::builtin());
         let oversized_response = oversized_server
             .handle_bytes(
                 json!({
@@ -947,6 +958,7 @@ mod tests {
             &mut Cursor::new(Vec::<u8>::new()),
             &mut empty_output,
             vec![McpCapability::Catalog],
+            Catalog::builtin(),
         )
         .unwrap();
         assert!(empty_output.is_empty());
@@ -961,6 +973,7 @@ mod tests {
             &mut Cursor::new(complete),
             &mut complete_output,
             vec![McpCapability::Catalog],
+            Catalog::builtin(),
         )
         .unwrap();
         let complete_response: Value = serde_json::from_slice(&complete_output).unwrap();
@@ -971,6 +984,7 @@ mod tests {
             &mut Cursor::new(b"{\"jsonrpc\":"),
             &mut truncated_output,
             vec![McpCapability::Catalog],
+            Catalog::builtin(),
         )
         .unwrap();
         let truncated_response: Value = serde_json::from_slice(&truncated_output).unwrap();
@@ -989,6 +1003,7 @@ mod tests {
             &mut Cursor::new(input),
             &mut Vec::new(),
             vec![McpCapability::Catalog],
+            Catalog::builtin(),
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
