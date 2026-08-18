@@ -743,7 +743,8 @@ fn ensure_builtin_database(path: &Path) -> Result<bool, ShellError> {
     else {
         return Ok(false);
     };
-    let encoded = intelligence::encode_database(&Catalog::builtin(), None)?;
+    let encoded =
+        intelligence::encode_database(&crate::native_catalog::builtin_native_catalog()?, None)?;
     let parent = index_parent(path);
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -1194,7 +1195,7 @@ fn catalog_from_files_checked(
     budget: &mut IndexBuildBudget,
     mut check_active: impl FnMut() -> Result<(), ShellError>,
 ) -> Result<(Catalog, Vec<ImportDiagnostic>), ShellError> {
-    let mut catalog = Catalog::builtin();
+    let mut catalog = crate::native_catalog::builtin_native_catalog()?;
     let mut diagnostics = Vec::new();
     for path in fish_files {
         check_active()?;
