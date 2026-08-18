@@ -162,7 +162,11 @@ neither path executes one directly.
   flag is shared with every request. Shutdown records cancellation before join;
   the process boundary kills the owned process group, drains bounded pipes,
   reaps the direct child, and returns before its scoped call and catalog worker
-  can join. No CLI code spawns an uncontained completion child.
+  can join. A provider-scoped timeout, malformed frame, excessive output, or
+  spawn failure records an identity-specific negative observation without
+  suppressing the valid base catalog or another provider's result. Global
+  refresh cancellation/deadline and worker panic still abort publication. No
+  CLI code spawns an uncontained completion child.
 - Only Fish and Zsh have executable adapters. Bash is represented in typed
   persistence/composition metadata for a later adapter and cannot be reported
   as a successful runtime provider. Carapace is not a runtime, build, or test

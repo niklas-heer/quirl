@@ -1532,13 +1532,23 @@ fn probe_local_completion_paths(
                     ShellError::new(ErrorCode::Io, "a local completion provider worker panicked")
                         .with_help("Retry; report repeated provider worker failures")
                 })?;
-                outcomes.push((context, result?));
+                outcomes.push((context, result));
             }
             Ok::<_, ShellError>(outcomes)
         })?;
+        // The process boundary uses ResourceLimit for both provider-local
+        // limits and owner cancellation. Recheck the owner state before
+        // isolating errors so shutdown and the catalog deadline still abort.
+        ensure_refresh_active(
+            deadline,
+            &cancelled,
+            "after local completion provider workers",
+        )?;
         for (context, outcome) in outcomes {
             match outcome {
-                ProcessCompletionOutcome::Completed(result) if !result.candidates.is_empty() => {
+                Ok(ProcessCompletionOutcome::Completed(result))
+                    if !result.candidates.is_empty() =>
+                {
                     records.extend(normalize_local_candidates(
                         command_path,
                         &context,
@@ -1547,18 +1557,32 @@ fn probe_local_completion_paths(
                         result.candidates,
                     ));
                 }
-                ProcessCompletionOutcome::Completed(_)
-                | ProcessCompletionOutcome::Unavailable(_) => {
-                    negatives.push(intelligence::LocalNegativeObservation {
-                        command_path: command_path.clone(),
-                        provider: context.identity.provider,
-                        executable_fingerprint: executable_source.fingerprint.clone(),
-                        provider_fingerprint: context.identity.provider_fingerprint.clone(),
-                        cwd_class: intelligence::LocalCwdClass::Any,
-                        environment_fingerprint: context.identity.environment_fingerprint.clone(),
-                        observed_unix_ms: now_unix_ms,
-                    });
+                Ok(ProcessCompletionOutcome::Completed(_))
+                | Ok(ProcessCompletionOutcome::Unavailable(_)) => {
+                    negatives.push(local_negative_observation(
+                        command_path,
+                        &context,
+                        &executable_source.fingerprint,
+                        now_unix_ms,
+                    ));
                 }
+                Err(error)
+                    if matches!(
+                        error.code,
+                        ErrorCode::Io
+                            | ErrorCode::ProcessSpawn
+                            | ErrorCode::Validation
+                            | ErrorCode::ResourceLimit
+                    ) =>
+                {
+                    negatives.push(local_negative_observation(
+                        command_path,
+                        &context,
+                        &executable_source.fingerprint,
+                        now_unix_ms,
+                    ));
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1596,6 +1620,23 @@ fn probe_local_completion_paths(
         changed = true;
     }
     Ok((updated, changed))
+}
+
+fn local_negative_observation(
+    command_path: &[String],
+    context: &LocalProviderContext,
+    executable_fingerprint: &str,
+    observed_unix_ms: u64,
+) -> intelligence::LocalNegativeObservation {
+    intelligence::LocalNegativeObservation {
+        command_path: command_path.to_vec(),
+        provider: context.identity.provider,
+        executable_fingerprint: executable_fingerprint.to_owned(),
+        provider_fingerprint: context.identity.provider_fingerprint.clone(),
+        cwd_class: intelligence::LocalCwdClass::Any,
+        environment_fingerprint: context.identity.environment_fingerprint.clone(),
+        observed_unix_ms,
+    }
 }
 
 fn command_executable_source<'a>(
@@ -3918,6 +3959,69 @@ mod tests {
         assert_eq!(calls, 1);
         assert!(!refresh_with_local(&config).unwrap());
         assert_eq!(fs::read(&marker).unwrap().len(), calls);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_provider_isolated_failure_publishes_base_and_warms_negative_cache() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        let binaries = &config.path_roots[0];
+        let marker = directory.join("malformed-provider-calls");
+        let provider = format!(
+            "#!/bin/sh\nprintf x >> '{}'\nprintf 'QLB10000000300000000ab'\n",
+            marker.display()
+        );
+        let shell = binaries.join("fish");
+        fs::write(&shell, provider).unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&binaries.join("ghq"));
+        fs::write(
+            config.fish_roots[0].join("ghq.fish"),
+            "# malformed dynamic provider fixture\n",
+        )
+        .unwrap();
+
+        assert!(refresh_with_local(&config).unwrap());
+        assert_eq!(fs::read(&marker).unwrap().len(), 1);
+        let bytes = read_index(&config.index_path).unwrap();
+        let (catalog, state_json) =
+            intelligence::decode_database(&bytes, &config.index_path).unwrap();
+        assert!(catalog.find("cd").is_some());
+        assert!(catalog.find("ghq").is_some());
+        let state: DiscoveryState = serde_json::from_str(state_json.as_deref().unwrap()).unwrap();
+        let executable = state
+            .sources
+            .iter()
+            .find(|source| {
+                source.kind == DiscoverySourceKind::PathExecutable
+                    && source.path.file_name().and_then(|name| name.to_str()) == Some("ghq")
+            })
+            .unwrap();
+        let provider = state
+            .local_providers
+            .iter()
+            .find(|provider| provider.provider == intelligence::LocalCompletionProvider::Fish)
+            .unwrap();
+        let overlay = intelligence::read_local_overlay(
+            &bytes,
+            &config.index_path,
+            &intelligence::LocalOverlayQuery {
+                native_catalog_fingerprint: state.native_catalog_identity,
+                executable_fingerprint: executable.fingerprint.clone(),
+                provider_fingerprint: provider.provider_fingerprint.clone(),
+                cwd_class: intelligence::LocalCwdClass::Any,
+                environment_fingerprint: provider.environment_fingerprint.clone(),
+                now_unix_ms: unix_time_ms(),
+            },
+        )
+        .unwrap();
+        assert_eq!(overlay.negative_hits.len(), 1);
+        assert_eq!(overlay.negative_hits[0].command_path, ["ghq"]);
+
+        assert!(!refresh_with_local(&config).unwrap());
+        assert_eq!(fs::read(&marker).unwrap().len(), 1);
         fs::remove_dir_all(directory).unwrap();
     }
 
