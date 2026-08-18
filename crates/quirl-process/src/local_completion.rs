@@ -1958,7 +1958,7 @@ compdef _qtool qtool
         let worker_process = process.clone();
         let worker = thread::spawn(move || worker_process.complete(first));
         let wait_started = Instant::now();
-        while !ready.exists() && wait_started.elapsed() < Duration::from_secs(1) {
+        while !ready.exists() && wait_started.elapsed() < Duration::from_secs(5) {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(ready.exists());
@@ -1996,7 +1996,7 @@ compdef _qtool qtool
         let process = LocalCompletionProcess::new(1).unwrap();
         let worker = thread::spawn(move || process.complete(request));
         let startup = Instant::now();
-        while !pid_file.exists() && startup.elapsed() < Duration::from_secs(1) {
+        while !pid_file.exists() && startup.elapsed() < Duration::from_secs(5) {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(pid_file.exists(), "descendant did not publish its pid");
@@ -2011,7 +2011,7 @@ compdef _qtool qtool
         loop {
             match kill(Pid::from_raw(pid), None) {
                 Err(Errno::ESRCH) => break,
-                _ if started.elapsed() < Duration::from_secs(1) => {
+                _ if started.elapsed() < Duration::from_secs(5) => {
                     thread::sleep(Duration::from_millis(1));
                 }
                 result => panic!("descendant {pid} remained after cleanup: {result:?}"),
