@@ -1,11 +1,11 @@
 # Quirl local retrieval evaluation
 
-This isolated spike measures the production `quirl ai search` command without
-training, downloading, indexing, or executing a returned command. It uses only
-the Python standard library and requires explicit local paths for the Quirl
-binary and SQLite command database. Supplying `--model` is optional; omitting it
-forces the product's deterministic lexical fallback instead of consulting an
-ambient model directory.
+This isolated spike measures the production `quirl ai search` command and can
+reproducibly tune the pinned `potion-base-8M` model's token weights. Evaluation
+uses only the Python standard library and never trains, downloads, indexes, or
+executes a returned command. Training has a separate locked Python 3.12
+environment, performs one pinned and hash-verified dataset download, and remains
+CPU-only.
 
 The v1 fixture defines disjoint command-group splits. Its original evaluation
 queries are not training data, intents, or indexed documents. Before measuring,
@@ -60,6 +60,43 @@ identities for the fixture, binary, database, and optional bounded model tree.
 Version 2 also records the full loaded-model manifest identity and the stored
 embedding generation identity rather than a repository label alone. `quirl ai
 status` must also confirm that network loading is disabled.
+
+## Train a command-retrieval candidate
+
+Read [TRAINING_DESIGN.md](TRAINING_DESIGN.md) before changing the training
+contract. From this directory, reproduce the v1 token-weight sweep with:
+
+```sh
+uv sync --locked
+uv run python -m unittest -v test_train.py
+uv run python train.py \
+  --database ../../target/retrieval-current.sqlite3 \
+  --model "$HOME/.local/share/quirl/models/potion-base-8M" \
+  --fixture fixture-v1.json \
+  --output training-output/current-v1 \
+  --epochs 160
+```
+
+The output path must not already exist. `train.py` admits only the exact pinned
+stock model, holds out the complete `rm`, `rmdir`, and `dig` command groups,
+selects a trial only with a deterministic NL2Bash validation split, and consults
+the Quirl fixture only after selection. It freezes all token vectors and tunes
+one bounded scalar weight per token. Both float32 and int8 exports carry an
+explicit `quirl-model.json`; neither replaces Quirl's automatic default.
+
+To use the int8 experiment, build its embeddings once and pass the same explicit
+path to subsequent commands:
+
+```sh
+export QUIRL_MODEL_PATH="$PWD/training-output/current-v1/selected-int8"
+quirl ai index --format json
+quirl ai search "find the largest files" --format json
+```
+
+The committed [TRAINING_RESULTS.md](TRAINING_RESULTS.md) records the first
+candidate's identities, benchmark deltas, and known regressions. Generated
+models and full reports remain ignored because they are local research
+artifacts, not source or an automatic product default.
 
 ## Bounds and interpretation
 
