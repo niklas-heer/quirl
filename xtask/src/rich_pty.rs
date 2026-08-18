@@ -42,6 +42,8 @@ const CHECK_NAMES: &[&str] = &[
     "cwd-history",
     "retained-output-cycles",
     "external-command-compatibility",
+    "streamed-progress-without-newline",
+    "full-screen-program-takeover",
     "local-completion-discovery",
     "rich-review-regressions",
     "native-job-control",
@@ -440,7 +442,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 19] {
+fn checks() -> [CheckCase; 21] {
     [
         CheckCase {
             name: "rich-editing",
@@ -489,6 +491,14 @@ fn checks() -> [CheckCase; 19] {
         CheckCase {
             name: "external-command-compatibility",
             run: check_external_command_compatibility,
+        },
+        CheckCase {
+            name: "streamed-progress-without-newline",
+            run: check_streamed_progress_without_newline,
+        },
+        CheckCase {
+            name: "full-screen-program-takeover",
+            run: check_full_screen_program_takeover,
         },
         CheckCase {
             name: "local-completion-discovery",
@@ -1885,6 +1895,119 @@ complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Prin
         0,
         "external command compatibility",
     )
+}
+
+fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), Box<dyn Error>> {
+    // Failure model: a child that reports progress with bare `\r` overwrites
+    // (no trailing `\n`) — `git push`, `curl`, package-manager progress bars,
+    // and similar — must still be visible while it runs. A transcript that
+    // only commits complete lines would sit frozen for the whole operation
+    // and dump every update at once on exit, which is indistinguishable from
+    // a hang. Each `printf` below is its own write separated by a real
+    // `sleep`, so a passing check proves each `\r` update reached the screen
+    // as it happened rather than being coalesced into the final flush.
+    let mut session = Session::new(binary, SessionOptions::default())?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    let output_start = session.pty.output().len();
+    let command = "/bin/sh -c 'printf start\\n >&2; printf 33%%\\r >&2; sleep 1; printf 66%%\\r >&2; sleep 1; printf 100%%done\\n >&2'";
+    session.pty.type_text(command)?;
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("first progress frame live", |screen| {
+            screen.text().contains("33%") && screen.bottom_line().contains("running")
+        })?;
+    if session.pty.screen().text().contains("100%done") {
+        return Err(io::Error::other(
+            "progress fixture completed before its first `\\r` frame was observable",
+        )
+        .into());
+    }
+    session
+        .pty
+        .wait_for_screen("second progress frame live", |screen| {
+            screen.text().contains("66%") && screen.bottom_line().contains("running")
+        })?;
+    session.pty.wait_for_screen(
+        "progress fixture completed inside persistent viewport",
+        |screen| {
+            let text = screen.text();
+            text.contains("100%done")
+                && text.contains("── exit 0")
+                && screen.bottom_line().contains("NORMAL")
+        },
+    )?;
+    if contains(&session.pty.output()[output_start..], b"\\u{1b}") {
+        return Err(screen_error(
+            "streamed carriage-return progress leaked a literal escape sequence",
+            session.pty.screen(),
+        ));
+    }
+    ensure_alternate_screen_unchanged(&session, output_start, "streamed carriage-return progress")?;
+    session.pty.send(key::CTRL_D)?;
+    ensure_status(
+        session.pty.wait_exit()?,
+        0,
+        "streamed progress without newline",
+    )
+}
+
+fn check_full_screen_program_takeover(binary: &Path) -> Result<(), Box<dyn Error>> {
+    // Failure model: the rich viewport normally captures a foreground
+    // command's stdout and stderr through a pipe and replays it inside its
+    // own transcript block. A full-screen program (an editor, pager, or
+    // similar) instead needs the real terminal: its own alternate screen,
+    // absolute cursor addressing, and live keystrokes. A fixture named
+    // `vim` proves the fix reaches the real terminal rather than a
+    // transcript-safe imitation of it: raw `\x1b[?1049h`/`\x1b[?1049l`
+    // bytes on the wire can only come from a real inherited terminal, since
+    // captured output is escaped before it ever reaches the transcript (see
+    // `check_streamed_progress_without_newline`'s literal-escape assertion).
+    let fixtures = TempDirectory::new("quirl-full-screen-takeover")?;
+    let binary_dir = fixtures.path.join("bin");
+    create_private_directory(&binary_dir)?;
+    write_executable(
+        &binary_dir.join("vim"),
+        "#!/bin/sh\n\
+         printf '\\033[?1049h'\n\
+         printf 'FIXTURE_READY\\n'\n\
+         read line\n\
+         printf 'GOT:%s\\n' \"$line\"\n\
+         printf '\\033[?1049l'\n",
+    )?;
+    let mut session = Session::new(
+        binary,
+        SessionOptions {
+            path: Some(binary_dir),
+            ..SessionOptions::default()
+        },
+    )?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    let output_start = session.pty.output().len();
+    session.pty.type_text("vim")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"FIXTURE_READY")?;
+    if !contains(&session.pty.output()[output_start..], b"\x1b[?1049h") {
+        return Err(io::Error::other(
+            "full-screen fixture never entered a real alternate screen; \
+             its output is still being captured instead of inherited",
+        )
+        .into());
+    }
+    session.pty.type_text("hello")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for(b"GOT:hello")?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[?1049l", output_start, DEFAULT_TIMEOUT)?;
+    session
+        .pty
+        .wait_for_screen("rich viewport reacquired after takeover", |screen| {
+            screen.bottom_line().contains("NORMAL")
+        })?;
+    execute_and_resume(&mut session, "/usr/bin/printf AFTER_%s TAKEOVER")?;
+    session.pty.send(key::CTRL_D)?;
+    ensure_status(session.pty.wait_exit()?, 0, "full-screen program takeover")
 }
 
 fn check_local_completion_discovery(binary: &Path) -> Result<(), Box<dyn Error>> {

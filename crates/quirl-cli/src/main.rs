@@ -1412,6 +1412,57 @@ fn execute_command_or_dialect_island(
     .map(|outcome| command_outcome_projection(&outcome))
 }
 
+/// Curated executables that always take over the whole terminal — full-screen
+/// editors, pagers, and other TUI programs — rather than write a plain
+/// stream of output.
+///
+/// The rich viewport normally captures a foreground command's output and
+/// replays it inside its own transcript block, which works well for
+/// programs that print a stream of text. A program in this list instead
+/// needs direct control of the real terminal: cursor addressing, its own
+/// alternate screen, and live keystrokes as the user types them. A captured,
+/// replayed transcript cannot provide any of that — the program either
+/// blocks on input it never receives, or (like Vim) detects that its output
+/// is not a terminal and refuses to draw at all.
+const FULL_SCREEN_PROGRAMS: &[&str] = &[
+    "vim", "vi", "nvim", "view", "nvi", "emacs", "nano", "pico", "less", "more", "most", "man",
+    "top", "htop", "btop", "gotop", "tmux", "screen", "watch", "mc", "ncdu", "fzf", "tig",
+    "lazygit", "k9s",
+];
+
+/// Return whether `source` is a single foreground external command whose
+/// executable is a known [`FULL_SCREEN_PROGRAMS`] entry.
+///
+/// Deliberately conservative: multi-stage pipelines, boolean or sequential
+/// lists, background commands, and commands with redirects all return
+/// `false` and fall back to the rich viewport's captured, replayed
+/// rendering. A pipeline stage still needs its output captured by the other
+/// side of the pipe, and a redirect target is a request the takeover path
+/// has no way to honor, so neither is safe to reinterpret as "give this
+/// command the real terminal."
+fn needs_real_terminal(source: &str) -> bool {
+    let Ok(list) = parse_command_list(source) else {
+        return false;
+    };
+    let ([pipeline], []) = (list.pipelines.as_slice(), list.connectors.as_slice()) else {
+        return false;
+    };
+    if pipeline.background {
+        return false;
+    }
+    let [command] = pipeline.commands.as_slice() else {
+        return false;
+    };
+    if !command.redirects.is_empty() {
+        return false;
+    }
+    let Some(executable) = command.words.first() else {
+        return false;
+    };
+    let name = executable.rsplit('/').next().unwrap_or(executable.as_str());
+    FULL_SCREEN_PROGRAMS.contains(&name)
+}
+
 fn execute_command_or_dialect_island_with_extensions(
     executor: &mut NativeExecutor,
     source: &str,
@@ -2165,7 +2216,25 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         let started = Instant::now();
                         let journal = recovery_journal(&mut recovery)?;
                         let output_mode = line_editor.command_output_mode();
+                        // A known full-screen program (an editor, pager, or
+                        // similar) cannot work through the rich viewport's
+                        // captured, replayed rendering: it needs the real
+                        // terminal for its own alternate screen, cursor
+                        // addressing, and live keystrokes. Route it through
+                        // the same inherited-stdio path the simple surface
+                        // always uses, and hand it the real terminal for the
+                        // duration of the call.
+                        let takeover = output_mode == ExecutionOutputMode::RichViewport
+                            && needs_real_terminal(command);
+                        let execution_output_mode = if takeover {
+                            ExecutionOutputMode::Interactive
+                        } else {
+                            output_mode
+                        };
                         let streaming = line_editor.begin_command_stream(command, &prompt)?;
+                        if takeover {
+                            line_editor.release_terminal_for_takeover()?;
+                        }
                         let mut streamed_any = false;
                         let execution = if streaming {
                             let mut observer = |stream, bytes: &[u8]| {
@@ -2177,7 +2246,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 journal,
                                 command,
                                 Some(&extensions),
-                                output_mode,
+                                execution_output_mode,
                                 Some(&mut observer),
                             )
                         } else {
@@ -2186,10 +2255,17 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 journal,
                                 command,
                                 Some(&extensions),
-                                output_mode,
+                                execution_output_mode,
                                 None,
                             )
                         };
+                        if takeover {
+                            // Reacquire the rich viewport even if the child
+                            // failed to start; the terminal must never stay
+                            // stranded on the takeover's (possibly partial)
+                            // frame.
+                            line_editor.resume_after_terminal_takeover(&prompt)?;
+                        }
                         let transcript_result = match execution {
                             Ok(report) => {
                                 last_status = report.status;
@@ -3050,6 +3126,25 @@ impl SessionEditor {
         Ok(true)
     }
 
+    /// Release the terminal for a full-screen foreground child.
+    ///
+    /// A no-op for the simple surface, which never captures a foreground
+    /// child's terminal in the first place.
+    fn release_terminal_for_takeover(&mut self) -> Result<(), ShellError> {
+        if let Self::Rich(editor) = self {
+            editor.release_terminal_for_takeover()?;
+        }
+        Ok(())
+    }
+
+    /// Reacquire the terminal after [`Self::release_terminal_for_takeover`].
+    fn resume_after_terminal_takeover(&mut self, prompt: &QuirlPrompt) -> Result<(), ShellError> {
+        if let Self::Rich(editor) = self {
+            editor.resume_after_terminal_takeover(prompt)?;
+        }
+        Ok(())
+    }
+
     fn append_command_stream(
         &mut self,
         stream: OutputStream,
@@ -3821,6 +3916,32 @@ mod tests {
             natural_command_candidate(&results).unwrap().command,
             "quirl ai run"
         );
+    }
+
+    #[test]
+    fn needs_real_terminal_matches_only_plain_full_screen_invocations() {
+        assert!(needs_real_terminal("vim"));
+        assert!(needs_real_terminal("vim notes.txt"));
+        assert!(needs_real_terminal("less README.md"));
+        assert!(needs_real_terminal("/usr/bin/vim notes.txt"));
+
+        // Not a full-screen program at all.
+        assert!(!needs_real_terminal("git push"));
+        assert!(!needs_real_terminal("ls -la"));
+
+        // A pipeline or redirect still needs its side of the byte stream
+        // captured, so neither is safe to reinterpret as a terminal handoff.
+        assert!(!needs_real_terminal("git log | less"));
+        assert!(!needs_real_terminal("vim > out.txt"));
+
+        // A backgrounded full-screen program cannot own the terminal either.
+        assert!(!needs_real_terminal("vim &"));
+
+        // A boolean or sequential list is not a single foreground command.
+        assert!(!needs_real_terminal("true; vim"));
+
+        // Invalid native syntax must not panic the heuristic.
+        assert!(!needs_real_terminal("vim '"));
     }
 
     #[test]

@@ -160,6 +160,16 @@ enum MouseDrag {
 struct StreamingText {
     utf8_tail: Vec<u8>,
     line: String,
+    /// A bare `\r` was seen and the next printable character (if any)
+    /// should overwrite `line` from its start rather than append.
+    ///
+    /// A real terminal treats `\r` as "move the cursor to column 0", not as
+    /// "erase the line": content already written stays visible until
+    /// something actually overwrites it. Clearing `line` immediately on
+    /// `\r` would both lose the in-flight content that [`Self::pending`]
+    /// exists to show and mishandle a `\r\n` line ending, which must keep
+    /// the line it terminates rather than blank it.
+    overwrite_pending: bool,
     sequence: TerminalSequence,
 }
 
@@ -177,7 +187,26 @@ impl StreamingText {
     fn reset(&mut self) {
         self.utf8_tail.clear();
         self.line.clear();
+        self.overwrite_pending = false;
         self.sequence = TerminalSequence::Ground;
+    }
+
+    /// Clear `line` exactly once for the character that follows a `\r`.
+    fn begin_overwrite_if_pending(&mut self) {
+        if std::mem::take(&mut self.overwrite_pending) {
+            self.line.clear();
+        }
+    }
+
+    /// Return the in-progress line accumulated since the last completed line.
+    ///
+    /// A child that reports progress with bare `\r` overwrites (no trailing
+    /// `\n`) never produces a completed line through [`Self::push`] until it
+    /// either starts a new line or the process exits. Callers use this to
+    /// show that in-flight content live instead of leaving the viewport
+    /// static for the whole operation.
+    fn pending(&self) -> &str {
+        &self.line
     }
 
     fn push(&mut self, bytes: &[u8]) -> Vec<String> {
@@ -195,6 +224,7 @@ impl StreamingText {
         if !self.line.is_empty() {
             lines.push(std::mem::take(&mut self.line));
         }
+        self.overwrite_pending = false;
         self.sequence = TerminalSequence::Ground;
         lines
     }
@@ -205,10 +235,19 @@ impl StreamingText {
             match &mut self.sequence {
                 TerminalSequence::Ground => match character {
                     '\u{1b}' => self.sequence = TerminalSequence::Escape,
-                    '\n' => lines.push(std::mem::take(&mut self.line)),
-                    '\r' => self.line.clear(),
-                    '\t' => self.line.push_str("    "),
-                    value if !value.is_control() => self.line.push(value),
+                    '\n' => {
+                        self.overwrite_pending = false;
+                        lines.push(std::mem::take(&mut self.line));
+                    }
+                    '\r' => self.overwrite_pending = true,
+                    '\t' => {
+                        self.begin_overwrite_if_pending();
+                        self.line.push_str("    ");
+                    }
+                    value if !value.is_control() => {
+                        self.begin_overwrite_if_pending();
+                        self.line.push(value);
+                    }
                     _ => {}
                 },
                 TerminalSequence::Escape => {
@@ -351,6 +390,12 @@ pub struct RichSurface {
     intent_completion: IntentCompletionState,
     stream_stdout: StreamingText,
     stream_stderr: StreamingText,
+    /// Stream currently occupying the transcript's uncommitted live line, if any.
+    ///
+    /// `\r`-driven progress updates overwrite one transcript line in place
+    /// instead of appending; this tracks which stream owns that line so the
+    /// other stream's next chunk starts a new one rather than clobbering it.
+    live_output_owner: Option<OutputStream>,
 }
 
 impl RichSurface {
@@ -412,6 +457,7 @@ impl RichSurface {
             intent_completion: IntentCompletionState::default(),
             stream_stdout: StreamingText::default(),
             stream_stderr: StreamingText::default(),
+            live_output_owner: None,
         })
     }
 
@@ -472,6 +518,7 @@ impl RichSurface {
             intent_completion: IntentCompletionState::default(),
             stream_stdout: StreamingText::default(),
             stream_stderr: StreamingText::default(),
+            live_output_owner: None,
         })
     }
 
@@ -507,6 +554,7 @@ impl RichSurface {
         self.dismiss_picker();
         self.stream_stdout.reset();
         self.stream_stderr.reset();
+        self.live_output_owner = None;
         self.append_transcript_line(&format!("❯ {command}"));
         self.output_notice = Some("running · output streams into this viewport".to_owned());
         self.draw_execution(prompt)
@@ -534,7 +582,11 @@ impl RichSurface {
             OutputStream::Stdout => self.stream_stdout.push(bytes),
             OutputStream::Stderr => self.stream_stderr.push(bytes),
         };
-        self.append_stream_lines(lines);
+        let pending = match stream {
+            OutputStream::Stdout => self.stream_stdout.pending().to_owned(),
+            OutputStream::Stderr => self.stream_stderr.pending().to_owned(),
+        };
+        self.push_stream_output(stream, lines, &pending);
         self.draw_execution(prompt)
     }
 
@@ -546,9 +598,10 @@ impl RichSurface {
         prompt: &QuirlPrompt,
     ) -> Result<(), ShellError> {
         let stdout = self.stream_stdout.finish();
-        self.append_stream_lines(stdout);
+        self.push_stream_output(OutputStream::Stdout, stdout, "");
         let stderr = self.stream_stderr.finish();
-        self.append_stream_lines(stderr);
+        self.push_stream_output(OutputStream::Stderr, stderr, "");
+        self.live_output_owner = None;
         self.append_transcript_line(&format!("── exit {status} · {}ms ──", duration.as_millis()));
         self.output_cursor_line = self.transcript.line_count().saturating_sub(1);
         self.output_notice =
@@ -556,9 +609,57 @@ impl RichSurface {
         self.draw_execution(prompt)
     }
 
-    fn append_stream_lines(&mut self, lines: Vec<String>) {
-        for line in lines {
-            self.append_transcript_line(&line);
+    /// Give a full-screen foreground child direct control of the real
+    /// terminal instead of the rich viewport's captured, replayed rendering.
+    ///
+    /// Call this after [`Self::begin_command_stream`] and only for a command
+    /// recognized as a full-screen program (an editor, pager, or similar):
+    /// unlike a plain output stream, that class of program needs its own
+    /// alternate screen, cursor addressing, and live keystrokes, none of
+    /// which the captured transcript can provide. The caller must invoke
+    /// [`Self::resume_after_terminal_takeover`] once the child returns
+    /// control, even on an early error path, or the terminal is left showing
+    /// the child's last frame instead of Quirl's UI.
+    pub fn release_terminal_for_takeover(&mut self) -> Result<(), ShellError> {
+        self.terminal.leave_alternate_screen()
+    }
+
+    /// Reacquire the rich viewport after [`Self::release_terminal_for_takeover`].
+    pub fn resume_after_terminal_takeover(
+        &mut self,
+        prompt: &QuirlPrompt,
+    ) -> Result<(), ShellError> {
+        self.terminal.reenter_alternate_screen()?;
+        self.draw_execution(prompt)
+    }
+
+    /// Commit one stream's newly completed lines, then show its still-open
+    /// `\r`-driven line (if any) as one uncommitted, in-place-updated line.
+    ///
+    /// Real terminals let concurrent stdout and stderr writers share one
+    /// cursor; the transcript instead gives each stream its own line so one
+    /// stream's in-flight update can never overwrite the other's completed
+    /// output. A stream's uncommitted line survives only until the other
+    /// stream appends past it or this stream finishes it with a real line.
+    fn push_stream_output(&mut self, stream: OutputStream, completed: Vec<String>, pending: &str) {
+        for line in completed {
+            if self.live_output_owner == Some(stream) {
+                self.replace_transcript_line(&line);
+            } else {
+                self.live_output_owner = None;
+                self.append_transcript_line(&line);
+            }
+            self.live_output_owner = None;
+        }
+        if pending.is_empty() {
+            return;
+        }
+        if self.live_output_owner == Some(stream) {
+            self.replace_transcript_line(pending);
+        } else {
+            self.live_output_owner = None;
+            self.append_transcript_line(pending);
+            self.live_output_owner = Some(stream);
         }
     }
 
@@ -623,6 +724,19 @@ impl RichSurface {
     fn append_transcript_line(&mut self, line: &str) {
         let safe = quirl_core::escape_terminal_line(line);
         let outcome = self.transcript.append_line(&safe);
+        self.transcript_truncated |= outcome.evicted_line_count > 0
+            || outcome.evicted_bytes > 0
+            || outcome.truncated_prefix_bytes > 0;
+    }
+
+    /// Replace the transcript's most recently appended line in place.
+    ///
+    /// Used only for the live, uncommitted line tracked by
+    /// [`Self::push_stream_output`]; every other caller must keep using
+    /// [`Self::append_transcript_line`] so committed history is never edited.
+    fn replace_transcript_line(&mut self, line: &str) {
+        let safe = quirl_core::escape_terminal_line(line);
+        let outcome = self.transcript.replace_last_line(&safe);
         self.transcript_truncated |= outcome.evicted_line_count > 0
             || outcome.evicted_bytes > 0
             || outcome.truncated_prefix_bytes > 0;
@@ -1808,6 +1922,53 @@ impl SurfaceTerminal {
         Ok(())
     }
 
+    /// Release the alternate screen so a full-screen foreground child draws
+    /// directly on the real terminal instead of the rich viewport's buffer.
+    ///
+    /// Callers must already have called [`Self::pause_for_execution`], and
+    /// must pair a successful call with [`Self::reenter_alternate_screen`]
+    /// once the child returns control — even on an early error path — or the
+    /// terminal is left showing the child's last frame instead of Quirl's UI.
+    /// A no-op when the alternate screen is not currently owned, so callers
+    /// do not need to track whether a previous takeover already left it.
+    fn leave_alternate_screen(&mut self) -> Result<(), ShellError> {
+        if !self.alternate_screen {
+            return Ok(());
+        }
+        if let Err(error) = execute!(io::stderr(), LeaveAlternateScreen) {
+            self.reset_best_effort();
+            return Err(terminal_error(
+                "leave the alternate terminal screen for a foreground takeover",
+            )(error));
+        }
+        self.alternate_screen = false;
+        Ok(())
+    }
+
+    /// Reacquire the alternate screen after [`Self::leave_alternate_screen`].
+    ///
+    /// The takeover child may have written anything to the real terminal, so
+    /// the caller must force a full repaint afterward rather than relying on
+    /// ratatui's diff against its stale pre-takeover buffer.
+    fn reenter_alternate_screen(&mut self) -> Result<(), ShellError> {
+        if self.alternate_screen {
+            return Ok(());
+        }
+        if let Err(error) = execute!(io::stderr(), EnterAlternateScreen) {
+            self.reset_best_effort();
+            return Err(terminal_error(
+                "reenter the alternate terminal screen after a foreground takeover",
+            )(error));
+        }
+        self.alternate_screen = true;
+        if let Some(terminal) = self.terminal.as_mut() {
+            terminal
+                .clear()
+                .map_err(terminal_error("repaint after a foreground takeover"))?;
+        }
+        Ok(())
+    }
+
     fn draw(
         &mut self,
         model: &FrameModel<'_>,
@@ -2830,6 +2991,34 @@ mod tests {
             ["clone ssh://example"]
         );
         assert_eq!(stream.push(b"10%\r20%\n"), ["20%"]);
+    }
+
+    #[test]
+    fn streaming_text_pending_exposes_carriage_return_updates_before_a_newline() {
+        // A child reporting `\r`-driven progress (git push, curl, package
+        // manager progress bars) may hold one logical line open across many
+        // separate writes with no intervening `\n`. `push` alone cannot show
+        // that: it only returns completed lines. `pending` is what a caller
+        // uses to render the still-open line live instead of leaving the
+        // viewport static until the line finally completes.
+        let mut stream = StreamingText::default();
+        assert!(stream.pending().is_empty());
+
+        assert!(stream.push(b"Counting objects:  10%\r").is_empty());
+        assert_eq!(stream.pending(), "Counting objects:  10%");
+
+        // A later bare `\r` update overwrites the pending line in place
+        // rather than accumulating after it, matching a real terminal.
+        assert!(stream.push(b"Counting objects:  55%\r").is_empty());
+        assert_eq!(stream.pending(), "Counting objects:  55%");
+
+        // Finishing the line with a real newline clears the pending buffer
+        // and surfaces it as one completed line.
+        assert_eq!(
+            stream.push(b"Counting objects: 100% (5/5), done.\n"),
+            ["Counting objects: 100% (5/5), done."]
+        );
+        assert!(stream.pending().is_empty());
     }
 
     #[test]

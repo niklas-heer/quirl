@@ -339,6 +339,32 @@ impl Transcript {
         Ok(Some(selected))
     }
 
+    /// Replace the most recently appended logical line in place.
+    ///
+    /// Used for carriage-return-driven progress updates (`git push`, `curl`,
+    /// package-manager progress bars, and similar) whose child process
+    /// repeatedly overwrites one in-flight line rather than emitting a new
+    /// one. Appending each update would grow the transcript unboundedly and
+    /// leave stale intermediate frames in scrollback; replacing keeps exactly
+    /// one retained line for the in-progress update, matching what a real
+    /// terminal displays. Falls back to [`Self::append_line`] when the
+    /// transcript is empty. Any active selection is re-clamped against the
+    /// replaced line's new length, since an in-place update can shrink or
+    /// grow the line underneath an in-progress mouse selection.
+    pub(super) fn replace_last_line(&mut self, line: &str) -> AppendOutcome {
+        if let Some(previous) = self.lines.pop_back() {
+            self.retained_bytes = self.retained_bytes.saturating_sub(previous.len());
+        }
+        let outcome = self.append_line(line);
+        if let Some(selection) = self.selection {
+            self.selection = self.clamp_position(selection.anchor).and_then(|anchor| {
+                self.clamp_position(selection.head)
+                    .map(|head| Selection { anchor, head })
+            });
+        }
+        outcome
+    }
+
     /// Return the ordered active selection endpoints for viewport styling.
     pub(super) fn selection_range(&self) -> Option<(TextPosition, TextPosition)> {
         self.selection
@@ -452,6 +478,50 @@ mod tests {
         assert_eq!(line_eviction.evicted_line_count, 1);
         assert_eq!(visible_lines(&transcript, 8), ["three", "", ""]);
         assert_eq!(transcript.line_count(), 3);
+    }
+
+    #[test]
+    fn replace_last_line_updates_content_without_growing_line_count() {
+        let mut transcript = transcript(8, 1_024);
+        transcript.append_line("one");
+        transcript.append_line("Counting objects:  10%");
+
+        transcript.replace_last_line("Counting objects:  55%");
+        assert_eq!(transcript.line_count(), 2);
+        assert_eq!(
+            visible_lines(&transcript, 8),
+            ["one", "Counting objects:  55%"]
+        );
+
+        transcript.replace_last_line("Counting objects: 100%, done.");
+        assert_eq!(transcript.line_count(), 2);
+        assert_eq!(
+            visible_lines(&transcript, 8),
+            ["one", "Counting objects: 100%, done."]
+        );
+    }
+
+    #[test]
+    fn replace_last_line_on_empty_transcript_behaves_like_append() {
+        let mut transcript = transcript(8, 1_024);
+        transcript.replace_last_line("first");
+        assert_eq!(transcript.line_count(), 1);
+        assert_eq!(visible_lines(&transcript, 8), ["first"]);
+    }
+
+    #[test]
+    fn replace_last_line_reclamps_a_selection_shortened_underneath_it() {
+        let mut transcript = transcript(8, 1_024);
+        transcript.append_line("stable");
+        transcript.append_line("progress: 10% almost there");
+        transcript.begin_selection(position(1, 20));
+        transcript.update_selection(position(1, 24));
+        assert_eq!(selected_text(&transcript).as_deref(), Some(" the"));
+
+        transcript.replace_last_line("progress: 20%");
+
+        assert_eq!(selected_text(&transcript).as_deref(), Some(""));
+        assert_eq!(visible_lines(&transcript, 8), ["stable", "progress: 20%"]);
     }
 
     #[test]
