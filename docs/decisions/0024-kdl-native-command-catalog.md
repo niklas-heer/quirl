@@ -157,11 +157,12 @@ Draft generation and curated maintenance are separate states:
    unexplained checksum change with unchanged canonical input is a compiler
    defect, not a generated-file refresh.
 
-The integration tooling must expose distinct import, format, check, and build
-operations. Their exact command-line spelling and repository paths are owned by
-the tooling integration and are intentionally not fixed by this ADR. Until that
-integration lands, documentation uses role placeholders rather than commands
-that contributors could mistake for implemented interfaces.
+The integration tooling exposes distinct `cargo xtask catalog
+import-carapace`, `cargo xtask catalog fmt`, `cargo xtask catalog check`, and
+`cargo xtask catalog build` operations. Import requires an explicit local
+checkout and exact 40-character pinned revision; format supports the
+non-mutating `--check` mode. The concrete paths and contributor procedure live
+in [`../catalog-schema.md`](../catalog-schema.md).
 
 ### Publication and runtime fallback fail closed
 

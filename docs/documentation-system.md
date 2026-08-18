@@ -145,7 +145,7 @@ intentionally remains Rust-focused and does not require Node.
 
 Carapace can only propose an external native draft from a pinned revision. The
 four contributor operations are import to a separate draft, canonical format,
-strict check, and deterministic build. Their CLI spelling and repository paths
-belong to the follow-up tooling integration; until it lands, use the explicit
-role placeholders in [the catalog schema](catalog-schema.md) rather than
-documenting commands that do not exist.
+strict check, and deterministic build. Use `cargo xtask catalog
+import-carapace`, `cargo xtask catalog fmt`, `cargo xtask catalog check`, and
+`cargo xtask catalog build`; the exact pin, checkout, and review procedure is
+documented in [the catalog schema](catalog-schema.md).

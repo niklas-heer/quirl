@@ -74,11 +74,9 @@ git log -1 --format='%h %s'
 
 - [ ] `cargo xtask check` passes with the pinned Rust 1.97.1 toolchain.
 - [ ] The generated Lua SDK has no diff after `cargo xtask sdk`.
-- [ ] The implemented native-catalog format-check, strict-check, and build
-  operations pass; a second build is byte-identical, and the published image
-  reopens through the hardened reader. Use the task runner's implemented
-  spelling for those operation roles; do not substitute the unimplemented
-  placeholders from the schema document.
+- [ ] `cargo xtask catalog fmt --check`, `cargo xtask catalog check`, and
+  `cargo xtask catalog build` pass; a second build is byte-identical, and the
+  published image reopens through the hardened reader.
 - [ ] Catalog tests cover schema rejection, all declared byte/count/depth/query
   bounds, platform filtering, semantic ordering, snapshot/projection tampering,
   and atomic-publication cleanup. Runtime tests pass without Carapace or network

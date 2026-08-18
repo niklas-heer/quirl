@@ -333,21 +333,23 @@ pinned revision update is reviewed as a supply-chain change:
 7. Review the resulting checksum change. Unchanged canonical KDL must not
    produce a different database.
 
-The tooling dependency lands after the core compiler documented here. To avoid
-inventing commands or repository paths, contributor examples use explicit role
-placeholders until the integration defines its CLI:
+Run the implemented task-runner interface from the repository root:
 
-```text
-<catalog-tool> <import-operation>   # pinned Carapace input -> review-only draft
-<catalog-tool> <format-operation>   # canonicalize KDL; run twice for idempotence
-<catalog-tool> <check-operation>    # strict schema, bounds, provenance, and drift checks
-<catalog-tool> <build-operation>    # KDL -> deterministic QCNC SQLite + checksum
+```sh
+cargo xtask catalog import-carapace --source <checkout> --revision <40-character-pin>
+cargo xtask catalog fmt
+cargo xtask catalog fmt --check
+cargo xtask catalog check
+cargo xtask catalog build
 ```
 
-Contributors should obtain the implemented spelling from the task runner's help
-and replace these four placeholders as one integration documentation change.
-The required order and semantics above are stable even if the eventual command
-names differ.
+`import-carapace` requires the revision to match both
+`catalog/carapace-import.json` and the detached local checkout. It atomically
+updates only `catalog/draft`; it refuses any imported root that collides with
+`catalog/curated`. `fmt --check` is non-mutating. `check` validates formatting,
+schema, provenance, license retention, curated/draft separation, generated
+database bytes, and the checksum. `build` atomically refreshes the generated
+SQLite image and checksum from curated KDL only.
 
 ## Runtime lookup and fallback
 
