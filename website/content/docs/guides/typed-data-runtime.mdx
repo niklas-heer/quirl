@@ -84,6 +84,24 @@ implementation accident that produced `null`; write `null` explicitly. Bare
 paths containing whitespace also receive a migration diagnostic directing the
 author to quote the complete path.
 
+`get`, `where`, and `sort` accept dotted cell paths that index into lists with
+a non-negative integer segment as well as into records by field name, for
+example `get items.0.name`. A path accepted by `get` or `where` may end with a
+trailing `?` to make the whole path optional: `get b?` returns `Nothing`
+instead of failing when a field or index is absent, and `where b? == 1`
+treats an absent `b` as a non-match instead of erroring. Without the `?`
+marker, `get` and `where` fail closed on a field a row does not have, so a
+typo in a path is a diagnostic rather than a silently empty result.
+
+`Record` is an insertion-ordered mapping, not an alphabetized one: `select`
+emits fields in the order requested rather than sorted order, and table
+rendering unions columns across heterogeneous rows in first-seen order. A
+record's own field order otherwise follows however it was constructed (for
+example, the order YAML or CSV headers declared it); native JSON literals and
+`from json` still normalize to `serde_json`'s parse order, which is
+alphabetical, since that conversion boundary does not yet preserve source
+order end to end.
+
 `--format json` emits a tagged `Value` or `Stream` envelope so a script
 does not need to infer whether an array is an ordinary value or a pipeline
 stream. Values themselves retain an ABI tag (`int`, `decimal`, `path`, `size`,
