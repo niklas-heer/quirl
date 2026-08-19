@@ -1266,14 +1266,14 @@ pub(crate) fn build_embeddings_cancellable(
         .map_err(|_| {
             ShellError::new(
                 ErrorCode::Validation,
-                "the local Model2Vec tokenizer failed",
+                "the local command-search model failed to process the query",
             )
             .with_help("Replace the model files with the intact pinned Quirl command model")
         })?;
         if encoded.len() != batch.len() {
             return Err(ShellError::new(
                 ErrorCode::Validation,
-                "the local Model2Vec model returned an incomplete embedding batch",
+                "the local command-search model returned an incomplete embedding batch",
             )
             .with_context(format!(
                 "expected vectors: {}; observed: {}",
@@ -1288,7 +1288,7 @@ pub(crate) fn build_embeddings_cancellable(
     if vectors.len() != documents.len() {
         return Err(ShellError::new(
             ErrorCode::Validation,
-            "the local Model2Vec model returned an incomplete embedding batch",
+            "the local command-search model returned an incomplete embedding batch",
         )
         .with_context(format!(
             "expected vectors: {}; observed: {}",
@@ -1302,7 +1302,7 @@ pub(crate) fn build_embeddings_cancellable(
     if dimensions != loaded.identity.dimensions {
         return Err(ShellError::new(
             ErrorCode::Validation,
-            "the local Model2Vec output dimension changed after admission",
+            "the local command-search model output dimension changed after admission",
         )
         .with_context(format!(
             "admitted: {}; observed: {dimensions}",
@@ -1343,7 +1343,7 @@ pub(crate) fn build_embeddings_cancellable(
         if vector.len() != dimensions || vector.iter().any(|value| !value.is_finite()) {
             return Err(ShellError::new(
                 ErrorCode::Validation,
-                "the local Model2Vec model returned an invalid embedding",
+                "the local command-search model returned an invalid embedding",
             )
             .with_context(format!("document: {}", document.id))
             .with_help("Replace the model files and rebuild the semantic index"));
@@ -2822,14 +2822,17 @@ fn load_model_selected(path: &Path, explicit: bool) -> Result<LoadedModel, Shell
         StaticModel::from_bytes(&tokenizer, &weights, &config, Some(true))
     }))
     .map_err(|_| {
-        ShellError::new(ErrorCode::Validation, "the local Model2Vec loader failed")
-            .with_help("Replace the local model with intact bounded Model2Vec assets")
+        ShellError::new(
+            ErrorCode::Validation,
+            "the local command-search model loader failed",
+        )
+        .with_help("Replace the local model with intact bounded model files")
     })?
     .map_err(|error| {
         ShellError::new(
             ErrorCode::Validation,
             format!(
-                "could not load the local Model2Vec model from {}",
+                "could not load the local command-search model from {}",
                 path.display()
             ),
         )
@@ -2842,9 +2845,9 @@ fn load_model_selected(path: &Path, explicit: bool) -> Result<LoadedModel, Shell
     .map_err(|_| {
         ShellError::new(
             ErrorCode::Validation,
-            "the local Model2Vec model failed its dimension probe",
+            "the local command-search model failed its dimension probe",
         )
-        .with_help("Replace the local model with intact Model2Vec assets")
+        .with_help("Replace the local model with intact model files")
     })?;
     validate_dimensions(probe.len())?;
     if probe.len() != manifest.dimensions || probe.iter().any(|value| !value.is_finite()) {
@@ -2883,7 +2886,7 @@ fn validate_model_root(path: &Path) -> Result<(), ShellError> {
         ShellError::new(
             ErrorCode::Io,
             format!(
-                "local Model2Vec directory {} is unavailable",
+                "local command-search model directory {} is unavailable",
                 path.display()
             ),
         )
@@ -2894,7 +2897,7 @@ fn validate_model_root(path: &Path) -> Result<(), ShellError> {
         return Err(ShellError::new(
             ErrorCode::Validation,
             format!(
-                "local Model2Vec root {} is not a real directory",
+                "local command-search model root {} is not a real directory",
                 path.display()
             ),
         )

@@ -2530,6 +2530,10 @@ fn validate_completion_request(request: &CompletionRequest) -> Result<(), ShellE
             ErrorCode::ResourceLimit,
             format!("completion query exceeds its limit of {MAX_COMPLETION_QUERY_BYTES} bytes"),
         )
+        .with_context(format!(
+            "limit: {MAX_COMPLETION_QUERY_BYTES}; observed: {}",
+            request.line.len()
+        ))
         .with_help("Shorten the input before requesting completion"));
     }
     if request.cursor > request.line.len() || !request.line.is_char_boundary(request.cursor) {
@@ -2544,6 +2548,10 @@ fn validate_completion_request(request: &CompletionRequest) -> Result<(), ShellE
             ErrorCode::ResourceLimit,
             format!("completion result limit exceeds {MAX_COMPLETION_RESULTS}"),
         )
+        .with_context(format!(
+            "limit: {MAX_COMPLETION_RESULTS}; observed: {}",
+            request.limit
+        ))
         .with_help("Request at most the documented completion result limit"));
     }
     if !(1..=MAX_COMPLETION_DEADLINE_MS).contains(&request.deadline_ms) {
@@ -2551,6 +2559,7 @@ fn validate_completion_request(request: &CompletionRequest) -> Result<(), ShellE
             ErrorCode::Validation,
             format!("completion deadline must be between 1 and {MAX_COMPLETION_DEADLINE_MS} milliseconds"),
         )
+        .with_context(format!("observed: {} milliseconds", request.deadline_ms))
         .with_help("Use a small positive deadline and issue a new request after expiry"));
     }
     Ok(())

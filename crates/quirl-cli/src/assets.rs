@@ -1575,7 +1575,8 @@ fn validate_manifest_entry(asset: &AssetManifestEntry) -> Result<(), ShellError>
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     {
-        return Err(manifest_validation("invalid logical asset name"));
+        return Err(manifest_validation("invalid logical asset name")
+            .with_context(format!("observed: {:?}", asset.logical_name)));
     }
     if asset.format.is_empty()
         || asset.format.len() > FORMAT_BYTES_MAX
@@ -2509,8 +2510,9 @@ fn integrity_failure(
 }
 
 fn manifest_validation(message: impl Into<String>) -> ShellError {
-    ShellError::new(ErrorCode::Validation, message)
-        .with_help("Use a compatible versioned Quirl runtime asset manifest")
+    ShellError::new(ErrorCode::Validation, message).with_help(
+        "This indicates a malformed Quirl release manifest; report it and run `quirl assets retry` once fixed",
+    )
 }
 
 fn resource_limit<T: std::fmt::Display>(

@@ -1559,7 +1559,10 @@ fn worker_crash_error(child: &mut ContainedChild) -> ShellError {
         ErrorCode::Lua,
         "isolated Lua worker terminated without a response",
     )
-    .with_context(format!("status: {status:?}"))
+    .with_context(status.map_or_else(
+        || "exit status unavailable".to_owned(),
+        |s| format!("worker exited with {s}"),
+    ))
     .with_help("Inspect the Lua source and restart Quirl")
 }
 

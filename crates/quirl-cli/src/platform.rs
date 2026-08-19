@@ -392,7 +392,11 @@ fn read_process_table() -> Result<String, ShellError> {
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(platform_error("the process lister did not expose stdout"));
+        return Err(ShellError::new(
+            ErrorCode::InvalidArgument,
+            "the process lister did not expose stdout",
+        )
+        .with_help("Retry the process view, or use `quirl view directory` if it keeps failing"));
     };
     stdout
         .take(MAX_PROCESS_OUTPUT_BYTES + 1)
@@ -468,10 +472,13 @@ fn names<T: Serialize>(values: &[T]) -> Result<String, ShellError> {
             serde_json::to_value(value)
                 .map_err(json_error)
                 .and_then(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| platform_error("protocol name was not a string"))
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        ShellError::new(
+                            ErrorCode::InvalidArgument,
+                            "protocol name was not a string",
+                        )
+                        .with_help("Report this as a Quirl protocol schema defect")
+                    })
                 })
         })
         .collect::<Result<Vec<_>, _>>()
@@ -487,6 +494,7 @@ fn print_json(value: &impl Serialize) -> Result<(), ShellError> {
 fn json_error(error: serde_json::Error) -> ShellError {
     ShellError::new(ErrorCode::Io, "could not serialize platform output")
         .with_context(error.to_string())
+        .with_help("Report this as a Quirl platform schema defect")
 }
 
 fn platform_error(message: impl Into<String>) -> ShellError {

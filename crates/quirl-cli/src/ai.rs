@@ -198,9 +198,9 @@ pub(crate) fn execute(command: AiCommand) -> Result<i32, ShellError> {
         }
         AiCommand::Run { .. } => Err(ShellError::new(
             ErrorCode::Validation,
-            "natural command execution was not routed through the composition root",
+            "quirl ai run cannot execute a command directly; route it through the interactive shell",
         )
-        .with_help("Run the command through the Quirl CLI dispatcher")),
+        .with_help("Use the interactive shell or `quirl exec` instead")),
     }
 }
 

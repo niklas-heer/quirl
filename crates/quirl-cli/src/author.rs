@@ -901,8 +901,12 @@ fn io_error(action: &str, path: &Path, error: std::io::Error) -> ShellError {
 }
 
 fn json_error(error: serde_json::Error) -> ShellError {
-    ShellError::new(ErrorCode::Validation, error.to_string())
-        .with_help("Report this catalog serialization failure")
+    ShellError::new(
+        ErrorCode::Validation,
+        "could not serialize catalog documentation output",
+    )
+    .with_context(error.to_string())
+    .with_help("Report this as a Quirl catalog schema defect")
 }
 
 #[cfg(test)]

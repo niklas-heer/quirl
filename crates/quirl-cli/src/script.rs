@@ -785,7 +785,7 @@ pub(crate) fn check_quirl_source(source: &str, source_name: &str) -> Result<(), 
     } else {
         ErrorCode::InvalidCommand
     };
-    let mut error = ShellError::new(code, "Quirl script validation failed");
+    let mut error = ShellError::new(code, "quirl script has validation diagnostics");
     for diagnostic in diagnostics {
         error = error
             .with_label(
@@ -1187,10 +1187,7 @@ pub(crate) fn execute_plan(
 
 fn execute_lua_script_plan(plan: &ExecutionPlan) -> Result<ExecutionOutcome, ShellError> {
     if plan.output() != ExecutionOutputTarget::Value {
-        return Err(script_representation_error(
-            plan,
-            "typed Lua scripts return structured values",
-        ));
+        return Err(script_representation_error(plan, "a structured value"));
     }
     let mut policy = LuaPolicy::script();
     policy.wall_time = policy.wall_time.min(
@@ -1228,10 +1225,7 @@ fn execute_quirl_script_plan(
     plan: &ExecutionPlan,
 ) -> Result<ExecutionOutcome, ShellError> {
     if plan.output() != ExecutionOutputTarget::Value {
-        return Err(script_representation_error(
-            plan,
-            "native Quirl scripts return one structured value",
-        ));
+        return Err(script_representation_error(plan, "a structured value"));
     }
     if !plan
         .declared_effects()
@@ -1278,10 +1272,10 @@ fn execute_quirl_script_plan(
                     | quirl_data::DataEnvelope::Task { .. } => {
                         return Err(ShellError::new(
                             ErrorCode::Data,
-                            "Quirl script data statement returned an unhandled control envelope",
+                            "Quirl script data statement produced a value that still needs unwrapping",
                         )
                         .with_help(
-                            "Handle Option, Result, or Task before returning from the script",
+                            "Call .unwrap(), .resolve(), or .await on the Option, Result, or Task before returning it",
                         ));
                     }
                 };
@@ -1319,14 +1313,18 @@ fn execute_quirl_script_plan(
     )
 }
 
-fn script_representation_error(plan: &ExecutionPlan, expected: &str) -> ShellError {
+fn script_representation_error(plan: &ExecutionPlan, produced: &str) -> ShellError {
+    let requested = match plan.output() {
+        ExecutionOutputTarget::Inherit => "inherited output",
+        ExecutionOutputTarget::Capture { .. } => "captured byte output",
+        ExecutionOutputTarget::Value => "a structured value",
+    };
     ShellError::new(
         ErrorCode::Validation,
-        "script output representation is incompatible",
+        format!("script produced {produced} but the execution request expects {requested}"),
     )
     .with_command(plan.source().text())
-    .with_context(expected)
-    .with_help("Use the output representation selected by the script execution request")
+    .with_help("Report this as a Quirl execution-plan mismatch")
 }
 
 impl ScriptLanguage {
@@ -1502,7 +1500,8 @@ fn run_reference_script(
             return Err(ShellError::new(
                 ErrorCode::InvalidArgument,
                 "reference runner requires Bash or Zsh",
-            ));
+            )
+            .with_help("Report this as a Quirl script-language routing defect"));
         }
     }
     // The syntax-error classifier matches untranslated interpreter
@@ -1832,10 +1831,7 @@ fn run_quirl_source(
             Value::Array(values.into_iter().map(|value| value.json_value()).collect())
         }
         ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => {
-            return Err(script_representation_error(
-                &plan,
-                "expected structured value output",
-            ));
+            return Err(script_representation_error(&plan, "non-structured output"));
         }
     };
     Ok(ScriptRunOutput { status, value })

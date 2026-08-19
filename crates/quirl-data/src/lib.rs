@@ -3199,10 +3199,9 @@ fn syntax_shell_error(source: &str, diagnostic: DataSyntaxDiagnostic) -> ShellEr
         .with_help(diagnostic.help)
 }
 
-fn data_error(source: &str, message: impl Into<String>) -> ShellError {
-    ShellError::new(ErrorCode::Data, "invalid data expression")
-        .with_context(message)
-        .with_label(None, 0, source.len(), "could not evaluate this stage")
+fn data_error(stage: &str, message: impl Into<String>) -> ShellError {
+    ShellError::new(ErrorCode::Data, message)
+        .with_context(format!("in `{stage}`"))
         .with_help("Try `help data` for source and transform syntax")
 }
 
@@ -4513,7 +4512,7 @@ mod tests {
             .eval_typed(r#""not json" | from json"#)
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Data);
-        assert!(error.details.context[0].contains("invalid JSON"));
+        assert!(error.message.contains("invalid JSON"));
     }
 
     #[test]

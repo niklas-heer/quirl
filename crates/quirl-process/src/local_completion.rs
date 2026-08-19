@@ -485,7 +485,7 @@ fn path_bytes_len(path: &Path) -> Result<usize, ShellError> {
             ErrorCode::InvalidArgument,
             "local completion path is not valid Unicode on this platform",
         )
-        .with_help("Use a Unicode absolute path for the unavailable-platform check")
+        .with_help("Use an absolute path that is valid Unicode on this platform")
     })
 }
 
@@ -927,7 +927,9 @@ end
                 ErrorCode::ResourceLimit,
                 "local completion adapter file attempts are exhausted",
             )
-            .with_context(format!("limit {ATTEMPTS_MAX} create attempts"))
+            .with_context(format!(
+                "limit {ATTEMPTS_MAX} create attempts; observed {ATTEMPTS_MAX} collisions"
+            ))
             .with_help("Remove stale Quirl adapter files from the temporary directory"))
         }
 
@@ -1000,7 +1002,9 @@ end
             "could not remove the local completion adapter file",
         )
         .with_context(format!("{}: {error}", path.display()))
-        .with_help("Remove the mode-0600 adapter file and check temporary-directory access")
+        .with_help(
+            "Remove the temporary adapter file yourself and check temporary-directory permissions",
+        )
     }
 
     fn provider_command(
@@ -1208,7 +1212,9 @@ end
             .bytes_max
             .saturating_div(bytes_per_turn)
             .saturating_add(2);
+        let mut turns_used = 0_usize;
         for _ in 0..turns_max {
+            turns_used += 1;
             let stdout_progress = drain_stream_turn(stdout, OutputStream::Stdout, output)?;
             let stderr_progress = drain_stream_turn(stderr, OutputStream::Stderr, output)?;
             output.ensure_within_limit()?;
@@ -1217,10 +1223,10 @@ end
             }
         }
         Err(resource_limit_error(
-            "local completion output drain exceeds its turn limit",
+            "local completion provider kept writing output after being terminated",
             turns_max,
-            turns_max.saturating_add(1),
-            "Reduce provider output or report a descriptor that remained writable",
+            turns_used,
+            "Report this provider; it did not stop producing output after Quirl closed it",
         ))
     }
 

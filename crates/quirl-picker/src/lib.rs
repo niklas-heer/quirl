@@ -121,13 +121,25 @@ impl PickerRequest {
     pub fn validate(&self) -> Result<(), ShellError> {
         PICKER_VERSION_POLICY.validate("picker request", self.protocol_version)?;
         if self.query.len() > MAX_PICKER_QUERY_BYTES {
-            return Err(resource_limit("picker query", MAX_PICKER_QUERY_BYTES));
+            return Err(resource_limit(
+                "picker query",
+                self.query.len(),
+                MAX_PICKER_QUERY_BYTES,
+            ));
         }
         if self.items.len() > MAX_PICKER_ITEMS {
-            return Err(resource_limit("picker items", MAX_PICKER_ITEMS));
+            return Err(resource_limit(
+                "picker items",
+                self.items.len(),
+                MAX_PICKER_ITEMS,
+            ));
         }
         if self.limit > MAX_PICKER_ITEMS {
-            return Err(resource_limit("picker result limit", MAX_PICKER_ITEMS));
+            return Err(resource_limit(
+                "picker result limit",
+                self.limit,
+                MAX_PICKER_ITEMS,
+            ));
         }
         if !(1..=MAX_PICKER_DEADLINE_MS).contains(&self.deadline_ms) {
             return Err(ShellError::new(
@@ -153,6 +165,7 @@ impl PickerRequest {
             if text_len > MAX_PICKER_ITEM_TEXT_BYTES {
                 return Err(resource_limit(
                     "picker item text",
+                    text_len,
                     MAX_PICKER_ITEM_TEXT_BYTES,
                 ));
             }
@@ -160,6 +173,7 @@ impl PickerRequest {
             if value_len > MAX_PICKER_ITEM_VALUE_BYTES {
                 return Err(resource_limit(
                     "picker item value",
+                    value_len,
                     MAX_PICKER_ITEM_VALUE_BYTES,
                 ));
             }
@@ -169,9 +183,15 @@ impl PickerRequest {
                 .checked_add(96)
                 .and_then(|total| total.checked_add(text_len))
                 .and_then(|total| total.checked_add(value_len))
-                .ok_or_else(|| resource_limit("picker request", MAX_PICKER_REQUEST_BYTES))?;
+                .ok_or_else(|| {
+                    resource_limit("picker request", usize::MAX, MAX_PICKER_REQUEST_BYTES)
+                })?;
             if request_bytes > MAX_PICKER_REQUEST_BYTES {
-                return Err(resource_limit("picker request", MAX_PICKER_REQUEST_BYTES));
+                return Err(resource_limit(
+                    "picker request",
+                    request_bytes,
+                    MAX_PICKER_REQUEST_BYTES,
+                ));
             }
         }
         Ok(())
@@ -467,11 +487,12 @@ fn picker_response(request_id: u64, outcome: PickerOutcome) -> PickerResponse {
     }
 }
 
-fn resource_limit(subject: &str, maximum: usize) -> ShellError {
+fn resource_limit(subject: &str, observed: usize, maximum: usize) -> ShellError {
     ShellError::new(
         ErrorCode::ResourceLimit,
         format!("{subject} exceeds its limit of {maximum}"),
     )
+    .with_context(format!("limit: {maximum}; observed: {observed}"))
     .with_help("Reduce the request size before sending it to the interactive picker")
 }
 
@@ -501,7 +522,9 @@ fn json_value_bytes(value: &serde_json::Value, depth: usize) -> Result<usize, Sh
             total
                 .checked_add(1)
                 .and_then(|total| total.checked_add(value))
-                .ok_or_else(|| resource_limit("picker item value", MAX_PICKER_ITEM_VALUE_BYTES))
+                .ok_or_else(|| {
+                    resource_limit("picker item value", usize::MAX, MAX_PICKER_ITEM_VALUE_BYTES)
+                })
         }),
         serde_json::Value::Object(values) => {
             values.iter().try_fold(2_usize, |total, (key, value)| {
@@ -511,7 +534,9 @@ fn json_value_bytes(value: &serde_json::Value, depth: usize) -> Result<usize, Sh
                     .and_then(|total| total.checked_add(json_string_bytes(key)))
                     .and_then(|total| total.checked_add(1))
                     .and_then(|total| total.checked_add(value))
-                    .ok_or_else(|| resource_limit("picker item value", MAX_PICKER_ITEM_VALUE_BYTES))
+                    .ok_or_else(|| {
+                        resource_limit("picker item value", usize::MAX, MAX_PICKER_ITEM_VALUE_BYTES)
+                    })
             })
         }
     }

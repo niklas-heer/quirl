@@ -4119,7 +4119,6 @@ fn require_grant(grants: &HashSet<String>, capability: &str) -> mlua::Result<()>
                 ErrorCode::Validation,
                 format!("capability denied: {capability}"),
             )
-            .with_context(format!("capability denied: {capability}"))
             .with_context("lua failure: registration")
             .with_help("Grant only the capability approved by the plugin policy"),
         ))
@@ -5290,6 +5289,7 @@ fn script_read_error(path: &Path, error: std::io::Error) -> ShellError {
         format!("cannot read Lua file {}", path.display()),
     )
     .with_context(error.to_string())
+    .with_help("Check that the file exists and is readable")
 }
 
 fn lua_error(error: mlua::Error, path: Option<&Path>, source_len: usize) -> ShellError {
@@ -5361,13 +5361,9 @@ fn lua_resource_error(
 }
 
 fn validation_error(source: &str, message: impl Into<String>) -> ShellError {
-    ShellError::new(
-        ErrorCode::Validation,
-        "Lua value failed Rust schema validation",
-    )
-    .with_context(message)
-    .with_label(Some(source.to_owned()), 0, 0, "schema mismatch")
-    .with_help("Check the documented Lua SDK shape and remove unknown fields or invalid values")
+    ShellError::new(ErrorCode::Validation, message)
+        .with_label(Some(source.to_owned()), 0, 0, "schema mismatch")
+        .with_help("Check the documented Lua SDK shape and remove unknown fields or invalid values")
 }
 
 #[cfg(test)]
@@ -5467,7 +5463,7 @@ mod tests {
         let error = config.validate("symbols.lua").unwrap_err();
 
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error.details.context[0].contains("prompt.symbols"));
+        assert!(error.message.contains("prompt.symbols"));
     }
 
     #[test]
@@ -5615,7 +5611,7 @@ mod tests {
         unknown.ui.theme = "missing".to_owned();
         let error = unknown.validate("unknown.lua").unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error.details.context[0].contains("not built in"));
+        assert!(error.message.contains("not built in"));
 
         let mut malformed = QuirlConfig::default();
         malformed.ui.theme = "quiet".to_owned();
@@ -5625,7 +5621,7 @@ mod tests {
             .insert("quiet".to_owned(), test_theme("123456"));
         let error = malformed.validate("malformed.lua").unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error.details.context[0].contains("#RRGGBB"));
+        assert!(error.message.contains("#RRGGBB"));
 
         let mut shadowing = QuirlConfig::default();
         shadowing
@@ -5634,7 +5630,7 @@ mod tests {
             .insert("tokyo-night".to_owned(), test_theme("#123456"));
         let error = shadowing.validate("shadow.lua").unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error.details.context[0].contains("must not shadow"));
+        assert!(error.message.contains("must not shadow"));
     }
 
     #[test]
@@ -5649,7 +5645,7 @@ mod tests {
         unsafe_name.ui.theme = "Tokyo_Night".to_owned();
         let error = unsafe_name.validate("unsafe-name.lua").unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error.details.context[0].contains("lowercase ASCII"));
+        assert!(error.message.contains("lowercase ASCII"));
 
         let mut long_color = QuirlConfig::default();
         long_color.ui.theme = "quiet".to_owned();
@@ -6517,7 +6513,7 @@ mod tests {
             .complete_with_provider("malformed", &serde_json::json!({}))
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
-        assert!(error.details.context[0].contains("completion item 0"));
+        assert!(error.message.contains("completion item 0"));
     }
 
     #[test]
@@ -6941,7 +6937,11 @@ return { main = exported }
         }"#;
         let denied = LuaRuntime::new_with_capabilities(LuaPolicy::config(), &[]).unwrap();
         let error = denied.eval(source).unwrap_err();
-        assert!(error.details.context[0].contains("capability denied: commands.register"));
+        assert!(
+            error
+                .message
+                .contains("capability denied: commands.register")
+        );
 
         let runtime = LuaRuntime::new_with_capabilities(
             LuaPolicy::config(),
@@ -7007,7 +7007,7 @@ return { main = exported }
             .run_plugin_command("demo run", &serde_json::json!([42]))
             .unwrap_err();
         assert_eq!(invalid.code, ErrorCode::Validation);
-        assert!(invalid.details.context[0].contains("named object"));
+        assert!(invalid.message.contains("named object"));
     }
 
     #[test]
@@ -7060,7 +7060,7 @@ return { main = exported }
                 }"#,
             )
             .unwrap_err();
-        assert!(error.details.context[0].contains("capability denied: plan.rewrite"));
+        assert!(error.message.contains("capability denied: plan.rewrite"));
 
         let runtime = LuaRuntime::new_with_capabilities(
             LuaPolicy {
@@ -7256,7 +7256,7 @@ return { main = exported }
             )
             .unwrap_err();
         assert_eq!(hostile.code, ErrorCode::Validation);
-        assert!(hostile.details.context[0].contains("cyclic"));
+        assert!(hostile.message.contains("cyclic"));
 
         let source = format!(
             r#"return {{ abi_version = 1, main = function()

@@ -168,6 +168,7 @@ fn file_items(root: &Path) -> Result<Vec<PickItem>, ShellError> {
                         format!("could not inspect {}", path.display()),
                     )
                     .with_context(error.to_string())
+                    .with_help("Retry with a narrower --root")
                 })?
                 .is_dir();
             items.push(PickItem {

@@ -1342,13 +1342,18 @@ impl LuaExtensionHost {
                             }
                         }
                     }
-                    Ok(_) => self.record_error(ShellError::new(
-                        ErrorCode::Validation,
-                        format!(
-                            "completion provider `{}` must return an array",
-                            provider.command
+                    Ok(_) => self.record_error(
+                        ShellError::new(
+                            ErrorCode::Validation,
+                            format!(
+                                "completion provider `{}` must return an array",
+                                provider.command
+                            ),
+                        )
+                        .with_help(
+                            "Return a JSON array of completion items from the provider callback",
                         ),
-                    )),
+                    ),
                     Err(error) => self.record_error(
                         error.with_context(format!("completion provider: {}", provider.command)),
                     ),
@@ -3694,13 +3699,11 @@ max_message_bytes = 65536
         write_managed_lock(&root, &denied);
         assert_eq!(host.reload_if_changed(), ExtensionReloadState::Rejected);
         assert!(host.named_prompt_segments(Mode::Command, 0).is_empty());
-        assert!(host.take_errors().iter().any(|error| {
-            error
-                .details
-                .context
+        assert!(
+            host.take_errors()
                 .iter()
-                .any(|context| context.contains("capability denied: prompt.register"))
-        }));
+                .any(|error| error.message.contains("capability denied: prompt.register"))
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }

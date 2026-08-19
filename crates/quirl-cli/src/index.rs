@@ -1796,7 +1796,7 @@ fn load_cached_catalog_with_local_overlay(
     let Some(state_json) = state_json else {
         return Ok(catalog);
     };
-    let state: DiscoveryState = serde_json::from_str(&state_json).map_err(json_error)?;
+    let state: DiscoveryState = serde_json::from_str(&state_json).map_err(json_decode_error)?;
     if state.version != DISCOVERY_STATE_VERSION
         || state.native_catalog_identity != crate::native_catalog::embedded_database_identity()
     {
@@ -3745,6 +3745,13 @@ fn index_io_error(action: &str, path: &Path, error: std::io::Error) -> ShellErro
 fn json_error(error: serde_json::Error) -> ShellError {
     ShellError::new(ErrorCode::Io, "could not serialize completion index data")
         .with_context(error.to_string())
+        .with_help("Rebuild the command database with `quirl index build`")
+}
+
+fn json_decode_error(error: serde_json::Error) -> ShellError {
+    ShellError::new(ErrorCode::Io, "could not decode completion index data")
+        .with_context(error.to_string())
+        .with_help("Rebuild the command database with `quirl index build`")
 }
 
 fn print_json(value: &impl Serialize) -> Result<(), ShellError> {

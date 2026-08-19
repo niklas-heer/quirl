@@ -642,11 +642,15 @@ fn read_message(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, ShellError
         } else {
             &buffer[..chunk]
         };
-        if message.len().saturating_add(content.len()) > MAX_MESSAGE_BYTES {
+        let observed_bytes = message.len().saturating_add(content.len());
+        if observed_bytes > MAX_MESSAGE_BYTES {
             return Err(ShellError::new(
                 ErrorCode::ResourceLimit,
                 "MCP message exceeds the configured byte limit",
             )
+            .with_context(format!(
+                "limit: {MAX_MESSAGE_BYTES} bytes; observed: {observed_bytes} bytes"
+            ))
             .with_help("Send one JSON-RPC request no larger than 1 MiB"));
         }
         message.extend_from_slice(content);
@@ -671,6 +675,10 @@ fn write_message(writer: &mut impl Write, response: &Response) -> Result<(), She
             ErrorCode::ResourceLimit,
             "MCP response exceeds the configured byte limit",
         )
+        .with_context(format!(
+            "limit: {MAX_MESSAGE_BYTES} bytes; observed: {} bytes",
+            bytes.len()
+        ))
         .with_help("Request a smaller capability result"));
     }
     writer
