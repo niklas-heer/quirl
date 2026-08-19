@@ -43,6 +43,7 @@ const CHECK_NAMES: &[&str] = &[
     "retained-output-cycles",
     "external-command-compatibility",
     "streamed-progress-without-newline",
+    "spinner-animates-during-silent-command",
     "full-screen-program-takeover",
     "full-screen-program-spawn-failure-restores-terminal",
     "ctrl-l-forces-full-repaint",
@@ -444,7 +445,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 23] {
+fn checks() -> [CheckCase; 24] {
     [
         CheckCase {
             name: "rich-editing",
@@ -497,6 +498,10 @@ fn checks() -> [CheckCase; 23] {
         CheckCase {
             name: "streamed-progress-without-newline",
             run: check_streamed_progress_without_newline,
+        },
+        CheckCase {
+            name: "spinner-animates-during-silent-command",
+            run: check_spinner_animates_during_silent_command,
         },
         CheckCase {
             name: "full-screen-program-takeover",
@@ -1973,6 +1978,50 @@ fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), Box<dyn 
         session.pty.wait_exit()?,
         0,
         "streamed progress without newline",
+    )
+}
+
+fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), Box<dyn Error>> {
+    // Failure model: a command that produces no output of its own (a bare
+    // `sleep`) must still show Quirl is alive and waiting on it. Without a
+    // liveness tick independent of child output, the viewport would sit
+    // frozen on the very first frame for the command's whole duration,
+    // indistinguishable from a hang. This is distinct from
+    // `check_streamed_progress_without_newline`, which proves a child's own
+    // `\r` progress reaches the screen live; this proves Quirl's own
+    // heartbeat does, with zero bytes from the child at all.
+    let mut session = Session::new(binary, SessionOptions::default())?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    session.pty.type_text("/bin/sleep 2")?;
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("spinner shows the command is running", |screen| {
+            screen.bottom_line().contains("running")
+        })?;
+    let first = session.pty.screen().bottom_line();
+    session
+        .pty
+        .wait_for_screen("spinner advances without any child output", |screen| {
+            screen.bottom_line().contains("running") && screen.bottom_line() != first
+        })?;
+    let second = session.pty.screen().bottom_line();
+    if second == first {
+        return Err(io::Error::other(
+            "the running-command status line never changed while the silent child was still \
+             executing",
+        )
+        .into());
+    }
+    session.pty.wait_for_screen(
+        "silent command completed inside persistent viewport",
+        |screen| screen.text().contains("── exit 0") && screen.bottom_line().contains("NORMAL"),
+    )?;
+    session.pty.send(key::CTRL_D)?;
+    ensure_status(
+        session.pty.wait_exit()?,
+        0,
+        "spinner animates during silent command",
     )
 }
 

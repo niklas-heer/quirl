@@ -56,7 +56,8 @@ use quirl_data::{DataEnvelope, DataOutput, DataRenderFormat, DataRuntime};
 use quirl_lua::{LuaPolicy, MAX_LUA_SOURCE_BYTES, QuirlConfig, sdk_json, sdk_lua, sdk_markdown};
 use quirl_picker::{ItemKind, MAX_PICKER_ITEMS, PickItem, Picker};
 use quirl_process::{
-    DEFAULT_CAPTURE_BYTES, JobStatus, NativeExecutor, OutputObserver, sandboxed_process_host,
+    DEFAULT_CAPTURE_BYTES, JobStatus, NativeExecutor, ObservedActivity, OutputObserver,
+    sandboxed_process_host,
 };
 use quirl_syntax::{InteractiveLine, Mode, classify, parse_command_list};
 use quirl_ui::{
@@ -925,10 +926,12 @@ fn execute_execution_request_streaming(
     if !matches!(plan.input(), ExecutionInput::None) && plan.mode() != ExecutionMode::Plugin {
         return Err(ShellError::new(
             ErrorCode::Validation,
-            "the selected front door does not yet consume execution input",
+            "this command does not yet accept piped input",
         )
         .with_command(plan.source().text())
-        .with_help("Use an explicit engine adapter until P08/P09 add typed stream composition"));
+        .with_help(
+            "Run it without piped input, or use a data/plugin command that supports streaming",
+        ));
     }
     let deadline_guard = DeadlineCancellationGuard::arm(&plan, "before mode dispatch")?;
     let result = match plan.mode() {
@@ -2237,9 +2240,14 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         }
                         let mut streamed_any = false;
                         let execution = if streaming {
-                            let mut observer = |stream, bytes: &[u8]| {
-                                streamed_any |= !bytes.is_empty();
-                                line_editor.append_command_stream(stream, bytes, &prompt)
+                            let mut observer = |activity: ObservedActivity<'_>| match activity {
+                                ObservedActivity::Output { stream, bytes } => {
+                                    streamed_any |= !bytes.is_empty();
+                                    line_editor.append_command_stream(stream, bytes, &prompt)
+                                }
+                                ObservedActivity::Tick => {
+                                    line_editor.tick_command_stream(started, &prompt)
+                                }
                             };
                             execute_with_recovery(
                                 &mut executor,
@@ -3157,6 +3165,21 @@ impl SessionEditor {
         Ok(())
     }
 
+    /// Refresh the running-command spinner and elapsed time.
+    ///
+    /// A no-op for the simple surface, which inherits the real terminal
+    /// directly and has no viewport of its own to animate.
+    fn tick_command_stream(
+        &mut self,
+        started: Instant,
+        prompt: &QuirlPrompt,
+    ) -> Result<(), ShellError> {
+        if let Self::Rich(editor) = self {
+            editor.tick_command_stream(started.elapsed(), prompt)?;
+        }
+        Ok(())
+    }
+
     fn finish_command_stream(
         &mut self,
         status: i32,
@@ -3707,6 +3730,9 @@ fn run_stdin() -> Result<i32, ShellError> {
         .map_err(|error| {
             ShellError::new(ErrorCode::Io, "could not read standard input")
                 .with_context(error.to_string())
+                .with_help(
+                    "Check that standard input is connected and not closed by the calling shell",
+                )
         })?;
     if bytes.len() > MAX_LUA_SOURCE_BYTES {
         return Err(ShellError::new(
@@ -3879,7 +3905,9 @@ fn print_outcome(outcome: &quirl_core::CommandOutcome) {
 }
 
 fn json_error(error: serde_json::Error) -> ShellError {
-    ShellError::new(ErrorCode::Io, "could not produce JSON").with_context(error.to_string())
+    ShellError::new(ErrorCode::Io, "could not produce JSON")
+        .with_context(error.to_string())
+        .with_help("Retry without --format json, or report this if it persists")
 }
 
 #[cfg(test)]

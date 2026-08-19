@@ -53,6 +53,7 @@ use super::{
     ExtensionCompleter, MAX_HISTORY_ENCODED_ENTRY_BYTES, MAX_HISTORY_ENTRY_BYTES,
     MAX_HISTORY_RETAINED_BYTES, PickerRanker, QuirlPrompt, read_history,
 };
+use crate::SurfaceSymbols;
 use crate::theme::Theme;
 use crossterm::{
     cursor::{SetCursorStyle, Show},
@@ -556,7 +557,22 @@ impl RichSurface {
         self.stream_stderr.reset();
         self.live_output_owner = None;
         self.append_transcript_line(&format!("❯ {command}"));
-        self.output_notice = Some("running · output streams into this viewport".to_owned());
+        self.output_notice = Some(running_notice(Duration::ZERO, prompt.surface_symbols()));
+        self.draw_execution(prompt)
+    }
+
+    /// Refresh the running-command spinner and elapsed time, then repaint.
+    ///
+    /// Call this once per liveness tick delivered while a foreground command
+    /// has produced no new output: without it, a silent long-running command
+    /// leaves the viewport looking frozen even though Quirl is still
+    /// waiting on it.
+    pub fn tick_command_stream(
+        &mut self,
+        elapsed: Duration,
+        prompt: &QuirlPrompt,
+    ) -> Result<(), ShellError> {
+        self.output_notice = Some(running_notice(elapsed, prompt.surface_symbols()));
         self.draw_execution(prompt)
     }
 
@@ -1805,6 +1821,43 @@ impl Drop for RichSurface {
         if self.terminal.active {
             self.terminal.reset_best_effort();
         }
+    }
+}
+
+/// Frame length of one spinner glyph, matching the observer's tick cadence
+/// so every delivered tick advances the spinner by exactly one frame.
+const SPINNER_FRAME_MS: u128 = 100;
+const SPINNER_FRAMES_UNICODE: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPINNER_FRAMES_PLAIN: [char; 4] = ['|', '/', '-', '\\'];
+
+/// Build the running-command status text: a spinner glyph that advances
+/// with `elapsed`, plus a compact elapsed-time readout.
+///
+/// This is Quirl's own liveness indicator, distinct from a child process's
+/// own carriage-return progress output (which the transcript already
+/// replays live): it is what tells the user Quirl is still waiting on a
+/// command that has produced no output of its own at all.
+fn running_notice(elapsed: Duration, symbols: SurfaceSymbols) -> String {
+    let frame = (elapsed.as_millis() / SPINNER_FRAME_MS) as usize;
+    let glyph = match symbols {
+        SurfaceSymbols::Plain => SPINNER_FRAMES_PLAIN[frame % SPINNER_FRAMES_PLAIN.len()],
+        SurfaceSymbols::Unicode | SurfaceSymbols::NerdFont => {
+            SPINNER_FRAMES_UNICODE[frame % SPINNER_FRAMES_UNICODE.len()]
+        }
+    };
+    format!(
+        "{glyph} running {} · output streams into this viewport",
+        format_elapsed(elapsed)
+    )
+}
+
+/// Render `elapsed` as a compact `12.3s` or `4m05s` readout.
+fn format_elapsed(elapsed: Duration) -> String {
+    let total_seconds = elapsed.as_secs();
+    if total_seconds < 60 {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    } else {
+        format!("{}m{:02}s", total_seconds / 60, total_seconds % 60)
     }
 }
 

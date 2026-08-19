@@ -24,9 +24,30 @@ use std::{
 pub const SESSION_ENVIRONMENT_VARIABLES_MAX: usize = 65_536;
 /// Maximum key and value bytes retained by one native executor's environment snapshot.
 pub const SESSION_ENVIRONMENT_BYTES_MAX: usize = 16 * 1024 * 1024;
-/// Callback invoked with one bounded retained-output chunk during native execution.
+/// One observation delivered to an [`OutputObserver`] during native execution.
+#[derive(Debug, Clone, Copy)]
+pub enum ObservedActivity<'a> {
+    /// One bounded retained-output chunk read from the foreground child.
+    Output {
+        /// Which stream the chunk was read from.
+        stream: quirl_core::OutputStream,
+        /// The chunk itself, read in at most 8 KiB pieces.
+        bytes: &'a [u8],
+    },
+    /// A liveness heartbeat delivered on a bounded cadence while a foreground
+    /// child is running but has produced no new output to report.
+    ///
+    /// Carries no payload: elapsed time is the observer's own concern (it
+    /// already knows when the command started), and a fixed cadence keeps
+    /// this a plain "still running" signal rather than a timing source
+    /// callers might otherwise be tempted to accumulate against.
+    Tick,
+}
+
+/// Callback invoked with one bounded retained-output chunk, or a liveness
+/// tick, during native execution.
 pub type OutputObserver<'a> =
-    dyn FnMut(quirl_core::OutputStream, &[u8]) -> Result<(), quirl_core::ShellError> + 'a;
+    dyn FnMut(ObservedActivity<'_>) -> Result<(), quirl_core::ShellError> + 'a;
 
 #[derive(Clone)]
 pub(crate) struct SessionEnvironment {
@@ -161,7 +182,7 @@ impl SessionEnvironment {
             let generation = self.generation.checked_add(1).ok_or_else(|| {
                 quirl_core::ShellError::new(
                     quirl_core::ErrorCode::ResourceLimit,
-                    "session environment generation counter was exhausted",
+                    "session environment has been updated too many times to track safely",
                 )
                 .with_help("Restart Quirl before applying another environment update")
             })?;
@@ -422,8 +443,9 @@ mod simulation_support {
 mod platform {
     use super::{
         ARITHMETIC_DEPTH_MAX, ARITHMETIC_SOURCE_BYTES_MAX, DEFAULT_CAPTURE_BYTES,
-        EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, OutputObserver, RETAINED_JOBS_MAX,
-        SessionEnvironment, allocate_job_id, builtin, validate_native_plan, validate_native_source,
+        EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, ObservedActivity, OutputObserver,
+        RETAINED_JOBS_MAX, SessionEnvironment, allocate_job_id, builtin, validate_native_plan,
+        validate_native_source,
     };
 
     use nix::{
@@ -444,7 +466,7 @@ mod platform {
     #[cfg(test)]
     use std::env;
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
         fs::{File, OpenOptions},
         io::{ErrorKind, IsTerminal, Read, Write},
         path::{Path, PathBuf},
@@ -519,8 +541,32 @@ mod platform {
         bytes: Vec<u8>,
     }
 
+    /// Minimum spacing between two [`ObservedActivity::Tick`] deliveries to
+    /// one observer, so a spinner or elapsed-time display animates smoothly
+    /// without redrawing far faster than a terminal or a human eye needs.
+    const OBSERVER_TICK_INTERVAL: Duration = Duration::from_millis(100);
+
     struct OutputObserverHandle<'a> {
         callback: RefCell<&'a mut OutputObserver<'a>>,
+        last_tick: Cell<Instant>,
+    }
+
+    impl OutputObserverHandle<'_> {
+        /// Deliver a [`ObservedActivity::Tick`] if at least
+        /// [`OBSERVER_TICK_INTERVAL`] has passed since the last one.
+        ///
+        /// Called every turn of the bounded foreground-wait loop, which is
+        /// itself already cancellation-checked, so this stays a plain
+        /// elapsed-time comparison rather than a timer needing its own
+        /// cleanup or cancellation path.
+        fn maybe_tick(&self) -> Result<(), ShellError> {
+            let now = Instant::now();
+            if now.duration_since(self.last_tick.get()) < OBSERVER_TICK_INTERVAL {
+                return Ok(());
+            }
+            self.last_tick.set(now);
+            (self.callback.borrow_mut())(ObservedActivity::Tick)
+        }
     }
 
     struct CaptureBudget {
@@ -961,6 +1007,13 @@ mod platform {
             &mut self,
             group_result: Result<(), Errno>,
         ) -> Result<(), ShellError> {
+            fn render_outcome<T, E: std::fmt::Display>(result: &Result<T, E>) -> String {
+                match result {
+                    Ok(_) => "ok".to_owned(),
+                    Err(error) => error.to_string(),
+                }
+            }
+
             let child_result = self.child.kill();
             self.keepalive.take();
             let wait_result = self.child.wait();
@@ -973,8 +1026,11 @@ mod platform {
             Err(
                 ShellError::new(ErrorCode::Io, "could not terminate owned process group")
                     .with_context(format!(
-                "group={group_result:?}; anchor_kill={child_result:?}; anchor_wait={wait_result:?}"
-            ))
+                        "group={}; anchor_kill={}; anchor_wait={}",
+                        render_outcome(&group_result),
+                        render_outcome(&child_result),
+                        render_outcome(&wait_result)
+                    ))
                     .with_help(
                         "Retry the command; report repeated anchored-group cleanup failures",
                     ),
@@ -1024,7 +1080,8 @@ mod platform {
                 "could not establish the owned process-group anchor",
             )
             .with_context(format!(
-                "pid {child_id}; expected group {process_group}; getpgid={observed_group:?}"
+                "pid {child_id}; expected group {process_group}; observed group {}",
+                observed_group.map_or_else(|e| format!("unavailable ({e})"), |g| g.to_string())
             ))
             .with_help("Retry the command; report repeated anchor construction failures"));
         }
@@ -1231,6 +1288,7 @@ mod platform {
             let context = RequestContext::new(&request)?;
             let observer = OutputObserverHandle {
                 callback: RefCell::new(observer),
+                last_tick: Cell::new(Instant::now()),
             };
             self.execute_inner_with_observer(&request.command, true, Some(context), Some(&observer))
         }
@@ -1795,7 +1853,14 @@ mod platform {
                     .first()
                     .map(|word| word.strip_prefix('^').unwrap_or(word))
                     .ok_or_else(|| {
-                        ShellError::new(ErrorCode::InvalidCommand, "empty command stage")
+                        ShellError::new(
+                            ErrorCode::InvalidCommand,
+                            "a pipeline stage has no command name",
+                        )
+                        .with_command(source)
+                        .with_help(
+                            "Remove the empty stage, e.g. a stray `|` or `^` with nothing after it",
+                        )
                     })?;
                 let staged_group_leader = spawned.process_group.is_none();
                 let mut process = if staged_group_leader {
@@ -2319,7 +2384,7 @@ mod platform {
                     self.skip();
                     if self.input.get(self.index) != Some(&b')') {
                         return Err(expansion_error(
-                            "invalid arithmetic expansion",
+                            "unbalanced parentheses in arithmetic expansion",
                             "Balance parentheses in `$((...))`",
                         ));
                     }
@@ -2344,12 +2409,15 @@ mod platform {
                 }
                 if start == self.index {
                     return Err(expansion_error(
-                        "invalid arithmetic expansion",
+                        "missing operand in arithmetic expansion",
                         "Use integer literals and +, -, *, /, or parentheses",
                     ));
                 }
                 let text = std::str::from_utf8(&self.input[start..self.index]).map_err(|_| {
-                    expansion_error("invalid arithmetic expansion", "Use ASCII integer literals")
+                    expansion_error(
+                        "non-numeric digits in arithmetic expansion",
+                        "Use ASCII integer literals",
+                    )
                 })?;
                 let value = text.parse::<i64>().map_err(|_| {
                     expansion_error(
@@ -2368,9 +2436,10 @@ mod platform {
         parser.skip();
         if parser.index != parser.input.len() {
             return Err(expansion_error(
-                "invalid arithmetic expansion",
+                "unexpected trailing text in arithmetic expansion",
                 "Use integer literals and +, -, *, /, or parentheses",
-            ));
+            )
+            .with_context(format!("in `{source}`")));
         }
         Ok(value)
     }
@@ -2438,9 +2507,13 @@ mod platform {
                                 ErrorCode::ResourceLimit,
                                 "pathname expansion exceeded its match budget",
                             )
-                            .with_help(
-                                "Narrow the pattern below 10,000 matches or use an explicit data pipeline",
-                            ));
+                            .with_context(format!(
+                                "limit {MAX_GLOB_MATCHES} matches; observed {} matches",
+                                next.len()
+                            ))
+                            .with_help(format!(
+                                "Narrow the pattern below {MAX_GLOB_MATCHES} matches or use an explicit data pipeline",
+                            )));
                         }
                     }
                 }
@@ -2780,7 +2853,9 @@ mod platform {
             .find(|redirect| matches!(redirect.kind, RedirectKind::Output | RedirectKind::Append))
             .ok_or_else(|| {
                 ShellError::new(ErrorCode::Io, "missing output redirection")
-                    .with_help("Remove the redirect and retry")
+                    .with_help(
+                        "Add a > or >> redirect to the command, or report this if one was already given",
+                    )
             })?;
         let file = open_redirected_output(redirect)?;
         io_write_all(file, bytes, &redirect.path)
@@ -2968,7 +3043,8 @@ mod platform {
             "could not establish the native pipeline process group",
         )
         .with_context(format!(
-            "pid {process_id}; expected group {expected_group}; setpgid={set_result:?}; getpgid={observed_group:?}{}",
+            "pid {process_id}; expected group {expected_group}; setpgid={set_result:?}; observed group {}{}",
+            observed_group.map_or_else(|e| format!("unavailable ({e})"), |g| g.to_string()),
             exited_child_context.unwrap_or_default()
         ))
         .with_help("Retry the command; report repeated process-group construction failures"))
@@ -3017,7 +3093,8 @@ mod platform {
                 )
                 .with_command(source)
                 .with_context(format!(
-                    "pid {process_group}; expected group {process_group}; getpgid={observed_group:?}"
+                    "pid {process_group}; expected group {process_group}; observed group {}",
+                    observed_group.map_or_else(|e| format!("unavailable ({e})"), |g| g.to_string())
                 ))
                 .with_help("Retry the command; report repeated process-group staging failures"));
             }
@@ -3204,15 +3281,7 @@ mod platform {
         let Some(anchor) = process_group_anchor.take() else {
             return Ok(());
         };
-        anchor.terminate_owned_group().map_err(|error| {
-            ShellError::new(
-                ErrorCode::Io,
-                "could not terminate remaining pipeline descendants",
-            )
-            .with_context(error.message)
-            .with_context(error.details.context.join("; "))
-            .with_help("Retry the command; report repeated process-group cleanup failures")
-        })
+        anchor.terminate_owned_group()
     }
 
     fn spawn_reader_observed(
@@ -3651,6 +3720,9 @@ mod platform {
         let mut stop_propagated = false;
         loop {
             drain_output_events(observer, output, 64)?;
+            if let Some(observer) = observer {
+                observer.maybe_tick()?;
+            }
             for child in children
                 .iter_mut()
                 .filter(|child| child.status != JobStatus::Done)
@@ -3701,7 +3773,10 @@ mod platform {
                 Ok(event) => event,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
-            (observer.callback.borrow_mut())(event.stream, &event.bytes)?;
+            (observer.callback.borrow_mut())(ObservedActivity::Output {
+                stream: event.stream,
+                bytes: &event.bytes,
+            })?;
         }
         Ok(())
     }
@@ -4132,8 +4207,11 @@ mod platform {
             };
             let mut first_arrived_while_running = false;
             let outcome = NativeExecutor::default()
-                .execute_capture_request_streaming(request, &mut |stream, bytes| {
-                    if stream == OutputStream::Stdout && bytes == b"first" {
+                .execute_capture_request_streaming(request, &mut |activity| {
+                    if let ObservedActivity::Output { stream, bytes } = activity
+                        && stream == OutputStream::Stdout
+                        && bytes == b"first"
+                    {
                         first_arrived_while_running = !finished.exists();
                     }
                     Ok(())
@@ -5133,8 +5211,9 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::{
-        DEFAULT_CAPTURE_BYTES, HERE_STRING_BYTES_MAX, OutputObserver, RETAINED_JOBS_MAX,
-        SessionEnvironment, allocate_job_id, builtin, validate_native_plan, validate_native_source,
+        DEFAULT_CAPTURE_BYTES, HERE_STRING_BYTES_MAX, ObservedActivity, OutputObserver,
+        RETAINED_JOBS_MAX, SessionEnvironment, allocate_job_id, builtin, validate_native_plan,
+        validate_native_source,
     };
     use quirl_core::{CommandOutcome, ErrorCode, OutputStream, ProcessRequest, ShellError};
     use quirl_syntax::{ListConnector, Pipeline, RedirectKind, SimpleCommand, parse_command_list};
@@ -5418,10 +5497,16 @@ mod platform {
         ) -> Result<CommandOutcome, ShellError> {
             let outcome = self.execute_capture_request(request)?;
             if let Some(stdout) = &outcome.stdout {
-                observer(OutputStream::Stdout, stdout.as_bytes())?;
+                observer(ObservedActivity::Output {
+                    stream: OutputStream::Stdout,
+                    bytes: stdout.as_bytes(),
+                })?;
             }
             if let Some(stderr) = &outcome.stderr {
-                observer(OutputStream::Stderr, stderr.as_bytes())?;
+                observer(ObservedActivity::Output {
+                    stream: OutputStream::Stderr,
+                    bytes: stderr.as_bytes(),
+                })?;
             }
             Ok(outcome)
         }
@@ -6443,11 +6528,34 @@ pub fn transition_job_state(
         (JobStatus::Running | JobStatus::Stopped, JobLifecycleEvent::Exit(status)) => {
             Ok((JobStatus::Done, Some(status)))
         }
-        (_, event) => Err(quirl_core::ShellError::new(
-            quirl_core::ErrorCode::InvalidArgument,
-            format!("invalid job lifecycle transition from {current:?} through {event:?}"),
-        )
-        .with_help("Refresh the job list before requesting another lifecycle transition")),
+        (_, event) => {
+            fn render_status(status: JobStatus) -> &'static str {
+                match status {
+                    JobStatus::Running => "running",
+                    JobStatus::Stopped => "stopped",
+                    JobStatus::Done => "done",
+                }
+            }
+            fn render_event(event: JobLifecycleEvent) -> String {
+                match event {
+                    JobLifecycleEvent::Stop => "stop".to_owned(),
+                    JobLifecycleEvent::Continue => "continue".to_owned(),
+                    JobLifecycleEvent::Exit(status) => format!("exit({status})"),
+                }
+            }
+            Err(quirl_core::ShellError::new(
+                quirl_core::ErrorCode::InvalidArgument,
+                format!(
+                    "invalid job lifecycle transition from {} through {}",
+                    render_status(current),
+                    render_event(event)
+                ),
+            )
+            .with_help("Refresh the job list before requesting another lifecycle transition")
+            .with_help(
+                "Report this internal job-table inconsistency, including the job's recent history",
+            ))
+        }
     }
 }
 
@@ -6541,13 +6649,13 @@ mod backend_contract_tests {
         std::assert_matches!(
             transition_job_state(JobStatus::Done, JobLifecycleEvent::Continue),
             Err(error) if error.code == ErrorCode::InvalidArgument
-                && error.message.contains("Done")
+                && error.message.contains("done")
                 && !error.details.help.is_empty()
         );
         std::assert_matches!(
             transition_job_state(JobStatus::Stopped, JobLifecycleEvent::Stop),
             Err(error) if error.code == ErrorCode::InvalidArgument
-                && error.message.contains("Stopped")
+                && error.message.contains("stopped")
                 && !error.details.help.is_empty()
         );
     }
