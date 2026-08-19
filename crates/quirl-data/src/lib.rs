@@ -16,6 +16,7 @@
 pub mod syntax;
 mod value_boundary;
 
+use indexmap::{IndexMap, IndexSet};
 use quirl_core::{
     DirectoryOptions, Entry, EntryKind, ErrorCode, ProcessHost, ProcessRequest, ShellError,
     StructuredValue, directory_entries_with_options,
@@ -23,7 +24,7 @@ use quirl_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -728,8 +729,8 @@ impl DataRuntime {
     ) -> Result<DataOutput, ShellError> {
         validate_limits(self.limits)?;
         let syntax_limits = syntax_limits(self.limits);
-        let expression = syntax::parse_data_expression(source, syntax_limits)
-            .map_err(|diagnostic| syntax_shell_error(source, diagnostic))?;
+        let expression =
+            syntax::parse_data_expression(source, syntax_limits).map_err(syntax_shell_error)?;
         check_cancelled(cancelled)?;
         let mut output = evaluate_source_output(
             &expression.source,
@@ -1013,7 +1014,7 @@ fn directory_entry_value(entry: Entry) -> DataValue {
     let target = entry.symlink_target.map_or(DataValue::Nothing, |path| {
         DataValue::Path(path.display().to_string())
     });
-    DataValue::Record(BTreeMap::from([
+    DataValue::Record(IndexMap::from([
         ("hidden".to_owned(), DataValue::Bool(entry.hidden)),
         ("kind".to_owned(), DataValue::String(kind.to_owned())),
         ("modified".to_owned(), modified),
@@ -1889,7 +1890,7 @@ fn open_tar_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
                     tar_error_display(&display, "read size cannot be represented on this host")
                 })?;
             }
-            Ok(Some(DataValue::Record(BTreeMap::from([
+            Ok(Some(DataValue::Record(IndexMap::from([
                 ("kind".to_owned(), DataValue::String(kind.to_owned())),
                 ("path".to_owned(), DataValue::Path(path)),
                 ("size".to_owned(), DataValue::Size { bytes: size }),
@@ -2163,7 +2164,7 @@ enum TypedJsonFrame<'a> {
         index: usize,
     },
     Record {
-        entries: std::collections::btree_map::Iter<'a, String, DataValue>,
+        entries: indexmap::map::Iter<'a, String, DataValue>,
         first: bool,
     },
 }
@@ -2323,7 +2324,7 @@ enum JsonCompatibleFrame<'a> {
         index: usize,
     },
     Record {
-        entries: std::collections::btree_map::Iter<'a, String, DataValue>,
+        entries: indexmap::map::Iter<'a, String, DataValue>,
         first: bool,
     },
 }
@@ -2534,7 +2535,7 @@ fn render_table_rows_to(
     limits: DataLimits,
     cancelled: Option<&AtomicBool>,
 ) -> Result<(), ShellError> {
-    let mut columns = BTreeSet::new();
+    let mut columns = IndexSet::new();
     for row in rows {
         if let DataValue::Record(row) = row {
             columns.extend(row.keys().map(String::as_str));
@@ -2741,20 +2742,36 @@ fn apply_transform(
     }
 }
 
+/// Split a trailing `?` optional-access marker off a dotted/indexed cell path.
+///
+/// A path of just `?` is left untouched, since it is not a meaningful field
+/// or index name to strip down to an empty path.
+fn split_optional_path(path: &str) -> (&str, bool) {
+    match path.strip_suffix('?') {
+        Some(stripped) if !stripped.is_empty() => (stripped, true),
+        _ => (path, false),
+    }
+}
+
 fn get_field(value: DataValue, field: &str, stage: &str) -> Result<DataValue, ShellError> {
+    let (field, optional) = split_optional_path(field);
     match value {
-        DataValue::Record(object) => get_path(&DataValue::Record(object), field)
-            .cloned()
-            .ok_or_else(|| data_error(stage, format!("record has no field `{field}`"))),
+        DataValue::Record(object) => match get_path(&DataValue::Record(object), field) {
+            Some(found) => Ok(found.clone()),
+            None if optional => Ok(DataValue::Nothing),
+            None => Err(data_error(stage, format!("record has no field `{field}`"))),
+        },
         DataValue::List(values) => values
             .into_iter()
             .map(|value| {
                 if !matches!(value, DataValue::Record(_)) {
                     return Err(data_error(stage, "get over a list expects record rows"));
                 }
-                get_path(&value, field)
-                    .cloned()
-                    .ok_or_else(|| data_error(stage, format!("row has no field `{field}`")))
+                match get_path(&value, field) {
+                    Some(found) => Ok(found.clone()),
+                    None if optional => Ok(DataValue::Nothing),
+                    None => Err(data_error(stage, format!("row has no field `{field}`"))),
+                }
             })
             .collect::<Result<Vec<_>, _>>()
             .map(DataValue::List),
@@ -2858,8 +2875,13 @@ fn evaluate_condition(
     row: &DataValue,
     stage: &str,
 ) -> Result<bool, ShellError> {
-    let Some(actual) = get_path(row, &condition.field) else {
-        return Ok(false);
+    let (field, optional) = split_optional_path(&condition.field);
+    let Some(actual) = get_path(row, field) else {
+        return if optional {
+            Ok(false)
+        } else {
+            Err(data_error(stage, format!("row has no field `{field}`")))
+        };
     };
     match condition.comparison {
         SyntaxComparisonOperator::Equal => values_equal(actual, &condition.expected, stage),
@@ -3028,10 +3050,15 @@ fn value_kind(value: &DataValue) -> &'static str {
 }
 
 fn get_path<'a>(value: &'a DataValue, path: &str) -> Option<&'a DataValue> {
-    path.split('.').try_fold(value, |value, field| match value {
-        DataValue::Record(values) => values.get(field),
-        _ => None,
-    })
+    path.split('.')
+        .try_fold(value, |value, segment| match value {
+            DataValue::Record(values) => values.get(segment),
+            DataValue::List(values) => segment
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| values.get(index)),
+            _ => None,
+        })
 }
 
 fn sort_rows(
@@ -3097,9 +3124,9 @@ fn select_fields(
     stage: &str,
 ) -> Result<DataValue, ShellError> {
     fn select(
-        object: BTreeMap<String, DataValue>,
+        object: IndexMap<String, DataValue>,
         fields: &[String],
-    ) -> BTreeMap<String, DataValue> {
+    ) -> IndexMap<String, DataValue> {
         fields
             .iter()
             .filter_map(|field| {
@@ -3183,7 +3210,7 @@ fn syntax_limits(limits: DataLimits) -> DataSyntaxLimits {
     }
 }
 
-fn syntax_shell_error(source: &str, diagnostic: DataSyntaxDiagnostic) -> ShellError {
+fn syntax_shell_error(diagnostic: DataSyntaxDiagnostic) -> ShellError {
     let code = match diagnostic.kind {
         DataSyntaxDiagnosticKind::ResourceLimit => ErrorCode::ResourceLimit,
         DataSyntaxDiagnosticKind::Encoding | DataSyntaxDiagnosticKind::Syntax => ErrorCode::Data,
@@ -3195,7 +3222,6 @@ fn syntax_shell_error(source: &str, diagnostic: DataSyntaxDiagnostic) -> ShellEr
             diagnostic.end,
             "invalid data syntax",
         )
-        .with_context(format!("expression bytes: {}", source.len()))
         .with_help(diagnostic.help)
 }
 
@@ -3398,7 +3424,7 @@ mod tests {
     }
 
     fn expansion_row() -> DataValue {
-        DataValue::Record(BTreeMap::from([(
+        DataValue::Record(IndexMap::from([(
             "header".to_owned(),
             DataValue::String("\u{001b}".repeat(128)),
         )]))
@@ -3488,6 +3514,16 @@ mod tests {
     }
 
     #[test]
+    fn where_on_a_field_missing_from_a_row_is_an_error_not_a_silent_non_match() {
+        let runtime = DataRuntime::new();
+        let error = runtime
+            .eval_typed(r#"[{"a":1}] | where b == 1"#)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Data);
+        assert!(error.message.contains("row has no field `b`"));
+    }
+
+    #[test]
     fn quoted_predicate_values_remain_strings() {
         let runtime = DataRuntime::new();
         assert_eq!(
@@ -3537,6 +3573,30 @@ mod tests {
                 )
                 .unwrap(),
             typed(serde_json::json!(["Lin", "Ada"]))
+        );
+    }
+
+    #[test]
+    fn cell_paths_index_into_lists_and_optional_paths_tolerate_a_missing_segment() {
+        let runtime = DataRuntime::new();
+        assert_eq!(
+            runtime
+                .eval_typed(r#"[{"items":[{"name":"a"},{"name":"b"}]}] | get items.1.name"#)
+                .unwrap(),
+            typed(serde_json::json!(["b"]))
+        );
+
+        assert_eq!(
+            runtime.eval_typed(r#"[{"a":1}] | get b?"#).unwrap(),
+            typed(serde_json::json!([null]))
+        );
+        assert!(runtime.eval_typed(r#"[{"a":1}] | get b"#).is_err());
+
+        assert_eq!(
+            runtime
+                .eval_typed(r#"[{"a":1},{"a":2,"b":9}] | where b? == 9 | get a"#)
+                .unwrap(),
+            typed(serde_json::json!([2]))
         );
     }
 
@@ -3748,7 +3808,7 @@ mod tests {
         let mut stream = runtime.open_stream(&tar).unwrap();
         assert_eq!(
             stream.next(&AtomicBool::new(false)).unwrap(),
-            Some(DataValue::Record(BTreeMap::from([
+            Some(DataValue::Record(IndexMap::from([
                 ("kind".to_owned(), DataValue::String("file".to_owned())),
                 ("path".to_owned(), DataValue::Path("alpha.txt".to_owned())),
                 ("size".to_owned(), DataValue::Size { bytes: 5 }),
@@ -3756,7 +3816,7 @@ mod tests {
         );
         assert_eq!(
             stream.next(&AtomicBool::new(false)).unwrap(),
-            Some(DataValue::Record(BTreeMap::from([
+            Some(DataValue::Record(IndexMap::from([
                 ("kind".to_owned(), DataValue::String("file".to_owned())),
                 (
                     "path".to_owned(),
@@ -3959,7 +4019,7 @@ mod tests {
         let error = render_stream_with_limit(rows, DataRenderFormat::Plain, 64).unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert!(error.details.context[0].contains("limit: 64"));
-        assert!(error.details.context[0].contains("observed: 65"));
+        assert!(error.details.context[0].contains("observed: 72"));
     }
 
     #[test]
@@ -3970,7 +4030,7 @@ mod tests {
         let output = DataOutput::Stream(DataStream::from_values(
             rows,
             DataLimits {
-                max_materialized_bytes: 64,
+                max_materialized_bytes: 128,
                 ..DataLimits::DEFAULT
             },
         ));
@@ -3981,7 +4041,7 @@ mod tests {
                 &AtomicBool::new(false),
                 &mut writer,
                 DataLimits {
-                    max_materialized_bytes: 64,
+                    max_materialized_bytes: 128,
                     ..DataLimits::DEFAULT
                 },
             )
@@ -4007,7 +4067,7 @@ mod tests {
 
     #[test]
     fn table_headers_separators_and_escaping_are_part_of_the_bound() {
-        let row = DataValue::Record(BTreeMap::from([(
+        let row = DataValue::Record(IndexMap::from([(
             "na\u{001b}me".to_owned(),
             DataValue::String("value".to_owned()),
         )]));
@@ -4019,7 +4079,7 @@ mod tests {
         .unwrap();
         assert_eq!(rendered, "na\\u{1b}me\nvalue\nvalue\n");
         let error = render_stream_with_limit(
-            vec![DataValue::Record(BTreeMap::from([(
+            vec![DataValue::Record(IndexMap::from([(
                 "na\u{001b}me".to_owned(),
                 DataValue::String("value".to_owned()),
             )]))],
@@ -4028,6 +4088,47 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn select_and_table_rendering_preserve_requested_and_first_seen_column_order() {
+        let runtime = DataRuntime::new();
+        let DataValue::List(rows) = runtime
+            .eval_typed(
+                r#"[{"service":"api","region":"us","status":"failed"}]
+                   | select service region"#,
+            )
+            .unwrap()
+        else {
+            panic!("expected a list of selected rows");
+        };
+        let [DataValue::Record(row)] = rows.as_slice() else {
+            panic!("expected exactly one selected record");
+        };
+        assert_eq!(
+            row.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["service", "region"]
+        );
+
+        let rendered = render_stream_with_limit(
+            vec![
+                DataValue::Record(IndexMap::from([
+                    ("service".to_owned(), DataValue::String("api".to_owned())),
+                    ("region".to_owned(), DataValue::String("us".to_owned())),
+                ])),
+                DataValue::Record(IndexMap::from([(
+                    "status".to_owned(),
+                    DataValue::String("degraded".to_owned()),
+                )])),
+            ],
+            DataRenderFormat::Table,
+            DataLimits::DEFAULT.max_materialized_bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "service\tregion\tstatus\napi\tus\t\n\t\tdegraded\n"
+        );
     }
 
     #[test]
@@ -4106,7 +4207,7 @@ mod tests {
     #[test]
     fn value_and_option_rendering_require_and_enforce_explicit_custom_limits() {
         let exact_limits = DataLimits {
-            max_materialized_bytes: 64,
+            max_materialized_bytes: std::mem::size_of::<DataValue>() + 2,
             ..DataLimits::DEFAULT
         };
         assert_eq!(
@@ -4446,7 +4547,7 @@ mod tests {
             DataValue::UInt(1),
             DataValue::Decimal("1.25".to_owned()),
             DataValue::String("text".to_owned()),
-            DataValue::Record(BTreeMap::from([(
+            DataValue::Record(IndexMap::from([(
                 "nested".to_owned(),
                 DataValue::List(vec![DataValue::Path("path".to_owned())]),
             )])),

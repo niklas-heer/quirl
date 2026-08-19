@@ -389,7 +389,7 @@ fn status(format: AiOutputFormat) -> Result<i32, ShellError> {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "unconfigured".to_owned());
             println!(
-                "model: {} at {} ({})",
+                "embedding model: {} at {} ({})",
                 escape_terminal_controls(&status.model),
                 escape_terminal_controls(&model_path),
                 if status.model_ready {
@@ -397,6 +397,9 @@ fn status(format: AiOutputFormat) -> Result<i32, ShellError> {
                 } else {
                     "missing"
                 }
+            );
+            println!(
+                "  used for `quirl ai search`; unrelated to the `command-model` completion asset reported by `quirl assets status`"
             );
             println!("network loading: disabled");
             if let Some(identity) = &status.model_identity {

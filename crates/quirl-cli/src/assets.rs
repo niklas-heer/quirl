@@ -1934,6 +1934,11 @@ fn render_status_text(report: &AssetStatusReport) -> String {
             escape_terminal_controls(&asset.logical_name),
             if asset.valid { "ready" } else { "unavailable" }
         ));
+        if asset.logical_name == "command-model" {
+            output.push_str(
+                "    used for offline completion and catalog docs; unrelated to the embedding model reported by `quirl ai status`\n",
+            );
+        }
         if let Some(diagnostic) = &asset.diagnostic {
             output.push_str(&format!(
                 "    diagnostic: {}\n",

@@ -3210,6 +3210,25 @@ fn split_preserving_whitespace(input: &str) -> Vec<&str> {
     segments
 }
 
+/// Render one [`ErrorCode`] as a hyphen-separated display slug.
+///
+/// This is a presentation-only projection of the `Debug` spelling (for
+/// example `ProcessSpawn` becomes `process-spawn`); it is independent of the
+/// stable `snake_case` wire representation produced by [`ErrorCode`]'s
+/// `Serialize` implementation, which callers should use instead when
+/// branching on the error category.
+fn error_code_slug(code: ErrorCode) -> String {
+    let debug = format!("{code:?}");
+    let mut slug = String::with_capacity(debug.len() + 4);
+    for (index, character) in debug.char_indices() {
+        if index > 0 && character.is_uppercase() {
+            slug.push('-');
+        }
+        slug.extend(character.to_lowercase());
+    }
+    slug
+}
+
 /// Render structured shell diagnostics as terminal-safe text.
 ///
 /// All untrusted messages, source labels, context, and help are escaped before
@@ -3217,8 +3236,7 @@ fn split_preserving_whitespace(input: &str) -> Vec<&str> {
 /// chrome are added; otherwise the result contains no styling escapes. The
 /// returned string has no trailing newline so the caller controls framing.
 pub fn render_error(error: &ShellError, color: bool) -> String {
-    let code = format!("{:?}", error.code).to_lowercase();
-    let heading = format!("error[{code}]");
+    let heading = format!("error[{}]", error_code_slug(error.code));
     let heading = if color {
         Color::Red.bold().paint(heading).to_string()
     } else {
@@ -3536,6 +3554,16 @@ mod tests {
         let rendered = render_error(&error, false);
         assert!(rendered.starts_with("error[lua]"));
         assert!(rendered.contains("help: fix it"));
+    }
+
+    #[test]
+    fn multi_word_error_codes_render_as_hyphenated_slugs() {
+        let error = ShellError::new(ErrorCode::ProcessSpawn, "could not start `lsxx`");
+        let rendered = render_error(&error, false);
+        assert!(rendered.starts_with("error[process-spawn]"));
+
+        let error = ShellError::new(ErrorCode::InvalidArgument, "bad flag");
+        assert!(render_error(&error, false).starts_with("error[invalid-argument]"));
     }
 
     #[test]

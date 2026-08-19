@@ -5,9 +5,9 @@
 //! engine only after a request validates into an [`ExecutionPlan`].
 
 use crate::{CommandOutcome, ErrorCode, ShellError};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -301,8 +301,8 @@ pub enum StructuredValue {
     String(String),
     /// An ordered bounded sequence of values.
     List(Vec<StructuredValue>),
-    /// A deterministically ordered bounded mapping.
-    Record(BTreeMap<String, StructuredValue>),
+    /// An insertion-ordered bounded mapping.
+    Record(IndexMap<String, StructuredValue>),
     /// A filesystem path represented as UTF-8 text.
     Path(String),
     /// An elapsed duration in nanoseconds.

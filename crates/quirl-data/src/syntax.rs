@@ -1010,14 +1010,58 @@ fn parse_transform(
             ));
         }
         _ => {
+            let default_help = "use `get`, `where`, `select`, `sort`, `take`, `first`, `length`, `lines`, `from json`, or `to json`";
+            let help = match nearest_transform_keyword(command) {
+                Some(suggestion) => {
+                    format!("Did you mean `{suggestion}`? Otherwise {default_help}")
+                }
+                None => format!("Use {default_help}"),
+            };
             return Err(syntax_error(
                 format!("unknown data transform `{command}`"),
                 tokens[0].span.clone(),
-                "Use `get`, `where`, `select`, `sort`, `take`, `first`, `length`, `lines`, `from json`, or `to json`",
+                help,
             ));
         }
     };
     Ok(Spanned { value, span })
+}
+
+/// Every top-level data transform keyword, used only to suggest a fix for a
+/// misspelled transform name; it is not the grammar's source of truth.
+const TRANSFORM_KEYWORDS: [&str; 10] = [
+    "get", "where", "select", "sort", "take", "first", "length", "lines", "from", "to",
+];
+
+/// Return the closest transform keyword to `command` by edit distance, when
+/// one is close enough to plausibly be a typo (at most 2 edits, and no more
+/// than half the candidate's length).
+fn nearest_transform_keyword(command: &str) -> Option<&'static str> {
+    TRANSFORM_KEYWORDS
+        .iter()
+        .map(|&keyword| (keyword, levenshtein_distance(command, keyword)))
+        .filter(|&(keyword, distance)| distance <= 2 && distance * 2 <= keyword.len())
+        .min_by_key(|&(_, distance)| distance)
+        .map(|(keyword, _)| keyword)
+}
+
+/// Bounded Levenshtein edit distance between two short keyword-length strings.
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let mut previous_row: Vec<usize> = (0..=right.len()).collect();
+    let mut current_row = vec![0usize; right.len() + 1];
+    for (left_index, &left_char) in left.iter().enumerate() {
+        current_row[0] = left_index + 1;
+        for (right_index, &right_char) in right.iter().enumerate() {
+            let cost = usize::from(left_char != right_char);
+            current_row[right_index + 1] = (previous_row[right_index + 1] + 1)
+                .min(current_row[right_index] + 1)
+                .min(previous_row[right_index] + cost);
+        }
+        std::mem::swap(&mut previous_row, &mut current_row);
+    }
+    previous_row[right.len()]
 }
 
 fn parse_predicate(
@@ -1899,6 +1943,16 @@ mod tests {
         assert_eq!(expression.span, 0..source.len());
         std::assert_matches!(&expression.transforms[1].value, DataTransform::Where(predicate)
             if predicate.conditions.len() == 1);
+    }
+
+    #[test]
+    fn unknown_transform_typo_suggests_the_nearest_keyword() {
+        let error = parse("[{\"a\":1}] | wehre a == 1").unwrap_err();
+        assert!(error.message.contains("unknown data transform `wehre`"));
+        assert!(error.help.contains("Did you mean `where`?"));
+
+        let error = parse("[{\"a\":1}] | zzzzzzzzzz").unwrap_err();
+        assert!(!error.help.contains("Did you mean"));
     }
 
     #[test]

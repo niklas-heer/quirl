@@ -3903,7 +3903,7 @@ max_message_bytes = 65536
             .unwrap();
         let exact_fields = (0..MAX_PLUGIN_VALUE_FIELDS)
             .map(|index| (format!("f{index}"), StructuredValue::Nothing))
-            .collect::<BTreeMap<_, _>>();
+            .collect::<indexmap::IndexMap<_, _>>();
         let exact_fields_request = host
             .lock()
             .unwrap()
