@@ -425,7 +425,7 @@ fn generate_session(
 fn generate_step(generator: &mut DeterministicRng) -> String {
     let left = generator.word();
     let right = generator.word();
-    match generator.bounded(38) {
+    match generator.bounded(42) {
         0 => format!("printf '%s:%s' '{left}' '{right}'"),
         1 => format!("printf '%s' '{left}' | tr a-z A-Z"),
         2 => format!("true && printf '%s' '{left}' || printf '%s' '{right}'"),
@@ -457,11 +457,6 @@ fn generate_step(generator: &mut DeterministicRng) -> String {
             format!("expr {first} + {second}")
         }
         22 => "seq 1 5 | tail -n 1".to_owned(),
-        // Native `${...}` expansion only resolves a bare variable name today
-        // (see docs/... follow-up); `:-`, `#`, `%`, and similar POSIX
-        // parameter-expansion operators are not implemented, so exercising
-        // them here would report a known gap as a fresh nightly mismatch on
-        // every run. Keep the corpus on operators that are actually native.
         23 => format!("printf '%s\\n%s\\n' '{left}' '{right}' | grep -c '.'"),
         24 => format!("printf '%s' '{left}' | tr '[:lower:]' '[:upper:]'"),
         25 => format!("printf '%s-%s-%s' '{left}' '{right}' '{left}' | cut -d'-' -f2"),
@@ -492,6 +487,13 @@ fn generate_step(generator: &mut DeterministicRng) -> String {
         36 => format!("true; printf '%s' '{left}'"),
         // Native descriptor duplication supports only `2>&1`, not `1>&2`.
         37 => format!("printf '%s' '{left}' > out3 2>&1 && cat out3"),
+        // Parameter expansion needs `export NAME=value`, not a bare `NAME=value`
+        // statement: the C1 executor does not recognize a lone assignment and
+        // tries to exec it as an external program instead.
+        38 => format!("export x='{left}{right}'; printf '%s' \"${{x%?}}\""),
+        39 => format!("export x='{left}{right}'; printf '%s' \"${{x#?}}\""),
+        40 => format!("printf '%s' \"${{QUIRL_SIM_NEVER_SET:-{left}}}\""),
+        41 => "printf '%s' \"${#QUIRL_SIM_VALUE}\"".to_owned(),
         _ => format!("printf '%s' '{right}' | cat"),
     }
 }

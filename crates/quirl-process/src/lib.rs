@@ -133,6 +133,15 @@ impl SessionEnvironment {
             .unwrap_or_default()
     }
 
+    /// Whether `name` has any recorded value, distinguishing an unset
+    /// variable from one explicitly set to the empty string. Parameter
+    /// expansion's unset-only operators (`${VAR-word}`, `${VAR+word}`,
+    /// `${VAR=word}`, `${VAR?word}`) need this distinction; `value` alone
+    /// cannot provide it because it returns an empty string for both.
+    fn is_set(&self, name: &str) -> bool {
+        self.variables.contains_key(OsStr::new(name))
+    }
+
     fn resolve_executable(&self, program: &str) -> Option<std::path::PathBuf> {
         let path = self.variables.get(OsStr::new("PATH"))?;
         std::env::split_paths(path).find_map(|directory| {
@@ -253,6 +262,12 @@ pub const NATIVE_PIPELINE_STAGES_MAX: usize = 64;
 pub const HERE_STRING_BYTES_MAX: usize = 256 * 1024;
 /// Maximum bytes retained by expansion for one native pipeline.
 pub const EXPANSION_BYTES_MAX: usize = NATIVE_COMMAND_BYTES_MAX;
+/// Maximum value and pattern bytes considered by one `#`/`##`/`%`/`%%`
+/// parameter-expansion pattern removal. The match scan tries every
+/// prefix/suffix length against the glob pattern, so it is quadratic in the
+/// value length; this keeps that scan bounded independent of the much
+/// larger [`EXPANSION_BYTES_MAX`] ceiling.
+pub const PARAMETER_PATTERN_BYTES_MAX: usize = 4 * 1024;
 /// Maximum bytes parsed by one arithmetic expansion.
 pub const ARITHMETIC_SOURCE_BYTES_MAX: usize = 16 * 1024;
 /// Maximum nested unary/parenthesized arithmetic expressions.
@@ -444,8 +459,8 @@ mod platform {
     use super::{
         ARITHMETIC_DEPTH_MAX, ARITHMETIC_SOURCE_BYTES_MAX, DEFAULT_CAPTURE_BYTES,
         EXPANSION_BYTES_MAX, HERE_STRING_BYTES_MAX, ObservedActivity, OutputObserver,
-        RETAINED_JOBS_MAX, SessionEnvironment, allocate_job_id, builtin, validate_native_plan,
-        validate_native_source,
+        PARAMETER_PATTERN_BYTES_MAX, RETAINED_JOBS_MAX, SessionEnvironment, allocate_job_id,
+        builtin, validate_native_plan, validate_native_source,
     };
 
     use nix::{
@@ -1682,7 +1697,13 @@ mod platform {
                             "Close the `}` in `${...}`",
                         ));
                     };
-                    let value = self.environment.value(&after[..close]);
+                    let value = self.expand_parameter(
+                        &after[..close],
+                        limit,
+                        request,
+                        previous_status,
+                        budget,
+                    )?;
                     budget.append(output, &value)?;
                     index += 3 + close;
                     continue;
@@ -1721,6 +1742,140 @@ mod platform {
                 index += character.len_utf8();
             }
             Ok(())
+        }
+
+        /// Expand `spec`, the text between one `${` and `}` pair, applying
+        /// the POSIX unset/empty-default, assignment, error, and prefix/suffix
+        /// removal operators on top of the bare `${VAR}` name lookup.
+        ///
+        /// Default, alternate, and error-message words are themselves
+        /// expanded (nested `$VAR`, `$(...)`, and `$((...))` all work) by
+        /// recursing into [`Self::expand_fragment`]; the existing command
+        /// substitution depth counter still bounds that recursion. Pattern
+        /// text for `#`/`##`/`%`/`%%` is matched as a literal glob pattern
+        /// without a further expansion pass. Because the enclosing brace
+        /// scan in `expand_fragment` is not depth-aware, a default or
+        /// pattern word containing its own `${...}` is not supported.
+        fn expand_parameter(
+            &mut self,
+            spec: &str,
+            limit: usize,
+            request: Option<RequestContext<'_>>,
+            previous_status: i32,
+            budget: &mut ExpansionBudget,
+        ) -> Result<String, ShellError> {
+            if let Some(rest) = spec.strip_prefix('#') {
+                let name_length = identifier_length(rest);
+                if name_length == rest.len() && name_length > 0 {
+                    return Ok(self.environment.value(rest).chars().count().to_string());
+                }
+            }
+            let name_length = identifier_length(spec);
+            let name = &spec[..name_length];
+            let operator = &spec[name_length..];
+            if operator.is_empty() || name.is_empty() {
+                // Either a bare `${VAR}` lookup, or a shape this expander does
+                // not model (for example a positional parameter); both fall
+                // back to the original whole-spec name lookup.
+                return Ok(self.environment.value(spec));
+            }
+            let is_set = self.environment.is_set(name);
+            let value = self.environment.value(name);
+            if let Some(word) = operator.strip_prefix(":-") {
+                return if value.is_empty() {
+                    self.expand_default_word(word, limit, request, previous_status, budget)
+                } else {
+                    Ok(value)
+                };
+            }
+            if let Some(word) = operator.strip_prefix('-') {
+                return if is_set {
+                    Ok(value)
+                } else {
+                    self.expand_default_word(word, limit, request, previous_status, budget)
+                };
+            }
+            if let Some(word) = operator.strip_prefix(":+") {
+                return if value.is_empty() {
+                    Ok(String::new())
+                } else {
+                    self.expand_default_word(word, limit, request, previous_status, budget)
+                };
+            }
+            if let Some(word) = operator.strip_prefix('+') {
+                return if is_set {
+                    self.expand_default_word(word, limit, request, previous_status, budget)
+                } else {
+                    Ok(String::new())
+                };
+            }
+            if let Some(word) = operator.strip_prefix(":=") {
+                if !value.is_empty() {
+                    return Ok(value);
+                }
+                let assigned =
+                    self.expand_default_word(word, limit, request, previous_status, budget)?;
+                self.environment
+                    .set_variables(&[(name.to_owned(), assigned.clone())])?;
+                return Ok(assigned);
+            }
+            if let Some(word) = operator.strip_prefix('=') {
+                if is_set {
+                    return Ok(value);
+                }
+                let assigned =
+                    self.expand_default_word(word, limit, request, previous_status, budget)?;
+                self.environment
+                    .set_variables(&[(name.to_owned(), assigned.clone())])?;
+                return Ok(assigned);
+            }
+            if let Some(word) = operator.strip_prefix(":?") {
+                if !value.is_empty() {
+                    return Ok(value);
+                }
+                let message =
+                    self.expand_default_word(word, limit, request, previous_status, budget)?;
+                return Err(parameter_unset_error(name, &message));
+            }
+            if let Some(word) = operator.strip_prefix('?') {
+                if is_set {
+                    return Ok(value);
+                }
+                let message =
+                    self.expand_default_word(word, limit, request, previous_status, budget)?;
+                return Err(parameter_unset_error(name, &message));
+            }
+            if let Some(pattern) = operator.strip_prefix("##") {
+                return strip_matching_prefix(&value, pattern, true);
+            }
+            if let Some(pattern) = operator.strip_prefix('#') {
+                return strip_matching_prefix(&value, pattern, false);
+            }
+            if let Some(pattern) = operator.strip_prefix("%%") {
+                return strip_matching_suffix(&value, pattern, true);
+            }
+            if let Some(pattern) = operator.strip_prefix('%') {
+                return strip_matching_suffix(&value, pattern, false);
+            }
+            Err(expansion_error(
+                &format!("unsupported parameter expansion operator in `${{{spec}}}`"),
+                "Supported forms: ${VAR}, ${#VAR}, ${VAR:-word}, ${VAR-word}, ${VAR:=word}, \
+                 ${VAR=word}, ${VAR:+word}, ${VAR+word}, ${VAR:?word}, ${VAR?word}, \
+                 ${VAR#pattern}, ${VAR##pattern}, ${VAR%pattern}, ${VAR%%pattern}",
+            ))
+        }
+
+        fn expand_default_word(
+            &mut self,
+            word: &str,
+            limit: usize,
+            request: Option<RequestContext<'_>>,
+            previous_status: i32,
+            budget: &mut ExpansionBudget,
+        ) -> Result<String, ShellError> {
+            let mut expanded = String::new();
+            self.expand_fragment(word, limit, request, previous_status, &mut expanded, budget)?;
+            Ok(expanded)
         }
 
         fn execute_control_builtin(
@@ -2220,6 +2375,86 @@ mod platform {
         ShellError::new(ErrorCode::InvalidCommand, message).with_help(help)
     }
 
+    fn parameter_unset_error(name: &str, message: &str) -> ShellError {
+        let message = if message.is_empty() {
+            format!("{name}: parameter is unset or empty")
+        } else {
+            format!("{name}: {message}")
+        };
+        ShellError::new(ErrorCode::InvalidCommand, message)
+            .with_help("Set the variable, or use `:-`/`-` to supply a default instead of `:?`/`?`")
+    }
+
+    /// Byte length of the leading `[A-Za-z0-9_]*` run of `text`, matching the
+    /// identifier shape already accepted by bare `$NAME` expansion.
+    fn identifier_length(text: &str) -> usize {
+        text.chars()
+            .take_while(|character| *character == '_' || character.is_ascii_alphanumeric())
+            .map(char::len_utf8)
+            .sum()
+    }
+
+    fn ensure_parameter_pattern_bounds(value: &str, pattern: &str) -> Result<(), ShellError> {
+        let observed_bytes = value.len().saturating_add(pattern.len());
+        if observed_bytes <= PARAMETER_PATTERN_BYTES_MAX {
+            return Ok(());
+        }
+        Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "parameter expansion pattern removal exceeds its byte limit",
+        )
+        .with_context(format!(
+            "limit {PARAMETER_PATTERN_BYTES_MAX} bytes; observed {observed_bytes} bytes across the value and pattern"
+        ))
+        .with_help("Match a shorter prefix/suffix, or trim the value before expanding it"))
+    }
+
+    /// Remove the shortest (`longest = false`) or longest (`longest = true`)
+    /// glob-matching prefix of `value`, per `${VAR#pattern}`/`${VAR##pattern}`.
+    fn strip_matching_prefix(
+        value: &str,
+        pattern: &str,
+        longest: bool,
+    ) -> Result<String, ShellError> {
+        ensure_parameter_pattern_bounds(value, pattern)?;
+        let characters = value.chars().collect::<Vec<_>>();
+        let lengths: Box<dyn Iterator<Item = usize>> = if longest {
+            Box::new((0..=characters.len()).rev())
+        } else {
+            Box::new(0..=characters.len())
+        };
+        for length in lengths {
+            let candidate = characters[..length].iter().collect::<String>();
+            if glob_matches(pattern, &candidate, false) {
+                return Ok(characters[length..].iter().collect());
+            }
+        }
+        Ok(value.to_owned())
+    }
+
+    /// Remove the shortest (`longest = false`) or longest (`longest = true`)
+    /// glob-matching suffix of `value`, per `${VAR%pattern}`/`${VAR%%pattern}`.
+    fn strip_matching_suffix(
+        value: &str,
+        pattern: &str,
+        longest: bool,
+    ) -> Result<String, ShellError> {
+        ensure_parameter_pattern_bounds(value, pattern)?;
+        let characters = value.chars().collect::<Vec<_>>();
+        let starts: Box<dyn Iterator<Item = usize>> = if longest {
+            Box::new(0..=characters.len())
+        } else {
+            Box::new((0..=characters.len()).rev())
+        };
+        for start in starts {
+            let candidate = characters[start..].iter().collect::<String>();
+            if glob_matches(pattern, &candidate, false) {
+                return Ok(characters[..start].iter().collect());
+            }
+        }
+        Ok(value.to_owned())
+    }
+
     fn matching_paren(source: &str) -> Option<usize> {
         let mut depth = 1_u32;
         let mut quote = None;
@@ -2489,7 +2724,7 @@ mod platform {
                     let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                         continue;
                     };
-                    if glob_matches(component, &name) {
+                    if glob_matches(component, &name, true) {
                         let path = prefix.join(name);
                         claim_path_expansion_bytes(
                             retained_before_paths,
@@ -2552,7 +2787,14 @@ mod platform {
         .with_help("Narrow the pathname pattern or move the file list into a data pipeline"))
     }
 
-    fn glob_matches(pattern: &str, candidate: &str) -> bool {
+    /// Match `candidate` against a `*`/`?`/`[...]` glob `pattern`.
+    ///
+    /// `hide_leading_dot` reproduces the pathname-expansion convention that a
+    /// candidate beginning with `.` matches only a pattern that itself
+    /// begins with `.` (so a bare `*` does not silently sweep up dotfiles).
+    /// Parameter-expansion pattern removal (`${VAR#pattern}` and friends)
+    /// has no such convention, so its callers pass `false`.
+    fn glob_matches(pattern: &str, candidate: &str, hide_leading_dot: bool) -> bool {
         enum GlobAtom {
             Star,
             Any,
@@ -2605,7 +2847,7 @@ mod platform {
             }
             index += 1;
         }
-        if candidate.starts_with('.') && !pattern.starts_with('.') {
+        if hide_leading_dot && candidate.starts_with('.') && !pattern.starts_with('.') {
             return false;
         }
         let candidate = candidate.chars().collect::<Vec<_>>();
@@ -3971,12 +4213,13 @@ mod platform {
 
         #[test]
         fn pathname_matching_is_unicode_aware_and_non_exponential() {
-            assert!(glob_matches("über-?.[rR][s-t]", "über-🌀.rs"));
-            assert!(glob_matches(".quirl*", ".quirl-history"));
-            assert!(!glob_matches("*", ".quirl-history"));
+            assert!(glob_matches("über-?.[rR][s-t]", "über-🌀.rs", true));
+            assert!(glob_matches(".quirl*", ".quirl-history", true));
+            assert!(!glob_matches("*", ".quirl-history", true));
             assert!(!glob_matches(
                 "********************************x",
                 "a-very-long-candidate-without-the-final-letter",
+                true,
             ));
         }
 
@@ -6941,6 +7184,115 @@ mod backend_contract_tests {
             output.stdout.as_deref(),
             Some("expanded|3|3|nested\nvalue\n")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_expands_parameter_length_and_default_value_operators() {
+        let mut backend = NativeExecutor::default();
+        backend
+            .set_environment_variable("QUIRL_C1_WORD".to_owned(), "expanded".to_owned())
+            .unwrap();
+        backend
+            .set_environment_variable("QUIRL_C1_EMPTY".to_owned(), String::new())
+            .unwrap();
+        let output = backend
+            .execute_capture(
+                "printf '%s|%s|%s|%s|%s|%s\\n' \
+                 \"${#QUIRL_C1_WORD}\" \
+                 \"${QUIRL_C1_UNSET:-fallback}\" \
+                 \"${QUIRL_C1_WORD:-fallback}\" \
+                 \"${QUIRL_C1_EMPTY-default}\" \
+                 \"${QUIRL_C1_WORD:+alt}\" \
+                 \"${QUIRL_C1_UNSET:+alt}\"",
+            )
+            .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(
+            output.stdout.as_deref(),
+            // `${#QUIRL_C1_WORD}` counts "expanded" (8 chars); `-` (no
+            // colon) treats the explicitly-empty QUIRL_C1_EMPTY as set, so
+            // it keeps its own empty value rather than falling back.
+            Some("8|fallback|expanded||alt|\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_parameter_assignment_operators_persist_the_assigned_value() {
+        let output = NativeExecutor::default()
+            .execute_capture(
+                "printf '[%s]' \"${QUIRL_C1_ASSIGNED:=first}\"; printf '[%s]' \"$QUIRL_C1_ASSIGNED\"",
+            )
+            .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.as_deref(), Some("[first][first]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_parameter_error_operator_fails_closed_with_the_message() {
+        let error = NativeExecutor::default()
+            .execute_capture("printf '%s' \"${QUIRL_C1_MISSING:?must be configured}\"")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert!(error.message.contains("QUIRL_C1_MISSING"));
+        assert!(error.message.contains("must be configured"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_parameter_prefix_and_suffix_removal_use_glob_patterns() {
+        let mut backend = NativeExecutor::default();
+        backend
+            .set_environment_variable("QUIRL_C1_PATH".to_owned(), "/a/b/c.txt".to_owned())
+            .unwrap();
+        let output = backend
+            .execute_capture(
+                "printf '%s|%s|%s|%s\\n' \
+                 \"${QUIRL_C1_PATH#?}\" \
+                 \"${QUIRL_C1_PATH##*/}\" \
+                 \"${QUIRL_C1_PATH%.*}\" \
+                 \"${QUIRL_C1_PATH%%.*}\"",
+            )
+            .unwrap();
+        assert_eq!(output.status, 0);
+        assert_eq!(
+            output.stdout.as_deref(),
+            Some("a/b/c.txt|c.txt|/a/b/c|/a/b/c\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_unsupported_parameter_expansion_operator_fails_closed_instead_of_silently_empty() {
+        let mut backend = NativeExecutor::default();
+        backend
+            .set_environment_variable("QUIRL_C1_WORD".to_owned(), "expanded".to_owned())
+            .unwrap();
+        let error = backend
+            .execute_capture("printf '%s' \"${QUIRL_C1_WORD@Q}\"")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidCommand);
+        assert!(error.message.contains("unsupported parameter expansion"));
+        assert!(error.details.help[0].contains("${VAR:-word}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_c1_parameter_pattern_removal_is_bounded() {
+        let mut backend = NativeExecutor::default();
+        let payload = "x".repeat(PARAMETER_PATTERN_BYTES_MAX);
+        backend
+            .set_environment_variable("QUIRL_C1_LONG".to_owned(), payload.clone())
+            .unwrap();
+        let error = backend
+            .execute_capture("printf '%s' \"${QUIRL_C1_LONG#?}\"")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context.iter().any(|context| {
+            context.contains(&format!("limit {PARAMETER_PATTERN_BYTES_MAX} bytes"))
+        }));
     }
 
     #[cfg(unix)]
