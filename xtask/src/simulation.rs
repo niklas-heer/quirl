@@ -413,10 +413,19 @@ fn generate_session(
     Ok(GeneratedSession { steps, source })
 }
 
+// Every branch must be a construct bash and zsh are guaranteed to evaluate
+// identically (POSIX-portable syntax, or common utilities invoked with
+// arguments that never depend on shell-specific expansion rules). `classify`
+// treats a bash/zsh disagreement as a `ReferenceDivergence`, which the nightly
+// workflow reports exactly like a genuine Quirl bug, so a branch that can
+// legitimately diverge between the two reference shells (unmatched globs,
+// bash-only arrays, `[[ ]]`, brace expansion, `$RANDOM`, locale-sensitive
+// case conversion, and similar) does not belong here even though Quirl would
+// likely still agree with at least one of them.
 fn generate_step(generator: &mut DeterministicRng) -> String {
     let left = generator.word();
     let right = generator.word();
-    match generator.bounded(14) {
+    match generator.bounded(38) {
         0 => format!("printf '%s:%s' '{left}' '{right}'"),
         1 => format!("printf '%s' '{left}' | tr a-z A-Z"),
         2 => format!("true && printf '%s' '{left}' || printf '%s' '{right}'"),
@@ -434,6 +443,55 @@ fn generate_step(generator: &mut DeterministicRng) -> String {
         10 => "sh -c 'printf warning >&2; exit 7' || printf recovered".to_owned(),
         11 => "false; printf '%s' $?".to_owned(),
         12 => "printf '[%s]' $QUIRL_SIM_VALUE".to_owned(),
+        13 => format!("printf '%s\\n' '{left}' | wc -c"),
+        14 => format!("printf '%s %s\\n' '{left}' '{right}' | cut -d' ' -f1"),
+        15 => format!("printf '%s\\n%s\\n' '{right}' '{left}' | sort"),
+        16 => format!("printf '%s\\n%s\\n%s\\n' '{left}' '{right}' '{left}' | sort -u"),
+        17 => format!("printf '%s' '{left}' | sed 's/a/X/g'"),
+        18 => format!("printf '%s' '{left}' | grep -c '.'"),
+        19 => format!("basename '/tmp/{left}/{right}'"),
+        20 => format!("dirname '/tmp/{left}/{right}'"),
+        21 => {
+            let first = generator.bounded(100);
+            let second = generator.bounded(100);
+            format!("expr {first} + {second}")
+        }
+        22 => "seq 1 5 | tail -n 1".to_owned(),
+        // Native `${...}` expansion only resolves a bare variable name today
+        // (see docs/... follow-up); `:-`, `#`, `%`, and similar POSIX
+        // parameter-expansion operators are not implemented, so exercising
+        // them here would report a known gap as a fresh nightly mismatch on
+        // every run. Keep the corpus on operators that are actually native.
+        23 => format!("printf '%s\\n%s\\n' '{left}' '{right}' | grep -c '.'"),
+        24 => format!("printf '%s' '{left}' | tr '[:lower:]' '[:upper:]'"),
+        25 => format!("printf '%s-%s-%s' '{left}' '{right}' '{left}' | cut -d'-' -f2"),
+        26 => format!("printf '%s' '{left}' | wc -l"),
+        // `if`/`for`/`while`/`case`/function-definition keywords are C2
+        // dialect control forms that the native `command { ... }` block
+        // rejects outright (`bash { ... }`/`zsh { ... }` own that grammar
+        // instead), so equivalent behavior here stays within `&&`/`||`.
+        27 => format!("[ '{left}' = '{right}' ] && printf 'same' || printf 'diff'"),
+        28 => {
+            format!("printf '%s' '{left}' > out1 && printf '%s' '{right}' > out2 && cat out1 out2")
+        }
+        29 => format!("printf '%s' '{left}' | tr -d 'aeiou'"),
+        30 => format!("printf '%s\\n%s\\n' '{left}' '{left}' | uniq | wc -l"),
+        31 => format!("mkdir -p sub && printf '%s' '{left}' > sub/file.txt && cat sub/file.txt"),
+        32 => format!("printf '' > '{left}.marker' && ls -- *.marker | sort | wc -l"),
+        33 => format!("printf '%s' '{left}' | awk '{{ print length($0) }}'"),
+        34 => format!("printf '%s' '{left}{right}' | head -c 3"),
+        35 => {
+            // Native arithmetic expansion supports only `+ - * /` and
+            // parentheses on integer literals; `%` is rejected outright.
+            let first = generator.bounded(100);
+            let second = generator.bounded(100);
+            format!("printf '%s' $(({first} - {second}))")
+        }
+        // The `:` no-op builtin is not implemented natively; the C1 executor
+        // tries (and fails) to exec it as an external program instead.
+        36 => format!("true; printf '%s' '{left}'"),
+        // Native descriptor duplication supports only `2>&1`, not `1>&2`.
+        37 => format!("printf '%s' '{left}' > out3 2>&1 && cat out3"),
         _ => format!("printf '%s' '{right}' | cat"),
     }
 }
