@@ -4564,8 +4564,16 @@ mod tests {
         let catalog = load_catalog_at(&config.index_path);
         let cp = catalog.find("cp").unwrap();
         assert_eq!(cp.summary, "Copy files and directories");
+        // The native contract's own wording for `-R` differs by platform (BSD
+        // cp on macOS documents subtree copying; GNU cp on Linux documents it
+        // as a plain synonym for `--recursive`), so the expected override text
+        // must track the platform this test actually runs the native merge on.
+        #[cfg(target_os = "macos")]
+        let expected_native_r_text = "complete subtree";
+        #[cfg(not(target_os = "macos"))]
+        let expected_native_r_text = "synonym for --recursive";
         assert!(cp.options.iter().any(|option| {
-            option.names == ["-R"] && option.documentation.contains("complete subtree")
+            option.names == ["-R"] && option.documentation.contains(expected_native_r_text)
         }));
         assert!(cp.options.iter().any(|option| {
             option.names == ["-p"] && option.documentation.contains("timestamps")

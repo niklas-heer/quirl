@@ -138,6 +138,10 @@ catalog "cp" {
         flag "-P" summary="Do not follow symbolic links" description="Copy symbolic links themselves during recursive copies." {
             platform "macos"
         }
+        flag "-R" summary="copy directories recursively" description="copy directories recursively; a synonym for --recursive" {
+            platform "linux"
+            platform "freebsd"
+        }
         flag "-R" summary="Copy directories recursively" description="Copy each directory and its complete subtree while preserving symbolic links." {
             platform "macos"
         }
