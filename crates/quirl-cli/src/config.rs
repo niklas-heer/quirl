@@ -29,8 +29,10 @@ pub enum ConfigCommand {
     },
     /// Open a loopback-only, schema-backed configuration form.
     Web {
-        /// Lua configuration file edited by the local form.
-        file: PathBuf,
+        /// Lua configuration file edited by the local form; defaults to the
+        /// discovered config.lua (QUIRL_CONFIG_DIR, XDG_CONFIG_HOME, or
+        /// ~/.config/quirl) when omitted.
+        file: Option<PathBuf>,
         /// Loopback TCP port; 0 selects an available port.
         #[arg(long, default_value_t = 0)]
         port: u16,
@@ -137,7 +139,7 @@ pub fn execute(command: ConfigCommand) -> Result<i32, ShellError> {
         ConfigCommand::Get { file, key } => get(&file, &key),
         ConfigCommand::Set { file, key, value } => set(&file, &key, &value),
         ConfigCommand::Tui { file } => tui(&file),
-        ConfigCommand::Web { file, port } => web(&file, port),
+        ConfigCommand::Web { file, port } => web(&default_config_file(file)?, port),
         ConfigCommand::Fmt { file, check } => format(&file, check),
         ConfigCommand::Export { file, format } => export(&file, format),
         ConfigCommand::Diff {
@@ -2383,6 +2385,25 @@ fn patch_error(message: &str) -> ShellError {
     ShellError::new(ErrorCode::Validation, message).with_help(
         "Only recognized literal fields inside `quirl.config { ... }` can be patched; edit dynamic values in code",
     )
+}
+
+fn default_config_file(file: Option<PathBuf>) -> Result<PathBuf, ShellError> {
+    if let Some(file) = file {
+        return Ok(file);
+    }
+    crate::extensions::resolve_config_directory(
+        std::env::var_os("QUIRL_CONFIG_DIR"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+    .map(|directory| directory.join("config.lua"))
+    .ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::Io,
+            "could not determine the default configuration file",
+        )
+        .with_help("Set QUIRL_CONFIG_DIR, XDG_CONFIG_HOME, or HOME, or pass an explicit file path")
+    })
 }
 
 fn file_error(action: &str, file: &Path, error: std::io::Error) -> ShellError {

@@ -46,6 +46,10 @@ pub struct FrameModel<'a> {
     pub transcript_truncated: bool,
     pub output_focus: bool,
     pub output_notice: Option<&'a str>,
+    /// Set while a foreground command still owns execution: the input row's
+    /// indicator is replaced with this animated glyph instead of rendering
+    /// identically to an idle, ready-for-input prompt.
+    pub busy_glyph: Option<char>,
 }
 
 impl FrameModel<'_> {
@@ -357,13 +361,21 @@ impl FrameModel<'_> {
             .filter(|byte| *byte == b'\n')
             .count();
         let mut cursor_column = 0_usize;
+        let busy_indicator = self.busy_glyph.map(|glyph| format!("{glyph} "));
         for (line_index, part) in self.editor.buffer().split('\n').enumerate() {
             let indicator = if line_index == 0 {
-                self.symbols.input_indicator(self.mode)
+                busy_indicator
+                    .as_deref()
+                    .unwrap_or_else(|| self.symbols.input_indicator(self.mode))
             } else {
                 self.symbols.multiline_indicator()
             };
-            let mut spans = vec![Span::styled(indicator, self.theme.accent(self.mode))];
+            let indicator_style = if busy_indicator.is_some() {
+                self.theme.dim()
+            } else {
+                self.theme.accent(self.mode)
+            };
+            let mut spans = vec![Span::styled(indicator.to_owned(), indicator_style)];
             let line_end = offset.saturating_add(part.len());
             let local_cursor = (line_index == cursor_line)
                 .then(|| self.editor.cursor().saturating_sub(offset).min(part.len()));
@@ -894,6 +906,7 @@ mod tests {
                     transcript_truncated: false,
                     output_focus: false,
                     output_notice: None,
+                    busy_glyph: None,
                 }
                 .render(frame);
             })
@@ -959,6 +972,7 @@ mod tests {
                     transcript_truncated: false,
                     output_focus: false,
                     output_notice: None,
+                    busy_glyph: None,
                 }
                 .render(frame);
             })
@@ -1017,6 +1031,7 @@ mod tests {
                     transcript_truncated: false,
                     output_focus: false,
                     output_notice: None,
+                    busy_glyph: None,
                 }
                 .render(frame);
             })
@@ -1077,6 +1092,7 @@ mod tests {
                     transcript_truncated: false,
                     output_focus: false,
                     output_notice: None,
+                    busy_glyph: None,
                 }
                 .render(frame);
             })
@@ -1166,6 +1182,7 @@ mod tests {
                     transcript_truncated: false,
                     output_focus: false,
                     output_notice: None,
+                    busy_glyph: None,
                 }
                 .render(frame);
             })
@@ -1276,6 +1293,7 @@ mod tests {
             transcript_truncated: false,
             output_focus: false,
             output_notice: None,
+            busy_glyph: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(78, 4)).unwrap();
         terminal.draw(|frame| model.render(frame)).unwrap();
@@ -1356,6 +1374,7 @@ mod tests {
             transcript_truncated: false,
             output_focus: false,
             output_notice: None,
+            busy_glyph: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(78, 12)).unwrap();
         terminal.draw(|frame| model.render(frame)).unwrap();
@@ -1414,6 +1433,7 @@ mod tests {
                         transcript_truncated: false,
                         output_focus: false,
                         output_notice: None,
+                        busy_glyph: None,
                     }
                     .render(frame);
                 })
@@ -1508,6 +1528,7 @@ mod tests {
                     transcript_truncated: false,
                     output_focus: true,
                     output_notice: None,
+                    busy_glyph: None,
                 }
                 .render(frame);
             })
@@ -1584,6 +1605,7 @@ mod tests {
                         transcript_truncated: false,
                         output_focus: false,
                         output_notice: None,
+                        busy_glyph: None,
                     }
                     .render(frame);
                 })
@@ -1698,6 +1720,7 @@ mod tests {
                     transcript_truncated: false,
                     output_focus: false,
                     output_notice: None,
+                    busy_glyph: None,
                 };
                 model.render(frame);
             })
@@ -1756,6 +1779,7 @@ mod tests {
                     transcript_truncated: false,
                     output_focus: false,
                     output_notice: None,
+                    busy_glyph: None,
                 };
                 model.render(frame);
             })
@@ -1880,6 +1904,7 @@ mod tests {
                     transcript_truncated: false,
                     output_focus: false,
                     output_notice: None,
+                    busy_glyph: None,
                 }
                 .render(frame);
             })

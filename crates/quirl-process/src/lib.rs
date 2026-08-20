@@ -1905,9 +1905,7 @@ mod platform {
                     )
                     .with_command(source)
                     .with_context(error.to_string())
-                    .with_help(
-                        "Check that the command exists on PATH, or use `help` to inspect built-ins",
-                    )
+                    .with_help(process_group_not_found_help(executable))
                 })?;
                 let child_stderr = capture_streams.then(|| child.stderr.take()).flatten();
                 if staged_group_leader {
@@ -3171,6 +3169,32 @@ mod platform {
         }
     }
 
+    /// Names of top-level `quirl <name> ...` CLI subcommands (mirroring the
+    /// `Command` enum in `quirl-cli`'s `main.rs`) that are administrative
+    /// tooling, not interactive-shell builtins. Kept intentionally short and
+    /// specific to Quirl's own vocabulary so the hint below never second-guesses
+    /// an unrelated missing external command.
+    const QUIRL_CLI_ONLY_SUBCOMMANDS: &[&str] = &["config", "plugin", "catalog", "sdk"];
+
+    fn process_group_not_found_help(executable: &str) -> String {
+        const BASE_HELP: &str =
+            "Check that the command exists on PATH, or use `help` to inspect built-ins";
+        if executable == "quirl" {
+            format!(
+                "{BASE_HELP}. The running `quirl` binary is not necessarily the one on PATH; \
+                 use its full path to invoke it recursively, or install it onto PATH"
+            )
+        } else if QUIRL_CLI_ONLY_SUBCOMMANDS.contains(&executable) {
+            format!(
+                "{BASE_HELP}. `{executable}` is a `quirl` CLI subcommand, not an interactive \
+                 builtin; run `quirl {executable} ...` from outside this shell, or through an \
+                 explicit Bash/Zsh island"
+            )
+        } else {
+            BASE_HELP.to_string()
+        }
+    }
+
     fn wait_for_staged_group_leader(
         child: &mut Child,
         process_group: i32,
@@ -3217,9 +3241,7 @@ mod platform {
                     )
                     .with_command(source)
                     .with_context("executable was not found by the trusted process-group stage")
-                    .with_help(
-                        "Check that the command exists on PATH, or use `help` to inspect built-ins",
-                    ));
+                    .with_help(process_group_not_found_help(executable)));
                 }
                 Ok(status) => {
                     return Err(ShellError::new(

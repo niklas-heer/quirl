@@ -592,7 +592,7 @@ git branch --format='%(refname:short)' | pick --query feature
 
 ### Lua configuration with synchronized views
 
-`quirl config web <file>` opens a polished local configuration app; `quirl config tui <file>` presents the same model in the terminal. `config.lua` is the source of truth. Browser and TUI are schema-backed views of that file—not separate stores. The web view refreshes from the file on each page load and checks the source again before saving; it does not claim a background file watcher.
+`quirl config web [file]` opens a polished local configuration app; `quirl config tui <file>` presents the same model in the terminal. `config.lua` is the source of truth. Browser and TUI are schema-backed views of that file—not separate stores. Omitting `file` for `web` defaults to the discovered `config.lua` (`QUIRL_CONFIG_DIR`, `XDG_CONFIG_HOME`, or `~/.config/quirl`). The web view refreshes from the file on each page load and checks the source again before saving; it does not claim a background file watcher.
 
 ```lua
 ---@type quirl.Config
@@ -625,7 +625,7 @@ return config
 | Portability | `export`, `diff`, `migrate`, `doctor` work without a browser; synchronization is file ↔ UI, never mandatory cloud storage. |
 
 ```sh
-quirl config web config.lua  # local loopback web app; config.lua remains authoritative
+quirl config web             # local loopback web app against the discovered config.lua
 quirl config tui             # same schema, terminal presentation
 quirl config get editor.keymap
 quirl config set picker.layout adaptive
@@ -637,7 +637,7 @@ quirl config migrate config.lua --dry-run
 quirl config doctor config.lua
 ```
 
-`quirl config web <file>` uses a tokenized, loopback-only session and renders
+`quirl config web [file]` uses a tokenized, loopback-only session and renders
 the complete current schema as an accessible HTML form. It does not create a
 second configuration store: every save conservatively patches literal Lua
 values, validates the full candidate, preserves a backup, and reports a

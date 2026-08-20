@@ -65,6 +65,16 @@ Notable user-visible changes to Quirl are recorded here. The format follows
 - `where` now fails with a diagnostic when a row does not have a field named
   in its predicate, instead of silently treating the row as a non-match; use
   the new `?` optional-path marker to opt back into tolerant matching.
+- `quirl config web` no longer requires an explicit `<file>` argument; omitting
+  it defaults to the discovered `config.lua` (`QUIRL_CONFIG_DIR`,
+  `XDG_CONFIG_HOME`, or `~/.config/quirl`), matching the resolution the shell
+  already uses at startup.
+- Typing a `quirl` CLI-only subcommand name (`config`, `plugin`, `catalog`,
+  `sdk`) or a bare `quirl` directly in the interactive shell now fails with a
+  specific hint instead of a generic "not found on PATH" message.
+- The rich surface's input row now shows a dimmed, animated spinner glyph in
+  place of the prompt indicator while a foreground command is still running,
+  so it can no longer be mistaken for an idle, ready-for-input prompt.
 
 ### Known limitations
 

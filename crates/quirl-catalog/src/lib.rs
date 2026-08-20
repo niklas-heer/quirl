@@ -781,16 +781,16 @@ impl Catalog {
                 ),
                 command(
                     "quirl config web",
-                    "quirl config web <file> [--port <port>]",
+                    "quirl config web [file] [--port <port>]",
                     "Open the local schema-backed configuration form",
-                    "Serves an accessible configuration form only on IPv4 loopback. The private session URL carries a CSRF token; saves validate the complete Lua configuration, retain a `.bak`, preserve non-overlapping concurrent source edits, and reject conflicting or code-controlled fields.",
+                    "Serves an accessible configuration form only on IPv4 loopback. The private session URL carries a CSRF token; saves validate the complete Lua configuration, retain a `.bak`, preserve non-overlapping concurrent source edits, and reject conflicting or code-controlled fields. Omitting `file` defaults to the discovered config.lua (QUIRL_CONFIG_DIR, XDG_CONFIG_HOME, or ~/.config/quirl).",
                     vec![option(
                         &["--port"],
                         Some("port"),
                         "Loopback port; 0 selects an available port",
                     )],
                     &[
-                        "quirl config web ~/.config/quirl/config.lua",
+                        "quirl config web",
                         "quirl config web examples/config.lua --port 8787",
                     ],
                     &[Effect::ReadFilesystem, Effect::WriteFilesystem],

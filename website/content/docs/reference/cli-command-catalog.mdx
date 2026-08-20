@@ -500,11 +500,11 @@ Options:
 
 - `file` — Positional `file` declared by the builtin command signature.
 
-## `quirl config web <file> [--port <port>]`
+## `quirl config web [file] [--port <port>]`
 
 Open the local schema-backed configuration form
 
-Serves an accessible configuration form only on IPv4 loopback. The private session URL carries a CSRF token; saves validate the complete Lua configuration, retain a `.bak`, preserve non-overlapping concurrent source edits, and reject conflicting or code-controlled fields.
+Serves an accessible configuration form only on IPv4 loopback. The private session URL carries a CSRF token; saves validate the complete Lua configuration, retain a `.bak`, preserve non-overlapping concurrent source edits, and reject conflicting or code-controlled fields. Omitting `file` defaults to the discovered config.lua (QUIRL_CONFIG_DIR, XDG_CONFIG_HOME, or ~/.config/quirl).
 
 - Input: `Nothing`
 - Output: `Bytes`

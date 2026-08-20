@@ -383,6 +383,11 @@ pub struct RichSurface {
     output_cursor_line: usize,
     output_anchor_line: Option<usize>,
     output_notice: Option<String>,
+    /// Set from `begin_command_stream` until `finish_command_stream`: the
+    /// prompt row must not look identical to an idle, ready-for-input prompt
+    /// while a foreground command still owns execution, so its indicator is
+    /// replaced with this animated spinner glyph.
+    busy_glyph: Option<char>,
     transcript_area: Rect,
     visible_screen: VisibleScreen,
     screen_selection: Option<ScreenSelection>,
@@ -450,6 +455,7 @@ impl RichSurface {
             output_cursor_line: 0,
             output_anchor_line: None,
             output_notice: None,
+            busy_glyph: None,
             transcript_area: Rect::default(),
             visible_screen: VisibleScreen::default(),
             screen_selection: None,
@@ -511,6 +517,7 @@ impl RichSurface {
             output_cursor_line: 0,
             output_anchor_line: None,
             output_notice: None,
+            busy_glyph: None,
             transcript_area: Rect::default(),
             visible_screen: VisibleScreen::default(),
             screen_selection: None,
@@ -557,7 +564,9 @@ impl RichSurface {
         self.stream_stderr.reset();
         self.live_output_owner = None;
         self.append_transcript_line(&format!("❯ {command}"));
-        self.output_notice = Some(running_notice(Duration::ZERO, prompt.surface_symbols()));
+        let symbols = prompt.surface_symbols();
+        self.output_notice = Some(running_notice(Duration::ZERO, symbols));
+        self.busy_glyph = Some(spinner_glyph(Duration::ZERO, symbols));
         self.draw_execution(prompt)
     }
 
@@ -572,7 +581,9 @@ impl RichSurface {
         elapsed: Duration,
         prompt: &QuirlPrompt,
     ) -> Result<(), ShellError> {
-        self.output_notice = Some(running_notice(elapsed, prompt.surface_symbols()));
+        let symbols = prompt.surface_symbols();
+        self.output_notice = Some(running_notice(elapsed, symbols));
+        self.busy_glyph = Some(spinner_glyph(elapsed, symbols));
         self.draw_execution(prompt)
     }
 
@@ -622,6 +633,7 @@ impl RichSurface {
         self.output_cursor_line = self.transcript.line_count().saturating_sub(1);
         self.output_notice =
             Some("result kept in viewport · PageUp/PageDown scroll · Alt-Q O copy".to_owned());
+        self.busy_glyph = None;
         self.draw_execution(prompt)
     }
 
@@ -714,6 +726,7 @@ impl RichSurface {
             transcript_truncated: self.transcript_truncated,
             output_focus: false,
             output_notice: self.output_notice.as_deref(),
+            busy_glyph: self.busy_glyph,
         };
         self.transcript_area =
             model.transcript_area(Rect::new(0, 0, terminal_width, terminal_height));
@@ -900,6 +913,7 @@ impl RichSurface {
                     transcript_truncated: self.transcript_truncated,
                     output_focus: self.output_focus,
                     output_notice: self.output_notice.as_deref(),
+                    busy_glyph: None,
                 };
                 let transcript_area =
                     model.transcript_area(Rect::new(0, 0, terminal_width, terminal_height));
@@ -1838,17 +1852,26 @@ const SPINNER_FRAMES_PLAIN: [char; 4] = ['|', '/', '-', '\\'];
 /// replays live): it is what tells the user Quirl is still waiting on a
 /// command that has produced no output of its own at all.
 fn running_notice(elapsed: Duration, symbols: SurfaceSymbols) -> String {
-    let frame = (elapsed.as_millis() / SPINNER_FRAME_MS) as usize;
-    let glyph = match symbols {
-        SurfaceSymbols::Plain => SPINNER_FRAMES_PLAIN[frame % SPINNER_FRAMES_PLAIN.len()],
-        SurfaceSymbols::Unicode | SurfaceSymbols::NerdFont => {
-            SPINNER_FRAMES_UNICODE[frame % SPINNER_FRAMES_UNICODE.len()]
-        }
-    };
+    let glyph = spinner_glyph(elapsed, symbols);
     format!(
         "{glyph} running {} · output streams into this viewport",
         format_elapsed(elapsed)
     )
+}
+
+/// Select the spinner glyph for `elapsed`, advancing one frame every
+/// [`SPINNER_FRAME_MS`] so every delivered liveness tick animates it.
+///
+/// Shared by the status-bar running notice and the prompt row's busy
+/// indicator so both spin in lockstep.
+fn spinner_glyph(elapsed: Duration, symbols: SurfaceSymbols) -> char {
+    let frame = (elapsed.as_millis() / SPINNER_FRAME_MS) as usize;
+    match symbols {
+        SurfaceSymbols::Plain => SPINNER_FRAMES_PLAIN[frame % SPINNER_FRAMES_PLAIN.len()],
+        SurfaceSymbols::Unicode | SurfaceSymbols::NerdFont => {
+            SPINNER_FRAMES_UNICODE[frame % SPINNER_FRAMES_UNICODE.len()]
+        }
+    }
 }
 
 /// Render `elapsed` as a compact `12.3s` or `4m05s` readout.
