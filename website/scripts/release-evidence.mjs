@@ -9,6 +9,7 @@ const projectionEnd = '<!-- END QUIRL RELEASE EVIDENCE STATUS -->';
 const sourceBytesMax = 1024 * 1024;
 const gitOutputBytesMax = 256 * 1024;
 const gitTimeoutMs = 10_000;
+const gitUnshallowTimeoutMs = 30_000;
 
 export const evidenceSourcePath = 'docs/benchmarks/release-v1.0.md';
 export const generatedEvidenceMirrorPath =
@@ -358,6 +359,23 @@ function runGit(repositoryRoot, arguments_) {
 
 export function repositoryGit(repositoryRoot) {
   return {
+    ensureFullHistory() {
+      const shallow = runGit(repositoryRoot, ['rev-parse', '--is-shallow-repository']);
+      if (shallow.status !== 0 || shallow.stdout.trim() !== 'true') return;
+      const fetch = spawnSync('git', ['fetch', '--quiet', '--unshallow', 'origin'], {
+        cwd: repositoryRoot,
+        encoding: 'utf8',
+        maxBuffer: gitOutputBytesMax,
+        timeout: gitUnshallowTimeoutMs,
+      });
+      if (fetch.status !== 0) {
+        throw new Error(
+          'release evidence needs full git ancestry, but this checkout is a shallow clone ' +
+            `and \`git fetch --unshallow origin\` failed: ${fetch.stderr.trim()}. ` +
+            'Run `git fetch --unshallow` (or configure a full clone) before building.',
+        );
+      }
+    },
     commitExists(commit) {
       const result = runGit(repositoryRoot, ['cat-file', '-e', `${commit}^{commit}`]);
       return result.status === 0;
@@ -400,7 +418,9 @@ export function loadEvidence(
   const source = readBounded(join(repositoryRoot, evidenceSourcePath));
   const metadata = parseEvidenceMetadata(source);
   validateRecordIdentity(source, metadata);
-  validateAttribution(metadata, repositoryGit(repositoryRoot), {
+  const git = repositoryGit(repositoryRoot);
+  git.ensureFullHistory();
+  validateAttribution(metadata, git, {
     allowImplicitCurrentBeforeCommit,
   });
   return { metadata, source };

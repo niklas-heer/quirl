@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import {
   evidenceSourcePath,
   parseEvidenceMetadata,
   renderProjection,
+  repositoryGit,
   validateAttribution,
   validateProjection,
   validateRecordIdentity,
@@ -236,4 +241,53 @@ test('record_identity_rejects_visible_artifact_time_and_platform_mismatches', ()
       ),
     /platform scope field must occur exactly once/,
   );
+});
+
+function runGitOrThrow(cwd, arguments_) {
+  const result = spawnSync('git', arguments_, { cwd, encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw new Error(`git ${arguments_.join(' ')} failed: ${result.stderr}`);
+  }
+  return result.stdout.trim();
+}
+
+test('ensure_full_history_deepens_a_shallow_clone_so_ancestor_commits_resolve', () => {
+  const origin = mkdtempSync(join(tmpdir(), 'quirl-evidence-origin-'));
+  const clone = mkdtempSync(join(tmpdir(), 'quirl-evidence-clone-'));
+  try {
+    runGitOrThrow(origin, ['init', '--quiet']);
+    runGitOrThrow(origin, ['config', 'user.email', 'test@example.com']);
+    runGitOrThrow(origin, ['config', 'user.name', 'Test']);
+    writeFileSync(join(origin, 'a.txt'), 'a');
+    runGitOrThrow(origin, ['add', 'a.txt']);
+    runGitOrThrow(origin, ['commit', '--quiet', '-m', 'first']);
+    const rootCommit = runGitOrThrow(origin, ['rev-parse', 'HEAD']);
+    writeFileSync(join(origin, 'b.txt'), 'b');
+    runGitOrThrow(origin, ['add', 'b.txt']);
+    runGitOrThrow(origin, ['commit', '--quiet', '-m', 'second']);
+
+    // A plain local path triggers git's local-clone optimization, which
+    // hard-links objects and ignores --depth. Force the git:// transport
+    // semantics with a file:// URL so the clone is genuinely shallow.
+    spawnSync('git', ['clone', '--quiet', '--depth', '1', `file://${origin}`, clone], {
+      encoding: 'utf8',
+    });
+    assert.equal(runGitOrThrow(clone, ['rev-parse', '--is-shallow-repository']), 'true');
+    assert.notEqual(
+      spawnSync('git', ['cat-file', '-e', `${rootCommit}^{commit}`], { cwd: clone }).status,
+      0,
+      'the root commit must be absent before deepening, or the test proves nothing',
+    );
+
+    repositoryGit(clone).ensureFullHistory();
+
+    assert.equal(runGitOrThrow(clone, ['rev-parse', '--is-shallow-repository']), 'false');
+    assert.equal(
+      spawnSync('git', ['cat-file', '-e', `${rootCommit}^{commit}`], { cwd: clone }).status,
+      0,
+    );
+  } finally {
+    rmSync(origin, { recursive: true, force: true });
+    rmSync(clone, { recursive: true, force: true });
+  }
 });
