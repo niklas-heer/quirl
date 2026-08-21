@@ -913,8 +913,12 @@ impl PtySession {
         io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "timed out waiting for {expected}; raw_tail={tail:?}; screen=\n{}; process_tree=\n{}",
+                "timed out waiting for {expected}; raw_tail={tail:?}; screen=\n{}; child_state=\n{}; process_tree=\n{}",
                 self.screen.text(),
+                self.child.map_or_else(
+                    || "(no tracked child)".to_owned(),
+                    |pid| child_kernel_state(pid.as_raw()),
+                ),
                 process_tree_snapshot()
             ),
         )
@@ -926,6 +930,59 @@ impl Drop for PtySession {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+#[cfg(target_os = "linux")]
+const CHILD_THREADS_MAX: usize = 64;
+
+/// Best-effort per-thread kernel sleep state for the harness's own tracked
+/// child, read straight from Linux's `/proc` (a no-op elsewhere: macOS has
+/// no equivalent, and this is diagnostic only).
+///
+/// `wchan` names the kernel function a thread is blocked in, which turns "a
+/// wait timed out" into either "genuinely still computing" (short or empty
+/// wchan, high recent CPU) or "asleep waiting on something that never
+/// arrived" (a wchan like `futex_wait_queue` or `pipe_read`) without needing
+/// a live debugger attached to the CI runner.
+#[cfg(target_os = "linux")]
+fn child_kernel_state(pid: i32) -> String {
+    let task_directory = PathBuf::from(format!("/proc/{pid}/task"));
+    let Ok(entries) = std::fs::read_dir(&task_directory) else {
+        return format!("(could not read {})", task_directory.display());
+    };
+    let mut lines = Vec::new();
+    for entry in entries.filter_map(Result::ok).take(CHILD_THREADS_MAX) {
+        let tid = entry.file_name();
+        let wchan = std::fs::read_to_string(entry.path().join("wchan"))
+            .unwrap_or_else(|error| format!("(unreadable: {error})"));
+        let comm = std::fs::read_to_string(entry.path().join("comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let state = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.split(')')
+                    .nth(1)?
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "?".to_owned());
+        lines.push(format!(
+            "tid={} comm={comm:?} state={state} wchan={wchan}",
+            tid.to_string_lossy()
+        ));
+    }
+    if lines.is_empty() {
+        return format!("(no threads found under {})", task_directory.display());
+    }
+    lines.join("\n")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn child_kernel_state(_pid: i32) -> String {
+    "(child kernel state is only available on Linux)".to_owned()
 }
 
 const PROCESS_TREE_LINES_MAX: usize = 200;
