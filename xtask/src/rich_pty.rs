@@ -2474,6 +2474,13 @@ fn check_suspend_resume(binary: &Path) -> Result<(), Box<dyn Error>> {
         println!("skip: check_suspend_resume (zsh/bash unavailable)");
         return Ok(());
     };
+    // zsh's own job-control message says "suspended"; bash's says "Stopped".
+    // The standard GitHub-hosted Ubuntu runner does not ship zsh, so this
+    // check silently exercised bash there while asserting zsh's wording,
+    // which can never match: not flaky, just wrong for whichever shell
+    // `find_on_path` actually resolved.
+    let is_zsh = shell.file_name().is_some_and(|name| name == "zsh");
+    let suspend_marker: &[u8] = if is_zsh { b"suspended" } else { b"Stopped" };
     let mut session = Session::new(
         binary,
         SessionOptions {
@@ -2486,7 +2493,7 @@ fn check_suspend_resume(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.send(key::ENTER)?;
     session.pty.wait_for(STARTUP_MARKER)?;
     session.pty.send(b"\x1a")?;
-    session.pty.wait_for(b"suspended")?;
+    session.pty.wait_for(suspend_marker)?;
     session.pty.type_text("fg")?;
     session.pty.send(key::ENTER)?;
     session.pty.wait_for(STARTUP_MARKER)?;
