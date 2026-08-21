@@ -913,8 +913,9 @@ impl PtySession {
         io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "timed out waiting for {expected}; raw_tail={tail:?}; screen=\n{}",
-                self.screen.text()
+                "timed out waiting for {expected}; raw_tail={tail:?}; screen=\n{}; process_tree=\n{}",
+                self.screen.text(),
+                process_tree_snapshot()
             ),
         )
         .into()
@@ -924,6 +925,29 @@ impl PtySession {
 impl Drop for PtySession {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+const PROCESS_TREE_BYTES_MAX: usize = 16 * 1024;
+
+/// Best-effort `ps -ef` snapshot attached to a timeout diagnostic.
+///
+/// A PTY wait timing out this test harness could mean the harness itself is
+/// just slow under CI load, or that a child (or something it spawned) is
+/// genuinely still alive and blocking cleanup; this distinguishes the two
+/// without needing to reproduce the hang interactively. Never fails the
+/// check itself: a `ps` failure just yields a short diagnostic string.
+fn process_tree_snapshot() -> String {
+    match std::process::Command::new("ps").arg("-ef").output() {
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if text.len() > PROCESS_TREE_BYTES_MAX {
+                format!("{}... (truncated)", &text[..PROCESS_TREE_BYTES_MAX])
+            } else {
+                text.into_owned()
+            }
+        }
+        Err(error) => format!("(ps -ef unavailable: {error})"),
     }
 }
 
