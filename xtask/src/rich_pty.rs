@@ -1810,7 +1810,7 @@ fn check_external_command_compatibility(binary: &Path) -> Result<(), Box<dyn Err
                get)\n\
                  printf '\\033[0;32mclone\\033[0m %s\\n' \"$2\"\n\
                  printf 'progress 10%%\\rprogress 20%%\\n'\n\
-                 /bin/sleep 1\n\
+                 /bin/sleep 5\n\
                  printf 'clone complete\\n'\n\
                  : > {}\n\
                  ;;\n\
