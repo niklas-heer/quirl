@@ -2004,6 +2004,8 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     // Scheduling returns immediately; the guard only joins after cancellation
     // during shell shutdown, so no download can delay the first prompt.
     let _asset_refresh = assets::schedule_background_update();
+    let _periodic_asset_refresh =
+        assets::schedule_periodic_update(ai_bootstrap.asset_update_signal());
     let mut mode = Mode::Command;
     // Recovery snapshots are only needed once a native command is accepted.
     // Environment capture can be deferred past the first interactive paint.

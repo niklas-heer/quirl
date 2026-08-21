@@ -267,12 +267,20 @@ impl InteractiveAiBootstrap {
     }
 
     pub(crate) fn take_catalog_changed(&self) -> bool {
-        self.shared
+        let discovery_changed = self
+            .shared
             .catalog_refresh
             .lock()
             .ok()
             .and_then(|refresh| refresh.as_ref().map(index::CatalogRefresh::take_changed))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        // A periodic runtime-asset refresh (see `assets::schedule_periodic_update`)
+        // flips this independently of local discovery, since a newly-installed
+        // completion database is a different source than fish/bash/zsh/man
+        // files on PATH. Draining unconditionally (not short-circuited by
+        // `||`) keeps both signals accurate even if discovery already changed.
+        let asset_changed = self.shared.asset_changed.swap(false, Ordering::AcqRel);
+        discovery_changed || asset_changed
     }
 
     pub(crate) fn request_catalog_refresh(&self) {
@@ -286,6 +294,13 @@ impl InteractiveAiBootstrap {
             self.shared
                 .publish(format!("AI discovery deferred: {}", error.message));
         }
+    }
+
+    /// A shared flag a periodic runtime-asset refresh worker can flip on a
+    /// successful install, so the next `take_catalog_changed()` poll picks
+    /// it up the same way a local discovery change would.
+    pub(crate) fn asset_update_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shared.asset_changed)
     }
 }
 
@@ -331,6 +346,7 @@ struct Shared {
     wake: (Mutex<()>, Condvar),
     worker: Mutex<Option<JoinHandle<()>>>,
     catalog_refresh: Mutex<Option<index::CatalogRefresh>>,
+    asset_changed: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -351,6 +367,7 @@ impl Shared {
             wake: (Mutex::new(()), Condvar::new()),
             worker: Mutex::new(None),
             catalog_refresh: Mutex::new(None),
+            asset_changed: Arc::new(AtomicBool::new(false)),
         }
     }
 

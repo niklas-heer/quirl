@@ -36,7 +36,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -321,6 +321,29 @@ impl Downloader for HttpsDownloader {
     }
 }
 
+/// Opens `file://` payloads for local manifest testing. Never constructed
+/// unless the manifest itself was already loaded from a local file — see
+/// `install_one`'s `allow_file` gate.
+struct FileDownloader;
+
+impl Downloader for FileDownloader {
+    fn open(
+        &self,
+        url: &str,
+        _cancelled: Arc<AtomicBool>,
+    ) -> Result<Box<dyn Read + Send>, ShellError> {
+        let path = url.strip_prefix("file://").ok_or_else(|| {
+            manifest_validation("local asset payload URL must use the file:// scheme")
+        })?;
+        let file = File::open(path).map_err(|error| {
+            ShellError::new(ErrorCode::Io, "could not open the local asset payload")
+                .with_context(error.to_string())
+                .with_help("Check the file:// path in the local manifest")
+        })?;
+        Ok(Box::new(file))
+    }
+}
+
 /// Cancellable ownership of the single startup asset worker.
 pub(crate) struct BackgroundAssetRefresh {
     cancelled: Arc<AtomicBool>,
@@ -382,7 +405,7 @@ pub(crate) fn schedule_background_update() -> Option<BackgroundAssetRefresh> {
         .spawn(move || {
             let downloader = HttpsDownloader::new();
             let _ = update_from_source(
-                ManifestSource::Url(default_manifest_url()),
+                manifest_candidates(None),
                 &downloader,
                 &worker_cancelled,
                 UpdateMode::Background,
@@ -393,6 +416,92 @@ pub(crate) fn schedule_background_update() -> Option<BackgroundAssetRefresh> {
         cancelled,
         worker: Some(worker),
     })
+}
+
+const PERIODIC_ASSET_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Cancellable ownership of the periodic asset-refresh worker. Held for the
+/// interactive session's lifetime alongside [`BackgroundAssetRefresh`]'s
+/// one-shot startup check.
+pub(crate) struct PeriodicAssetRefresh {
+    cancelled: Arc<AtomicBool>,
+    wake: Arc<(Mutex<()>, Condvar)>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Drop for PeriodicAssetRefresh {
+    fn drop(&mut self) {
+        {
+            let _guard = match self.wake.0.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            self.cancelled.store(true, Ordering::Release);
+        }
+        self.wake.1.notify_all();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Periodically re-check the manifest and install a newer completion
+/// database or command model in the background, without waiting for any
+/// asset work before returning.
+///
+/// On every successful install, `changed` is set so the interactive main
+/// loop's existing `take_catalog_changed()` poll (already used to hot-swap
+/// in a freshly-discovered local catalog between prompts) picks up the
+/// newly-installed asset too, with no separate UI wiring.
+pub(crate) fn schedule_periodic_update(changed: Arc<AtomicBool>) -> Option<PeriodicAssetRefresh> {
+    #[cfg(debug_assertions)]
+    env::var_os("QUIRL_TEST_ASSET_REFRESH_ENABLE_NETWORK")?;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new((Mutex::new(()), Condvar::new()));
+    let worker_cancelled = Arc::clone(&cancelled);
+    let worker_wake = Arc::clone(&wake);
+    let worker = thread::Builder::new()
+        .name("quirl-assets-periodic".to_owned())
+        .spawn(move || periodic_refresh_loop(&worker_cancelled, &worker_wake, &changed))
+        .ok()?;
+    Some(PeriodicAssetRefresh {
+        cancelled,
+        wake,
+        worker: Some(worker),
+    })
+}
+
+fn periodic_refresh_loop(
+    cancelled: &Arc<AtomicBool>,
+    wake: &(Mutex<()>, Condvar),
+    changed: &AtomicBool,
+) {
+    let downloader = HttpsDownloader::new();
+    loop {
+        let guard = match wake.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match wake.1.wait_timeout(guard, PERIODIC_ASSET_REFRESH_INTERVAL) {
+            Ok((guard, _)) => drop(guard),
+            Err(poisoned) => drop(poisoned.into_inner()),
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        if let Ok(report) = update_from_source(
+            manifest_candidates(None),
+            &downloader,
+            cancelled,
+            UpdateMode::Background,
+        ) && report.installed > 0
+        {
+            changed.store(true, Ordering::Release);
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+    }
 }
 
 pub(crate) fn wants_json(command: &AssetsCommand) -> bool {
@@ -518,10 +627,8 @@ fn execute_update(
     let downloader = HttpsDownloader::new();
     let cancelled = Arc::new(AtomicBool::new(false));
     let _signals = AssetSignalRegistration::register(Arc::clone(&cancelled))?;
-    let source = manifest
-        .map(ManifestSource::File)
-        .unwrap_or_else(|| ManifestSource::Url(default_manifest_url()));
-    let report = update_from_source(source, &downloader, &cancelled, mode)?;
+    let sources = manifest_candidates(manifest);
+    let report = update_from_source(sources, &downloader, &cancelled, mode)?;
     let failed = report.failed > 0;
     present_update(&report, format)?;
     Ok(i32::from(failed))
@@ -534,6 +641,7 @@ enum UpdateMode {
     Retry,
 }
 
+#[derive(Clone)]
 enum ManifestSource {
     File(PathBuf),
     Url(String),
@@ -578,7 +686,7 @@ impl RetryState {
 }
 
 fn update_from_source(
-    source: ManifestSource,
+    sources: Vec<ManifestSource>,
     downloader: &dyn Downloader,
     cancelled: &Arc<AtomicBool>,
     mode: UpdateMode,
@@ -586,7 +694,15 @@ fn update_from_source(
     let paths = AssetPaths::discover()?;
     create_private_directory(&paths.data)?;
     create_private_directory(&paths.cache)?;
-    let source_identity = source.identity();
+    // One retry-state entry covers the whole candidate list: if every
+    // candidate is currently failing, back off the set as a unit rather than
+    // tracking per-mirror state, and if any candidate works the whole
+    // resolution succeeds so backoff never applies.
+    let source_identity = sources
+        .iter()
+        .map(ManifestSource::identity)
+        .collect::<Vec<_>>()
+        .join(",");
     let wait = match mode {
         UpdateMode::Background => CoordinationWait::Background,
         UpdateMode::Explicit | UpdateMode::Retry => CoordinationWait::Explicit,
@@ -627,18 +743,19 @@ fn update_from_source(
             }],
         });
     }
-    let manifest =
-        match load_manifest(source, downloader, Arc::clone(cancelled)).and_then(|manifest| {
-            validate_manifest(&manifest)?;
-            Ok(manifest)
-        }) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                record_manifest_failure(&mut retry, source_identity, &error, now_ms)?;
-                write_retry_state(&paths.state, &retry)?;
-                return Err(error);
-            }
-        };
+    let (manifest, allow_file) = match resolve_manifest(&sources, downloader, cancelled).and_then(
+        |(manifest, allow_file)| {
+            validate_manifest(&manifest, allow_file)?;
+            Ok((manifest, allow_file))
+        },
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            record_manifest_failure(&mut retry, source_identity, &error, now_ms)?;
+            write_retry_state(&paths.state, &retry)?;
+            return Err(error);
+        }
+    };
     retry.entries.remove(MANIFEST_RETRY_KEY);
     let mut report = AssetUpdateReport {
         schema_version: STATUS_SCHEMA_VERSION,
@@ -681,6 +798,7 @@ fn update_from_source(
             &manifest.release_version,
             asset,
             downloader,
+            allow_file,
             cancelled,
         ) {
             Ok(InstallOutcome::Current) => {
@@ -731,10 +849,11 @@ fn install_one(
     release_version: &str,
     asset: &AssetManifestEntry,
     downloader: &dyn Downloader,
+    allow_file: bool,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<InstallOutcome, AssetFailure> {
     let admission_started = Instant::now();
-    validate_manifest_entry(asset).map_err(AssetFailure::permanent)?;
+    validate_manifest_entry(asset, allow_file).map_err(AssetFailure::permanent)?;
     validate_required_asset_contract(asset).map_err(AssetFailure::permanent)?;
     validate_compatibility(asset)?;
     let asset_root = paths.data.join(&asset.logical_name);
@@ -751,9 +870,15 @@ fn install_one(
     }
     create_private_directory(&asset_root).map_err(AssetFailure::transient)?;
     let mut temporary = TemporaryDownload::create(&asset_root).map_err(AssetFailure::transient)?;
-    let mut reader = downloader
-        .open(&asset.url, Arc::clone(cancelled))
-        .map_err(AssetFailure::transient)?;
+    let mut reader = if allow_file && asset.url.starts_with("file://") {
+        FileDownloader
+            .open(&asset.url, Arc::clone(cancelled))
+            .map_err(AssetFailure::permanent)?
+    } else {
+        downloader
+            .open(&asset.url, Arc::clone(cancelled))
+            .map_err(AssetFailure::transient)?
+    };
     let mut temporary_file = temporary.take_file().map_err(AssetFailure::transient)?;
     download_and_verify(
         reader.as_mut(),
@@ -1439,7 +1564,7 @@ fn validate_payload_controlled(
     Ok(())
 }
 
-fn validate_manifest(manifest: &AssetManifest) -> Result<(), ShellError> {
+fn validate_manifest(manifest: &AssetManifest, allow_file: bool) -> Result<(), ShellError> {
     if manifest.schema_version != MANIFEST_SCHEMA_VERSION {
         return Err(manifest_validation(
             "unsupported asset manifest schema version",
@@ -1499,7 +1624,7 @@ fn validate_manifest(manifest: &AssetManifest) -> Result<(), ShellError> {
     let mut total = 0_u64;
     let mut names = BTreeMap::new();
     for asset in &manifest.assets {
-        validate_manifest_entry(asset)?;
+        validate_manifest_entry(asset, allow_file)?;
         validate_required_asset_contract(asset)?;
         if asset.compatibility.quirl_version_requirement != format!("={}", manifest.release_version)
         {
@@ -1567,7 +1692,7 @@ fn validate_required_asset_contract(asset: &AssetManifestEntry) -> Result<(), Sh
     Ok(())
 }
 
-fn validate_manifest_entry(asset: &AssetManifestEntry) -> Result<(), ShellError> {
+fn validate_manifest_entry(asset: &AssetManifestEntry, allow_file: bool) -> Result<(), ShellError> {
     if asset.logical_name.is_empty()
         || asset.logical_name.len() > LOGICAL_NAME_BYTES_MAX
         || !asset
@@ -1611,10 +1736,14 @@ fn validate_manifest_entry(asset: &AssetManifestEntry) -> Result<(), ShellError>
     {
         return Err(manifest_validation("invalid runtime asset SHA-256"));
     }
-    if asset.url.len() > URL_BYTES_MAX || !asset.url.starts_with("https://") {
-        return Err(manifest_validation(
-            "runtime asset URL must be bounded absolute HTTPS",
-        ));
+    let scheme_ok =
+        asset.url.starts_with("https://") || (allow_file && asset.url.starts_with("file://"));
+    if asset.url.len() > URL_BYTES_MAX || !scheme_ok {
+        return Err(manifest_validation(if allow_file {
+            "runtime asset URL must be bounded absolute HTTPS or file://"
+        } else {
+            "runtime asset URL must be bounded absolute HTTPS"
+        }));
     }
     for values in [
         &asset.compatibility.operating_systems,
@@ -1698,6 +1827,28 @@ fn load_manifest(
     })
 }
 
+/// Try each candidate manifest source in order, returning the first that
+/// fetches and parses successfully, plus whether that source was local
+/// (which in turn permits `file://` asset payload URLs downstream).
+///
+/// Only a fetch/parse-level failure falls through to the next candidate; a
+/// successfully-parsed-but-invalid manifest is a hard error so a real bug at
+/// one mirror is never silently papered over by trying another.
+fn resolve_manifest(
+    sources: &[ManifestSource],
+    downloader: &dyn Downloader,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<(AssetManifest, bool), ShellError> {
+    let mut last_error = None;
+    for source in sources {
+        match load_manifest(source.clone(), downloader, Arc::clone(cancelled)) {
+            Ok(manifest) => return Ok((manifest, matches!(source, ManifestSource::File(_)))),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| manifest_validation("no manifest source was configured")))
+}
+
 fn read_receipt(path: &Path) -> Result<InstalledReceipt, ShellError> {
     let bytes = read_bounded_file(path, RECEIPT_BYTES_MAX)?;
     let receipt: InstalledReceipt = serde_json::from_slice(&bytes).map_err(|error| {
@@ -1713,7 +1864,11 @@ fn read_receipt(path: &Path) -> Result<InstalledReceipt, ShellError> {
             "unsupported installed asset receipt version",
         ));
     }
-    validate_manifest_entry(&receipt.asset)?;
+    // Already-installed content is independently sha256-verified against its
+    // payload on disk regardless of what `url` says; the field is read back
+    // here purely as provenance, not re-fetched, so a local-sourced receipt
+    // stays readable on every later `status`/startup check.
+    validate_manifest_entry(&receipt.asset, true)?;
     Ok(receipt)
 }
 
@@ -2016,13 +2171,51 @@ fn print_json(value: &impl Serialize) -> Result<(), ShellError> {
     Ok(())
 }
 
-fn default_manifest_url() -> String {
-    env::var("QUIRL_ASSET_MANIFEST_URL").unwrap_or_else(|_| {
-        format!(
+/// Resolve where to look for the runtime asset manifest.
+///
+/// `explicit_file` is the `--manifest` CLI flag, when given. Otherwise:
+/// `QUIRL_ASSET_MANIFEST_FILE` (a local path, for a fully offline dev loop —
+/// this is what lets the interactive session's own background checker, which
+/// never goes through the `assets` subcommand, pick up a local build too),
+/// then `QUIRL_ASSET_MANIFEST_URL` (a single full override, unchanged from
+/// its previous behavior), then the built-in candidate list: quirl.dev
+/// first, quirl.vercel.app as a same-deployment fallback if quirl.dev's DNS
+/// specifically is the problem, then GitHub Releases (already published
+/// there for Homebrew/binary releases regardless, so this is free
+/// resilience if both website hosts are ever unreachable).
+fn manifest_candidates(explicit_file: Option<PathBuf>) -> Vec<ManifestSource> {
+    manifest_candidates_from(
+        explicit_file,
+        env::var_os("QUIRL_ASSET_MANIFEST_FILE").map(PathBuf::from),
+        env::var("QUIRL_ASSET_MANIFEST_URL").ok(),
+    )
+}
+
+/// Pure resolution logic behind [`manifest_candidates`], taking the
+/// already-read environment as parameters so it's directly testable without
+/// mutating real process-global env state.
+fn manifest_candidates_from(
+    explicit_file: Option<PathBuf>,
+    env_file: Option<PathBuf>,
+    env_url: Option<String>,
+) -> Vec<ManifestSource> {
+    if let Some(path) = explicit_file {
+        return vec![ManifestSource::File(path)];
+    }
+    if let Some(path) = env_file {
+        return vec![ManifestSource::File(path)];
+    }
+    if let Some(url) = env_url {
+        return vec![ManifestSource::Url(url)];
+    }
+    vec![
+        ManifestSource::Url("https://quirl.dev/reference/asset-manifest-v1.json".to_owned()),
+        ManifestSource::Url("https://quirl.vercel.app/reference/asset-manifest-v1.json".to_owned()),
+        ManifestSource::Url(format!(
             "https://github.com/niklas-heer/quirl/releases/download/v{0}/asset-manifest-v1.json",
             env!("CARGO_PKG_VERSION")
-        )
-    })
+        )),
+    ]
 }
 
 fn asset_data_directory() -> Result<PathBuf, ShellError> {
@@ -2572,11 +2765,7 @@ fn truncate_utf8(value: &str, bytes_max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        collections::BTreeMap,
-        io::Cursor,
-        sync::{Mutex, atomic::AtomicUsize},
-    };
+    use std::{collections::BTreeMap, io::Cursor, sync::atomic::AtomicUsize};
 
     const TEST_NATIVE_DATABASE: &[u8] =
         include_bytes!("../../../catalog/generated/catalog.sqlite3");
@@ -2759,6 +2948,7 @@ mod tests {
             "0.1.0",
             &asset,
             &downloader,
+            false,
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
@@ -2781,6 +2971,7 @@ mod tests {
             "0.1.0",
             &asset,
             &downloader,
+            false,
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
@@ -2807,6 +2998,7 @@ mod tests {
             "0.1.0",
             &first_asset,
             &first_downloader,
+            false,
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
@@ -2821,6 +3013,7 @@ mod tests {
             "0.1.1",
             &next,
             &corrupt,
+            false,
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap_err();
@@ -2848,7 +3041,7 @@ mod tests {
         manifest
             .assets
             .push(entry("command-model", &command_model_tar()));
-        validate_manifest(&manifest).unwrap();
+        validate_manifest(&manifest, false).unwrap();
         let completion = manifest
             .assets
             .iter()
@@ -2879,7 +3072,7 @@ mod tests {
         let mut wrong_candidate = manifest.clone();
         wrong_candidate.candidate_commit = "f".repeat(40);
         if env!("QUIRL_BUILD_COMMIT") != "f".repeat(40) {
-            assert!(validate_manifest(&wrong_candidate).is_err());
+            assert!(validate_manifest(&wrong_candidate, false).is_err());
         }
 
         let json = br#"{
@@ -2893,6 +3086,129 @@ mod tests {
     }
 
     #[test]
+    fn manifest_candidates_follow_explicit_env_then_built_in_precedence() {
+        let file = PathBuf::from("/tmp/local-manifest.json");
+        assert!(matches!(
+            manifest_candidates_from(Some(file.clone()), None, None).as_slice(),
+            [ManifestSource::File(path)] if *path == file
+        ));
+
+        let env_file = PathBuf::from("/tmp/env-manifest.json");
+        assert!(matches!(
+            manifest_candidates_from(None, Some(env_file.clone()), Some("https://ignored.invalid/m.json".to_owned())).as_slice(),
+            [ManifestSource::File(path)] if *path == env_file
+        ));
+
+        let candidates = manifest_candidates_from(
+            None,
+            None,
+            Some("https://override.invalid/asset-manifest-v1.json".to_owned()),
+        );
+        assert!(matches!(
+            candidates.as_slice(),
+            [ManifestSource::Url(url)] if url == "https://override.invalid/asset-manifest-v1.json"
+        ));
+
+        let defaults = manifest_candidates_from(None, None, None);
+        let urls = defaults
+            .iter()
+            .map(|source| match source {
+                ManifestSource::Url(url) => url.clone(),
+                ManifestSource::File(_) => panic!("default candidates must all be URLs"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://quirl.dev/reference/asset-manifest-v1.json".to_owned(),
+                "https://quirl.vercel.app/reference/asset-manifest-v1.json".to_owned(),
+                format!(
+                    "https://github.com/niklas-heer/quirl/releases/download/v{}/asset-manifest-v1.json",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            ]
+        );
+    }
+
+    fn single_asset_manifest(asset: AssetManifestEntry) -> AssetManifest {
+        AssetManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            release_version: env!("CARGO_PKG_VERSION").to_owned(),
+            candidate_commit: "0".repeat(40),
+            source_date_epoch: 1,
+            assets: vec![asset],
+        }
+    }
+
+    #[test]
+    fn resolve_manifest_falls_through_an_unreachable_first_candidate() {
+        let asset = entry("completion-database", b"payload");
+        let manifest = single_asset_manifest(asset);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let downloader = FakeDownloader::new([(
+            "https://second.invalid/asset-manifest-v1.json".to_owned(),
+            bytes,
+        )]);
+        let sources = vec![
+            ManifestSource::Url("https://first.invalid/asset-manifest-v1.json".to_owned()),
+            ManifestSource::Url("https://second.invalid/asset-manifest-v1.json".to_owned()),
+        ];
+        let (resolved, allow_file) =
+            resolve_manifest(&sources, &downloader, &Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(resolved.release_version, manifest.release_version);
+        assert!(!allow_file);
+    }
+
+    #[test]
+    fn resolve_manifest_reports_no_local_trust_for_every_candidate_unreachable() {
+        let downloader = FakeDownloader::new([]);
+        let sources = vec![ManifestSource::Url(
+            "https://first.invalid/asset-manifest-v1.json".to_owned(),
+        )];
+        assert!(
+            resolve_manifest(&sources, &downloader, &Arc::new(AtomicBool::new(false))).is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_manifest_trusts_local_files_only_from_a_local_source() {
+        let directory = TestDirectory::new("resolve-local");
+        let manifest_path = directory.0.join("manifest.json");
+        let asset = entry("completion-database", b"payload");
+        let manifest = single_asset_manifest(asset);
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let sources = vec![ManifestSource::File(manifest_path)];
+        let downloader = FakeDownloader::new([]);
+        let (_, allow_file) =
+            resolve_manifest(&sources, &downloader, &Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(allow_file);
+    }
+
+    #[test]
+    fn local_asset_payload_is_installed_only_when_trusted() {
+        let directory = TestDirectory::new("file-payload");
+        let paths = directory.paths();
+        create_private_directory(&paths.data).unwrap();
+        let bytes = TEST_NATIVE_DATABASE;
+        let payload_path = directory.0.join("completion.sqlite3");
+        fs::write(&payload_path, bytes).unwrap();
+        let mut asset = entry("completion-database", bytes);
+        asset.url = format!("file://{}", payload_path.display());
+        let downloader = FakeDownloader::new([]);
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        assert!(
+            install_one(&paths, "0.1.0", &asset, &downloader, false, &cancelled)
+                .unwrap_err()
+                .permanent
+        );
+
+        let outcome = install_one(&paths, "0.1.0", &asset, &downloader, true, &cancelled).unwrap();
+        assert!(matches!(outcome, InstallOutcome::Installed));
+        assert_eq!(downloader.opens.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn cancelled_download_cleans_partial_file() {
         let directory = TestDirectory::new("cancel");
         let paths = directory.paths();
@@ -2901,7 +3217,7 @@ mod tests {
         let asset = entry("completion-database", bytes);
         let downloader = FakeDownloader::new([(asset.url.clone(), bytes.to_vec())]);
         let cancelled = Arc::new(AtomicBool::new(true));
-        assert!(install_one(&paths, "0.1.0", &asset, &downloader, &cancelled).is_err());
+        assert!(install_one(&paths, "0.1.0", &asset, &downloader, false, &cancelled).is_err());
         let root = paths.data.join("completion-database");
         let remaining = fs::read_dir(root)
             .unwrap()
@@ -2926,7 +3242,7 @@ mod tests {
             bytes: bytes.to_vec(),
         };
         let cancelled = Arc::new(AtomicBool::new(false));
-        assert!(install_one(&paths, "0.1.0", &asset, &downloader, &cancelled).is_err());
+        assert!(install_one(&paths, "0.1.0", &asset, &downloader, false, &cancelled).is_err());
         let asset_root = paths.data.join("completion-database");
         assert!(
             fs::read_dir(asset_root)
@@ -2951,6 +3267,7 @@ mod tests {
             "0.1.0",
             &asset,
             &downloader,
+            false,
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap_err();
@@ -2965,6 +3282,7 @@ mod tests {
                 "0.1.0",
                 &asset,
                 &downloader,
+                false,
                 &Arc::new(AtomicBool::new(false)),
             )
             .unwrap_err()
@@ -2996,6 +3314,7 @@ mod tests {
                 "0.1.0",
                 &asset,
                 &downloader,
+                false,
                 &Arc::new(AtomicBool::new(false)),
             )
             .is_err()
