@@ -1780,23 +1780,59 @@ impl Catalog {
         }
 
         if let Some((command, token_start, token)) = self.option_context(query, query_start) {
+            // A POSIX short-flag cluster like `-al`: once every character
+            // before the last is already a known single-character flag on
+            // this command, only the last position is still being typed.
+            // Matching the whole cluster against full option names (as
+            // below) can never succeed past two characters, since no single
+            // short flag is that long — so narrow the match to the trailing
+            // character and keep the validated prefix fixed instead.
+            let is_short_flag_name = |name: &str| {
+                let mut chars = name.chars();
+                chars.next() == Some('-') && chars.next().is_some() && chars.next().is_none()
+            };
+            let bundle_prefix = (!token.starts_with("--") && token.chars().count() > 2)
+                .then(|| {
+                    let split = token.len() - token.chars().next_back().map_or(0, char::len_utf8);
+                    let prefix = &token[..split];
+                    prefix[1..]
+                        .chars()
+                        .all(|flag| {
+                            let mut candidate = String::from('-');
+                            candidate.push(flag);
+                            command.options.iter().any(|option| {
+                                option.kind == ArgumentKind::Flag
+                                    && option.names.contains(&candidate)
+                            })
+                        })
+                        .then_some(prefix)
+                })
+                .flatten();
+            let (match_query, insert_start, bundling) = match bundle_prefix {
+                Some(prefix) => (&token[prefix.len()..], token_start + prefix.len(), true),
+                None => (token, token_start, false),
+            };
             let mut choices = command
                 .options
                 .iter()
                 .flat_map(|option| option.names.iter().map(move |name| (name, option)))
+                .filter(|(name, option)| {
+                    !bundling || (option.kind == ArgumentKind::Flag && is_short_flag_name(name))
+                })
                 .filter_map(|(name, option)| {
-                    fuzzy_match(token, name).map(|(score, indices)| {
+                    let insert = if bundling { &name[1..] } else { name.as_str() };
+                    fuzzy_match(match_query, insert).map(|(score, indices)| {
                         (
                             score,
                             Completion {
-                                value: name.clone(),
+                                value: insert.to_owned(),
                                 display: match option.kind {
                                     ArgumentKind::Flag => name.clone(),
                                     _ => format!("{name} <{}>", option.value_type),
                                 },
                                 summary: option.documentation.clone(),
                                 detail: command.signature.clone(),
-                                replace_start: token_start,
+                                replace_start: insert_start,
                                 replace_end: cursor,
                                 match_indices: indices,
                             },
@@ -2318,7 +2354,7 @@ fn whitespace_width_at(input: &str, index: usize) -> usize {
 }
 
 fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
-    let query = query.to_lowercase();
+    let query_lower = query.to_lowercase();
     let mut candidate_lower = String::new();
     let mut original_indices = Vec::new();
     for (original_index, character) in candidate.chars().enumerate() {
@@ -2327,22 +2363,35 @@ fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
             original_indices.push(original_index);
         }
     }
-    if query.is_empty() {
+    if query_lower.is_empty() {
         return Some((0, vec![]));
     }
-    if candidate_lower.starts_with(&query) {
+    // Matching is case-insensitive, but ties (`-a` and `-A` both prefix-match
+    // a lowercase "a" query identically) should still favor whichever
+    // candidate matches the typed case exactly — a plain alphabetical
+    // tiebreak would put `-A` first purely because 'A' < 'a' in ASCII, which
+    // reads as backwards to anyone who typed lowercase.
+    let case_bonus = i32::try_from(
+        candidate
+            .chars()
+            .zip(query.chars())
+            .filter(|(c, q)| c == q)
+            .count(),
+    )
+    .unwrap_or(0);
+    if candidate_lower.starts_with(&query_lower) {
         let mut indices = original_indices
             .iter()
-            .take(query.chars().count())
+            .take(query_lower.chars().count())
             .copied()
             .collect::<Vec<_>>();
         indices.dedup();
-        return Some((10_000 - candidate.len() as i32, indices));
+        return Some((10_000 - candidate.len() as i32 + case_bonus, indices));
     }
 
     let mut indices = Vec::new();
     let mut candidate_chars = candidate_lower.chars().enumerate();
-    for wanted in query.chars() {
+    for wanted in query_lower.chars() {
         let (folded_index, _) = candidate_chars.find(|(_, actual)| *actual == wanted)?;
         let original_index = *original_indices.get(folded_index)?;
         if indices.last() != Some(&original_index) {
@@ -2350,7 +2399,10 @@ fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
         }
     }
     let spread = indices.last().copied().unwrap_or_default() as i32;
-    Some((1_000 - spread - candidate.len() as i32, indices))
+    Some((
+        1_000 - spread - candidate.len() as i32 + case_bonus,
+        indices,
+    ))
 }
 
 fn option(names: &[&str], value: Option<&str>, summary: &str) -> OptionSpec {
@@ -2673,6 +2725,85 @@ mod tests {
         let completions = Catalog::builtin().complete("git commit --am", 15);
         assert_eq!(completions[0].value, "--amend");
         assert_eq!(completions[0].replace_start, 11);
+    }
+
+    fn bundle_test_catalog() -> Catalog {
+        Catalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            commands: vec![command(
+                "tar",
+                "tar [options]",
+                "Manipulate tape archives",
+                "Test fixture: two single-character boolean flags to bundle.",
+                vec![
+                    option(&["-x", "--extract"], None, "Extract files from an archive"),
+                    option(
+                        &["-v", "--verbose"],
+                        None,
+                        "List files as they're processed",
+                    ),
+                    option(
+                        &["-f", "--file"],
+                        Some("path"),
+                        "Use the given archive file",
+                    ),
+                ],
+                &["tar -xvf archive.tar"],
+                &[Effect::ReadFilesystem, Effect::WriteFilesystem],
+                Provenance::Builtin,
+            )],
+        }
+    }
+
+    #[test]
+    fn bundled_short_flags_complete_the_trailing_position() {
+        // `-x` and `-v` are both boolean flags (no value); once `-x` is
+        // validated as a known flag, `-xv` should complete the trailing `v`
+        // against `-v` rather than trying (and failing) to fuzzy-match the
+        // whole two-character token against full option names.
+        let completions = bundle_test_catalog().complete("tar -xv", 7);
+        let accepted = completions
+            .iter()
+            .find(|completion| completion.value == "v")
+            .unwrap_or_else(|| panic!("expected a completion inserting 'v', got {completions:?}"));
+        // Replacing from `replace_start` to the cursor must land exactly on
+        // the `v` in `-xv`, not clobber the already-typed `-x` prefix.
+        assert_eq!(accepted.replace_start, 6);
+
+        // A value-taking option (`-f`) is never offered as a bundle
+        // continuation: `-xvf` would ambiguously consume the *next* token
+        // as `-f`'s value under real getopt semantics, so it's excluded
+        // from pure boolean-flag bundling rather than guessed at.
+        assert!(!completions.iter().any(|completion| completion.value == "f"));
+    }
+
+    #[test]
+    fn bundled_short_flags_require_every_prior_character_to_be_a_known_flag() {
+        // `-xz`: `-x` is real, `-z` is not a flag on this fixture command,
+        // so this isn't a valid bundle prefix and should fall back to
+        // matching the whole token against full option names (finding
+        // nothing, since no flag here is spelled "-xz").
+        let completions = bundle_test_catalog().complete("tar -xz", 7);
+        assert!(completions.is_empty());
+    }
+
+    #[test]
+    fn fuzzy_match_prefers_the_exact_typed_case_on_ties() {
+        // Option names retain their leading dash through fuzzy_match (see
+        // the option-completion branch of `complete`), so the query here
+        // must too, matching the real `-a` vs `-A` comparison.
+        let lower = fuzzy_match("-a", "-a").unwrap();
+        let upper = fuzzy_match("-a", "-A").unwrap();
+        assert!(
+            lower.0 > upper.0,
+            "typing lowercase 'a' should rank '-a' above '-A'"
+        );
+        let lower = fuzzy_match("-A", "-a").unwrap();
+        let upper = fuzzy_match("-A", "-A").unwrap();
+        assert!(
+            upper.0 > lower.0,
+            "typing uppercase 'A' should rank '-A' above '-a'"
+        );
     }
 
     #[test]
