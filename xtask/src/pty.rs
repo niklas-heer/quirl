@@ -830,7 +830,18 @@ impl PtySession {
     }
 
     pub(super) fn wait_exit(&mut self) -> Result<i32, Box<dyn Error>> {
-        let deadline = Instant::now() + self.timeout;
+        self.wait_exit_within(self.timeout)
+    }
+
+    /// Wait for the child to exit within an explicit, shorter-than-usual
+    /// deadline rather than the session's configured [`Self::timeout`].
+    ///
+    /// Meant for a bounded probe before a defensive retry (for example
+    /// resending a keystroke that a still-alive child may have swallowed as
+    /// something other than the intended action) that itself still has the
+    /// full session timeout to work with.
+    pub(super) fn wait_exit_within(&mut self, timeout: Duration) -> Result<i32, Box<dyn Error>> {
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             self.drain_for(
                 deadline

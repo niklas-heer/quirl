@@ -2376,9 +2376,31 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), Box<dyn Error>> {
         &mut session,
         "/usr/bin/printf AFTER_%s DATA_CANCEL_RESTORED",
     )?;
-    session.pty.send(key::CTRL_D)?;
-    session.pty.wait_exit()?;
+    send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     Ok(())
+}
+
+/// Send Ctrl-D and wait for the child to exit, retrying the keystroke once
+/// if the child is still alive after a short probe.
+///
+/// Reedline's Ctrl-D exits only an empty editor and otherwise falls back to
+/// a plain edit action; landing right after a command finishes, on an
+/// editor buffer that has not fully settled yet, it can take that fallback
+/// path instead, leaving the shell alive and waiting for more input rather
+/// than hung. On real CI this produced a `wait_exit` timeout that was
+/// consistent, not occasional, and that a longer deadline alone never
+/// fixed -- confirmed by a process/thread-state snapshot showing the child
+/// idling normally in its terminal read loop, not stuck or busy.
+fn send_ctrl_d_and_wait_for_exit(pty: &mut PtySession) -> Result<i32, Box<dyn Error>> {
+    const EXIT_PROBE: Duration = Duration::from_millis(500);
+    pty.send(key::CTRL_D)?;
+    match pty.wait_exit_within(EXIT_PROBE) {
+        Ok(status) => Ok(status),
+        Err(_) => {
+            pty.send(key::CTRL_D)?;
+            pty.wait_exit()
+        }
+    }
 }
 
 fn check_rich_review_regressions(binary: &Path) -> Result<(), Box<dyn Error>> {
