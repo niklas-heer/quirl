@@ -5347,6 +5347,15 @@ mod platform {
             command.arg("-c").arg("sleep 10");
             let mut child = command.spawn().unwrap();
             let process_id = i32::try_from(child.id()).unwrap();
+            // POSIX rejects setpgid on a child that has already exec'd, which
+            // is exactly what makes verify_process_group's own setpgid call
+            // fail here (the child never joins its own new group). Before
+            // that exec completes, though, setpgid can still succeed and
+            // spuriously report the child Live in the requested group,
+            // flipping this test's outcome under CI contention that delays
+            // scheduling the child. Give the exec a generous, fixed head
+            // start rather than racing it.
+            thread::sleep(Duration::from_millis(50));
 
             let error = verify_process_group(&mut child, process_id, process_id).unwrap_err();
 
