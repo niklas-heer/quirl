@@ -3846,7 +3846,12 @@ mod tests {
     }
 
     fn wait_for_observation(counter: &AtomicUsize) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Wide enough to tolerate heavy parallel `cargo test --workspace`
+        // contention (this genuinely flaked under load, not from a real
+        // product bug): each fake provider is a trivial shell script, but a
+        // busy machine can still delay scheduling it well past a couple of
+        // seconds.
+        let deadline = Instant::now() + Duration::from_secs(10);
         while counter.load(Ordering::Acquire) == 0 {
             assert!(
                 Instant::now() < deadline,
@@ -3859,7 +3864,7 @@ mod tests {
     fn refresh(config: &DiscoveryConfig) -> Result<bool, ShellError> {
         refresh_catalog_cache(
             config,
-            RefreshDeadline::starting_now(Duration::from_secs(5)),
+            RefreshDeadline::starting_now(Duration::from_secs(20)),
             &AtomicBool::new(false),
             None,
         )
@@ -3869,7 +3874,7 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         refresh_catalog_cache(
             config,
-            RefreshDeadline::starting_now(Duration::from_secs(5)),
+            RefreshDeadline::starting_now(Duration::from_secs(20)),
             &cancelled,
             Some(Arc::clone(&cancelled)),
         )
