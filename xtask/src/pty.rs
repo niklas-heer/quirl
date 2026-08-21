@@ -27,7 +27,13 @@ use std::{
 };
 use unicode_width::UnicodeWidthChar;
 
-pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+// A shared, CPU-constrained CI runner can be slow enough under load that a
+// correct interactive round trip (render a completion popup, stream a large
+// file, exit cleanly) misses a 5s deadline with nothing actually wrong;
+// reproduced locally by adding artificial CPU contention. 15s keeps this a
+// real, generous bound while still catching an actually-hung child quickly
+// relative to a CI job's overall multi-minute budget.
+pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_OUTPUT_BYTES_MAX: usize = 16 * 1024 * 1024;
 const READ_BYTES_MAX: usize = 64 * 1024;
 const SCREEN_CELLS_MAX: usize = 512 * 512;

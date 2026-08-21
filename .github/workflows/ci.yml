@@ -27,4 +27,11 @@ jobs:
           persist-credentials: false
 
       - name: Run the canonical quality gate
+        # This suite spawns many real subprocesses/PTYs with wall-clock
+        # deadlines (job control, terminal I/O). Running them at full
+        # default parallelism has intermittently missed those deadlines
+        # under this runner's CPU contention, not from any actual defect;
+        # capping parallelism trades a little wall time for reliability.
+        env:
+          RUST_TEST_THREADS: "2"
         run: cargo xtask check
