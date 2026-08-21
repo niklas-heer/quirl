@@ -27,13 +27,23 @@ use std::{
 };
 use unicode_width::UnicodeWidthChar;
 
-// A shared, CPU-constrained CI runner can be slow enough under load that a
-// correct interactive round trip (render a completion popup, stream a large
-// file, exit cleanly) misses a 5s deadline with nothing actually wrong;
-// reproduced locally by adding artificial CPU contention. 15s keeps this a
-// real, generous bound while still catching an actually-hung child quickly
-// relative to a CI job's overall multi-minute budget.
-pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default deadline for one bounded PTY wait.
+///
+/// A shared, CPU-constrained CI runner can be slow enough under load that a
+/// correct interactive round trip (render a completion popup, stream a large
+/// file, exit cleanly) misses a short deadline with nothing actually wrong;
+/// reproduced locally by adding artificial CPU contention, and observed on
+/// the actual CI runner even at 15s. `GITHUB_ACTIONS` (set by every GitHub
+/// Actions job) selects a much more generous bound there, since wasting a
+/// few extra seconds of CI wall time beats a false failure; a real hang is
+/// still caught well within a job's multi-minute budget either way.
+pub(super) fn default_timeout() -> Duration {
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        Duration::from_secs(45)
+    } else {
+        Duration::from_secs(15)
+    }
+}
 const DEFAULT_OUTPUT_BYTES_MAX: usize = 16 * 1024 * 1024;
 const READ_BYTES_MAX: usize = 64 * 1024;
 const SCREEN_CELLS_MAX: usize = 512 * 512;
@@ -492,7 +502,7 @@ impl SpawnOptions {
             environment: BTreeMap::new(),
             rows: 30,
             columns: 120,
-            timeout: DEFAULT_TIMEOUT,
+            timeout: default_timeout(),
             output_bytes_max: DEFAULT_OUTPUT_BYTES_MAX,
             stderr_path: None,
         }
@@ -1019,6 +1029,16 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn default_timeout_is_more_generous_under_github_actions() {
+        let expected = if std::env::var_os("GITHUB_ACTIONS").is_some() {
+            Duration::from_secs(45)
+        } else {
+            Duration::from_secs(15)
+        };
+        assert_eq!(default_timeout(), expected);
     }
 
     #[test]

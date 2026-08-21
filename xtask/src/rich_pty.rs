@@ -1,6 +1,6 @@
 //! End-to-end rich-terminal checks driven by the Rust PTY harness.
 
-use crate::pty::{DEFAULT_TIMEOUT, PtySession, SpawnOptions, VirtualScreen, key};
+use crate::pty::{PtySession, SpawnOptions, VirtualScreen, default_timeout, key};
 use nix::{
     errno::Errno,
     sys::{
@@ -559,7 +559,7 @@ fn enter_and_wait(
 fn wait_for_rich_input_since(session: &mut Session, start: usize) -> Result<(), Box<dyn Error>> {
     session
         .pty
-        .wait_for_since(b"\x1b[?1000h", start, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[?1000h", start, default_timeout())?;
     Ok(())
 }
 
@@ -599,7 +599,7 @@ fn execute_and_resume_with_marker(
     )?;
     session
         .pty
-        .wait_for_since(b"\x1b[?1000h", output_start, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[?1000h", output_start, default_timeout())?;
     ensure_alternate_screen_unchanged(session, output_start, "marked command")
 }
 
@@ -634,7 +634,7 @@ fn wait_for_terminal_owner(session: &mut Session) -> Result<(), Box<dyn Error>> 
         .pty
         .child_pid()
         .ok_or_else(|| io::Error::other("Quirl exited before recovering terminal ownership"))?;
-    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    let deadline = Instant::now() + default_timeout();
     while session.pty.foreground_group()? != child && Instant::now() < deadline {
         session.pty.drain_for(Duration::from_millis(10))?;
     }
@@ -883,7 +883,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.resize(18, 120)?;
     session
         .pty
-        .wait_for_since(b"\x1b[J", restored_startup_width_start, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[J", restored_startup_width_start, default_timeout())?;
     session
         .pty
         .wait_for_screen("bottom status after resize restoration", |screen| {
@@ -920,7 +920,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.resize(18, 400)?;
     session
         .pty
-        .wait_for_since(b"\x1b[J", wide_provenance_resize_start, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[J", wide_provenance_resize_start, default_timeout())?;
     session
         .pty
         .wait_for_screen("wide provenance frame", |screen| {
@@ -964,7 +964,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.resize(18, 120)?;
     session
         .pty
-        .wait_for_since(b"\x1b[J", normal_width_resize_start, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[J", normal_width_resize_start, default_timeout())?;
     session
         .pty
         .wait_for_screen("normal-width flag frame", |screen| {
@@ -987,7 +987,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
         })?;
     session
         .pty
-        .wait_for_since(b"\x1b[?1000h", normal_ls_start, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[?1000h", normal_ls_start, default_timeout())?;
     if session.pty.screen().text().contains("unknown flag")
         || session
             .pty
@@ -1023,7 +1023,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.resize(18, 400)?;
     session
         .pty
-        .wait_for_since(b"\x1b[J", wide_data_resize_start, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[J", wide_data_resize_start, default_timeout())?;
     wait_for_command_information(
         &mut session,
         "ls",
@@ -1049,7 +1049,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.resize(18, 120)?;
     session
         .pty
-        .wait_for_since(b"\x1b[J", data_width_resize_start, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[J", data_width_resize_start, default_timeout())?;
     session
         .pty
         .wait_for_screen("normal-width typed ls frame", |screen| {
@@ -1086,7 +1086,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     }
     session
         .pty
-        .wait_for_since(b"\x1b[?1000h", execution_start, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[?1000h", execution_start, default_timeout())?;
     session.pty.send(key::ALT_Q)?;
     session.pty.send(b"n")?;
     wait_for_standard_status(&mut session)?;
@@ -1137,7 +1137,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     session.pty.resize(18, 120)?;
     session
         .pty
-        .wait_for_since(b"\x1b[J", restored_cleanup_width_start, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[J", restored_cleanup_width_start, default_timeout())?;
     session
         .pty
         .wait_for_screen("restored bottom status", |screen| {
@@ -2072,7 +2072,7 @@ fn check_full_screen_program_takeover(binary: &Path) -> Result<(), Box<dyn Error
     session.pty.wait_for(b"GOT:hello")?;
     session
         .pty
-        .wait_for_since(b"\x1b[?1049l", output_start, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[?1049l", output_start, default_timeout())?;
     session
         .pty
         .wait_for_screen("rich viewport reacquired after takeover", |screen| {
@@ -2139,7 +2139,7 @@ fn check_ctrl_l_forces_full_repaint(binary: &Path) -> Result<(), Box<dyn Error>>
     session.pty.send(key::CTRL_L)?;
     session
         .pty
-        .wait_for_since(b"\x1b[J", since, DEFAULT_TIMEOUT)?;
+        .wait_for_since(b"\x1b[J", since, default_timeout())?;
     if contains(&session.pty.output()[since..], b"\x1b[6n") {
         return Err(io::Error::other(
             "Ctrl-L queried the terminal's cursor position instead of \
@@ -2686,7 +2686,7 @@ fn check_no_color_preserves_semantic_hints(binary: &Path) -> Result<(), Box<dyn 
 }
 
 fn wait_for_file(session: &mut Session, path: PathBuf) -> Result<(), Box<dyn Error>> {
-    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    let deadline = Instant::now() + default_timeout();
     while !path.is_file() && Instant::now() < deadline {
         session.pty.drain_for(Duration::from_millis(20))?;
     }
@@ -2836,7 +2836,7 @@ fn wait_for_file_contents(
     path: &Path,
     marker: &[u8],
 ) -> Result<(), Box<dyn Error>> {
-    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    let deadline = Instant::now() + default_timeout();
     while Instant::now() < deadline {
         if read_bounded_fixture(path, DISCOVERY_ARTIFACT_BYTES_MAX)
             .is_ok_and(|bytes| contains(&bytes, marker))
