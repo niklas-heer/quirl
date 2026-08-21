@@ -730,8 +730,11 @@ fn check_rich_editing(binary: &Path) -> Result<(), Box<dyn Error>> {
             io::Error::other("interactive command stdout was not handed back to the PTY").into(),
         );
     }
-    session.pty.send(key::CTRL_D)?;
-    ensure_status(session.pty.wait_exit()?, 0, "Ctrl-D")
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "Ctrl-D",
+    )
 }
 
 fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Error>> {
@@ -823,8 +826,11 @@ fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Err
     }
     session.pty.send(key::CTRL_U)?;
     session.pty.drain_for(Duration::from_millis(100))?;
-    session.pty.send(key::CTRL_D)?;
-    ensure_status(session.pty.wait_exit()?, 0, "screen-state session")
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "screen-state session",
+    )
 }
 
 fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Error>> {
@@ -1144,8 +1150,11 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
             screen.bottom_line().contains("NORMAL")
         })?;
     let cleanup_start = session.pty.output().len();
-    session.pty.send(key::CTRL_D)?;
-    ensure_status(session.pty.wait_exit()?, 0, "command-intelligence EOF")?;
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "command-intelligence EOF",
+    )?;
     ensure_terminal_restored(&session, cleanup_start, "command-intelligence EOF")
 }
 
@@ -1200,8 +1209,11 @@ fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), Box<dyn Er
         b"niklas-heer/quirl-command-v3-int8",
     )?;
     let cleanup_start = session.pty.output().len();
-    session.pty.send(key::CTRL_D)?;
-    ensure_status(session.pty.wait_exit()?, 0, "AI bootstrap activity EOF")?;
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "AI bootstrap activity EOF",
+    )?;
     ensure_terminal_restored(&session, cleanup_start, "AI bootstrap activity EOF")
 }
 
@@ -1294,8 +1306,11 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
         );
     }
     clear_editor(&mut cold)?;
-    cold.pty.send(key::CTRL_D)?;
-    ensure_status(cold.pty.wait_exit()?, 0, "cold discovery session")?;
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut cold.pty)?,
+        0,
+        "cold discovery session",
+    )?;
     let cold_catalog = read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX)?;
     drop(cold);
 
@@ -1347,8 +1362,11 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     warm.pty.send(key::ESCAPE)?;
     wait_for_standard_status(&mut warm)?;
     clear_editor(&mut warm)?;
-    warm.pty.send(key::CTRL_D)?;
-    ensure_status(warm.pty.wait_exit()?, 0, "warm discovery session")?;
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut warm.pty)?,
+        0,
+        "warm discovery session",
+    )?;
     if read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX)? == cold_catalog {
         return Err(
             io::Error::other("changed discovery sources did not replace durable state").into(),
@@ -1397,8 +1415,11 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
             screen.bottom_line().contains("DATA")
         })?;
     let cleanup_start = degraded.pty.output().len();
-    degraded.pty.send(key::CTRL_D)?;
-    ensure_status(degraded.pty.wait_exit()?, 0, "corrupt-cache fallback")?;
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut degraded.pty)?,
+        0,
+        "corrupt-cache fallback",
+    )?;
     ensure_terminal_restored(&degraded, cleanup_start, "corrupt-cache fallback")
 }
 
@@ -1466,8 +1487,7 @@ fn check_completion(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.drain_for(Duration::from_millis(100))?;
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"^C")?;
-    session.pty.send(key::CTRL_D)?;
-    session.pty.wait_exit()?;
+    send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     Ok(())
 }
 
@@ -1519,8 +1539,7 @@ fn check_deferred_catalog_admission(binary: &Path) -> Result<(), Box<dyn Error>>
     session.pty.wait_for(b"git status [--short]")?;
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"^C")?;
-    session.pty.send(key::CTRL_D)?;
-    session.pty.wait_exit()?;
+    send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     Ok(())
 }
 
@@ -1620,8 +1639,11 @@ fn check_cwd_history(binary: &Path) -> Result<(), Box<dyn Error>> {
         .pty
         .wait_for_screen_text("/usr/bin/printf LOCAL_HISTORY_CHOICE")?;
     clear_editor(&mut session)?;
-    session.pty.send(key::CTRL_D)?;
-    ensure_status(session.pty.wait_exit()?, 0, "cwd history")?;
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "cwd history",
+    )?;
     if !session.private.path.join("history.sqlite3").is_file() {
         return Err(io::Error::other("cwd-aware SQLite history was not created").into());
     }
@@ -1793,8 +1815,11 @@ fn check_retained_output_cycles(binary: &Path) -> Result<(), Box<dyn Error>> {
                 && !screen.bottom_line().contains("OUTPUT")
                 && !screen.bottom_line().contains("copied")
         })?;
-    session.pty.send(key::CTRL_D)?;
-    ensure_status(session.pty.wait_exit()?, 0, "retained-output cycles")
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "retained-output cycles",
+    )
 }
 
 fn check_external_command_compatibility(binary: &Path) -> Result<(), Box<dyn Error>> {
@@ -1918,9 +1943,8 @@ complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Prin
         return Err(io::Error::other("GHQ fixture did not reach process completion").into());
     }
     ensure_alternate_screen_unchanged(&session, output_start, "streamed GHQ fixture")?;
-    session.pty.send(key::CTRL_D)?;
     ensure_status(
-        session.pty.wait_exit()?,
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
         0,
         "external command compatibility",
     )
@@ -1973,9 +1997,8 @@ fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), Box<dyn 
         ));
     }
     ensure_alternate_screen_unchanged(&session, output_start, "streamed carriage-return progress")?;
-    session.pty.send(key::CTRL_D)?;
     ensure_status(
-        session.pty.wait_exit()?,
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
         0,
         "streamed progress without newline",
     )
@@ -2017,9 +2040,8 @@ fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), Box
         "silent command completed inside persistent viewport",
         |screen| screen.text().contains("── exit 0") && screen.bottom_line().contains("NORMAL"),
     )?;
-    session.pty.send(key::CTRL_D)?;
     ensure_status(
-        session.pty.wait_exit()?,
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
         0,
         "spinner animates during silent command",
     )
@@ -2079,8 +2101,11 @@ fn check_full_screen_program_takeover(binary: &Path) -> Result<(), Box<dyn Error
             screen.bottom_line().contains("NORMAL")
         })?;
     execute_and_resume(&mut session, "/usr/bin/printf AFTER_%s TAKEOVER")?;
-    session.pty.send(key::CTRL_D)?;
-    ensure_status(session.pty.wait_exit()?, 0, "full-screen program takeover")
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "full-screen program takeover",
+    )
 }
 
 fn check_full_screen_program_spawn_failure_restores_terminal(
@@ -2115,9 +2140,8 @@ fn check_full_screen_program_spawn_failure_restores_terminal(
         },
     )?;
     execute_and_resume(&mut session, "/usr/bin/printf AFTER_SPAWN_FAILURE")?;
-    session.pty.send(key::CTRL_D)?;
     ensure_status(
-        session.pty.wait_exit()?,
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
         0,
         "full-screen program spawn failure",
     )
@@ -2152,8 +2176,11 @@ fn check_ctrl_l_forces_full_repaint(binary: &Path) -> Result<(), Box<dyn Error>>
         .wait_for_screen("status bar repainted after Ctrl-L", |screen| {
             screen.bottom_line().contains("NORMAL")
         })?;
-    session.pty.send(key::CTRL_D)?;
-    ensure_status(session.pty.wait_exit()?, 0, "Ctrl-L full repaint")
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "Ctrl-L full repaint",
+    )
 }
 
 fn check_local_completion_discovery(binary: &Path) -> Result<(), Box<dyn Error>> {
@@ -2234,9 +2261,8 @@ fn check_local_completion_discovery(binary: &Path) -> Result<(), Box<dyn Error>>
     session.pty.send(key::ESCAPE)?;
     clear_editor(&mut session)?;
     let cleanup_start = session.pty.output().len();
-    session.pty.send(key::CTRL_D)?;
     ensure_status(
-        session.pty.wait_exit()?,
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
         0,
         "local completion discovery EOF",
     )?;
@@ -2442,8 +2468,7 @@ fn check_rich_review_regressions(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"^C")?;
     let cleanup_start = session.pty.output().len();
-    session.pty.send(key::CTRL_D)?;
-    session.pty.wait_exit()?;
+    send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     if !contains(&session.pty.output()[cleanup_start..], b"\x1b[?25h") {
         return Err(io::Error::other("cleanup did not show cursor").into());
     }
@@ -2464,8 +2489,7 @@ fn check_rich_review_regressions(binary: &Path) -> Result<(), Box<dyn Error>> {
     }
     no_hints.pty.send(key::CTRL_C)?;
     no_hints.pty.wait_for(b"^C")?;
-    no_hints.pty.send(key::CTRL_D)?;
-    no_hints.pty.wait_exit()?;
+    send_ctrl_d_and_wait_for_exit(&mut no_hints.pty)?;
     Ok(())
 }
 
@@ -2628,8 +2652,7 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
     if session.pty.terminal_modes()? != prompt_modes {
         return Err(io::Error::other("termios not restored after fg").into());
     }
-    session.pty.send(key::CTRL_D)?;
-    session.pty.wait_exit()?;
+    send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     Ok(())
 }
 
@@ -2654,8 +2677,7 @@ fn check_noninteractive_dialect_islands(binary: &Path) -> Result<(), Box<dyn Err
         "/usr/bin/printf AFTER_%s ISLAND_CTRLZ",
         b"AFTER_ISLAND_CTRLZ",
     )?;
-    session.pty.send(key::CTRL_D)?;
-    session.pty.wait_exit()?;
+    send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     Ok(())
 }
 
@@ -2673,8 +2695,7 @@ fn check_fallbacks(binary: &Path) -> Result<(), Box<dyn Error>> {
         return Err(io::Error::other("TERM=dumb rendered rich status").into());
     }
     enter_and_wait(&mut dumb, "/usr/bin/printf DUMB_OK", b"DUMB_OK")?;
-    dumb.pty.send(key::CTRL_D)?;
-    dumb.pty.wait_exit()?;
+    send_ctrl_d_and_wait_for_exit(&mut dumb.pty)?;
     let mut redirected = Session::new(
         binary,
         SessionOptions {
@@ -2691,8 +2712,7 @@ fn check_fallbacks(binary: &Path) -> Result<(), Box<dyn Error>> {
         "/usr/bin/printf REDIRECT_OK",
         b"REDIRECT_OK",
     )?;
-    redirected.pty.send(key::CTRL_D)?;
-    redirected.pty.wait_exit()?;
+    send_ctrl_d_and_wait_for_exit(&mut redirected.pty)?;
     Ok(())
 }
 
@@ -2709,8 +2729,7 @@ fn check_no_color_preserves_semantic_hints(binary: &Path) -> Result<(), Box<dyn 
     session.pty.wait_for(b"unknown flag")?;
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"^C")?;
-    session.pty.send(key::CTRL_D)?;
-    session.pty.wait_exit()?;
+    send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     Ok(())
 }
 
