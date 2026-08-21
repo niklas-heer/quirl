@@ -291,3 +291,82 @@ test('ensure_full_history_deepens_a_shallow_clone_so_ancestor_commits_resolve', 
     rmSync(clone, { recursive: true, force: true });
   }
 });
+
+test('ensure_full_history_reports_a_clear_error_when_no_remote_or_fallback_exists', () => {
+  // Reproduces the real Vercel build failure this guards against: its
+  // checkout is a shallow clone with no `origin` (or any) remote configured
+  // at all, so `git fetch --unshallow origin` fails outright.
+  const origin = mkdtempSync(join(tmpdir(), 'quirl-evidence-origin-'));
+  const clone = mkdtempSync(join(tmpdir(), 'quirl-evidence-clone-'));
+  try {
+    runGitOrThrow(origin, ['init', '--quiet']);
+    runGitOrThrow(origin, ['config', 'user.email', 'test@example.com']);
+    runGitOrThrow(origin, ['config', 'user.name', 'Test']);
+    writeFileSync(join(origin, 'a.txt'), 'a');
+    runGitOrThrow(origin, ['add', 'a.txt']);
+    runGitOrThrow(origin, ['commit', '--quiet', '-m', 'first']);
+    writeFileSync(join(origin, 'b.txt'), 'b');
+    runGitOrThrow(origin, ['add', 'b.txt']);
+    runGitOrThrow(origin, ['commit', '--quiet', '-m', 'second']);
+
+    spawnSync('git', ['clone', '--quiet', '--depth', '1', `file://${origin}`, clone], {
+      encoding: 'utf8',
+    });
+    runGitOrThrow(clone, ['remote', 'remove', 'origin']);
+    assert.equal(spawnSync('git', ['remote'], { cwd: clone, encoding: 'utf8' }).stdout.trim(), '');
+
+    assert.throws(
+      () => repositoryGit(clone, {}).ensureFullHistory(),
+      /no configured git remote and no VERCEL_GIT_REPO_OWNER\/VERCEL_GIT_REPO_SLUG/,
+    );
+  } finally {
+    rmSync(origin, { recursive: true, force: true });
+    rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+test('ensure_full_history_falls_back_to_the_vercel_repo_env_vars_when_no_remote_exists', () => {
+  const origin = mkdtempSync(join(tmpdir(), 'quirl-evidence-origin-'));
+  const clone = mkdtempSync(join(tmpdir(), 'quirl-evidence-clone-'));
+  try {
+    runGitOrThrow(origin, ['init', '--quiet']);
+    runGitOrThrow(origin, ['config', 'user.email', 'test@example.com']);
+    runGitOrThrow(origin, ['config', 'user.name', 'Test']);
+    writeFileSync(join(origin, 'a.txt'), 'a');
+    runGitOrThrow(origin, ['add', 'a.txt']);
+    runGitOrThrow(origin, ['commit', '--quiet', '-m', 'first']);
+    const rootCommit = runGitOrThrow(origin, ['rev-parse', 'HEAD']);
+    writeFileSync(join(origin, 'b.txt'), 'b');
+    runGitOrThrow(origin, ['add', 'b.txt']);
+    runGitOrThrow(origin, ['commit', '--quiet', '-m', 'second']);
+
+    spawnSync('git', ['clone', '--quiet', '--depth', '1', `file://${origin}`, clone], {
+      encoding: 'utf8',
+    });
+    runGitOrThrow(clone, ['remote', 'remove', 'origin']);
+
+    // `fallbackRemoteUrl` always builds a github.com URL; stand in for it by
+    // pointing VERCEL_GIT_REPO_OWNER/SLUG-style env at a fake host name
+    // that `git`'s `insteadOf` rewrites to the real local origin, so the
+    // fallback path is exercised without any network access.
+    runGitOrThrow(clone, [
+      'config',
+      'url.file://' + origin + '.insteadOf',
+      'https://github.com/quirl-evidence-test/quirl-evidence-test.git',
+    ]);
+
+    repositoryGit(clone, {
+      VERCEL_GIT_REPO_OWNER: 'quirl-evidence-test',
+      VERCEL_GIT_REPO_SLUG: 'quirl-evidence-test',
+    }).ensureFullHistory();
+
+    assert.equal(runGitOrThrow(clone, ['rev-parse', '--is-shallow-repository']), 'false');
+    assert.equal(
+      spawnSync('git', ['cat-file', '-e', `${rootCommit}^{commit}`], { cwd: clone }).status,
+      0,
+    );
+  } finally {
+    rmSync(origin, { recursive: true, force: true });
+    rmSync(clone, { recursive: true, force: true });
+  }
+});

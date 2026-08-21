@@ -357,12 +357,39 @@ function runGit(repositoryRoot, arguments_) {
   return result;
 }
 
-export function repositoryGit(repositoryRoot) {
+// Vercel's checkout is a shallow clone with no git remote configured at all
+// (confirmed against a real Vercel build: `git fetch --unshallow origin`
+// fails with "'origin' does not appear to be a git repository"), so
+// `ensureFullHistory` cannot assume `origin` exists. Vercel does expose the
+// source repository through system environment variables, which becomes the
+// fetch source when no remote is configured.
+function fallbackRemoteUrl(env) {
+  const owner = env.VERCEL_GIT_REPO_OWNER;
+  const slug = env.VERCEL_GIT_REPO_SLUG;
+  return owner && slug ? `https://github.com/${owner}/${slug}.git` : undefined;
+}
+
+export function repositoryGit(repositoryRoot, env = process.env) {
   return {
     ensureFullHistory() {
       const shallow = runGit(repositoryRoot, ['rev-parse', '--is-shallow-repository']);
       if (shallow.status !== 0 || shallow.stdout.trim() !== 'true') return;
-      const fetch = spawnSync('git', ['fetch', '--quiet', '--unshallow', 'origin'], {
+      const remotesResult = runGit(repositoryRoot, ['remote']);
+      const remotes =
+        remotesResult.status === 0
+          ? remotesResult.stdout.trim().split('\n').filter(Boolean)
+          : [];
+      const source = remotes.includes('origin')
+        ? 'origin'
+        : (remotes[0] ?? fallbackRemoteUrl(env));
+      if (!source) {
+        throw new Error(
+          'release evidence needs full git ancestry, but this checkout is a shallow clone with ' +
+            'no configured git remote and no VERCEL_GIT_REPO_OWNER/VERCEL_GIT_REPO_SLUG to ' +
+            'fall back to. Run `git fetch --unshallow` (or configure a full clone) before building.',
+        );
+      }
+      const fetch = spawnSync('git', ['fetch', '--quiet', '--unshallow', source], {
         cwd: repositoryRoot,
         encoding: 'utf8',
         maxBuffer: gitOutputBytesMax,
@@ -371,7 +398,7 @@ export function repositoryGit(repositoryRoot) {
       if (fetch.status !== 0) {
         throw new Error(
           'release evidence needs full git ancestry, but this checkout is a shallow clone ' +
-            `and \`git fetch --unshallow origin\` failed: ${fetch.stderr.trim()}. ` +
+            `and \`git fetch --unshallow ${source}\` failed: ${fetch.stderr.trim()}. ` +
             'Run `git fetch --unshallow` (or configure a full clone) before building.',
         );
       }
