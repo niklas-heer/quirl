@@ -38,14 +38,15 @@ use unicode_width::UnicodeWidthChar;
 /// few extra seconds of CI wall time beats a false failure; a real hang is
 /// still caught well within a job's multi-minute budget either way.
 ///
-/// 90s specifically clears `index::BACKGROUND_DISCOVERY_DEADLINE` (30s) with
-/// real margin: a check waiting on completed automatic command discovery can
-/// need the slower background pass, not just the quick first-run fallback,
-/// and a busier real runner's own scheduling adds further latency on top of
-/// that budget.
+/// 60s -- `validate_timeout`'s own hard ceiling for one bounded wait -- is
+/// used in full under CI so it clears `index::BACKGROUND_DISCOVERY_DEADLINE`
+/// (30s) with real margin: a check waiting on completed automatic command
+/// discovery can need the slower background pass, not just the quick
+/// first-run fallback, and a busier real runner's own scheduling adds
+/// further latency on top of that budget.
 pub(super) fn default_timeout() -> Duration {
     if std::env::var_os("GITHUB_ACTIONS").is_some() {
-        Duration::from_secs(90)
+        Duration::from_secs(60)
     } else {
         Duration::from_secs(15)
     }
@@ -1146,7 +1147,7 @@ mod tests {
     #[test]
     fn default_timeout_is_more_generous_under_github_actions() {
         let expected = if std::env::var_os("GITHUB_ACTIONS").is_some() {
-            Duration::from_secs(90)
+            Duration::from_secs(60)
         } else {
             Duration::from_secs(15)
         };
