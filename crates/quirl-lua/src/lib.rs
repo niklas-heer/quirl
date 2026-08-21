@@ -141,7 +141,7 @@ pub const CONFIG_SCHEMA_DESCRIPTOR_V3: &str = "quirl.config@3{QuirlConfig{deny_u
 ///
 /// The descriptor includes defaults, value domains, and migration policy so its
 /// fingerprint changes whenever a reader-visible configuration rule changes.
-pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@4{QuirlConfig{deny_unknown;schema_version:u32(default=4,legacy=0|1|2|3-migrates-to-4);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=full)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=rust_version,jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);theme:string(default=tokyo-night);themes:map<string,ThemeColors>(max=32,default={});statusline:StatuslineConfig(default)};ThemeColors{deny_unknown;accent_command:#RRGGBB;accent_data:#RRGGBB;context_primary:#RRGGBB;context_secondary:#RRGGBB;muted:#RRGGBB;border:#RRGGBB;status_background:#RRGGBB;error:#RRGGBB;warning:#RRGGBB;hint:#RRGGBB;string:#RRGGBB;operator:#RRGGBB;expansion:#RRGGBB;number:#RRGGBB};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=false);min_chars:u16(0..=4096,default=2)};builtins:ansi|ayu-dark|catppuccin-mocha|cobalt-2|dracula|everforest-dark-medium|github-dark|gotham|gruvbox-dark|horizon-dark|kanagawa-wave|material|monokai-dark|moonfly|night-owl|nord|oceanic-next|one-dark|one-half-black|oxocarbon-dark|palenight|papercolor-dark|rose-pine-moon|snazzy|solarized-dark|sonokai|srcery|synthwave|tokyo-night|tomorrow-night|zenburn;migration:unversioned-or-v1-or-v2-or-v3-to-v4}";
+pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@4{QuirlConfig{deny_unknown;schema_version:u32(default=4,legacy=0|1|2|3-migrates-to-4);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=compact)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=rust_version,jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);theme:string(default=tokyo-night);themes:map<string,ThemeColors>(max=32,default={});statusline:StatuslineConfig(default)};ThemeColors{deny_unknown;accent_command:#RRGGBB;accent_data:#RRGGBB;context_primary:#RRGGBB;context_secondary:#RRGGBB;muted:#RRGGBB;border:#RRGGBB;status_background:#RRGGBB;error:#RRGGBB;warning:#RRGGBB;hint:#RRGGBB;string:#RRGGBB;operator:#RRGGBB;expansion:#RRGGBB;number:#RRGGBB};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=false);min_chars:u16(0..=4096,default=2)};builtins:ansi|ayu-dark|catppuccin-mocha|cobalt-2|dracula|everforest-dark-medium|github-dark|gotham|gruvbox-dark|horizon-dark|kanagawa-wave|material|monokai-dark|moonfly|night-owl|nord|oceanic-next|one-dark|one-half-black|oxocarbon-dark|palenight|papercolor-dark|rose-pine-moon|snazzy|solarized-dark|sonokai|srcery|synthwave|tokyo-night|tomorrow-night|zenburn;migration:unversioned-or-v1-or-v2-or-v3-to-v4}";
 
 /// Return the deterministic fingerprint of [`CONFIG_SCHEMA_DESCRIPTOR`].
 pub fn config_schema_hash() -> String {
@@ -485,7 +485,7 @@ impl Default for EditorConfig {
         Self {
             keymap: "emacs".to_owned(),
             semantic_hints: true,
-            banner: "full".to_owned(),
+            banner: "compact".to_owned(),
         }
     }
 }
@@ -5512,7 +5512,7 @@ mod tests {
             "fnv1a64:ecd91686169f6b26"
         );
         assert!(CONFIG_SCHEMA_DESCRIPTOR.contains("migration:unversioned-or-v1-or-v2-or-v3-to-v4"));
-        assert_eq!(config_schema_hash(), "fnv1a64:dbd1a871405836bc");
+        assert_eq!(config_schema_hash(), "fnv1a64:db55539ac7d9dc22");
     }
 
     #[test]
