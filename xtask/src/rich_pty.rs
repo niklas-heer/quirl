@@ -1877,7 +1877,16 @@ complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Prin
             bottom.contains("🌀") && bottom.contains("dev@")
         })?;
     wait_for_file_contents(&mut session, &index_dir.join("catalog.sqlite3"), b"ghq get")?;
+    let wide_resize_start = session.pty.output().len();
     session.pty.resize(20, 400)?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[J", wide_resize_start, default_timeout())?;
+    session
+        .pty
+        .wait_for_screen("wide external-command frame", |screen| {
+            screen.bottom_line().contains("NORMAL")
+        })?;
     wait_for_command_information(
         &mut session,
         "ghq",
@@ -1901,7 +1910,16 @@ complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Prin
     }
     session.pty.send(key::ESCAPE)?;
     clear_editor(&mut session)?;
+    let narrow_resize_start = session.pty.output().len();
     session.pty.resize(20, 160)?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[J", narrow_resize_start, default_timeout())?;
+    session
+        .pty
+        .wait_for_screen("narrow external-command frame", |screen| {
+            screen.bottom_line().contains("NORMAL")
+        })?;
     let command = "ghq get git@github.com:niklas-heer/homebrew-tap.git";
     let output_start = session.pty.output().len();
     session.pty.type_text(command)?;
