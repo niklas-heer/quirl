@@ -2489,6 +2489,7 @@ fn rank_lexical_documents_cancellable(
 ) -> Result<Vec<SearchResult>, ShellError> {
     let query_phrase = normalize_document_field(query).to_lowercase();
     let mut document_matches = Vec::with_capacity(documents.len());
+    let mut title_matches = Vec::with_capacity(documents.len());
     let mut phrase_matches = Vec::with_capacity(documents.len());
     let mut exact_boosts = Vec::with_capacity(documents.len());
     for (index, document) in documents.iter().enumerate() {
@@ -2496,12 +2497,16 @@ fn rank_lexical_documents_cancellable(
             check_cancelled()?;
         }
         let haystack = document.body.to_lowercase();
-        let matched = query_terms
-            .iter()
-            .enumerate()
-            .filter_map(|(index, term)| haystack.contains(term.as_str()).then_some(index))
-            .collect::<BTreeSet<_>>();
-        document_matches.push(matched);
+        let title_haystack = document.title.to_lowercase();
+        let match_terms = |haystack: &str| {
+            query_terms
+                .iter()
+                .enumerate()
+                .filter_map(|(index, term)| haystack_contains_term(haystack, term).then_some(index))
+                .collect::<BTreeSet<_>>()
+        };
+        document_matches.push(match_terms(&haystack));
+        title_matches.push(match_terms(&title_haystack));
         phrase_matches.push(!query_phrase.is_empty() && haystack.contains(&query_phrase));
         exact_boosts.push(exact_lexical_boost(
             &document.lexical_features,
@@ -2531,36 +2536,100 @@ fn rank_lexical_documents_cancellable(
         }
     }
 
-    let denominator = query_terms.len().max(1) as f32;
+    // Every matched term counted equally would let extremely common English
+    // words ("all", "list", "files") saturate the score for any command
+    // with enough options that *something* mentions them somewhere,
+    // indistinguishable from a command that's genuinely about the task —
+    // rolling every option up into its command's score (above) makes this
+    // worse, not better, since it only takes one option out of dozens to
+    // "match". Weight each term by how rare it is across the corpus (a
+    // standard inverse-document-frequency term), so a distinctive word
+    // pulls its actual weight and a word that appears almost everywhere
+    // barely moves the score.
+    let total_documents = documents.len().max(1) as f32;
+    let mut document_frequency = vec![0_usize; query_terms.len()];
+    for matched in &document_matches {
+        for &term_index in matched {
+            document_frequency[term_index] += 1;
+        }
+    }
+    let term_weight = document_frequency
+        .iter()
+        .map(|&frequency| (total_documents / (1.0 + frequency as f32)).ln().max(0.1))
+        .collect::<Vec<_>>();
+    // A term matching in the short, focused title/summary field is a much
+    // stronger relevance signal than the same term turning up somewhere in
+    // a long option description or usage example — `ls`'s own summary
+    // *is* "List directory contents", which should count for far more than
+    // an unrelated command's option that happens to mention "files" once in
+    // a paragraph. This bonus is intentionally *not* rolled up across a
+    // command's options (unlike `command_matches` below): it only credits a
+    // document's own title, so a command's aggregate score still reflects
+    // its own identity, not its most talkative flag's.
+    const TITLE_MATCH_BONUS: f32 = 2.0;
+    // The whole query appearing verbatim (e.g. a documented example that
+    // happens to match a natural-language request word for word) is
+    // stronger evidence than any per-term heuristic below it — comparable
+    // to `exact_lexical_boost`'s strongest tiers (an exact path/alias
+    // match), not a token-sized nudge. Keeping this dominant means a
+    // command whose own summary happens to share a distinctive word (the
+    // title bonus below) still can't outrank a genuine verbatim match.
+    const PHRASE_MATCH_BONUS: f32 = 12.0;
+    // A plain-language task query ("list all files") is asking which
+    // *command* to run, not what one specific flag does — a query that
+    // actually names a flag (contains `-`) doesn't get this bonus, since
+    // then an option match is exactly what's wanted.
+    const COMMAND_PREFERENCE_BONUS: f32 = 3.0;
+    let prefers_commands = !query.contains('-');
+
     let mut results = documents
         .iter()
         .zip(document_matches)
+        .zip(title_matches)
         .zip(phrase_matches)
         .zip(exact_boosts)
-        .filter_map(|(((document, local_matches), phrase_match), exact_boost)| {
-            if !kind.admits(document) {
-                return None;
-            }
-            let matches = if document.kind == "command" {
-                command_matches
-                    .get(document.command.as_str())
-                    .map_or(0, BTreeSet::len)
-            } else {
-                local_matches.len()
-            };
-            (matches > 0 || exact_boost > 0.0).then(|| SearchResult {
-                document_id: document.id.clone(),
-                command: document.command.clone(),
-                target: document.target.clone(),
-                kind: document.kind.clone(),
-                summary: document.title.clone(),
-                score: matches as f32 / denominator
-                    + if phrase_match { 1.0 } else { 0.0 }
-                    + exact_boost,
-                semantic: false,
-                mode: RetrievalMode::Lexical,
-            })
-        })
+        .filter_map(
+            |((((document, local_matches), title_matched), phrase_match), exact_boost)| {
+                if !kind.admits(document) {
+                    return None;
+                }
+                let matched_indices = if document.kind == "command" {
+                    command_matches.get(document.command.as_str())
+                } else {
+                    Some(&local_matches)
+                };
+                let matches = matched_indices.map_or(0.0, |indices| {
+                    indices.iter().map(|&index| term_weight[index]).sum()
+                });
+                let title_bonus = title_matched
+                    .iter()
+                    .map(|&index| term_weight[index] * TITLE_MATCH_BONUS)
+                    .sum::<f32>();
+                let command_bonus = if prefers_commands && document.kind == "command" {
+                    COMMAND_PREFERENCE_BONUS
+                } else {
+                    0.0
+                };
+                (matches > 0.0 || exact_boost > 0.0).then(|| SearchResult {
+                    document_id: document.id.clone(),
+                    command: document.command.clone(),
+                    target: document.target.clone(),
+                    kind: document.kind.clone(),
+                    summary: document.title.clone(),
+                    score: matches
+                        + title_bonus
+                        + command_bonus
+                        + if phrase_match {
+                            PHRASE_MATCH_BONUS
+                        } else {
+                            0.0
+                        }
+                        + exact_boost,
+                    semantic: false,
+                    mode: RetrievalMode::Lexical,
+                })
+            },
+        )
         .collect::<Vec<_>>();
     sort_and_limit(&mut results, limit);
     check_cancelled()?;
@@ -3144,6 +3213,32 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Whether `term` occurs in `haystack` as a whole word, not merely as a
+/// substring. Plain `str::contains` let short common words match inside
+/// unrelated longer ones — "all" inside "install", "list" inside
+/// "checklist" — turning up lexically-confident but semantically unrelated
+/// results (an option about reading a namefile of installer-related files
+/// outranking `ls` itself for "list all files"). `query_terms` only ever
+/// produces alphanumeric terms, so any non-alphanumeric character (or the
+/// string boundary) on both sides is a valid word boundary.
+fn haystack_contains_term(haystack: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return false;
+    }
+    haystack.match_indices(term).any(|(start, matched)| {
+        let end = start + matched.len();
+        let before_boundary = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_alphanumeric());
+        let after_boundary = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_alphanumeric());
+        before_boundary && after_boundary
+    })
 }
 
 fn query_terms(query: &str) -> Vec<String> {
@@ -4229,5 +4324,153 @@ mod tests {
         );
         let selected = compose_primary_description(&[fallback, useful.clone()]).unwrap();
         assert_eq!(selected, useful);
+    }
+
+    fn lexical_document(
+        id: &str,
+        kind: &str,
+        command: &str,
+        target: &str,
+        body: &str,
+    ) -> SemanticDocument {
+        SemanticDocument {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            command: command.to_owned(),
+            target: target.to_owned(),
+            title: body.to_owned(),
+            body: format!("command: {command}\nsummary: {body}"),
+            fingerprint: format!("fingerprint:{id}"),
+            lexical_features: LexicalFeatures {
+                paths: vec![command.to_owned()],
+                aliases: Vec::new(),
+                names: vec![command.to_owned()],
+                types: Vec::new(),
+            },
+            provenance_json: "{}".to_owned(),
+        }
+    }
+
+    fn rank(documents: &[SemanticDocument], query: &str) -> Vec<SearchResult> {
+        let query_terms = query_terms(query);
+        rank_lexical_documents_cancellable(
+            documents,
+            &query_terms,
+            query,
+            documents.len(),
+            SearchDocumentKind::All,
+            &mut || Ok(()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn haystack_contains_term_requires_a_word_boundary() {
+        assert!(haystack_contains_term("list all files", "all"));
+        assert!(!haystack_contains_term(
+            "useful for installer programs",
+            "all"
+        ));
+        assert!(haystack_contains_term("a checklist of all items", "all"));
+        assert!(!haystack_contains_term("", "all"));
+        assert!(!haystack_contains_term("anything", ""));
+    }
+
+    #[test]
+    fn lexical_ranking_does_not_let_a_substring_collision_outrank_a_real_match() {
+        // Mirrors the real bug: a query term ("all") landing inside an
+        // unrelated longer word ("installer") must not out-rank a document
+        // that actually matches every query term as whole words.
+        let documents = vec![
+            lexical_document(
+                "codesign:file-list",
+                "option",
+                "codesign",
+                "codesign -file-list",
+                "writes a list of files, useful for installer or patcher programs",
+            ),
+            lexical_document(
+                "ls:command",
+                "command",
+                "ls",
+                "ls",
+                "List directory contents, including all files",
+            ),
+        ];
+        let results = rank(&documents, "list all files");
+        assert_eq!(results[0].target, "ls");
+    }
+
+    #[test]
+    fn lexical_ranking_downweights_extremely_common_terms() {
+        // "all" appears (as a whole word) in every fixture document here,
+        // so it carries no discriminating power; "distinctive" appears in
+        // only one and should dominate the ranking despite being the only
+        // term that document matches on its own.
+        let common_documents = (0..20)
+            .map(|index| {
+                lexical_document(
+                    &format!("common:{index}"),
+                    "command",
+                    &format!("common{index}"),
+                    &format!("common{index}"),
+                    "matches all of the words in this query all all",
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut documents = common_documents;
+        documents.push(lexical_document(
+            "distinctive:command",
+            "command",
+            "distinctive",
+            "distinctive",
+            "a distinctive rare match",
+        ));
+        let results = rank(&documents, "distinctive all");
+        assert_eq!(results[0].target, "distinctive");
+    }
+
+    #[test]
+    fn lexical_ranking_prefers_a_command_title_match_over_option_body_noise() {
+        let documents = vec![
+            lexical_document(
+                "tool:opt",
+                "option",
+                "tool",
+                "tool --unrelated-flag",
+                "an unrelated flag that happens to mention copy in passing",
+            ),
+            lexical_document(
+                "cp:command",
+                "command",
+                "cp",
+                "cp",
+                "copy files and directories",
+            ),
+        ];
+        let results = rank(&documents, "copy");
+        assert_eq!(results[0].target, "cp");
+    }
+
+    #[test]
+    fn lexical_ranking_prefers_commands_over_options_for_plain_language_queries() {
+        let documents = vec![lexical_document(
+            "runner:command",
+            "command",
+            "runner",
+            "runner",
+            "run the configured task",
+        )];
+        let plain_score = rank(&documents, "run the task")[0].score;
+        // A query that names a flag explicitly (contains `-`) shouldn't get
+        // the same command-preference nudge — the underlying term matches
+        // are identical either way, so the only possible difference is the
+        // bonus itself, which should disappear entirely.
+        let flag_score = rank(&documents, "-run the task")[0].score;
+        assert!(
+            plain_score > flag_score,
+            "plain-language query ({plain_score}) should score the command higher than a \
+             flag-shaped query ({flag_score})"
+        );
     }
 }
