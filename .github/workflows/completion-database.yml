@@ -58,7 +58,7 @@ jobs:
           cargo xtask assets rebase-manifest
           --input "${{ runner.temp }}/asset-manifest-v1.json"
           --base-url https://quirl.vercel.app/reference
-          --output "${{ runner.temp }}/asset-manifest-v1.json"
+          --output "${{ runner.temp }}/asset-manifest-v1-rebased.json"
 
       - name: Publish into the website's static reference directory
         shell: bash
@@ -73,7 +73,7 @@ jobs:
           find "${{ runner.temp }}/assets" -mindepth 2 -maxdepth 2 -type f \
             \( -name '*.sqlite3' -o -name '*.tar' \) \
             -exec cp {} website/public/reference/ \;
-          cp "${{ runner.temp }}/asset-manifest-v1.json" website/public/reference/asset-manifest-v1.json
+          cp "${{ runner.temp }}/asset-manifest-v1-rebased.json" website/public/reference/asset-manifest-v1.json
           git status --porcelain -- website/public/reference
 
       - name: Commit and push the published assets
