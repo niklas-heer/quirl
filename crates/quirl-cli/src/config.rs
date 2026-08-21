@@ -2838,8 +2838,8 @@ return config
             ("ui_theme".to_owned(), "tokyo-night".to_owned()),
             ("ui_surface".to_owned(), "auto".to_owned()),
             ("ui_statusline_hints".to_owned(), "true".to_owned()),
-            ("completion_auto".to_owned(), "false".to_owned()),
-            ("completion_min_chars".to_owned(), "2".to_owned()),
+            ("completion_auto".to_owned(), "true".to_owned()),
+            ("completion_min_chars".to_owned(), "1".to_owned()),
         ])
     }
 

@@ -2741,7 +2741,13 @@ mod tests {
 
     #[test]
     fn data_ls_information_opens_automatically_without_enabling_global_auto_completion() {
-        let config = QuirlConfig::default();
+        // Explicit, not the default: this test's whole point is that the
+        // data-mode `ls` info panel opens on its own regardless of the
+        // general auto-completion setting, so pin that setting off here
+        // rather than relying on whatever QuirlConfig::default() happens
+        // to be.
+        let mut config = QuirlConfig::default();
+        config.completion.auto = false;
         assert!(!config.completion.auto);
         let mut surface = RichSurface::new(
             Arc::new(Catalog::builtin()),

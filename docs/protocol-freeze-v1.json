@@ -11,7 +11,7 @@
     {"name":"common_abi","owner":"quirl-core","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:254f7565de75d691","status":"frozen"},
     {"name":"compatibility_matrix","owner":"quirl-syntax","current_version":"3","oldest_readable":"3","compatibility":"frozen_major","schema_hash":"fnv1a64:b900f78fe1c20a64","status":"frozen_disposition"},
     {"name":"completion","owner":"quirl-catalog","current_version":"1","oldest_readable":"1","compatibility":"frozen_major","schema_hash":"fnv1a64:8293d43f3a269ccf","status":"versioned_async_frozen"},
-    {"name":"config","owner":"quirl-lua","current_version":"4","oldest_readable":"0","compatibility":"migrated_range","schema_hash":"fnv1a64:db55539ac7d9dc22","status":"v0_v1_v2_v3_migrate_to_v4"},
+    {"name":"config","owner":"quirl-lua","current_version":"4","oldest_readable":"0","compatibility":"migrated_range","schema_hash":"fnv1a64:b0ba5db7062a85c2","status":"v0_v1_v2_v3_migrate_to_v4"},
     {"name":"extension","owner":"quirl-core","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:bfddb053a448bfe8","status":"frozen"},
     {"name":"mcp","owner":"quirl-cli","current_version":"1","oldest_readable":"1","compatibility":"frozen_major","schema_hash":"fnv1a64:07810b391f9d8e17","status":"modern_2026_07_28_and_legacy_negotiated"},
     {"name":"package","owner":"quirl-contract","current_version":"1","oldest_readable":"1","compatibility":"frozen_major","schema_hash":"fnv1a64:a1caea99e3832838","status":"frozen_current_shape"},
