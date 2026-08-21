@@ -18,9 +18,10 @@ use std::{
 };
 
 use crate::release::{
-    absolute, clean_candidate_identity, immutable_write, input_error, json_bytes, read_bounded,
-    read_json_bounded, release_url, render_tar_entries, resource_error, run_status_bounded,
-    sha256_hex, validate_relative_file_name,
+    CandidateIdentity, absolute, clean_candidate_identity, current_candidate_identity,
+    immutable_write, input_error, json_bytes, read_bounded, read_json_bounded, release_url,
+    render_tar_entries, resource_error, run_status_bounded, sha256_hex,
+    validate_relative_file_name,
 };
 
 const CONTRACT_VERSION: u32 = 1;
@@ -40,6 +41,11 @@ pub(crate) enum AssetsCommand {
         /// Directory receiving the immutable asset and descriptor.
         #[arg(long)]
         output: PathBuf,
+        /// Candidate identity source: `next` (default, cutting a release —
+        /// requires a matching CHANGELOG/tag/notes) or `current` (refreshing
+        /// content against whatever version is already shipped).
+        #[arg(long, value_enum, default_value_t = IdentitySource::Next)]
+        identity: IdentitySource,
     },
     /// Combine asset descriptors into the release asset manifest.
     Manifest {
@@ -49,7 +55,49 @@ pub(crate) enum AssetsCommand {
         /// Exact manifest path to write.
         #[arg(long)]
         output: PathBuf,
+        /// Candidate identity source, matching whichever the descriptors
+        /// were built with.
+        #[arg(long, value_enum, default_value_t = IdentitySource::Next)]
+        identity: IdentitySource,
     },
+    /// Rewrite an already-built manifest's asset URLs to a different host.
+    ///
+    /// The manifest must already be fully built and validated; only the
+    /// `url` field of each asset changes here, never `sha256`/`byte_size`,
+    /// so this can't silently change what a client actually installs.
+    RebaseManifest {
+        /// Already-built manifest to rebase.
+        #[arg(long)]
+        input: PathBuf,
+        /// New base URL; each asset's URL becomes `{base_url}/{file}`.
+        #[arg(long)]
+        base_url: String,
+        /// Exact manifest path to write.
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
+/// Which identity an asset build/manifest carries.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum IdentitySource {
+    /// The next planned release version — requires a matching CHANGELOG
+    /// heading, release notes, and an as-yet-unpublished tag. Use when
+    /// actually cutting a quirl release.
+    Next,
+    /// The current, already-shipped workspace version. Use for refreshing
+    /// downloadable content (like the completion database) independently of
+    /// cutting a new quirl release.
+    Current,
+}
+
+impl IdentitySource {
+    fn resolve(self, root: &Path) -> Result<CandidateIdentity, Box<dyn Error>> {
+        match self {
+            Self::Next => clean_candidate_identity(root),
+            Self::Current => current_candidate_identity(root),
+        }
+    }
 }
 
 /// Supported separately downloadable runtime payloads.
@@ -122,8 +170,21 @@ struct AssetManifestResult {
 
 pub(crate) fn run(root: &Path, command: AssetsCommand) -> Result<(), Box<dyn Error>> {
     match command {
-        AssetsCommand::Build { kind, output } => build(root, kind, &output),
-        AssetsCommand::Manifest { input, output } => manifest(root, &input, &output),
+        AssetsCommand::Build {
+            kind,
+            output,
+            identity,
+        } => build(root, kind, &output, identity),
+        AssetsCommand::Manifest {
+            input,
+            output,
+            identity,
+        } => manifest(root, &input, &output, identity),
+        AssetsCommand::RebaseManifest {
+            input,
+            base_url,
+            output,
+        } => rebase_manifest(&input, &base_url, &output),
     }
 }
 
@@ -167,8 +228,13 @@ impl AssetManifest {
     }
 }
 
-fn build(root: &Path, kind: AssetKind, output: &Path) -> Result<(), Box<dyn Error>> {
-    let identity = clean_candidate_identity(root)?;
+fn build(
+    root: &Path,
+    kind: AssetKind,
+    output: &Path,
+    identity: IdentitySource,
+) -> Result<(), Box<dyn Error>> {
+    let identity = identity.resolve(root)?;
     let version = identity.version;
     let output = absolute(root, output);
     fs::create_dir_all(&output)?;
@@ -258,8 +324,13 @@ fn build(root: &Path, kind: AssetKind, output: &Path) -> Result<(), Box<dyn Erro
     })
 }
 
-fn manifest(root: &Path, input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
-    let identity = clean_candidate_identity(root)?;
+fn manifest(
+    root: &Path,
+    input: &Path,
+    output: &Path,
+    identity: IdentitySource,
+) -> Result<(), Box<dyn Error>> {
+    let identity = identity.resolve(root)?;
     let version = identity.version;
     let input = absolute(root, input);
     let output = absolute(root, output);
@@ -318,6 +389,32 @@ fn manifest(root: &Path, input: &Path, output: &Path) -> Result<(), Box<dyn Erro
     };
     manifest.validate_for_release(&manifest.release_version)?;
     immutable_write(&output, &json_bytes(&manifest)?)?;
+    print_json(&AssetManifestResult {
+        schema_version: CONTRACT_VERSION,
+        manifest: output.display().to_string(),
+        asset_count: manifest.assets.len(),
+    })
+}
+
+fn rebase_manifest(input: &Path, base_url: &str, output: &Path) -> Result<(), Box<dyn Error>> {
+    if base_url.is_empty() || !base_url.starts_with("https://") || base_url.ends_with('/') {
+        return Err(input_error(
+            "rebase base URL must be a bounded absolute HTTPS URL with no trailing slash",
+        ));
+    }
+    let mut manifest: AssetManifest = read_json_bounded(input)?;
+    let release_version = manifest.release_version.clone();
+    // `validate_for_release` requires each asset's URL to be the exact
+    // GitHub Releases form (`validate_record`), so it only runs here, on the
+    // as-built manifest, before any URL rewriting — confirming the input is
+    // a genuine, unmodified build output. It can't run again afterward: a
+    // rebased manifest fails that same GitHub-specific check by design.
+    manifest.validate_for_release(&release_version)?;
+    for asset in &mut manifest.assets {
+        validate_relative_file_name(&asset.file)?;
+        asset.url = format!("{base_url}/{}", asset.file);
+    }
+    immutable_write(output, &json_bytes(&manifest)?)?;
     print_json(&AssetManifestResult {
         schema_version: CONTRACT_VERSION,
         manifest: output.display().to_string(),
@@ -453,5 +550,72 @@ mod tests {
     fn manifest_contract_rejects_unknown_fields() {
         let json = r#"{"schema_version":1,"release_version":"0.1.0","candidate_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_date_epoch":1,"assets":[],"extra":true}"#;
         assert!(serde_json::from_str::<AssetManifest>(json).is_err());
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "quirl-xtask-assets-test-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn rebase_manifest_only_rewrites_urls() {
+        let manifest = AssetManifest {
+            schema_version: 1,
+            release_version: "0.1.0".to_owned(),
+            candidate_commit: "b".repeat(40),
+            source_date_epoch: 1,
+            assets: vec![
+                record("command-model", "model.tar", "tar"),
+                record("completion-database", "completion.sqlite3", "sqlite3"),
+            ],
+        };
+        assert!(manifest.validate_for_release("0.1.0").is_ok());
+        let input = temp_path("input.json");
+        let output = temp_path("output.json");
+        fs::write(&input, json_bytes(&manifest).unwrap()).unwrap();
+
+        rebase_manifest(&input, "https://quirl.vercel.app/reference", &output).unwrap();
+
+        let rebased: AssetManifest = read_json_bounded(&output).unwrap();
+        for (original, rewritten) in manifest.assets.iter().zip(&rebased.assets) {
+            assert_eq!(
+                rewritten.url,
+                format!("https://quirl.vercel.app/reference/{}", original.file)
+            );
+            assert_eq!(rewritten.sha256, original.sha256);
+            assert_eq!(rewritten.byte_size, original.byte_size);
+            assert_eq!(rewritten.logical_name, original.logical_name);
+        }
+        assert_eq!(rebased.release_version, manifest.release_version);
+        assert_eq!(rebased.candidate_commit, manifest.candidate_commit);
+
+        fs::remove_file(&input).unwrap();
+        fs::remove_file(&output).unwrap();
+    }
+
+    #[test]
+    fn rebase_manifest_rejects_a_non_https_base_url() {
+        let manifest = AssetManifest {
+            schema_version: 1,
+            release_version: "0.1.0".to_owned(),
+            candidate_commit: "b".repeat(40),
+            source_date_epoch: 1,
+            assets: vec![
+                record("command-model", "model.tar", "tar"),
+                record("completion-database", "completion.sqlite3", "sqlite3"),
+            ],
+        };
+        let input = temp_path("insecure-input.json");
+        let output = temp_path("insecure-output.json");
+        fs::write(&input, json_bytes(&manifest).unwrap()).unwrap();
+
+        assert!(rebase_manifest(&input, "http://insecure.invalid", &output).is_err());
+        assert!(rebase_manifest(&input, "https://trailing.invalid/", &output).is_err());
+
+        fs::remove_file(&input).unwrap();
     }
 }

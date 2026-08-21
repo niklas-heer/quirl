@@ -1352,6 +1352,32 @@ pub(crate) fn clean_candidate_identity(root: &Path) -> Result<CandidateIdentity,
     })
 }
 
+/// Identity for asset builds that aren't cutting a release — just refreshing
+/// downloadable content (the completion database, the command model) against
+/// whatever version is *currently* shipped. Unlike
+/// [`clean_candidate_identity`], this never requires a matching CHANGELOG
+/// heading, release notes, or tag: those only make sense when preparing an
+/// actual version bump. It still requires a clean worktree, since publishing
+/// an asset built from uncommitted changes would misattribute its identity.
+pub(crate) fn current_candidate_identity(root: &Path) -> Result<CandidateIdentity, Box<dyn Error>> {
+    let version = workspace_version(root)?;
+    let commit = current_commit(root)?;
+    let clean = git(
+        root,
+        &["status", "--porcelain", "--untracked-files=normal"],
+        true,
+    )?
+    .is_empty();
+    if !clean {
+        return Err(input_error("candidate worktree is not clean"));
+    }
+    Ok(CandidateIdentity {
+        version,
+        commit,
+        source_date_epoch: candidate_source_epoch(root)?,
+    })
+}
+
 pub(crate) fn current_commit(root: &Path) -> Result<String, Box<dyn Error>> {
     let commit = git(root, &["rev-parse", "HEAD"], true)?;
     validate_commit(&commit)?;

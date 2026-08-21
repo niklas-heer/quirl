@@ -1,0 +1,91 @@
+name: Completion database
+
+# Publishes the completion-database and command-model runtime assets to the
+# website, independently of cutting a quirl binary release. Builds against
+# whatever version is *currently* shipped (`--identity current`), not a
+# planned next version, so it's safe to run on any clean commit on `main`.
+#
+# Manual dispatch only for now: once a run has been sanity-checked against
+# the published website, add a `push` trigger scoped to
+# `catalog/curated/**`, `catalog/generated/**`, and `crates/quirl-catalog/**`
+# so a curated-data change ships automatically.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: completion-database
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out the current candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Build the completion database
+        run: >-
+          cargo xtask assets build
+          --kind completion-database
+          --identity current
+          --output "${{ runner.temp }}/assets/completion-database"
+
+      - name: Build the command model
+        run: >-
+          cargo xtask assets build
+          --kind command-model
+          --identity current
+          --output "${{ runner.temp }}/assets/command-model"
+
+      - name: Describe the complete downloadable asset set
+        run: >-
+          cargo xtask assets manifest
+          --input "${{ runner.temp }}/assets"
+          --output "${{ runner.temp }}/asset-manifest-v1.json"
+          --identity current
+
+      - name: Rebase the manifest onto the website
+        run: >-
+          cargo xtask assets rebase-manifest
+          --input "${{ runner.temp }}/asset-manifest-v1.json"
+          --base-url https://quirl.vercel.app/reference
+          --output "${{ runner.temp }}/asset-manifest-v1.json"
+
+      - name: Publish into the website's static reference directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p website/public/reference
+          # Asset filenames embed the version (quirl-completion-database-vX.Y.Z.*),
+          # so a later real version bump would otherwise leave this run's files
+          # behind forever; clear the previous payloads before copying today's.
+          find website/public/reference -maxdepth 1 -type f \
+            \( -name '*.sqlite3' -o -name '*.tar' \) -delete
+          find "${{ runner.temp }}/assets" -mindepth 2 -maxdepth 2 -type f \
+            \( -name '*.sqlite3' -o -name '*.tar' \) \
+            -exec cp {} website/public/reference/ \;
+          cp "${{ runner.temp }}/asset-manifest-v1.json" website/public/reference/asset-manifest-v1.json
+          git status --porcelain -- website/public/reference
+
+      - name: Commit and push the published assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- website/public/reference; then
+            echo "No change to publish."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add website/public/reference
+          git commit -m "chore(website): publish refreshed completion database"
+          git push origin HEAD:main
