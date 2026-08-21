@@ -1649,7 +1649,7 @@ impl SurfaceSymbols {
             (Self::Unicode, Mode::Natural) => "✧ ",
             (Self::NerdFont, Mode::Command) => "❯ ",
             (Self::NerdFont, Mode::Data) => "\u{f1b2} ",
-            (Self::NerdFont, Mode::Natural) => "\u{f544} ",
+            (Self::NerdFont, Mode::Natural) => "\u{f075} ",
         }
     }
 
@@ -1671,7 +1671,7 @@ impl SurfaceSymbols {
             (Self::Unicode, Mode::Natural) => "✧",
             (Self::NerdFont, Mode::Command) => "\u{f120}",
             (Self::NerdFont, Mode::Data) => "\u{f1c0}",
-            (Self::NerdFont, Mode::Natural) => "\u{f544}",
+            (Self::NerdFont, Mode::Natural) => "\u{f075}",
         }
     }
 }
