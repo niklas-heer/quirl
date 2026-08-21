@@ -5393,14 +5393,21 @@ mod platform {
             assert_eq!(error.code, ErrorCode::ProcessSpawn);
             assert!(error.message.contains("/definitely/missing/quirl-stage"));
 
+            // The shell's stdout redirect creates (and truncates) the file
+            // before `printf` actually runs and writes the pid into it, so
+            // polling for existence alone can observe it still empty. Poll
+            // for parseable content instead.
+            let mut process_id = None;
             for _ in 0..100 {
-                if process_id_path.exists() {
+                if let Ok(value) = fs::read_to_string(&process_id_path)
+                    && let Ok(parsed) = value.trim().parse::<i32>()
+                {
+                    process_id = Some(parsed);
                     break;
                 }
                 thread::sleep(Duration::from_millis(1));
             }
-            if let Ok(value) = fs::read_to_string(&process_id_path) {
-                let process_id = value.trim().parse::<i32>().unwrap();
+            if let Some(process_id) = process_id {
                 assert!(kill(Pid::from_raw(process_id), None).is_err());
                 fs::remove_file(process_id_path).unwrap();
             }
