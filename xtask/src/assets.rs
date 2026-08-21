@@ -397,9 +397,16 @@ fn manifest(
 }
 
 fn rebase_manifest(input: &Path, base_url: &str, output: &Path) -> Result<(), Box<dyn Error>> {
-    if base_url.is_empty() || !base_url.starts_with("https://") || base_url.ends_with('/') {
+    // `file://` is accepted too, purely for local end-to-end testing: the
+    // runtime side (`crates/quirl-cli/src/assets.rs`) only trusts `file://`
+    // asset payloads when the manifest itself was loaded from a local file
+    // via `--manifest`/`QUIRL_ASSET_MANIFEST_FILE`, never from a fetched
+    // HTTPS manifest, so this can't be used to smuggle a local path into a
+    // published manifest that real installs would ever see.
+    let scheme_ok = base_url.starts_with("https://") || base_url.starts_with("file://");
+    if base_url.is_empty() || !scheme_ok || base_url.ends_with('/') {
         return Err(input_error(
-            "rebase base URL must be a bounded absolute HTTPS URL with no trailing slash",
+            "rebase base URL must be a bounded absolute HTTPS or file:// URL with no trailing slash",
         ));
     }
     let mut manifest: AssetManifest = read_json_bounded(input)?;

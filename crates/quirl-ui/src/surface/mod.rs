@@ -1174,9 +1174,12 @@ impl RichSurface {
                             }
                             if editor.buffer().trim().is_empty() {
                                 // Nothing to run: skip the terminal pause/resume
-                                // round trip a real command would need and just
-                                // keep the prompt live, matching a plain shell's
-                                // no-op Enter on an empty line.
+                                // round trip a real command would need, but still
+                                // advance the transcript by one bare prompt line —
+                                // a plain shell's Enter on an empty line moves the
+                                // cursor down even though nothing is added to
+                                // command history.
+                                self.append_transcript_line("❯");
                                 editor.clear();
                                 self.dismiss_picker();
                                 continue;
