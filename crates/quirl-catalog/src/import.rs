@@ -1792,6 +1792,13 @@ fn shell_words(source: &str) -> Result<Vec<String>, String> {
             }
             '#' if !started => break,
             ';' if !started => break,
+            // Completion functions routinely chain a call with `&& ret=0` or
+            // `|| return 1` on the same physical line (no `;`, no line
+            // continuation). Without stopping here, those control-flow
+            // tokens get swept in as bogus completion candidates and the
+            // real candidate list — usually the very next token — never
+            // gets a chance to resolve.
+            '&' | '|' if !started => break,
             character if character.is_whitespace() => {
                 if started {
                     words.push(std::mem::take(&mut word));
@@ -1934,6 +1941,42 @@ _describe -t commands Commands _c
                 .iter()
                 .any(|command| { matches!(command.path.as_str(), "ghq Commands" | "ghq _c") })
         );
+    }
+
+    #[test]
+    fn zsh_describe_call_chained_with_and_and_ret_on_one_line_still_resolves_the_array() {
+        // Real completion functions routinely write `<call> && ret=0` on the
+        // same physical line, with no `;` and no line continuation. The
+        // trailing control-flow tokens must not leak into the candidate
+        // list, and must not block the array-name fast path that resolves
+        // the real subcommand list.
+        let source = r#"#compdef git
+local -a commands
+commands=(
+  'checkout:Switch branches or restore working tree files'
+  'commit:Record changes to the repository'
+)
+_describe -t commands 'git commands' commands && ret=0
+"#;
+        let report = import_zsh(source, "_git");
+        assert!(
+            report
+                .commands
+                .iter()
+                .any(|command| command.path == "git checkout")
+        );
+        assert!(
+            report
+                .commands
+                .iter()
+                .any(|command| command.path == "git commit")
+        );
+        assert!(!report.commands.iter().any(|command| {
+            matches!(
+                command.path.as_str(),
+                "git &&" | "git ret=0" | "git commands"
+            )
+        }));
     }
 
     #[test]
