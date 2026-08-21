@@ -1130,7 +1130,7 @@ mod tests {
     #[test]
     fn data_mode_repaints_indicator_and_status_without_relying_on_color() {
         let terminal = rendered_model_in_mode(78, 3, "files", None, Mode::Data, false, |_| {});
-        assert!(row(&terminal, 1).contains("❯ ▦ files"));
+        assert!(row(&terminal, 1).contains("▦ files"));
         assert!(row(&terminal, 2).contains("DATA"));
         assert!(!row(&terminal, 2).contains("NORMAL"));
     }

@@ -1634,16 +1634,22 @@ impl SurfaceSymbols {
     }
 
     pub(crate) const fn input_indicator(self, mode: Mode) -> &'static str {
+        // The prompt symbol itself is mode-specific — not a fixed chevron
+        // with a second icon tacked on after it. Mode must stay legible
+        // without color (NO_COLOR, monochrome terminals, colorblind users;
+        // see the accessibility test below), so each mode still gets its
+        // own distinct glyph, it just replaces the chevron instead of
+        // following it.
         match (self, mode) {
             (Self::Plain, Mode::Command) => "> ",
             (Self::Plain, Mode::Data) => "> D ",
             (Self::Plain, Mode::Natural) => "> AI ",
             (Self::Unicode, Mode::Command) => "❯ ",
-            (Self::Unicode, Mode::Data) => "❯ ▦ ",
-            (Self::Unicode, Mode::Natural) => "❯ ✧ ",
+            (Self::Unicode, Mode::Data) => "▦ ",
+            (Self::Unicode, Mode::Natural) => "✧ ",
             (Self::NerdFont, Mode::Command) => "❯ ",
-            (Self::NerdFont, Mode::Data) => "❯ \u{f1b2} ",
-            (Self::NerdFont, Mode::Natural) => "❯ \u{f544} ",
+            (Self::NerdFont, Mode::Data) => "\u{f1b2} ",
+            (Self::NerdFont, Mode::Natural) => "\u{f544} ",
         }
     }
 
