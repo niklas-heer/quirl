@@ -56,14 +56,14 @@ use super::{
 use crate::SurfaceSymbols;
 use crate::theme::Theme;
 use crossterm::{
-    cursor::{SetCursorStyle, Show},
+    cursor::{MoveTo, SetCursorStyle, Show},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     style::Print,
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use quirl_catalog::Catalog;
 use quirl_core::{
@@ -1172,10 +1172,17 @@ impl RichSurface {
                                 editor.apply(EditAction::ForceNewline);
                                 continue;
                             }
-                            let buffer = editor.buffer().to_owned();
-                            if !buffer.trim().is_empty() {
-                                self.append_history(&buffer)?;
+                            if editor.buffer().trim().is_empty() {
+                                // Nothing to run: skip the terminal pause/resume
+                                // round trip a real command would need and just
+                                // keep the prompt live, matching a plain shell's
+                                // no-op Enter on an empty line.
+                                editor.clear();
+                                self.dismiss_picker();
+                                continue;
                             }
+                            let buffer = editor.buffer().to_owned();
+                            self.append_history(&buffer)?;
                             self.terminal.pause_for_execution()?;
                             return Ok(InteractiveSignal::Success(buffer));
                         }
@@ -2144,7 +2151,16 @@ impl SurfaceTerminal {
         }
         if self.alternate_screen {
             match execute!(io::stderr(), LeaveAlternateScreen) {
-                Ok(()) => self.alternate_screen = false,
+                Ok(()) => {
+                    self.alternate_screen = false;
+                    // The primary screen still holds whatever was on it before
+                    // Quirl entered the alternate screen (its own startup
+                    // banner, most often), and LeaveAlternateScreen restores
+                    // that content verbatim. Clear it so exiting or
+                    // suspending Quirl hands back a clean terminal instead of
+                    // resurrecting stale pre-launch output.
+                    let _ = execute!(io::stderr(), Clear(ClearType::All), MoveTo(0, 0));
+                }
                 Err(error) => retain_error(
                     &mut failure,
                     terminal_error("leave the alternate terminal screen")(error),
