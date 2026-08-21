@@ -1168,8 +1168,16 @@ mod tests {
             }
         }
 
+        // A `WouldBlock` on a 4 KiB write does not guarantee a much smaller
+        // write stays blocked an instant later: on Linux the tty output
+        // queue's low-water mark can free enough room, between the fill
+        // loop above and the timed `send` below, for a 5-byte payload to
+        // fit even though the queue is still effectively full. Measure the
+        // timeout with a payload the same size as what actually established
+        // `WouldBlock`, so the same fullness that blocked the fill loop
+        // still blocks this write.
         let started = Instant::now();
-        let error = session.send(b"reply").unwrap_err();
+        let error = session.send(&input).unwrap_err();
         let elapsed = started.elapsed();
         assert_eq!(
             error.downcast_ref::<io::Error>().map(io::Error::kind),
