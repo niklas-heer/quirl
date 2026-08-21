@@ -928,24 +928,38 @@ impl Drop for PtySession {
     }
 }
 
-const PROCESS_TREE_BYTES_MAX: usize = 16 * 1024;
+const PROCESS_TREE_LINES_MAX: usize = 200;
 
-/// Best-effort `ps -ef` snapshot attached to a timeout diagnostic.
+/// Best-effort `ps -ef` snapshot attached to a timeout diagnostic, filtered
+/// to userspace processes.
 ///
 /// A PTY wait timing out this test harness could mean the harness itself is
 /// just slow under CI load, or that a child (or something it spawned) is
 /// genuinely still alive and blocking cleanup; this distinguishes the two
-/// without needing to reproduce the hang interactively. Never fails the
-/// check itself: a `ps` failure just yields a short diagnostic string.
+/// without needing to reproduce the hang interactively. On a real VM-backed
+/// CI runner (unlike a container) `ps -ef` lists the whole host, hundreds of
+/// bracketed kernel threads (`[kworker/...]`) and all; drop those so the
+/// bound below is spent on the processes that could actually matter here.
+/// Never fails the check itself: a `ps` failure just yields a short
+/// diagnostic string.
 fn process_tree_snapshot() -> String {
     match std::process::Command::new("ps").arg("-ef").output() {
         Ok(output) => {
             let text = String::from_utf8_lossy(&output.stdout);
-            if text.len() > PROCESS_TREE_BYTES_MAX {
-                format!("{}... (truncated)", &text[..PROCESS_TREE_BYTES_MAX])
-            } else {
-                text.into_owned()
-            }
+            let mut lines = text.lines();
+            let header = lines.next().unwrap_or_default();
+            let mut kept = vec![header.to_owned()];
+            kept.extend(
+                lines
+                    .filter(|line| {
+                        line.split_whitespace()
+                            .last()
+                            .is_none_or(|command| !command.starts_with('['))
+                    })
+                    .take(PROCESS_TREE_LINES_MAX)
+                    .map(str::to_owned),
+            );
+            kept.join("\n")
         }
         Err(error) => format!("(ps -ef unavailable: {error})"),
     }
