@@ -21,10 +21,10 @@ pub use runtime::{
 
 /// One-shot rich-session loader that returns the complete immutable catalog.
 ///
-/// The rich surface invokes this only after its first frame has been flushed
-/// and before terminal input is polled. An error leaves terminal restoration to
-/// the surface's existing RAII guard and is returned unchanged.
-pub type CatalogLoader = Box<dyn FnOnce() -> Result<Arc<Catalog>, ShellError>>;
+/// The rich surface starts this on one owned worker only after its first frame
+/// has been flushed. Input remains responsive while the bounded loader runs;
+/// the complete catalog is published atomically on the surface thread.
+pub type CatalogLoader = Box<dyn FnOnce() -> Result<Arc<Catalog>, ShellError> + Send>;
 
 /// Bounded history metadata installed by the product's durable history store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +85,11 @@ use std::{
     fs::OpenOptions,
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -356,6 +360,7 @@ pub enum InteractiveSignal {
 pub struct RichSurface {
     catalog: Option<Arc<Catalog>>,
     catalog_loader: Option<CatalogLoader>,
+    catalog_admission: Option<CatalogAdmission>,
     completion: CompletionState,
     picker: PickerOverlay,
     picker_layout: PickerLayout,
@@ -404,6 +409,11 @@ pub struct RichSurface {
     live_output_owner: Option<OutputStream>,
 }
 
+struct CatalogAdmission {
+    receiver: Receiver<Result<Arc<Catalog>, ShellError>>,
+    worker: Option<JoinHandle<()>>,
+}
+
 impl RichSurface {
     /// Construct a rich surface without entering raw terminal mode.
     ///
@@ -430,6 +440,7 @@ impl RichSurface {
             expand_completion_pending: false,
             catalog: Some(catalog),
             catalog_loader: None,
+            catalog_admission: None,
             keymap: config.editor.keymap.clone(),
             history_path,
             history,
@@ -468,13 +479,14 @@ impl RichSurface {
         })
     }
 
-    /// Construct a rich surface whose complete catalog is admitted after the
-    /// first successful terminal flush and before the first input poll.
+    /// Construct a rich surface whose complete catalog starts loading after
+    /// the first successful terminal flush without blocking the first input.
     ///
     /// Configuration, theme, keymap, history, picker policy, and terminal
-    /// acquisition remain eager. The loader is consumed exactly once. Its
-    /// returned [`Arc<Catalog>`] is published as one complete generation to
-    /// analysis, completion, picker/help, and the composition root.
+    /// acquisition remain eager. The loader is consumed exactly once by one
+    /// owned worker. Its returned [`Arc<Catalog>`] is published as one complete
+    /// generation on the surface thread to analysis, completion, picker/help,
+    /// and the composition root. Dropping the surface joins the bounded worker.
     pub fn new_deferred(
         catalog_loader: CatalogLoader,
         extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
@@ -487,6 +499,7 @@ impl RichSurface {
         Ok(Self {
             catalog: None,
             catalog_loader: Some(catalog_loader),
+            catalog_admission: None,
             completion: CompletionState::unpublished(extension_completer),
             picker: PickerOverlay::new(picker_ranker),
             picker_layout: PickerLayout::from_config(&config.picker.layout),
@@ -784,25 +797,75 @@ impl RichSurface {
         self.dismiss_picker();
     }
 
-    fn admit_catalog(&mut self) -> Result<(), ShellError> {
-        if self.catalog.is_some() {
+    fn begin_catalog_admission(&mut self) -> Result<(), ShellError> {
+        if self.catalog.is_some() || self.catalog_admission.is_some() {
             return Ok(());
         }
         let loader = self.catalog_loader.take().ok_or_else(|| {
             ShellError::new(ErrorCode::Io, "interactive catalog loader is unavailable")
                 .with_help("Restart Quirl to create a fresh interactive session")
         })?;
-        let catalog = loader()?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("quirl-catalog-admission".to_owned())
+            .spawn(move || {
+                let _ = sender.send(loader());
+            })
+            .map_err(|error| {
+                ShellError::new(ErrorCode::Io, "cannot start the catalog admission worker")
+                    .with_context(error.to_string())
+                    .with_help("Retry after freeing process or thread resources")
+            })?;
+        self.catalog_admission = Some(CatalogAdmission {
+            receiver,
+            worker: Some(worker),
+        });
+        Ok(())
+    }
 
-        // Failure model: the terminal is already raw and owns the alternate
-        // viewport. No input observer runs during this transaction. Publish
-        // clones to every consumer first, then expose the catalog slot last so
-        // no reachable state can observe a partial generation.
+    fn poll_catalog_admission(&mut self) -> Result<bool, ShellError> {
+        let Some(admission) = self.catalog_admission.as_ref() else {
+            return Ok(false);
+        };
+        let outcome = match admission.receiver.try_recv() {
+            Ok(outcome) => outcome,
+            Err(TryRecvError::Empty) => return Ok(false),
+            Err(TryRecvError::Disconnected) => Err(ShellError::new(
+                ErrorCode::Io,
+                "catalog admission worker ended without publishing a result",
+            )
+            .with_help("Restart Quirl to create a fresh interactive session")),
+        };
+        let Some(mut admission) = self.catalog_admission.take() else {
+            return Err(ShellError::new(
+                ErrorCode::Io,
+                "catalog admission worker ownership was lost",
+            )
+            .with_help("Restart Quirl to create a fresh interactive session"));
+        };
+        Self::join_catalog_admission(&mut admission)?;
+        let catalog = outcome?;
+
+        // The worker owns construction only. Publish clones to every consumer
+        // on the surface thread first, then expose the catalog slot last so no
+        // reachable state can observe a partial generation.
         self.completion.publish_catalog(Arc::clone(&catalog));
         self.input_analysis.publish_catalog(Arc::clone(&catalog));
         self.catalog = Some(catalog);
         self.runtime.catalog_admitted();
-        Ok(())
+        #[cfg(debug_assertions)]
+        catalog_admission_published_test_hook()?;
+        Ok(true)
+    }
+
+    fn join_catalog_admission(admission: &mut CatalogAdmission) -> Result<(), ShellError> {
+        let Some(worker) = admission.worker.take() else {
+            return Ok(());
+        };
+        worker.join().map_err(|_| {
+            ShellError::new(ErrorCode::Io, "catalog admission worker panicked")
+                .with_help("Restart Quirl to create a fresh interactive session")
+        })
     }
 
     /// Replace the bounded immutable job and typed-result sources for the next frame.
@@ -925,14 +988,18 @@ impl RichSurface {
                 )?;
                 self.transcript_area = transcript_area;
                 let draw_elapsed = started.elapsed();
-                // Ratatui flushes the backend before `draw` returns. Catalog
-                // admission is deliberately the next effect: terminal input
-                // remains queued until this complete generation is published.
-                self.admit_catalog()?;
+                // Ratatui flushes the backend before `draw` returns. Start the
+                // bounded catalog worker only after that first visible frame;
+                // subsequent input polling must not wait for discovery.
+                self.begin_catalog_admission()?;
                 self.record_draw(draw_elapsed);
                 dirty = self.copy_pending_screen_selection()?;
             }
 
+            if self.poll_catalog_admission()? {
+                dirty = true;
+                continue;
+            }
             if self.semantic_hints && self.input_analysis.poll_path() {
                 dirty = true;
                 continue;
@@ -1836,6 +1903,22 @@ impl RichSurface {
     }
 }
 
+#[cfg(debug_assertions)]
+fn catalog_admission_published_test_hook() -> Result<(), ShellError> {
+    let Some(gate) = env::var_os("QUIRL_TEST_CATALOG_GATE") else {
+        return Ok(());
+    };
+    let published = PathBuf::from(format!("{}.published", PathBuf::from(gate).display()));
+    fs::write(&published, b"catalog published").map_err(|error| {
+        ShellError::new(
+            ErrorCode::Io,
+            "could not publish catalog admission test marker",
+        )
+        .with_context(error.to_string())
+        .with_help("Use a writable QUIRL_TEST_CATALOG_GATE path")
+    })
+}
+
 impl Drop for RichSurface {
     fn drop(&mut self) {
         // Failure model: a read/history/completion error can unwind while raw
@@ -1844,6 +1927,11 @@ impl Drop for RichSurface {
         // dropping fields in declaration order.
         if self.terminal.active {
             self.terminal.reset_best_effort();
+        }
+        // Discovery is bounded by the owning CLI loader. Join only after raw
+        // mode is gone so even a slow cleanup cannot strand terminal state.
+        if let Some(mut admission) = self.catalog_admission.take() {
+            let _ = Self::join_catalog_admission(&mut admission);
         }
     }
 }
@@ -2675,6 +2763,20 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    fn await_catalog_admission(surface: &mut RichSurface) -> Result<(), ShellError> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match surface.poll_catalog_admission() {
+                Ok(true) => return Ok(()),
+                Ok(false) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(false) => panic!("catalog admission test exceeded its one-second bound"),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     #[test]
     fn incomplete_quotes_continue_instead_of_executing() {
         assert!(input_is_incomplete("printf 'hello", Mode::Command));
@@ -3337,9 +3439,17 @@ mod tests {
         let loader_calls = Arc::clone(&calls);
         let expected = Arc::new(Catalog::builtin());
         let loader_catalog = Arc::clone(&expected);
+        let (release_sender, release_receiver) = mpsc::channel();
         let mut surface = RichSurface::new_deferred(
             Box::new(move || {
                 loader_calls.fetch_add(1, Ordering::Relaxed);
+                release_receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .map_err(|error| {
+                        ShellError::new(ErrorCode::Io, "catalog test gate failed")
+                            .with_context(error.to_string())
+                            .with_help("Release the catalog test gate")
+                    })?;
                 Ok(loader_catalog)
             }),
             None,
@@ -3350,8 +3460,11 @@ mod tests {
         .unwrap();
 
         assert!(surface.published_catalog().is_none());
-        surface.admit_catalog().unwrap();
-        surface.admit_catalog().unwrap();
+        surface.begin_catalog_admission().unwrap();
+        surface.begin_catalog_admission().unwrap();
+        assert!(!surface.poll_catalog_admission().unwrap());
+        release_sender.send(()).unwrap();
+        await_catalog_admission(&mut surface).unwrap();
 
         let published = surface.published_catalog().unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -3381,7 +3494,8 @@ mod tests {
         )
         .unwrap();
 
-        let error = surface.admit_catalog().unwrap_err();
+        surface.begin_catalog_admission().unwrap();
+        let error = await_catalog_admission(&mut surface).unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
         assert_eq!(error.message, "catalog fixture is corrupt");
         assert_eq!(error.details.context, ["observed fixture bytes: 9"]);

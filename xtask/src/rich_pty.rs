@@ -1513,27 +1513,26 @@ fn check_deferred_catalog_admission(binary: &Path) -> Result<(), Box<dyn Error>>
     {
         return Err(io::Error::other("catalog gate did not run inside owned raw mode").into());
     }
-    session.pty.resize(4, 40)?;
     session
         .pty
         .send(b"\x1b[200~/usr/bin/printf QUEUED_AFTER_ADMISSION\x1b[201~\r")?;
-    session.pty.drain_for(Duration::from_millis(150))?;
-    if contains(session.pty.output(), b"QUEUED_AFTER_ADMISSION") {
-        return Err(
-            io::Error::other("terminal input was consumed before catalog publication").into(),
-        );
-    }
+    session
+        .pty
+        .wait_for_screen("input while catalog loading", |screen| {
+            screen.text().contains("QUEUED_AFTER_ADMISSION")
+        })?;
     fs::write(&session.catalog_gate, b"release\n")?;
+    let catalog_published = PathBuf::from(format!("{}.published", session.catalog_gate.display()));
+    wait_for_file(&mut session, catalog_published)?;
     session.pty.resize(30, 120)?;
-    session.pty.wait_for_screen(
-        "queued command transcript after catalog admission",
-        |screen| {
+    session
+        .pty
+        .wait_for_screen("queued command transcript while catalog loads", |screen| {
             let text = screen.text();
             text.contains("❯ /usr/bin/printf QUEUED_AFTER_ADMISSION")
                 && text.contains("QUEUED_AFTER_ADMISSION")
                 && screen.bottom_line().contains("result kept in viewport")
-        },
-    )?;
+        })?;
     session.pty.type_text("git st")?;
     session.pty.send(b"\t")?;
     session.pty.wait_for(b"git status [--short]")?;
@@ -2485,6 +2484,16 @@ fn check_rich_review_regressions(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.wait_for(b"VIEWPORT-END")?;
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"^C")?;
+    // The cancellation marker is emitted before the rich surface finishes
+    // its replacement frame. Wait for that complete idle frame so Ctrl-D
+    // cannot race the cancellation repaint and make this cleanup assertion
+    // depend on scheduler timing.
+    session
+        .pty
+        .wait_for_screen("idle prompt after cancellation", |screen| {
+            screen.text().contains("interactive input cancelled")
+                && screen.bottom_line().contains("NORMAL")
+        })?;
     let cleanup_start = session.pty.output().len();
     send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     if !contains(&session.pty.output()[cleanup_start..], b"\x1b[?25h") {

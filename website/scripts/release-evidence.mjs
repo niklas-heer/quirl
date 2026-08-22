@@ -18,6 +18,7 @@ export const generatedEvidenceMirrorPath =
 export const projectionPaths = [
   'README.md',
   'CHANGELOG.md',
+  'RELEASE_NOTES.md',
   'docs/language-design.md',
   'docs/release-checklist.md',
   'docs/security-accessibility-audit-v0.1.md',
@@ -157,17 +158,16 @@ export function renderProjection(metadata, format = 'markdown') {
     metadata.status === 'historical'
       ? [
           `> **Release evidence status — historical.** Artifact evidence for measured ${identity} is historical.`,
-          `>${evidenceCommitClause(metadata)} It is not evidence for the corrected implementation, which has no fresh exact-candidate measurement.`,
+          `>${evidenceCommitClause(metadata)} It is evidence only for that named artifact, not for a later candidate.`,
+          '> This historical record does not assert the release-readiness or human-review state of a later candidate.',
         ]
       : [
           `> **Release evidence status — current.** The record for measured ${identity} is current exact-candidate evidence.`,
           ...(metadata.evidenceDocumentationCommit
             ? [`>${evidenceCommitClause(metadata)}`]
             : []),
+          '> Human terminal and demo review status is recorded in the exact-candidate performance record.',
         ];
-  statusLines.push(
-    '> Human review on named Linux and macOS terminals, remote-PTY review, and real-terminal demo review remain incomplete.',
-  );
   return `${markers.begin}\n${statusLines.join('\n')}\n${markers.end}`;
 }
 
@@ -175,9 +175,9 @@ export function renderWebsiteEvidenceNotice(metadata) {
   const label = metadata.status === 'historical' ? 'Historical artifact evidence' : 'Current exact-candidate evidence';
   const relationship =
     metadata.status === 'historical'
-      ? 'It is not evidence for the corrected implementation.'
-      : 'It is the current exact-candidate automated performance record.';
-  return `> **${label}:** This record measures candidate \`${metadata.measuredCandidateCommit}\` and artifact \`${metadata.artifactSha256}\`. ${relationship} Human Linux/macOS terminal, remote-PTY, and real-terminal demo review remain incomplete.\n\n`;
+      ? 'It applies only to that artifact and does not assert the readiness of a later candidate.'
+      : 'It is the current exact-candidate automated performance record; the record also states the human terminal and demo review status.';
+  return `> **${label}:** This record measures candidate \`${metadata.measuredCandidateCommit}\` and artifact \`${metadata.artifactSha256}\`. ${relationship}\n\n`;
 }
 
 export function replaceProjection(contents, metadata, path) {

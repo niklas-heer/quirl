@@ -107,8 +107,9 @@ Release evidence status has an additional semantic source of truth: the strict
 `docs/benchmarks/release-v1.0.md`. The shared website parser accepts only the
 closed `historical`/`current` states, exact commit and digest shapes, a UTC
 measurement timestamp, and a bounded platform scope. `sync-docs.mjs` derives
-the marked README, changelog, language-design, checklist, audit, and website
-status regions from that header. The release-attribution check also verifies
+the marked README, changelog, release notes, language-design, checklist, audit,
+and website status regions from that header. The release-attribution check also
+verifies
 named Git objects and, for current evidence, the evidence-only direct child of
 the measured candidate. A byte-fresh mirror cannot therefore override or
 contradict the canonical evidence state.
