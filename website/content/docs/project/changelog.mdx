@@ -9,6 +9,10 @@ Notable user-visible changes to Quirl are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Content under `[Unreleased]` remains candidate work. A versioned entry is cut
+only after its exact commit and artifacts pass the
+[release checklist](/docs/project/release-0.1/release-checklist).
+
 ## [Unreleased]
 
 ### Added
@@ -55,14 +59,21 @@ Notable user-visible changes to Quirl are recorded here. The format follows
 - The capable-TTY default is now the rich Ratatui inline frame. Reedline remains
   the explicit and automatic simple-terminal fallback; its removal is not part
   of this change.
-- Advanced the pre-release config contract to v3. It retains the v2 rich-surface
-  settings and adds validated shared semantic themes; unversioned v0 and
-  explicit v1/v2 configurations migrate to v3 defaults before validation, while
-  future versions fail closed.
+- Advanced the release-candidate config contract to v4. It retains v3's
+  validated shared semantic themes, changes the polished defaults to a compact
+  welcome banner, automatic completion after one character, and an active Rust
+  toolchain right-prompt segment, and deterministically migrates unversioned v0
+  plus explicit v1/v2/v3 configurations before validation. Future versions
+  fail closed.
 - Added a release-only website gate with non-mutating generated-mirror
   freshness, semantic release-evidence attribution, lint, route type checking,
   and a production build. It uses the exact `website/package-lock.json`
   dependency graph and is not part of narrow Rust-only checks.
+- Runtime assets now use an exact-version website channel with immutable,
+  content-addressed payloads and per-asset provenance. Completion knowledge can
+  be refreshed independently of binary releases while retaining the compatible
+  command model, required license notice, the previous valid local generation,
+  and strict binary-version, size, format, and SHA-256 admission checks.
 - `Record` is now an insertion-ordered mapping instead of an alphabetized one:
   `select` emits fields in the requested order and table rendering unions
   columns across rows in first-seen order, instead of both always sorting
@@ -77,9 +88,11 @@ Notable user-visible changes to Quirl are recorded here. The format follows
 - Typing a `quirl` CLI-only subcommand name (`config`, `plugin`, `catalog`,
   `sdk`) or a bare `quirl` directly in the interactive shell now fails with a
   specific hint instead of a generic "not found on PATH" message.
-- The rich surface's input row now shows a dimmed, animated spinner glyph in
-  place of the prompt indicator while a foreground command is still running,
-  so it can no longer be mistaken for an idle, ready-for-input prompt.
+- The rich surface now tails bounded stdout and stderr while a foreground
+  command runs. Its input row shows a dimmed animated spinner instead of the
+  prompt indicator, silent commands still repaint elapsed time on liveness
+  ticks, and carriage-return progress updates replace their live line rather
+  than filling the transcript.
 
 ### Known limitations
 
@@ -103,7 +116,3 @@ Notable user-visible changes to Quirl are recorded here. The format follows
 > Evidence commit `14e70939d039d96c195f57452a0e1ec3928194af` documents that measurement. It is not evidence for the corrected implementation, which has no fresh exact-candidate measurement.
 > Human review on named Linux and macOS terminals, remote-PTY review, and real-terminal demo review remain incomplete.
 {/* END QUIRL RELEASE EVIDENCE STATUS */}
-
-The first version entry will be cut only after the exact candidate passes the
-[release checklist](/docs/project/release-0.1/release-checklist). Until then, everything above is
-part of the unreleased 0.1 candidate.

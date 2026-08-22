@@ -61,8 +61,13 @@ const documents = [
   ['docs/decisions/0016-runtime-layering-contract.md', 'architecture/decisions/0016-runtime-layering-contract.mdx'],
   ['docs/decisions/0017-shared-execution-contract.md', 'architecture/decisions/0017-shared-execution-contract.mdx'],
   ['docs/decisions/0018-typed-lua-runner-abi.md', 'architecture/decisions/0018-typed-lua-runner-abi.mdx'],
+  ['docs/decisions/0019-isolated-lua-worker-deadlines.md', 'architecture/decisions/0019-isolated-lua-worker-deadlines.mdx'],
+  ['docs/decisions/0020-owned-unix-process-group-anchor.md', 'architecture/decisions/0020-owned-unix-process-group-anchor.mdx'],
   ['docs/decisions/0021-sqlite-local-command-intelligence.md', 'architecture/decisions/0021-sqlite-local-command-intelligence.mdx'],
+  ['docs/decisions/0022-persistent-rich-session-transcript.md', 'architecture/decisions/0022-persistent-rich-session-transcript.mdx'],
+  ['docs/decisions/0023-rust-1.97-compatibility.md', 'architecture/decisions/0023-rust-1.97-compatibility.mdx'],
   ['docs/decisions/0024-kdl-native-command-catalog.md', 'architecture/decisions/0024-kdl-native-command-catalog.mdx'],
+  ['docs/decisions/0025-fine-tuned-command-retrieval-model.md', 'architecture/decisions/0025-fine-tuned-command-retrieval-model.mdx'],
   ['docs/decisions/0026-rust-native-releases-and-runtime-assets.md', 'architecture/decisions/0026-rust-native-releases-and-runtime-assets.mdx'],
 ];
 

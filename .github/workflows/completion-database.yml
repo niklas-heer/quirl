@@ -1,9 +1,9 @@
 name: Completion database
 
-# Publishes the completion-database and command-model runtime assets to the
-# website, independently of cutting a quirl binary release. Builds against
-# whatever version is *currently* shipped (`--identity current`), not a
-# planned next version, so it's safe to run on any clean commit on `main`.
+# Advances the current Quirl version's website asset channel independently of
+# cutting a binary release. The small version-scoped manifest is the mutable
+# pointer; every payload filename includes its SHA-256 and is immutable. A
+# completion refresh retains the current command model instead of rebuilding it.
 #
 # Manual dispatch only for now: once a run has been sanity-checked against
 # the published website, add a `push` trigger scoped to
@@ -21,7 +21,7 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: write
 
@@ -29,8 +29,51 @@ jobs:
       - name: Check out the current candidate
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: main
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
+
+      - name: Set up the website toolchain
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install the exact website dependency graph
+        run: npm ci --prefix website
+
+      - name: Resolve the version-scoped website channel
+        id: channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "quirl-cli") | .version')"
+          test -n "$version"
+          channel_directory="website/public/reference/v${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "directory=$channel_directory" >> "$GITHUB_OUTPUT"
+          if test -f "$channel_directory/asset-manifest-v2.json"
+          then
+            echo "has_previous=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_previous=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify the exact released binary version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUIRL_VERSION: ${{ steps.channel.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${QUIRL_VERSION}"
+          local_commit="$(git rev-parse "${tag}^{commit}")"
+          remote_commit="$(git ls-remote --tags --refs origin "refs/tags/${tag}" | cut -f1)"
+          test -n "$remote_commit"
+          test "$local_commit" = "$remote_commit"
+          release_tag="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName')"
+          test "$release_tag" = "$tag"
 
       - name: Build the completion database
         run: >-
@@ -39,53 +82,161 @@ jobs:
           --identity current
           --output "${{ runner.temp }}/assets/completion-database"
 
-      - name: Build the command model
+      - name: Enforce the bounded website generation history
+        env:
+          CHANNEL_DIRECTORY: ${{ steps.channel.outputs.directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          generations_max=32
+          new_database="$(find "${{ runner.temp }}/assets/completion-database" -maxdepth 1 -type f -name 'quirl-completion-database-*.sqlite3' -print -quit)"
+          test -n "$new_database"
+          retained=0
+          if test -d "$CHANNEL_DIRECTORY"
+          then
+            retained="$(find "$CHANNEL_DIRECTORY" -maxdepth 1 -type f -name 'quirl-completion-database-*.sqlite3' | wc -l | tr -d ' ')"
+          fi
+          if ! test -e "$CHANNEL_DIRECTORY/$(basename "$new_database")"
+          then
+            retained=$((retained + 1))
+          fi
+          if test "$retained" -gt "$generations_max"
+          then
+            echo "The v${{ steps.channel.outputs.version }} website channel already retains $generations_max immutable completion generations." >&2
+            echo "Review the channel retention/version policy before publishing another generation." >&2
+            exit 1
+          fi
+
+      - name: Build the initial command model
+        if: steps.channel.outputs.has_previous != 'true'
         run: >-
           cargo xtask assets build
           --kind command-model
           --identity current
           --output "${{ runner.temp }}/assets/command-model"
 
-      - name: Describe the complete downloadable asset set
-        run: >-
-          cargo xtask assets manifest
-          --input "${{ runner.temp }}/assets"
-          --output "${{ runner.temp }}/asset-manifest-v1.json"
-          --identity current
-
-      - name: Rebase the manifest onto the website
-        run: >-
-          cargo xtask assets rebase-manifest
-          --input "${{ runner.temp }}/asset-manifest-v1.json"
-          --base-url https://quirl.vercel.app/reference
-          --output "${{ runner.temp }}/asset-manifest-v1-rebased.json"
-
-      - name: Publish into the website's static reference directory
+      - name: Describe the advanced downloadable asset set
+        env:
+          CHANNEL_DIRECTORY: ${{ steps.channel.outputs.directory }}
+          HAS_PREVIOUS: ${{ steps.channel.outputs.has_previous }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p website/public/reference
-          # Asset filenames embed the version (quirl-completion-database-vX.Y.Z.*),
-          # so a later real version bump would otherwise leave this run's files
-          # behind forever; clear the previous payloads before copying today's.
-          find website/public/reference -maxdepth 1 -type f \
-            \( -name '*.sqlite3' -o -name '*.tar' \) -delete
+          arguments=(
+            --input "${{ runner.temp }}/assets"
+            --output "${{ runner.temp }}/asset-manifest-v2.json"
+            --identity current
+          )
+          if test "$HAS_PREVIOUS" = true
+          then
+            arguments+=(--previous-manifest "$CHANNEL_DIRECTORY/asset-manifest-v2.json")
+          fi
+          cargo xtask assets manifest "${arguments[@]}"
+
+      - name: Rebase the manifest onto the website
+        env:
+          QUIRL_VERSION: ${{ steps.channel.outputs.version }}
+        run: >-
+          cargo xtask assets rebase-manifest
+          --input "${{ runner.temp }}/asset-manifest-v2.json"
+          --base-url "https://quirl.vercel.app/reference/v${QUIRL_VERSION}"
+          --output "${{ runner.temp }}/asset-manifest-v2-rebased.json"
+
+      - name: Admit the channel with the exact released binary
+        env:
+          CHANNEL_DIRECTORY: ${{ steps.channel.outputs.directory }}
+          QUIRL_VERSION: ${{ steps.channel.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke_assets="${{ runner.temp }}/smoke-assets"
+          released_source="${{ runner.temp }}/released-source"
+          released_target="${{ runner.temp }}/released-target"
+          mkdir -p "$smoke_assets"
+          copy_immutable() {
+            source="$1"
+            destination="$smoke_assets/$(basename "$source")"
+            if test -e "$destination"
+            then
+              cmp --silent "$source" "$destination"
+            else
+              cp "$source" "$destination"
+            fi
+          }
+          if test -d "$CHANNEL_DIRECTORY"
+          then
+            while IFS= read -r -d '' source
+            do
+              copy_immutable "$source"
+            done < <(find "$CHANNEL_DIRECTORY" -maxdepth 1 -type f \
+              \( -name '*.sqlite3' -o -name '*.tar' -o -name 'quirl-*-license-*.txt' \) -print0)
+          fi
+          while IFS= read -r -d '' source
+          do
+            copy_immutable "$source"
+          done < <(find "${{ runner.temp }}/assets" -mindepth 2 -maxdepth 2 -type f \
+            \( -name '*.sqlite3' -o -name '*.tar' -o -name 'quirl-*-license-*.txt' \) -print0)
+          cargo xtask assets rebase-manifest \
+            --input "${{ runner.temp }}/asset-manifest-v2.json" \
+            --base-url "file://${smoke_assets}" \
+            --output "${{ runner.temp }}/asset-manifest-v2-local.json"
+          git worktree add --detach "$released_source" "v${QUIRL_VERSION}"
+          trap 'git worktree remove --force "$released_source" || true' EXIT
+          cargo build \
+            --manifest-path "$released_source/Cargo.toml" \
+            --package quirl-cli \
+            --target-dir "$released_target"
+          QUIRL_ASSET_DATA_DIR="${{ runner.temp }}/smoke-data" \
+          QUIRL_ASSET_CACHE_DIR="${{ runner.temp }}/smoke-cache" \
+            "$released_target/debug/quirl" assets update \
+              --manifest "${{ runner.temp }}/asset-manifest-v2-local.json" \
+              --format json
+          QUIRL_ASSET_DATA_DIR="${{ runner.temp }}/smoke-data" \
+          QUIRL_ASSET_CACHE_DIR="${{ runner.temp }}/smoke-cache" \
+            "$released_target/debug/quirl" assets status --format json
+
+      - name: Publish into the website's static reference directory
+        env:
+          CHANNEL_DIRECTORY: ${{ steps.channel.outputs.directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$CHANNEL_DIRECTORY"
           find "${{ runner.temp }}/assets" -mindepth 2 -maxdepth 2 -type f \
-            \( -name '*.sqlite3' -o -name '*.tar' \) \
-            -exec cp {} website/public/reference/ \;
-          cp "${{ runner.temp }}/asset-manifest-v1-rebased.json" website/public/reference/asset-manifest-v1.json
-          git status --porcelain -- website/public/reference
+            \( -name '*.sqlite3' -o -name '*.tar' -o -name 'quirl-*-license-*.txt' \) \
+            -print0 | while IFS= read -r -d '' source
+          do
+            destination="$CHANNEL_DIRECTORY/$(basename "$source")"
+            if test -e "$destination"
+            then
+              cmp --silent "$source" "$destination"
+            else
+              cp "$source" "$destination"
+            fi
+          done
+          cp "${{ runner.temp }}/asset-manifest-v2-rebased.json" "$CHANNEL_DIRECTORY/asset-manifest-v2.json"
+          git status --porcelain -- "$CHANNEL_DIRECTORY"
+
+      - name: Validate the complete website with the advanced channel
+        run: cargo xtask website-check
 
       - name: Commit and push the published assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add website/public/reference
-          if git diff --cached --quiet -- website/public/reference; then
+          git add "${{ steps.channel.outputs.directory }}"
+          if git diff --cached --quiet -- "${{ steps.channel.outputs.directory }}"; then
             echo "No change to publish."
             exit 0
           fi
           git commit -m "chore(website): publish refreshed completion database"
+          # The helper must retain the variable reference literally; Git expands
+          # it only when push requests credentials in this final write step.
+          # shellcheck disable=SC2016
+          git config credential.helper '!f() { echo username=x-access-token; echo password=$GITHUB_TOKEN; }; f'
+          trap 'git config --unset-all credential.helper || true' EXIT
           git push origin HEAD:main

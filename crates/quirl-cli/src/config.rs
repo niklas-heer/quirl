@@ -406,9 +406,14 @@ fn migrate(file: &Path, dry_run: bool, format: ConfigOutputFormat) -> Result<i32
     match format {
         ConfigOutputFormat::Json => print_json(&report)?,
         ConfigOutputFormat::Text if report.changed => {
+            let source_version = report.source_schema_version.map_or_else(
+                || "unversioned config".to_owned(),
+                |version| format!("schema_version {version}"),
+            );
             println!(
-                "would migrate {} from unversioned config to schema_version {}; no files changed\n--- migration preview ---",
+                "would migrate {} from {} to schema_version {}; no files changed\n--- migration preview ---",
                 escape_terminal_controls(&file.display().to_string()),
+                source_version,
                 CONFIG_SCHEMA_VERSION
             );
             if let Some(candidate) = &report.candidate_source {

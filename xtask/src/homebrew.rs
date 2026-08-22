@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     error::Error,
     fs::{self, OpenOptions},
@@ -193,20 +193,26 @@ fn validate_manifest(root: &Path, manifest: &ReleaseManifest) -> Result<(), Box<
         || current_commit(root)? != manifest.candidate_commit
         || local_tag_target(root, &manifest.tag)? != manifest.candidate_commit
         || manifest.artifacts.len() != 4
-        || manifest.asset_manifest.as_deref() != Some("asset-manifest-v1.json")
+        || manifest.asset_manifest.as_deref() != Some("asset-manifest-v2.json")
     {
         return Err(input_error(
             "release manifest is not a complete Quirl v1 release",
         ));
     }
     crate::assets::AssetManifest {
-        schema_version: 1,
-        release_version: manifest.version.clone(),
-        candidate_commit: manifest.candidate_commit.clone(),
-        source_date_epoch: manifest.source_date_epoch,
+        schema_version: 2,
+        quirl_version: manifest.version.clone(),
         assets: manifest.assets.clone(),
     }
     .validate_for_release(&manifest.version)?;
+    if manifest.assets.iter().any(|asset| {
+        asset.source_revision != manifest.candidate_commit
+            || asset.source_date_epoch != manifest.source_date_epoch
+    }) {
+        return Err(input_error(
+            "release asset source identity does not match the native candidate",
+        ));
+    }
     let expected = [
         "aarch64-apple-darwin",
         "aarch64-unknown-linux-gnu",
@@ -299,8 +305,20 @@ fn offline_package_test(
             "offline Homebrew package differs from the release manifest",
         ));
     }
-    let binary = extract_single_binary(&archive)?;
-    let temporary = install_temporary_binary(&binary)?;
+    let package = extract_native_package(&archive)?;
+    if [
+        package.product_license.as_slice(),
+        package.third_party_notices.as_slice(),
+        package.third_party_licenses.as_slice(),
+    ]
+    .iter()
+    .any(|document| document.is_empty())
+    {
+        return Err(input_error(
+            "native package contains an empty redistribution document",
+        ));
+    }
+    let temporary = install_temporary_binary(&package.binary)?;
     verify_binary_version(&temporary.path, &manifest.version)
 }
 
@@ -316,51 +334,134 @@ fn host_release_target() -> Result<&'static str, Box<dyn Error>> {
     }
 }
 
-fn extract_single_binary(archive: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+struct NativePackage {
+    binary: Vec<u8>,
+    product_license: Vec<u8>,
+    third_party_notices: Vec<u8>,
+    third_party_licenses: Vec<u8>,
+}
+
+fn extract_native_package(archive: &[u8]) -> Result<NativePackage, Box<dyn Error>> {
     if archive.len() < 1_536 || !archive.len().is_multiple_of(512) {
         return Err(input_error(
             "native package is not a complete ustar archive",
         ));
     }
-    let header = &archive[..512];
-    if &header[257..263] != b"ustar\0" {
-        return Err(input_error("native package has no ustar header"));
+    let mut offset = 0usize;
+    let mut names = BTreeSet::new();
+    let mut binary = None;
+    let mut product_license = None;
+    let mut third_party_notices = None;
+    let mut third_party_licenses = None;
+    while archive.len().saturating_sub(offset) > 1_024 {
+        let entry = parse_package_tar_entry(archive, offset)?;
+        if !names.insert(entry.name) {
+            return Err(input_error("native package contains a duplicate entry"));
+        }
+        match entry.name {
+            b"bin/quirl" if entry.mode == 0o755 => binary = Some(entry.bytes.to_vec()),
+            b"LICENSE" if entry.mode == 0o644 => {
+                product_license = Some(entry.bytes.to_vec());
+            }
+            b"THIRD_PARTY_NOTICES.md" if entry.mode == 0o644 => {
+                third_party_notices = Some(entry.bytes.to_vec());
+            }
+            b"THIRD_PARTY_LICENSES.txt" if entry.mode == 0o644 => {
+                third_party_licenses = Some(entry.bytes.to_vec());
+            }
+            _ => return Err(input_error("native package contains an unexpected entry")),
+        }
+        offset = entry.next_offset;
+    }
+    if archive.len().checked_sub(offset) != Some(1_024)
+        || !archive[offset..].iter().all(|byte| *byte == 0)
+        || names
+            != BTreeSet::from([
+                b"bin/quirl".as_slice(),
+                b"LICENSE".as_slice(),
+                b"THIRD_PARTY_NOTICES.md".as_slice(),
+                b"THIRD_PARTY_LICENSES.txt".as_slice(),
+            ])
+    {
+        return Err(input_error(
+            "native package does not contain the exact release file set",
+        ));
+    }
+    Ok(NativePackage {
+        binary: binary.ok_or_else(|| input_error("native package binary is missing"))?,
+        product_license: product_license
+            .ok_or_else(|| input_error("native package product license is missing"))?,
+        third_party_notices: third_party_notices
+            .ok_or_else(|| input_error("native package third-party notices are missing"))?,
+        third_party_licenses: third_party_licenses
+            .ok_or_else(|| input_error("native package third-party licenses are missing"))?,
+    })
+}
+
+struct PackageTarEntry<'a> {
+    name: &'a [u8],
+    bytes: &'a [u8],
+    mode: usize,
+    next_offset: usize,
+}
+
+fn parse_package_tar_entry(
+    archive: &[u8],
+    offset: usize,
+) -> Result<PackageTarEntry<'_>, Box<dyn Error>> {
+    let header_end = offset
+        .checked_add(512)
+        .ok_or_else(|| input_error("native package header offset overflowed"))?;
+    let header = archive
+        .get(offset..header_end)
+        .ok_or_else(|| input_error("native package entry header is truncated"))?;
+    if &header[257..263] != b"ustar\0" || header[156] != b'0' {
+        return Err(input_error(
+            "native package entry is not a regular ustar file",
+        ));
     }
     let name_end = header[..100]
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(100);
-    if &header[..name_end] != b"bin/quirl" {
-        return Err(input_error(
-            "native package does not install exactly bin/quirl",
-        ));
-    }
-    let size_field = std::str::from_utf8(&header[124..136])?
-        .trim_matches(char::from(0))
-        .trim();
-    let size = usize::from_str_radix(size_field, 8)
-        .map_err(|_| input_error("native package has an invalid entry size"))?;
+    let size = parse_tar_octal(&header[124..136], "entry size")?;
+    let mode = parse_tar_octal(&header[100..108], "entry mode")?;
     if size == 0 || size > PACKAGE_BYTES_MAX {
         return Err(input_error(
-            "native package binary size is outside its limit",
+            "native package entry size is outside its limit",
         ));
     }
-    let end = 512usize
+    let end = header_end
         .checked_add(size)
         .ok_or_else(|| input_error("native package entry size overflowed"))?;
-    let padded_end = end
+    let next_offset = end
         .checked_add(511)
         .and_then(|value| value.checked_div(512))
         .and_then(|value| value.checked_mul(512))
         .ok_or_else(|| input_error("native package padding overflowed"))?;
-    if padded_end.checked_add(1_024) != Some(archive.len())
-        || !archive[end..].iter().all(|byte| *byte == 0)
-    {
-        return Err(input_error(
-            "native package contains unexpected entries or trailing bytes",
-        ));
+    let bytes = archive
+        .get(header_end..end)
+        .ok_or_else(|| input_error("native package entry is truncated"))?;
+    let padding = archive
+        .get(end..next_offset)
+        .ok_or_else(|| input_error("native package entry padding is truncated"))?;
+    if !padding.iter().all(|byte| *byte == 0) {
+        return Err(input_error("native package entry padding is not zeroed"));
     }
-    Ok(archive[512..end].to_vec())
+    Ok(PackageTarEntry {
+        name: &header[..name_end],
+        bytes,
+        mode,
+        next_offset,
+    })
+}
+
+fn parse_tar_octal(field: &[u8], label: &str) -> Result<usize, Box<dyn Error>> {
+    let value = std::str::from_utf8(field)?
+        .trim_matches(char::from(0))
+        .trim();
+    usize::from_str_radix(value, 8)
+        .map_err(|_| input_error(format!("native package has an invalid {label}")))
 }
 
 struct TemporaryBinary {
@@ -417,12 +518,20 @@ fn render_formula(manifest: &ReleaseManifest) -> Result<String, Box<dyn Error>> 
     render_platform(&mut output, "linux", linux_arm, linux_intel);
     output.push_str("\n  def install\n");
     output.push_str("    bin.install \"bin/quirl\"\n");
+    output.push_str(
+        "    (pkgshare/\"licenses\").install \"LICENSE\", \"THIRD_PARTY_NOTICES.md\", \"THIRD_PARTY_LICENSES.txt\"\n",
+    );
     output.push_str("  end\n\n");
     output.push_str("  test do\n");
     output.push_str(&format!(
         "    assert_match \"quirl {}\", shell_output(\"#{{bin}}/quirl --version\", 0)\n",
         manifest.version
     ));
+    output.push_str(
+        "    %w[LICENSE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.txt].each do |notice|\n",
+    );
+    output.push_str("      assert_path_exists pkgshare/\"licenses\"/notice\n");
+    output.push_str("    end\n");
     output.push_str("  end\n");
     output.push_str("end\n");
     if output.len() > FORMULA_BYTES_MAX {
@@ -466,6 +575,8 @@ fn validate_formula_shape(formula: &str) -> Result<(), Box<dyn Error>> {
         "  on_macos do",
         "  on_linux do",
         "bin.install \"bin/quirl\"",
+        "(pkgshare/\"licenses\").install \"LICENSE\", \"THIRD_PARTY_NOTICES.md\", \"THIRD_PARTY_LICENSES.txt\"",
+        "assert_path_exists pkgshare/\"licenses\"/notice",
         "shell_output(\"#{bin}/quirl --version\", 0)",
     ];
     if required.iter().any(|marker| !formula.contains(marker))
@@ -535,12 +646,23 @@ mod tests {
             .into_iter()
             .map(release_artifact)
             .collect(),
-            asset_manifest: Some("asset-manifest-v1.json".to_owned()),
+            asset_manifest: Some("asset-manifest-v2.json".to_owned()),
             assets: Vec::new(),
         };
         let formula = render_formula(&manifest).unwrap();
         assert!(validate_formula_shape(&formula).is_ok());
         assert_eq!(formula.matches("      sha256 \"").count(), 4);
+        assert_eq!(
+            formula.matches("(pkgshare/\"licenses\").install").count(),
+            1
+        );
+        for name in [
+            "LICENSE",
+            "THIRD_PARTY_NOTICES.md",
+            "THIRD_PARTY_LICENSES.txt",
+        ] {
+            assert!(formula.contains(name));
+        }
         assert!(!formula.contains("completion-database"));
         assert!(!formula.contains("command-model"));
     }
@@ -555,15 +677,44 @@ mod tests {
     }
 
     #[test]
-    fn offline_install_accepts_only_the_single_expected_binary_entry() {
-        let archive =
-            crate::release::render_tar_entries(&[("bin/quirl", b"binary", 0o755)], 1).unwrap();
-        assert_eq!(extract_single_binary(&archive).unwrap(), b"binary");
-        let extra = crate::release::render_tar_entries(
-            &[("bin/quirl", b"binary", 0o755), ("unexpected", b"x", 0o644)],
+    fn offline_install_accepts_only_the_exact_release_file_set() {
+        let archive = crate::release::render_tar_entries(
+            &[
+                ("bin/quirl", b"binary", 0o755),
+                ("LICENSE", b"license", 0o644),
+                ("THIRD_PARTY_NOTICES.md", b"notices", 0o644),
+                ("THIRD_PARTY_LICENSES.txt", b"dependency licenses", 0o644),
+            ],
             1,
         )
         .unwrap();
-        assert!(extract_single_binary(&extra).is_err());
+        let package = extract_native_package(&archive).unwrap();
+        assert_eq!(package.binary, b"binary");
+        assert_eq!(package.product_license, b"license");
+        assert_eq!(package.third_party_notices, b"notices");
+        assert_eq!(package.third_party_licenses, b"dependency licenses");
+        let extra = crate::release::render_tar_entries(
+            &[
+                ("bin/quirl", b"binary", 0o755),
+                ("LICENSE", b"license", 0o644),
+                ("THIRD_PARTY_NOTICES.md", b"notices", 0o644),
+                ("THIRD_PARTY_LICENSES.txt", b"dependency licenses", 0o644),
+                ("unexpected", b"x", 0o644),
+            ],
+            1,
+        )
+        .unwrap();
+        assert!(extract_native_package(&extra).is_err());
+        let executable_license = crate::release::render_tar_entries(
+            &[
+                ("bin/quirl", b"binary", 0o755),
+                ("LICENSE", b"license", 0o755),
+                ("THIRD_PARTY_NOTICES.md", b"notices", 0o644),
+                ("THIRD_PARTY_LICENSES.txt", b"dependency licenses", 0o644),
+            ],
+            1,
+        )
+        .unwrap();
+        assert!(extract_native_package(&executable_license).is_err());
     }
 }

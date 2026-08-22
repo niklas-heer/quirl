@@ -43,6 +43,18 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 const TEMPORARY_ATTEMPTS_MAX: usize = 32;
 const RELEASE_NOTES_PATH: &str = "RELEASE_NOTES.md";
 const RELEASE_PREPARATION_COMMIT: &str = "chore(release): prepare next version";
+const PRODUCT_LICENSE_PATH: &str = "LICENSE";
+const THIRD_PARTY_NOTICES_PATH: &str = "crates/quirl-process/THIRD_PARTY_NOTICES.md";
+const ARCHIVE_THIRD_PARTY_NOTICES_PATH: &str = "THIRD_PARTY_NOTICES.md";
+const THIRD_PARTY_INVENTORY_PATH: &str = "distribution/quirl-cli-third-party.tsv";
+const THIRD_PARTY_LICENSE_FALLBACK_ROOT: &str = "distribution/licenses";
+const ARCHIVE_THIRD_PARTY_LICENSES_PATH: &str = "THIRD_PARTY_LICENSES.txt";
+const RELEASE_DEPENDENCIES_MAX: usize = 512;
+const LICENSE_SCAN_ENTRIES_MAX: usize = 100_000;
+const LICENSE_SCAN_DEPTH_MAX: usize = 8;
+const LICENSE_DOCUMENTS_MAX: usize = 1_024;
+const LICENSE_DOCUMENT_BYTES_MAX: usize = 512 * 1024;
+const LICENSE_REPORT_BYTES_MAX: usize = 8 * 1024 * 1024;
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 /// One release lifecycle action.
@@ -64,6 +76,9 @@ pub(crate) enum ReleaseCommand {
         /// Fail unless the intended tag is absent from the origin remote.
         #[arg(long, requires = "expected_tag")]
         require_remote_tag_absent: bool,
+        /// Fail unless HEAD is the commit currently advertised by this origin branch.
+        #[arg(long)]
+        required_remote_branch: Option<String>,
     },
     /// Preview or atomically create and push the immutable lightweight release tag.
     Tag {
@@ -184,6 +199,55 @@ struct BuildInfo {
     source_dirty: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CargoMetadata {
+    packages: Vec<CargoPackage>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CargoPackage {
+    name: String,
+    version: String,
+    license: Option<String>,
+    license_file: Option<String>,
+    repository: Option<String>,
+    source: Option<String>,
+    manifest_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DependencyContract {
+    name: String,
+    version: String,
+    declared_license: String,
+    source: String,
+    repository: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReleaseDependency {
+    contract: DependencyContract,
+    package_root: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct InventoryRecord {
+    contract: DependencyContract,
+    platforms: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct LicenseDocument {
+    bytes: Vec<u8>,
+    origins: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct PackageLicenseFile {
+    relative_path: String,
+    bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PackageProvenance {
@@ -260,7 +324,13 @@ pub(crate) fn run(root: &Path, command: ReleaseCommand) -> Result<(), Box<dyn Er
         ReleaseCommand::Verify {
             expected_tag,
             require_remote_tag_absent,
-        } => verify(root, expected_tag.as_deref(), require_remote_tag_absent),
+            required_remote_branch,
+        } => verify(
+            root,
+            expected_tag.as_deref(),
+            require_remote_tag_absent,
+            required_remote_branch.as_deref(),
+        ),
         ReleaseCommand::Tag {
             expected_tag,
             write,
@@ -356,7 +426,8 @@ fn plan(root: &Path) -> Result<ReleasePlan, Box<dyn Error>> {
         (Some(version), Bump::None | Bump::FirstRelease, false) => version.clone(),
     };
     let next_version = render_version(&next);
-    let release_notes = render_release_notes(&next_version, &commits);
+    let changelog = read_utf8_bounded(&root.join("CHANGELOG.md"), CHANGELOG_BYTES_MAX)?;
+    let release_notes = render_release_notes(&next_version, &changelog, &commits);
     Ok(ReleasePlan {
         schema_version: CONTRACT_VERSION,
         candidate_commit,
@@ -422,6 +493,7 @@ fn verify(
     root: &Path,
     expected_tag: Option<&str>,
     require_remote_tag_absent: bool,
+    required_remote_branch: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let plan = plan(root)?;
     if !plan.candidate_clean {
@@ -432,6 +504,9 @@ fn verify(
             "workspace version {} does not match planned version {}; run `cargo xtask release prepare --write`, review, and commit it",
             plan.workspace_version, plan.next_version
         )));
+    }
+    if let Some(branch) = required_remote_branch {
+        verify_remote_branch_candidate(root, branch, &plan.candidate_commit)?;
     }
     if let Some(expected_tag) = expected_tag {
         let planned_tag = format!("v{}", plan.next_version);
@@ -465,6 +540,68 @@ fn verify(
         clean: true,
         release_notes_sha256: sha256_hex(plan.release_notes.as_bytes()),
     })
+}
+
+fn verify_remote_branch_candidate(
+    root: &Path,
+    branch: &str,
+    candidate_commit: &str,
+) -> Result<(), Box<dyn Error>> {
+    validate_remote_branch(branch)?;
+    let reference = format!("refs/heads/{branch}");
+    let arguments = [
+        OsStr::new("ls-remote"),
+        OsStr::new("--exit-code"),
+        OsStr::new("--heads"),
+        OsStr::new("origin"),
+        OsStr::new(&reference),
+    ];
+    let output = command_output_with_directory(
+        Path::new("git"),
+        &arguments,
+        root,
+        PROCESS_TIMEOUT,
+        GIT_OUTPUT_BYTES_MAX,
+    )?;
+    ensure_output_success("origin release branch lookup", &output)?;
+    parse_remote_branch(&output.stdout, branch, &reference, candidate_commit)
+}
+
+fn parse_remote_branch(
+    output: &[u8],
+    branch: &str,
+    expected_reference: &str,
+    candidate_commit: &str,
+) -> Result<(), Box<dyn Error>> {
+    let line = std::str::from_utf8(output)?;
+    let (commit, found_reference) = line
+        .trim()
+        .split_once('\t')
+        .ok_or_else(|| input_error("remote branch response has an invalid shape"))?;
+    validate_commit(commit)?;
+    if commit != candidate_commit || found_reference != expected_reference {
+        return Err(input_error(format!(
+            "release candidate {candidate_commit} is not synchronized with origin branch {branch} at {commit}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_remote_branch(branch: &str) -> Result<(), Box<dyn Error>> {
+    if branch.is_empty()
+        || branch.len() > 255
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.contains("..")
+        || branch.contains("@{")
+        || branch.contains("//")
+        || branch
+            .bytes()
+            .any(|byte| !byte.is_ascii_alphanumeric() && !matches!(byte, b'-' | b'_' | b'.' | b'/'))
+    {
+        return Err(input_error("required remote branch name is invalid"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -643,6 +780,450 @@ fn verify_remote_tag_absent(root: &Path, tag: &str) -> Result<(), Box<dyn Error>
     }
 }
 
+fn release_dependencies_for_target(
+    root: &Path,
+    target: &str,
+) -> Result<Vec<ReleaseDependency>, Box<dyn Error>> {
+    let metadata_arguments = [
+        OsStr::new("metadata"),
+        OsStr::new("--format-version"),
+        OsStr::new("1"),
+        OsStr::new("--locked"),
+        OsStr::new("--filter-platform"),
+        OsStr::new(target),
+    ];
+    let metadata_output = command_output_with_directory(
+        Path::new("cargo"),
+        &metadata_arguments,
+        root,
+        PROCESS_TIMEOUT,
+        JSON_BYTES_MAX,
+    )?;
+    ensure_output_success(
+        "cargo metadata for release dependency audit",
+        &metadata_output,
+    )?;
+    let metadata: CargoMetadata = serde_json::from_slice(&metadata_output.stdout)?;
+    if metadata.packages.len() > RELEASE_DEPENDENCIES_MAX * 2 {
+        return Err(resource_error("Cargo metadata package count"));
+    }
+
+    let tree_arguments = [
+        OsStr::new("tree"),
+        OsStr::new("-p"),
+        OsStr::new("quirl-cli"),
+        OsStr::new("--locked"),
+        OsStr::new("--target"),
+        OsStr::new(target),
+        OsStr::new("--edges"),
+        OsStr::new("normal,build"),
+        OsStr::new("--prefix"),
+        OsStr::new("none"),
+        OsStr::new("--format"),
+        OsStr::new("{p}"),
+    ];
+    let tree_output = command_output_with_directory(
+        Path::new("cargo"),
+        &tree_arguments,
+        root,
+        PROCESS_TIMEOUT,
+        JSON_BYTES_MAX,
+    )?;
+    ensure_output_success("cargo tree for release dependency audit", &tree_output)?;
+    let tree = std::str::from_utf8(&tree_output.stdout)?;
+    let mut package_keys = BTreeSet::new();
+    for line in tree.lines() {
+        package_keys.insert(parse_cargo_tree_package(line)?);
+        if package_keys.len() > RELEASE_DEPENDENCIES_MAX {
+            return Err(resource_error("release dependency count"));
+        }
+    }
+
+    let mut packages_by_key = BTreeMap::<(String, String), Vec<CargoPackage>>::new();
+    for package in metadata.packages {
+        packages_by_key
+            .entry((package.name.clone(), package.version.clone()))
+            .or_default()
+            .push(package);
+    }
+    let mut dependencies = Vec::new();
+    for key in package_keys {
+        let candidates = packages_by_key.get(&key).ok_or_else(|| {
+            input_error(format!(
+                "cargo tree package {} v{} is absent from Cargo metadata",
+                key.0, key.1
+            ))
+        })?;
+        if candidates.len() != 1 {
+            return Err(input_error(format!(
+                "cargo tree package {} v{} resolves to {} metadata packages; the release audit requires an unambiguous source",
+                key.0,
+                key.1,
+                candidates.len()
+            )));
+        }
+        let package = &candidates[0];
+        let Some(source) = package.source.as_deref() else {
+            if !package.manifest_path.starts_with(root) {
+                return Err(input_error(format!(
+                    "path dependency {} v{} is outside the Quirl workspace and has no auditable source identity",
+                    package.name, package.version
+                )));
+            }
+            continue;
+        };
+        let declared_license = declared_package_license(package)?;
+        let package_root = package
+            .manifest_path
+            .parent()
+            .ok_or_else(|| input_error("Cargo package manifest has no parent directory"))?
+            .to_path_buf();
+        dependencies.push(ReleaseDependency {
+            contract: DependencyContract {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                declared_license,
+                source: source.to_owned(),
+                repository: package.repository.clone().unwrap_or_else(|| "-".to_owned()),
+            },
+            package_root,
+        });
+    }
+    dependencies.sort_by(|left, right| left.contract.cmp(&right.contract));
+    let platform = target_platform(target)?.1;
+    validate_dependency_inventory(root, platform, &dependencies)?;
+    Ok(dependencies)
+}
+
+fn parse_cargo_tree_package(line: &str) -> Result<(String, String), Box<dyn Error>> {
+    let line = line.trim();
+    let (name, remainder) = line
+        .split_once(" v")
+        .ok_or_else(|| input_error(format!("invalid cargo tree package line {line:?}")))?;
+    let version = remainder
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| input_error(format!("cargo tree package has no version: {line:?}")))?;
+    if name.is_empty() || version.is_empty() || name.contains(char::is_whitespace) {
+        return Err(input_error(format!(
+            "invalid cargo tree package identity {line:?}"
+        )));
+    }
+    Ok((name.to_owned(), version.to_owned()))
+}
+
+fn declared_package_license(package: &CargoPackage) -> Result<String, Box<dyn Error>> {
+    if let Some(license) = package.license.as_deref().map(str::trim)
+        && !license.is_empty()
+    {
+        return Ok(license.to_owned());
+    }
+    if let Some(license_file) = package.license_file.as_deref().map(str::trim)
+        && !license_file.is_empty()
+    {
+        return Ok(format!("LicenseRef-file:{license_file}"));
+    }
+    Err(input_error(format!(
+        "release dependency {} v{} declares neither a license nor a license file",
+        package.name, package.version
+    )))
+}
+
+fn validate_dependency_inventory(
+    root: &Path,
+    platform: &str,
+    dependencies: &[ReleaseDependency],
+) -> Result<(), Box<dyn Error>> {
+    let inventory = parse_dependency_inventory(&read_utf8_bounded(
+        &root.join(THIRD_PARTY_INVENTORY_PATH),
+        JSON_BYTES_MAX,
+    )?)?;
+    let expected = inventory
+        .iter()
+        .filter(|record| record.platforms.contains(platform))
+        .map(|record| record.contract.clone())
+        .collect::<BTreeSet<_>>();
+    let observed = dependencies
+        .iter()
+        .map(|dependency| dependency.contract.clone())
+        .collect::<BTreeSet<_>>();
+    if expected == observed {
+        return Ok(());
+    }
+    let missing = expected.difference(&observed).take(8).collect::<Vec<_>>();
+    let unexpected = observed.difference(&expected).take(8).collect::<Vec<_>>();
+    Err(input_error(format!(
+        "{THIRD_PARTY_INVENTORY_PATH} does not match the locked {platform} quirl-cli normal/build closure; missing {missing:?}; unexpected {unexpected:?}"
+    )))
+}
+
+fn parse_dependency_inventory(source: &str) -> Result<Vec<InventoryRecord>, Box<dyn Error>> {
+    let mut records = Vec::new();
+    let mut previous = None::<DependencyContract>;
+    for (index, line) in source.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 6 || fields.iter().any(|field| field.is_empty()) {
+            return Err(input_error(format!(
+                "invalid third-party inventory record on line {}",
+                index + 1
+            )));
+        }
+        let platforms = fields[2]
+            .split(',')
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        if platforms.is_empty()
+            || platforms
+                .iter()
+                .any(|platform| platform != "linux" && platform != "macos")
+        {
+            return Err(input_error(format!(
+                "invalid third-party inventory platform on line {}",
+                index + 1
+            )));
+        }
+        let contract = DependencyContract {
+            name: fields[0].to_owned(),
+            version: fields[1].to_owned(),
+            declared_license: fields[3].to_owned(),
+            source: fields[4].to_owned(),
+            repository: fields[5].to_owned(),
+        };
+        if previous.as_ref().is_some_and(|prior| prior >= &contract) {
+            return Err(input_error(format!(
+                "third-party inventory must be strictly sorted; line {} is out of order or duplicated",
+                index + 1
+            )));
+        }
+        previous = Some(contract.clone());
+        records.push(InventoryRecord {
+            contract,
+            platforms,
+        });
+        if records.len() > RELEASE_DEPENDENCIES_MAX {
+            return Err(resource_error("third-party inventory record count"));
+        }
+    }
+    if records.is_empty() {
+        return Err(input_error("third-party inventory is empty"));
+    }
+    Ok(records)
+}
+
+fn render_third_party_license_report(
+    root: &Path,
+    target: &str,
+    dependencies: &[ReleaseDependency],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut documents = BTreeMap::<String, LicenseDocument>::new();
+    let mut dependency_documents = Vec::new();
+    let mut unique_document_bytes = 0_usize;
+    for dependency in dependencies {
+        let mut files = collect_dependency_license_files(&dependency.package_root)?;
+        if files.is_empty() {
+            files.push(read_license_fallback(root, &dependency.contract)?);
+        }
+        let mut references = BTreeSet::new();
+        for PackageLicenseFile {
+            relative_path,
+            bytes,
+        } in files
+        {
+            std::str::from_utf8(&bytes).map_err(|error| {
+                input_error(format!(
+                    "license document {} v{}:{relative_path} is not UTF-8: {error}",
+                    dependency.contract.name, dependency.contract.version
+                ))
+            })?;
+            let sha256 = sha256_hex(&bytes);
+            let origin = format!(
+                "{} v{}:{relative_path}",
+                dependency.contract.name, dependency.contract.version
+            );
+            if let Some(document) = documents.get_mut(&sha256) {
+                if document.bytes != bytes {
+                    return Err(input_error(
+                        "SHA-256 collision in dependency license documents",
+                    ));
+                }
+                document.origins.insert(origin);
+            } else {
+                unique_document_bytes = unique_document_bytes
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| resource_error("dependency license byte count"))?;
+                if unique_document_bytes > LICENSE_REPORT_BYTES_MAX {
+                    return Err(resource_error("dependency license byte count"));
+                }
+                documents.insert(
+                    sha256.clone(),
+                    LicenseDocument {
+                        bytes,
+                        origins: BTreeSet::from([origin]),
+                    },
+                );
+                if documents.len() > LICENSE_DOCUMENTS_MAX {
+                    return Err(resource_error("dependency license document count"));
+                }
+            }
+            references.insert((relative_path, sha256));
+        }
+        dependency_documents.push((dependency.contract.clone(), references));
+    }
+
+    let mut report = Vec::new();
+    report_extend(
+        &mut report,
+        format!(
+            "Quirl third-party dependency licenses\n\nTarget: {target}\nScope: locked quirl-cli normal and build dependency closure\n\nDependency inventory\n====================\n"
+        )
+        .as_bytes(),
+    )?;
+    for (contract, references) in dependency_documents {
+        report_extend(
+            &mut report,
+            format!(
+                "\n{} v{}\n  declared license: {}\n  source: {}\n  repository: {}\n",
+                contract.name,
+                contract.version,
+                contract.declared_license,
+                contract.source,
+                contract.repository
+            )
+            .as_bytes(),
+        )?;
+        for (path, sha256) in references {
+            report_extend(
+                &mut report,
+                format!("  document: {path} (sha256 {sha256})\n").as_bytes(),
+            )?;
+        }
+    }
+    report_extend(&mut report, b"\nLicense documents\n=================\n")?;
+    for (sha256, document) in documents {
+        report_extend(
+            &mut report,
+            format!("\nSHA-256: {sha256}\nOrigins:\n").as_bytes(),
+        )?;
+        for origin in document.origins {
+            report_extend(&mut report, format!("  - {origin}\n").as_bytes())?;
+        }
+        report_extend(&mut report, b"--- BEGIN EXACT DOCUMENT ---\n")?;
+        report_extend(&mut report, &document.bytes)?;
+        if !document.bytes.ends_with(b"\n") {
+            report_extend(&mut report, b"\n")?;
+        }
+        report_extend(&mut report, b"--- END EXACT DOCUMENT ---\n")?;
+    }
+    Ok(report)
+}
+
+fn collect_dependency_license_files(
+    package_root: &Path,
+) -> Result<Vec<PackageLicenseFile>, Box<dyn Error>> {
+    let root_metadata = fs::symlink_metadata(package_root)?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(input_error(format!(
+            "dependency package root {} must be a non-symlink directory",
+            package_root.display()
+        )));
+    }
+    let mut stack = vec![(package_root.to_path_buf(), 0_usize)];
+    let mut files = Vec::new();
+    let mut entries_seen = 0_usize;
+    while let Some((directory, depth)) = stack.pop() {
+        let mut entries = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries.into_iter().rev() {
+            entries_seen = entries_seen
+                .checked_add(1)
+                .ok_or_else(|| resource_error("dependency package entry count"))?;
+            if entries_seen > LICENSE_SCAN_ENTRIES_MAX {
+                return Err(resource_error("dependency package entry count"));
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(input_error(format!(
+                    "dependency package contains an unauditable symlink at {}",
+                    path.display()
+                )));
+            }
+            if metadata.is_dir() {
+                if depth >= LICENSE_SCAN_DEPTH_MAX {
+                    return Err(resource_error("dependency package directory depth"));
+                }
+                stack.push((path, depth + 1));
+                continue;
+            }
+            if !metadata.is_file() || !is_license_file_name(&entry.file_name()) {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(package_root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.push(PackageLicenseFile {
+                relative_path: relative,
+                bytes: read_bounded(&path, LICENSE_DOCUMENT_BYTES_MAX)?,
+            });
+            if files.len() > LICENSE_DOCUMENTS_MAX {
+                return Err(resource_error("dependency package license file count"));
+            }
+        }
+    }
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(files)
+}
+
+fn is_license_file_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    ["license", "licence", "copying", "notice", "copyright"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+fn read_license_fallback(
+    root: &Path,
+    contract: &DependencyContract,
+) -> Result<PackageLicenseFile, Box<dyn Error>> {
+    let file_name = match (contract.name.as_str(), contract.version.as_str()) {
+        ("keybindings", "0.0.2") => "keybindings-0.0.2-Apache-2.0.txt",
+        ("mlua-sys", "0.11.0") => "mlua-sys-0.11.0-MIT.txt",
+        ("number_prefix", "0.4.0") => "number_prefix-0.4.0-MIT.txt",
+        _ => {
+            return Err(input_error(format!(
+                "release dependency {} v{} has no packaged license document and no reviewed fallback",
+                contract.name, contract.version
+            )));
+        }
+    };
+    Ok(PackageLicenseFile {
+        relative_path: format!("reviewed-fallback/{file_name}"),
+        bytes: read_bounded(
+            &root.join(THIRD_PARTY_LICENSE_FALLBACK_ROOT).join(file_name),
+            LICENSE_DOCUMENT_BYTES_MAX,
+        )?,
+    })
+}
+
+fn report_extend(report: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    let next_len = report
+        .len()
+        .checked_add(bytes.len())
+        .ok_or_else(|| resource_error("third-party license report byte count"))?;
+    if next_len > LICENSE_REPORT_BYTES_MAX {
+        return Err(resource_error("third-party license report byte count"));
+    }
+    report.extend_from_slice(bytes);
+    Ok(())
+}
+
 fn package(root: &Path, target: &str, output: &Path) -> Result<(), Box<dyn Error>> {
     validate_target(target)?;
     let plan = plan(root)?;
@@ -683,11 +1264,30 @@ fn package(root: &Path, target: &str, output: &Path) -> Result<(), Box<dyn Error
     let build_info: BuildInfo = serde_json::from_slice(&metadata.stdout)?;
     validate_build_info(&build_info, &plan, target)?;
     let binary_bytes = read_bounded(&binary, ARTIFACT_BYTES_MAX)?;
+    let product_license = read_bounded(&root.join(PRODUCT_LICENSE_PATH), ARTIFACT_BYTES_MAX)?;
+    let third_party_notices =
+        read_bounded(&root.join(THIRD_PARTY_NOTICES_PATH), ARTIFACT_BYTES_MAX)?;
+    let release_dependencies = release_dependencies_for_target(root, target)?;
+    let third_party_licenses =
+        render_third_party_license_report(root, target, &release_dependencies)?;
     let extension = env::consts::EXE_SUFFIX;
     let archive_name = format!("quirl-v{}-{target}.tar", plan.next_version);
-    let archive = render_tar(
-        &format!("bin/quirl{extension}"),
-        &binary_bytes,
+    let binary_name = format!("bin/quirl{extension}");
+    let archive = render_tar_entries(
+        &[
+            (binary_name.as_str(), binary_bytes.as_slice(), 0o755),
+            (PRODUCT_LICENSE_PATH, product_license.as_slice(), 0o644),
+            (
+                ARCHIVE_THIRD_PARTY_NOTICES_PATH,
+                third_party_notices.as_slice(),
+                0o644,
+            ),
+            (
+                ARCHIVE_THIRD_PARTY_LICENSES_PATH,
+                third_party_licenses.as_slice(),
+                0o644,
+            ),
+        ],
         source_date_epoch,
     )?;
     let archive_sha256 = sha256_hex(&archive);
@@ -739,7 +1339,7 @@ fn aggregate(root: &Path, input: &Path, output: &Path) -> Result<(), Box<dyn Err
         let name = file_name(path)?;
         if name.ends_with(".tar.provenance.json") {
             provenances.push(read_json_bounded::<PackageProvenance>(path)?);
-        } else if name == "asset-manifest-v1.json" {
+        } else if name == "asset-manifest-v2.json" {
             if asset_manifest.is_some() {
                 return Err(input_error(
                     "aggregate input contains multiple asset manifests",
@@ -801,19 +1401,23 @@ fn aggregate(root: &Path, input: &Path, output: &Path) -> Result<(), Box<dyn Err
         ));
     }
     let asset_manifest = asset_manifest.ok_or_else(|| {
-        input_error("aggregate input must contain exactly one asset-manifest-v1.json")
+        input_error("aggregate input must contain exactly one asset-manifest-v2.json")
     })?;
     asset_manifest.validate_for_release(&plan.next_version)?;
-    if asset_manifest.candidate_commit != plan.candidate_commit
-        || asset_manifest.source_date_epoch != candidate_source_epoch(root)?
-    {
-        return Err(input_error(
-            "asset manifest candidate identity does not match aggregate HEAD",
-        ));
+    let source_date_epoch = candidate_source_epoch(root)?;
+    for asset in &asset_manifest.assets {
+        if asset.source_revision != plan.candidate_commit
+            || asset.source_date_epoch != source_date_epoch
+        {
+            return Err(input_error(format!(
+                "asset {} source identity does not match aggregate HEAD",
+                asset.logical_name
+            )));
+        }
     }
-    let manifest_path = unique_file_named(&files, "asset-manifest-v1.json")?;
+    let manifest_path = unique_file_named(&files, "asset-manifest-v2.json")?;
     selected.insert(
-        "asset-manifest-v1.json".to_owned(),
+        "asset-manifest-v2.json".to_owned(),
         manifest_path.to_path_buf(),
     );
     for asset in &asset_manifest.assets {
@@ -828,6 +1432,20 @@ fn aggregate(root: &Path, input: &Path, output: &Path) -> Result<(), Box<dyn Err
             )));
         }
         selected.insert(asset.file.clone(), path.to_path_buf());
+        for notice in &asset.notices {
+            let notice_path = unique_file_named(&files, &notice.file)?;
+            let notice_bytes = read_bounded(notice_path, ARTIFACT_BYTES_MAX)?;
+            if sha256_hex(&notice_bytes) != notice.sha256
+                || u64::try_from(notice_bytes.len()).ok() != Some(notice.byte_size)
+                || notice_bytes != notice.text.as_bytes()
+            {
+                return Err(input_error(format!(
+                    "asset notice {} differs from its manifest",
+                    notice.file
+                )));
+            }
+            selected.insert(notice.file.clone(), notice_path.to_path_buf());
+        }
     }
     let manifest = ReleaseManifest {
         schema_version: CONTRACT_VERSION,
@@ -837,7 +1455,7 @@ fn aggregate(root: &Path, input: &Path, output: &Path) -> Result<(), Box<dyn Err
         candidate_commit: plan.candidate_commit,
         source_date_epoch: candidate_source_epoch(root)?,
         artifacts,
-        asset_manifest: Some("asset-manifest-v1.json".to_owned()),
+        asset_manifest: Some("asset-manifest-v2.json".to_owned()),
         assets: asset_manifest.assets,
     };
     fs::create_dir_all(&output)?;
@@ -947,7 +1565,35 @@ fn choose_bump(previous: Option<&SemanticVersion>, commits: &[ReleaseCommit]) ->
     }
 }
 
-fn render_release_notes(version: &str, commits: &[ReleaseCommit]) -> String {
+fn render_release_notes(version: &str, changelog: &str, commits: &[ReleaseCommit]) -> String {
+    let version_heading = format!("## [{version}]");
+    let curated = changelog_section(changelog, &version_heading)
+        .or_else(|| changelog_section(changelog, "## [Unreleased]"));
+    if let Some(curated) = curated.filter(|section| !section.is_empty()) {
+        return format!("# Quirl {version}\n\n{curated}\n");
+    }
+    render_commit_release_notes(version, commits)
+}
+
+fn changelog_section(source: &str, heading: &str) -> Option<String> {
+    let mut in_section = false;
+    let mut lines = Vec::new();
+    for line in source.lines() {
+        if !in_section {
+            if line == heading || line.starts_with(&format!("{heading} - ")) {
+                in_section = true;
+            }
+            continue;
+        }
+        if line.starts_with("## ") {
+            break;
+        }
+        lines.push(line);
+    }
+    in_section.then(|| lines.join("\n").trim().to_owned())
+}
+
+fn render_commit_release_notes(version: &str, commits: &[ReleaseCommit]) -> String {
     let mut output = format!("# Quirl {version}\n");
     for (category, heading) in [
         ("breaking", "Breaking changes"),
@@ -1192,10 +1838,6 @@ fn target_binary(root: &Path, target: &str) -> PathBuf {
         .join(target)
         .join("release")
         .join(format!("quirl{}", env::consts::EXE_SUFFIX))
-}
-
-fn render_tar(name: &str, bytes: &[u8], modified: u64) -> Result<Vec<u8>, Box<dyn Error>> {
-    render_tar_entries(&[(name, bytes, 0o755)], modified)
 }
 
 pub(crate) fn render_tar_entries(
@@ -1828,6 +2470,19 @@ mod tests {
     }
 
     #[test]
+    fn remote_release_branch_must_point_to_the_exact_candidate() {
+        let candidate = "a".repeat(40);
+        let reference = "refs/heads/main";
+        let exact = format!("{candidate}\t{reference}\n");
+        assert!(parse_remote_branch(exact.as_bytes(), "main", reference, &candidate).is_ok());
+        let different = format!("{}\t{reference}\n", "b".repeat(40));
+        assert!(parse_remote_branch(different.as_bytes(), "main", reference, &candidate).is_err());
+        assert!(validate_remote_branch("release/0.1").is_ok());
+        assert!(validate_remote_branch("../main").is_err());
+        assert!(validate_remote_branch("main;git push").is_err());
+    }
+
+    #[test]
     fn changelog_update_preserves_curated_unreleased_content() {
         let source = "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- Curated.\n";
         let updated = update_changelog(source, "0.1.0", "2026-08-18").unwrap();
@@ -1836,6 +2491,22 @@ mod tests {
             update_changelog(&updated, "0.1.0", "2026-08-18").unwrap(),
             updated
         );
+    }
+
+    #[test]
+    fn release_notes_use_curated_changelog_before_and_after_preparation() {
+        let source = "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- A user-facing summary.\n";
+        let prepared = update_changelog(source, "0.1.0", "2026-08-18").unwrap();
+        let commits = vec![ReleaseCommit {
+            commit: "a".repeat(40),
+            subject: "feat: implementation detail".to_owned(),
+            category: "features".to_owned(),
+            breaking: false,
+            releasing: true,
+        }];
+        let expected = "# Quirl 0.1.0\n\n### Added\n\n- A user-facing summary.\n";
+        assert_eq!(render_release_notes("0.1.0", source, &commits), expected);
+        assert_eq!(render_release_notes("0.1.0", &prepared, &commits), expected);
     }
 
     #[test]
@@ -1861,7 +2532,10 @@ mod tests {
             "a".repeat(40)
         );
         let commits = parse_commits(&log).unwrap();
-        assert_eq!(render_release_notes("0.2.0", &commits), "# Quirl 0.2.0\n");
+        assert_eq!(
+            render_release_notes("0.2.0", "## [Unreleased]\n", &commits),
+            "# Quirl 0.2.0\n"
+        );
     }
 
     #[test]
@@ -1872,15 +2546,85 @@ mod tests {
         );
         let commits = parse_commits(&log).unwrap();
         assert_eq!(commits[0].category, "release_preparation");
-        assert_eq!(render_release_notes("0.2.0", &commits), "# Quirl 0.2.0\n");
+        assert_eq!(
+            render_release_notes("0.2.0", "## [Unreleased]\n", &commits),
+            "# Quirl 0.2.0\n"
+        );
     }
 
     #[test]
     fn tar_bytes_are_reproducible_and_end_with_two_zero_blocks() {
-        let first = render_tar("bin/quirl", b"binary", 123).unwrap();
-        let second = render_tar("bin/quirl", b"binary", 123).unwrap();
+        let entries = [("bin/quirl", b"binary".as_slice(), 0o755)];
+        let first = render_tar_entries(&entries, 123).unwrap();
+        let second = render_tar_entries(&entries, 123).unwrap();
         assert_eq!(first, second);
         assert!(first[first.len() - 1024..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn native_tar_entries_have_stable_paths_and_modes() {
+        let archive = render_tar_entries(
+            &[
+                ("bin/quirl", b"binary", 0o755),
+                ("LICENSE", b"license", 0o644),
+                ("THIRD_PARTY_NOTICES.md", b"notices", 0o644),
+                ("THIRD_PARTY_LICENSES.txt", b"dependency licenses", 0o644),
+            ],
+            123,
+        )
+        .unwrap();
+        for (offset, name, mode) in [
+            (0, b"bin/quirl".as_slice(), b"0000755\0".as_slice()),
+            (1_024, b"LICENSE".as_slice(), b"0000644\0".as_slice()),
+            (
+                2_048,
+                b"THIRD_PARTY_NOTICES.md".as_slice(),
+                b"0000644\0".as_slice(),
+            ),
+            (
+                3_072,
+                b"THIRD_PARTY_LICENSES.txt".as_slice(),
+                b"0000644\0".as_slice(),
+            ),
+        ] {
+            assert_eq!(&archive[offset..offset + name.len()], name);
+            assert_eq!(&archive[offset + 100..offset + 108], mode);
+        }
+    }
+
+    #[test]
+    fn release_dependency_inventory_matches_every_supported_target() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        for target in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+        ] {
+            let dependencies = release_dependencies_for_target(root, target).unwrap();
+            assert!(dependencies.len() > 200);
+        }
+    }
+
+    #[test]
+    fn third_party_report_includes_declared_and_fallback_license_texts() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let target = "x86_64-unknown-linux-gnu";
+        let dependencies = release_dependencies_for_target(root, target).unwrap();
+        let report = render_third_party_license_report(root, target, &dependencies).unwrap();
+        let report = String::from_utf8(report).unwrap();
+        assert!(
+            report.contains("model2vec-rs v0.2.1\n  declared license: LicenseRef-file:LICENSE")
+        );
+        assert!(
+            report
+                .contains("keybindings v0.0.2:reviewed-fallback/keybindings-0.0.2-Apache-2.0.txt")
+        );
+        assert!(report.contains("mlua-sys v0.11.0:reviewed-fallback/mlua-sys-0.11.0-MIT.txt"));
+        assert!(
+            report.contains("number_prefix v0.4.0:reviewed-fallback/number_prefix-0.4.0-MIT.txt")
+        );
+        assert!(report.contains("onig_sys v69.9.3:oniguruma/COPYING"));
     }
 
     #[test]

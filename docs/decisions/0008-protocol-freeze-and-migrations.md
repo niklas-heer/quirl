@@ -55,6 +55,13 @@ ADR 0013 subsequently moves configuration to schema v3 for bounded built-in
 and custom semantic themes. Legacy v0/v1/v2 documents receive the Tokyo Night
 default before v3 validation; versions newer than v3 fail closed.
 
+The integrated 0.1.0 candidate subsequently advances configuration to schema
+v4 for user-facing defaults: a compact banner, automatic completion after one
+character, and the active Rust toolchain in the right prompt. Legacy
+v0/v1/v2/v3 documents migrate deterministically to those v4 defaults; versions
+newer than v4 fail closed. The historical v2 and v3 descriptors remain pinned
+as migration evidence.
+
 The executable plugin-I/O transition later supersedes that historical lock
 migration under ADR 0016's fail-closed rule. Plugin manifest v2 gives command
 I/O a closed Lua ABI-v1 interpretation, and lock v3 binds that identity. Lock

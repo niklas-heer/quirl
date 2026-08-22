@@ -7,7 +7,7 @@
 use clap::{Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     ffi::OsStr,
     fs,
@@ -24,10 +24,12 @@ use crate::release::{
     validate_relative_file_name,
 };
 
-const CONTRACT_VERSION: u32 = 1;
+const CONTRACT_VERSION: u32 = 2;
 const ASSET_BYTES_MAX: usize = 128 * 1024 * 1024;
 const INPUT_FILES_MAX: usize = 64;
 const INPUT_DEPTH_MAX: usize = 4;
+const NOTICES_MAX: usize = 4;
+const NOTICE_BYTES_MAX: usize = 16 * 1024;
 const MODEL_ROOT: &str = "models/quirl-command-v3-int8/quirl-command-v3-9bc5efbd14096b54";
 
 /// One downloadable-asset construction action.
@@ -55,6 +57,11 @@ pub(crate) enum AssetsCommand {
         /// Exact manifest path to write.
         #[arg(long)]
         output: PathBuf,
+        /// Previously published version-scoped manifest whose unchanged
+        /// records are retained. New descriptors replace records with the
+        /// same logical name after both inputs pass their full contracts.
+        #[arg(long)]
+        previous_manifest: Option<PathBuf>,
         /// Candidate identity source, matching whichever the descriptors
         /// were built with.
         #[arg(long, value_enum, default_value_t = IdentitySource::Next)]
@@ -128,15 +135,28 @@ pub(crate) struct AssetRecord {
     pub(crate) sha256: String,
     pub(crate) url: String,
     pub(crate) compatibility: AssetCompatibility,
+    pub(crate) source_revision: String,
+    pub(crate) source_date_epoch: u64,
+    pub(crate) notices: Vec<AssetNotice>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssetNotice {
+    pub(crate) name: String,
+    pub(crate) spdx_license: String,
+    pub(crate) file: String,
+    pub(crate) byte_size: u64,
+    pub(crate) sha256: String,
+    pub(crate) url: String,
+    pub(crate) text: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AssetManifest {
     pub(crate) schema_version: u32,
-    pub(crate) release_version: String,
-    pub(crate) candidate_commit: String,
-    pub(crate) source_date_epoch: u64,
+    pub(crate) quirl_version: String,
     pub(crate) assets: Vec<AssetRecord>,
 }
 
@@ -144,9 +164,7 @@ pub(crate) struct AssetManifest {
 #[serde(deny_unknown_fields)]
 struct AssetDescriptor {
     schema_version: u32,
-    release_version: String,
-    candidate_commit: String,
-    source_date_epoch: u64,
+    quirl_version: String,
     asset: AssetRecord,
 }
 
@@ -158,6 +176,7 @@ struct AssetBuildResult {
     descriptor: String,
     sha256: String,
     byte_size: u64,
+    notices: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -178,8 +197,15 @@ pub(crate) fn run(root: &Path, command: AssetsCommand) -> Result<(), Box<dyn Err
         AssetsCommand::Manifest {
             input,
             output,
+            previous_manifest,
             identity,
-        } => manifest(root, &input, &output, identity),
+        } => manifest(
+            root,
+            &input,
+            &output,
+            previous_manifest.as_deref(),
+            identity,
+        ),
         AssetsCommand::RebaseManifest {
             input,
             base_url,
@@ -190,19 +216,18 @@ pub(crate) fn run(root: &Path, command: AssetsCommand) -> Result<(), Box<dyn Err
 
 impl AssetManifest {
     pub(crate) fn validate_for_release(&self, version: &str) -> Result<(), Box<dyn Error>> {
-        if self.schema_version != CONTRACT_VERSION || self.release_version != version {
+        self.validate(version, true)
+    }
+
+    pub(crate) fn validate_for_channel(&self, version: &str) -> Result<(), Box<dyn Error>> {
+        self.validate(version, false)
+    }
+
+    fn validate(&self, version: &str, require_release_url: bool) -> Result<(), Box<dyn Error>> {
+        if self.schema_version != CONTRACT_VERSION || self.quirl_version != version {
             return Err(input_error(
-                "asset manifest version does not match the release",
+                "asset manifest does not target the requested Quirl version",
             ));
-        }
-        if self.candidate_commit.len() != 40
-            || !self
-                .candidate_commit
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            || self.source_date_epoch == 0
-        {
-            return Err(input_error("asset manifest candidate identity is invalid"));
         }
         if self.assets.len() != 2 {
             return Err(input_error(
@@ -211,7 +236,7 @@ impl AssetManifest {
         }
         let mut names = BTreeSet::new();
         for asset in &self.assets {
-            validate_record(asset, version)?;
+            validate_record(asset, version, require_release_url)?;
             if !names.insert(asset.logical_name.as_str()) {
                 return Err(input_error(format!(
                     "duplicate runtime asset {}",
@@ -238,7 +263,7 @@ fn build(
     let version = identity.version;
     let output = absolute(root, output);
     fs::create_dir_all(&output)?;
-    let (logical_name, file, format, bytes) = match kind {
+    let (logical_name, format, bytes) = match kind {
         AssetKind::CompletionDatabase => {
             run_status_bounded(
                 Command::new(std::env::current_exe()?)
@@ -249,15 +274,13 @@ fn build(
                 Duration::from_secs(10 * 60),
                 "native completion database build",
             )?;
-            let file = format!("quirl-completion-database-v{version}.sqlite3");
             let bytes = read_bounded(
                 &root.join("catalog/generated/catalog.sqlite3"),
                 ASSET_BYTES_MAX,
             )?;
-            ("completion-database", file, "sqlite3", bytes)
+            ("completion-database", "sqlite3", bytes)
         }
         AssetKind::CommandModel => {
-            let file = format!("quirl-command-model-v{version}.tar");
             let model_root = root.join(MODEL_ROOT);
             let names = [
                 "LICENSE",
@@ -284,11 +307,36 @@ fn build(
                 .map(|(name, bytes)| (name.as_str(), bytes.as_slice(), 0o644))
                 .collect::<Vec<_>>();
             let bytes = render_tar_entries(&entries, identity.source_date_epoch)?;
-            ("command-model", file, "tar", bytes)
+            ("command-model", "tar", bytes)
         }
     };
     let byte_size = u64::try_from(bytes.len()).map_err(|_| resource_error("asset byte count"))?;
     let sha256 = sha256_hex(&bytes);
+    let file = content_addressed_file(logical_name, &version, &sha256)?;
+    let notices = if logical_name == "completion-database" {
+        let notice_bytes = read_bounded(
+            &root.join("catalog/provenance/CARAPACE_LICENSE"),
+            NOTICE_BYTES_MAX,
+        )?;
+        let notice_sha256 = sha256_hex(&notice_bytes);
+        let notice_file = format!("quirl-carapace-license-{notice_sha256}.txt");
+        let text = String::from_utf8(notice_bytes.clone())
+            .map_err(|_| input_error("Carapace license notice is not UTF-8"))?;
+        immutable_write(&output.join(&notice_file), &notice_bytes)?;
+        vec![AssetNotice {
+            name: "Carapace".to_owned(),
+            spdx_license: "MIT".to_owned(),
+            file: notice_file.clone(),
+            byte_size: u64::try_from(notice_bytes.len())
+                .map_err(|_| resource_error("asset notice byte count"))?,
+            sha256: notice_sha256,
+            url: release_url(&version, &notice_file),
+            text,
+        }]
+    } else {
+        Vec::new()
+    };
+    let notice_files = notices.iter().map(|notice| notice.file.clone()).collect();
     let record = AssetRecord {
         logical_name: logical_name.to_owned(),
         file: file.clone(),
@@ -302,16 +350,17 @@ fn build(
             operating_systems: vec!["linux".to_owned(), "macos".to_owned()],
             architectures: vec!["aarch64".to_owned(), "x86_64".to_owned()],
         },
+        source_revision: identity.commit.clone(),
+        source_date_epoch: identity.source_date_epoch,
+        notices,
     };
-    let descriptor_name = format!("{logical_name}.asset-v1.json");
+    let descriptor_name = format!("{logical_name}.asset-v2.json");
     immutable_write(&output.join(&file), &bytes)?;
     immutable_write(
         &output.join(&descriptor_name),
         &json_bytes(&AssetDescriptor {
             schema_version: CONTRACT_VERSION,
-            release_version: version,
-            candidate_commit: identity.commit,
-            source_date_epoch: identity.source_date_epoch,
+            quirl_version: version,
             asset: record,
         })?,
     )?;
@@ -321,6 +370,7 @@ fn build(
         descriptor: descriptor_name,
         sha256,
         byte_size,
+        notices: notice_files,
     })
 }
 
@@ -328,15 +378,26 @@ fn manifest(
     root: &Path,
     input: &Path,
     output: &Path,
+    previous_manifest: Option<&Path>,
     identity: IdentitySource,
 ) -> Result<(), Box<dyn Error>> {
     let identity = identity.resolve(root)?;
+    manifest_with_identity(root, input, output, previous_manifest, identity)
+}
+
+fn manifest_with_identity(
+    root: &Path,
+    input: &Path,
+    output: &Path,
+    previous_manifest: Option<&Path>,
+    identity: CandidateIdentity,
+) -> Result<(), Box<dyn Error>> {
     let version = identity.version;
     let input = absolute(root, input);
     let output = absolute(root, output);
-    if output.file_name() != Some(OsStr::new("asset-manifest-v1.json")) {
+    if output.file_name() != Some(OsStr::new("asset-manifest-v2.json")) {
         return Err(input_error(
-            "asset manifest output file must be named asset-manifest-v1.json",
+            "asset manifest output file must be named asset-manifest-v2.json",
         ));
     }
     let files = collect_files(&input)?;
@@ -345,29 +406,48 @@ fn manifest(
         if path
             .file_name()
             .and_then(OsStr::to_str)
-            .is_some_and(|name| name.ends_with(".asset-v1.json"))
+            .is_some_and(|name| name.ends_with(".asset-v2.json"))
         {
             descriptors.push(read_json_bounded::<AssetDescriptor>(path)?);
         }
     }
-    if descriptors.len() != 2 {
+    if descriptors.is_empty() || descriptors.len() > 2 {
         return Err(input_error(
-            "asset manifest input must contain exactly two descriptors",
+            "asset manifest input must contain one or two descriptors",
         ));
     }
     descriptors.sort_by(|left, right| left.asset.logical_name.cmp(&right.asset.logical_name));
-    let mut assets = Vec::with_capacity(descriptors.len());
+    let replaced_names = descriptors
+        .iter()
+        .map(|descriptor| descriptor.asset.logical_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut assets = BTreeMap::new();
+    if let Some(previous_manifest) = previous_manifest {
+        let previous_path = absolute(root, previous_manifest);
+        let previous: AssetManifest = read_json_bounded(&previous_path)?;
+        previous.validate_for_channel(&version)?;
+        for asset in previous.assets {
+            if !replaced_names.contains(asset.logical_name.as_str()) {
+                verify_retained_record(&previous_path, &asset)?;
+            }
+            assets.insert(asset.logical_name.clone(), asset);
+        }
+    } else if descriptors.len() != 2 {
+        return Err(input_error(
+            "an initial asset manifest requires both runtime asset descriptors",
+        ));
+    }
     for descriptor in descriptors {
         if descriptor.schema_version != CONTRACT_VERSION
-            || descriptor.release_version != version
-            || descriptor.candidate_commit != identity.commit
-            || descriptor.source_date_epoch != identity.source_date_epoch
+            || descriptor.quirl_version != version
+            || descriptor.asset.source_revision != identity.commit
+            || descriptor.asset.source_date_epoch != identity.source_date_epoch
         {
             return Err(input_error(
                 "asset descriptor version does not match the workspace release",
             ));
         }
-        validate_record(&descriptor.asset, &version)?;
+        validate_record(&descriptor.asset, &version, true)?;
         let path = unique_file_named(&files, &descriptor.asset.file)?;
         let bytes = read_bounded(path, ASSET_BYTES_MAX)?;
         if sha256_hex(&bytes) != descriptor.asset.sha256
@@ -378,22 +458,96 @@ fn manifest(
                 descriptor.asset.file
             )));
         }
-        assets.push(descriptor.asset);
+        for notice in &descriptor.asset.notices {
+            let notice_path = unique_file_named(&files, &notice.file)?;
+            let notice_bytes = read_bounded(notice_path, NOTICE_BYTES_MAX)?;
+            if sha256_hex(&notice_bytes) != notice.sha256
+                || u64::try_from(notice_bytes.len()).ok() != Some(notice.byte_size)
+                || notice_bytes != notice.text.as_bytes()
+            {
+                return Err(input_error(format!(
+                    "asset notice {} differs from its descriptor",
+                    notice.file
+                )));
+            }
+        }
+        assets.insert(descriptor.asset.logical_name.clone(), descriptor.asset);
     }
     let manifest = AssetManifest {
         schema_version: CONTRACT_VERSION,
-        release_version: version,
-        candidate_commit: identity.commit,
-        source_date_epoch: identity.source_date_epoch,
-        assets,
+        quirl_version: version,
+        assets: assets.into_values().collect(),
     };
-    manifest.validate_for_release(&manifest.release_version)?;
+    manifest.validate_for_channel(&manifest.quirl_version)?;
     immutable_write(&output, &json_bytes(&manifest)?)?;
     print_json(&AssetManifestResult {
         schema_version: CONTRACT_VERSION,
         manifest: output.display().to_string(),
         asset_count: manifest.assets.len(),
     })
+}
+
+fn verify_retained_record(manifest_path: &Path, asset: &AssetRecord) -> Result<(), Box<dyn Error>> {
+    let directory = manifest_path
+        .parent()
+        .ok_or_else(|| input_error("previous asset manifest has no parent directory"))?;
+    verify_sibling_bytes(
+        directory,
+        &asset.file,
+        asset.byte_size,
+        &asset.sha256,
+        ASSET_BYTES_MAX,
+        "retained asset",
+    )?;
+    for notice in &asset.notices {
+        let bytes = verify_sibling_bytes(
+            directory,
+            &notice.file,
+            notice.byte_size,
+            &notice.sha256,
+            NOTICE_BYTES_MAX,
+            "retained asset notice",
+        )?;
+        if bytes != notice.text.as_bytes() {
+            return Err(input_error(format!(
+                "retained asset notice {} differs from its manifest text",
+                notice.file
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_sibling_bytes(
+    directory: &Path,
+    file: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+    bytes_max: usize,
+    label: &str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    validate_relative_file_name(file)?;
+    let path = directory.join(file);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        input_error(format!(
+            "could not inspect {label} sibling {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() != expected_size {
+        return Err(input_error(format!(
+            "{label} sibling {} is not the declared regular file",
+            path.display()
+        )));
+    }
+    let bytes = read_bounded(&path, bytes_max)?;
+    if sha256_hex(&bytes) != expected_sha256 {
+        return Err(input_error(format!(
+            "{label} sibling {} differs from its declared SHA-256",
+            path.display()
+        )));
+    }
+    Ok(bytes)
 }
 
 fn rebase_manifest(input: &Path, base_url: &str, output: &Path) -> Result<(), Box<dyn Error>> {
@@ -410,16 +564,18 @@ fn rebase_manifest(input: &Path, base_url: &str, output: &Path) -> Result<(), Bo
         ));
     }
     let mut manifest: AssetManifest = read_json_bounded(input)?;
-    let release_version = manifest.release_version.clone();
-    // `validate_for_release` requires each asset's URL to be the exact
-    // GitHub Releases form (`validate_record`), so it only runs here, on the
-    // as-built manifest, before any URL rewriting — confirming the input is
-    // a genuine, unmodified build output. It can't run again afterward: a
-    // rebased manifest fails that same GitHub-specific check by design.
-    manifest.validate_for_release(&release_version)?;
+    let quirl_version = manifest.quirl_version.clone();
+    // A refresh may merge an unchanged record from the currently published
+    // website manifest with a newly built GitHub-URL descriptor. Validate the
+    // complete provider-neutral contract before rewriting every URL together.
+    manifest.validate_for_channel(&quirl_version)?;
     for asset in &mut manifest.assets {
         validate_relative_file_name(&asset.file)?;
         asset.url = format!("{base_url}/{}", asset.file);
+        for notice in &mut asset.notices {
+            validate_relative_file_name(&notice.file)?;
+            notice.url = format!("{base_url}/{}", notice.file);
+        }
     }
     immutable_write(output, &json_bytes(&manifest)?)?;
     print_json(&AssetManifestResult {
@@ -429,7 +585,11 @@ fn rebase_manifest(input: &Path, base_url: &str, output: &Path) -> Result<(), Bo
     })
 }
 
-fn validate_record(record: &AssetRecord, version: &str) -> Result<(), Box<dyn Error>> {
+fn validate_record(
+    record: &AssetRecord,
+    version: &str,
+    require_release_url: bool,
+) -> Result<(), Box<dyn Error>> {
     validate_relative_file_name(&record.file)?;
     if !matches!(
         record.logical_name.as_str(),
@@ -439,11 +599,25 @@ fn validate_record(record: &AssetRecord, version: &str) -> Result<(), Box<dyn Er
         || record.byte_size == 0
         || record.byte_size > u64::try_from(ASSET_BYTES_MAX)?
         || record.sha256.len() != 64
-        || !record.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || record.url != release_url(version, &record.file)
+        || !record
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || record.file != content_addressed_file(&record.logical_name, version, &record.sha256)?
+        || (require_release_url && record.url != release_url(version, &record.file))
+        || (!require_release_url
+            && (!record.url.starts_with("https://")
+                || !record.url.ends_with(&format!("/{}", record.file))))
         || record.compatibility.quirl_version_requirement != format!("={version}")
         || record.compatibility.operating_systems != ["linux", "macos"]
         || record.compatibility.architectures != ["aarch64", "x86_64"]
+        || record.source_revision.len() != 40
+        || !record
+            .source_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || record.source_date_epoch == 0
+        || !validate_notices(record, version, require_release_url)?
     {
         return Err(input_error(format!(
             "invalid runtime asset record {}",
@@ -451,6 +625,58 @@ fn validate_record(record: &AssetRecord, version: &str) -> Result<(), Box<dyn Er
         )));
     }
     Ok(())
+}
+
+fn validate_notices(
+    record: &AssetRecord,
+    version: &str,
+    require_release_url: bool,
+) -> Result<bool, Box<dyn Error>> {
+    if record.notices.len() > NOTICES_MAX {
+        return Ok(false);
+    }
+    if record.logical_name == "command-model" {
+        return Ok(record.notices.is_empty());
+    }
+    if record.logical_name != "completion-database" || record.notices.len() != 1 {
+        return Ok(false);
+    }
+    let notice = &record.notices[0];
+    validate_relative_file_name(&notice.file)?;
+    let text_bytes = notice.text.as_bytes();
+    let expected_file = format!("quirl-carapace-license-{}.txt", notice.sha256);
+    Ok(notice.name == "Carapace"
+        && notice.spdx_license == "MIT"
+        && !text_bytes.is_empty()
+        && text_bytes.len() <= NOTICE_BYTES_MAX
+        && u64::try_from(text_bytes.len()).ok() == Some(notice.byte_size)
+        && sha256_hex(text_bytes) == notice.sha256
+        && notice.file == expected_file
+        && if require_release_url {
+            notice.url == release_url(version, &notice.file)
+        } else {
+            notice.url.starts_with("https://") && notice.url.ends_with(&format!("/{}", notice.file))
+        })
+}
+
+fn content_addressed_file(
+    logical_name: &str,
+    quirl_version: &str,
+    sha256: &str,
+) -> Result<String, Box<dyn Error>> {
+    let (stem, extension) = match logical_name {
+        "completion-database" => ("quirl-completion-database", "sqlite3"),
+        "command-model" => ("quirl-command-model", "tar"),
+        _ => return Err(input_error("unknown runtime asset logical name")),
+    };
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(input_error("runtime asset digest is not lowercase SHA-256"));
+    }
+    Ok(format!("{stem}-v{quirl_version}-{sha256}.{extension}"))
 }
 
 fn collect_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
@@ -516,30 +742,57 @@ fn print_json(value: &impl Serialize) -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
-    fn record(name: &str, file: &str, format: &str) -> AssetRecord {
+    fn test_identity() -> CandidateIdentity {
+        CandidateIdentity {
+            version: "0.1.0".to_owned(),
+            commit: "d".repeat(40),
+            source_date_epoch: 2,
+        }
+    }
+
+    fn record(name: &str, _file: &str, format: &str) -> AssetRecord {
+        let sha256 = sha256_hex(b"x");
+        let file = content_addressed_file(name, "0.1.0", &sha256).unwrap();
+        let notices = if name == "completion-database" {
+            let text = "MIT License\n\nCopyright (c) Carapace contributors\n".to_owned();
+            let notice_sha256 = sha256_hex(text.as_bytes());
+            let notice_file = format!("quirl-carapace-license-{notice_sha256}.txt");
+            vec![AssetNotice {
+                name: "Carapace".to_owned(),
+                spdx_license: "MIT".to_owned(),
+                file: notice_file.clone(),
+                byte_size: u64::try_from(text.len()).unwrap(),
+                sha256: notice_sha256,
+                url: release_url("0.1.0", &notice_file),
+                text,
+            }]
+        } else {
+            Vec::new()
+        };
         AssetRecord {
             logical_name: name.to_owned(),
-            file: file.to_owned(),
+            file: file.clone(),
             format: format.to_owned(),
             format_version: 1,
             byte_size: 1,
-            sha256: "a".repeat(64),
-            url: release_url("0.1.0", file),
+            sha256,
+            url: release_url("0.1.0", &file),
             compatibility: AssetCompatibility {
                 quirl_version_requirement: "=0.1.0".to_owned(),
                 operating_systems: vec!["linux".to_owned(), "macos".to_owned()],
                 architectures: vec!["aarch64".to_owned(), "x86_64".to_owned()],
             },
+            source_revision: "b".repeat(40),
+            source_date_epoch: 1,
+            notices,
         }
     }
 
     #[test]
     fn manifest_requires_both_unique_logical_assets() {
         let valid = AssetManifest {
-            schema_version: 1,
-            release_version: "0.1.0".to_owned(),
-            candidate_commit: "b".repeat(40),
-            source_date_epoch: 1,
+            schema_version: 2,
+            quirl_version: "0.1.0".to_owned(),
             assets: vec![
                 record("command-model", "model.tar", "tar"),
                 record("completion-database", "completion.sqlite3", "sqlite3"),
@@ -555,7 +808,7 @@ mod tests {
 
     #[test]
     fn manifest_contract_rejects_unknown_fields() {
-        let json = r#"{"schema_version":1,"release_version":"0.1.0","candidate_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","source_date_epoch":1,"assets":[],"extra":true}"#;
+        let json = r#"{"schema_version":2,"quirl_version":"0.1.0","assets":[],"extra":true}"#;
         assert!(serde_json::from_str::<AssetManifest>(json).is_err());
     }
 
@@ -571,10 +824,8 @@ mod tests {
     #[test]
     fn rebase_manifest_only_rewrites_urls() {
         let manifest = AssetManifest {
-            schema_version: 1,
-            release_version: "0.1.0".to_owned(),
-            candidate_commit: "b".repeat(40),
-            source_date_epoch: 1,
+            schema_version: 2,
+            quirl_version: "0.1.0".to_owned(),
             assets: vec![
                 record("command-model", "model.tar", "tar"),
                 record("completion-database", "completion.sqlite3", "sqlite3"),
@@ -596,9 +847,21 @@ mod tests {
             assert_eq!(rewritten.sha256, original.sha256);
             assert_eq!(rewritten.byte_size, original.byte_size);
             assert_eq!(rewritten.logical_name, original.logical_name);
+            for (original_notice, rewritten_notice) in
+                original.notices.iter().zip(&rewritten.notices)
+            {
+                assert_eq!(
+                    rewritten_notice.url,
+                    format!(
+                        "https://quirl.vercel.app/reference/{}",
+                        original_notice.file
+                    )
+                );
+                assert_eq!(rewritten_notice.text, original_notice.text);
+                assert_eq!(rewritten_notice.sha256, original_notice.sha256);
+            }
         }
-        assert_eq!(rebased.release_version, manifest.release_version);
-        assert_eq!(rebased.candidate_commit, manifest.candidate_commit);
+        assert_eq!(rebased.quirl_version, manifest.quirl_version);
 
         fs::remove_file(&input).unwrap();
         fs::remove_file(&output).unwrap();
@@ -607,10 +870,8 @@ mod tests {
     #[test]
     fn rebase_manifest_rejects_a_non_https_base_url() {
         let manifest = AssetManifest {
-            schema_version: 1,
-            release_version: "0.1.0".to_owned(),
-            candidate_commit: "b".repeat(40),
-            source_date_epoch: 1,
+            schema_version: 2,
+            quirl_version: "0.1.0".to_owned(),
             assets: vec![
                 record("command-model", "model.tar", "tar"),
                 record("completion-database", "completion.sqlite3", "sqlite3"),
@@ -624,5 +885,109 @@ mod tests {
         assert!(rebase_manifest(&input, "https://trailing.invalid/", &output).is_err());
 
         fs::remove_file(&input).unwrap();
+    }
+
+    #[test]
+    fn manifest_refresh_retains_only_an_exact_previous_payload() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let identity = test_identity();
+        let directory = temp_path("merge");
+        let input = directory.join("input");
+        fs::create_dir_all(&input).unwrap();
+
+        let mut retained = record("command-model", "ignored", "tar");
+        retained.source_revision = "c".repeat(40);
+        retained.url = format!("https://quirl.dev/reference/v0.1.0/{}", retained.file);
+        let previous = AssetManifest {
+            schema_version: CONTRACT_VERSION,
+            quirl_version: identity.version.clone(),
+            assets: vec![
+                retained.clone(),
+                record("completion-database", "ignored", "sqlite3"),
+            ],
+        };
+        let previous_path = directory.join("previous.json");
+        fs::write(&previous_path, json_bytes(&previous).unwrap()).unwrap();
+        fs::write(directory.join(&retained.file), b"x").unwrap();
+
+        let bytes = b"new completion database";
+        let sha256 = sha256_hex(bytes);
+        let file =
+            content_addressed_file("completion-database", &identity.version, &sha256).unwrap();
+        let mut replacement = record("completion-database", "ignored", "sqlite3");
+        replacement.file = file.clone();
+        replacement.byte_size = u64::try_from(bytes.len()).unwrap();
+        replacement.sha256 = sha256;
+        replacement.url = release_url(&identity.version, &file);
+        replacement.source_revision = identity.commit.clone();
+        replacement.source_date_epoch = identity.source_date_epoch;
+        fs::write(input.join(&file), bytes).unwrap();
+        for notice in &replacement.notices {
+            fs::write(input.join(&notice.file), notice.text.as_bytes()).unwrap();
+        }
+        fs::write(
+            input.join("completion-database.asset-v2.json"),
+            json_bytes(&AssetDescriptor {
+                schema_version: CONTRACT_VERSION,
+                quirl_version: identity.version.clone(),
+                asset: replacement.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let output = directory.join("asset-manifest-v2.json");
+        manifest_with_identity(root, &input, &output, Some(&previous_path), test_identity())
+            .unwrap();
+
+        let merged: AssetManifest = read_json_bounded(&output).unwrap();
+        assert_eq!(merged.assets.len(), 2);
+        assert!(merged.assets.contains(&retained));
+        assert!(merged.assets.contains(&replacement));
+
+        fs::remove_file(&output).unwrap();
+        fs::write(directory.join(&retained.file), b"y").unwrap();
+        assert!(
+            manifest_with_identity(root, &input, &output, Some(&previous_path), test_identity(),)
+                .is_err()
+        );
+        assert!(!output.exists());
+
+        fs::remove_file(directory.join(&retained.file)).unwrap();
+        assert!(
+            manifest_with_identity(root, &input, &output, Some(&previous_path), test_identity())
+                .is_err()
+        );
+        assert!(!output.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn retained_record_requires_exact_sibling_payload_and_notice_bytes() {
+        let directory = temp_path("retained-files");
+        fs::create_dir_all(&directory).unwrap();
+        let record = record("completion-database", "ignored", "sqlite3");
+        let manifest_path = directory.join("asset-manifest-v2.json");
+        fs::write(&manifest_path, b"{}").unwrap();
+        fs::write(directory.join(&record.file), b"x").unwrap();
+        for notice in &record.notices {
+            fs::write(directory.join(&notice.file), notice.text.as_bytes()).unwrap();
+        }
+        assert!(verify_retained_record(&manifest_path, &record).is_ok());
+
+        fs::write(directory.join(&record.file), b"y").unwrap();
+        assert!(verify_retained_record(&manifest_path, &record).is_err());
+        fs::write(directory.join(&record.file), b"x").unwrap();
+
+        let notice = &record.notices[0];
+        let mut corrupt_notice = notice.text.as_bytes().to_vec();
+        corrupt_notice[0] ^= 1;
+        fs::write(directory.join(&notice.file), corrupt_notice).unwrap();
+        assert!(verify_retained_record(&manifest_path, &record).is_err());
+        fs::remove_file(directory.join(&notice.file)).unwrap();
+        assert!(verify_retained_record(&manifest_path, &record).is_err());
+        fs::remove_file(directory.join(&record.file)).unwrap();
+        assert!(verify_retained_record(&manifest_path, &record).is_err());
+
+        fs::remove_dir_all(directory).unwrap();
     }
 }

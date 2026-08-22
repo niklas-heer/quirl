@@ -4,6 +4,11 @@ Release policy lives in Quirl's Rust `xtask`. Workflow files are orchestration
 only. [ADR 0026](decisions/0026-rust-native-releases-and-runtime-assets.md)
 defines the identity, immutability, recovery, and storage contracts.
 
+The 0.1 distribution is the native GitHub Release plus Homebrew tap. Product
+crates are explicitly `publish = false`; crates.io and `cargo install` are not
+release targets until the path dependency graph, package metadata, and support
+contract are designed for them.
+
 ## Local commands
 
 Inspect the next version and deterministic notes without changing files:
@@ -36,13 +41,37 @@ cargo xtask release package --target aarch64-apple-darwin --output target/releas
 cargo xtask release aggregate --input target/release-input --output target/release-aggregate
 ```
 
+Each native archive has exactly four top-level contracts: executable
+`bin/quirl`, Quirl's `LICENSE`, process-bridge `THIRD_PARTY_NOTICES.md`, and a
+deterministic target-specific `THIRD_PARTY_LICENSES.txt`. Packaging checks the
+locked release dependency graph against `distribution/quirl-cli-third-party.tsv`
+and fails if a dependency, declared license, source, platform closure, or
+bounded license text drifts.
+
 Build separate downloadable assets and their strict manifest:
 
 ```console
 cargo xtask assets build --kind completion-database --output target/assets
 cargo xtask assets build --kind command-model --output target/assets
-cargo xtask assets manifest --input target/assets --output target/assets/asset-manifest-v1.json
+cargo xtask assets manifest --input target/assets --output target/assets/asset-manifest-v2.json
 ```
+
+To refresh completions for the currently shipped binary without rebuilding the
+model or cutting a release, build only `completion-database`, then merge it with
+the current version-scoped website manifest:
+
+```console
+cargo xtask assets build --kind completion-database --identity current --output target/assets/completion-database
+cargo xtask assets manifest --identity current --input target/assets --previous-manifest website/public/reference/vVERSION/asset-manifest-v2.json --output target/assets/asset-manifest-v2.json
+cargo xtask assets rebase-manifest --input target/assets/asset-manifest-v2.json --base-url https://quirl.vercel.app/reference/vVERSION --output target/assets/asset-manifest-v2-website.json
+```
+
+The checked-in completion workflow performs the bounded publication transaction:
+it copies new digest-named payload and notice files without overwriting existing
+names, verifies every retained sibling again, admits the complete result with
+the exact tagged binary, validates the complete website, and updates the small
+manifest last. It refuses to publish before that version's immutable tag and
+GitHub Release exist.
 
 Render and validate the tap formula from the aggregate release manifest:
 
@@ -63,7 +92,6 @@ Use protected environments so untrusted pull requests never receive secrets:
 
 | Environment | Authority | Contents |
 | --- | --- | --- |
-| `release-preparation` | Quirl preparation PR only | Quirl-scoped App client ID/private key; protected manual workflow |
 | `release` | Quirl repository only | GitHub-provided token with `contents: write`; required reviewer for publication |
 | `release-assets` | Asset source only | Narrow read credentials needed to acquire the model/database inputs; none when inputs are public |
 | `homebrew-tap` | Tap repository only | GitHub App client ID and private key; fine-grained PAT fallback |
@@ -73,19 +101,13 @@ client ID. Secrets contain only the App private key, source credentials,
 or fallback PAT. Do not store checksums, versions, URLs, or policy as variables;
 `xtask` derives them from candidate inputs.
 
-For the checked-in workflows, define `RELEASE_APP_CLIENT_ID` and
-`HOMEBREW_APP_CLIENT_ID` as repository variables. Store
-`RELEASE_APP_PRIVATE_KEY` on the protected `release-preparation` environment and
-`HOMEBREW_APP_PRIVATE_KEY` on the protected `homebrew-tap` environment. Give
-the `release` environment a required reviewer, enable immutable releases, and
-protect release tags from mutation. Keep the repository's default workflow
-token read-only; only the publication job receives `contents: write`.
-
-The release-preparation App is installed only on `niklas-heer/quirl` with
-repository `Contents: read and write` and `Pull requests: read and write`. Its
-token is minted only after preparation and the canonical gate pass, allowing
-the resulting PR commit to trigger normal CI. Rotate it with the same
-replace-test-revoke sequence as the tap App.
+For the checked-in workflows, define `HOMEBREW_APP_CLIENT_ID` as a repository
+variable and store `HOMEBREW_APP_PRIVATE_KEY` on the protected `homebrew-tap`
+environment. Give the `release` environment a required reviewer, enable
+immutable releases, and protect release tags from mutation. The preparation
+workflow uses the repository's built-in token with job-local `contents: write`
+and `pull-requests: write`; the publication job is the only other job that
+receives `contents: write`.
 
 The GitHub App is installed only on `niklas-heer/homebrew-tap` and has
 repository `Contents: read and write` and `Pull requests: read and write`.
@@ -120,14 +142,19 @@ hosted-runner reference before changing those labels.
 5. Run `cargo xtask release tag --expected-tag vVERSION --write` to create the
    immutable exact-candidate tag, then create the GitHub Release and upload only
    the aggregate's exact bytes. Refuse a conflicting tag, release, or asset.
-6. Generate `Formula/quirl.rb` from that published release manifest on a new tap
+6. Wait for the release-dispatched completion workflow to seed or advance the
+   exact version's website channel and smoke-admit it with the released binary.
+7. Generate `Formula/quirl.rb` from that published release manifest on a new tap
    branch and open a PR. Never push the tap default branch.
 
-Before a tag or public asset exists, fix a failure and rerun from a new clean
-candidate. After a tag or any asset is public, do not move, delete-and-recreate,
-or overwrite it as routine recovery. Preserve logs and manifests, correct the
-problem in source, and publish a new SemVer version. An empty unpublished draft
-may be removed only after verifying that no tag or asset escaped.
+Before a tag or GitHub Release asset exists, fix a binary-release failure and
+rerun from a new clean candidate. After either is public, do not move,
+delete-and-recreate, or overwrite it as routine recovery. Preserve logs and
+manifests, correct the problem in source, and publish a new SemVer version. An
+empty unpublished draft may be removed only after verifying that no tag or
+release asset escaped. Website channel manifests may advance independently, but
+only after their new content-addressed bytes exist; an existing payload URL is
+never overwritten.
 
 If the tap PR fails, the Quirl release remains valid. Regenerate the formula
 from its published manifest and retry with a new tap branch. If asset hosting is
@@ -136,12 +163,20 @@ remain valid; do not repoint a published manifest to mutable replacement bytes.
 
 ## Runtime assets and offline behavior
 
-Version 0.1 publishes the completion SQLite database, command model bundle, and
-`asset-manifest-v1.json` as versioned GitHub Release assets. Homebrew installs
-only `quirl`. It must not fetch either runtime asset in `install` or `test`.
-The asset manifest binds both logical assets to the exact release version,
-candidate commit, and source epoch as well as their individual format,
-compatibility, byte-size, digest, and immutable URL contracts.
+Version 0.1 publishes an initial completion SQLite database, command model
+bundle, their retained license notices, and `asset-manifest-v2.json` as GitHub
+Release assets. Homebrew installs `quirl` plus the redistribution documents; it
+must not fetch runtime assets in `install` or `test`. The formula installs `LICENSE`,
+`THIRD_PARTY_NOTICES.md`, and `THIRD_PARTY_LICENSES.txt` below
+`share/quirl/licenses` so the redistribution notices accompany the binary.
+
+The live website manifest is version-scoped, for example
+`/reference/v0.1.0/asset-manifest-v2.json`, and may advance without a binary
+release. Each entry has its own source revision and epoch, exact binary
+compatibility, format, byte size, digest, and content-addressed URL. A completion
+refresh replaces only that logical record and retains the current model. The
+workflow publishes new bytes before the manifest, never deletes or overwrites a
+payload, and admits at most 32 completion generations per binary version.
 
 Quirl stores downloaded assets below the platform data/cache roots:
 

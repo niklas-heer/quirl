@@ -10,7 +10,7 @@ document turns the §10/§12 vision in
 [language-design.md](/docs/architecture/product-and-language-design) into an
 implementation contract. [ADR 0012](/docs/architecture/decisions/0012-ratatui-interactive-surface)
 accepts Ratatui as the capable-TTY default and retains Reedline as the simple
-fallback. [ADR 0022](decisions/0022-persistent-rich-session-transcript.md)
+fallback. [ADR 0022](/docs/architecture/decisions/0022-persistent-rich-session-transcript)
 supersedes ADR 0012's per-command screen release with a persistent, bounded
 rich-session transcript. Sections marked as future work remain design targets
 rather than claims about the current binary.
@@ -485,10 +485,15 @@ when the theme presents them with compact shared chrome. A capture-limit error
 replaces a success footer and states the configured and observed byte counts;
 it never shows a partial capture as successful.
 
-Stage 1 admits results only after completion. Spinners, live tailing, and
-interactive child input are future work. `prompt.transient` remains in config
-schema v2 for compatibility and still applies to the simple surface; the rich
-surface always records accepted commands in its bounded transcript.
+The current rich path admits stdout and stderr incrementally through bounded
+8 KiB chunks while the process owner retains lifecycle and capture limits. A
+spinner and elapsed-time notice repaint on liveness ticks even when a command
+is silent; carriage-return progress replaces one live transcript line. Status
+is committed only after both readers drain, and overflow or cleanup failure is
+never presented as success. Interactive child input remains a separate terminal
+takeover boundary. `prompt.transient` remains for compatibility and still
+applies to the simple surface; the rich surface always records accepted
+commands in its bounded transcript.
 
 ### 5.6 Picker overlays
 
@@ -761,7 +766,7 @@ v0/v1/v2/v3-to-v4 migration:
 
 ```lua
 local config = quirl.config {
-  editor = { keymap = "emacs", semantic_hints = true, banner = "full" }, -- existing
+  editor = { keymap = "emacs", semantic_hints = true, banner = "compact" },
   picker = { layout = "adaptive", preview = true },        -- existing
   prompt = {
     symbols = "auto",                                      -- existing
@@ -775,15 +780,18 @@ local config = quirl.config {
     surface = "auto",              -- auto | rich | simple
     statusline = { hints = true },
   },
-  completion = {                                           -- new
-    auto = false,                  -- manual by default; true enables threshold opening
-    min_chars = 2,                 -- threshold when auto is enabled
+  completion = {
+    auto = true,                   -- automatic semantic completion by default
+    min_chars = 1,                 -- threshold when auto is enabled
   },
 }
 ```
 
-ADR 0013 later adds bounded built-in and custom semantic themes as config
-schema v3; v0/v1/v2 documents migrate to the Tokyo Night default.
+ADR 0013 added bounded built-in and custom semantic themes as config schema v3.
+The current schema v4 changes only polished defaults: a compact banner,
+automatic completion after one character, and `rust_version` in the right
+prompt. Unversioned v0 and explicit v1/v2/v3 documents migrate to v4 before
+validation, retaining the Tokyo Night theme default.
 
 `ui.surface = "auto"` applies the §9 probe. Everything else in the frame
 derives from existing config (keymap, picker layout, prompt segments,

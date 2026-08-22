@@ -1,13 +1,14 @@
 # Security policy
 
 Quirl executes commands and hosts extensions, so security reports are taken
-seriously even while the project is a pre-release prototype.
+seriously throughout the 0.1.0 release-candidate process and after publication.
 
 ## Supported versions
 
-No stable version has been published yet. Security fixes are made on `main` and
-will be included in the next release candidate. Old commits, local forks, and
-unreleased build artifacts are not maintained as separate support lines.
+The latest immutable `0.1.x` GitHub Release is the supported release line. When
+no `0.1.x` release exists yet, security fixes are made on `main` and included
+in the next exact candidate. Old commits, local forks, and untagged build
+artifacts are not maintained as separate support lines.
 
 ## Report a vulnerability
 

@@ -8,12 +8,17 @@ natively, adds an explicit typed data mode for structured pipelines, and
 standardizes configuration, scripts, prompts, completions, and trusted plugins
 on one sandboxed Lua 5.4 SDK.
 
-<Callout type="warn" title="Pre-release documentation">
-  Quirl 0.1 is an unreleased Unix candidate implementation and a fast-moving
-  prototype. Some interfaces will change before the first tagged release. Linux
-  and macOS are the supported interactive targets; Windows is best-effort
-  portability work. Historical benchmark records apply only to their named
-  artifacts, not to this candidate.
+The native binary remains usable offline. Compatible completion knowledge is
+delivered separately through an exact-version website channel, so its immutable
+database generations can improve without manufacturing an otherwise empty
+binary release.
+
+<Callout type="warn" title="0.1 release identity">
+  Quirl's 0.1 line supports interactive Linux and macOS. A build is an official
+  release only when an immutable GitHub tag and release name its exact commit;
+  other source checkouts are candidate or development builds. Windows is
+  best-effort portability work. Historical benchmark records apply only to
+  their named artifacts.
 </Callout>
 
 {/* BEGIN QUIRL RELEASE EVIDENCE STATUS */}
@@ -25,7 +30,7 @@ on one sandboxed Lua 5.4 SDK.
 ## Start here
 
 <Cards>
-  <Card title="Install from source" href="/docs/getting-started/installation" description="Build the current candidate implementation with the pinned Rust toolchain." />
+  <Card title="Install from source" href="/docs/getting-started/installation" description="Build Quirl with the pinned Rust toolchain." />
   <Card title="Your first session" href="/docs/getting-started/first-session" description="Move from familiar commands to typed data and back again." />
   <Card title="Understand the language" href="/docs/architecture/product-and-language-design" description="Read the complete product and language specification." />
   <Card title="Extend with Lua" href="/docs/extensions/lua-sdk" description="Use one bounded SDK for scripts, configuration, and plugins." />

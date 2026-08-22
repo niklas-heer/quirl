@@ -1,6 +1,6 @@
 ---
 title: Install Quirl
-description: Install a native Quirl release or build the 0.1 candidate with the pinned toolchain.
+description: Install a native Quirl release or build the 0.1 line with the pinned toolchain.
 ---
 
 <Callout type="warn" title="0.1 publication status">
@@ -15,8 +15,9 @@ brew install niklas-heer/tap/quirl
 ```
 
 The formula selects a SHA-256-pinned native binary for macOS or Linux on ARM64
-or x86_64. It installs only `quirl`; its bounded offline test does not download
-the completion database or command model.
+or x86_64. It installs `quirl` plus its redistribution license files; its
+bounded offline test does not download the completion database or command
+model.
 
 ## Direct release archive
 
@@ -25,7 +26,12 @@ versioned GitHub Release, verify it against `SHA256SUMS`, and compare the entry
 in `release-manifest-v1.json` before putting `quirl` on `PATH`. Never use an
 asset from a mutable branch URL as a release binary.
 
-## Requirements
+## Binary requirements
+
+The native package needs only a supported Linux or macOS host. It does not
+require Git, Rust, Python, or a system Lua installation.
+
+## Source-build requirements
 
 - Linux or macOS for the supported interactive experience.
 - Git.
@@ -62,10 +68,14 @@ strategy.
 
 ## Downloadable data and offline use
 
-The completion SQLite database and command model are separate versioned assets,
-not part of the binary or Homebrew package. Missing assets never delay the first
-prompt: Quirl uses built-in/local completion and degraded natural-command
-retrieval while a bounded background update is eligible.
+The completion SQLite database and command model are separate exact-version
+assets, not part of the binary or Homebrew package. The website channel may
+advance completion knowledge independently without cutting a binary release;
+each database and required license notice has immutable, digest-named bytes and
+its own source identity, while the compatible model record is retained. Missing
+assets never delay the first prompt: Quirl uses built-in/local completion and
+degraded natural-command retrieval while a bounded background update is
+eligible.
 
 Inspect or explicitly retry asset work with:
 

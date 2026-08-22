@@ -1,24 +1,26 @@
 ---
 title: Getting started
-description: Build Quirl from source and learn the three boundaries that shape every session.
+description: Build Quirl from source and learn its three interactive modes and bounded Lua extension surface.
 ---
 
 Quirl is deliberately familiar at the prompt. Start with the commands you
 already know, opt into typed data when rows and records are the right model,
-and reach for Lua when you need general-purpose logic.
+use AI mode to discover a command without executing it, and reach for Lua when
+you need general-purpose logic.
 
 <Cards>
-  <Card title="Install from source" href="/docs/getting-started/installation" description="Use the pinned Rust 1.97.1 toolchain and run the current candidate." />
-  <Card title="Try the core workflow" href="/docs/getting-started/first-session" description="Move between command bytes, typed values, and Lua." />
-  <Card title="Check project status" href="/docs/getting-started/status-and-platforms" description="See what is supported today and what remains prerelease." />
+  <Card title="Install from source" href="/docs/getting-started/installation" description="Use the pinned Rust 1.97.1 toolchain to build and run Quirl." />
+  <Card title="Try the core workflow" href="/docs/getting-started/first-session" description="Move between command bytes, typed values, AI discovery, and Lua." />
+  <Card title="Check project status" href="/docs/getting-started/status-and-platforms" description="See current platform support, release identity, and known limits." />
 </Cards>
 
 ## The mental model
 
 | Surface | Carries | Use it for |
 | --- | --- | --- |
-| Command mode | byte streams | familiar programs, redirects, jobs, Bash/Zsh islands |
+| Normal mode | byte streams | familiar programs, redirects, jobs, Bash/Zsh islands |
 | Data mode | typed values | records, tables, filtering, selection, structured output |
+| AI mode | local command knowledge | describe an intent, then insert a suggestion for review |
 | Lua 5.4 | bounded logic | configuration, scripts, prompts, completion, plugins |
 
 No mode silently pretends to be another. Native Quirl scripts make their

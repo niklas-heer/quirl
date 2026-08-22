@@ -13,9 +13,9 @@ jobs:
   prepare:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    environment: release-preparation
     permissions:
-      contents: read
+      contents: write
+      pull-requests: write
 
     steps:
       - name: Check out Quirl
@@ -34,21 +34,10 @@ jobs:
       - name: Run the canonical quality gate
         run: cargo xtask check
 
-      - name: Create a narrowly scoped release-preparation token
-        id: release-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: niklas-heer
-          repositories: quirl
-          permission-contents: write
-          permission-pull-requests: write
-
       - name: Open the release preparation pull request
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
-          token: ${{ steps.release-token.outputs.token }}
+          token: ${{ github.token }}
           add-paths: |
             Cargo.toml
             Cargo.lock
