@@ -2484,6 +2484,16 @@ fn check_rich_review_regressions(binary: &Path) -> Result<(), Box<dyn Error>> {
     session.pty.wait_for(b"VIEWPORT-END")?;
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"^C")?;
+    // The cancellation marker is emitted before the rich surface finishes
+    // its replacement frame. Wait for that complete idle frame so Ctrl-D
+    // cannot race the cancellation repaint and make this cleanup assertion
+    // depend on scheduler timing.
+    session
+        .pty
+        .wait_for_screen("idle prompt after cancellation", |screen| {
+            screen.text().contains("interactive input cancelled")
+                && screen.bottom_line().contains("NORMAL")
+        })?;
     let cleanup_start = session.pty.output().len();
     send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     if !contains(&session.pty.output()[cleanup_start..], b"\x1b[?25h") {
