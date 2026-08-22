@@ -80,7 +80,7 @@ struct Environment {
     quirl_version: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QuirlBuildInfo {
     schema_version: u32,
@@ -91,6 +91,8 @@ struct QuirlBuildInfo {
     operating_system: String,
     architecture: String,
     source_commit: String,
+    build_timestamp: String,
+    official_release: bool,
     source_dirty: Option<bool>,
 }
 
@@ -1541,7 +1543,13 @@ fn quirl_build_info(quirl: &Path) -> Option<QuirlBuildInfo> {
         return None;
     }
     let info: QuirlBuildInfo = serde_json::from_slice(&output.stdout).ok()?;
-    (info.schema_version == 2).then_some(info)
+    build_info_contract_is_current(&info).then_some(info)
+}
+
+fn build_info_contract_is_current(info: &QuirlBuildInfo) -> bool {
+    let timestamp_is_valid = info.build_timestamp.parse::<u64>().is_ok();
+    let official_release_is_clean = !info.official_release || info.source_dirty == Some(false);
+    info.schema_version == 3 && timestamp_is_valid && official_release_is_clean
 }
 
 fn build_info_matches_benchmark(info: &QuirlBuildInfo) -> bool {
@@ -1949,7 +1957,7 @@ mod tests {
             "abort"
         };
         let matching = QuirlBuildInfo {
-            schema_version: 2,
+            schema_version: 3,
             version: "0.1.0".to_owned(),
             build_profile: profile.to_owned(),
             optimization_level: if cfg!(debug_assertions) { "0" } else { "z" }.to_owned(),
@@ -1957,10 +1965,32 @@ mod tests {
             operating_system: env::consts::OS.to_owned(),
             architecture: env::consts::ARCH.to_owned(),
             source_commit: "abc123".to_owned(),
+            build_timestamp: "1".to_owned(),
+            official_release: false,
             source_dirty: Some(false),
         };
 
+        assert!(build_info_contract_is_current(&matching));
         assert!(build_info_matches_benchmark(&matching));
+
+        let legacy = QuirlBuildInfo {
+            schema_version: 2,
+            ..matching.clone()
+        };
+        assert!(!build_info_contract_is_current(&legacy));
+
+        let invalid_timestamp = QuirlBuildInfo {
+            build_timestamp: "not-a-timestamp".to_owned(),
+            ..matching.clone()
+        };
+        assert!(!build_info_contract_is_current(&invalid_timestamp));
+
+        let dirty_official_release = QuirlBuildInfo {
+            official_release: true,
+            source_dirty: Some(true),
+            ..matching.clone()
+        };
+        assert!(!build_info_contract_is_current(&dirty_official_release));
 
         let mismatched = QuirlBuildInfo {
             build_profile: "other".to_owned(),
@@ -1972,7 +2002,7 @@ mod tests {
     #[test]
     fn release_harness_requires_the_same_clean_source_as_the_binary() {
         let matching = QuirlBuildInfo {
-            schema_version: 2,
+            schema_version: 3,
             version: "0.1.0".to_owned(),
             build_profile: "release".to_owned(),
             optimization_level: "z".to_owned(),
@@ -1980,6 +2010,8 @@ mod tests {
             operating_system: env::consts::OS.to_owned(),
             architecture: env::consts::ARCH.to_owned(),
             source_commit: env!("QUIRL_BUILD_COMMIT").to_owned(),
+            build_timestamp: "1".to_owned(),
+            official_release: false,
             source_dirty: Some(false),
         };
 
