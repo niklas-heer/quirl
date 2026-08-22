@@ -83,7 +83,7 @@ jobs:
           --output "${{ runner.temp }}/package"
 
       - name: Preserve the candidate package
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: package-${{ matrix.target }}
           path: ${{ runner.temp }}/package
@@ -120,7 +120,7 @@ jobs:
           --output "${{ runner.temp }}/asset"
 
       - name: Preserve the downloadable asset
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: asset-${{ matrix.kind }}
           path: ${{ runner.temp }}/asset
@@ -145,7 +145,7 @@ jobs:
           ref: ${{ needs.check.outputs.candidate_commit }}
 
       - name: Restore the downloadable assets
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: asset-*
           path: ${{ runner.temp }}/assets
@@ -158,7 +158,7 @@ jobs:
           --output "${{ runner.temp }}/asset-manifest-v2.json"
 
       - name: Preserve the downloadable asset manifest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: asset-manifest
           path: ${{ runner.temp }}/asset-manifest-v2.json
@@ -184,13 +184,13 @@ jobs:
           ref: ${{ needs.check.outputs.candidate_commit }}
 
       - name: Restore every candidate component
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: package-*
           path: ${{ runner.temp }}/release-input/packages
 
       - name: Restore the complete downloadable asset set and manifest
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: asset-*
           path: ${{ runner.temp }}/release-input/assets
@@ -202,7 +202,7 @@ jobs:
           --output "${{ runner.temp }}/release-dist"
 
       - name: Preserve the verified release bundle
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-bundle
           path: ${{ runner.temp }}/release-dist
@@ -242,13 +242,13 @@ jobs:
           cargo xtask release tag --expected-tag "$EXPECTED_TAG" --write
 
       - name: Restore the verified release bundle
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-bundle
           path: ${{ runner.temp }}/release-bundle
 
       - name: Create the immutable tag and GitHub Release
-        uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
         with:
           tag: ${{ inputs.tag }}
           commit: ${{ needs.check.outputs.candidate_commit }}
