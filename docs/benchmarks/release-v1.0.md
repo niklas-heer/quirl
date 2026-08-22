@@ -31,10 +31,11 @@ measurement-platform-scope: macos-15.7.9-24g830-apple-m2-pro-aarch64-apple-darwi
 
 **Automated performance gate:** **passed all release budgets**
 
-**Overall release readiness:** **blocked pending human and platform review**.
-Named human terminal review on Linux and macOS, remote-PTY review, and human
-review of a candidate-derived real-terminal demo remain unavailable. No tag,
-release, upload, deployment, publication, or remote operation was performed.
+**Overall release readiness at the time:** **blocked pending human and platform
+review**. Named human terminal review on Linux and macOS, remote-PTY review,
+and human review of a candidate-derived real-terminal demo were unavailable for
+this historical candidate. No tag, release, upload, deployment, publication,
+or remote operation was performed for it.
 
 This record measures the exact `quirl 0.1.0` artifact named above. Report
 schema v7 rejected tracked or untracked source changes, required an
@@ -172,9 +173,9 @@ returned zero; neither was retried.
 The post-generation idempotence checks and post-commit semantic attribution
 and website results are reported with evidence commit B.
 
-## Missing evidence and blockers
+## Evidence absent from this historical candidate
 
-All automated merge-relevant gates passed. Overall release readiness remains
+All automated merge-relevant gates passed. At the time, this candidate remained
 blocked on:
 
 - a named human reviewer completing the real-terminal checklist in an actual

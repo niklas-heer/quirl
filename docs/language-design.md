@@ -47,8 +47,8 @@ defined in [the documentation system](documentation-system.md).
 
 <!-- BEGIN QUIRL RELEASE EVIDENCE STATUS -->
 > **Release evidence status — historical.** Artifact evidence for measured candidate `23fd5d36907fc816bdafd9aa3c2dcb3afb69feb5` and artifact `9a893a5f1a0b49d62712f331c88966113d910d94efa9651dc4feffe9fd55b637` is historical.
-> Evidence commit `14e70939d039d96c195f57452a0e1ec3928194af` documents that measurement. It is not evidence for the corrected implementation, which has no fresh exact-candidate measurement.
-> Human review on named Linux and macOS terminals, remote-PTY review, and real-terminal demo review remain incomplete.
+> Evidence commit `14e70939d039d96c195f57452a0e1ec3928194af` documents that measurement. It is evidence only for that named artifact, not for a later candidate.
+> This historical record does not assert the release-readiness or human-review state of a later candidate.
 <!-- END QUIRL RELEASE EVIDENCE STATUS -->
 
 ## Long-term direction and illustrative design
