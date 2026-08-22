@@ -31,6 +31,14 @@ jobs:
       - name: Prepare the release sources
         run: cargo xtask release prepare --write
 
+      - name: Set up the documentation toolchain
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Refresh generated website documentation
+        run: npm --prefix website run sync:docs
+
       - name: Run the canonical quality gate
         run: cargo xtask check
 
@@ -43,6 +51,7 @@ jobs:
             Cargo.lock
             CHANGELOG.md
             RELEASE_NOTES.md
+            website/content/docs/project/changelog.mdx
           branch: codex/release-prepare
           delete-branch: true
           commit-message: "chore(release): prepare next version"

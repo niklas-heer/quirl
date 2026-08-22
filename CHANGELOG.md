@@ -10,6 +10,8 @@ only after its exact commit and artifacts pass the
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-22
+
 ### Added
 
 - A native C1-core command graph on Linux and macOS with byte pipelines,
