@@ -151,7 +151,7 @@ fn check(
         run_status_bounded(
             Command::new("brew")
                 .current_dir(&tap_root)
-                .args(["audit", "--strict", "Formula/quirl.rb"])
+                .args(["audit", "--strict", "--changed"])
                 .env("HOMEBREW_NO_AUTO_UPDATE", "1")
                 .env("HOMEBREW_NO_ANALYTICS", "1"),
             HOMEBREW_TIMEOUT,
@@ -517,7 +517,6 @@ fn render_formula(manifest: &ReleaseManifest) -> Result<String, Box<dyn Error>> 
     output.push_str("class Quirl < Formula\n");
     output.push_str("  desc \"Everything you need, mixed in\"\n");
     output.push_str("  homepage \"https://github.com/niklas-heer/quirl\"\n");
-    output.push_str(&format!("  version \"{}\"\n", manifest.version));
     output.push_str("  license \"MIT\"\n\n");
     render_platform(&mut output, "macos", mac_arm, mac_intel);
     output.push('\n');
