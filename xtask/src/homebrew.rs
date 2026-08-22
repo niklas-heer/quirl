@@ -524,7 +524,7 @@ fn render_formula(manifest: &ReleaseManifest) -> Result<String, Box<dyn Error>> 
     output.push_str("  end\n\n");
     output.push_str("  test do\n");
     output.push_str(&format!(
-        "    assert_match \"quirl {}\", shell_output(\"#{{bin}}/quirl --version\", 0)\n",
+        "    assert_match \"quirl {}\", shell_output(\"#{{bin}}/quirl --version\")\n",
         manifest.version
     ));
     output.push_str(
@@ -577,7 +577,7 @@ fn validate_formula_shape(formula: &str) -> Result<(), Box<dyn Error>> {
         "bin.install \"bin/quirl\"",
         "(pkgshare/\"licenses\").install \"LICENSE\", \"THIRD_PARTY_NOTICES.md\", \"THIRD_PARTY_LICENSES.txt\"",
         "assert_path_exists pkgshare/\"licenses\"/notice",
-        "shell_output(\"#{bin}/quirl --version\", 0)",
+        "shell_output(\"#{bin}/quirl --version\")",
     ];
     if required.iter().any(|marker| !formula.contains(marker))
         || formula.matches("      url \"https://").count() != 4
