@@ -272,10 +272,12 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     let stream_samples = sample_argument("--stream-samples", DEFAULT_STREAM_SAMPLES)?;
     let binary_limit = binary_limit_argument()?;
 
+    let rich_status_identity = build_info.as_ref().map(rich_status_identity);
     let pty = measure_pty(
         &quirl,
         pty_samples,
         Duration::from_millis(pty_timeout_ms as u64),
+        rich_status_identity.as_deref(),
     );
     let cold = measure_cli_startup(&quirl, cold_samples)?;
     let edit = measure_headless_edit_frame(edit_samples)?;
@@ -508,7 +510,12 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn measure_pty(path: &Path, samples: usize, timeout: Duration) -> PtyStatistics {
+fn measure_pty(
+    path: &Path,
+    samples: usize,
+    timeout: Duration,
+    rich_status_identity: Option<&str>,
+) -> PtyStatistics {
     let fixture = match PtyFixture::create() {
         Ok(fixture) => fixture,
         Err(error) => {
@@ -528,7 +535,7 @@ fn measure_pty(path: &Path, samples: usize, timeout: Duration) -> PtyStatistics 
     let mut failures = Vec::new();
 
     for sample in 0..samples {
-        match measure_pty_sample(path, &fixture, timeout) {
+        match measure_pty_sample(path, &fixture, timeout, rich_status_identity) {
             Ok(measurement) => {
                 prompt_paint.push(measurement.prompt_paint);
                 cold_to_editable.push(measurement.cold_to_editable);
@@ -549,21 +556,43 @@ fn measure_pty(path: &Path, samples: usize, timeout: Duration) -> PtyStatistics 
     }
 }
 
+fn rich_status_identity(info: &QuirlBuildInfo) -> String {
+    if info.official_release {
+        return format!("🌀 v{}", info.version);
+    }
+    let short_commit = info.source_commit.chars().take(7).collect::<String>();
+    let dirty = if info.source_dirty == Some(true) {
+        "*"
+    } else {
+        ""
+    };
+    format!("🌀 dev@{}+{short_commit}{dirty}", info.build_timestamp)
+}
+
+fn editable_command_frame(screen: &str, rich_status_identity: Option<&str>) -> bool {
+    let prompt_is_visible = screen.lines().any(|line| line.trim() == "❯");
+    let Some(status) = screen.lines().next_back() else {
+        return false;
+    };
+    let mode_is_visible = status.contains(" NORMAL ");
+    let identity_is_visible = rich_status_identity.is_none_or(|identity| status.contains(identity));
+    prompt_is_visible && mode_is_visible && identity_is_visible
+}
+
 fn measure_pty_sample(
     path: &Path,
     fixture: &PtyFixture,
     timeout: Duration,
+    rich_status_identity: Option<&str>,
 ) -> Result<PtySample, Box<dyn Error>> {
     let started = Instant::now();
     let mut session = PtySession::spawn(path, fixture)?;
     let result = (|| {
-        // The textual status row is the accessibility contract for an editable
-        // command frame and cannot be confused with terminal echo.
-        session.wait_for_screen(
-            "NORMAL · Alt-Q Quirl",
-            timeout,
-            "first editable command frame",
-        )?;
+        // Readiness requires the command prompt, mode label, and the exact
+        // binary identity in one modeled frame. Status notices may replace the
+        // optional shortcut hints, so presentation copy is not a readiness
+        // invariant.
+        session.wait_for_editable_command_frame(rich_status_identity, timeout)?;
         let prompt_paint = started.elapsed();
 
         // A short prefix of the representative edit establishes that the newly
@@ -616,6 +645,11 @@ impl PtyFixture {
             env::temp_dir().join(format!("quirl-preview-pty-{}-{nonce}", std::process::id()));
         let config_dir = root.join("config");
         fs::create_dir_all(&config_dir)?;
+        // macOS exposes /var as a symlink to /private/var. Canonicalizing once
+        // prevents Quirl's no-symlink database admission from rejecting the
+        // benchmark's own otherwise-private fixture path.
+        let root = fs::canonicalize(root)?;
+        let config_dir = root.join("config");
         Ok(Self {
             history: root.join("history"),
             index: root.join("catalog.json"),
@@ -764,6 +798,58 @@ impl PtySession {
                 Err(RecvTimeoutError::Timeout) => return Ok(()),
                 Err(RecvTimeoutError::Disconnected) => {
                     return Err(format!("PTY reader disconnected while stabilizing {phase}").into());
+                }
+            }
+        }
+    }
+
+    fn wait_for_editable_command_frame(
+        &mut self,
+        rich_status_identity: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn Error>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let screen = self.parser.screen().contents();
+            if editable_command_frame(&screen, rich_status_identity) {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "timed out after {:.0} ms waiting for first editable command frame; screen={:?}",
+                    millis(timeout),
+                    screen_tail(&screen)
+                )
+                .into());
+            }
+            match self.receiver.recv_timeout(remaining) {
+                Ok(PtyEvent::Data(bytes)) => {
+                    self.answer_cursor_queries(&bytes)?;
+                    self.parser.process(&bytes);
+                }
+                Ok(PtyEvent::End) => {
+                    return Err("PTY ended while waiting for first editable command frame".into());
+                }
+                Ok(PtyEvent::Error(error)) => {
+                    return Err(format!(
+                        "PTY read failed while waiting for first editable command frame: {error}"
+                    )
+                    .into());
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(format!(
+                        "timed out after {:.0} ms waiting for first editable command frame; screen={:?}",
+                        millis(timeout),
+                        screen_tail(&self.parser.screen().contents())
+                    )
+                    .into());
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(
+                        "PTY reader disconnected while waiting for first editable command frame"
+                            .into(),
+                    );
                 }
             }
         }
@@ -1997,6 +2083,54 @@ mod tests {
             ..matching
         };
         assert!(!build_info_matches_benchmark(&mismatched));
+    }
+
+    #[test]
+    fn editable_frame_uses_stable_prompt_mode_and_identity_contracts() {
+        let info = QuirlBuildInfo {
+            schema_version: 3,
+            version: "0.1.0".to_owned(),
+            build_profile: "release".to_owned(),
+            optimization_level: "z".to_owned(),
+            panic_strategy: "unwind".to_owned(),
+            operating_system: env::consts::OS.to_owned(),
+            architecture: env::consts::ARCH.to_owned(),
+            source_commit: "abcdef0123456789".to_owned(),
+            build_timestamp: "1787388008".to_owned(),
+            official_release: false,
+            source_dirty: Some(false),
+        };
+        let identity = rich_status_identity(&info);
+        let screen = format!(
+            "welcome\n❯ \n\n NORMAL  │ AI discovery is unavailable                 {identity}"
+        );
+
+        assert_eq!(identity, "🌀 dev@1787388008+abcdef0");
+        assert!(editable_command_frame(&screen, Some(&identity)));
+        assert!(!editable_command_frame(
+            &screen.replace("❯ ", ""),
+            Some(&identity)
+        ));
+        assert!(!editable_command_frame(
+            &screen.replace(" NORMAL ", " DATA "),
+            Some(&identity)
+        ));
+        assert!(!editable_command_frame(&screen, Some("🌀 v0.1.0")));
+
+        let official = QuirlBuildInfo {
+            official_release: true,
+            ..info
+        };
+        assert_eq!(rich_status_identity(&official), "🌀 v0.1.0");
+    }
+
+    #[test]
+    fn pty_fixture_paths_are_canonical_before_database_admission() {
+        let fixture = PtyFixture::create().unwrap();
+
+        assert_eq!(fixture.root, fs::canonicalize(&fixture.root).unwrap());
+        assert_eq!(fixture.index.parent(), Some(fixture.root.as_path()));
+        assert_eq!(fixture.config_dir.parent(), Some(fixture.root.as_path()));
     }
 
     #[test]
