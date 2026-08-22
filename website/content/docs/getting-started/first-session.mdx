@@ -1,14 +1,16 @@
 ---
 title: Your first session
-description: Use familiar commands, switch into typed data, and discover the shared catalog.
+description: Use Normal, Data, and AI modes, then discover the shared catalog and bounded Lua surface.
 ---
 
-## Begin with command mode
+## Begin in Normal mode
 
 Quirl starts where shell users expect: external commands, redirects, byte
 pipelines, boolean lists, and background jobs. The native grammar intentionally
 stays small; use an explicit Bash or Zsh island when you need behavior outside
-that frozen core.
+that frozen core. The default rich viewport streams bounded foreground output
+but rejects background pipelines before spawn; set `ui.surface = "simple"` for
+classic inherited-terminal background-job workflows.
 
 ```sh
 ls -la | grep Cargo
@@ -26,13 +28,39 @@ open deployments.json | where status == "failed" | select service region
 
 The detailed semantics live in the [typed data runtime](/docs/guides/typed-data-runtime).
 
+Return to Normal mode with <kbd>Alt-Q</kbd>, then <kbd>n</kbd>. The leader menu
+keeps the active grammar visible: <kbd>n</kbd> selects byte-and-process commands,
+and <kbd>d</kbd> selects typed data. The textual forms are `mode normal`,
+`mode data`, and `mode ai`.
+
+## Find a command in AI mode
+
+Press <kbd>Alt-Q</kbd>, then <kbd>i</kbd>, and describe what you want in everyday
+language. Results update from Quirl's local command catalog as you type. Press
+<kbd>Up</kbd> or <kbd>Down</kbd> to select a result, then <kbd>Enter</kbd> to
+insert it into Normal mode for review. AI mode never executes the suggestion.
+
+The completion database and command model are separate bounded runtime assets.
+When an update is eligible, Quirl schedules it in the background without
+delaying the first prompt. Until the assets are available, Quirl remains usable
+and AI discovery falls back to deterministic lexical ranking over admitted
+local knowledge. Use `quirl assets status` to inspect readiness and
+`quirl ai status` to inspect database, model, and index state.
+
 ## Discover as you type
 
 - <kbd>Tab</kbd> opens semantic completion.
+- <kbd>Shift-Tab</kbd> expands completion into the picker.
 - <kbd>F1</kbd> opens contextual documentation from the same catalog.
-- <kbd>Ctrl-R</kbd> opens reverse history search.
+- <kbd>Ctrl-R</kbd> or <kbd>Up</kbd> opens cwd-aware history search.
 - <kbd>Alt-Q</kbd>, then <kbd>f</kbd>, opens the file picker.
 - <kbd>Alt-Q</kbd>, then <kbd>p</kbd>, opens catalog actions.
+
+The same leader also exposes history (<kbd>h</kbd>), directories
+(<kbd>c</kbd>), jobs (<kbd>j</kbd>), recent typed results (<kbd>r</kbd>), and
+retained output (<kbd>o</kbd>). Lua is not a hidden interactive grammar mode:
+use `lua <expression>` for a bounded one-off expression or `quirl run` for a
+script, configuration, or extension workflow.
 
 The catalog is also the source for generated help, documentation, and AI-facing
 metadata, so these surfaces do not drift into separate command lists.

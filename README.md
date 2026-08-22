@@ -16,10 +16,11 @@
 ---
 
 > [!IMPORTANT]
-> Quirl is an **unreleased 0.1 Unix release candidate** and a fast-moving
-> prototype. Linux and macOS are the supported interactive targets. Windows is
-> best-effort, contract-tested portability work rather than a supported
-> interactive platform.
+> Quirl's **0.1 Unix line** supports interactive Linux and macOS. Treat a build
+> as the official `0.1.0` release only when it comes from the immutable
+> [`v0.1.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0);
+> other source checkouts are candidate or development builds. Windows is
+> best-effort, contract-tested portability work.
 
 The complete Fumadocs website—landing page, guides, reference material,
 architecture records, research, and release evidence—lives in
@@ -61,11 +62,15 @@ For a published release, install the native binary from the Homebrew tap:
 brew install niklas-heer/tap/quirl
 ```
 
-The formula installs only the `quirl` binary and its offline test never fetches
-the command model or completion database. Quirl acquires those separately in
+The formula installs the `quirl` binary plus its redistribution license files;
+its offline test never fetches the command model or completion database. Quirl
+acquires those separately in
 the background when available and remains usable in degraded mode while
-offline. Until the first `0.1.0` release and tap PR are published, build the
-candidate from source. The repository pins Rust 1.97.1 through
+offline. Compatible completion knowledge can advance through Quirl's
+version-scoped website channel without forcing an otherwise empty binary
+release; every database generation has immutable, digest-named bytes and its
+own source identity. Until the first `0.1.0` release and tap PR are published,
+build the candidate from source. The repository pins Rust 1.97.1 through
 `rust-toolchain.toml`; no system Lua installation is required.
 
 ```console
@@ -82,8 +87,12 @@ cargo xtask demo
 ```
 
 Inside an interactive session, <kbd>Tab</kbd> opens semantic completion,
-<kbd>F1</kbd> opens contextual help, <kbd>Alt-Q</kbd> opens Quirl's leader menu,
-<kbd>Ctrl-R</kbd> or <kbd>Up</kbd> searches cwd-aware history; <kbd>Alt-Q</kbd>, then <kbd>f</kbd>, opens the file picker.
+<kbd>Shift-Tab</kbd> expands it into the picker, <kbd>F1</kbd> opens contextual
+help, and <kbd>Ctrl-R</kbd> or <kbd>Up</kbd> searches cwd-aware history.
+<kbd>Alt-Q</kbd> opens Quirl's leader menu: then press <kbd>n</kbd>,
+<kbd>d</kbd>, or <kbd>i</kbd> for Normal, Data, or AI mode, or <kbd>f</kbd> for
+the file picker. AI mode searches local command knowledge as you type; Enter
+inserts the selected command into Normal mode for review and never executes it.
 
 For requirements and a guided first session, see the website's
 [getting-started section](website/content/docs/getting-started/index.mdx).
@@ -91,24 +100,31 @@ Release operators should use [the Rust-native release procedure](docs/releasing.
 
 ## Status
 
-The integrated 0.1 candidate implementation has native C1-core command
+The integrated 0.1 implementation has native C1-core command
 execution on Linux and macOS; a bounded, focused typed-data runtime; a
 restricted Lua 5.4 runner and SDK; permission-locked trusted-Lua plugin command
 dispatch; a semantic catalog and language service; and rich/simple terminal
-surfaces with explicit process and recovery boundaries. These behaviors have
-repository tests, but this commit is not a measured or tagged release artifact.
-The runtime contracts live in `Catalog::builtin()` and `HOST_API`; the generated
-references and website are projections, not competing specifications.
+surfaces with explicit process and recovery boundaries. Repository tests cover
+these behaviors; release evidence and support attach only to the exact commit
+and artifacts named by an immutable release. The runtime contracts live in
+`Catalog::builtin()` and `HOST_API`; the generated references and website are
+projections, not competing specifications.
 
-Config schema v3 includes 30 curated dark themes plus `ansi`, and accepts
-bounded custom semantic palettes shared by both terminal surfaces. Tokyo Night
-is the default. `quirl config web` exposes the same validated palettes through a
-bounded, no-JavaScript preview gallery. See [ADR 0013](docs/decisions/0013-lua-config-themes.md)
-and [ADR 0015](docs/decisions/0015-bounded-theme-preview-gallery.md).
+Config schema v4 includes 30 curated dark themes plus `ansi`, accepts bounded
+custom semantic palettes shared by both terminal surfaces, enables completion
+after one character by default, uses the compact welcome banner, and adds the
+active Rust toolchain to the default right prompt. Legacy unversioned and
+explicit v1/v2/v3 configurations migrate deterministically to v4. Tokyo Night
+is the default. `quirl config web` exposes the same validated palettes through
+a bounded, no-JavaScript preview gallery. See
+[ADR 0013](docs/decisions/0013-lua-config-themes.md) and
+[ADR 0015](docs/decisions/0015-bounded-theme-preview-gallery.md).
 
 Important current limits:
 
-- No stable version or supported package-manager distribution has shipped.
+- A source checkout is not a supported release merely because its workspace
+  version says `0.1.0`; the immutable tag, release assets, and checklist
+  evidence must identify the same candidate.
 - Wasm packages validate but do not execute.
 - Package publishing is a local dry run, not a remote registry operation.
 - Bash/Zsh here-documents, process substitution, loops, functions, and dialect
@@ -126,8 +142,8 @@ The operational requirements and commands remain in the human
 
 | Platform | Support level | Promise |
 | --- | --- | --- |
-| Linux | Supported candidate | Interactive shell, PTY handoff, job control, and release smoke tests |
-| macOS | Supported candidate | Interactive shell, PTY handoff, job control, and release smoke tests |
+| Linux | Supported release target | Interactive shell, PTY handoff, job control, and release smoke tests |
+| macOS | Supported release target | Interactive shell, PTY handoff, job control, and release smoke tests |
 | Windows | Best effort | Cross-compiled, contract-tested process portability only |
 
 ## Documentation

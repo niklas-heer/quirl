@@ -852,7 +852,7 @@ impl Catalog {
                     "quirl config migrate",
                     "quirl config migrate <file> --dry-run [--format text|json]",
                     "Preview a schema migration without rewriting configuration",
-                    "0.1.0 only previews the unversioned-to-v1 schema insertion. `--dry-run` is required and no source or backup file is written.",
+                    "Previews migration of an unversioned or explicit v1/v2/v3 configuration to the current v4 schema. `--dry-run` is required; the candidate source is reported without writing the source or a backup file.",
                     vec![
                         option(
                             &["--dry-run"],
@@ -1202,7 +1202,7 @@ impl Catalog {
                     "quirl assets status",
                     "quirl assets status [--format text|json]",
                     "Inspect separately downloaded runtime assets",
-                    "Validates installed completion-database and command-model receipts and payloads without network access, and reports degraded operation plus bounded retry state.",
+                    "Validates installed completion-database and command-model receipts, payloads, and per-asset source identities without network access, and reports degraded operation plus bounded retry state.",
                     vec![option(
                         &["--format"],
                         Some("text|json"),
@@ -1216,7 +1216,7 @@ impl Catalog {
                     "quirl assets update",
                     "quirl assets update [--manifest path] [--format text|json]",
                     "Install compatible runtime assets from a verified manifest",
-                    "Reads the versioned deny-unknown asset manifest, downloads bounded HTTPS payloads without a shell, verifies compatibility, format, byte size, and SHA-256, then atomically switches the current receipt while preserving the prior valid generation.",
+                    "Reads this Quirl version's deny-unknown website channel manifest, downloads independently refreshed content-addressed payloads over bounded HTTPS without a shell, verifies exact binary compatibility, per-asset provenance and license notices, format, byte size, and SHA-256, then atomically switches the current receipt while preserving the prior valid generation.",
                     vec![
                         option(
                             &["--manifest"],

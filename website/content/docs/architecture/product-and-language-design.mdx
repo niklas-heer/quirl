@@ -41,12 +41,14 @@ that a release artifact has been measured or published:
   separate immutable SQLite artifact; neither replaces the CLI-owned mutable
   intelligence cache.
 
-The current release remains **unreleased 0.1**. In this document, “1.0” is
-either a historical/accepted scope label from an ADR or a long-term direction;
-it is not a current version, distribution, or support claim. Historical
-benchmark records apply only to their named candidates, artifacts, environments,
-and methods. The source-of-truth and evidence order is defined in [the
-documentation system](/docs/contributing/documentation-system).
+The implemented product line is **0.1.x**. An official release exists only when
+an immutable GitHub tag and release name the exact candidate; an untagged source
+checkout is a candidate or development build even when its workspace version
+is `0.1.0`. In this document, “1.0” is either a historical/accepted scope label
+from an ADR or a long-term direction, not a current distribution or support
+claim. Historical benchmark records apply only to their named candidates,
+artifacts, environments, and methods. The source-of-truth and evidence order is
+defined in [the documentation system](/docs/contributing/documentation-system).
 
 {/* BEGIN QUIRL RELEASE EVIDENCE STATUS */}
 > **Release evidence status — historical.** Artifact evidence for measured candidate `23fd5d36907fc816bdafd9aa3c2dcb3afb69feb5` and artifact `9a893a5f1a0b49d62712f331c88966113d910d94efa9651dc4feffe9fd55b637` is historical.
@@ -598,7 +600,7 @@ git branch --format='%(refname:short)' | pick --query feature
 ---@type quirl.Config
 local config = quirl.config {
   schema_version = 4,
-  editor = { keymap = "emacs", semantic_hints = true, banner = "full" },
+  editor = { keymap = "emacs", semantic_hints = true, banner = "compact" },
   picker = { layout = "adaptive", preview = true },
   prompt = {
     symbols = "auto",
@@ -626,7 +628,7 @@ return config
 
 ```sh
 quirl config web             # local loopback web app against the discovered config.lua
-quirl config tui             # same schema, terminal presentation
+quirl config tui ~/.config/quirl/config.lua  # same schema, terminal presentation
 quirl config get editor.keymap
 quirl config set picker.layout adaptive
 quirl config diff personal.lua work.lua

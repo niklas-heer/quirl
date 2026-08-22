@@ -49,7 +49,8 @@ target rejection, and byte-identical aggregation. Strict versioned JSON fixtures
 must reject unknown fields, oversized collections and strings, invalid hashes,
 path traversal, unsupported schema versions, missing targets, and candidate
 identity disagreement. Formula tests exercise all four OS/architecture branches
-and prove the offline test invokes only the installed binary.
+and prove the offline test invokes only the installed binary while asserting
+that every redistribution license/notice file is installed.
 
 Runtime asset tests use an injected downloader or bounded local server, never
 the internet. Cross every byte, deadline, redirect, retry, manifest-entry, and

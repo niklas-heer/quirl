@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    outputs:
+      candidate_commit: ${{ steps.candidate.outputs.commit }}
 
     steps:
       - name: Check out the candidate
@@ -27,11 +29,20 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Verify the release state
         env:
           EXPECTED_TAG: ${{ inputs.tag }}
-        run: cargo xtask release verify --expected-tag "$EXPECTED_TAG"
+        run: >-
+          cargo xtask release verify
+          --expected-tag "$EXPECTED_TAG"
+          --required-remote-branch main
+
+      - name: Freeze the verified candidate identity
+        id: candidate
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Run the canonical quality gate
         run: cargo xtask check
@@ -61,6 +72,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ needs.check.outputs.candidate_commit }}
 
       - name: Build and package the native binary
         env:
@@ -97,6 +109,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ needs.check.outputs.candidate_commit }}
 
       - name: Build the downloadable asset
         env:
@@ -115,7 +128,9 @@ jobs:
           retention-days: 1
 
   asset-manifest:
-    needs: asset
+    needs:
+      - check
+      - asset
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -127,6 +142,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ needs.check.outputs.candidate_commit }}
 
       - name: Restore the downloadable assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -139,18 +155,19 @@ jobs:
         run: >-
           cargo xtask assets manifest
           --input "${{ runner.temp }}/assets"
-          --output "${{ runner.temp }}/asset-manifest-v1.json"
+          --output "${{ runner.temp }}/asset-manifest-v2.json"
 
       - name: Preserve the downloadable asset manifest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: asset-manifest
-          path: ${{ runner.temp }}/asset-manifest-v1.json
+          path: ${{ runner.temp }}/asset-manifest-v2.json
           if-no-files-found: error
           retention-days: 1
 
   aggregate:
     needs:
+      - check
       - package
       - asset-manifest
     runs-on: ubuntu-24.04
@@ -164,6 +181,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ needs.check.outputs.candidate_commit }}
 
       - name: Restore every candidate component
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -192,7 +210,9 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: aggregate
+    needs:
+      - check
+      - aggregate
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: release
@@ -204,15 +224,22 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
+          ref: ${{ needs.check.outputs.candidate_commit }}
 
       - name: Atomically publish the immutable candidate tag
         env:
           EXPECTED_TAG: ${{ inputs.tag }}
-        run: >-
-          cargo xtask release tag
-          --expected-tag "$EXPECTED_TAG"
-          --write
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep the token unavailable to build/check steps and install a
+          # credential helper only for the exact tag transaction.
+          # shellcheck disable=SC2016
+          git config credential.helper '!f() { echo username=x-access-token; echo password=$GITHUB_TOKEN; }; f'
+          trap 'git config --unset-all credential.helper || true' EXIT
+          cargo xtask release tag --expected-tag "$EXPECTED_TAG" --write
 
       - name: Restore the verified release bundle
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -224,7 +251,7 @@ jobs:
         uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
         with:
           tag: ${{ inputs.tag }}
-          commit: ${{ github.sha }}
+          commit: ${{ needs.check.outputs.candidate_commit }}
           bodyFile: ${{ runner.temp }}/release-bundle/release-notes.md
           artifacts: ${{ runner.temp }}/release-bundle/*
           artifactErrorsFailBuild: true
@@ -232,6 +259,44 @@ jobs:
           replacesArtifacts: false
           immutableCreate: true
           makeLatest: true
+
+  website-assets:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Advance and verify the released version's website asset channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          gh workflow run completion-database.yml --ref main --repo "$GITHUB_REPOSITORY"
+          run_id=""
+          for _ in $(seq 1 30)
+          do
+            run_id="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow completion-database.yml \
+              --event workflow_dispatch \
+              --branch main \
+              --limit 5 \
+              --json databaseId,createdAt \
+              --jq ".[] | select(.createdAt >= \"${started}\") | .databaseId" \
+              | head -n 1)"
+            if test -n "$run_id"
+            then
+              break
+            fi
+            sleep 2
+          done
+          test -n "$run_id"
+          gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status
 
   homebrew:
     needs: publish

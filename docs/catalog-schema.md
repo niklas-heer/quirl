@@ -513,9 +513,11 @@ release's downloaded `command-model` asset and builds embeddings automatically.
 The provider-neutral release manifest fixes the model bundle's version, size,
 SHA-256 digest, format, compatibility, and immutable URL. Quirl streams that
 single bounded tar payload, verifies it before admission, expands only its
-closed three-file model layout, and atomically publishes a private,
-content-addressed model directory. It never downloads model files from a
-mutable branch. An explicit `QUIRL_MODEL_PATH` is never replaced automatically.
+closed six-file model layout (`LICENSE`, `README.md`, `config.json`,
+`model.safetensors`, `quirl-model.json`, and `tokenizer.json`), and atomically
+publishes a private, content-addressed model directory. It never downloads
+model files from a mutable branch. An explicit `QUIRL_MODEL_PATH` is never
+replaced automatically.
 Redirects, waits, retained chunks, staging attempts, directory depth, file
 bytes, documents, tokens, batches, vector dimensions, serialized bytes, and
 finite floats are bounded; cancellation is checked between streamed chunks and

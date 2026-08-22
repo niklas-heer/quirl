@@ -283,6 +283,10 @@ Before publishing the capture:
 - [ ] Native packages were produced by `cargo xtask release package` on the
   explicit `aarch64-apple-darwin`, `x86_64-apple-darwin`,
   `aarch64-unknown-linux-gnu`, and `x86_64-unknown-linux-gnu` runner matrix.
+- [ ] Every native archive contains only `bin/quirl`, `LICENSE`,
+  `THIRD_PARTY_NOTICES.md`, and the generated target-specific
+  `THIRD_PARTY_LICENSES.txt`; packaging accepted the locked dependency inventory
+  and resolved every declared redistribution notice without following links.
 - [ ] `cargo xtask release aggregate` accepted exactly one package for every
   target and produced the versioned release manifest, SHA-256 file, notes, and
   provenance from those exact bytes. A second aggregation is byte-identical.
@@ -290,17 +294,22 @@ Before publishing the capture:
   checksums, and version tag all identify the already-gated A artifact.
 - [ ] `cargo xtask assets build` produced the completion SQLite image and model
   bundle in separate jobs, and `cargo xtask assets manifest` recorded each
-  logical name, clean candidate commit, source epoch, format/schema version,
-  exact byte length, SHA-256, immutable URL, and compatibility requirements.
+  logical name, per-asset source revision and epoch, format/schema version,
+  exact byte length, SHA-256, content-addressed URL, compatibility requirements,
+  and required license notices. The initial release snapshot sources both assets
+  from A; later website completion generations may have a newer data revision.
   Neither asset is in a native package.
-- [ ] Asset jobs that require credentials ran only in the protected
-  `release-assets` environment; no pull-request job or log received them.
+- [ ] Asset jobs used only checked-in/public inputs and no source credential.
+  If a future input requires credentials, its job runs only in the protected
+  `release-assets` environment; no pull-request job or log receives them.
 - [ ] Draft release notes with supported platforms, native compatibility scope,
   reference-shell behavior, known residual risks, and upgrade/migration notes.
   For 0.1, note that config schema v3 adds shared semantic themes on top of the
-  v2 rich-surface settings and v4 adds the default active Rust toolchain prompt
-  segment; legacy unversioned v0 and explicit v1/v2/v3 config migrate to v4
-  defaults, and no published config contract is being silently reinterpreted.
+  v2 rich-surface settings, while v4 changes the polished defaults to the
+  compact banner, automatic completion after one character, and the active
+  Rust toolchain prompt segment. Legacy unversioned v0 and explicit v1/v2/v3
+  config migrate deterministically to v4 defaults; no published config contract
+  is silently reinterpreted.
 - [ ] Create the immutable version tag only after every required Linux/macOS
   gate above is signed off, using `cargo xtask release tag --expected-tag
   vVERSION --write` at A. Refuse rather than move a conflicting existing tag.
@@ -310,23 +319,30 @@ Before publishing the capture:
 - [ ] Publish the measured artifacts and checksums, then verify a clean install
   starts and reports A's expected version and source identity. Attach evidence
   produced after A as release assets or link it from B without rebuilding A.
-- [ ] Publish the completion database, model bundle, and asset manifest as
-  versioned GitHub Release assets. Missing assets leave first prompt and core
-  shell use available; corrupt, truncated, incompatible, or unexpected inputs
-  fail without replacing an existing valid generation.
+- [ ] Publish the candidate-built completion database, model bundle, notice
+  sidecar, and `asset-manifest-v2.json` as immutable GitHub Release assets. The
+  release workflow must then dispatch and wait for the version-scoped website
+  channel transaction. That channel may advance to newer compatible per-asset
+  source revisions, but its complete manifest must be admitted by the exact
+  released binary before publication. Missing assets leave first prompt and
+  core shell use available; corrupt, truncated, incompatible, or unexpected
+  inputs fail without replacing an existing valid generation.
 - [ ] Generate `Formula/quirl.rb` deterministically from the published release
   manifest, run `cargo xtask homebrew check`, and open a tap PR with the
   repository-scoped GitHub App (or documented fine-grained PAT fallback).
   Never push directly to the tap's default branch.
 - [ ] The Homebrew install and bounded offline test select all four platform
-  variants by OS/architecture, verify exact hashes, install only `quirl`, and do
-  not download the completion database or model.
+  variants by OS/architecture, verify exact hashes, install `quirl` plus all
+  three license/notice documents, and do not download the completion database
+  or model.
 - [ ] On each supported platform, verify admitted curated native facts are
   platform-filtered and that a missing, corrupt, incompatible, unsafe, or
   wrong-platform native database falls back to Quirl builtins and bounded local
   discovery without invoking Carapace or delaying terminal startup/shutdown.
 - [ ] Keep the tag and release immutable. Corrections use a new version rather
-  than replacing a measured artifact in place.
+  than replacing a measured artifact in place. Compatible completion-only
+  updates add new content-addressed website bytes and advance only the matching
+  version's bounded manifest; they do not move the tag or alter release assets.
 
 ## Not release blockers
 

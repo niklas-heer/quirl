@@ -47,7 +47,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 
-const MANIFEST_SCHEMA_VERSION: u32 = 1;
+const MANIFEST_SCHEMA_VERSION: u32 = 2;
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const RETRY_STATE_SCHEMA_VERSION: u32 = 1;
 const STATUS_SCHEMA_VERSION: u32 = 1;
@@ -64,6 +64,8 @@ const LOGICAL_NAME_BYTES_MAX: usize = 64;
 const FORMAT_BYTES_MAX: usize = 64;
 const URL_BYTES_MAX: usize = 2 * 1024;
 const COMPATIBILITY_VALUES_MAX: usize = 16;
+const ASSET_NOTICES_MAX: usize = 4;
+const ASSET_NOTICE_BYTES_MAX: usize = 16 * 1024;
 const RETRY_ENTRIES_MAX: usize = ASSETS_MAX + 1;
 const MANIFEST_RETRY_KEY: &str = "manifest";
 const REQUIRED_ASSETS: [(&str, &str, u32, u64); 2] = [
@@ -124,18 +126,14 @@ pub(crate) enum AssetsOutputFormat {
     Json,
 }
 
-/// Versioned, provider-neutral release asset manifest.
+/// Version-scoped, provider-neutral runtime asset manifest.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AssetManifest {
     /// Manifest contract version.
     pub schema_version: u32,
-    /// Immutable product release containing these assets.
-    pub release_version: String,
-    /// Exact immutable Git commit from which the release candidate was built.
-    pub candidate_commit: String,
-    /// Reproducible-build timestamp from the candidate commit.
-    pub source_date_epoch: u64,
+    /// Exact Quirl version whose runtime contracts can consume these assets.
+    pub quirl_version: String,
     /// Individually versioned downloadable assets.
     pub assets: Vec<AssetManifestEntry>,
 }
@@ -160,6 +158,32 @@ pub(crate) struct AssetManifestEntry {
     pub url: String,
     /// Runtime compatibility required before admission.
     pub compatibility: AssetCompatibility,
+    /// Lowercase Git revision from which this asset was generated.
+    pub source_revision: String,
+    /// Reproducible-build timestamp from the asset source revision.
+    pub source_date_epoch: u64,
+    /// Bounded license notices required when redistributing this payload.
+    pub notices: Vec<AssetNotice>,
+}
+
+/// One retained third-party license notice carried with an asset manifest.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssetNotice {
+    /// Human-readable upstream project name.
+    pub name: String,
+    /// SPDX license identifier for the retained text.
+    pub spdx_license: String,
+    /// Content-addressed sidecar filename published beside the payload.
+    pub file: String,
+    /// Exact UTF-8 notice length in bytes.
+    pub byte_size: u64,
+    /// Lowercase SHA-256 digest of `text` and the published sidecar.
+    pub sha256: String,
+    /// Absolute provider URL for the notice sidecar.
+    pub url: String,
+    /// Complete retained license text, available even before sidecar download.
+    pub text: String,
 }
 
 /// Closed compatibility requirements for one asset.
@@ -759,7 +783,7 @@ fn update_from_source(
     retry.entries.remove(MANIFEST_RETRY_KEY);
     let mut report = AssetUpdateReport {
         schema_version: STATUS_SCHEMA_VERSION,
-        manifest_release_version: manifest.release_version.clone(),
+        manifest_release_version: manifest.quirl_version.clone(),
         installed: 0,
         current: 0,
         deferred: 0,
@@ -795,7 +819,7 @@ fn update_from_source(
         }
         match install_one(
             &paths,
-            &manifest.release_version,
+            &manifest.quirl_version,
             asset,
             downloader,
             allow_file,
@@ -846,7 +870,7 @@ enum InstallOutcome {
 
 fn install_one(
     paths: &AssetPaths,
-    release_version: &str,
+    quirl_version: &str,
     asset: &AssetManifestEntry,
     downloader: &dyn Downloader,
     allow_file: bool,
@@ -862,7 +886,7 @@ fn install_one(
         .ok()
         .map(|receipt| receipt.asset.sha256);
     if let Ok(receipt) = read_receipt(&receipt_path)
-        && receipt.release_version == release_version
+        && receipt.release_version == quirl_version
         && receipt.asset.sha256 == asset.sha256
         && validate_installed_payload(&asset_root, &receipt.asset).is_ok()
     {
@@ -913,7 +937,7 @@ fn install_one(
     )?;
     let receipt = InstalledReceipt {
         schema_version: RECEIPT_SCHEMA_VERSION,
-        release_version: release_version.to_owned(),
+        release_version: quirl_version.to_owned(),
         asset: asset.clone(),
     };
     let bytes = serde_json::to_vec_pretty(&receipt).map_err(|error| {
@@ -1570,49 +1594,19 @@ fn validate_manifest(manifest: &AssetManifest, allow_file: bool) -> Result<(), S
             "unsupported asset manifest schema version",
         ));
     }
-    if manifest.release_version.is_empty() || manifest.release_version.len() > 64 {
-        return Err(manifest_validation(
-            "invalid asset manifest release version",
-        ));
+    if manifest.quirl_version.is_empty() || manifest.quirl_version.len() > 64 {
+        return Err(manifest_validation("invalid asset manifest Quirl version"));
     }
-    if manifest.release_version != env!("CARGO_PKG_VERSION") {
-        return Err(manifest_validation(
-            "runtime asset manifest release does not match this Quirl",
-        )
-        .with_context(format!(
-            "manifest release: {}; current release: {}",
-            manifest.release_version,
-            env!("CARGO_PKG_VERSION")
-        )));
-    }
-    if manifest.candidate_commit.len() != 40
-        || !manifest
-            .candidate_commit
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(manifest_validation(
-            "runtime asset manifest candidate commit is not a lowercase 40-hex identity",
-        ));
-    }
-    let build_commit = env!("QUIRL_BUILD_COMMIT");
-    let build_has_commit =
-        build_commit.len() == 40 && build_commit.bytes().all(|byte| byte.is_ascii_hexdigit());
-    if (env!("QUIRL_OFFICIAL_RELEASE") == "true" || build_has_commit)
-        && manifest.candidate_commit != build_commit
-    {
-        return Err(manifest_validation(
-            "runtime asset manifest candidate does not match this Quirl binary",
-        )
-        .with_context(format!(
-            "manifest candidate: {}; binary candidate: {build_commit}",
-            manifest.candidate_commit
-        )));
-    }
-    if manifest.source_date_epoch == 0 {
-        return Err(manifest_validation(
-            "runtime asset manifest source date epoch must be nonzero",
-        ));
+    if manifest.quirl_version != env!("CARGO_PKG_VERSION") {
+        return Err(
+            manifest_validation("runtime asset manifest does not target this Quirl").with_context(
+                format!(
+                    "manifest Quirl version: {}; current Quirl version: {}",
+                    manifest.quirl_version,
+                    env!("CARGO_PKG_VERSION")
+                ),
+            ),
+        );
     }
     if manifest.assets.is_empty() || manifest.assets.len() > ASSETS_MAX {
         return Err(resource_limit(
@@ -1626,11 +1620,10 @@ fn validate_manifest(manifest: &AssetManifest, allow_file: bool) -> Result<(), S
     for asset in &manifest.assets {
         validate_manifest_entry(asset, allow_file)?;
         validate_required_asset_contract(asset)?;
-        if asset.compatibility.quirl_version_requirement != format!("={}", manifest.release_version)
-        {
+        if asset.compatibility.quirl_version_requirement != format!("={}", manifest.quirl_version) {
             return Err(manifest_validation(format!(
-                "runtime asset {} is not bound to manifest release {}",
-                asset.logical_name, manifest.release_version
+                "runtime asset {} is not bound to manifest Quirl version {}",
+                asset.logical_name, manifest.quirl_version
             )));
         }
         if names.insert(asset.logical_name.as_str(), ()).is_some() {
@@ -1736,6 +1729,36 @@ fn validate_manifest_entry(asset: &AssetManifestEntry, allow_file: bool) -> Resu
     {
         return Err(manifest_validation("invalid runtime asset SHA-256"));
     }
+    if asset.source_revision.len() != 40
+        || !asset
+            .source_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(manifest_validation(
+            "runtime asset source revision is not a lowercase 40-hex identity",
+        ));
+    }
+    if asset.source_date_epoch == 0 {
+        return Err(manifest_validation(
+            "runtime asset source date epoch must be nonzero",
+        ));
+    }
+    validate_asset_notices(asset, allow_file)?;
+    if matches!(
+        asset.logical_name.as_str(),
+        "completion-database" | "command-model"
+    ) && asset.file
+        != content_addressed_file(
+            &asset.logical_name,
+            env!("CARGO_PKG_VERSION"),
+            &asset.sha256,
+        )?
+    {
+        return Err(manifest_validation(
+            "runtime asset filename is not bound to its content digest",
+        ));
+    }
     let scheme_ok =
         asset.url.starts_with("https://") || (allow_file && asset.url.starts_with("file://"));
     if asset.url.len() > URL_BYTES_MAX || !scheme_ok {
@@ -1744,6 +1767,11 @@ fn validate_manifest_entry(asset: &AssetManifestEntry, allow_file: bool) -> Resu
         } else {
             "runtime asset URL must be bounded absolute HTTPS"
         }));
+    }
+    if !asset.url.ends_with(&format!("/{}", asset.file)) {
+        return Err(manifest_validation(
+            "runtime asset URL does not end in its content-addressed filename",
+        ));
     }
     for values in [
         &asset.compatibility.operating_systems,
@@ -1761,6 +1789,73 @@ fn validate_manifest_entry(asset: &AssetManifestEntry, allow_file: bool) -> Resu
         }
     }
     Ok(())
+}
+
+fn validate_asset_notices(asset: &AssetManifestEntry, allow_file: bool) -> Result<(), ShellError> {
+    if asset.notices.len() > ASSET_NOTICES_MAX {
+        return Err(resource_limit(
+            "asset license notices",
+            ASSET_NOTICES_MAX,
+            asset.notices.len(),
+        ));
+    }
+    if asset.logical_name == "command-model" {
+        if asset.notices.is_empty() {
+            return Ok(());
+        }
+        return Err(manifest_validation(
+            "command model license is embedded in its archive, not a sidecar",
+        ));
+    }
+    if asset.logical_name != "completion-database" || asset.notices.len() != 1 {
+        return Err(manifest_validation(
+            "completion database must retain exactly one Carapace license notice",
+        ));
+    }
+    let notice = &asset.notices[0];
+    let text_bytes = notice.text.as_bytes();
+    let observed_size = u64::try_from(text_bytes.len()).unwrap_or(u64::MAX);
+    if notice.name != "Carapace"
+        || notice.spdx_license != "MIT"
+        || text_bytes.is_empty()
+        || text_bytes.len() > ASSET_NOTICE_BYTES_MAX
+        || notice.byte_size != observed_size
+        || notice.sha256.len() != 64
+        || !notice
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || format!("{:x}", Sha256::digest(text_bytes)) != notice.sha256
+        || notice.file != format!("quirl-carapace-license-{}.txt", notice.sha256)
+    {
+        return Err(manifest_validation(
+            "completion database Carapace license notice is invalid",
+        ));
+    }
+    let scheme_ok =
+        notice.url.starts_with("https://") || (allow_file && notice.url.starts_with("file://"));
+    if notice.url.len() > URL_BYTES_MAX
+        || !scheme_ok
+        || !notice.url.ends_with(&format!("/{}", notice.file))
+    {
+        return Err(manifest_validation(
+            "runtime asset notice URL is invalid or not content-addressed",
+        ));
+    }
+    Ok(())
+}
+
+fn content_addressed_file(
+    logical_name: &str,
+    quirl_version: &str,
+    sha256: &str,
+) -> Result<String, ShellError> {
+    let (stem, extension) = match logical_name {
+        "completion-database" => ("quirl-completion-database", "sqlite3"),
+        "command-model" => ("quirl-command-model", "tar"),
+        _ => return Err(manifest_validation("unknown runtime asset logical name")),
+    };
+    Ok(format!("{stem}-v{quirl_version}-{sha256}.{extension}"))
 }
 
 fn validate_compatibility(asset: &AssetManifestEntry) -> Result<(), AssetFailure> {
@@ -2091,7 +2186,7 @@ fn render_status_text(report: &AssetStatusReport) -> String {
         ));
         if asset.logical_name == "command-model" {
             output.push_str(
-                "    used for offline completion and catalog docs; unrelated to the embedding model reported by `quirl ai status`\n",
+                "    used to build local semantic embeddings for AI search and ranking; inspect model details with `quirl ai status`\n",
             );
         }
         if let Some(diagnostic) = &asset.diagnostic {
@@ -2209,10 +2304,16 @@ fn manifest_candidates_from(
         return vec![ManifestSource::Url(url)];
     }
     vec![
-        ManifestSource::Url("https://quirl.dev/reference/asset-manifest-v1.json".to_owned()),
-        ManifestSource::Url("https://quirl.vercel.app/reference/asset-manifest-v1.json".to_owned()),
         ManifestSource::Url(format!(
-            "https://github.com/niklas-heer/quirl/releases/download/v{0}/asset-manifest-v1.json",
+            "https://quirl.dev/reference/v{}/asset-manifest-v2.json",
+            env!("CARGO_PKG_VERSION")
+        )),
+        ManifestSource::Url(format!(
+            "https://quirl.vercel.app/reference/v{}/asset-manifest-v2.json",
+            env!("CARGO_PKG_VERSION")
+        )),
+        ManifestSource::Url(format!(
+            "https://github.com/niklas-heer/quirl/releases/download/v{0}/asset-manifest-v2.json",
             env!("CARGO_PKG_VERSION")
         )),
     ]
@@ -2666,9 +2767,7 @@ fn manifest_identity(
     hasher.update(b"quirl-asset-retry-identity-v1");
     for value in [
         manifest.schema_version.to_string(),
-        manifest.release_version.clone(),
-        manifest.candidate_commit.clone(),
-        manifest.source_date_epoch.to_string(),
+        manifest.quirl_version.clone(),
         source_identity.to_owned(),
         asset.logical_name.clone(),
         asset.file.clone(),
@@ -2680,6 +2779,25 @@ fn manifest_identity(
         asset.compatibility.quirl_version_requirement.clone(),
         asset.compatibility.operating_systems.join("\n"),
         asset.compatibility.architectures.join("\n"),
+        asset.source_revision.clone(),
+        asset.source_date_epoch.to_string(),
+        asset
+            .notices
+            .iter()
+            .map(|notice| {
+                format!(
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                    notice.name,
+                    notice.spdx_license,
+                    notice.file,
+                    notice.byte_size,
+                    notice.sha256,
+                    notice.url,
+                    notice.text
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n---\n"),
     ] {
         hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
         hasher.update(value.as_bytes());
@@ -2872,24 +2990,46 @@ mod tests {
     }
 
     fn entry(name: &str, bytes: &[u8]) -> AssetManifestEntry {
-        let (file, format) = match name {
-            "completion-database" => ("completion.sqlite3", "sqlite3"),
-            "command-model" => ("command-model.tar", "tar"),
-            _ => ("asset.bin", "test"),
+        let format = match name {
+            "completion-database" => "sqlite3",
+            "command-model" => "tar",
+            _ => "test",
+        };
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let file = content_addressed_file(name, env!("CARGO_PKG_VERSION"), &sha256)
+            .unwrap_or_else(|_| "asset.bin".to_owned());
+        let notices = if name == "completion-database" {
+            let text = "MIT License\n\nCopyright (c) Carapace contributors\n".to_owned();
+            let notice_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
+            let notice_file = format!("quirl-carapace-license-{notice_sha256}.txt");
+            vec![AssetNotice {
+                name: "Carapace".to_owned(),
+                spdx_license: "MIT".to_owned(),
+                file: notice_file.clone(),
+                byte_size: u64::try_from(text.len()).unwrap(),
+                sha256: notice_sha256,
+                url: format!("https://example.invalid/{notice_file}"),
+                text,
+            }]
+        } else {
+            Vec::new()
         };
         AssetManifestEntry {
             logical_name: name.to_owned(),
-            file: file.to_owned(),
+            file: file.clone(),
             format: format.to_owned(),
             format_version: 1,
             byte_size: u64::try_from(bytes.len()).unwrap(),
-            sha256: format!("{:x}", Sha256::digest(bytes)),
-            url: format!("https://example.invalid/{name}"),
+            sha256,
+            url: format!("https://example.invalid/{file}"),
             compatibility: AssetCompatibility {
                 quirl_version_requirement: format!("={}", env!("CARGO_PKG_VERSION")),
                 operating_systems: vec![env::consts::OS.to_owned()],
                 architectures: vec![env::consts::ARCH.to_owned()],
             },
+            source_revision: "0".repeat(40),
+            source_date_epoch: 1,
+            notices,
         }
     }
 
@@ -3024,20 +3164,7 @@ mod tests {
 
     #[test]
     fn unknown_manifest_fields_and_incompatible_assets_fail_permanently() {
-        let candidate_commit = if env!("QUIRL_BUILD_COMMIT").len() == 40 {
-            env!("QUIRL_BUILD_COMMIT").to_owned()
-        } else {
-            "0".repeat(40)
-        };
-        let exact_contract = format!(
-            r#"{{"schema_version":1,"release_version":"0.1.0","candidate_commit":"{}","source_date_epoch":1,"assets":[{{"logical_name":"completion-database","file":"quirl-completion-database-v0.1.0.sqlite3","format":"sqlite3","format_version":1,"byte_size":1,"sha256":"{}","url":"https://github.com/niklas-heer/quirl/releases/download/v0.1.0/quirl-completion-database-v0.1.0.sqlite3","compatibility":{{"quirl_version_requirement":"={}","operating_systems":["{}"],"architectures":["{}"]}}}}]}}"#,
-            candidate_commit,
-            "0".repeat(64),
-            env!("CARGO_PKG_VERSION"),
-            env::consts::OS,
-            env::consts::ARCH
-        );
-        let mut manifest: AssetManifest = serde_json::from_str(&exact_contract).unwrap();
+        let mut manifest = single_asset_manifest(entry("completion-database", b"payload"));
         manifest
             .assets
             .push(entry("command-model", &command_model_tar()));
@@ -3069,14 +3196,28 @@ mod tests {
             manifest_identity(&manifest, completion, "provider-b")
         );
 
-        let mut wrong_candidate = manifest.clone();
-        wrong_candidate.candidate_commit = "f".repeat(40);
-        if env!("QUIRL_BUILD_COMMIT") != "f".repeat(40) {
-            assert!(validate_manifest(&wrong_candidate, false).is_err());
-        }
+        let mut newer_source = manifest.clone();
+        newer_source.assets[0].source_revision = "f".repeat(40);
+        assert!(validate_manifest(&newer_source, false).is_ok());
+        let newer_completion = newer_source
+            .assets
+            .iter()
+            .find(|asset| asset.logical_name == "completion-database")
+            .unwrap();
+        assert_ne!(
+            first_identity,
+            manifest_identity(&newer_source, newer_completion, "provider-a")
+        );
+
+        let mut mutable_filename = manifest.clone();
+        mutable_filename.assets[0].file = "quirl-completion-database-v0.1.0.sqlite3".to_owned();
+        assert!(validate_manifest(&mutable_filename, false).is_err());
+        let mut missing_notice = manifest.clone();
+        missing_notice.assets[0].notices.clear();
+        assert!(validate_manifest(&missing_notice, false).is_err());
 
         let json = br#"{
-            "schema_version":1,"release_version":"0.1.0","assets":[],"provider":"github"
+            "schema_version":2,"quirl_version":"0.1.0","assets":[],"provider":"github"
         }"#;
         assert!(serde_json::from_slice::<AssetManifest>(json).is_err());
 
@@ -3102,11 +3243,11 @@ mod tests {
         let candidates = manifest_candidates_from(
             None,
             None,
-            Some("https://override.invalid/asset-manifest-v1.json".to_owned()),
+            Some("https://override.invalid/asset-manifest-v2.json".to_owned()),
         );
         assert!(matches!(
             candidates.as_slice(),
-            [ManifestSource::Url(url)] if url == "https://override.invalid/asset-manifest-v1.json"
+            [ManifestSource::Url(url)] if url == "https://override.invalid/asset-manifest-v2.json"
         ));
 
         let defaults = manifest_candidates_from(None, None, None);
@@ -3120,10 +3261,16 @@ mod tests {
         assert_eq!(
             urls,
             vec![
-                "https://quirl.dev/reference/asset-manifest-v1.json".to_owned(),
-                "https://quirl.vercel.app/reference/asset-manifest-v1.json".to_owned(),
                 format!(
-                    "https://github.com/niklas-heer/quirl/releases/download/v{}/asset-manifest-v1.json",
+                    "https://quirl.dev/reference/v{}/asset-manifest-v2.json",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                format!(
+                    "https://quirl.vercel.app/reference/v{}/asset-manifest-v2.json",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                format!(
+                    "https://github.com/niklas-heer/quirl/releases/download/v{}/asset-manifest-v2.json",
                     env!("CARGO_PKG_VERSION")
                 ),
             ]
@@ -3133,9 +3280,7 @@ mod tests {
     fn single_asset_manifest(asset: AssetManifestEntry) -> AssetManifest {
         AssetManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
-            release_version: env!("CARGO_PKG_VERSION").to_owned(),
-            candidate_commit: "0".repeat(40),
-            source_date_epoch: 1,
+            quirl_version: env!("CARGO_PKG_VERSION").to_owned(),
             assets: vec![asset],
         }
     }
@@ -3146,16 +3291,16 @@ mod tests {
         let manifest = single_asset_manifest(asset);
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let downloader = FakeDownloader::new([(
-            "https://second.invalid/asset-manifest-v1.json".to_owned(),
+            "https://second.invalid/asset-manifest-v2.json".to_owned(),
             bytes,
         )]);
         let sources = vec![
-            ManifestSource::Url("https://first.invalid/asset-manifest-v1.json".to_owned()),
-            ManifestSource::Url("https://second.invalid/asset-manifest-v1.json".to_owned()),
+            ManifestSource::Url("https://first.invalid/asset-manifest-v2.json".to_owned()),
+            ManifestSource::Url("https://second.invalid/asset-manifest-v2.json".to_owned()),
         ];
         let (resolved, allow_file) =
             resolve_manifest(&sources, &downloader, &Arc::new(AtomicBool::new(false))).unwrap();
-        assert_eq!(resolved.release_version, manifest.release_version);
+        assert_eq!(resolved.quirl_version, manifest.quirl_version);
         assert!(!allow_file);
     }
 
@@ -3163,7 +3308,7 @@ mod tests {
     fn resolve_manifest_reports_no_local_trust_for_every_candidate_unreachable() {
         let downloader = FakeDownloader::new([]);
         let sources = vec![ManifestSource::Url(
-            "https://first.invalid/asset-manifest-v1.json".to_owned(),
+            "https://first.invalid/asset-manifest-v2.json".to_owned(),
         )];
         assert!(
             resolve_manifest(&sources, &downloader, &Arc::new(AtomicBool::new(false))).is_err()
@@ -3190,9 +3335,9 @@ mod tests {
         let paths = directory.paths();
         create_private_directory(&paths.data).unwrap();
         let bytes = TEST_NATIVE_DATABASE;
-        let payload_path = directory.0.join("completion.sqlite3");
-        fs::write(&payload_path, bytes).unwrap();
         let mut asset = entry("completion-database", bytes);
+        let payload_path = directory.0.join(&asset.file);
+        fs::write(&payload_path, bytes).unwrap();
         asset.url = format!("file://{}", payload_path.display());
         let downloader = FakeDownloader::new([]);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -3374,6 +3519,41 @@ mod tests {
         assert!(completion.installed);
         assert!(!completion.valid);
         assert!(completion.diagnostic.is_some());
+        let status_json = serde_json::to_value(&report).unwrap();
+        let completion_json = status_json["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|asset| asset["logical_name"] == "completion-database")
+            .unwrap();
+        assert_eq!(completion_json["release_version"], "0.1.0");
+        assert!(completion_json.get("quirl_version").is_none());
+    }
+
+    #[test]
+    fn schema_one_receipt_and_machine_output_keep_release_version_fields() {
+        let asset = entry("completion-database", TEST_NATIVE_DATABASE);
+        let receipt = InstalledReceipt {
+            schema_version: RECEIPT_SCHEMA_VERSION,
+            release_version: "0.1.0".to_owned(),
+            asset,
+        };
+        let receipt_json = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(receipt_json["release_version"], "0.1.0");
+        assert!(receipt_json.get("quirl_version").is_none());
+
+        let update = AssetUpdateReport {
+            schema_version: STATUS_SCHEMA_VERSION,
+            manifest_release_version: "0.1.0".to_owned(),
+            installed: 0,
+            current: 0,
+            deferred: 0,
+            failed: 0,
+            results: Vec::new(),
+        };
+        let update_json = serde_json::to_value(&update).unwrap();
+        assert_eq!(update_json["manifest_release_version"], "0.1.0");
+        assert!(update_json.get("manifest_quirl_version").is_none());
     }
 
     #[test]

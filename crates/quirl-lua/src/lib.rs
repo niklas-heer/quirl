@@ -428,8 +428,9 @@ impl Default for LuaPolicy {
 #[serde(deny_unknown_fields)]
 /// Validated top-level Quirl configuration returned across the Lua boundary.
 ///
-/// Unknown fields are rejected. Versions zero and one are migrated to the current
-/// schema only after Lua evaluation and typed deserialization succeed.
+/// Unknown fields are rejected. Legacy versions zero through three are migrated
+/// to the current schema only after Lua evaluation and typed deserialization
+/// succeed.
 pub struct QuirlConfig {
     /// Serialized configuration version; validated against [`CONFIG_SCHEMA_VERSION`].
     #[serde(default = "default_config_schema_version")]

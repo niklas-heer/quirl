@@ -46,7 +46,12 @@
   "architecture/decisions/0016-runtime-layering-contract.mdx",
   "architecture/decisions/0017-shared-execution-contract.mdx",
   "architecture/decisions/0018-typed-lua-runner-abi.mdx",
+  "architecture/decisions/0019-isolated-lua-worker-deadlines.mdx",
+  "architecture/decisions/0020-owned-unix-process-group-anchor.mdx",
   "architecture/decisions/0021-sqlite-local-command-intelligence.mdx",
+  "architecture/decisions/0022-persistent-rich-session-transcript.mdx",
+  "architecture/decisions/0023-rust-1.97-compatibility.mdx",
   "architecture/decisions/0024-kdl-native-command-catalog.mdx",
+  "architecture/decisions/0025-fine-tuned-command-retrieval-model.mdx",
   "architecture/decisions/0026-rust-native-releases-and-runtime-assets.mdx"
 ]

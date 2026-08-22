@@ -399,7 +399,7 @@ fn status(format: AiOutputFormat) -> Result<i32, ShellError> {
                 }
             );
             println!(
-                "  used for `quirl ai search`; unrelated to the `command-model` completion asset reported by `quirl assets status`"
+                "  sourced from `QUIRL_MODEL_PATH` when set, otherwise from the `command-model` runtime asset reported by `quirl assets status`"
             );
             println!("network loading: disabled");
             if let Some(identity) = &status.model_identity {

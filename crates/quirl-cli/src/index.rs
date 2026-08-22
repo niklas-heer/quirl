@@ -3880,6 +3880,51 @@ mod tests {
         )
     }
 
+    fn extend_negative_cache_backoff(config: &DiscoveryConfig, command: &str) {
+        let bytes = read_index(&config.index_path).unwrap();
+        let (_, state_json) = intelligence::decode_database(&bytes, &config.index_path).unwrap();
+        let state: DiscoveryState = serde_json::from_str(state_json.as_deref().unwrap()).unwrap();
+        let executable = state
+            .sources
+            .iter()
+            .find(|source| {
+                source.kind == DiscoverySourceKind::PathExecutable
+                    && source.path.file_name().and_then(|name| name.to_str()) == Some(command)
+            })
+            .unwrap();
+        let provider = state.local_providers.first().unwrap();
+        let observation = intelligence::LocalNegativeObservation {
+            command_path: vec![command.to_owned()],
+            provider: provider.provider,
+            executable_fingerprint: executable.fingerprint.clone(),
+            provider_fingerprint: provider.provider_fingerprint.clone(),
+            cwd_class: intelligence::LocalCwdClass::Any,
+            environment_fingerprint: provider.environment_fingerprint.clone(),
+            observed_unix_ms: unix_time_ms(),
+        };
+        let native_catalog_fingerprint = crate::native_catalog::embedded_database_identity();
+        let mut updated = bytes;
+        // Drive the deterministic exponential transition to its five-minute cap.
+        // The integration assertion below must test a warm cache, not whether a
+        // busy test process happens to get scheduled twice within the initial
+        // one-second production retry window.
+        for _ in 0..9 {
+            updated = intelligence::record_local_negative_hit(
+                &updated,
+                &config.index_path,
+                &native_catalog_fingerprint,
+                &observation,
+            )
+            .unwrap();
+        }
+        write_index_bytes_atomically_unlocked(
+            &config.index_path,
+            &updated,
+            intelligence::DATABASE_BYTES_MAX,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn editor_probe_paths_are_incremental_coalesced_and_bounded() {
         assert_eq!(
@@ -3993,6 +4038,7 @@ mod tests {
         assert!(refresh_with_local(&config).unwrap());
         let calls = fs::read(&marker).unwrap().len();
         assert_eq!(calls, 1);
+        extend_negative_cache_backoff(&config, "ghq");
         assert!(!refresh_with_local(&config).unwrap());
         assert_eq!(fs::read(&marker).unwrap().len(), calls);
         fs::remove_dir_all(directory).unwrap();
@@ -4056,6 +4102,7 @@ mod tests {
         assert_eq!(overlay.negative_hits.len(), 1);
         assert_eq!(overlay.negative_hits[0].command_path, ["ghq"]);
 
+        extend_negative_cache_backoff(&config, "ghq");
         assert!(!refresh_with_local(&config).unwrap());
         assert_eq!(fs::read(&marker).unwrap().len(), 1);
         fs::remove_dir_all(directory).unwrap();
