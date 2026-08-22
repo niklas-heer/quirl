@@ -2,9 +2,9 @@
 # VHS/ttyd/ffmpeg, and the JetBrainsMono Nerd Font before opening this tape.
 Output assets/quirl-demo.gif
 
-Require sh
+Require bash
 
-Set Shell "sh"
+Set Shell "bash"
 Set FontFamily "JetBrainsMono Nerd Font"
 Set FontSize 18
 Set Width 1200
@@ -16,7 +16,8 @@ Set Theme { "name": "Quirl", "black": "#17202a", "red": "#ff6b6b", "green": "#7e
 Hide
 Type `scripts/demo-session.sh --nerd-font "$QUIRL_DEMO_BIN"`
 Enter
-Wait+Screen /Quirl 0.1/
+Wait+Screen /v0\.1\.0/
+Wait+Screen /Alt-Q Quirl/
 Show
 Sleep 2s
 
@@ -24,13 +25,23 @@ Sleep 2s
 Type "git commit --"
 Tab
 Sleep 2s
-Down
+Tab
 Sleep 1s
 Escape
 Ctrl+U
 
 # One native process graph owns the byte pipe and boolean continuation.
 Type `printf 'alpha\nbeta\n' | wc -l && echo pipeline-ok`
+Enter
+Sleep 3s
+
+# Replay the native pipeline from durable history using the real picker.
+Ctrl+R
+Sleep 1s
+Tab
+Sleep 1s
+Enter
+Sleep 1s
 Enter
 Sleep 3s
 
@@ -42,15 +53,9 @@ Enter
 Sleep 3s
 Ctrl+Space
 Sleep 1s
-
-# Select the earlier native pipeline from durable history using the real picker.
-Ctrl+R
+Ctrl+Space
+Wait+Screen /NORMAL/
 Sleep 1s
-Type "pipeline-ok"
-Sleep 2s
-Enter
-Enter
-Sleep 3s
 
 # End on the explicit native/reference-shell compatibility boundary.
 Type "echo <(printf hi)"

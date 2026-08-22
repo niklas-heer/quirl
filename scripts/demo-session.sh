@@ -28,9 +28,23 @@ if [ ! -x "$demo_bin" ]; then
   echo "Quirl binary is not executable: $demo_bin" >&2
   exit 1
 fi
+demo_script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd -P)
+demo_model_input=$demo_script_dir/../models/quirl-command-v3-int8/quirl-command-v3-9bc5efbd14096b54
+demo_model=$(CDPATH='' cd "$demo_model_input" 2>/dev/null && pwd -P) || {
+  echo "Quirl demo model directory not found: $demo_model_input" >&2
+  exit 1
+}
+if [ ! -f "$demo_model/quirl-model.json" ]; then
+  echo "Quirl demo model manifest not found: $demo_model/quirl-model.json" >&2
+  exit 1
+fi
 
 umask 077
-demo_temp_base=${TMPDIR:-/tmp}
+demo_temp_base_input=${TMPDIR:-/tmp}
+demo_temp_base=$(CDPATH='' cd "$demo_temp_base_input" 2>/dev/null && pwd -P) || {
+  echo "Demo temporary directory not found: $demo_temp_base_input" >&2
+  exit 1
+}
 demo_root=$(mktemp -d "$demo_temp_base/quirl-demo.XXXXXX") || {
   echo "Could not create an isolated Quirl demo directory" >&2
   exit 1
@@ -97,6 +111,7 @@ if [ -n "${NO_COLOR+x}" ]; then
     QUIRL_CONFIG_DIR="$demo_config" \
     QUIRL_PLUGIN_HOME="$demo_plugins" \
     QUIRL_INDEX_PATH="$demo_cache/catalog.json" \
+    QUIRL_MODEL_PATH="$demo_model" \
     QUIRL_HISTORY="$demo_state/history" \
     QUIRL_RECOVERY_DIR="$demo_recovery" \
     QUIRL_SESSION_ID=release-demo \
@@ -119,6 +134,7 @@ else
     QUIRL_CONFIG_DIR="$demo_config" \
     QUIRL_PLUGIN_HOME="$demo_plugins" \
     QUIRL_INDEX_PATH="$demo_cache/catalog.json" \
+    QUIRL_MODEL_PATH="$demo_model" \
     QUIRL_HISTORY="$demo_state/history" \
     QUIRL_RECOVERY_DIR="$demo_recovery" \
     QUIRL_SESSION_ID=release-demo \
