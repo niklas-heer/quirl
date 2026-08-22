@@ -16,9 +16,9 @@ use std::{
 };
 
 use crate::release::{
-    ReleaseArtifact, ReleaseManifest, absolute, atomic_write, current_commit, input_error,
-    json_bytes, local_tag_target, read_bounded, read_json_bounded, release_url, run_status_bounded,
-    sha256_hex, verify_binary_version,
+    ReleaseArtifact, ReleaseManifest, absolute, atomic_write, input_error, json_bytes,
+    local_tag_target, read_bounded, read_json_bounded, release_url, run_status_bounded, sha256_hex,
+    verify_binary_version,
 };
 
 const FORMULA_BYTES_MAX: usize = 128 * 1024;
@@ -181,17 +181,8 @@ fn check(
 
 fn validate_manifest(root: &Path, manifest: &ReleaseManifest) -> Result<(), Box<dyn Error>> {
     validate_release_version(&manifest.version)?;
-    if manifest.schema_version != 1
-        || manifest.product != "quirl"
-        || manifest.tag != format!("v{}", manifest.version)
-        || manifest.candidate_commit.len() != 40
-        || !manifest
-            .candidate_commit
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
-        || manifest.source_date_epoch == 0
-        || current_commit(root)? != manifest.candidate_commit
-        || local_tag_target(root, &manifest.tag)? != manifest.candidate_commit
+    let tag_target = local_tag_target(root, &manifest.tag)?;
+    if !release_identity_matches(manifest, &tag_target)
         || manifest.artifacts.len() != 4
         || manifest.asset_manifest.as_deref() != Some("asset-manifest-v2.json")
     {
@@ -234,6 +225,21 @@ fn validate_manifest(root: &Path, manifest: &ReleaseManifest) -> Result<(), Box<
         validate_artifact_for_manifest(&manifest.version, artifact)?;
     }
     Ok(())
+}
+
+fn release_identity_matches(manifest: &ReleaseManifest, tag_target: &str) -> bool {
+    // The publisher tooling may be repaired after a release. The immutable tag,
+    // rather than the tooling checkout, binds the manifest to shipped source.
+    manifest.schema_version == 1
+        && manifest.product == "quirl"
+        && manifest.tag == format!("v{}", manifest.version)
+        && manifest.candidate_commit.len() == 40
+        && manifest
+            .candidate_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && manifest.source_date_epoch != 0
+        && tag_target == manifest.candidate_commit
 }
 
 fn validate_artifact_for_manifest(
@@ -674,6 +680,23 @@ mod tests {
         assert!(validate_artifact_for_manifest("0.1.0", &artifact).is_ok());
         artifact.url.push_str(".different");
         assert!(validate_artifact_for_manifest("0.1.0", &artifact).is_err());
+    }
+
+    #[test]
+    fn immutable_tag_not_tooling_checkout_binds_release_identity() {
+        let manifest = ReleaseManifest {
+            schema_version: 1,
+            product: "quirl".to_owned(),
+            version: "0.1.0".to_owned(),
+            tag: "v0.1.0".to_owned(),
+            candidate_commit: "a".repeat(40),
+            source_date_epoch: 1,
+            artifacts: Vec::new(),
+            asset_manifest: None,
+            assets: Vec::new(),
+        };
+        assert!(release_identity_matches(&manifest, &"a".repeat(40)));
+        assert!(!release_identity_matches(&manifest, &"b".repeat(40)));
     }
 
     #[test]
