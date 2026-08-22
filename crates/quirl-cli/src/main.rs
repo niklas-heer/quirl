@@ -640,8 +640,8 @@ fn load_composed_catalog() -> Result<Catalog, ShellError> {
 fn load_rich_catalog() -> Result<Arc<Catalog>, ShellError> {
     #[cfg(debug_assertions)]
     catalog_admission_test_hook()?;
-    // The rich surface has already flushed its first frame before invoking this
-    // loader, so bounded discovery cannot delay terminal acquisition or paint.
+    // The rich surface invokes this on its owned worker after flushing the
+    // first frame, so bounded discovery delays neither paint nor input.
     index::initialize_interactive_catalog();
     load_composed_catalog().map(Arc::new)
 }
