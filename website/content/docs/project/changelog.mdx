@@ -17,9 +17,11 @@ only after its exact commit and artifacts pass the
 
 ### Added
 
-- A recorded VHS terminal demo and an asciinema/`agg` text-tour GIF, embedded
+- A recorded VHS terminal demo and an asciinema/`asg` text-tour SVG, embedded
   in the README and website to show semantic completion, native pipelines,
-  typed data, and Lua in action.
+  typed data, and Lua in action. `scripts/record-tour.sh` reproduces the tour
+  recording; `scripts/demo.sh` takes an opt-in `QUIRL_DEMO_PACE_SECONDS` pace
+  for it without changing `cargo xtask demo`'s default (unpaced) behavior.
 
 ### Fixed
 
