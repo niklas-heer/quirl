@@ -1,6 +1,6 @@
 import { RootProvider } from 'fumadocs-ui/provider/next';
 import './global.css';
-import { Inter, JetBrains_Mono } from 'next/font/google';
+import { Bungee, Inter, JetBrains_Mono } from 'next/font/google';
 import type { Metadata } from 'next';
 
 const inter = Inter({
@@ -11,6 +11,12 @@ const inter = Inter({
 const mono = JetBrains_Mono({
   subsets: ['latin'],
   variable: '--font-mono',
+});
+
+const bungee = Bungee({
+  subsets: ['latin'],
+  weight: '400',
+  variable: '--font-display',
 });
 
 export const metadata: Metadata = {
@@ -41,7 +47,7 @@ export default function Layout({ children }: LayoutProps<'/'>) {
   return (
     <html
       lang="en"
-      className={`${inter.variable} ${mono.variable}`}
+      className={`${inter.variable} ${mono.variable} ${bungee.variable}`}
       suppressHydrationWarning
     >
       <body className="flex flex-col min-h-screen">
