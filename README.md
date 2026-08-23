@@ -15,6 +15,8 @@
 
 ---
 
+![A recorded Quirl terminal session: semantic completion, a native pipeline, history replay, a typed data filter, and an explicit Bash dialect island](assets/quirl-demo.gif)
+
 > [!IMPORTANT]
 > Quirl's **0.1 Unix line** supports interactive Linux and macOS. Treat a build
 > as the official `0.1.0` release only when it comes from the immutable
@@ -22,15 +24,13 @@
 > other source checkouts are candidate or development builds. Windows is
 > best-effort, contract-tested portability work.
 
-The complete Fumadocs website—landing page, guides, reference material,
-architecture records, research, and release evidence—lives in
-[`website/`](website/). It is the new documentation experience and can be
-refreshed from the repository's canonical Markdown sources with one command.
+Full documentation—guides, reference material, architecture records, research,
+and release evidence—lives on the [Quirl website](website/), generated from
+this repository's canonical Markdown sources.
 
-- [Explore the website source](website/)
-- [Start with the documentation](website/content/docs/index.mdx)
-- [Read the product and language design](docs/language-design.md)
-- [See the 0.1 release checklist](docs/release-checklist.md)
+- [Documentation home](website/content/docs/index.mdx)
+- [Product and language design](docs/language-design.md)
+- [0.1 release checklist](docs/release-checklist.md)
 
 ## Why Quirl
 
@@ -87,6 +87,8 @@ sandboxed Lua, diagnostics, and generated command documentation:
 ```console
 cargo xtask demo
 ```
+
+![Quirl's deterministic text tour: typed-data filtering, semantic completion, sandboxed Lua evaluation, and generated documentation](assets/quirl-tour.svg)
 
 Inside an interactive session, <kbd>Tab</kbd> opens semantic completion,
 <kbd>Shift-Tab</kbd> expands it into the picker, <kbd>F1</kbd> opens contextual

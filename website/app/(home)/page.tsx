@@ -9,6 +9,7 @@ import {
   Sparkles,
   TerminalSquare,
 } from 'lucide-react';
+import { HeroDemo } from '@/components/hero-demo';
 
 export default function HomePage() {
   return (
@@ -46,7 +47,7 @@ export default function HomePage() {
           </p>
         </div>
 
-        <div className="terminal-wrap" aria-label="Example Quirl session">
+        <div className="terminal-wrap" aria-label="Recorded Quirl session">
           <Image
             className="hero-mark"
             src="/logo.png"
@@ -62,40 +63,10 @@ export default function HomePage() {
                 <span />
                 <span />
               </div>
-              <span>quirl — data mode</span>
-              <span className="terminal-mode">DATA</span>
+              <span>quirl — recorded session</span>
+              <span className="terminal-mode">DEMO</span>
             </div>
-            <div className="terminal-body">
-              <div className="terminal-line">
-                <span className="prompt">❯</span>
-                <span className="command">data</span>
-              </div>
-              <div className="terminal-line terminal-input">
-                <span className="prompt data-prompt">∿</span>
-                <span>
-                  open <strong>deployments.json</strong> | where status ==
-                  <em> &quot;failed&quot;</em> | select service region
-                </span>
-              </div>
-              <div className="terminal-table">
-                <div className="table-row table-head">
-                  <span>service</span>
-                  <span>region</span>
-                </div>
-                <div className="table-row">
-                  <span>payments</span>
-                  <span>eu-central-1</span>
-                </div>
-                <div className="table-row">
-                  <span>search</span>
-                  <span>us-east-1</span>
-                </div>
-              </div>
-              <div className="terminal-line terminal-input">
-                <span className="prompt data-prompt">∿</span>
-                <span className="cursor" aria-hidden="true" />
-              </div>
-            </div>
+            <HeroDemo />
             <div className="terminal-footer">
               <span>Alt-Q Quirl leader</span>
               <span>Tab complete</span>

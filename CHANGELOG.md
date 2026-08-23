@@ -10,6 +10,22 @@ only after its exact commit and artifacts pass the
 
 ## [Unreleased]
 
+### Added
+
+- A recorded VHS terminal demo and an asciinema/`asg` text-tour SVG, embedded
+  in the README and website to show semantic completion, native pipelines,
+  typed data, and Lua in action. `scripts/record-tour.sh` reproduces the tour
+  recording; `scripts/demo.sh` takes an opt-in `QUIRL_DEMO_PACE_SECONDS` pace
+  for it without changing `cargo xtask demo`'s default (unpaced) behavior.
+
+### Fixed
+
+- `scripts/demo.tape`'s startup wait condition, which previously matched only
+  an official `v0.1.0` release build and timed out against development
+  builds; it now matches either build identity. The closing beat now ends on
+  a successful `bash { ... }` dialect island instead of the native-mode
+  process-substitution error.
+
 ## [0.1.0] - 2026-08-22
 
 ### Added

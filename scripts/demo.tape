@@ -16,7 +16,7 @@ Set Theme { "name": "Quirl", "black": "#17202a", "red": "#ff6b6b", "green": "#7e
 Hide
 Type `scripts/demo-session.sh --nerd-font "$QUIRL_DEMO_BIN"`
 Enter
-Wait+Screen /v0\.1\.0/
+Wait+Screen /(v[0-9]+\.[0-9]+\.[0-9]+|dev@)/
 Wait+Screen /Alt-Q Quirl/
 Show
 Sleep 2s
@@ -57,10 +57,16 @@ Ctrl+Space
 Wait+Screen /NORMAL/
 Sleep 1s
 
-# End on the explicit native/reference-shell compatibility boundary.
+# Native mode is explicit about the reference-shell compatibility boundary.
 Type "echo <(printf hi)"
 Enter
-Sleep 4s
+Sleep 2s
+Ctrl+U
+
+# An explicit dialect island opts back in to full Bash semantics.
+Type `bash { cat <(printf hi) }`
+Enter
+Sleep 3s
 
 Hide
 Type "exit"

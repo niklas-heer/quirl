@@ -39,9 +39,14 @@ if [ ! -x "$quirl_demo_bin" ]; then
   exit 1
 fi
 
+demo_pace_seconds=${QUIRL_DEMO_PACE_SECONDS:-0}
+
 run_demo() {
   printf '\n%s%s %s%s\n' "$demo_cyan" "$demo_prompt" "$*" "$demo_reset"
   "$demo_session" "$quirl_demo_bin" "$@"
+  if [ "$demo_pace_seconds" != 0 ]; then
+    sleep "$demo_pace_seconds"
+  fi
 }
 
 printf '%sQuirl %s a well-stirred shell%s\n' \
