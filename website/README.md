@@ -1,9 +1,10 @@
 # Quirl website
 
 The Quirl landing page and complete documentation site are built with Next.js
-and [Fumadocs](https://www.fumadocs.dev/). The site is intentionally ready ahead
-of the first tagged release: public copy is honest about the 0.1 candidate, and
-the documentation mirror is designed for frequent updates.
+and [Fumadocs](https://www.fumadocs.dev/). Public copy describes the supported
+0.1.0 release while keeping untagged source work, historical evidence, and
+future product direction clearly separated. The documentation mirror is
+designed for frequent updates.
 
 ## Develop locally
 
@@ -57,17 +58,18 @@ attribution, lint, route type checking, and a production build without rewriting
 tracked files. It uses the exact dependency graph in `package-lock.json`; do not
 substitute `npm install` for release validation.
 
-Set `NEXT_PUBLIC_SITE_URL` to the canonical production origin when deployment is
-configured. Until then, metadata uses the local development origin and makes no
-claim about an unpublished domain.
+Set `NEXT_PUBLIC_SITE_URL` to the canonical production origin in deployment.
+Without it, local builds deliberately use `http://localhost:3000` as their
+metadata origin.
 
-## Updating toward release
+## Updating release status
 
-Before the first public release:
+For every public release:
 
 1. Refresh canonical project documentation and run `npm run sync:docs`.
-2. Replace remaining prerelease framing only after the release checklist passes.
-3. Set `NEXT_PUBLIC_SITE_URL` in the deployment environment.
-4. Review the landing-page terminal example against the candidate binary.
+2. Update release, installation, support, and historical-evidence wording only
+   after the immutable release exists.
+3. Confirm `NEXT_PUBLIC_SITE_URL` in the deployment environment.
+4. Review the landing-page terminal example against the released binary.
 5. Validate search, social cards, mobile navigation, and representative long
    architecture/reference pages.

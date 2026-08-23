@@ -18,7 +18,7 @@ export default function HomePage() {
         <div className="hero-copy">
           <div className="release-pill">
             <span className="release-dot" />
-            Unreleased Unix candidate · 0.1
+            v0.1.0 · Linux and macOS
           </div>
           <p className="hero-kicker">A well-stirred shell.</p>
           <h1>Your shell, with a richer vocabulary.</h1>
@@ -28,8 +28,11 @@ export default function HomePage() {
             configuration, scripts, prompts, completions, and plugins.
           </p>
           <div className="hero-actions">
-            <Link href="/docs" className="button button-primary">
-              Read the docs <ArrowRight size={16} />
+            <Link
+              href="/docs/getting-started/installation"
+              className="button button-primary"
+            >
+              Install Quirl <ArrowRight size={16} />
             </Link>
             <a
               href="https://github.com/niklas-heer/quirl"
@@ -39,7 +42,7 @@ export default function HomePage() {
             </a>
           </div>
           <p className="hero-note">
-            Unreleased prototype · Linux and macOS · Built from source
+            Available now · Homebrew or native release archive
           </p>
         </div>
 
@@ -184,12 +187,13 @@ export default function HomePage() {
       <section className="status-section">
         <div className="status-icon"><BookOpenText /></div>
         <div>
-          <p className="section-label">The foundation is here</p>
+          <p className="section-label">The 0.1 release is here</p>
           <h2>Documentation for the project as it exists today.</h2>
           <p>
-            Quirl is an unreleased 0.1 Unix candidate implementation and a
-            fast-moving prototype. The docs separate current usage and runtime
-            contracts from long-term direction and exact-artifact evidence.
+            Quirl 0.1.0 is available for Linux and macOS through Homebrew and
+            immutable native release archives. The docs separate current usage
+            and runtime contracts from long-term direction and exact-artifact
+            evidence.
           </p>
         </div>
         <Link href="/docs" className="button button-secondary">

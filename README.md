@@ -56,7 +56,7 @@ into typed structures and validated before the rest of the shell can use them.
 
 ## Quick start
 
-For a published release, install the native binary from the Homebrew tap:
+Install the official Quirl 0.1.0 release from the Homebrew tap:
 
 ```console
 brew install niklas-heer/tap/quirl
@@ -69,9 +69,11 @@ the background when available and remains usable in degraded mode while
 offline. Compatible completion knowledge can advance through Quirl's
 version-scoped website channel without forcing an otherwise empty binary
 release; every database generation has immutable, digest-named bytes and its
-own source identity. If the `v0.1.0` release or tap formula is not yet available,
-build from source. The repository pins Rust 1.97.1 through
-`rust-toolchain.toml`; no system Lua installation is required.
+own source identity. Native archives and checksums are also available from the
+immutable [`v0.1.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0).
+Build from source when contributing or testing current development work. The
+repository pins Rust 1.97.1 through `rust-toolchain.toml`; no system Lua
+installation is required.
 
 ```console
 git clone https://github.com/niklas-heer/quirl.git
@@ -110,6 +112,12 @@ and artifacts named by an immutable release. The runtime contracts live in
 `Catalog::builtin()` and `HOST_API`; the generated references and website are
 projections, not competing specifications.
 
+The supported release is
+[`v0.1.0`](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0), published
+from immutable commit `168f9f2e2f2899f7910ca64831561c8885d9ef24`. The
+performance block below remains deliberately separate: it records an older
+measured artifact and is not retroactively attributed to the published binary.
+
 Config schema v4 includes 30 curated dark themes plus `ansi`, accepts bounded
 custom semantic palettes shared by both terminal surfaces, enables completion
 after one character by default, uses the compact welcome banner, and adds the
@@ -123,8 +131,8 @@ a bounded, no-JavaScript preview gallery. See
 Important current limits:
 
 - A source checkout is not a supported release merely because its workspace
-  version says `0.1.0`; the immutable tag, release assets, and checklist
-  evidence must identify the same candidate.
+  version says `0.1.0`; the immutable tag and release assets must identify the
+  same candidate, and the publication record must disclose its evidence scope.
 - Wasm packages validate but do not execute.
 - Package publishing is a local dry run, not a remote registry operation.
 - Bash/Zsh here-documents, process substitution, loops, functions, and dialect

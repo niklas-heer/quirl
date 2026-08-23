@@ -1,7 +1,7 @@
 # Security policy
 
 Quirl executes commands and hosts extensions, so security reports are taken
-seriously throughout the 0.1.0 release-candidate process and after publication.
+seriously for the supported 0.1.x release line and ongoing development.
 
 ## Supported versions
 
