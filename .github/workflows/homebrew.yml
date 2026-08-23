@@ -44,6 +44,24 @@ jobs:
           path: homebrew-tap
           persist-credentials: false
 
+      - name: Prepare an isolated registered tap for auditing
+        id: audit-tap
+        shell: bash
+        run: |
+          set -euo pipefail
+          audit_parent="$(brew --repository)/Library/Taps/quirl-release"
+          audit_name="quirl-release/quirl-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          audit_tap="$audit_parent/homebrew-${audit_name#*/}"
+          audit_config="$RUNNER_TEMP/homebrew-audit-config-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$audit_tap"
+          test ! -e "$audit_config"
+          mkdir -p "$audit_parent"
+          mkdir -p "$audit_config"
+          cp -R "$GITHUB_WORKSPACE/homebrew-tap" "$audit_tap"
+          printf 'name=%s\n' "$audit_name" >> "$GITHUB_OUTPUT"
+          printf 'path=%s\n' "$audit_tap" >> "$GITHUB_OUTPUT"
+          printf 'config=%s\n' "$audit_config" >> "$GITHUB_OUTPUT"
+
       - name: Download the published release manifest
         uses: robinraju/release-downloader@28fc21f50d76778e7023361aa1f863e717d3d56f # v1.13
         with:
@@ -69,13 +87,24 @@ jobs:
           cargo xtask homebrew render
           --release-manifest release/release-manifest-v1.json
           --expected-tag "$EXPECTED_TAG"
-          --tap-root homebrew-tap
+          --tap-root "${{ steps.audit-tap.outputs.path }}"
           --write
 
+      - name: Stage the formula for changed-file auditing
+        env:
+          XDG_CONFIG_HOME: ${{ steps.audit-tap.outputs.config }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C "${{ steps.audit-tap.outputs.path }}" add -- Formula/quirl.rb
+          brew trust --tap "${{ steps.audit-tap.outputs.name }}"
+
       - name: Verify the rendered tap
+        env:
+          XDG_CONFIG_HOME: ${{ steps.audit-tap.outputs.config }}
         run: >-
           cargo xtask homebrew check
-          --tap-root homebrew-tap
+          --tap-root "${{ steps.audit-tap.outputs.path }}"
           --release-manifest release/release-manifest-v1.json
           --package-root release
 
@@ -83,9 +112,30 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: homebrew-formula
-          path: homebrew-tap/Formula/quirl.rb
+          path: ${{ steps.audit-tap.outputs.path }}/Formula/quirl.rb
           if-no-files-found: error
           retention-days: 7
+
+      - name: Remove the isolated audit tap
+        if: always() && steps.audit-tap.outputs.path != ''
+        env:
+          AUDIT_CONFIG: ${{ steps.audit-tap.outputs.config }}
+          AUDIT_TAP: ${{ steps.audit-tap.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          audit_prefix="$(brew --repository)/Library/Taps/quirl-release/homebrew-quirl-"
+          config_prefix="$RUNNER_TEMP/homebrew-audit-config-"
+          case "$AUDIT_TAP" in
+            "$audit_prefix"*) ;;
+            *) exit 1 ;;
+          esac
+          case "$AUDIT_CONFIG" in
+            "$config_prefix"*) ;;
+            *) exit 1 ;;
+          esac
+          find "$AUDIT_TAP" -depth -delete
+          find "$AUDIT_CONFIG" -depth -delete
 
   pull-request:
     needs: formula
