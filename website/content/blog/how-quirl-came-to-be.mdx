@@ -1,0 +1,78 @@
+---
+title: How Quirl Came to Be
+description: Nine days, three AI coding tools, and a few billion tokens later — the origin story of a Rust shell with typed pipelines and a sandboxed Lua runtime.
+date: 2026-08-24
+---
+
+This is the first post on this blog, so it gets the origin story. Quirl went from an empty git repository to a tagged `v0.1.0` release in nine days — August 15 to August 24, 2026 — built by one person leaning hard on three different AI coding tools. I wanted to write down how that actually happened while the numbers are still fresh, because they're stranger than I expected even having lived through it.
+
+## The scale, first
+
+Before the story, the receipts. Everything below is measured directly from the repository and from real usage exports, not estimated:
+
+| | |
+| --- | --- |
+| Product crates | 13 |
+| Lines of Rust | 115,283 |
+| Tests | 1,059 (plus 74 more in the release tooling) |
+| Architecture decision records | 26 |
+| Tracked source size | ~32 MiB |
+| Total commits | 299 |
+| Elapsed time | 9 days |
+
+Thirteen crates with an enforced one-way dependency graph, twenty-six written-down architecture decisions, a thousand-plus tests, a generated Lua SDK, a language server, an MCP surface, a terminal UI with a tested fail-closed fallback — in a source tree small enough to `git clone` and read in an afternoon. That ratio, ambition against footprint, is the first surprising thing about this project.
+
+The second surprising thing is how it got typed.
+
+## Over 3 billion tokens
+
+I use three different AI coding tools day to day — Claude Code, Codex/ChatGPT Desktop, and Cursor (both the desktop app and its agent CLI) — and I was curious what that actually adds up to for a project built this fast. So I pulled real numbers instead of guessing.
+
+Counting every session that touched this repository, including the parallel agent runs I kicked off in separate git worktrees so multiple tools could work on different parts of the codebase at once, the total is **north of 3.7 billion tokens** across all three tools. If you count only the primary checkout and ignore the parallel worktree sessions, it's a more modest 2.5 billion. Either way: billions, for a project whose entire tracked source fits in about 32 megabytes.
+
+Broken down by tool (the primary-checkout figures, which is the fairer per-tool comparison):
+
+- **Claude Code**: ~3,900 messages, ~2.0 million output tokens, and **1.37 billion cache-read tokens**. That last number is the one worth sitting with — it's not new content, it's the model re-reading context it already had, which is exactly what you'd expect from a project this dense with self-imposed rules (more on those below) that need re-checking constantly.
+- **Codex / ChatGPT Desktop**: ~8,800 messages in the main checkout alone, climbing to roughly 19,000 once you count every parallel worktree session — real evidence that a meaningful chunk of this ran as multiple agents working concurrently on different branches of the same repo.
+- **Cursor** (app and agent CLI combined — Cursor's own usage export can't separate the two, or scope itself to just this repository): about 196 messages and 16.2 million input tokens, spread across a genuinely mixed roster of models — Claude Sonnet 5, Claude Fable 5, a few GPT-5.x variants, xAI's Grok, and Cursor's own Composer.
+
+If you price all of that out at standard API list rates — which is not what I actually paid, since Claude Code, Cursor, and ChatGPT are largely flat-rate subscriptions rather than metered billing — it comes out to somewhere between **$1,425 and $2,150** in token-cost-equivalent terms, depending on whether you count the parallel worktree sessions. That's real money, but it's laptop money, not team money. For less than a mid-range laptop, in pure token-accounting terms, one person produced a release with the operational discipline of something built by a small, well-run team.
+
+Is it *worth* it? I think the honest answer is: the tokens aren't the value. The value is what they got checked against. A test suite that actually runs, a set of architecture rules an agent can't quietly ignore, and a habit of writing decisions down before building on top of them — that's what turned a very large number of tokens into a working shell instead of a very large pile of code nobody trusts. Token count with no guardrails is just noise at scale. Token count against `cargo xtask check` and twenty-six ADRs is compressed engineering time.
+
+## The Steel detour
+
+The origin story has a real plot twist, and it's dated to the hour.
+
+The actual working prototype landed a little over five hours after the very first commit — one commit, at 19:52 on day one, that already contained a full multi-crate workspace with **two** embedded scripting runtimes built side by side: one on Lua via `mlua`, and one wrapping a Scheme interpreter called Steel. A minute later, a benchmark harness went in comparing eight language runtimes on binary size and memory footprint. A minute after that, the actual decision record landed, scoring all eight. Steel came in dead last — 59.5 out of 100, "startup, RSS, maturity, and familiarity costs" — next to a measured Lua runtime using roughly a thirtieth of the memory for the same workload.
+
+Twenty-seven minutes after the prototype commit, Steel was gone: deleted outright, its crate directory renamed and repurposed, `BREAKING CHANGE: Steel and Scheme scripts and the interactive Steel bridge are no longer supported` written directly into the commit message. I won't pretend that was a thirty-minute decision — a single commit that already ships two finished runtimes and eight-way benchmarks is clearly a squashed snapshot of thinking that happened before the repository existed, not a live diary. But it's a real decision, made for real reasons: Rust already owns every performance-critical path in Quirl, so the embedded language only needed to be small, boring, and already familiar to the people who'd be writing plugins for it — the same bet Neovim and WezTerm made with their own Lua configuration layers.
+
+## Why build a shell at all
+
+Bash and Zsh pass bytes between commands. Nushell passes typed values but trusts its plugins with no sandbox. Fish deliberately breaks from POSIX for usability but stays text-based. xonsh gives you full Python inside your shell, which is powerful and also means a plugin has exactly as much authority as you do.
+
+What none of them does, as far as I could find in their own documentation, is combine a typed data pipeline with an extension language that's actually resource-bounded at runtime — memory limits, instruction budgets, wall-clock deadlines, a stripped standard library, all enforced whether the script is trusted or not. That gap, not "yet another Bash," is what Quirl is actually trying to fill.
+
+## How far along toward that vision
+
+The pitch, from the start, was three things stitched together: the muscle memory of a traditional shell like Bash, the typed-data mode of something like Nushell, and the real scripting power of an embedded programming language — the way xonsh hands you actual Python instead of a shell dialect pretending to be one. Nine days in, here's an honest read on where each piece actually stands.
+
+```mermaid
+graph LR
+    bash["Bash/Zsh familiarity<br/>Normal mode"] -->|shipped, tested| quirl((Quirl))
+    nu["Nushell-style typed data<br/>Data mode"] -->|shipped, tested,<br/>lazy + bounded| quirl
+    xonsh["xonsh-style real scripting<br/>Lua 5.4 SDK"] -->|shipped, but<br/>deliberately sandboxed| quirl
+```
+
+**Bash familiarity** is real and tested: native process groups, real job control (`fg`, `bg`, `Ctrl-Z` actually send `SIGSTOP`/`SIGCONT`), quoting and redirects that work the way you already expect, with explicit Bash/Zsh "islands" for syntax Quirl's own grammar doesn't parse.
+
+**Typed data, Nushell-style**, is also real, not aspirational: values stay lazy until you explicitly materialize them, hard limits are enforced on rows, bytes, and nesting depth rather than hoped for, and the whole thing is a genuine pull-based stream under the hood, not a list dressed up as one.
+
+**Real scripting, xonsh-style**, is the interesting middle case. Lua is a full, general-purpose language — you get real functions, real control flow, real logic, not a constrained shell dialect. But unlike xonsh's decision to hand you the entirety of Python, Quirl deliberately doesn't hand a script the entirety of anything. Every Lua VM runs under a memory limit, an instruction budget, and a wall-clock deadline; the standard library is cut down to almost nothing; even the *string-matching functions* got replaced with fail-closed stubs because the originals run in C and can't be interrupted by the safety checks everything else obeys. That's a genuinely different bet than xonsh's: less raw power by default, more confidence that a plugin you didn't write can't quietly do something you didn't ask for.
+
+So: two of the three pillars are load-bearing today, in the sense that you could build real things on top of them right now and the tests would catch you if you didn't. The third is real and shipped, but intentionally narrower in scope than its inspiration — sandboxed by design rather than a full unsandboxed scripting environment. What's still mostly a plan rather than shipped code: values don't yet carry their origin (span, file, command) as they flow through a pipeline; WebAssembly plugins can be validated but not executed yet; Windows gets process portability but not an interactive shell. None of that is hidden — the project's own docs are unusually blunt about drawing the line between "this is the current release contract" and "this is where we're headed."
+
+## What's next
+
+This blog is where I'll keep writing about that: what changes, what breaks, what gets ripped out the way Steel did. If you want the deeper technical version of this story — the crate-by-crate architecture, the exact sandbox tests, a shell-by-shell comparison against Bash, Zsh, fish, Nushell, xonsh, and Oil/YSH sourced from their own docs — that's coming as a follow-up post. For now: `v0.1.0` is out, it's on [GitHub](https://github.com/niklas-heer/quirl) and Homebrew, and it does exactly what the [docs](/docs) say it does — no more, and importantly, no less.
