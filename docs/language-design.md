@@ -1,6 +1,6 @@
 # Quirl language and product design
 
-**Product direction with an evidence-bounded current contract · 16 August 2026**
+**Product direction with an evidence-bounded current contract · 23 August 2026**
 
 > **The development environment in your terminal.** Your shell should feel as smart as your editor.
 
@@ -9,10 +9,12 @@ performance, and a well-tooled Lua extension language with an IDE-grade editing
 experience. Completion, diagnostics, documentation, prompt context, and
 interactive views are one product—not a pile of plugins.
 
-## Current 0.1 candidate contract
+## Current 0.1 release contract
 
-This is the implemented contract in the integrated source tree, not a claim
-that a release artifact has been measured or published:
+This is the implemented contract for the 0.1 release line. The supported
+artifact is the immutable
+[`v0.1.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0);
+untagged source remains candidate or development work:
 
 - On Linux and macOS, the native C1-core includes byte pipelines, redirects,
   boolean lists, bounded expansion/substitution, jobs, and explicit Bash/Zsh
@@ -36,14 +38,14 @@ that a release artifact has been measured or published:
   separate immutable SQLite artifact; neither replaces the CLI-owned mutable
   intelligence cache.
 
-The implemented product line is **0.1.x**. An official release exists only when
-an immutable GitHub tag and release name the exact candidate; an untagged source
-checkout is a candidate or development build even when its workspace version
-is `0.1.0`. In this document, “1.0” is either a historical/accepted scope label
-from an ADR or a long-term direction, not a current distribution or support
-claim. Historical benchmark records apply only to their named candidates,
-artifacts, environments, and methods. The source-of-truth and evidence order is
-defined in [the documentation system](documentation-system.md).
+The implemented product line is **0.1.x**. Version 0.1.0 was published from
+commit `168f9f2e2f2899f7910ca64831561c8885d9ef24`; a source checkout is not that
+supported release merely because its workspace version is still `0.1.0`. In
+this document, “1.0” is either a historical/accepted scope label from an ADR or
+a long-term direction, not a current distribution or support claim. Historical
+benchmark records apply only to their named candidates, artifacts,
+environments, and methods. The source-of-truth and evidence order is defined in
+[the documentation system](documentation-system.md).
 
 <!-- BEGIN QUIRL RELEASE EVIDENCE STATUS -->
 > **Release evidence status — historical.** Artifact evidence for measured candidate `23fd5d36907fc816bdafd9aa3c2dcb3afb69feb5` and artifact `9a893a5f1a0b49d62712f331c88966113d910d94efa9651dc4feffe9fd55b637` is historical.
@@ -791,8 +793,9 @@ asked.
 ### Prove the risky seams first
 
 This delivery table is a design tracker. “Implemented” identifies integrated
-code and tests; it does not mean the current source has a tagged release,
-completed human checklist, or fresh exact-artifact evidence.
+code and tests. Release support attaches only to an immutable versioned
+artifact; it does not transfer automatically to later source commits or to
+historical evidence from another candidate.
 
 | Phase | Status | Deliverable |
 | --- | --- | --- |
@@ -800,7 +803,7 @@ completed human checklist, or fresh exact-artifact evidence.
 | 1 | **Accepted · Preview** | Job control, redirects, indexed completions, Zsh/Bash/Fish and help/man ingestion, history/file/action picker, adaptive prompt, typed config forms with web/TUI views, C1 subset, structured core commands, plain fallbacks, Linux/macOS. |
 | 2 | **Complete · Scriptable** | Lua scripts and computed config, `quirl run`, formatter, annotation-aware checker, linter, tests, docs, language service, agent catalog/validation formats, package manifests, generated host API, deterministic tests. |
 | 3 | **Accepted · Platform** | Trusted-language and isolated-plugin contracts, permissions/lockfile, catalog/completion/UI/event extension points, Bash/Zsh runners, directory/process panels, bounded live sampling, portable process contracts, recovery. |
-| 4 | **Integrated candidate work** | Automated contracts, compatibility dispositions, performance harnesses, and security/accessibility audits are present. A release still requires fresh exact-artifact evidence and the human Linux/macOS checklist; explicit reference-shell and best-effort platform boundaries remain outside the current 0.1 support claim. |
+| 4 | **Published · 0.1.0** | The Linux/macOS release, native packages, Homebrew formula, version-scoped runtime assets, automated contracts, compatibility dispositions, performance harnesses, and security/accessibility audits are present. Historical performance evidence remains scoped to its measured artifact; future binaries require their own gate. Explicit reference-shell and best-effort platform boundaries remain outside the 0.1 support claim. |
 
 ### Phase 1 acceptance gates
 
@@ -939,8 +942,8 @@ and accessible text output, per the release criterion in §10.
   cancellation, deadlines, and stale-result evidence. Linux and macOS are the
   supported interactive platforms. Windows terminal behavior is best effort,
   and non-native dialect forms remain explicit reference-shell islands; neither
-  is a hidden release blocker. The exact candidate still requires fresh
-  performance evidence and the human release checklist.
+  is a hidden release blocker. Every future release candidate requires its own
+  performance attribution and human release checklist.
 
 ## 14. Review decisions
 

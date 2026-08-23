@@ -3,9 +3,10 @@ title: Install Quirl
 description: Install a native Quirl release or build the 0.1 line with the pinned toolchain.
 ---
 
-<Callout type="warn" title="0.1 publication status">
-  The commands below become installable when the immutable 0.1.0 GitHub Release
-  and Homebrew tap PR are published. Until then, use the source build.
+<Callout type="info" title="Quirl 0.1.0 is available">
+  Install the supported release with Homebrew or download a SHA-256-pinned
+  native archive from the immutable
+  [v0.1.0 GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0).
 </Callout>
 
 ## Homebrew
@@ -22,9 +23,10 @@ model.
 ## Direct release archive
 
 Download the package for your operating system and architecture from the
-versioned GitHub Release, verify it against `SHA256SUMS`, and compare the entry
-in `release-manifest-v1.json` before putting `quirl` on `PATH`. Never use an
-asset from a mutable branch URL as a release binary.
+[v0.1.0 GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0),
+verify it against `SHA256SUMS`, and compare the entry in
+`release-manifest-v1.json` before putting `quirl` on `PATH`. Never use an asset
+from a mutable branch URL as a release binary.
 
 ## Binary requirements
 

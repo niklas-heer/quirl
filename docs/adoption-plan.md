@@ -1,6 +1,6 @@
 # Quirl adoption plan
 
-Status: working plan for after the Unix release candidate is stable
+Status: post-v0.1.0 adoption plan; the first Unix release is public
 
 ## Objective
 
@@ -42,28 +42,31 @@ and explicitly volunteered usage reports.
 6. **Great defaults, graceful fallbacks.** The modern prompt, completion, and
    picker should feel polished without requiring color or a patched font.
 
-## Phase 0: make the candidate trustworthy
+## Phase 0: maintain the release foundation
 
-Goal: turn the current repository into an artifact that can be recommended
-without caveats hidden in conversation.
+Quirl 0.1.0 is available through Homebrew and immutable native archives. The
+goal now is to keep the supported release easy to verify while tightening
+evidence and onboarding from observed user experience.
 
-### Required work
+### Completed for v0.1.0
 
-- Complete the canonical quality gate on the final integrated source.
-- Refresh performance evidence against the exact clean candidate artifact.
-- Complete real-terminal checks on named Linux and macOS environments.
+- Publish four native Linux/macOS archives, checksums, release notes, and
+  provenance from one immutable candidate.
+- Publish and verify the Homebrew formula without coupling installation to
+  downloadable runtime assets.
+- Complete human macOS, Linux, and remote PTY/SSH terminal review.
+- Publish clear known limitations and the Unix-first support contract.
+- Bootstrap the version-scoped website asset channel while preserving
+  independent, immutable completion-database updates.
+
+### Follow-up hardening
+
+- Refresh performance evidence against the exact supported release artifact;
+  the checked-in record currently describes an older measured candidate.
+- Publish a reviewed real-terminal recording from the immutable release binary.
 - Dogfood Quirl for normal repository, Git, scripting, and process workflows.
 - Resolve every high-severity crash, hang, terminal-corruption, child-process,
-  history-loss, or configuration-loss defect before launch.
-- Publish clear known limitations and the Unix-first support contract.
-- Prepare reproducible checksums and release notes for the measured artifact.
-
-### Exit criteria
-
-- The release checklist passes.
-- The documented artifact and published artifact have the same identity.
-- A maintainer can use Quirl for a working week without returning to another
-  shell because of a Quirl defect in a supported workflow.
+  history-loss, or configuration-loss defect before the next release.
 
 ## Phase 1: make the value obvious
 
@@ -205,15 +208,15 @@ retention metrics.
 
 ## Launch sequence
 
-### Two to four weeks before launch
+### Two to four weeks before a future release
 
 - Freeze large features.
 - Run daily-driver testing and supported-terminal checks.
 - Finish packaging and the quick start.
-- Record the demo only after the release candidate is final.
+- Record the demo only after the next release candidate is final.
 - Ask a small group of external developers to test installation and messaging.
 
-### Launch week
+### Release week
 
 - Publish the release, checksums, demo, quick start, and known limitations
   together.
@@ -257,13 +260,13 @@ retention metrics.
 
 When implementation work resumes, start here:
 
-1. Finish and sign off the Unix release checklist.
-2. Produce the exact candidate artifact and refreshed performance record.
-3. Test the five-minute quick start with external developers.
-4. Record the real-terminal demo from the measured release binary.
-5. Prepare Homebrew and checksummed Linux installation paths.
-6. Publish the first three killer-workflow guides.
-7. Interview early users and select one flagship integration.
+1. Test the five-minute Homebrew and archive quick starts with external
+   developers.
+2. Refresh the performance record against the published v0.1.0 binary.
+3. Record and review the real-terminal demo from that immutable binary.
+4. Publish the first three killer-workflow guides.
+5. Interview early users and select one flagship integration.
+6. Use installation and issue feedback to prioritize the first patch release.
 
 Revisit this plan after the first 30 days of public availability. Replace
 assumptions with observed installation, retention, workflow, and contribution
