@@ -2,14 +2,30 @@
 set -eu
 
 usage() {
-  echo "usage: scripts/demo-session.sh [--nerd-font] <quirl-binary> [arguments...]" >&2
+  echo "usage: scripts/demo-session.sh [--nerd-font] [--ai-ready] <quirl-binary> [arguments...]" >&2
 }
 
 demo_symbols=auto
-if [ "${1:-}" = --nerd-font ]; then
-  demo_symbols=nerd_font
-  shift
-fi
+demo_ai_ready=false
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --nerd-font)
+      demo_symbols=nerd_font
+      shift
+      ;;
+    --ai-ready)
+      demo_ai_ready=true
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 if [ "$#" -lt 1 ]; then
   usage
   exit 2
@@ -65,6 +81,7 @@ demo_data=$demo_root/data
 demo_recovery=$demo_root/recovery
 demo_tmp=$demo_root/tmp
 demo_workspace=$demo_root/workspace
+demo_empty=$demo_root/empty
 mkdir -p \
   "$demo_home" \
   "$demo_config" \
@@ -74,7 +91,8 @@ mkdir -p \
   "$demo_data" \
   "$demo_recovery" \
   "$demo_tmp" \
-  "$demo_workspace"
+  "$demo_workspace" \
+  "$demo_empty"
 
 printf 'demo notes\n' >"$demo_workspace/notes.txt"
 printf 'service,status\napi,up\nworker,degraded\n' >"$demo_workspace/services.csv"
@@ -87,6 +105,7 @@ if [ "$demo_symbols" = nerd_font ]; then
   printf '%s\n' \
     'return quirl.config {' \
     '  prompt = { symbols = "nerd_font" },' \
+    '  completion = { auto = false, min_chars = 1 },' \
     '}' >"$demo_config/config.lua"
 fi
 
@@ -94,49 +113,72 @@ demo_path=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin
 demo_term=${TERM:-xterm-256color}
 cd "$demo_workspace"
 
-if [ -n "${NO_COLOR+x}" ]; then
-  env -i \
-    HOME="$demo_home" \
-    USER=demo \
-    LOGNAME=demo \
-    SHELL=/bin/sh \
-    PATH="$demo_path" \
-    TERM="$demo_term" \
-    LANG=C.UTF-8 \
-    TMPDIR="$demo_tmp" \
-    XDG_CONFIG_HOME="$demo_root/xdg-config" \
-    XDG_STATE_HOME="$demo_state" \
-    XDG_CACHE_HOME="$demo_cache" \
-    XDG_DATA_HOME="$demo_data" \
-    QUIRL_CONFIG_DIR="$demo_config" \
-    QUIRL_PLUGIN_HOME="$demo_plugins" \
-    QUIRL_INDEX_PATH="$demo_cache/catalog.json" \
-    QUIRL_MODEL_PATH="$demo_model" \
-    QUIRL_HISTORY="$demo_state/history" \
-    QUIRL_RECOVERY_DIR="$demo_recovery" \
-    QUIRL_SESSION_ID=release-demo \
-    NO_COLOR=1 \
-    "$demo_bin" "$@"
-else
-  env -i \
-    HOME="$demo_home" \
-    USER=demo \
-    LOGNAME=demo \
-    SHELL=/bin/sh \
-    PATH="$demo_path" \
-    TERM="$demo_term" \
-    LANG=C.UTF-8 \
-    TMPDIR="$demo_tmp" \
-    XDG_CONFIG_HOME="$demo_root/xdg-config" \
-    XDG_STATE_HOME="$demo_state" \
-    XDG_CACHE_HOME="$demo_cache" \
-    XDG_DATA_HOME="$demo_data" \
-    QUIRL_CONFIG_DIR="$demo_config" \
-    QUIRL_PLUGIN_HOME="$demo_plugins" \
-    QUIRL_INDEX_PATH="$demo_cache/catalog.json" \
-    QUIRL_MODEL_PATH="$demo_model" \
-    QUIRL_HISTORY="$demo_state/history" \
-    QUIRL_RECOVERY_DIR="$demo_recovery" \
-    QUIRL_SESSION_ID=release-demo \
-    "$demo_bin" "$@"
+run_in_demo_environment() {
+  if [ -n "${NO_COLOR+x}" ]; then
+    env -i \
+      HOME="$demo_home" \
+      USER=demo \
+      LOGNAME=demo \
+      SHELL=/bin/sh \
+      PATH="$demo_path" \
+      TERM="$demo_term" \
+      LANG=C.UTF-8 \
+      TMPDIR="$demo_tmp" \
+      XDG_CONFIG_HOME="$demo_root/xdg-config" \
+      XDG_STATE_HOME="$demo_state" \
+      XDG_CACHE_HOME="$demo_cache" \
+      XDG_DATA_HOME="$demo_data" \
+      QUIRL_CONFIG_DIR="$demo_config" \
+      QUIRL_PLUGIN_HOME="$demo_plugins" \
+      QUIRL_INDEX_PATH="$demo_cache/catalog.sqlite3" \
+      QUIRL_MODEL_PATH="$demo_model" \
+      QUIRL_HISTORY="$demo_state/history" \
+      QUIRL_RECOVERY_DIR="$demo_recovery" \
+      QUIRL_SESSION_ID=release-demo \
+      QUIRL_FISH_PATH="$demo_empty" \
+      QUIRL_BASH_PATH="$demo_empty" \
+      QUIRL_ZSH_PATH="$demo_empty" \
+      QUIRL_HELP_PATH="$demo_empty" \
+      QUIRL_MAN_PATH="$demo_empty" \
+      NO_COLOR=1 \
+      "$@"
+  else
+    env -i \
+      HOME="$demo_home" \
+      USER=demo \
+      LOGNAME=demo \
+      SHELL=/bin/sh \
+      PATH="$demo_path" \
+      TERM="$demo_term" \
+      LANG=C.UTF-8 \
+      TMPDIR="$demo_tmp" \
+      XDG_CONFIG_HOME="$demo_root/xdg-config" \
+      XDG_STATE_HOME="$demo_state" \
+      XDG_CACHE_HOME="$demo_cache" \
+      XDG_DATA_HOME="$demo_data" \
+      QUIRL_CONFIG_DIR="$demo_config" \
+      QUIRL_PLUGIN_HOME="$demo_plugins" \
+      QUIRL_INDEX_PATH="$demo_cache/catalog.sqlite3" \
+      QUIRL_MODEL_PATH="$demo_model" \
+      QUIRL_HISTORY="$demo_state/history" \
+      QUIRL_RECOVERY_DIR="$demo_recovery" \
+      QUIRL_SESSION_ID=release-demo \
+      QUIRL_FISH_PATH="$demo_empty" \
+      QUIRL_BASH_PATH="$demo_empty" \
+      QUIRL_ZSH_PATH="$demo_empty" \
+      QUIRL_HELP_PATH="$demo_empty" \
+      QUIRL_MAN_PATH="$demo_empty" \
+      "$@"
+  fi
+}
+
+if [ "$demo_ai_ready" = true ]; then
+  # The recording is private and offline, so build a deterministic builtin-only
+  # catalog rather than scanning or displaying commands from the host machine.
+  run_in_demo_environment \
+    "$demo_bin" index build --output "$demo_cache/catalog.sqlite3" --format json \
+    >/dev/null
+  run_in_demo_environment "$demo_bin" ai index --format json >/dev/null
 fi
+
+run_in_demo_environment "$demo_bin" "$@"

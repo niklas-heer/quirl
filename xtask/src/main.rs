@@ -353,8 +353,7 @@ fn task_run(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
 
 fn task_demo(root: &Path) -> Result<(), Box<dyn Error>> {
     let sh = workspace_shell(root)?;
-    cmd!(sh, "cargo build --quiet --release -p quirl-cli").run()?;
-    cmd!(sh, "scripts/demo.sh target/release/quirl").run()?;
+    cmd!(sh, "scripts/demo.sh").run()?;
     Ok(())
 }
 

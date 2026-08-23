@@ -50,13 +50,16 @@ cd quirl
 cargo run -p quirl-cli
 ```
 
-For a guided recording of the major surfaces:
+For a guided, text-only tour of the major surfaces, first install the official
+release with Homebrew. The tour deliberately uses that release rather than a
+binary compiled from the checkout:
 
 ```sh
+brew install niklas-heer/tap/quirl
 cargo xtask demo
 ```
 
-![Quirl's deterministic text tour: typed-data filtering, semantic completion, sandboxed Lua evaluation, and generated documentation](/quirl-tour.svg)
+![Quirl's narrated deterministic tour: Normal, Data, and AI modes, semantic completion, sandboxed Lua, and the shared command catalog](/quirl-tour.svg)
 
 ## Verify a checkout
 

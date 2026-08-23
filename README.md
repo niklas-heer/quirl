@@ -15,7 +15,7 @@
 
 ---
 
-![A recorded Quirl terminal session: semantic completion, a native pipeline, history replay, a typed data filter, and an explicit Bash dialect island](assets/quirl-demo.gif)
+![A narrated Quirl terminal session: visible Normal, Data, and AI modes, semantic completion, a native pipeline, history replay, typed-data filtering, safe local AI discovery, a Bash dialect island, and sandboxed Lua](assets/quirl-demo.gif)
 
 > [!IMPORTANT]
 > Quirl's **0.1 Unix line** supports interactive Linux and macOS. Treat a build
@@ -81,8 +81,9 @@ cd quirl
 cargo run -p quirl-cli
 ```
 
-Run the deterministic text tour to see typed data, semantic completion,
-sandboxed Lua, diagnostics, and generated command documentation:
+Run the deterministic text tour against the Homebrew-installed release to see
+Normal, Data, and AI modes, semantic completion, sandboxed Lua, and the shared
+command catalog:
 
 ```console
 cargo xtask demo

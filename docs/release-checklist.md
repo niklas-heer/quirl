@@ -142,7 +142,7 @@ cargo xtask sdk
 git diff --exit-code -- docs/quirl.lua
 npm ci --prefix website
 cargo xtask website-check
-cargo xtask demo
+scripts/demo.sh target/release/quirl
 cargo xtask release-preview
 ```
 

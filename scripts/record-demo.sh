@@ -33,6 +33,18 @@ if [ ! -x "$demo_bin" ]; then
   echo "Release binary is not executable: $demo_bin" >&2
   exit 1
 fi
+demo_build_info=$("$demo_bin" --build-info) || {
+  echo "Could not inspect the Quirl release build identity." >&2
+  exit 1
+}
+case $demo_build_info in
+  *'"official_release": true'*) ;;
+  *)
+    echo "Recording refused a development build: $demo_bin" >&2
+    echo "Install the official release with 'brew install niklas-heer/tap/quirl'." >&2
+    exit 1
+    ;;
+esac
 
 for demo_program in vhs ttyd ffmpeg; do
   if ! command -v "$demo_program" >/dev/null 2>&1; then
