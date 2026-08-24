@@ -32,7 +32,7 @@ export function HeroDemo() {
       loop
       muted
       playsInline
-      aria-label="Recorded Quirl terminal session: semantic completion, a native pipeline, history replay, a typed data filter, and an explicit Bash dialect island"
+      aria-label="Recorded Quirl terminal session: a native pipeline and semantic completion, typed JSON transformed with open, where, sort, and select, local AI suggestions, explicit Bash compatibility, sandboxed Lua, and measured release proof"
     >
       <source src="/quirl-demo.webm" type="video/webm" />
       <source src="/quirl-demo.mp4" type="video/mp4" />

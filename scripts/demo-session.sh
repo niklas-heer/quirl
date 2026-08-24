@@ -97,10 +97,19 @@ mkdir -p \
 printf 'demo notes\n' >"$demo_workspace/notes.txt"
 printf 'service,status\napi,up\nworker,degraded\n' >"$demo_workspace/services.csv"
 printf '%s\n' \
+  '[' \
+  '  {"service":"checkout","region":"fra","latency":18,"status":"healthy"},' \
+  '  {"service":"search","region":"iad","latency":91,"status":"degraded"},' \
+  '  {"service":"billing","region":"fra","latency":54,"status":"healthy"},' \
+  '  {"service":"identity","region":"sin","latency":73,"status":"degraded"}' \
+  ']' >"$demo_workspace/services.json"
+printf '%s\n' \
   'return {' \
   '  answer = 6 * 7,' \
   '  runtime = _VERSION,' \
   '}' >"$demo_workspace/hello.lua"
+cp "$demo_script_dir/demo-card.sh" "$demo_workspace/tour"
+chmod 700 "$demo_workspace/tour"
 if [ "$demo_symbols" = nerd_font ]; then
   printf '%s\n' \
     'return quirl.config {' \

@@ -15,7 +15,7 @@
 
 ---
 
-![A narrated Quirl terminal session: visible Normal, Data, and AI modes, semantic completion, a native pipeline, history replay, typed-data filtering, safe local AI discovery, a Bash dialect island, and sandboxed Lua](assets/quirl-demo.gif)
+![A narrated Quirl terminal session: a native pipeline and semantic completion in Normal mode; typed JSON flowing through open, where, sort, and select in Data mode; local AI suggestions; an explicit Bash island; sandboxed Lua; and measured release proof](assets/quirl-demo.gif)
 
 > [!IMPORTANT]
 > Quirl's **0.1 Unix line** supports interactive Linux and macOS. Treat a build

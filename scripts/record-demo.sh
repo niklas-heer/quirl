@@ -93,5 +93,8 @@ fi
 
 QUIRL_DEMO_BIN=$demo_bin
 export QUIRL_DEMO_BIN
+# The marketing artifact has a fixed color contract even when the invoking
+# developer normally requests monochrome command output.
+unset NO_COLOR
 cd "$repo_dir"
 vhs scripts/demo.tape
