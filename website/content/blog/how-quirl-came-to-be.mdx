@@ -22,7 +22,18 @@ Before the story, the receipts. Everything below is measured directly from the r
 
 Thirteen crates with an enforced one-way dependency graph, twenty-six written-down architecture decisions, a thousand-plus tests, a generated Lua SDK, a language server, an MCP surface, a terminal UI with a tested fail-closed fallback — in a source tree small enough to `git clone` and read in an afternoon. That ratio, ambition against footprint, is the first surprising thing about this project.
 
-The second surprising thing is how it got typed.
+## How this stacks up
+
+Numbers alone don't mean much without something to hold them against, so I cloned three real, respected projects and ran the exact same measurements against their current snapshots — [tokei](https://github.com/XAMPPRocky/tokei) for lines of Rust, a grep for `#[test]` for test count:
+
+| Project | Rust code (lines) | Tests | Scope |
+| --- | --- | --- | --- |
+| ripgrep | 41,084 | 508 (plus ~350 more via its own `rgtest!` integration-test macro) | one thing, done extremely well |
+| **Quirl** | **115,283** | **1,059** (plus 74 more in release tooling) | a shell: pipelines, typed data, a Lua runtime, LSP, MCP, a TUI |
+| fish (current Rust rewrite) | 82,042 | 280 (plus a separate suite of 217 `.fish` script-based test files) | an established, widely used interactive shell |
+| Nushell | 351,222 | 6,462 | a mature, community-maintained shell built around typed data |
+
+A few honest notes before anyone reads too much into that table. It's lines of Rust and `#[test]` attributes only — different projects test differently, and this undercounts anyone with a custom test macro (ripgrep) or a separate script-based suite (fish), the same way it would undercount Quirl if you only looked at inline `#[test]` and ignored the seeded differential runs against real Bash and Zsh. It's also not adjusted for scope: ripgrep does one job and does it about as well as software gets done; Nushell is built by a team, over years, with typed data as its entire premise. By these numbers Quirl lands in between — bigger than the smallest, most polished tool in the Rust CLI world, and a fraction of the size of the shell it's most directly answering. Given Quirl is nine days old and the other two have years and many contributors behind them, "somewhere in the middle" is the honest headline — not "biggest," and not something to be embarrassed about either.
 
 ## Over 3 billion tokens
 
@@ -36,9 +47,9 @@ Broken down by tool (the primary-checkout figures, which is the fairer per-tool 
 - **Codex / ChatGPT Desktop**: ~8,800 messages in the main checkout alone, climbing to roughly 19,000 once you count every parallel worktree session — real evidence that a meaningful chunk of this ran as multiple agents working concurrently on different branches of the same repo.
 - **Cursor** (app and agent CLI combined — Cursor's own usage export can't separate the two, or scope itself to just this repository): about 196 messages and 16.2 million input tokens, spread across a genuinely mixed roster of models — Claude Sonnet 5, Claude Fable 5, a few GPT-5.x variants, xAI's Grok, and Cursor's own Composer.
 
-If you price all of that out at standard API list rates — which is not what I actually paid, since Claude Code, Cursor, and ChatGPT are largely flat-rate subscriptions rather than metered billing — it comes out to somewhere between **$1,425 and $2,150** in token-cost-equivalent terms, depending on whether you count the parallel worktree sessions. That's real money, but it's laptop money, not team money. For less than a mid-range laptop, in pure token-accounting terms, one person produced a release with the operational discipline of something built by a small, well-run team.
+None of that actually cost me anything extra. Claude Code, Cursor, and ChatGPT are all flat-rate subscriptions I already pay for regardless of how hard I lean on them in a given month — there's no invoice from this project, no metered bill that grew with the token count. So I'm not going to pretend $X was spent, because it wasn't. What those numbers are useful for is a sense of scale for the *work*, not the money: if you priced the same volume at standard API list rates — a number nobody involved actually paid, mine included — it lands somewhere between $1,425 and $2,150 depending on how you scope the parallel worktree sessions. That's not a receipt. It's a rough unit for "how much iteration happened here," in the same spirit as counting commits or lines of code.
 
-Is it *worth* it? I think the honest answer is: the tokens aren't the value. The value is what they got checked against. A test suite that actually runs, a set of architecture rules an agent can't quietly ignore, and a habit of writing decisions down before building on top of them — that's what turned a very large number of tokens into a working shell instead of a very large pile of code nobody trusts. Token count with no guardrails is just noise at scale. Token count against `cargo xtask check` and twenty-six ADRs is compressed engineering time.
+Is it worth it, then? I think the honest answer is: the tokens themselves aren't the value — what they got checked against is. A test suite that actually runs, a set of architecture rules an agent can't quietly ignore, and a habit of writing decisions down before building on top of them: that's what turned a very large amount of iteration into a working shell instead of a very large pile of code nobody trusts. A huge token count with no guardrails is just noise at scale. A huge token count run against `cargo xtask check` and twenty-six ADRs, over and over, is compressed engineering time — and that compression, not the subscription price, is the actual value.
 
 ## The Steel detour
 
