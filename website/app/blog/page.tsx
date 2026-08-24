@@ -20,7 +20,8 @@ function CassetteReels() {
 
 export default function BlogIndexPage() {
   const posts = [...blogSource.getPages()].sort((a, b) =>
-    String(b.data.date).localeCompare(String(a.data.date)),
+    String(b.data.date).localeCompare(String(a.data.date)) ||
+    a.url.localeCompare(b.url),
   );
 
   return (
@@ -33,10 +34,10 @@ export default function BlogIndexPage() {
           </div>
           <p className="kicker">The Quirl blog</p>
           <h1 className="glitch-h1">
-            <span className="line" data-text="Notes from behind">
+            <span className="line">
               Notes from behind
             </span>
-            <span className="line" data-text="the whisk.">
+            <span className="line">
               the whisk.
             </span>
           </h1>

@@ -103,6 +103,8 @@ kbd {
 }
 
 .hero {
+  display: grid;
+  justify-items: center;
   padding-block: clamp(3rem, 7vw, 5rem) clamp(2rem, 5vw, 3rem);
   text-align: center;
 }
@@ -126,7 +128,7 @@ kbd {
   width: 0.45rem;
 }
 
-.kicker {
+.hero .kicker {
   color: var(--lp-amber);
   font-size: 0.82rem;
   font-weight: 600;
@@ -139,42 +141,27 @@ kbd {
   font-size: clamp(2rem, 6vw, 4rem);
   line-height: 1.15;
   margin-top: 1rem;
+  max-width: 64rem;
   position: relative;
-}
-
-.glitch-h1 .line { color: var(--lp-text); display: block; position: relative; }
-
-.glitch-h1 .line::before,
-.glitch-h1 .line::after {
-  content: attr(data-text);
-  left: 0;
-  opacity: 0.75;
-  position: absolute;
-  top: 0;
   width: 100%;
 }
 
-.glitch-h1 .line::before { animation: glitchA 6s infinite steps(1); color: var(--lp-cyan); mix-blend-mode: screen; transform: translate(-2px, 1px); }
-.glitch-h1 .line::after { animation: glitchB 7s infinite steps(1); color: var(--lp-magenta); mix-blend-mode: screen; transform: translate(2px, -1px); }
-
-@keyframes glitchA {
-  0%, 96%, 100% { clip-path: inset(0 0 0 0); }
-  97% { clip-path: inset(20% 0 55% 0); transform: translate(-5px, 1px); }
-  98.5% { clip-path: inset(55% 0 10% 0); }
+.glitch-h1 .line {
+  color: var(--lp-text);
+  display: block;
+  position: relative;
+  text-shadow:
+    -2px 1px 0 color-mix(in oklab, var(--lp-cyan) 58%, transparent),
+    2px -1px 0 color-mix(in oklab, var(--lp-magenta) 58%, transparent);
 }
 
-@keyframes glitchB {
-  0%, 95%, 100% { clip-path: inset(0 0 0 0); }
-  96% { clip-path: inset(50% 0 20% 0); transform: translate(5px, -1px); }
-  97.5% { clip-path: inset(10% 0 60% 0); }
-}
-
-.lede {
+.hero .lede {
   color: var(--lp-dim);
   font-size: 1rem;
   margin-inline: auto;
   margin-top: 1.7rem;
-  max-width: 36rem;
+  max-width: 52rem;
+  text-wrap: pretty;
 }
 
 .actions {
@@ -205,7 +192,7 @@ kbd {
 .button-primary { background: var(--lp-magenta); color: #1c0414; }
 .button-secondary { background: transparent; border-color: rgba(255, 255, 255, 0.25); color: var(--lp-text); }
 
-.hero-note {
+.hero .hero-note {
   color: var(--lp-dim);
   font-size: 0.78rem;
   margin-top: 1.6rem;
@@ -241,9 +228,17 @@ kbd {
 .cassette-reels { align-items: center; display: flex; gap: 0.5rem; }
 .cassette-reels span { border: 2px solid rgba(5, 1, 10, 0.5); border-radius: 50%; height: 0.6rem; width: 0.6rem; }
 
-.demo-cassette { width: min(44rem, 100%); }
+.demo-cassette { width: min(64rem, 100%); }
 .demo-cassette .cassette-label { background: var(--lp-cyan); }
-.demo-cassette .terminal-video { background: #000; display: block; filter: saturate(1.25) contrast(1.05); height: auto; width: 100%; }
+.demo-cassette .terminal-video {
+  aspect-ratio: 5 / 3;
+  background: #000;
+  display: block;
+  filter: saturate(1.25) contrast(1.05);
+  height: auto;
+  object-fit: cover;
+  width: 100%;
+}
 
 .landing-shell section { padding-block: clamp(3rem, 6vw, 5rem); }
 
@@ -341,6 +336,4 @@ kbd {
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   .button { transition: none; }
-  .glitch-h1 .line::before,
-  .glitch-h1 .line::after { animation: none; opacity: 0.35; }
 }

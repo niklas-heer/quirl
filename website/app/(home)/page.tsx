@@ -30,10 +30,10 @@ export default function HomePage() {
         </div>
         <p className="kicker">A well-stirred shell</p>
         <h1 className="glitch-h1">
-          <span className="line" data-text="Your shell, with a">
+          <span className="line">
             Your shell, with a
           </span>
-          <span className="line" data-text="richer vocabulary.">
+          <span className="line">
             richer vocabulary.
           </span>
         </h1>
@@ -69,7 +69,7 @@ export default function HomePage() {
           aria-label="Recorded Quirl session"
         >
           <div className="cassette-label">
-            <span>SIDE A — RECORDED SESSION</span>
+            <span>SIDE A — 69 SECOND PRODUCT TOUR</span>
             <CassetteReels />
           </div>
           <HeroDemo />

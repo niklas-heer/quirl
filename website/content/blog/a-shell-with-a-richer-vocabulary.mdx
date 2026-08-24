@@ -1,0 +1,132 @@
+---
+title: A Shell With a Richer Vocabulary
+description: See how Quirl moves from familiar commands to typed JSON, local AI suggestions, explicit Bash compatibility, and bounded Lua—without hiding the boundaries.
+date: 2026-08-24
+---
+
+Most shells give `|` one job: connect the bytes written by one process to the
+bytes read by another. That model is durable for a reason. It is also why so
+many useful command lines eventually turn into a negotiation between columns,
+delimiters, quoting rules, and a growing collection of text-processing tools.
+
+Quirl keeps that familiar shell intact, then adds a richer vocabulary beside
+it. Normal mode speaks in processes and bytes. Data mode speaks in typed
+values. AI mode searches local command knowledge and returns a suggestion for
+review. Lua handles general-purpose extension logic inside a deliberately
+small, resource-bounded runtime.
+
+The important part is that Quirl does not pretend these are the same thing.
+Changing modes changes the grammar visibly. Crossing into Bash, an external
+process, JSON, or Lua is explicit in the command you can read and save.
+
+<video
+  controls
+  loop
+  muted
+  playsInline
+  preload="metadata"
+  poster="/quirl-demo-poster.png"
+  width="1200"
+  height="720"
+  aria-label="Quirl product tour showing Normal, Data, and AI modes, explicit Bash compatibility, sandboxed Lua, and release measurements"
+  style={{ width: '100%', height: 'auto', borderRadius: '0.75rem', background: '#000' }}
+>
+  <source src="/quirl-demo.webm" type="video/webm" />
+  <source src="/quirl-demo.mp4" type="video/mp4" />
+  <a href="/quirl-demo.mp4">Watch the Quirl product tour.</a>
+</video>
+
+## Start where you already are
+
+Normal mode is intentionally unsurprising:
+
+```console
+printf 'api\nworker\njobs\n' | wc -l && echo 'pipeline: healthy'
+```
+
+Quoting, redirects, byte pipes, boolean lists, process status, and job control
+belong to the Rust shell. Semantic completion understands the command and the
+option being edited, but the result is still an ordinary command line you can
+inspect before running.
+
+When Quirl's native grammar is not the right tool, compatibility is a named
+boundary rather than an imitation:
+
+```bash
+bash { cat <(printf 'Bash, on purpose.\n') }
+```
+
+That island runs Bash syntax as Bash. The rest of the session does not have to
+silently guess which shell a line was written for.
+
+## Let JSON remain data
+
+Data mode starts with a visible mode change and a focused set of readable
+verbs. A JSON file becomes typed records at `open`, not decorated terminal
+text that must be parsed again:
+
+```text
+open services.json
+| where latency > 50
+| sort latency desc
+| select service region latency
+```
+
+`where` compares numbers as numbers. `sort` orders the typed field. `select`
+projects only the fields that matter. The same runtime can read JSON, CSV,
+YAML, TOML, filesystem entries, tar archives, or an explicitly adapted
+external command. Every adapter carries concrete byte, row, field, depth, and
+materialization limits.
+
+This is not a promise of a sprawling new programming language at the prompt.
+It is a bounded data pipeline for the work shells routinely make awkward.
+
+## Search by intent, run by choice
+
+AI mode is local command retrieval, not an agent silently operating the shell.
+Type an outcome such as:
+
+```text
+copy a directory while preserving permissions
+```
+
+Quirl searches the same semantic catalog used by completion, help,
+documentation, and agent exports. Selecting a result inserts it into Normal
+mode. It does not execute the suggestion. That review step is part of the
+product contract, not a temporary safety prompt.
+
+## Extend one small boundary
+
+Lua 5.4 is Quirl's single extension language for configuration, scripts,
+prompts, completion providers, and trusted plugins:
+
+```lua
+return { answer = 6 * 7, sandboxed = true }
+```
+
+Every VM runs with a memory limit, instruction budget, wall deadline, and
+cancellation. The standard library is restricted, and values are converted
+into typed Rust structures and validated before higher layers use them. Rust
+owns process execution and performance-critical paths; Lua owns extension
+logic within the capabilities the host grants.
+
+## Small enough to inspect, tested like a shell
+
+The measured 0.1 release artifact is 4.46 MiB and reached the first prompt in
+19.2 ms P95 in its recorded release environment. The current repository has
+more than 1,100 Rust tests, plus real-PTY journeys, guest-side Lua tests, and
+bounded differential cases against available Bash and Zsh references.
+
+Those numbers matter less as trophies than as constraints. A shell owns child
+processes, terminal modes, history, configuration, and user data. Fast is good;
+restoring the terminal and reaping every child on a failure path is mandatory.
+
+Quirl's pitch is therefore simple: familiar where it should be, explicit where
+it matters. Install the official release with:
+
+```console
+brew install niklas-heer/tap/quirl
+```
+
+Then run `quirl`, press <kbd>Ctrl-Space</kbd>, and give the same prompt a richer
+vocabulary.

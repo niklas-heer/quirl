@@ -25,9 +25,15 @@ only after its exact commit and artifacts pass the
   VHS take emits synchronized GIF, MP4, and WebM assets and gives typed JSON,
   its `open`/`where`/`sort`/`select` pipeline, local AI, explicit compatibility
   boundaries, and measured release evidence their own visual beats.
+- A feature-tour blog post explains how Normal, Data, and AI modes, explicit
+  Bash compatibility, and the bounded Lua SDK fit together.
 
 ### Fixed
 
+- The homepage demo now exposes playback controls when autoplay or reduced
+  motion leaves it paused, reserves its aspect ratio, and shares a stable
+  content rail with centered hero copy. The decorative headline treatment no
+  longer moves text. README playback now has an explicit raw GIF plus MP4 link.
 - `scripts/demo.tape`'s startup wait condition, which previously matched only
   an official `v0.1.0` release build and timed out against development
   builds; it now matches either build identity. The closing beat now ends on

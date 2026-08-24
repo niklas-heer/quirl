@@ -15,7 +15,15 @@
 
 ---
 
-![A narrated Quirl terminal session: a native pipeline and semantic completion in Normal mode; typed JSON flowing through open, where, sort, and select in Data mode; local AI suggestions; an explicit Bash island; sandboxed Lua; and measured release proof](assets/quirl-demo.gif)
+<div align="center">
+  <a href="https://quirl.vercel.app/">
+    <img src="assets/quirl-demo.gif?raw=1" width="1200" alt="A narrated Quirl terminal session: a native pipeline and semantic completion in Normal mode; typed JSON flowing through open, where, sort, and select in Data mode; local AI suggestions; an explicit Bash island; sandboxed Lua; and measured release proof">
+  </a>
+  <br>
+  <a href="https://quirl.vercel.app/quirl-demo.mp4">Watch the MP4</a>
+  ·
+  <a href="https://quirl.vercel.app/blog/a-shell-with-a-richer-vocabulary">Read the feature tour</a>
+</div>
 
 > [!IMPORTANT]
 > Quirl's **0.1 Unix line** supports interactive Linux and macOS. Treat a build
