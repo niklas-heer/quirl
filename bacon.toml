@@ -1,0 +1,21 @@
+# `bacon` is the short feedback loop; `cargo xtask check` remains the complete
+# pre-commit gate because it also covers Rustdoc, generated artifacts, PTYs, and
+# guest-side Lua tests.
+default_job = "clippy-all"
+
+[jobs.check-all]
+command = ["cargo", "check", "--workspace", "--all-targets"]
+need_stdout = false
+
+[jobs.clippy-all]
+command = ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+need_stdout = false
+
+[jobs.nextest]
+command = ["cargo", "nextest", "run", "--workspace"]
+analyzer = "nextest"
+need_stdout = true
+
+[jobs.canonical]
+command = ["cargo", "xtask", "check"]
+need_stdout = true

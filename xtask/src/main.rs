@@ -1,6 +1,10 @@
 //! Reproducible development, documentation, test, and release tasks for Quirl.
 
 use clap::{Parser, Subcommand};
+use color_eyre::{
+    config::{HookBuilder, Theme},
+    eyre::{Result as EyreResult, WrapErr, eyre},
+};
 mod assets;
 mod catalog;
 mod homebrew;
@@ -13,14 +17,15 @@ mod simulation;
 
 use std::{
     env,
-    error::Error,
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
 };
 use xshell::{Shell, cmd};
+
+type TaskError = Box<dyn std::error::Error + Send + Sync>;
 
 const DEFAULT_TEST_CASES: usize = 128;
 const DEFAULT_TEST_SEED: u64 = 7_640_891_576_956_012_809;
@@ -134,14 +139,18 @@ enum Task {
     },
 }
 
-fn main() {
-    if let Err(error) = execute(Cli::parse()) {
-        eprintln!("xtask: {error}");
-        std::process::exit(1);
+fn main() -> EyreResult<()> {
+    let mut reporter = HookBuilder::new();
+    if !io::stderr().is_terminal() || env::var_os("NO_COLOR").is_some() {
+        reporter = reporter.theme(Theme::new());
     }
+    reporter.install()?;
+    execute(Cli::parse())
+        .map_err(|error| eyre!(error))
+        .wrap_err("xtask failed")
 }
 
-fn execute(cli: Cli) -> Result<(), Box<dyn Error>> {
+fn execute(cli: Cli) -> Result<(), TaskError> {
     let root = workspace_root()?;
     match cli.task {
         Task::Release { command } => release::run(&root, command),
@@ -179,7 +188,7 @@ fn execute(cli: Cli) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn workspace_root() -> Result<PathBuf, Box<dyn Error>> {
+fn workspace_root() -> Result<PathBuf, TaskError> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
         .parent()
@@ -187,19 +196,19 @@ fn workspace_root() -> Result<PathBuf, Box<dyn Error>> {
         .ok_or_else(|| io::Error::other("xtask manifest has no workspace parent").into())
 }
 
-fn task_fmt(root: &Path) -> Result<(), Box<dyn Error>> {
+fn task_fmt(root: &Path) -> Result<(), TaskError> {
     let sh = workspace_shell(root)?;
     cmd!(sh, "cargo fmt --all").run()?;
     Ok(())
 }
 
-fn task_lint(root: &Path) -> Result<(), Box<dyn Error>> {
+fn task_lint(root: &Path) -> Result<(), TaskError> {
     let sh = workspace_shell(root)?;
     cmd!(sh, "cargo clippy --workspace --all-targets -- -D warnings").run()?;
     Ok(())
 }
 
-fn task_test(root: &Path, seed: u64, cases: usize) -> Result<(), Box<dyn Error>> {
+fn task_test(root: &Path, seed: u64, cases: usize) -> Result<(), TaskError> {
     let sh = workspace_shell(root)?;
     let seed = seed.to_string();
     let cases = cases.to_string();
@@ -222,7 +231,7 @@ fn task_test(root: &Path, seed: u64, cases: usize) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-fn task_check(root: &Path, seed: u64, cases: usize) -> Result<(), Box<dyn Error>> {
+fn task_check(root: &Path, seed: u64, cases: usize) -> Result<(), TaskError> {
     let sh = workspace_shell(root)?;
     cmd!(sh, "cargo fmt --all -- --check").run()?;
     cmd!(sh, "cargo run --quiet -p quirl-cli -- fmt examples --check").run()?;
@@ -232,7 +241,7 @@ fn task_check(root: &Path, seed: u64, cases: usize) -> Result<(), Box<dyn Error>
     task_test(root, seed, cases)
 }
 
-fn task_docs(root: &Path) -> Result<(), Box<dyn Error>> {
+fn task_docs(root: &Path) -> Result<(), TaskError> {
     let sh = workspace_shell(root)?;
     cmd!(sh, "cargo doc --workspace --no-deps")
         .env("RUSTDOCFLAGS", "-D warnings")
@@ -240,7 +249,7 @@ fn task_docs(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn task_website_check(root: &Path) -> Result<(), Box<dyn Error>> {
+fn task_website_check(root: &Path) -> Result<(), TaskError> {
     let sh = workspace_shell(root)?;
     cmd!(sh, "{WEBSITE_CHECK_PROGRAM} --prefix website run check").run()?;
     Ok(())
@@ -253,7 +262,7 @@ fn task_simulate(
     steps: usize,
     session: Option<usize>,
     output: &Path,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     if session.is_some_and(|index| index >= sessions) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -310,7 +319,7 @@ fn debug_quirl_binary(root: &Path) -> PathBuf {
         .join(format!("quirl{}", env::consts::EXE_SUFFIX))
 }
 
-fn task_sdk(root: &Path) -> Result<(), Box<dyn Error>> {
+fn task_sdk(root: &Path) -> Result<(), TaskError> {
     let output = Command::new("cargo")
         .current_dir(root)
         .args([
@@ -345,19 +354,19 @@ fn task_sdk(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn task_run(root: &Path, arguments: &[OsString]) -> Result<(), Box<dyn Error>> {
+fn task_run(root: &Path, arguments: &[OsString]) -> Result<(), TaskError> {
     let sh = workspace_shell(root)?;
     cmd!(sh, "cargo run -p quirl-cli -- {arguments...}").run()?;
     Ok(())
 }
 
-fn task_demo(root: &Path) -> Result<(), Box<dyn Error>> {
+fn task_demo(root: &Path) -> Result<(), TaskError> {
     let sh = workspace_shell(root)?;
     cmd!(sh, "scripts/demo.sh").run()?;
     Ok(())
 }
 
-fn task_demo_record(root: &Path, expected_sha256: &str) -> Result<(), Box<dyn Error>> {
+fn task_demo_record(root: &Path, expected_sha256: &str) -> Result<(), TaskError> {
     validate_sha256(expected_sha256)?;
     let sh = workspace_shell(root)?;
     cmd!(
@@ -368,7 +377,7 @@ fn task_demo_record(root: &Path, expected_sha256: &str) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-fn task_release_preview(root: &Path) -> Result<(), Box<dyn Error>> {
+fn task_release_preview(root: &Path) -> Result<(), TaskError> {
     let sh = workspace_shell(root)?;
     cmd!(sh, "cargo build --release -p quirl-cli -p quirl-bench").run()?;
     cmd!(
@@ -379,7 +388,7 @@ fn task_release_preview(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn task_release_gate(root: &Path, expected_sha256: &str) -> Result<(), Box<dyn Error>> {
+fn task_release_gate(root: &Path, expected_sha256: &str) -> Result<(), TaskError> {
     validate_sha256(expected_sha256)?;
     for artifact in ["target/release/quirl", "target/release/quirl-bench"] {
         if !root.join(artifact).is_file() {
@@ -402,7 +411,7 @@ fn task_release_gate(root: &Path, expected_sha256: &str) -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn validate_sha256(value: &str) -> Result<(), Box<dyn Error>> {
+fn validate_sha256(value: &str) -> Result<(), TaskError> {
     if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Ok(());
     }
@@ -435,13 +444,13 @@ fn parse_simulation_steps(value: &str) -> Result<usize, String> {
     }
 }
 
-fn workspace_shell(root: &Path) -> Result<Shell, Box<dyn Error>> {
+fn workspace_shell(root: &Path) -> Result<Shell, TaskError> {
     let sh = Shell::new()?;
     sh.change_dir(root);
     Ok(sh)
 }
 
-fn ensure_success(label: &str, status: ExitStatus) -> Result<(), Box<dyn Error>> {
+fn ensure_success(label: &str, status: ExitStatus) -> Result<(), TaskError> {
     if status.success() {
         return Ok(());
     }

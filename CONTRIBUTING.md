@@ -54,9 +54,10 @@ Generated shell cases use a stable seed; replay or expand them with
 `cargo xtask test --seed <seed> --cases <count>`. Stateful compatibility swarms
 run with `cargo xtask simulate --seed <seed> --sessions <count>`, producing an
 inspectable JSONL trace. The complete layered strategy is in
-[`docs/testing-strategy.md`](docs/testing-strategy.md). Only that bounded swarm
-runs daily in CI while traffic is low, so include the local `cargo xtask check`
-result in your pull request.
+[`docs/testing-strategy.md`](docs/testing-strategy.md). Pull requests and pushes
+to `main` run the canonical gate in CI with bounded test parallelism; the larger
+replayable Bash/Zsh simulation swarm runs separately each day. Include the local
+`cargo xtask check` result in your pull request so failures are caught before CI.
 
 Prefer package-targeted commands during iteration so research-only workspace
 members such as `quirl-bench` are not rebuilt unnecessarily:
@@ -72,6 +73,28 @@ explicit `-p` selection or `--workspace` when another scope is intended.
 The default development profile keeps line numbers for workspace backtraces
 while omitting dependency debug data. Use `cargo build --profile debugging`
 when a full-debug build is needed.
+
+For a faster edit-test loop, install the optional developer tools and use the
+checked-in project configuration:
+
+```sh
+cargo install --locked cargo-nextest --version 0.9.143
+cargo install --locked bacon --version 3.25.0
+cargo nextest run --workspace
+bacon                 # Clippy on each relevant change
+bacon nextest         # Isolated tests with slow-test reporting
+```
+
+Nextest reports any test taking longer than two seconds as slow without killing
+it, so timing regressions are visible while each test's own resource and cleanup
+limits remain authoritative. Bacon also provides `check-all` and `canonical`
+jobs. The latter runs the full `cargo xtask check` gate; neither tool replaces
+that required pre-commit check.
+
+The developer-only `xtask` binary uses `color-eyre` for readable error chains,
+source locations, and panic reports. Set `RUST_BACKTRACE=1` when a task failure
+needs a backtrace. Product crates continue to return the stable, serializable
+`quirl_core::ShellError` contract.
 
 Useful focused tasks are typed Rust subcommands in [`xtask`](xtask/src/main.rs):
 

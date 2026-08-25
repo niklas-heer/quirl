@@ -27,6 +27,9 @@ rust-version = "1.97.1"
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
+# Rich reports are limited to the developer-only xtask binary. Product errors
+# continue to use the serialized quirl_core::ShellError contract.
+color-eyre = { version = "=0.6.5", default-features = false, features = ["track-caller"] }
 crossterm = "0.29"
 getrandom = "0.3"
 indexmap = { version = "2.14", features = ["serde"] }

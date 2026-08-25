@@ -8,7 +8,6 @@ use clap::{Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    error::Error,
     ffi::OsStr,
     fs,
     io::{self, Write},
@@ -17,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+use crate::TaskError;
 use crate::release::{
     CandidateIdentity, absolute, clean_candidate_identity, current_candidate_identity,
     immutable_write, input_error, json_bytes, read_bounded, read_json_bounded, release_url,
@@ -99,7 +99,7 @@ pub(crate) enum IdentitySource {
 }
 
 impl IdentitySource {
-    fn resolve(self, root: &Path) -> Result<CandidateIdentity, Box<dyn Error>> {
+    fn resolve(self, root: &Path) -> Result<CandidateIdentity, TaskError> {
         match self {
             Self::Next => clean_candidate_identity(root),
             Self::Current => current_candidate_identity(root),
@@ -187,7 +187,7 @@ struct AssetManifestResult {
     asset_count: usize,
 }
 
-pub(crate) fn run(root: &Path, command: AssetsCommand) -> Result<(), Box<dyn Error>> {
+pub(crate) fn run(root: &Path, command: AssetsCommand) -> Result<(), TaskError> {
     match command {
         AssetsCommand::Build {
             kind,
@@ -215,15 +215,15 @@ pub(crate) fn run(root: &Path, command: AssetsCommand) -> Result<(), Box<dyn Err
 }
 
 impl AssetManifest {
-    pub(crate) fn validate_for_release(&self, version: &str) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn validate_for_release(&self, version: &str) -> Result<(), TaskError> {
         self.validate(version, true)
     }
 
-    pub(crate) fn validate_for_channel(&self, version: &str) -> Result<(), Box<dyn Error>> {
+    pub(crate) fn validate_for_channel(&self, version: &str) -> Result<(), TaskError> {
         self.validate(version, false)
     }
 
-    fn validate(&self, version: &str, require_release_url: bool) -> Result<(), Box<dyn Error>> {
+    fn validate(&self, version: &str, require_release_url: bool) -> Result<(), TaskError> {
         if self.schema_version != CONTRACT_VERSION || self.quirl_version != version {
             return Err(input_error(
                 "asset manifest does not target the requested Quirl version",
@@ -258,7 +258,7 @@ fn build(
     kind: AssetKind,
     output: &Path,
     identity: IdentitySource,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let identity = identity.resolve(root)?;
     let version = identity.version;
     let output = absolute(root, output);
@@ -380,7 +380,7 @@ fn manifest(
     output: &Path,
     previous_manifest: Option<&Path>,
     identity: IdentitySource,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let identity = identity.resolve(root)?;
     manifest_with_identity(root, input, output, previous_manifest, identity)
 }
@@ -391,7 +391,7 @@ fn manifest_with_identity(
     output: &Path,
     previous_manifest: Option<&Path>,
     identity: CandidateIdentity,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let version = identity.version;
     let input = absolute(root, input);
     let output = absolute(root, output);
@@ -487,7 +487,7 @@ fn manifest_with_identity(
     })
 }
 
-fn verify_retained_record(manifest_path: &Path, asset: &AssetRecord) -> Result<(), Box<dyn Error>> {
+fn verify_retained_record(manifest_path: &Path, asset: &AssetRecord) -> Result<(), TaskError> {
     let directory = manifest_path
         .parent()
         .ok_or_else(|| input_error("previous asset manifest has no parent directory"))?;
@@ -525,7 +525,7 @@ fn verify_sibling_bytes(
     expected_sha256: &str,
     bytes_max: usize,
     label: &str,
-) -> Result<Vec<u8>, Box<dyn Error>> {
+) -> Result<Vec<u8>, TaskError> {
     validate_relative_file_name(file)?;
     let path = directory.join(file);
     let metadata = fs::symlink_metadata(&path).map_err(|error| {
@@ -550,7 +550,7 @@ fn verify_sibling_bytes(
     Ok(bytes)
 }
 
-fn rebase_manifest(input: &Path, base_url: &str, output: &Path) -> Result<(), Box<dyn Error>> {
+fn rebase_manifest(input: &Path, base_url: &str, output: &Path) -> Result<(), TaskError> {
     // `file://` is accepted too, purely for local end-to-end testing: the
     // runtime side (`crates/quirl-cli/src/assets.rs`) only trusts `file://`
     // asset payloads when the manifest itself was loaded from a local file
@@ -589,7 +589,7 @@ fn validate_record(
     record: &AssetRecord,
     version: &str,
     require_release_url: bool,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     validate_relative_file_name(&record.file)?;
     if !matches!(
         record.logical_name.as_str(),
@@ -635,7 +635,7 @@ fn validate_notices(
     record: &AssetRecord,
     version: &str,
     require_release_url: bool,
-) -> Result<bool, Box<dyn Error>> {
+) -> Result<bool, TaskError> {
     if record.notices.len() > NOTICES_MAX {
         return Ok(false);
     }
@@ -667,7 +667,7 @@ fn content_addressed_file(
     logical_name: &str,
     quirl_version: &str,
     sha256: &str,
-) -> Result<String, Box<dyn Error>> {
+) -> Result<String, TaskError> {
     let (stem, extension) = match logical_name {
         "completion-database" => ("quirl-completion-database", "sqlite3"),
         "command-model" => ("quirl-command-model", "tar"),
@@ -687,7 +687,7 @@ fn content_addressed_file(
     clippy::arithmetic_side_effects,
     reason = "visited file counts are bounded by the release asset limit"
 )]
-fn collect_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+fn collect_files(root: &Path) -> Result<Vec<PathBuf>, TaskError> {
     if !fs::symlink_metadata(root)?.file_type().is_dir() {
         return Err(input_error("asset manifest input must be a directory"));
     }
@@ -732,7 +732,7 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     clippy::indexing_slicing,
     reason = "the candidate count is validated as exactly one before access"
 )]
-fn unique_file_named<'a>(files: &'a [PathBuf], name: &str) -> Result<&'a Path, Box<dyn Error>> {
+fn unique_file_named<'a>(files: &'a [PathBuf], name: &str) -> Result<&'a Path, TaskError> {
     let matching = files
         .iter()
         .filter(|path| path.file_name() == Some(OsStr::new(name)))
@@ -745,7 +745,7 @@ fn unique_file_named<'a>(files: &'a [PathBuf], name: &str) -> Result<&'a Path, B
     Ok(matching[0])
 }
 
-fn print_json(value: &impl Serialize) -> Result<(), Box<dyn Error>> {
+fn print_json(value: &impl Serialize) -> Result<(), TaskError> {
     io::stdout().write_all(&json_bytes(value)?)?;
     Ok(())
 }

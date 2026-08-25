@@ -7,7 +7,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    error::Error,
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -15,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use crate::TaskError;
 use crate::release::{
     ReleaseArtifact, ReleaseManifest, absolute, atomic_write, input_error, json_bytes,
     local_tag_target, read_bounded, read_json_bounded, release_url, run_status_bounded, sha256_hex,
@@ -78,7 +78,7 @@ struct CheckResult {
     offline_package_test_run: bool,
 }
 
-pub(crate) fn run(root: &Path, command: HomebrewCommand) -> Result<(), Box<dyn Error>> {
+pub(crate) fn run(root: &Path, command: HomebrewCommand) -> Result<(), TaskError> {
     match command {
         HomebrewCommand::Render {
             release_manifest,
@@ -105,7 +105,7 @@ fn render(
     expected_tag: &str,
     tap_root: &Path,
     write: bool,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let manifest: ReleaseManifest = read_json_bounded(&absolute(root, release_manifest))?;
     validate_manifest(root, &manifest)?;
     if expected_tag != manifest.tag {
@@ -134,7 +134,7 @@ fn check(
     tap_root: &Path,
     release_manifest: Option<&Path>,
     package_root: Option<&Path>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let tap_root = absolute(root, tap_root);
     let formula_path = tap_root.join("Formula/quirl.rb");
     let formula = String::from_utf8(read_bounded(&formula_path, FORMULA_BYTES_MAX)?)?;
@@ -179,7 +179,7 @@ fn check(
     })
 }
 
-fn validate_manifest(root: &Path, manifest: &ReleaseManifest) -> Result<(), Box<dyn Error>> {
+fn validate_manifest(root: &Path, manifest: &ReleaseManifest) -> Result<(), TaskError> {
     validate_release_version(&manifest.version)?;
     let tag_target = local_tag_target(root, &manifest.tag)?;
     if !release_identity_matches(manifest, &tag_target)
@@ -246,7 +246,7 @@ fn release_identity_matches(manifest: &ReleaseManifest, tag_target: &str) -> boo
 fn validate_artifact_for_manifest(
     version: &str,
     artifact: &ReleaseArtifact,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let expected_file = format!("quirl-v{version}-{}.tar", artifact.target);
     if artifact.logical_name != "quirl"
         || artifact.file != expected_file
@@ -267,7 +267,7 @@ fn validate_artifact_for_manifest(
     Ok(())
 }
 
-fn validate_release_version(version: &str) -> Result<(), Box<dyn Error>> {
+fn validate_release_version(version: &str) -> Result<(), TaskError> {
     if version.is_empty() || version.len() > 64 || version.contains(['-', '+']) {
         return Err(input_error(
             "Homebrew release version must be stable SemVer",
@@ -292,7 +292,7 @@ fn offline_package_test(
     root: &Path,
     release_manifest: &Path,
     package_root: &Path,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let manifest: ReleaseManifest = read_json_bounded(&absolute(root, release_manifest))?;
     validate_manifest(root, &manifest)?;
     let target = host_release_target()?;
@@ -329,7 +329,7 @@ fn offline_package_test(
     verify_binary_version(&temporary.path, &manifest.version)
 }
 
-fn host_release_target() -> Result<&'static str, Box<dyn Error>> {
+fn host_release_target() -> Result<&'static str, TaskError> {
     match (env::consts::ARCH, env::consts::OS) {
         ("aarch64", "macos") => Ok("aarch64-apple-darwin"),
         ("x86_64", "macos") => Ok("x86_64-apple-darwin"),
@@ -352,7 +352,7 @@ struct NativePackage {
     clippy::indexing_slicing,
     reason = "archive header slices are preceded by complete fixed-header length validation"
 )]
-fn extract_native_package(archive: &[u8]) -> Result<NativePackage, Box<dyn Error>> {
+fn extract_native_package(archive: &[u8]) -> Result<NativePackage, TaskError> {
     if archive.len() < 1_536 || !archive.len().is_multiple_of(512) {
         return Err(input_error(
             "native package is not a complete ustar archive",
@@ -423,7 +423,7 @@ struct PackageTarEntry<'a> {
 fn parse_package_tar_entry(
     archive: &[u8],
     offset: usize,
-) -> Result<PackageTarEntry<'_>, Box<dyn Error>> {
+) -> Result<PackageTarEntry<'_>, TaskError> {
     let header_end = offset
         .checked_add(512)
         .ok_or_else(|| input_error("native package header offset overflowed"))?;
@@ -471,7 +471,7 @@ fn parse_package_tar_entry(
     })
 }
 
-fn parse_tar_octal(field: &[u8], label: &str) -> Result<usize, Box<dyn Error>> {
+fn parse_tar_octal(field: &[u8], label: &str) -> Result<usize, TaskError> {
     let value = std::str::from_utf8(field)?
         .trim_matches(char::from(0))
         .trim();
@@ -489,7 +489,7 @@ impl Drop for TemporaryBinary {
     }
 }
 
-fn install_temporary_binary(bytes: &[u8]) -> Result<TemporaryBinary, Box<dyn Error>> {
+fn install_temporary_binary(bytes: &[u8]) -> Result<TemporaryBinary, TaskError> {
     let path = env::temp_dir().join(format!(
         "quirl-homebrew-offline-test-{}",
         std::process::id()
@@ -512,7 +512,7 @@ fn install_temporary_binary(bytes: &[u8]) -> Result<TemporaryBinary, Box<dyn Err
     Ok(TemporaryBinary { path })
 }
 
-fn render_formula(manifest: &ReleaseManifest) -> Result<String, Box<dyn Error>> {
+fn render_formula(manifest: &ReleaseManifest) -> Result<String, TaskError> {
     let artifacts = manifest
         .artifacts
         .iter()
@@ -576,14 +576,14 @@ fn render_platform(
 fn artifact<'a>(
     artifacts: &'a BTreeMap<&str, &ReleaseArtifact>,
     target: &str,
-) -> Result<&'a ReleaseArtifact, Box<dyn Error>> {
+) -> Result<&'a ReleaseArtifact, TaskError> {
     artifacts
         .get(target)
         .copied()
         .ok_or_else(|| input_error(format!("release manifest is missing {target}")))
 }
 
-fn validate_formula_shape(formula: &str) -> Result<(), Box<dyn Error>> {
+fn validate_formula_shape(formula: &str) -> Result<(), TaskError> {
     let required = [
         "class Quirl < Formula",
         "  on_macos do",
@@ -606,7 +606,7 @@ fn validate_formula_shape(formula: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn executable_on_path(name: &str) -> Result<bool, Box<dyn Error>> {
+fn executable_on_path(name: &str) -> Result<bool, TaskError> {
     let Some(path) = env::var_os("PATH") else {
         return Ok(false);
     };
@@ -620,7 +620,7 @@ fn executable_on_path(name: &str) -> Result<bool, Box<dyn Error>> {
     Ok(false)
 }
 
-fn print_json(value: &impl Serialize) -> Result<(), Box<dyn Error>> {
+fn print_json(value: &impl Serialize) -> Result<(), TaskError> {
     io::stdout().write_all(&json_bytes(value)?)?;
     Ok(())
 }

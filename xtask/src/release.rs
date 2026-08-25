@@ -11,7 +11,6 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    error::Error,
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -22,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::assets::AssetManifest;
+use crate::{TaskError, assets::AssetManifest};
 #[cfg(unix)]
 use nix::{
     sys::signal::{Signal, killpg},
@@ -317,7 +316,7 @@ struct AggregateResult {
     upload_file_count: usize,
 }
 
-pub(crate) fn run(root: &Path, command: ReleaseCommand) -> Result<(), Box<dyn Error>> {
+pub(crate) fn run(root: &Path, command: ReleaseCommand) -> Result<(), TaskError> {
     match command {
         ReleaseCommand::Plan => print_json(&plan(root)?),
         ReleaseCommand::Prepare { write } => prepare(root, write),
@@ -340,7 +339,7 @@ pub(crate) fn run(root: &Path, command: ReleaseCommand) -> Result<(), Box<dyn Er
     }
 }
 
-fn plan(root: &Path) -> Result<ReleasePlan, Box<dyn Error>> {
+fn plan(root: &Path) -> Result<ReleasePlan, TaskError> {
     let workspace_version = workspace_version(root)?;
     let candidate_commit = git(root, &["rev-parse", "HEAD"], true)?;
     validate_commit(&candidate_commit)?;
@@ -443,7 +442,7 @@ fn plan(root: &Path) -> Result<ReleasePlan, Box<dyn Error>> {
     })
 }
 
-fn prepare(root: &Path, write: bool) -> Result<(), Box<dyn Error>> {
+fn prepare(root: &Path, write: bool) -> Result<(), TaskError> {
     let plan = plan(root)?;
     if plan.bump == Bump::None && plan.workspace_version == plan.next_version {
         return Err(input_error(
@@ -494,7 +493,7 @@ fn verify(
     expected_tag: Option<&str>,
     require_remote_tag_absent: bool,
     required_remote_branch: Option<&str>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let plan = plan(root)?;
     if !plan.candidate_clean {
         return Err(input_error("release candidate worktree is not clean"));
@@ -546,7 +545,7 @@ fn verify_remote_branch_candidate(
     root: &Path,
     branch: &str,
     candidate_commit: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     validate_remote_branch(branch)?;
     let reference = format!("refs/heads/{branch}");
     let arguments = [
@@ -572,7 +571,7 @@ fn parse_remote_branch(
     branch: &str,
     expected_reference: &str,
     candidate_commit: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let line = std::str::from_utf8(output)?;
     let (commit, found_reference) = line
         .trim()
@@ -587,7 +586,7 @@ fn parse_remote_branch(
     Ok(())
 }
 
-fn validate_remote_branch(branch: &str) -> Result<(), Box<dyn Error>> {
+fn validate_remote_branch(branch: &str) -> Result<(), TaskError> {
     if branch.is_empty()
         || branch.len() > 255
         || branch.starts_with('/')
@@ -610,7 +609,7 @@ enum RemoteTagState {
     ExactCandidate,
 }
 
-fn tag(root: &Path, expected_tag: &str, write: bool) -> Result<(), Box<dyn Error>> {
+fn tag(root: &Path, expected_tag: &str, write: bool) -> Result<(), TaskError> {
     let plan = plan(root)?;
     validate_release_candidate(root, &plan, expected_tag)?;
     let initial_state = remote_tag_state(root, expected_tag, &plan.candidate_commit)?;
@@ -641,7 +640,7 @@ fn validate_release_candidate(
     root: &Path,
     plan: &ReleasePlan,
     expected_tag: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     if !plan.candidate_clean {
         return Err(input_error("release candidate worktree is not clean"));
     }
@@ -677,7 +676,7 @@ fn remote_tag_state(
     root: &Path,
     tag: &str,
     candidate_commit: &str,
-) -> Result<RemoteTagState, Box<dyn Error>> {
+) -> Result<RemoteTagState, TaskError> {
     let reference = format!("refs/tags/{tag}");
     let arguments = [
         OsStr::new("ls-remote"),
@@ -709,7 +708,7 @@ fn parse_remote_tag(
     tag: &str,
     expected_reference: &str,
     candidate_commit: &str,
-) -> Result<RemoteTagState, Box<dyn Error>> {
+) -> Result<RemoteTagState, TaskError> {
     let line = std::str::from_utf8(output)?;
     let (commit, found_reference) = line
         .trim()
@@ -724,7 +723,7 @@ fn parse_remote_tag(
     }
 }
 
-fn ensure_local_tag(root: &Path, tag: &str, candidate_commit: &str) -> Result<(), Box<dyn Error>> {
+fn ensure_local_tag(root: &Path, tag: &str, candidate_commit: &str) -> Result<(), TaskError> {
     let reference = format!("refs/tags/{tag}");
     let existing = git(root, &["rev-parse", "--verify", &reference], false)?;
     if !existing.is_empty() {
@@ -751,7 +750,7 @@ fn ensure_local_tag(root: &Path, tag: &str, candidate_commit: &str) -> Result<()
     ensure_output_success("lightweight release tag creation", &output)
 }
 
-fn push_release_tag(root: &Path, tag: &str) -> Result<(), Box<dyn Error>> {
+fn push_release_tag(root: &Path, tag: &str) -> Result<(), TaskError> {
     let reference = format!("refs/tags/{tag}");
     let refspec = format!("{reference}:{reference}");
     let arguments = [
@@ -770,7 +769,7 @@ fn push_release_tag(root: &Path, tag: &str) -> Result<(), Box<dyn Error>> {
     ensure_output_success("immutable release tag push", &output)
 }
 
-fn verify_remote_tag_absent(root: &Path, tag: &str) -> Result<(), Box<dyn Error>> {
+fn verify_remote_tag_absent(root: &Path, tag: &str) -> Result<(), TaskError> {
     let candidate = git(root, &["rev-parse", "HEAD"], true)?;
     match remote_tag_state(root, tag, &candidate)? {
         RemoteTagState::Absent => Ok(()),
@@ -787,7 +786,7 @@ fn verify_remote_tag_absent(root: &Path, tag: &str) -> Result<(), Box<dyn Error>
 fn release_dependencies_for_target(
     root: &Path,
     target: &str,
-) -> Result<Vec<ReleaseDependency>, Box<dyn Error>> {
+) -> Result<Vec<ReleaseDependency>, TaskError> {
     let metadata_arguments = [
         OsStr::new("metadata"),
         OsStr::new("--format-version"),
@@ -899,7 +898,7 @@ fn release_dependencies_for_target(
     Ok(dependencies)
 }
 
-fn parse_cargo_tree_package(line: &str) -> Result<(String, String), Box<dyn Error>> {
+fn parse_cargo_tree_package(line: &str) -> Result<(String, String), TaskError> {
     let line = line.trim();
     let (name, remainder) = line
         .split_once(" v")
@@ -916,7 +915,7 @@ fn parse_cargo_tree_package(line: &str) -> Result<(String, String), Box<dyn Erro
     Ok((name.to_owned(), version.to_owned()))
 }
 
-fn declared_package_license(package: &CargoPackage) -> Result<String, Box<dyn Error>> {
+fn declared_package_license(package: &CargoPackage) -> Result<String, TaskError> {
     if let Some(license) = package.license.as_deref().map(str::trim)
         && !license.is_empty()
     {
@@ -937,7 +936,7 @@ fn validate_dependency_inventory(
     root: &Path,
     platform: &str,
     dependencies: &[ReleaseDependency],
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let inventory = parse_dependency_inventory(&read_utf8_bounded(
         &root.join(THIRD_PARTY_INVENTORY_PATH),
         JSON_BYTES_MAX,
@@ -966,7 +965,7 @@ fn validate_dependency_inventory(
     clippy::arithmetic_side_effects,
     reason = "inventory records validate field counts and the total input is resource-bounded"
 )]
-fn parse_dependency_inventory(source: &str) -> Result<Vec<InventoryRecord>, Box<dyn Error>> {
+fn parse_dependency_inventory(source: &str) -> Result<Vec<InventoryRecord>, TaskError> {
     let mut records = Vec::new();
     let mut previous = None::<DependencyContract>;
     for (index, line) in source.lines().enumerate() {
@@ -1026,7 +1025,7 @@ fn render_third_party_license_report(
     root: &Path,
     target: &str,
     dependencies: &[ReleaseDependency],
-) -> Result<Vec<u8>, Box<dyn Error>> {
+) -> Result<Vec<u8>, TaskError> {
     let mut documents = BTreeMap::<String, LicenseDocument>::new();
     let mut dependency_documents = Vec::new();
     let mut unique_document_bytes = 0_usize;
@@ -1135,7 +1134,7 @@ fn render_third_party_license_report(
 )]
 fn collect_dependency_license_files(
     package_root: &Path,
-) -> Result<Vec<PackageLicenseFile>, Box<dyn Error>> {
+) -> Result<Vec<PackageLicenseFile>, TaskError> {
     let root_metadata = fs::symlink_metadata(package_root)?;
     if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
         return Err(input_error(format!(
@@ -1204,7 +1203,7 @@ fn is_license_file_name(name: &OsStr) -> bool {
 fn read_license_fallback(
     root: &Path,
     contract: &DependencyContract,
-) -> Result<PackageLicenseFile, Box<dyn Error>> {
+) -> Result<PackageLicenseFile, TaskError> {
     let file_name = match (contract.name.as_str(), contract.version.as_str()) {
         ("keybindings", "0.0.2") => "keybindings-0.0.2-Apache-2.0.txt",
         ("mlua-sys", "0.11.0") => "mlua-sys-0.11.0-MIT.txt",
@@ -1225,7 +1224,7 @@ fn read_license_fallback(
     })
 }
 
-fn report_extend(report: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+fn report_extend(report: &mut Vec<u8>, bytes: &[u8]) -> Result<(), TaskError> {
     let next_len = report
         .len()
         .checked_add(bytes.len())
@@ -1237,7 +1236,7 @@ fn report_extend(report: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Box<dyn Error
     Ok(())
 }
 
-fn package(root: &Path, target: &str, output: &Path) -> Result<(), Box<dyn Error>> {
+fn package(root: &Path, target: &str, output: &Path) -> Result<(), TaskError> {
     validate_target(target)?;
     let plan = plan(root)?;
     if !plan.candidate_clean {
@@ -1338,7 +1337,7 @@ fn package(root: &Path, target: &str, output: &Path) -> Result<(), Box<dyn Error
     clippy::arithmetic_side_effects,
     reason = "archive sizes are checked against configured release limits before aggregation"
 )]
-fn aggregate(root: &Path, input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
+fn aggregate(root: &Path, input: &Path, output: &Path) -> Result<(), TaskError> {
     let plan = plan(root)?;
     validate_release_candidate(root, &plan, &format!("v{}", plan.next_version))?;
     let reviewed_release_notes = read_bounded(&root.join(RELEASE_NOTES_PATH), CHANGELOG_BYTES_MAX)?;
@@ -1513,7 +1512,7 @@ fn aggregate(root: &Path, input: &Path, output: &Path) -> Result<(), Box<dyn Err
     })
 }
 
-fn parse_commits(log: &str) -> Result<Vec<ReleaseCommit>, Box<dyn Error>> {
+fn parse_commits(log: &str) -> Result<Vec<ReleaseCommit>, TaskError> {
     let mut commits = Vec::new();
     for record in log
         .split('\u{1e}')
@@ -1661,7 +1660,7 @@ fn sanitize_markdown(value: &str) -> String {
     clippy::arithmetic_side_effects,
     reason = "section offsets come from ASCII heading searches in the bounded changelog"
 )]
-fn update_changelog(source: &str, version: &str, date: &str) -> Result<String, Box<dyn Error>> {
+fn update_changelog(source: &str, version: &str, date: &str) -> Result<String, TaskError> {
     let release_heading = format!("## [{version}]");
     if source
         .lines()
@@ -1682,7 +1681,7 @@ fn update_changelog(source: &str, version: &str, date: &str) -> Result<String, B
     Ok(output)
 }
 
-fn replace_workspace_version(source: &str, version: &str) -> Result<String, Box<dyn Error>> {
+fn replace_workspace_version(source: &str, version: &str) -> Result<String, TaskError> {
     let mut in_workspace_package = false;
     let mut replaced = false;
     let mut output = String::with_capacity(source.len());
@@ -1720,7 +1719,7 @@ fn replace_lock_workspace_versions(
     source: &str,
     current_version: &str,
     next_version: &str,
-) -> Result<String, Box<dyn Error>> {
+) -> Result<String, TaskError> {
     if current_version == next_version {
         return Ok(source.to_owned());
     }
@@ -1749,7 +1748,7 @@ fn replace_lock_workspace_versions(
     Ok(output)
 }
 
-pub(crate) fn workspace_version(root: &Path) -> Result<String, Box<dyn Error>> {
+pub(crate) fn workspace_version(root: &Path) -> Result<String, TaskError> {
     let manifest = read_utf8_bounded(&root.join("Cargo.toml"), JSON_BYTES_MAX)?;
     let mut in_workspace_package = false;
     for line in manifest.lines() {
@@ -1769,7 +1768,7 @@ pub(crate) fn workspace_version(root: &Path) -> Result<String, Box<dyn Error>> {
     clippy::indexing_slicing,
     reason = "semantic versions are validated as exactly three numeric components before access"
 )]
-fn parse_version(value: &str) -> Result<SemanticVersion, Box<dyn Error>> {
+fn parse_version(value: &str) -> Result<SemanticVersion, TaskError> {
     if value.is_empty() || value.len() > 64 || value.contains(['-', '+']) {
         return Err(input_error(format!(
             "unsupported release version {value:?}"
@@ -1802,7 +1801,7 @@ fn validate_build_info(
     info: &BuildInfo,
     plan: &ReleasePlan,
     target: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     if info.schema_version != 3
         || info.version != plan.next_version
         || info.source_commit != plan.candidate_commit
@@ -1833,7 +1832,7 @@ fn validate_build_info(
 fn validate_provenance(
     provenance: &PackageProvenance,
     plan: &ReleasePlan,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     if provenance.schema_version != CONTRACT_VERSION
         || provenance.product != "quirl"
         || provenance.version != plan.next_version
@@ -1849,7 +1848,7 @@ fn validate_provenance(
     validate_target(&provenance.target)
 }
 
-fn target_platform(target: &str) -> Result<(&'static str, &'static str), Box<dyn Error>> {
+fn target_platform(target: &str) -> Result<(&'static str, &'static str), TaskError> {
     match target {
         "aarch64-apple-darwin" => Ok(("aarch64", "macos")),
         "x86_64-apple-darwin" => Ok(("x86_64", "macos")),
@@ -1859,7 +1858,7 @@ fn target_platform(target: &str) -> Result<(&'static str, &'static str), Box<dyn
     }
 }
 
-fn validate_target(target: &str) -> Result<(), Box<dyn Error>> {
+fn validate_target(target: &str) -> Result<(), TaskError> {
     target_platform(target).map(|_| ())
 }
 
@@ -1881,7 +1880,7 @@ fn target_binary(root: &Path, target: &str) -> PathBuf {
 pub(crate) fn render_tar_entries(
     entries: &[(&str, &[u8], u64)],
     modified: u64,
-) -> Result<Vec<u8>, Box<dyn Error>> {
+) -> Result<Vec<u8>, TaskError> {
     if entries.is_empty() || entries.len() > 32 {
         return Err(resource_error("tar entry count"));
     }
@@ -1938,7 +1937,7 @@ pub(crate) fn render_tar_entries(
     clippy::arithmetic_side_effects,
     reason = "tar field length is validated before fixed trailer writes and octal width arithmetic"
 )]
-fn write_tar_octal(field: &mut [u8], value: u64) -> Result<(), Box<dyn Error>> {
+fn write_tar_octal(field: &mut [u8], value: u64) -> Result<(), TaskError> {
     let digits = format!("{:0width$o}", value, width = field.len() - 1);
     if digits.len() + 1 != field.len() {
         return Err(resource_error("tar numeric field"));
@@ -1952,7 +1951,7 @@ fn write_tar_octal(field: &mut [u8], value: u64) -> Result<(), Box<dyn Error>> {
     clippy::indexing_slicing,
     reason = "checksum field length is validated before fixed-format byte writes"
 )]
-fn write_tar_checksum(field: &mut [u8], value: u64) -> Result<(), Box<dyn Error>> {
+fn write_tar_checksum(field: &mut [u8], value: u64) -> Result<(), TaskError> {
     let digits = format!("{value:06o}");
     if digits.len() != 6 || field.len() != 8 {
         return Err(resource_error("tar checksum field"));
@@ -1967,7 +1966,7 @@ fn write_tar_checksum(field: &mut [u8], value: u64) -> Result<(), Box<dyn Error>
     clippy::arithmetic_side_effects,
     reason = "visited file counts are bounded by the release asset limit"
 )]
-fn collect_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+fn collect_files(root: &Path) -> Result<Vec<PathBuf>, TaskError> {
     let metadata = fs::symlink_metadata(root)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(input_error(
@@ -2015,7 +2014,7 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     clippy::indexing_slicing,
     reason = "the candidate count is validated as exactly one before access"
 )]
-fn unique_file_named<'a>(files: &'a [PathBuf], name: &str) -> Result<&'a Path, Box<dyn Error>> {
+fn unique_file_named<'a>(files: &'a [PathBuf], name: &str) -> Result<&'a Path, TaskError> {
     let matching = files
         .iter()
         .filter(|path| path.file_name() == Some(OsStr::new(name)))
@@ -2032,13 +2031,13 @@ pub(crate) fn release_url(version: &str, file: &str) -> String {
     format!("https://github.com/niklas-heer/quirl/releases/download/v{version}/{file}")
 }
 
-pub(crate) fn candidate_source_epoch(root: &Path) -> Result<u64, Box<dyn Error>> {
+pub(crate) fn candidate_source_epoch(root: &Path) -> Result<u64, TaskError> {
     git(root, &["show", "-s", "--format=%ct", "HEAD"], true)?
         .parse::<u64>()
         .map_err(|_| input_error("candidate commit timestamp is not an unsigned integer"))
 }
 
-pub(crate) fn clean_candidate_identity(root: &Path) -> Result<CandidateIdentity, Box<dyn Error>> {
+pub(crate) fn clean_candidate_identity(root: &Path) -> Result<CandidateIdentity, TaskError> {
     let plan = plan(root)?;
     let tag = format!("v{}", plan.next_version);
     validate_release_candidate(root, &plan, &tag)?;
@@ -2056,7 +2055,7 @@ pub(crate) fn clean_candidate_identity(root: &Path) -> Result<CandidateIdentity,
 /// heading, release notes, or tag: those only make sense when preparing an
 /// actual version bump. It still requires a clean worktree, since publishing
 /// an asset built from uncommitted changes would misattribute its identity.
-pub(crate) fn current_candidate_identity(root: &Path) -> Result<CandidateIdentity, Box<dyn Error>> {
+pub(crate) fn current_candidate_identity(root: &Path) -> Result<CandidateIdentity, TaskError> {
     let version = workspace_version(root)?;
     let commit = current_commit(root)?;
     let clean = git(
@@ -2075,13 +2074,13 @@ pub(crate) fn current_candidate_identity(root: &Path) -> Result<CandidateIdentit
     })
 }
 
-pub(crate) fn current_commit(root: &Path) -> Result<String, Box<dyn Error>> {
+pub(crate) fn current_commit(root: &Path) -> Result<String, TaskError> {
     let commit = git(root, &["rev-parse", "HEAD"], true)?;
     validate_commit(&commit)?;
     Ok(commit)
 }
 
-pub(crate) fn local_tag_target(root: &Path, tag: &str) -> Result<String, Box<dyn Error>> {
+pub(crate) fn local_tag_target(root: &Path, tag: &str) -> Result<String, TaskError> {
     let reference = format!("refs/tags/{tag}");
     let commit = git(root, &["rev-parse", "--verify", &reference], true)?;
     validate_commit(&commit)?;
@@ -2091,7 +2090,7 @@ pub(crate) fn local_tag_target(root: &Path, tag: &str) -> Result<String, Box<dyn
 pub(crate) fn verify_binary_version(
     binary: &Path,
     expected_version: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let output = command_output(
         binary,
         &[OsStr::new("--version")],
@@ -2116,7 +2115,7 @@ pub(crate) fn run_status_bounded(
     command: &mut Command,
     timeout: Duration,
     label: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn()?;
@@ -2138,7 +2137,7 @@ pub(crate) fn run_status_bounded(
     }
 }
 
-fn git(root: &Path, arguments: &[&str], require_success: bool) -> Result<String, Box<dyn Error>> {
+fn git(root: &Path, arguments: &[&str], require_success: bool) -> Result<String, TaskError> {
     let argument_os = arguments.iter().map(OsStr::new).collect::<Vec<_>>();
     let output = command_output_with_directory(
         Path::new("git"),
@@ -2168,7 +2167,7 @@ fn command_output(
     arguments: &[&OsStr],
     timeout: Duration,
     bytes_max: usize,
-) -> Result<BoundedOutput, Box<dyn Error>> {
+) -> Result<BoundedOutput, TaskError> {
     let directory = program.parent().unwrap_or_else(|| Path::new("."));
     command_output_with_directory(program, arguments, directory, timeout, bytes_max)
 }
@@ -2183,7 +2182,7 @@ fn command_output_with_directory(
     directory: &Path,
     timeout: Duration,
     bytes_max: usize,
-) -> Result<BoundedOutput, Box<dyn Error>> {
+) -> Result<BoundedOutput, TaskError> {
     let mut command = Command::new(program);
     command
         .args(arguments)
@@ -2268,7 +2267,7 @@ fn read_stream_bounded(mut stream: impl Read, bytes_max: usize) -> io::Result<Ve
     }
 }
 
-fn ensure_success(label: &str, status: ExitStatus) -> Result<(), Box<dyn Error>> {
+fn ensure_success(label: &str, status: ExitStatus) -> Result<(), TaskError> {
     if status.success() {
         Ok(())
     } else {
@@ -2276,7 +2275,7 @@ fn ensure_success(label: &str, status: ExitStatus) -> Result<(), Box<dyn Error>>
     }
 }
 
-fn ensure_output_success(label: &str, output: &BoundedOutput) -> Result<(), Box<dyn Error>> {
+fn ensure_output_success(label: &str, output: &BoundedOutput) -> Result<(), TaskError> {
     if output.status.success() {
         return Ok(());
     }
@@ -2289,11 +2288,11 @@ fn ensure_output_success(label: &str, output: &BoundedOutput) -> Result<(), Box<
     .into())
 }
 
-pub(crate) fn read_json_bounded<T: DeserializeOwned>(path: &Path) -> Result<T, Box<dyn Error>> {
+pub(crate) fn read_json_bounded<T: DeserializeOwned>(path: &Path) -> Result<T, TaskError> {
     serde_json::from_slice(&read_bounded(path, JSON_BYTES_MAX)?).map_err(Into::into)
 }
 
-pub(crate) fn read_bounded(path: &Path, bytes_max: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+pub(crate) fn read_bounded(path: &Path, bytes_max: usize) -> Result<Vec<u8>, TaskError> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(input_error(format!(
@@ -2314,7 +2313,7 @@ pub(crate) fn read_bounded(path: &Path, bytes_max: usize) -> Result<Vec<u8>, Box
     Ok(bytes)
 }
 
-fn read_utf8_bounded(path: &Path, bytes_max: usize) -> Result<String, Box<dyn Error>> {
+fn read_utf8_bounded(path: &Path, bytes_max: usize) -> Result<String, TaskError> {
     String::from_utf8(read_bounded(path, bytes_max)?).map_err(Into::into)
 }
 
@@ -2327,7 +2326,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
-pub(crate) fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, Box<dyn Error>> {
+pub(crate) fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, TaskError> {
     let mut bytes = serde_json::to_vec_pretty(value)?;
     bytes.push(b'\n');
     if bytes.len() > JSON_BYTES_MAX {
@@ -2336,12 +2335,12 @@ pub(crate) fn json_bytes(value: &impl Serialize) -> Result<Vec<u8>, Box<dyn Erro
     Ok(bytes)
 }
 
-fn print_json(value: &impl Serialize) -> Result<(), Box<dyn Error>> {
+fn print_json(value: &impl Serialize) -> Result<(), TaskError> {
     io::stdout().write_all(&json_bytes(value)?)?;
     Ok(())
 }
 
-pub(crate) fn immutable_write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+pub(crate) fn immutable_write(path: &Path, bytes: &[u8]) -> Result<(), TaskError> {
     if path.exists() {
         if read_bounded(path, bytes.len().max(JSON_BYTES_MAX))? == bytes {
             return Ok(());
@@ -2354,14 +2353,14 @@ pub(crate) fn immutable_write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn E
     atomic_write(path, bytes)
 }
 
-fn atomic_write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+fn atomic_write_if_changed(path: &Path, bytes: &[u8]) -> Result<(), TaskError> {
     if path.exists() && read_bounded(path, bytes.len().max(JSON_BYTES_MAX))? == bytes {
         return Ok(());
     }
     atomic_write(path, bytes)
 }
 
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), TaskError> {
     let parent = path
         .parent()
         .ok_or_else(|| input_error("output path has no parent"))?;
@@ -2409,7 +2408,7 @@ pub(crate) fn absolute(root: &Path, path: &Path) -> PathBuf {
     }
 }
 
-pub(crate) fn validate_relative_file_name(value: &str) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_relative_file_name(value: &str) -> Result<(), TaskError> {
     let path = Path::new(value);
     if value.is_empty()
         || value.len() > 255
@@ -2421,13 +2420,13 @@ pub(crate) fn validate_relative_file_name(value: &str) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-fn file_name(path: &Path) -> Result<&str, Box<dyn Error>> {
+fn file_name(path: &Path) -> Result<&str, TaskError> {
     path.file_name()
         .and_then(OsStr::to_str)
         .ok_or_else(|| input_error(format!("artifact path is not UTF-8: {}", path.display())))
 }
 
-fn validate_commit(value: &str) -> Result<(), Box<dyn Error>> {
+fn validate_commit(value: &str) -> Result<(), TaskError> {
     if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
     } else {
@@ -2437,7 +2436,7 @@ fn validate_commit(value: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn validate_release_date(value: &str) -> Result<(), Box<dyn Error>> {
+fn validate_release_date(value: &str) -> Result<(), TaskError> {
     if value.len() == 10
         && value.bytes().enumerate().all(|(index, byte)| {
             if matches!(index, 4 | 7) {
@@ -2453,15 +2452,15 @@ fn validate_release_date(value: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn version_overflow() -> Box<dyn Error> {
+fn version_overflow() -> TaskError {
     resource_error("semantic version component")
 }
 
-pub(crate) fn input_error(message: impl Into<String>) -> Box<dyn Error> {
+pub(crate) fn input_error(message: impl Into<String>) -> TaskError {
     io::Error::new(io::ErrorKind::InvalidInput, message.into()).into()
 }
 
-pub(crate) fn resource_error(resource: &str) -> Box<dyn Error> {
+pub(crate) fn resource_error(resource: &str) -> TaskError {
     io::Error::other(format!(
         "{resource} exceeded its configured release-tooling limit"
     ))

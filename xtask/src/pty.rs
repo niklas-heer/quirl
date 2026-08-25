@@ -14,7 +14,6 @@ use nix::{
 };
 use std::{
     collections::BTreeMap,
-    error::Error,
     ffi::{CString, OsStr, OsString},
     fs::{File, OpenOptions},
     io::{self, Read, Write},
@@ -26,6 +25,8 @@ use std::{
     time::{Duration, Instant},
 };
 use unicode_width::UnicodeWidthChar;
+
+use crate::TaskError;
 
 /// Default deadline for one bounded PTY wait.
 ///
@@ -559,7 +560,7 @@ impl PtySession {
         clippy::indexing_slicing,
         reason = "openpty populates both fixed descriptor slots before they are read"
     )]
-    pub(super) fn spawn(options: SpawnOptions) -> Result<Self, Box<dyn Error>> {
+    pub(super) fn spawn(options: SpawnOptions) -> Result<Self, TaskError> {
         validate_timeout(options.timeout)?;
         validate_screen_size(options.rows, options.columns)?;
         if options.argv.is_empty() {
@@ -680,7 +681,7 @@ impl PtySession {
         &self.screen
     }
 
-    pub(super) fn foreground_group(&self) -> Result<Pid, Box<dyn Error>> {
+    pub(super) fn foreground_group(&self) -> Result<Pid, TaskError> {
         let master = self
             .master
             .as_ref()
@@ -688,7 +689,7 @@ impl PtySession {
         Ok(tcgetpgrp(master)?)
     }
 
-    pub(super) fn terminal_modes(&self) -> Result<Termios, Box<dyn Error>> {
+    pub(super) fn terminal_modes(&self) -> Result<Termios, TaskError> {
         let master = self
             .master
             .as_ref()
@@ -700,7 +701,7 @@ impl PtySession {
         clippy::arithmetic_side_effects,
         reason = "bytes written cannot exceed the bounded caller-provided slice length"
     )]
-    pub(super) fn send(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    pub(super) fn send(&mut self, bytes: &[u8]) -> Result<(), TaskError> {
         let deadline = Instant::now() + self.timeout;
         self.send_until(bytes, deadline)
     }
@@ -709,7 +710,7 @@ impl PtySession {
         clippy::indexing_slicing,
         reason = "the write offset is bounded by the source slice length in the loop condition"
     )]
-    fn send_until(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), Box<dyn Error>> {
+    fn send_until(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), TaskError> {
         let mut offset = 0;
         while offset < bytes.len() {
             if Instant::now() >= deadline {
@@ -745,11 +746,11 @@ impl PtySession {
         Ok(())
     }
 
-    pub(super) fn type_text(&mut self, text: &str) -> Result<(), Box<dyn Error>> {
+    pub(super) fn type_text(&mut self, text: &str) -> Result<(), TaskError> {
         self.send(text.as_bytes())
     }
 
-    pub(super) fn resize(&mut self, rows: usize, columns: usize) -> Result<(), Box<dyn Error>> {
+    pub(super) fn resize(&mut self, rows: usize, columns: usize) -> Result<(), TaskError> {
         validate_screen_size(rows, columns)?;
         self.screen.resize(rows, columns)?;
         let master = self
@@ -778,7 +779,7 @@ impl PtySession {
         clippy::arithmetic_side_effects,
         reason = "read lengths are returned by the kernel for the fixed buffer and retained bytes are explicitly bounded"
     )]
-    pub(super) fn drain_for(&mut self, duration: Duration) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub(super) fn drain_for(&mut self, duration: Duration) -> Result<Vec<u8>, TaskError> {
         validate_timeout(duration)?;
         let deadline = Instant::now() + duration;
         let mut chunk = Vec::new();
@@ -821,7 +822,7 @@ impl PtySession {
         Ok(chunk)
     }
 
-    pub(super) fn wait_for(&mut self, marker: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+    pub(super) fn wait_for(&mut self, marker: &[u8]) -> Result<Vec<u8>, TaskError> {
         self.wait_for_since(marker, self.output.len(), self.timeout)
     }
 
@@ -834,7 +835,7 @@ impl PtySession {
         marker: &[u8],
         start: usize,
         timeout: Duration,
-    ) -> Result<Vec<u8>, Box<dyn Error>> {
+    ) -> Result<Vec<u8>, TaskError> {
         validate_timeout(timeout)?;
         let deadline = Instant::now() + timeout;
         while !contains_bytes(self.output.get(start..).unwrap_or_default(), marker)
@@ -862,7 +863,7 @@ impl PtySession {
         &mut self,
         description: &str,
         predicate: impl Fn(&VirtualScreen) -> bool,
-    ) -> Result<String, Box<dyn Error>> {
+    ) -> Result<String, TaskError> {
         let deadline = Instant::now() + self.timeout;
         while !predicate(&self.screen) && Instant::now() < deadline {
             self.drain_for(
@@ -879,13 +880,13 @@ impl PtySession {
         Ok(snapshot)
     }
 
-    pub(super) fn wait_for_screen_text(&mut self, marker: &str) -> Result<String, Box<dyn Error>> {
+    pub(super) fn wait_for_screen_text(&mut self, marker: &str) -> Result<String, TaskError> {
         self.wait_for_screen(&format!("{marker:?}"), |screen| {
             screen.text().contains(marker)
         })
     }
 
-    pub(super) fn wait_exit(&mut self) -> Result<i32, Box<dyn Error>> {
+    pub(super) fn wait_exit(&mut self) -> Result<i32, TaskError> {
         self.wait_exit_within(self.timeout)
     }
 
@@ -900,7 +901,7 @@ impl PtySession {
         clippy::arithmetic_side_effects,
         reason = "poll counts are bounded by the process deadline"
     )]
-    pub(super) fn wait_exit_within(&mut self, timeout: Duration) -> Result<i32, Box<dyn Error>> {
+    pub(super) fn wait_exit_within(&mut self, timeout: Duration) -> Result<i32, TaskError> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             self.drain_for(
@@ -920,7 +921,7 @@ impl PtySession {
         clippy::arithmetic_side_effects,
         reason = "poll counts are bounded by the close deadline"
     )]
-    pub(super) fn close(&mut self) -> Result<(), Box<dyn Error>> {
+    pub(super) fn close(&mut self) -> Result<(), TaskError> {
         if let Some(master) = self.master.as_ref()
             && let Ok(group) = tcgetpgrp(master)
             && group.as_raw() > 0
@@ -950,7 +951,7 @@ impl PtySession {
         Ok(())
     }
 
-    fn poll_master(&self, flags: PollFlags, timeout: Duration) -> Result<bool, Box<dyn Error>> {
+    fn poll_master(&self, flags: PollFlags, timeout: Duration) -> Result<bool, TaskError> {
         let master = self
             .master
             .as_ref()
@@ -960,7 +961,7 @@ impl PtySession {
         Ok(poll(&mut descriptors, timeout)? > 0)
     }
 
-    fn try_reap(&mut self) -> Result<Option<WaitStatus>, Box<dyn Error>> {
+    fn try_reap(&mut self) -> Result<Option<WaitStatus>, TaskError> {
         let Some(child) = self.child else {
             return Ok(None);
         };
@@ -982,7 +983,7 @@ impl PtySession {
         clippy::indexing_slicing,
         reason = "diagnostic output is sliced at a byte count clamped to the observed buffer length"
     )]
-    fn timeout_error(&self, expected: &str, observed: &[u8]) -> Box<dyn Error> {
+    fn timeout_error(&self, expected: &str, observed: &[u8]) -> TaskError {
         let source = if observed.is_empty() {
             &self.output
         } else {

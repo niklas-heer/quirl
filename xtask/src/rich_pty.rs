@@ -1,6 +1,9 @@
 //! End-to-end rich-terminal checks driven by the Rust PTY harness.
 
-use crate::pty::{PtySession, SpawnOptions, VirtualScreen, default_timeout, key};
+use crate::{
+    TaskError,
+    pty::{PtySession, SpawnOptions, VirtualScreen, default_timeout, key},
+};
 use nix::{
     errno::Errno,
     sys::{
@@ -13,7 +16,6 @@ use nix::{
 use std::{
     collections::BTreeMap,
     env,
-    error::Error,
     ffi::OsString,
     fs::{self, DirBuilder, File},
     io::{self, BufWriter, Write},
@@ -57,7 +59,7 @@ const CHECK_NAMES: &[&str] = &[
 ];
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-type Check = fn(&Path) -> Result<(), Box<dyn Error>>;
+type Check = fn(&Path) -> Result<(), TaskError>;
 
 struct CheckCase {
     name: &'static str,
@@ -94,7 +96,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(binary: &Path, options: SessionOptions) -> Result<Self, Box<dyn Error>> {
+    fn new(binary: &Path, options: SessionOptions) -> Result<Self, TaskError> {
         let private = TempDirectory::new("quirl-pty")?;
         let config_dir = private.path.join("config");
         create_private_directory(&config_dir)?;
@@ -415,7 +417,7 @@ impl Drop for ObservedProcessGroupCleanup {
     }
 }
 
-pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<(), Box<dyn Error>> {
+pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<(), TaskError> {
     if !binary.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -554,20 +556,20 @@ fn enter_and_wait(
     session: &mut Session,
     command: &str,
     marker: &[u8],
-) -> Result<Vec<u8>, Box<dyn Error>> {
+) -> Result<Vec<u8>, TaskError> {
     session.pty.type_text(command)?;
     session.pty.send(key::ENTER)?;
     session.pty.wait_for(marker)
 }
 
-fn wait_for_rich_input_since(session: &mut Session, start: usize) -> Result<(), Box<dyn Error>> {
+fn wait_for_rich_input_since(session: &mut Session, start: usize) -> Result<(), TaskError> {
     session
         .pty
         .wait_for_since(b"\x1b[?1000h", start, default_timeout())?;
     Ok(())
 }
 
-fn execute_and_resume(session: &mut Session, command: &str) -> Result<(), Box<dyn Error>> {
+fn execute_and_resume(session: &mut Session, command: &str) -> Result<(), TaskError> {
     let output_start = session.pty.output().len();
     session.pty.type_text(command)?;
     session.pty.send(key::ENTER)?;
@@ -587,7 +589,7 @@ fn execute_and_resume_with_marker(
     session: &mut Session,
     command: &str,
     marker: &[u8],
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let output_start = session.pty.output().len();
     session.pty.type_text(command)?;
     session.pty.send(key::ENTER)?;
@@ -615,7 +617,7 @@ fn ensure_alternate_screen_unchanged(
     session: &Session,
     output_start: usize,
     stage: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let emitted = &session.pty.output()[output_start..];
     if contains(emitted, ALTERNATE_SCREEN_LEAVE) || contains(emitted, ALTERNATE_SCREEN_ENTER) {
         return Err(io::Error::other(format!(
@@ -630,7 +632,7 @@ fn execute_simple_with_marker(
     session: &mut Session,
     command: &str,
     marker: &[u8],
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     session.pty.type_text(command)?;
     session.pty.send(key::ENTER)?;
     session.pty.wait_for(marker)?;
@@ -641,7 +643,7 @@ fn execute_simple_with_marker(
     clippy::arithmetic_side_effects,
     reason = "poll counts are bounded by the terminal ownership deadline"
 )]
-fn wait_for_terminal_owner(session: &mut Session) -> Result<(), Box<dyn Error>> {
+fn wait_for_terminal_owner(session: &mut Session) -> Result<(), TaskError> {
     let child = session
         .pty
         .child_pid()
@@ -660,7 +662,7 @@ fn wait_for_terminal_owner(session: &mut Session) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-fn check_rich_editing(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_rich_editing(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(binary, SessionOptions::default())?;
     session.pty.wait_for(STARTUP_MARKER)?;
     session.pty.type_text("/usr/bin/printf BACKSPACE_BAD")?;
@@ -753,7 +755,7 @@ fn check_rich_editing(binary: &Path) -> Result<(), Box<dyn Error>> {
     clippy::indexing_slicing,
     reason = "captured output offsets come from successful marker searches"
 )]
-fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(
         binary,
         SessionOptions {
@@ -853,7 +855,7 @@ fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Err
     clippy::indexing_slicing,
     reason = "captured output offsets come from successful marker searches"
 )]
-fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_automatic_command_intelligence(binary: &Path) -> Result<(), TaskError> {
     // Failure model: redraws may lag resize/input, commands may retain the PTY
     // foreground group, and any return path may strand raw or alternate-screen
     // state. Keep this ordered end-to-end transaction together so every phase
@@ -1178,7 +1180,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Err
     ensure_terminal_restored(&session, cleanup_start, "command-intelligence EOF")
 }
 
-fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), TaskError> {
     let fixtures = TempDirectory::new("quirl-idle-ai-bootstrap")?;
     let binary_dir = fixtures.path.join("bin");
     let index_dir = fixtures.path.join("index");
@@ -1241,7 +1243,7 @@ fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), Box<dyn Er
     clippy::indexing_slicing,
     reason = "captured output offsets come from successful marker searches"
 )]
-fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_durable_command_discovery(binary: &Path) -> Result<(), TaskError> {
     // Failure model: a cold write may be partial, a warm read may rewrite state,
     // refresh may publish inside an editor turn, hostile declarations may run,
     // and corrupt state may prevent prompt or terminal cleanup. This sequence
@@ -1447,7 +1449,7 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> 
     ensure_terminal_restored(&degraded, cleanup_start, "corrupt-cache fallback")
 }
 
-fn check_completion(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_completion(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(binary, SessionOptions::default())?;
     let path_target = session.private.path.join("path-target");
     create_private_directory(&path_target)?;
@@ -1515,7 +1517,7 @@ fn check_completion(binary: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn check_deferred_catalog_admission(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_deferred_catalog_admission(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(
         binary,
         SessionOptions {
@@ -1566,7 +1568,7 @@ fn check_deferred_catalog_admission(binary: &Path) -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-fn check_catalog_failure_restores_terminal(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_catalog_failure_restores_terminal(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(
         binary,
         SessionOptions {
@@ -1624,7 +1626,7 @@ fn check_catalog_failure_restores_terminal(binary: &Path) -> Result<(), Box<dyn 
     Ok(())
 }
 
-fn check_cwd_history(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_cwd_history(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(binary, SessionOptions::default())?;
     let local_directory = session.private.path.join("local-project");
     let other_directory = session.private.path.join("other-project");
@@ -1673,7 +1675,7 @@ fn check_cwd_history(binary: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn execute_cwd_history_command(session: &mut Session, command: &str) -> Result<(), Box<dyn Error>> {
+fn execute_cwd_history_command(session: &mut Session, command: &str) -> Result<(), TaskError> {
     let output_start = session.pty.output().len();
     session.pty.type_text(command)?;
     let editor_line = format!("> {command}");
@@ -1700,7 +1702,7 @@ fn execute_cwd_history_command(session: &mut Session, command: &str) -> Result<(
     clippy::arithmetic_side_effects,
     reason = "cycle counts are fixed and captured output offsets come from successful marker searches"
 )]
-fn check_retained_output_cycles(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_retained_output_cycles(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(
         binary,
         SessionOptions {
@@ -1850,7 +1852,7 @@ fn check_retained_output_cycles(binary: &Path) -> Result<(), Box<dyn Error>> {
     )
 }
 
-fn check_external_command_compatibility(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_external_command_compatibility(binary: &Path) -> Result<(), TaskError> {
     let fixtures = TempDirectory::new("quirl-external-compatibility")?;
     let binary_dir = fixtures.path.join("bin");
     create_private_directory(&binary_dir)?;
@@ -2000,7 +2002,7 @@ complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Prin
     clippy::indexing_slicing,
     reason = "captured output offsets come from successful marker searches"
 )]
-fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), TaskError> {
     // Failure model: a child that reports progress with bare `\r` overwrites
     // (no trailing `\n`) — `git push`, `curl`, package-manager progress bars,
     // and similar — must still be visible while it runs. A transcript that
@@ -2054,7 +2056,7 @@ fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), Box<dyn 
     )
 }
 
-fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), TaskError> {
     // Failure model: a command that produces no output of its own (a bare
     // `sleep`) must still show Quirl is alive and waiting on it. Without a
     // liveness tick independent of child output, the viewport would sit
@@ -2101,7 +2103,7 @@ fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), Box
     clippy::indexing_slicing,
     reason = "captured output offsets come from successful marker searches"
 )]
-fn check_full_screen_program_takeover(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_full_screen_program_takeover(binary: &Path) -> Result<(), TaskError> {
     // Failure model: the rich viewport normally captures a foreground
     // command's stdout and stderr through a pipe and replays it inside its
     // own transcript block. A full-screen program (an editor, pager, or
@@ -2164,7 +2166,7 @@ fn check_full_screen_program_takeover(binary: &Path) -> Result<(), Box<dyn Error
 
 fn check_full_screen_program_spawn_failure_restores_terminal(
     binary: &Path,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     // Failure model: `needs_real_terminal` decides to hand a command the
     // real terminal from its parsed source text alone, before the
     // executable is known to exist. When the recognized full-screen program
@@ -2205,7 +2207,7 @@ fn check_full_screen_program_spawn_failure_restores_terminal(
     clippy::indexing_slicing,
     reason = "captured output offsets come from successful marker searches"
 )]
-fn check_ctrl_l_forces_full_repaint(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_ctrl_l_forces_full_repaint(binary: &Path) -> Result<(), TaskError> {
     // Failure model: a raw ANSI clear wipes the real screen but does not by
     // itself invalidate ratatui's internal diff buffer, so the next draw
     // would re-emit only cells whose modeled content changed, leaving the
@@ -2241,7 +2243,7 @@ fn check_ctrl_l_forces_full_repaint(binary: &Path) -> Result<(), Box<dyn Error>>
     )
 }
 
-fn check_local_completion_discovery(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_local_completion_discovery(binary: &Path) -> Result<(), TaskError> {
     // Failure model: provider code is untrusted and editor revisions can repeat
     // while one background generation is running. Fake shells make invocation,
     // framing, and persistence deterministic without host rc files or binaries.
@@ -2350,7 +2352,7 @@ fn transcript_tail_flows_into_prompt(screen: &VirtualScreen, command: &str, outp
     )
 }
 
-fn check_interactive_runtime(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_interactive_runtime(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(binary, SessionOptions::default())?;
     session.pty.wait_for(STARTUP_MARKER)?;
     session.pty.resize(4, 40)?;
@@ -2475,7 +2477,7 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), Box<dyn Error>> {
 /// consistent, not occasional, and that a longer deadline alone never
 /// fixed -- confirmed by a process/thread-state snapshot showing the child
 /// idling normally in its terminal read loop, not stuck or busy.
-fn send_ctrl_d_and_wait_for_exit(pty: &mut PtySession) -> Result<i32, Box<dyn Error>> {
+fn send_ctrl_d_and_wait_for_exit(pty: &mut PtySession) -> Result<i32, TaskError> {
     const EXIT_PROBE: Duration = Duration::from_millis(500);
     pty.send(key::CTRL_D)?;
     match pty.wait_exit_within(EXIT_PROBE) {
@@ -2491,7 +2493,7 @@ fn send_ctrl_d_and_wait_for_exit(pty: &mut PtySession) -> Result<i32, Box<dyn Er
     clippy::indexing_slicing,
     reason = "captured output offsets come from successful marker searches"
 )]
-fn check_rich_review_regressions(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_rich_review_regressions(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(binary, SessionOptions::default())?;
     let startup = session.pty.wait_for(STARTUP_MARKER)?;
     for marker in ["❯", "◆", "·"] {
@@ -2565,7 +2567,7 @@ fn check_rich_review_regressions(binary: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn check_suspend_resume(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_suspend_resume(binary: &Path) -> Result<(), TaskError> {
     let Some(shell) = find_on_path("zsh").or_else(|| find_on_path("bash")) else {
         println!("skip: check_suspend_resume (zsh/bash unavailable)");
         return Ok(());
@@ -2605,7 +2607,7 @@ fn check_suspend_resume(binary: &Path) -> Result<(), Box<dyn Error>> {
     clippy::arithmetic_side_effects,
     reason = "job counts and process identifiers are bounded by the fixed PTY scenario"
 )]
-fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_native_job_control(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(
         binary,
         SessionOptions {
@@ -2732,7 +2734,7 @@ fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn check_noninteractive_dialect_islands(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_noninteractive_dialect_islands(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(binary, SessionOptions::default())?;
     session.pty.wait_for(STARTUP_MARKER)?;
     execute_and_resume_with_marker(
@@ -2757,7 +2759,7 @@ fn check_noninteractive_dialect_islands(binary: &Path) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-fn check_fallbacks(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_fallbacks(binary: &Path) -> Result<(), TaskError> {
     let mut dumb = Session::new(
         binary,
         SessionOptions {
@@ -2792,7 +2794,7 @@ fn check_fallbacks(binary: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn check_no_color_preserves_semantic_hints(binary: &Path) -> Result<(), Box<dyn Error>> {
+fn check_no_color_preserves_semantic_hints(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(
         binary,
         SessionOptions {
@@ -2813,7 +2815,7 @@ fn check_no_color_preserves_semantic_hints(binary: &Path) -> Result<(), Box<dyn 
     clippy::arithmetic_side_effects,
     reason = "poll counts are bounded by the file wait deadline"
 )]
-fn wait_for_file(session: &mut Session, path: PathBuf) -> Result<(), Box<dyn Error>> {
+fn wait_for_file(session: &mut Session, path: PathBuf) -> Result<(), TaskError> {
     let deadline = Instant::now() + default_timeout();
     while !path.is_file() && Instant::now() < deadline {
         session.pty.drain_for(Duration::from_millis(20))?;
@@ -2833,7 +2835,7 @@ fn discovery_session(
     path: &Path,
     index_dir: &Path,
     help_path: &Path,
-) -> Result<Session, Box<dyn Error>> {
+) -> Result<Session, TaskError> {
     Session::new(
         binary,
         SessionOptions {
@@ -2852,7 +2854,7 @@ fn wait_for_command_information(
     session: &mut Session,
     command: &str,
     markers: &[&str],
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     session.pty.type_text(command)?;
     session.pty.wait_for_screen(
         &format!("automatic information for {command:?}"),
@@ -2864,7 +2866,7 @@ fn wait_for_command_information(
     Ok(())
 }
 
-fn ensure_bottom_status(session: &Session, stage: &str) -> Result<(), Box<dyn Error>> {
+fn ensure_bottom_status(session: &Session, stage: &str) -> Result<(), TaskError> {
     if !session.pty.screen().bottom_line().contains("NORMAL") {
         return Err(screen_error(
             &format!("rich status was not on the physical bottom at {stage}"),
@@ -2874,11 +2876,11 @@ fn ensure_bottom_status(session: &Session, stage: &str) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-fn wait_for_standard_status(session: &mut Session) -> Result<(), Box<dyn Error>> {
+fn wait_for_standard_status(session: &mut Session) -> Result<(), TaskError> {
     wait_for_mode_status(session, "NORMAL")
 }
 
-fn wait_for_mode_status(session: &mut Session, mode: &str) -> Result<(), Box<dyn Error>> {
+fn wait_for_mode_status(session: &mut Session, mode: &str) -> Result<(), TaskError> {
     session
         .pty
         .wait_for_screen(&format!("standard {mode} bottom status"), |screen| {
@@ -2888,11 +2890,11 @@ fn wait_for_mode_status(session: &mut Session, mode: &str) -> Result<(), Box<dyn
     Ok(())
 }
 
-fn clear_editor(session: &mut Session) -> Result<(), Box<dyn Error>> {
+fn clear_editor(session: &mut Session) -> Result<(), TaskError> {
     clear_editor_in_mode(session, "NORMAL")
 }
 
-fn clear_editor_in_mode(session: &mut Session, mode: &str) -> Result<(), Box<dyn Error>> {
+fn clear_editor_in_mode(session: &mut Session, mode: &str) -> Result<(), TaskError> {
     session.pty.send(key::CTRL_U)?;
     wait_for_mode_status(session, mode)
 }
@@ -2905,7 +2907,7 @@ fn ensure_terminal_restored(
     session: &Session,
     output_start: usize,
     stage: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     if !contains(
         &session.pty.output()[output_start..],
         ALTERNATE_SCREEN_LEAVE,
@@ -2971,7 +2973,7 @@ fn wait_for_file_contents(
     session: &mut Session,
     path: &Path,
     marker: &[u8],
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let deadline = Instant::now() + default_timeout();
     while Instant::now() < deadline {
         if read_bounded_fixture(path, DISCOVERY_ARTIFACT_BYTES_MAX)
@@ -2991,7 +2993,7 @@ fn wait_for_file_contents(
     .into())
 }
 
-fn assert_discovery_artifacts_bounded(index_dir: &Path) -> Result<(), Box<dyn Error>> {
+fn assert_discovery_artifacts_bounded(index_dir: &Path) -> Result<(), TaskError> {
     let mut entries = 0_usize;
     for entry in fs::read_dir(index_dir)? {
         let entry = entry?;
@@ -3016,7 +3018,7 @@ fn assert_discovery_artifacts_bounded(index_dir: &Path) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-fn ensure_status(status: i32, expected: i32, label: &str) -> Result<(), Box<dyn Error>> {
+fn ensure_status(status: i32, expected: i32, label: &str) -> Result<(), TaskError> {
     if status != expected {
         return Err(
             io::Error::other(format!("{label} exited {status}; expected {expected}")).into(),
@@ -3025,7 +3027,7 @@ fn ensure_status(status: i32, expected: i32, label: &str) -> Result<(), Box<dyn 
     Ok(())
 }
 
-fn screen_error(message: &str, screen: &VirtualScreen) -> Box<dyn Error> {
+fn screen_error(message: &str, screen: &VirtualScreen) -> TaskError {
     io::Error::other(format!("{message}; screen=\n{}", screen.text())).into()
 }
 

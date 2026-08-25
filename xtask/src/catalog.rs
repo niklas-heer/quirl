@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    error::Error,
     ffi::OsStr,
     fmt::Write as _,
     fs::{self, File, OpenOptions},
@@ -21,6 +20,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+use crate::TaskError;
 
 const CURATED_DIRECTORY: &str = "catalog/curated";
 const DRAFT_DIRECTORY: &str = "catalog/draft";
@@ -76,7 +77,7 @@ pub(crate) enum CatalogCommand {
     Build,
 }
 
-pub(crate) fn run(root: &Path, command: CatalogCommand) -> Result<(), Box<dyn Error>> {
+pub(crate) fn run(root: &Path, command: CatalogCommand) -> Result<(), TaskError> {
     match command {
         CatalogCommand::ImportCarapace { source, revision } => {
             import_carapace(root, &source, &revision)
@@ -92,7 +93,7 @@ pub(crate) fn run(root: &Path, command: CatalogCommand) -> Result<(), Box<dyn Er
     clippy::indexing_slicing,
     reason = "promotion requires exactly one matched draft before accessing it"
 )]
-fn promote_drafts(root: &Path, commands: &[String]) -> Result<(), Box<dyn Error>> {
+fn promote_drafts(root: &Path, commands: &[String]) -> Result<(), TaskError> {
     if commands.is_empty() || commands.len() > SOURCE_FILE_COUNT_MAX {
         return Err(resource_error(
             "promoted command count",
@@ -273,7 +274,7 @@ struct RenderedDraft {
     bytes: Vec<u8>,
 }
 
-fn import_carapace(root: &Path, source: &Path, revision: &str) -> Result<(), Box<dyn Error>> {
+fn import_carapace(root: &Path, source: &Path, revision: &str) -> Result<(), TaskError> {
     validate_revision(revision)?;
     let configuration_path = root.join(IMPORT_CONFIGURATION);
     let configuration: ImportConfiguration = read_json_bounded(&configuration_path)?;
@@ -327,7 +328,7 @@ fn import_carapace(root: &Path, source: &Path, revision: &str) -> Result<(), Box
 fn render_imported_drafts(
     root: &Path,
     catalog: &NativeCatalog,
-) -> Result<Vec<RenderedDraft>, Box<dyn Error>> {
+) -> Result<Vec<RenderedDraft>, TaskError> {
     let mut rendered = Vec::with_capacity(catalog.commands.len());
     let mut output_bytes = 0_usize;
     let mut root_names = BTreeSet::new();
@@ -368,7 +369,7 @@ fn render_imported_drafts(
     Ok(rendered)
 }
 
-fn publish_imported_drafts(root: &Path, rendered: &[RenderedDraft]) -> Result<(), Box<dyn Error>> {
+fn publish_imported_drafts(root: &Path, rendered: &[RenderedDraft]) -> Result<(), TaskError> {
     let expected = rendered
         .iter()
         .map(|draft| draft.path.clone())
@@ -384,7 +385,7 @@ fn publish_imported_drafts(root: &Path, rendered: &[RenderedDraft]) -> Result<()
     Ok(())
 }
 
-fn managed_carapace_draft_paths(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+fn managed_carapace_draft_paths(root: &Path) -> Result<Vec<PathBuf>, TaskError> {
     let manifest_path = root.join(DRAFT_MANIFEST_FILE);
     if manifest_path.is_file() {
         let manifest: ImportManifest = read_json_bounded(&manifest_path)?;
@@ -445,7 +446,7 @@ fn managed_carapace_draft_paths(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Err
     Ok(paths)
 }
 
-fn read_existing_carapace_drafts(root: &Path) -> Result<Option<NativeCatalog>, Box<dyn Error>> {
+fn read_existing_carapace_drafts(root: &Path) -> Result<Option<NativeCatalog>, TaskError> {
     let mut commands = Vec::new();
     let mut provenance = None;
     for path in managed_carapace_draft_paths(root)? {
@@ -479,9 +480,7 @@ fn is_carapace_draft_name(name: &str) -> bool {
     name == "carapace-draft" || name.ends_with("-draft")
 }
 
-fn validate_import_configuration(
-    configuration: &ImportConfiguration,
-) -> Result<(), Box<dyn Error>> {
+fn validate_import_configuration(configuration: &ImportConfiguration) -> Result<(), TaskError> {
     if !configuration.source_url.starts_with("https://") {
         return Err(input_error("Carapace source_url must use https://"));
     }
@@ -555,7 +554,7 @@ fn validate_import_configuration(
 fn validate_upstream_license(
     source: &Path,
     configuration: &ImportConfiguration,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     validate_no_symlink_components(source, &configuration.license_file)?;
     let path = source.join(&configuration.license_file);
     let bytes = read_regular_file_bounded(&path, 64 * 1024)?;
@@ -572,7 +571,7 @@ fn validate_upstream_license(
 fn parse_carapace_checkout(
     source: &Path,
     configuration: &ImportConfiguration,
-) -> Result<ParsedCheckout, Box<dyn Error>> {
+) -> Result<ParsedCheckout, TaskError> {
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.file_type().is_dir() {
         return Err(input_error("Carapace source must be a directory"));
@@ -654,7 +653,7 @@ fn parse_carapace_checkout(
     clippy::arithmetic_side_effects,
     reason = "Go parser offsets come from ASCII delimiter searches and source byte limits bound accumulation"
 )]
-fn parse_go_file(source: &str, source_name: &str) -> Result<Vec<ParsedGoCommand>, Box<dyn Error>> {
+fn parse_go_file(source: &str, source_name: &str) -> Result<Vec<ParsedGoCommand>, TaskError> {
     if source.len() > SOURCE_FILE_BYTES_MAX {
         return Err(resource_error(
             "Carapace source file bytes",
@@ -747,7 +746,7 @@ enum GoLexState {
     clippy::arithmetic_side_effects,
     reason = "the scanner checks lookahead bounds and advances over ASCII Go comment delimiters"
 )]
-fn strip_go_comments(source: &str) -> Result<String, Box<dyn Error>> {
+fn strip_go_comments(source: &str) -> Result<String, TaskError> {
     let mut bytes = source.as_bytes().to_vec();
     let mut state = GoLexState::Code;
     let mut escaped = false;
@@ -803,7 +802,7 @@ fn strip_go_comments(source: &str) -> Result<String, Box<dyn Error>> {
     clippy::arithmetic_side_effects,
     reason = "marker and identifier offsets come from ASCII delimiter searches"
 )]
-fn variable_before_marker(source: &str, marker: usize) -> Result<String, Box<dyn Error>> {
+fn variable_before_marker(source: &str, marker: usize) -> Result<String, TaskError> {
     let line_start = source[..marker].rfind('\n').map_or(0, |index| index + 1);
     let prefix = source[line_start..marker].trim();
     let variable = prefix
@@ -814,7 +813,7 @@ fn variable_before_marker(source: &str, marker: usize) -> Result<String, Box<dyn
     Ok(variable.to_owned())
 }
 
-fn matching_brace(source: &str, open: usize) -> Result<usize, Box<dyn Error>> {
+fn matching_brace(source: &str, open: usize) -> Result<usize, TaskError> {
     let bytes = source.as_bytes();
     if bytes.get(open) != Some(&b'{') {
         return Err(input_error("Cobra command marker has no opening brace"));
@@ -871,7 +870,7 @@ fn keyed_go_string(body: &str, key: &str) -> Option<String> {
     clippy::indexing_slicing,
     reason = "the keyed literal parser validates the key and opening delimiter before fixed access"
 )]
-fn keyed_go_string_slice(body: &str, key: &str) -> Result<Vec<String>, Box<dyn Error>> {
+fn keyed_go_string_slice(body: &str, key: &str) -> Result<Vec<String>, TaskError> {
     let Some(line) = body.lines().find(|line| line.trim().starts_with(key)) else {
         return Ok(Vec::new());
     };
@@ -893,7 +892,7 @@ fn keyed_go_string_slice(body: &str, key: &str) -> Result<Vec<String>, Box<dyn E
     clippy::arithmetic_side_effects,
     reason = "string offsets are produced by char_indices and bounded delimiter searches"
 )]
-fn first_go_string(input: &str) -> Option<Result<(String, usize), Box<dyn Error>>> {
+fn first_go_string(input: &str) -> Option<Result<(String, usize), TaskError>> {
     let start = input.find('"')?;
     let mut escaped = false;
     for (relative, character) in input[start + 1..].char_indices() {
@@ -918,7 +917,7 @@ fn first_go_string(input: &str) -> Option<Result<(String, usize), Box<dyn Error>
     clippy::string_slice,
     reason = "consumed offsets returned by the Go string parser are UTF-8 boundaries"
 )]
-fn quoted_go_strings(input: &str) -> Result<Vec<String>, Box<dyn Error>> {
+fn quoted_go_strings(input: &str) -> Result<Vec<String>, TaskError> {
     let mut values = Vec::new();
     let mut rest = input;
     while let Some(result) = first_go_string(rest) {
@@ -939,7 +938,7 @@ fn parse_go_flags(
     source: &str,
     source_name: &str,
     variable: &str,
-) -> Result<ParsedFlags, Box<dyn Error>> {
+) -> Result<ParsedFlags, TaskError> {
     let ParsedFlagActions {
         actions,
         mut omissions,
@@ -1078,7 +1077,7 @@ fn parse_go_flag_actions(
     source: &str,
     source_name: &str,
     variable: &str,
-) -> Result<ParsedFlagActions, Box<dyn Error>> {
+) -> Result<ParsedFlagActions, TaskError> {
     let marker = format!("carapace.Gen({variable}).FlagCompletion(");
     let mut actions = BTreeMap::new();
     let mut omissions = Vec::new();
@@ -1163,7 +1162,7 @@ fn build_command_tree(
     root_variable: &str,
     platforms: &[NativePlatform],
     mut parsed: BTreeMap<String, ParsedGoCommand>,
-) -> Result<NativeCommand, Box<dyn Error>> {
+) -> Result<NativeCommand, TaskError> {
     if !parsed.contains_key(root_variable) {
         return Err(input_error(format!(
             "configured root variable {root_variable} was not found"
@@ -1233,7 +1232,7 @@ fn build_command_tree(
         .ok_or_else(|| input_error(format!("could not build root {root_variable}")))
 }
 
-fn format_sources(root: &Path, check: bool) -> Result<(), Box<dyn Error>> {
+fn format_sources(root: &Path, check: bool) -> Result<(), TaskError> {
     let sources = catalog_source_paths(root)?;
     let mut changed = Vec::new();
     for path in sources {
@@ -1264,7 +1263,7 @@ fn format_sources(root: &Path, check: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn check_catalog(root: &Path) -> Result<(), Box<dyn Error>> {
+fn check_catalog(root: &Path) -> Result<(), TaskError> {
     let (curated, drafts) = load_and_validate_sources(root, true)?;
     validate_separation(&curated, &drafts)?;
     validate_import_artifacts(root, &drafts)?;
@@ -1299,7 +1298,7 @@ fn check_catalog(root: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn build_catalog(root: &Path) -> Result<(), Box<dyn Error>> {
+fn build_catalog(root: &Path) -> Result<(), TaskError> {
     let (curated, drafts) = load_and_validate_sources(root, true)?;
     validate_separation(&curated, &drafts)?;
     validate_import_artifacts(root, &drafts)?;
@@ -1322,7 +1321,7 @@ fn build_catalog(root: &Path) -> Result<(), Box<dyn Error>> {
 fn load_and_validate_sources(
     root: &Path,
     require_canonical: bool,
-) -> Result<(NativeCatalog, Vec<NativeCatalog>), Box<dyn Error>> {
+) -> Result<(NativeCatalog, Vec<NativeCatalog>), TaskError> {
     let _ = catalog_source_paths(root)?;
     let curated_paths = kdl_files(&root.join(CURATED_DIRECTORY))?;
     if curated_paths.is_empty() {
@@ -1344,10 +1343,7 @@ fn load_and_validate_sources(
     Ok((curated, drafts))
 }
 
-fn merge_catalogs(
-    name: &str,
-    catalogs: Vec<NativeCatalog>,
-) -> Result<NativeCatalog, Box<dyn Error>> {
+fn merge_catalogs(name: &str, catalogs: Vec<NativeCatalog>) -> Result<NativeCatalog, TaskError> {
     let mut catalogs = catalogs.into_iter();
     let first = catalogs
         .next()
@@ -1384,7 +1380,7 @@ fn load_one_catalog(
     root: &Path,
     path: &Path,
     require_canonical: bool,
-) -> Result<NativeCatalog, Box<dyn Error>> {
+) -> Result<NativeCatalog, TaskError> {
     let source = read_catalog_source(path)?;
     let name = relative_display(root, path);
     let catalog = parse_native_catalog(&source, &name, NativeCatalogLimits::default())
@@ -1397,7 +1393,7 @@ fn load_one_catalog(
     Ok(catalog)
 }
 
-fn validate_provenance(catalog: &NativeCatalog, draft: bool) -> Result<(), Box<dyn Error>> {
+fn validate_provenance(catalog: &NativeCatalog, draft: bool) -> Result<(), TaskError> {
     if catalog.provenance.author.trim().is_empty()
         || catalog.provenance.license.trim().is_empty()
         || catalog.provenance.source_url.trim().is_empty()
@@ -1437,7 +1433,7 @@ fn validate_provenance(catalog: &NativeCatalog, draft: bool) -> Result<(), Box<d
 fn validate_separation(
     _curated: &NativeCatalog,
     drafts: &[NativeCatalog],
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let mut draft_names = BTreeSet::new();
     for draft in drafts {
         for command in &draft.commands {
@@ -1456,7 +1452,7 @@ fn validate_separation(
     clippy::indexing_slicing,
     reason = "artifact comparison validates equal bounded collections before paired access"
 )]
-fn validate_import_artifacts(root: &Path, drafts: &[NativeCatalog]) -> Result<(), Box<dyn Error>> {
+fn validate_import_artifacts(root: &Path, drafts: &[NativeCatalog]) -> Result<(), TaskError> {
     let configuration: ImportConfiguration = read_json_bounded(&root.join(IMPORT_CONFIGURATION))?;
     validate_import_configuration(&configuration)?;
     let mut imported_commands = Vec::new();
@@ -1580,7 +1576,7 @@ fn validate_import_artifacts(root: &Path, drafts: &[NativeCatalog]) -> Result<()
     Ok(())
 }
 
-fn render_catalog(catalog: &NativeCatalog) -> Result<String, Box<dyn Error>> {
+fn render_catalog(catalog: &NativeCatalog) -> Result<String, TaskError> {
     let mut output = String::new();
     writeln!(output, "catalog {} {{", quote(&catalog.name)?)?;
     writeln!(
@@ -1602,7 +1598,7 @@ fn render_command(
     output: &mut String,
     command: &NativeCommand,
     depth: usize,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let indent = "    ".repeat(depth);
     write!(
         output,
@@ -1653,7 +1649,7 @@ fn render_flag(
     flag: &NativeFlag,
     inherited_platforms: &[NativePlatform],
     indent: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     write!(
         output,
         "{indent}flag {} summary={} description={}",
@@ -1696,7 +1692,7 @@ fn render_argument(
     output: &mut String,
     argument: &NativeArgument,
     indent: &str,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     write!(
         output,
         "{indent}argument {} summary={} description={}",
@@ -1717,7 +1713,7 @@ fn render_argument(
     Ok(())
 }
 
-fn quote(value: &str) -> Result<String, Box<dyn Error>> {
+fn quote(value: &str) -> Result<String, TaskError> {
     Ok(serde_json::to_string(value)?)
 }
 
@@ -1826,7 +1822,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn catalog_source_paths(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+fn catalog_source_paths(root: &Path) -> Result<Vec<PathBuf>, TaskError> {
     let mut paths = kdl_files(&root.join(CURATED_DIRECTORY))?;
     paths.extend(kdl_files(&root.join(DRAFT_DIRECTORY))?);
     paths.sort();
@@ -1853,7 +1849,7 @@ fn catalog_source_paths(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     Ok(paths)
 }
 
-fn kdl_files(directory: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+fn kdl_files(directory: &Path) -> Result<Vec<PathBuf>, TaskError> {
     let metadata = fs::symlink_metadata(directory)?;
     if !metadata.file_type().is_dir() {
         return Err(input_error(format!(
@@ -1889,7 +1885,7 @@ fn kdl_files(directory: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     Ok(paths)
 }
 
-fn read_catalog_source(path: &Path) -> Result<String, Box<dyn Error>> {
+fn read_catalog_source(path: &Path) -> Result<String, TaskError> {
     let bytes = read_regular_file_bounded(path, NativeCatalogLimits::default().source_bytes_max)?;
     let source = String::from_utf8(bytes)
         .map_err(|_| input_error(format!("catalog KDL is not UTF-8: {}", path.display())))?;
@@ -1903,12 +1899,12 @@ fn read_catalog_source(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(source)
 }
 
-fn read_json_bounded<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, Box<dyn Error>> {
+fn read_json_bounded<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, TaskError> {
     let bytes = read_regular_file_bounded(path, SOURCE_FILE_BYTES_MAX)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn read_regular_file_bounded(path: &Path, bytes_max: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+fn read_regular_file_bounded(path: &Path, bytes_max: usize) -> Result<Vec<u8>, TaskError> {
     let metadata = fs::symlink_metadata(path)?;
     validate_input_metadata(path, &metadata, bytes_max)?;
     let observed = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
@@ -1947,7 +1943,7 @@ fn validate_input_metadata(
     path: &Path,
     metadata: &fs::Metadata,
     bytes_max: usize,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     if !metadata.file_type().is_file() {
         return Err(input_error(format!(
             "input is not a regular file: {}",
@@ -1996,7 +1992,7 @@ fn same_file_metadata(expected: &fs::Metadata, observed: &fs::Metadata) -> bool 
         && expected.modified().ok() == observed.modified().ok()
 }
 
-fn checkout_revision(source: &Path) -> Result<String, Box<dyn Error>> {
+fn checkout_revision(source: &Path) -> Result<String, TaskError> {
     let dot_git = source.join(".git");
     let metadata = fs::symlink_metadata(&dot_git)?;
     let git_directory = if metadata.file_type().is_dir() {
@@ -2036,7 +2032,7 @@ fn verify_checkout_sources(
     source: &Path,
     revision: &str,
     configuration: &ImportConfiguration,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let roots = expanded_import_roots(configuration);
     let mut files = roots
         .iter()
@@ -2082,7 +2078,7 @@ fn verify_checkout_sources(
     clippy::arithmetic_side_effects,
     reason = "poll counts are bounded by the subprocess deadline"
 )]
-fn run_bounded_git(source: &Path, arguments: &[String]) -> Result<ExitStatus, Box<dyn Error>> {
+fn run_bounded_git(source: &Path, arguments: &[String]) -> Result<ExitStatus, TaskError> {
     let mut child = Command::new("git")
         .args([
             "-c",
@@ -2121,7 +2117,7 @@ fn run_bounded_git(source: &Path, arguments: &[String]) -> Result<ExitStatus, Bo
     }
 }
 
-fn validate_revision(revision: &str) -> Result<(), Box<dyn Error>> {
+fn validate_revision(revision: &str) -> Result<(), TaskError> {
     if revision.len() == 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
     } else {
@@ -2135,7 +2131,7 @@ fn validate_revision(revision: &str) -> Result<(), Box<dyn Error>> {
     clippy::indexing_slicing,
     reason = "platform tuples are validated as exactly two fields before access"
 )]
-fn parse_platforms(values: &[String]) -> Result<Vec<NativePlatform>, Box<dyn Error>> {
+fn parse_platforms(values: &[String]) -> Result<Vec<NativePlatform>, TaskError> {
     if values.is_empty() {
         return Ok(vec![NativePlatform::Any]);
     }
@@ -2163,7 +2159,7 @@ fn parse_platforms(values: &[String]) -> Result<Vec<NativePlatform>, Box<dyn Err
     Ok(platforms)
 }
 
-fn validate_relative_source_path(value: &str) -> Result<(), Box<dyn Error>> {
+fn validate_relative_source_path(value: &str) -> Result<(), TaskError> {
     let path = Path::new(value);
     validate_normalized_relative_path(value, "Carapace source path")?;
     if path.extension() != Some(OsStr::new("go")) {
@@ -2174,7 +2170,7 @@ fn validate_relative_source_path(value: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn validate_normalized_relative_path(value: &str, label: &str) -> Result<(), Box<dyn Error>> {
+fn validate_normalized_relative_path(value: &str, label: &str) -> Result<(), TaskError> {
     let path = Path::new(value);
     if path.as_os_str().is_empty()
         || path
@@ -2188,7 +2184,7 @@ fn validate_normalized_relative_path(value: &str, label: &str) -> Result<(), Box
     Ok(())
 }
 
-fn validate_no_symlink_components(root: &Path, relative: &str) -> Result<(), Box<dyn Error>> {
+fn validate_no_symlink_components(root: &Path, relative: &str) -> Result<(), TaskError> {
     let mut path = root.to_path_buf();
     for component in Path::new(relative).components() {
         let Component::Normal(component) = component else {
@@ -2208,7 +2204,7 @@ fn validate_no_symlink_components(root: &Path, relative: &str) -> Result<(), Box
     Ok(())
 }
 
-fn validate_go_identifier(value: &str) -> Result<(), Box<dyn Error>> {
+fn validate_go_identifier(value: &str) -> Result<(), TaskError> {
     let mut bytes = value.bytes();
     let valid = bytes
         .next()
@@ -2221,7 +2217,7 @@ fn validate_go_identifier(value: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn validate_catalog_identifier(value: &str) -> Result<(), Box<dyn Error>> {
+fn validate_catalog_identifier(value: &str) -> Result<(), TaskError> {
     let mut bytes = value.bytes();
     let valid = bytes
         .next()
@@ -2238,7 +2234,7 @@ fn validate_catalog_identifier(value: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn validate_long_name(value: &str) -> Result<(), Box<dyn Error>> {
+fn validate_long_name(value: &str) -> Result<(), TaskError> {
     if !value.is_empty()
         && value
             .bytes()
@@ -2263,7 +2259,7 @@ impl Drop for TemporaryFile {
     }
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), TaskError> {
     let parent = path
         .parent()
         .ok_or_else(|| input_error("output has no parent directory"))?;
@@ -2316,7 +2312,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     ))
 }
 
-fn map_diagnostic(diagnostic: NativeCatalogDiagnostic) -> Box<dyn Error> {
+fn map_diagnostic(diagnostic: NativeCatalogDiagnostic) -> TaskError {
     let mut message = format!(
         "native catalog {:?}: {}: {}",
         diagnostic.kind, diagnostic.source_name, diagnostic.message
@@ -2335,11 +2331,11 @@ fn map_diagnostic(diagnostic: NativeCatalogDiagnostic) -> Box<dyn Error> {
     input_error(message)
 }
 
-fn input_error(message: impl Into<String>) -> Box<dyn Error> {
+fn input_error(message: impl Into<String>) -> TaskError {
     io::Error::new(io::ErrorKind::InvalidInput, message.into()).into()
 }
 
-fn resource_error(label: &str, limit: usize, observed: usize) -> Box<dyn Error> {
+fn resource_error(label: &str, limit: usize, observed: usize) -> TaskError {
     input_error(format!(
         "resource limit exceeded for {label}: limit {limit}, observed {observed}"
     ))

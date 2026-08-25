@@ -15,7 +15,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
     env,
-    error::Error,
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{self, BufWriter, Read, Write},
@@ -25,6 +24,8 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+use crate::TaskError;
 
 const REPORT_SCHEMA_VERSION: u32 = 1;
 const SESSION_SOURCE_BYTES_MAX: usize = 64 * 1024;
@@ -252,7 +253,7 @@ enum CaptureEvent {
     },
 }
 
-pub fn run(options: SimulationOptions) -> Result<SimulationResult, Box<dyn Error>> {
+pub fn run(options: SimulationOptions) -> Result<SimulationResult, TaskError> {
     validate_options(&options)?;
     let search_path = env::var_os("PATH")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "PATH is not configured"))?;
@@ -518,7 +519,7 @@ fn evaluate_session(
     context: &EvaluationContext<'_>,
     session_index: usize,
     generated: GeneratedSession,
-) -> Result<SessionRecord, Box<dyn Error>> {
+) -> Result<SessionRecord, TaskError> {
     let session_root = context
         .temporary_root
         .join(format!("session-{session_index:05}"));
@@ -600,7 +601,7 @@ fn run_quirl(
     script: &Path,
     working_directory: &Path,
     search_path: &OsStr,
-) -> Result<RunnerCapture, Box<dyn Error>> {
+) -> Result<RunnerCapture, TaskError> {
     let mut command = Command::new(executable);
     command.args([
         OsStr::new("run"),
@@ -646,7 +647,7 @@ fn run_reference(
     working_directory: &Path,
     search_path: &OsStr,
     is_bash: bool,
-) -> Result<RunnerCapture, Box<dyn Error>> {
+) -> Result<RunnerCapture, TaskError> {
     let mut command = Command::new(executable);
     if is_bash {
         command.args(["--noprofile", "--norc", "-c", source]);
@@ -906,7 +907,7 @@ fn classify(
     clippy::arithmetic_side_effects,
     reason = "manifest entry counts are bounded by the simulation filesystem limit"
 )]
-fn filesystem_manifest(root: &Path) -> Result<FilesystemManifest, Box<dyn Error>> {
+fn filesystem_manifest(root: &Path) -> Result<FilesystemManifest, TaskError> {
     let mut stack = vec![(root.to_path_buf(), 0_usize)];
     let mut files = Vec::new();
     let mut total_bytes = 0_usize;
@@ -981,7 +982,7 @@ fn interpreter_identity(
     name: &str,
     search_path: &OsStr,
     workspace_root: &Path,
-) -> Result<InterpreterIdentity, Box<dyn Error>> {
+) -> Result<InterpreterIdentity, TaskError> {
     let executable = resolve_executable(name, search_path).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -1017,7 +1018,7 @@ fn resolve_executable(name: &str, search_path: &OsStr) -> Option<PathBuf> {
         .and_then(|candidate| candidate.canonicalize().ok())
 }
 
-fn write_failure(run_directory: &Path, record: &SessionRecord) -> Result<(), Box<dyn Error>> {
+fn write_failure(run_directory: &Path, record: &SessionRecord) -> Result<(), TaskError> {
     let failures_directory = run_directory.join("failures");
     create_directory_durable(&failures_directory)?;
     let directory = failures_directory.join(format!("session-{:05}", record.session));
@@ -1042,7 +1043,7 @@ fn write_summary(
     bash: &InterpreterIdentity,
     zsh: &InterpreterIdentity,
     counts: &SimulationCounts,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), TaskError> {
     let result = if counts.mismatches == 0 {
         "passed"
     } else {

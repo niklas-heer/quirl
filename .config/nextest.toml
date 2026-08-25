@@ -1,0 +1,9 @@
+# Keep local runs compact while making performance regressions visible. A slow
+# test is reported after two seconds but is not terminated; test-owned resource
+# limits remain the authoritative timeout and cleanup mechanism.
+[profile.default]
+status-level = "slow"
+final-status-level = "slow"
+slow-timeout = "2s"
+failure-output = "immediate-final"
+success-output = "never"

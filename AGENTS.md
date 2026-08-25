@@ -260,9 +260,9 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
 
 - `cargo xtask check` is the canonical local quality gate and must pass before
   every commit. It includes the workspace Rustdoc build and missing-public-docs
-  enforcement. The only CI workflow is the bounded daily Bash/Zsh simulation swarm;
-  other local Cargo tasks deliberately remain local while project traffic is
-  low.
+  enforcement. Pull requests and pushes to `main` run this same gate in CI with
+  bounded test parallelism; the larger replayable Bash/Zsh simulation swarm runs
+  separately each day.
 - Conventional commits (`feat`, `fix`, `docs`, `refactor`, `chore`, `bench`),
   present tense, optionally scoped, e.g. `feat(lua): add completion budgets`.
 - Significant design choices go through an ADR in `docs/decisions/`.
