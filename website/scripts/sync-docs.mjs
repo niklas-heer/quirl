@@ -69,6 +69,7 @@ const documents = [
   ['docs/decisions/0024-kdl-native-command-catalog.md', 'architecture/decisions/0024-kdl-native-command-catalog.mdx'],
   ['docs/decisions/0025-fine-tuned-command-retrieval-model.md', 'architecture/decisions/0025-fine-tuned-command-retrieval-model.mdx'],
   ['docs/decisions/0026-rust-native-releases-and-runtime-assets.md', 'architecture/decisions/0026-rust-native-releases-and-runtime-assets.mdx'],
+  ['docs/decisions/0027-lua-5-5-1-runtime.md', 'architecture/decisions/0027-lua-5-5-1-runtime.mdx'],
 ];
 
 const pageBySource = new Map(documents);

@@ -1,7 +1,7 @@
 # AGENTS.md — working on Quirl
 
 Quirl is a Rust workspace implementing a shell with typed data pipelines and
-an embedded, sandboxed Lua 5.4 extension runtime. This file captures the
+an embedded, sandboxed Lua 5.5.1 extension runtime. This file captures the
 project-specific rules that generic Rust knowledge won't give you.
 
 ## Engineering priorities: safety, performance, developer experience
@@ -231,7 +231,7 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
   features from newer compilers.
 - `spikes/` directories are intentionally separate Cargo workspaces so that
   mutually exclusive engine features (Luau, QuickJS, …) never unify with the
-  shell's Lua 5.4 build. Never add spikes as workspace members or import
+  shell's Lua 5.5.1 build. Never add spikes as workspace members or import
   their dependencies into `crates/`.
 - `quirl-bench` is research tooling (`publish = false`), not product code.
 - Unsafe Rust is prohibited in `crates/` except for the private `cfg(windows)`

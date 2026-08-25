@@ -2,9 +2,11 @@
 
 **Decision 1.2 · Accepted · 15 August 2026**
 
-> **Outcome:** Quirl’s extension language is **Lua 5.4**.
+> **Outcome:** Quirl’s extension language is **Lua**. This selection report
+> evaluated Lua 5.4; the current runtime is Lua 5.5.1 under
+> [ADR 0027](decisions/0027-lua-5-5-1-runtime.md).
 
-Rust owns Quirl’s shell, executor, built-ins, value model, and performance-critical logic. Lua 5.4 is the deliberately small, recognizable extension language for configuration, scripts, and trusted plugins. Quirl supplies a modern experience with generated annotations, completion, linting, formatting, schema validation, and strict Rust boundary checks.
+Rust owns Quirl’s shell, executor, built-ins, value model, and performance-critical logic. Lua is the deliberately small, recognizable extension language for configuration, scripts, and trusted plugins. Quirl supplies a modern experience with generated annotations, completion, linting, formatting, schema validation, and strict Rust boundary checks. The historical measurements below remain Lua 5.4 evidence and are not attributed to the Lua 5.5.1 runtime.
 
 ## 1. Outcome
 
@@ -114,7 +116,7 @@ GitHub’s 2025 contributor data placed TypeScript first and Python second. Stac
 
 Neovim uses Lua for configuration and plugins and recommends annotations plus LuaLS for larger plugins. WezTerm uses a Lua script as configuration. That is stronger target-adjacent evidence for Lua-family familiarity than a web-wide ranking, though it remains an inference rather than a Quirl user survey.
 
-Quirl uses Lua 5.4 source and `.lua` files, not a private dialect presented as Lua. Its restricted environment and generated `quirl` API replace ambient shell access with explicit capabilities.
+Quirl uses Lua 5.5.1 source and `.lua` files, not a private dialect presented as Lua. Its restricted environment and generated `quirl` API replace ambient shell access with explicit capabilities.
 
 The first usability validation should include Rust/CLI, shell/DevOps, JavaScript/TypeScript, Python, and Neovim/Lua users. Each participant should configure a prompt segment, write a command plugin, handle a structured error, and fix a lint or schema diagnostic. Time to a correct result matters more than preference polling.
 
@@ -137,9 +139,9 @@ The isolated Rust probes resolved 12 packages for QuickJS alone, 24 for Lua/Fenn
 
 ### One familiar extension language, with Rust enforcing the contract
 
-Choose Lua 5.4 for configuration, scripts, and trusted plugins. Its familiarity, tiny footprint, longevity, and mature `mlua` bridge outweigh Luau’s stronger analysis. Quirl delivers IDE-quality assistance through generated SDK annotations and metadata, while Rust schemas validate all values before state changes.
+Choose Lua for configuration, scripts, and trusted plugins. Its familiarity, tiny footprint, longevity, and mature `mlua` bridge outweigh Luau’s stronger analysis. The original selection used Lua 5.4 evidence; ADR 0027 advances the runtime to 5.5.1. Quirl delivers IDE-quality assistance through generated SDK annotations and metadata, while Rust schemas validate all values before state changes.
 
-1. **Implemented:** `quirl-lua` embeds pinned Lua 5.4 through `mlua` with restricted libraries, capabilities, memory/instruction/time budgets, and cancellation.
+1. **Implemented:** `quirl-lua` embeds pinned Lua 5.5.1 through `mlua` with restricted libraries, capabilities, memory/instruction/time budgets, and cancellation.
 2. **Implemented:** one Rust host definition generates LuaLS stubs, completion data, Markdown, and AI-readable JSON.
 3. **Implemented:** configuration, scripts, prompt segments, and completion providers run through the same Rust-validated API; live prompt and IDE completion consume plugin callbacks.
 4. **Implemented:** the rejected prototype runtime, CLI bridge, workspace crate, dependencies, examples, and executable benchmark paths are removed.

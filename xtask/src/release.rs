@@ -866,14 +866,28 @@ fn release_dependencies_for_target(
             )));
         }
         let package = &candidates[0];
-        let Some(source) = package.source.as_deref() else {
+        let source = if let Some(source) = package.source.as_deref() {
+            source.to_owned()
+        } else {
             if !package.manifest_path.starts_with(root) {
                 return Err(input_error(format!(
                     "path dependency {} v{} is outside the Quirl workspace and has no auditable source identity",
                     package.name, package.version
                 )));
             }
-            continue;
+            let vendor_root = root.join("vendor");
+            if !package.manifest_path.starts_with(&vendor_root) {
+                continue;
+            }
+            let package_root = package
+                .manifest_path
+                .parent()
+                .ok_or_else(|| input_error("Cargo package manifest has no parent directory"))?;
+            let relative_package_root = package_root
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            format!("vendored+{relative_package_root}")
         };
         let declared_license = declared_package_license(package)?;
         let package_root = package
@@ -886,7 +900,7 @@ fn release_dependencies_for_target(
                 name: package.name.clone(),
                 version: package.version.clone(),
                 declared_license,
-                source: source.to_owned(),
+                source,
                 repository: package.repository.clone().unwrap_or_else(|| "-".to_owned()),
             },
             package_root,
@@ -2686,7 +2700,8 @@ mod tests {
             report
                 .contains("keybindings v0.0.2:reviewed-fallback/keybindings-0.0.2-Apache-2.0.txt")
         );
-        assert!(report.contains("mlua-sys v0.11.0:reviewed-fallback/mlua-sys-0.11.0-MIT.txt"));
+        assert!(report.contains("mlua-sys v0.11.0:LICENSE"));
+        assert!(report.contains("source: vendored+vendor/mlua-sys"));
         assert!(
             report.contains("number_prefix v0.4.0:reviewed-fallback/number_prefix-0.4.0-MIT.txt")
         );

@@ -12,7 +12,7 @@
 ## Context
 
 Lua instruction hooks enforce instruction, cancellation, and elapsed-time
-checks only while the interpreter dispatches Lua instructions. Lua 5.4 library
+checks only while the interpreter dispatches Lua instructions. Lua library
 functions implemented in native C can run without dispatching a hook. A host
 watchdog thread cannot safely close or otherwise access that thread's
 `lua_State`, and abandoning the thread would retain unbounded work. Therefore

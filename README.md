@@ -53,7 +53,7 @@ Quirl does that for the command line.
   filtering, selection, sorting, and structured output—without pretending byte
   streams and values are the same thing.
 - **One Lua SDK** powers configuration, scripts, prompt segments, completion
-  providers, and trusted plugins inside a restricted, resource-budgeted Lua 5.4
+  providers, and trusted plugins inside a restricted, resource-budgeted Lua 5.5.1
   runtime.
 - **One semantic catalog** drives completion, contextual help, generated
   documentation, and AI-facing command metadata so those surfaces do not drift.
@@ -113,15 +113,18 @@ Release operators should use [the Rust-native release procedure](docs/releasing.
 
 ## Status
 
-The integrated 0.1 implementation has native C1-core command
+The current development implementation has native C1-core command
 execution on Linux and macOS; a bounded, focused typed-data runtime; a
-restricted Lua 5.4 runner and SDK; permission-locked trusted-Lua plugin command
+restricted Lua 5.5.1 runner and SDK; permission-locked trusted-Lua plugin command
 dispatch; a semantic catalog and language service; and rich/simple terminal
 surfaces with explicit process and recovery boundaries. Repository tests cover
 these behaviors; release evidence and support attach only to the exact commit
 and artifacts named by an immutable release. The runtime contracts live in
 `Catalog::builtin()` and `HOST_API`; the generated references and website are
 projections, not competing specifications.
+
+The supported `v0.1.0` artifacts retain their recorded Lua 5.4 runtime; the
+Lua 5.5.1 upgrade is currently unreleased source-tree behavior.
 
 The supported release is
 [`v0.1.0`](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0), published

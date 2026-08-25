@@ -122,7 +122,7 @@ Lua ABI v1 has no finite input-batch or live-stream handle. Adding either would
 require a later versioned ABI with backpressure, cancellation, cleanup, and
 ownership semantics.
 
-Trusted Lua uses the pinned restricted Lua 5.4 runtime. Managed runtimes are
+Trusted Lua uses the pinned restricted Lua 5.5.1 runtime. Managed runtimes are
 constructed with exactly the granted capability strings. Host registration
 values are deny-unknown Rust schemas; command metadata is typed and complete;
 callbacks retain instruction, memory, cancellation, and deadline enforcement.

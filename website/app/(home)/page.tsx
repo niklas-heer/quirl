@@ -39,7 +39,7 @@ export default function HomePage() {
         </h1>
         <p className="lede">
           Quirl keeps the Bash and Zsh commands you already know, then adds
-          explicit typed data pipelines and one sandboxed Lua 5.4 SDK for
+          explicit typed data pipelines and one sandboxed Lua 5.5.1 SDK for
           configuration, scripts, prompts, completions, and plugins.
         </p>
         <div className="actions">
@@ -122,7 +122,7 @@ export default function HomePage() {
             <div className="cassette-body">
               <h3>Sandboxed Lua</h3>
               <p>
-                One restricted, resource-budgeted Lua 5.4 runtime powers the
+                One restricted, resource-budgeted Lua 5.5.1 runtime powers the
                 programmable surface behind a Rust-validated boundary.
               </p>
             </div>

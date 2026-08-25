@@ -29,7 +29,7 @@ untagged source remains candidate or development work:
   supports the sources, bridges, transforms, materialization points, limits,
   and exclusions documented in [the data runtime](/docs/guides/typed-data-runtime); bytes and
   values only cross at named boundaries.
-- Restricted Lua 5.4 runs configuration, scripts, and trusted-Lua plugin
+- Restricted Lua 5.5.1 runs configuration, scripts, and trusted-Lua plugin
   commands under the typed runner ABI v1. `HOST_API` is the complete executable
   Lua interface; generated stubs and prose are projections of it.
 - Managed plugins have locked grants, bounded event/panel/completion work, and
@@ -331,7 +331,7 @@ bash ./legacy-deploy.sh   # explicit always wins
 
 ### Small shell syntax. Strong values. Streaming by default.
 
-Quirl’s interactive data notation is expression-oriented and gradually typed, but deliberately remains a focused shell surface. It is parseable, formattable, and lintable; general-purpose modules and scripts use Lua 5.4.
+Quirl’s interactive data notation is expression-oriented and gradually typed, but deliberately remains a focused shell surface. It is parseable, formattable, and lintable; general-purpose modules and scripts use Lua 5.5.1.
 
 **Pipeline stages:** producer → `Stream<T>` with provenance → lazy, backpressured transform → `Result` → table/JSON/text/TUI/API renderer.
 
@@ -450,15 +450,15 @@ Diagnostic rendering supports human, compact, JSON, and GitHub Actions formats f
 
 Quirl needs one canonical general-purpose language for scripts, configuration, custom commands, prompt components, keymaps, and trusted UI extensions. The concise command/data notation remains the interactive shell surface; it does not grow into a second general-purpose language.
 
-> **Accepted: Lua 5.4.** Rust remains Quirl’s implementation language; Lua is the sole first-class language for configuration, scripts, and trusted plugins. Familiarity, a measured 0.58 MiB runtime probe, longevity, and the mature `mlua` bridge outweigh Luau’s stronger analyzer for this extension-only role. Read the [decision report](/docs/architecture/why-lua) and [ADR 0001](/docs/architecture/decisions/0001-lua-extension-language).
+> **Accepted: Lua.** Rust remains Quirl’s implementation language; Lua is the sole first-class language for configuration, scripts, and trusted plugins. The selection evidence measured Lua 5.4; the production source tree now pins Lua 5.5.1 under [ADR 0027](/docs/architecture/decisions/0027-lua-5-5-1-runtime). Familiarity, a small runtime, longevity, and the mature `mlua` bridge outweigh Luau’s stronger analyzer for this extension-only role. Read the [decision report](/docs/architecture/why-lua) and [ADR 0001](/docs/architecture/decisions/0001-lua-extension-language).
 
-The first Lua slice embeds restricted Lua 5.4; generates LuaLS/JSON/Markdown SDK views; validates configuration with Rust schemas; atomically reloads config and plugins at safe prompt boundaries; and applies keymap, prompt, picker, and extension settings to the editor. The rejected prototype runtime and all executable/dependency paths are removed.
+The first Lua slice embedded restricted Lua 5.4. The current source tree embeds restricted Lua 5.5.1; generates LuaLS/JSON/Markdown SDK views; validates configuration with Rust schemas; atomically reloads config and plugins at safe prompt boundaries; and applies keymap, prompt, picker, and extension settings to the editor. The rejected prototype runtime and all executable/dependency paths are removed.
 
 Quirl generates LuaLS-compatible annotations, completion metadata, docs, and AI schemas from Rust host definitions. `quirl check` parses, lints, resolves modules and capabilities, and validates known schemas without execution. Rust validates every host value before mutation, but Quirl does not promise sound static typing for arbitrary Lua.
 
 | Candidate | Strength | Core risk | Position |
 | --- | --- | --- | --- |
-| Lua 5.4 | Recognizable syntax, tiny mature VM, established tooling and `mlua` bridge | Dynamic semantics require annotations, linting, schemas, boundary diagnostics | Accepted core extension language |
+| Lua (5.4 selection evidence; 5.5.1 current runtime) | Recognizable syntax, tiny mature VM, established tooling and `mlua` bridge | Dynamic semantics require annotations, linting, schemas, boundary diagnostics | Accepted core extension language |
 | Luau strict | Fast embedding, inference, checker, analyzer/autocomplete, sandboxing | New language identity, C++ analyzer bridge, version coordination | Revisit only if Lua evidence demands it |
 | Rhai | Excellent pure-Rust API, resource controls, tiny startup | Smaller user ecosystem and less terminal-tool familiarity | Research result |
 | TypeScript 7 + QuickJS-NG | Familiar typed surface, official checker/service, tiny JS VM | Go checker sidecar, TS→JS cache, source maps, three upstreams, ≈31 MiB installed and ≈99 MiB checker RSS | Demoted on total complexity |
@@ -528,7 +528,7 @@ quirl run --lang zsh release.zsh
 
 | Script kind | Execution model | Status |
 | --- | --- | --- |
-| `.lua` | Pinned Lua 5.4 through `mlua`; generated annotations/bindings; restricted modules and explicit capabilities | Core commitment |
+| `.lua` | Pinned Lua 5.5.1 through `mlua`; generated annotations/bindings; restricted modules and explicit capabilities | Core commitment |
 | `.qrl` | Focused command/data scripts lowered to the shared execution plan; `.quirl` and `.🌀` are input aliases | Core commitment |
 | `.luau` / `.rhai` / `.ts` | Measured alternatives; no second core SDK or config ecosystem | Research or future optional runners |
 | `.fnl` | Compile to cached Lua, then use the Lua engine and same host adapter | Companion to Lua |
@@ -617,7 +617,7 @@ return config
 
 | Concern | Contract |
 | --- | --- |
-| One language | Settings, prompt logic, keymaps, hooks, commands, extensions use Lua 5.4. `quirl.config` is ordinary Lua backed by generated annotations and authoritative Rust schemas. |
+| One language | Settings, prompt logic, keymaps, hooks, commands, extensions use Lua 5.5.1. `quirl.config` is ordinary Lua backed by generated annotations and authoritative Rust schemas. |
 | Round trip | A concrete-syntax-tree patcher changes only recognized literal arguments, preserving comments, layout, unknown plugin forms, and surrounding code. Writes are atomic and retain a recoverable prior version. |
 | Live synchronization | Browser reads refresh from the authoritative file and saves re-check it before writing. Unsaved browser changes use a three-way merge; conflicts show a diff instead of silently winning. No background watcher is claimed. |
 | Validation | Versioned schema supplies types, ranges, deprecations, platform support, examples, plugin settings. `quirl config check` parses/lints Lua, validates known annotations and returned config through Rust schema, and never activates invalid state. |
@@ -957,7 +957,7 @@ On 15 August 2026, the following decisions were reviewed and agreed:
 - **Three explicit interactive modes:** normal mode uses bytes and compatibility syntax; data mode uses typed value pipelines; AI mode searches local command knowledge and inserts a selected command for review without execution.
 - **C0–C4 compatibility levels:** optimize copy/paste and common interactive syntax; use reference interpreters for exact dialect behavior.
 - **Result-based errors outside command mode:** retain traditional status interactively; require explicit failure handling in data pipelines and scripts.
-- **Lua 5.4 as the extension language:** Rust implements the product; one pinned Lua runtime and generated `quirl` SDK serve config, scripts, trusted plugins; annotations improve tooling while Rust schemas enforce boundaries.
+- **Lua as the extension language:** Rust implements the product; one pinned Lua 5.5.1 runtime and generated `quirl` SDK serve config, scripts, trusted plugins; annotations improve tooling while Rust schemas enforce boundaries.
 - **Batteries-included scope:** ship coherent navigation, discovery, data, views, developer context, operations.
 - **One composed semantic command catalog:** completion, highlighting, docs,
   validation, AI discovery, and plugins consume one versioned `CommandSpec`
@@ -975,8 +975,9 @@ The Draft 0.9 questions now have implemented dispositions:
 
 1. Rust `HOST_API` definitions generate the LuaLS annotations, runtime bindings,
    Markdown, and JSON views; Rust boundary validation remains authoritative.
-2. Quirl pins vendored Lua 5.4. A Lua 5.5 move requires a deliberate runtime,
-   SDK, compatibility, and benchmark review rather than an automatic upgrade.
+2. Quirl pins vendored Lua 5.5.1. Runtime-version moves require a deliberate
+   runtime, SDK, compatibility, and benchmark review rather than an automatic
+   upgrade; ADR 0027 records the 5.5.1 review.
 3. Lua receives only the restricted table, string, math, and UTF-8 libraries;
    ambient `io`, `os`, `debug`, `require`, and `package` stay unavailable.
 4. `LuaPolicy` combines memory, instruction, wall-clock, callback, and

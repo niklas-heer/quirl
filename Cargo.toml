@@ -35,7 +35,7 @@ getrandom = "0.3"
 indexmap = { version = "2.14", features = ["serde"] }
 # Source spans support inert diagnostics; legacy-v1 and fallback parsing stay disabled.
 kdl = { version = "6.5", default-features = false, features = ["span"] }
-mlua = { version = "0.12", features = ["lua54", "vendored", "serialize", "send"] }
+mlua = { version = "0.12", features = ["lua55", "vendored", "serialize", "send"] }
 nu-ansi-term = "0.50"
 nix = { version = "0.30", features = ["process", "signal", "term"] }
 os_pipe = "1.2"
@@ -54,6 +54,12 @@ unicode-width = "0.2.2"
 ureq = { version = "=3.3.0", default-features = false, features = ["rustls"] }
 wasmparser = { version = "0.256", default-features = false, features = ["std", "validate", "component-model"] }
 xshell = "0.2.7"
+
+[patch.crates-io]
+# mlua-sys 0.11.0 caps lua-src below 551 even though its Lua 5.5 bindings are
+# compatible. Keep this source-identical patch until upstream accepts
+# lua-src 551.x, then remove the patch and vendor/mlua-sys together.
+mlua-sys = { path = "vendor/mlua-sys" }
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }

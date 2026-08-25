@@ -1,6 +1,6 @@
 [package]
 name = "quirl-lua"
-description = "Quirl's restricted Lua 5.4 extension runtime and generated SDK metadata"
+description = "Quirl's restricted Lua 5.5.1 extension runtime and generated SDK metadata"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

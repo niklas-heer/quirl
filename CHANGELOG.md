@@ -10,6 +10,14 @@ only after its exact commit and artifacts pass the
 
 ## [Unreleased]
 
+### Changed
+
+- The unreleased source tree now embeds vendored Lua 5.5.1 through `mlua`'s
+  `lua55` bindings. The restricted standard library, typed Rust boundary,
+  execution budgets, and supervised-worker containment remain unchanged.
+  Lua 5.5 language incompatibilities apply to scripts, including read-only
+  numeric and generic `for` control variables.
+
 ### Added
 
 - A recorded VHS terminal demo and an asciinema/`asg` text-tour SVG, embedded

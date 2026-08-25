@@ -133,7 +133,7 @@ pub enum ExecutionMode {
     QuirlScript,
     /// Quirl's focused structured-data evaluator.
     Data,
-    /// The restricted Lua 5.4 runtime.
+    /// The restricted Lua 5.5.1 runtime.
     Lua,
     /// A typed Lua runner module invoked through `quirl run`.
     LuaScript,

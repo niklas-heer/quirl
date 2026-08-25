@@ -3,6 +3,8 @@
 - Status: Accepted
 - Date: 2026-08-15
 - Decision owners: Quirl maintainers
+- Superseded in part: the Lua 5.4 runtime pin is replaced by Lua 5.5.1 in
+  [ADR 0027](0027-lua-5-5-1-runtime.md)
 - Applies to: configuration, scripts, trusted plugins, prompt components, completion providers, and keymaps
 
 ## Context

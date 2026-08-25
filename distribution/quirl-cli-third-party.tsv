@@ -92,7 +92,7 @@ litrs	1.0.0	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/
 lock_api	0.4.14	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/Amanieu/parking_lot
 log	0.4.33	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-lang/log
 lru	0.18.2	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/jeromefroe/lru-rs.git
-lua-src	550.1.1	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/mlua-rs/lua-src-rs
+lua-src	551.0.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/mlua-rs/lua-src-rs
 luajit-src	210.7.2+b925b3e	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/mlua-rs/luajit-src-rs
 macro_rules_attribute	0.2.3	linux,macos	Apache-2.0 OR MIT OR Zlib	registry+https://github.com/rust-lang/crates.io-index	https://github.com/danielhenrymantilla/macro_rules_attribute-rs
 macro_rules_attribute-proc_macro	0.2.3	linux,macos	Apache-2.0 OR MIT OR Zlib	registry+https://github.com/rust-lang/crates.io-index	https://github.com/danielhenrymantilla/macro_rules_attribute-rs
@@ -102,7 +102,7 @@ miette	7.6.0	linux,macos	Apache-2.0	registry+https://github.com/rust-lang/crates
 minimal-lexical	0.2.1	linux,macos	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/Alexhuszagh/minimal-lexical
 mio	1.2.2	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/tokio-rs/mio
 mlua	0.12.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/mlua-rs/mlua
-mlua-sys	0.11.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/mlua-rs/mlua
+mlua-sys	0.11.0	linux,macos	MIT	vendored+vendor/mlua-sys	https://github.com/mlua-rs/mlua
 model2vec-rs	0.2.1	linux,macos	LicenseRef-file:LICENSE	registry+https://github.com/rust-lang/crates.io-index	https://github.com/MinishLab/model2vec-rs
 monostate	0.1.18	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/monostate
 monostate-impl	0.1.18	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/monostate

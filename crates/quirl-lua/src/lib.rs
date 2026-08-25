@@ -1,4 +1,4 @@
-//! Restricted Lua 5.4 runtime for Quirl configuration, scripts, and trusted plugins.
+//! Restricted Lua 5.5.1 runtime for Quirl configuration, scripts, and trusted plugins.
 
 #![cfg_attr(
     test,
@@ -1705,7 +1705,7 @@ impl ConfigStore {
     }
 }
 
-/// Sandboxed Lua 5.4 VM with explicit policy, capabilities, and callback registries.
+/// Sandboxed Lua 5.5.1 VM with explicit policy, capabilities, and callback registries.
 ///
 /// Only table, string, math, and UTF-8 standard libraries are installed. `io`,
 /// `os`, `debug`, `package`, `require`, and the dynamic chunk loader remain
@@ -6279,6 +6279,12 @@ mod tests {
 
         runtime.clear_cancellation();
         assert_eq!(runtime.eval("return 42").unwrap(), 42);
+    }
+
+    #[test]
+    fn runtime_reports_lua_5_5() {
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        assert_eq!(runtime.eval("return _VERSION").unwrap(), "Lua 5.5");
     }
 
     #[test]

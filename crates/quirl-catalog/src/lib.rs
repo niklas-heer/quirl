@@ -607,7 +607,7 @@ impl Catalog {
                     "lua",
                     "lua <expression>",
                     "Evaluate Lua without leaving command mode",
-                    "Runs an expression in the persistent restricted Lua 5.4 VM.",
+                    "Runs an expression in the persistent restricted Lua 5.5.1 VM.",
                     vec![],
                     &["lua return 20 + 22"],
                     &[],
