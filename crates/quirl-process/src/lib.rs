@@ -3357,6 +3357,14 @@ mod platform {
         Ok(None)
     }
 
+    fn process_group_may_have_disappeared_after_exec(
+        set_result: Result<(), Errno>,
+        observed_group: Result<Pid, Errno>,
+    ) -> bool {
+        matches!(set_result, Err(Errno::ESRCH | Errno::EACCES))
+            && observed_group == Err(Errno::ESRCH)
+    }
+
     fn verify_process_group(
         child: &mut Child,
         process_id: i32,
@@ -3370,7 +3378,12 @@ mod platform {
         if observed_group == Ok(expected_group) {
             return Ok(ProcessGroupVerification::Live);
         }
-        if set_result == Err(Errno::ESRCH) && observed_group == Err(Errno::ESRCH) {
+        // A child that completed the configured pre-exec group join may exec
+        // and exit before the parent verifies it. POSIX then permits EACCES
+        // from setpgid while getpgid reports ESRCH. Accept either race only
+        // after wait proves the child is already reaped; a live child whose
+        // group cannot be verified still fails closed below.
+        if process_group_may_have_disappeared_after_exec(set_result, observed_group) {
             let child_status = observe_fast_child_exit(child);
             exited_child_context = Some(format!("; child_status={child_status:?}"));
             if let Ok(Some(status)) = child_status {
@@ -5478,18 +5491,53 @@ mod platform {
         }
 
         #[test]
-        fn immediate_guest_exit_does_not_release_the_owned_group_early() {
-            for _ in 0..512 {
-                let outcome = NativeExecutor::default()
-                    .execute_capture("true | cat")
-                    .unwrap();
-                assert_eq!(outcome.status, 0);
+        fn fast_exit_admission_requires_exec_or_missing_child_and_missing_group() {
+            let unrelated_group = Ok(Pid::from_raw(7));
+            assert!(process_group_may_have_disappeared_after_exec(
+                Err(Errno::EACCES),
+                Err(Errno::ESRCH),
+            ));
+            assert!(process_group_may_have_disappeared_after_exec(
+                Err(Errno::ESRCH),
+                Err(Errno::ESRCH),
+            ));
+            assert!(!process_group_may_have_disappeared_after_exec(
+                Err(Errno::EACCES),
+                unrelated_group,
+            ));
+            assert!(!process_group_may_have_disappeared_after_exec(
+                Ok(()),
+                Err(Errno::ESRCH),
+            ));
+        }
 
-                let outcome = NativeExecutor::default()
-                    .execute_capture("printf value | sh -c 'exit 23'")
-                    .unwrap();
-                assert_eq!(outcome.status, 23);
-            }
+        #[test]
+        fn immediate_guest_exit_does_not_release_the_owned_group_early() {
+            const STRESS_CASE_COUNT: usize = 512;
+            const STRESS_WORKER_COUNT: usize = 8;
+            assert_eq!(STRESS_CASE_COUNT.checked_rem(STRESS_WORKER_COUNT), Some(0));
+            let cases_per_worker = STRESS_CASE_COUNT.checked_div(STRESS_WORKER_COUNT).unwrap();
+
+            // Each worker owns every executor and process group it creates, so
+            // concurrent stress cannot make one worker reap or signal another's
+            // children. The total regression sample remains fixed at 512 cases.
+            thread::scope(|scope| {
+                for _ in 0..STRESS_WORKER_COUNT {
+                    scope.spawn(|| {
+                        for _ in 0..cases_per_worker {
+                            let outcome = NativeExecutor::default()
+                                .execute_capture("true | cat")
+                                .unwrap();
+                            assert_eq!(outcome.status, 0);
+
+                            let outcome = NativeExecutor::default()
+                                .execute_capture("printf value | sh -c 'exit 23'")
+                                .unwrap();
+                            assert_eq!(outcome.status, 23);
+                        }
+                    });
+                }
+            });
         }
 
         #[test]
