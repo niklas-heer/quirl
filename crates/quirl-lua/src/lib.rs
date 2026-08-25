@@ -814,7 +814,10 @@ fn validate_theme_name(source: &str, description: &str, name: &str) -> Result<()
 fn valid_theme_color(color: &str) -> bool {
     color.len() == 7
         && color.starts_with('#')
-        && color.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+        && color
+            .as_bytes()
+            .get(1..)
+            .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2533,13 +2536,13 @@ impl LuaRuntime {
             named_tests.push((name, test));
         }
         named_tests.sort_by(|left, right| left.0.cmp(&right.0));
-        let mut count = 0;
+        let mut count: usize = 0;
         for (name, test) in named_tests {
             self.reset_budget();
             test.call::<()>(()).map_err(|error| {
                 lua_error(error, Some(path), source.len()).with_context(format!("test: {name}"))
             })?;
-            count += 1;
+            count = count.saturating_add(1);
         }
         if count == 0 {
             return Err(validation_error(
@@ -3134,9 +3137,9 @@ fn bounded_runner_diagnostic(value: &str) -> String {
     }
     let mut end = MAX_LUA_RUNNER_ERROR_FIELD_BYTES;
     while !value.is_char_boundary(end) {
-        end -= 1;
+        end = end.saturating_sub(1);
     }
-    let mut bounded = value[..end].to_owned();
+    let mut bounded = value.get(..end).unwrap_or_default().to_owned();
     bounded.push('…');
     bounded
 }
@@ -3262,49 +3265,60 @@ fn mask_lua_source(source: &str) -> MaskedLuaSource {
     let mut state = State::Normal;
     let mut index = 0;
     while index < bytes.len() {
+        let Some(&byte) = bytes.get(index) else {
+            break;
+        };
         match state {
-            State::Normal if matches!(bytes[index], b'\'' | b'"') => {
+            State::Normal if matches!(byte, b'\'' | b'"') => {
                 mask_string_byte(&mut masked, index);
                 state = State::Quoted {
-                    quote: bytes[index],
+                    quote: byte,
                     escaped: false,
                 };
-                index += 1;
+                index = index.saturating_add(1);
             }
-            State::Normal if bytes[index..].starts_with(b"--") => {
+            State::Normal
+                if bytes
+                    .get(index..)
+                    .is_some_and(|tail| tail.starts_with(b"--")) =>
+            {
                 comments.insert(index);
-                if let Some((equals, opener_len)) = long_bracket_open(bytes, index + 2) {
-                    for position in index..index + 2 + opener_len {
+                if let Some((equals, opener_len)) =
+                    long_bracket_open(bytes, index.saturating_add(2))
+                {
+                    let end = index.saturating_add(2).saturating_add(opener_len);
+                    for position in index..end {
                         mask_byte(&mut masked, position);
                     }
                     state = State::Long {
                         equals,
                         comment: true,
                     };
-                    index += 2 + opener_len;
+                    index = end;
                 } else {
-                    while index < bytes.len() && bytes[index] != b'\n' {
+                    while bytes.get(index).is_some_and(|byte| *byte != b'\n') {
                         mask_byte(&mut masked, index);
-                        index += 1;
+                        index = index.saturating_add(1);
                     }
                 }
             }
             State::Normal => {
                 if let Some((equals, opener_len)) = long_bracket_open(bytes, index) {
-                    for position in index..index + opener_len {
+                    let end = index.saturating_add(opener_len);
+                    for position in index..end {
                         mask_string_byte(&mut masked, position);
                     }
                     state = State::Long {
                         equals,
                         comment: false,
                     };
-                    index += opener_len;
+                    index = end;
                 } else {
-                    index += 1;
+                    index = index.saturating_add(1);
                 }
             }
             State::Quoted { quote, escaped } => {
-                let character = bytes[index];
+                let character = byte;
                 mask_string_byte(&mut masked, index);
                 state = if escaped {
                     State::Quoted {
@@ -3324,19 +3338,20 @@ fn mask_lua_source(source: &str) -> MaskedLuaSource {
                         escaped: false,
                     }
                 };
-                index += 1;
+                index = index.saturating_add(1);
             }
             State::Long { equals, comment } => {
                 if long_bracket_close(bytes, index, equals) {
-                    let closer_len = equals + 2;
-                    for position in index..index + closer_len {
+                    let closer_len = equals.saturating_add(2);
+                    let end = index.saturating_add(closer_len);
+                    for position in index..end {
                         if comment {
                             mask_byte(&mut masked, position);
                         } else {
                             mask_string_byte(&mut masked, position);
                         }
                     }
-                    index += closer_len;
+                    index = end;
                     state = State::Normal;
                 } else {
                     if comment {
@@ -3344,7 +3359,7 @@ fn mask_lua_source(source: &str) -> MaskedLuaSource {
                     } else {
                         mask_string_byte(&mut masked, index);
                     }
-                    index += 1;
+                    index = index.saturating_add(1);
                 }
             }
         }
@@ -3363,30 +3378,40 @@ fn long_bracket_open(bytes: &[u8], index: usize) -> Option<(usize, usize)> {
     if bytes.get(index) != Some(&b'[') {
         return None;
     }
-    let mut cursor = index + 1;
+    let mut cursor = index.checked_add(1)?;
     while bytes.get(cursor) == Some(&b'=') {
-        cursor += 1;
+        cursor = cursor.checked_add(1)?;
     }
-    (bytes.get(cursor) == Some(&b'[')).then_some((cursor - index - 1, cursor - index + 1))
+    let equals = cursor.checked_sub(index)?.checked_sub(1)?;
+    let length = cursor.checked_sub(index)?.checked_add(1)?;
+    (bytes.get(cursor) == Some(&b'[')).then_some((equals, length))
 }
 
 fn long_bracket_close(bytes: &[u8], index: usize, equals: usize) -> bool {
     bytes.get(index) == Some(&b']')
-        && bytes
-            .get(index + 1..index + 1 + equals)
-            .is_some_and(|characters| characters.iter().all(|character| *character == b'='))
-        && bytes.get(index + 1 + equals) == Some(&b']')
+        && index.checked_add(1).is_some_and(|start| {
+            start.checked_add(equals).is_some_and(|end| {
+                bytes
+                    .get(start..end)
+                    .is_some_and(|characters| characters.iter().all(|character| *character == b'='))
+                    && bytes.get(end) == Some(&b']')
+            })
+        })
 }
 
 fn mask_byte(bytes: &mut [u8], index: usize) {
-    if !matches!(bytes[index], b'\n' | b'\r') {
-        bytes[index] = b' ';
+    if let Some(byte) = bytes.get_mut(index)
+        && !matches!(*byte, b'\n' | b'\r')
+    {
+        *byte = b' ';
     }
 }
 
 fn mask_string_byte(bytes: &mut [u8], index: usize) {
-    if !matches!(bytes[index], b'\n' | b'\r') {
-        bytes[index] = b'_';
+    if let Some(byte) = bytes.get_mut(index)
+        && !matches!(*byte, b'\n' | b'\r')
+    {
+        *byte = b'_';
     }
 }
 
@@ -3663,7 +3688,8 @@ fn install_budget_hook(
     cancelled: Arc<AtomicBool>,
 ) -> mlua::Result<()> {
     lua.set_hook(
-        HookTriggers::new().every_nth_instruction(HOOK_GRANULARITY as u32),
+        HookTriggers::new()
+            .every_nth_instruction(u32::try_from(HOOK_GRANULARITY).unwrap_or(u32::MAX)),
         move |_, _| {
             let mut budget = budget.lock().map_err(|_| {
                 mlua::Error::RuntimeError("quirl budget state is unavailable".to_owned())
@@ -3705,7 +3731,9 @@ fn install_budget_hook(
                 );
                 return Err(terminate_budget(&mut budget, error));
             }
-            budget.remaining_instructions -= HOOK_GRANULARITY;
+            budget.remaining_instructions = budget
+                .remaining_instructions
+                .saturating_sub(HOOK_GRANULARITY);
             Ok(VmState::Continue)
         },
     )
@@ -4491,12 +4519,17 @@ fn completion_registration_bytes(registration: &CompletionRegistration) -> usize
 }
 
 fn command_registration_bytes(registration: &CommandRegistration) -> usize {
-    let scalar_bytes = registration.name.len()
-        + registration.signature.len()
-        + registration.summary.len()
-        + registration.details.len()
-        + registration.input_type.len()
-        + registration.output_type.len();
+    let scalar_bytes = [
+        registration.name.len(),
+        registration.signature.len(),
+        registration.summary.len(),
+        registration.details.len(),
+        registration.input_type.len(),
+        registration.output_type.len(),
+    ]
+    .into_iter()
+    .try_fold(0_usize, usize::checked_add)
+    .unwrap_or(usize::MAX);
     let list_bytes = registration
         .examples
         .iter()
@@ -4506,7 +4539,7 @@ fn command_registration_bytes(registration: &CommandRegistration) -> usize {
     let map_bytes = registration
         .error_codes
         .iter()
-        .map(|(key, value)| key.len() + value.len())
+        .map(|(key, value)| key.len().saturating_add(value.len()))
         .sum::<usize>();
     scalar_bytes
         .checked_add(list_bytes)
@@ -4515,13 +4548,28 @@ fn command_registration_bytes(registration: &CommandRegistration) -> usize {
 }
 
 fn event_registration_bytes(registration: &EventSubscription) -> usize {
-    registration.name.len()
-        + registration.events.len() * std::mem::size_of::<EventKind>()
-        + registration.capabilities.len() * std::mem::size_of::<ExtensionCapability>()
+    registration
+        .name
+        .len()
+        .saturating_add(
+            registration
+                .events
+                .len()
+                .saturating_mul(std::mem::size_of::<EventKind>()),
+        )
+        .saturating_add(
+            registration
+                .capabilities
+                .len()
+                .saturating_mul(std::mem::size_of::<ExtensionCapability>()),
+        )
 }
 
 fn contribution_registration_bytes(registration: &ContributionRegistration) -> usize {
-    registration.name.len() + registration.plain_fallback.as_ref().map_or(0, String::len)
+    registration
+        .name
+        .len()
+        .saturating_add(registration.plain_fallback.as_ref().map_or(0, String::len))
 }
 
 fn registration_limit_error(
@@ -4605,7 +4653,7 @@ fn validate_registration_input_shape(
     let mut retained_bytes = 0_usize;
     let mut observed_nodes = 0_usize;
     while let Some((value, depth)) = stack.pop() {
-        observed_nodes += 1;
+        observed_nodes = observed_nodes.saturating_add(1);
         match value {
             Value::String(value) => {
                 retained_bytes = retained_bytes
@@ -4632,7 +4680,7 @@ fn validate_registration_input_shape(
                     return Err(registration_limit_error(
                         description,
                         "depth",
-                        depth + 1,
+                        depth.saturating_add(1),
                         MAX_REGISTRATION_INPUT_DEPTH,
                     ));
                 }
@@ -4651,14 +4699,14 @@ fn validate_registration_input_shape(
                         &mut stack,
                         &mut scheduled_nodes,
                         key,
-                        depth + 1,
+                        depth.saturating_add(1),
                         description,
                     )?;
                     schedule_registration_value(
                         &mut stack,
                         &mut scheduled_nodes,
                         value,
-                        depth + 1,
+                        depth.saturating_add(1),
                         description,
                     )?;
                 }
@@ -4810,7 +4858,7 @@ fn validate_lua_return_shape(value: &Value) -> Result<(), ShellError> {
                 if depth >= MAX_LUA_RETURN_DEPTH {
                     return Err(lua_return_limit_error(
                         "depth",
-                        depth + 1,
+                        depth.saturating_add(1),
                         MAX_LUA_RETURN_DEPTH,
                     ));
                 }
@@ -4837,8 +4885,18 @@ fn validate_lua_return_shape(value: &Value) -> Result<(), ShellError> {
                             ));
                         }
                     }
-                    schedule_lua_return_value(&mut stack, &mut scheduled_nodes, key, depth + 1)?;
-                    schedule_lua_return_value(&mut stack, &mut scheduled_nodes, value, depth + 1)?;
+                    schedule_lua_return_value(
+                        &mut stack,
+                        &mut scheduled_nodes,
+                        key,
+                        depth.saturating_add(1),
+                    )?;
+                    schedule_lua_return_value(
+                        &mut stack,
+                        &mut scheduled_nodes,
+                        value,
+                        depth.saturating_add(1),
+                    )?;
                 }
             }
             unsupported => {
@@ -4912,19 +4970,19 @@ fn lint_source(source: &str, path: &Path) -> Result<(), ShellError> {
     ];
     let mut error = ShellError::new(ErrorCode::Validation, "Lua validation failed")
         .with_help("Use the generated `quirl` SDK instead of ambient Lua capabilities");
-    let mut offset = 0;
+    let mut offset = 0_usize;
     for (line, code) in source.lines().zip(masked.code.lines()) {
         for (needle, message) in FORBIDDEN {
             if let Some(column) = code.find(needle) {
                 error = error.with_label(
                     Some(path.display().to_string()),
-                    offset + column,
-                    offset + column + needle.len(),
+                    offset.saturating_add(column),
+                    offset.saturating_add(column).saturating_add(needle.len()),
                     *message,
                 );
             }
         }
-        offset += line.len() + 1;
+        offset = offset.saturating_add(line.len()).saturating_add(1);
     }
     if error.details.labels.is_empty() {
         Ok(())
@@ -4937,24 +4995,40 @@ fn validate_host_api_references(code: &str, path: &Path) -> Result<(), ShellErro
     let bytes = code.as_bytes();
     let mut error = ShellError::new(ErrorCode::Validation, "Lua host API validation failed")
         .with_help("Use a function and signature from `quirl sdk --format markdown`");
-    let mut offset = 0;
-    while offset + "quirl.".len() <= bytes.len() {
-        let Some(relative) = code[offset..].find("quirl.") else {
+    let mut offset = 0_usize;
+    while offset.saturating_add("quirl.".len()) <= bytes.len() {
+        let Some(relative) = code.get(offset..).and_then(|tail| tail.find("quirl.")) else {
             break;
         };
-        let start = offset + relative;
-        if start > 0 && is_lua_identifier_byte(bytes[start - 1]) {
-            offset = start + "quirl.".len();
+        let start = offset.saturating_add(relative);
+        if start > 0
+            && start
+                .checked_sub(1)
+                .and_then(|previous| bytes.get(previous))
+                .copied()
+                .is_some_and(is_lua_identifier_byte)
+        {
+            offset = start.saturating_add("quirl.".len());
             continue;
         }
-        let mut end = start + "quirl.".len();
-        while end < bytes.len() && (is_lua_identifier_byte(bytes[end]) || bytes[end] == b'.') {
-            end += 1;
+        let mut end = start.saturating_add("quirl.".len());
+        while bytes
+            .get(end)
+            .is_some_and(|byte| is_lua_identifier_byte(*byte) || *byte == b'.')
+        {
+            end = end.saturating_add(1);
         }
-        while end > start && bytes[end - 1] == b'.' {
-            end -= 1;
+        while end > start
+            && end.checked_sub(1).and_then(|previous| bytes.get(previous)) == Some(&b'.')
+        {
+            end = end.saturating_sub(1);
         }
-        let symbol = &code[start..end];
+        let symbol = code.get(start..end).ok_or_else(|| {
+            validation_error(
+                &path.display().to_string(),
+                "host API reference is not on a valid UTF-8 boundary",
+            )
+        })?;
         let specification = HOST_API.iter().find(|spec| spec.path == symbol);
         let namespace = HOST_API
             .iter()
@@ -4966,14 +5040,16 @@ fn validate_host_api_references(code: &str, path: &Path) -> Result<(), ShellErro
                 end,
                 format!("unknown Quirl host symbol `{symbol}`"),
             );
-            offset = end.max(start + 1);
+            offset = end.max(start.saturating_add(1));
             continue;
         }
         if let Some(specification) = specification {
-            let next = bytes[end..]
+            let next = bytes
+                .get(end..)
+                .unwrap_or_default()
                 .iter()
                 .position(|byte| !byte.is_ascii_whitespace())
-                .map(|relative| end + relative);
+                .map(|relative| end.saturating_add(relative));
             let actual_arguments =
                 match next.and_then(|next| bytes.get(next).map(|byte| (next, byte))) {
                     Some((open, b'(')) => count_parenthesized_arguments(code, open),
@@ -4994,7 +5070,7 @@ fn validate_host_api_references(code: &str, path: &Path) -> Result<(), ShellErro
                 }
             }
         }
-        offset = end.max(start + 1);
+        offset = end.max(start.saturating_add(1));
     }
     if error.details.labels.is_empty() {
         Ok(())
@@ -5014,21 +5090,27 @@ fn count_parenthesized_arguments(code: &str, open: usize) -> Option<usize> {
     let mut brackets = 0_usize;
     let mut commas = 0_usize;
     let mut has_argument = false;
-    let mut offset = open + 1;
+    let mut offset = open.checked_add(1)?;
     while let Some(byte) = bytes.get(offset) {
         match byte {
-            b'(' => parentheses += 1,
+            b'(' => parentheses = parentheses.saturating_add(1),
             b')' => {
                 parentheses = parentheses.saturating_sub(1);
                 if parentheses == 0 {
-                    return Some(if has_argument { commas + 1 } else { 0 });
+                    return Some(if has_argument {
+                        commas.saturating_add(1)
+                    } else {
+                        0
+                    });
                 }
             }
-            b'{' => braces += 1,
+            b'{' => braces = braces.saturating_add(1),
             b'}' => braces = braces.saturating_sub(1),
-            b'[' => brackets += 1,
+            b'[' => brackets = brackets.saturating_add(1),
             b']' => brackets = brackets.saturating_sub(1),
-            b',' if parentheses == 1 && braces == 0 && brackets == 0 => commas += 1,
+            b',' if parentheses == 1 && braces == 0 && brackets == 0 => {
+                commas = commas.saturating_add(1);
+            }
             byte if !byte.is_ascii_whitespace()
                 && parentheses == 1
                 && braces == 0
@@ -5038,7 +5120,7 @@ fn count_parenthesized_arguments(code: &str, open: usize) -> Option<usize> {
             }
             _ => {}
         }
-        offset += 1;
+        offset = offset.saturating_add(1);
     }
     None
 }
@@ -5052,11 +5134,11 @@ fn validate_annotations(
         .with_help(
             "Use the supported LuaLS-compatible `meta`, `module`, `class`, `field`, `param`, `return`, or `type` annotations",
         );
-    let mut offset = 0;
+    let mut offset = 0_usize;
     for line in source.lines() {
         let leading = line.len().saturating_sub(line.trim_start().len());
         let trimmed = line.trim_start();
-        let annotation_start = offset + leading;
+        let annotation_start = offset.saturating_add(leading);
         if let Some(annotation) = trimmed
             .strip_prefix("---@")
             .filter(|_| line_comment_starts.contains(&annotation_start))
@@ -5067,16 +5149,16 @@ fn validate_annotations(
                 .map_or((annotation, ""), |(kind, body)| (kind, body.trim()));
             let problem = validate_annotation(kind, body);
             if let Some(problem) = problem {
-                let start = offset + leading;
+                let start = offset.saturating_add(leading);
                 error = error.with_label(
                     Some(path.display().to_string()),
                     start,
-                    start + trimmed.len(),
+                    start.saturating_add(trimmed.len()),
                     problem,
                 );
             }
         }
-        offset += line.len() + 1;
+        offset = offset.saturating_add(line.len()).saturating_add(1);
     }
     if error.details.labels.is_empty() {
         Ok(())
@@ -6719,13 +6801,13 @@ return { main = exported }
         assert_eq!(error.code, ErrorCode::Validation);
         assert_eq!(error.details.labels.len(), 2);
         assert_eq!(
-            &source[error.details.labels[0].start..error.details.labels[0].end],
-            "quirl.process.missing"
+            source.get(error.details.labels[0].start..error.details.labels[0].end),
+            Some("quirl.process.missing")
         );
         assert!(error.details.labels[0].message.contains("unknown"));
         assert_eq!(
-            &source[error.details.labels[1].start..error.details.labels[1].end],
-            "quirl.cwd"
+            source.get(error.details.labels[1].start..error.details.labels[1].end),
+            Some("quirl.cwd")
         );
         assert!(error.details.labels[1].message.contains("expects 0"));
     }

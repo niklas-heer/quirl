@@ -153,15 +153,25 @@ impl PickerRequest {
         // 128 is a deliberate upper bound for the fixed request keys, braces,
         // commas, and integer fields (including a u64 request ID). Individual
         // string and JSON values below are measured in their JSON-encoded form.
-        let mut request_bytes = 128 + json_string_bytes(&self.query);
+        let mut request_bytes = 128_usize
+            .checked_add(json_string_bytes(&self.query))
+            .ok_or_else(|| {
+                resource_limit("picker request", usize::MAX, MAX_PICKER_REQUEST_BYTES)
+            })?;
         for item in &self.items {
-            let text_len = json_string_bytes(&item.id)
-                + json_string_bytes(&item.label)
-                + json_string_bytes(&item.description)
-                + item
-                    .preview
+            let text_len = [
+                json_string_bytes(&item.id),
+                json_string_bytes(&item.label),
+                json_string_bytes(&item.description),
+                item.preview
                     .as_ref()
-                    .map_or(0, |preview| json_string_bytes(preview));
+                    .map_or(0, |preview| json_string_bytes(preview)),
+            ]
+            .into_iter()
+            .try_fold(0_usize, usize::checked_add)
+            .ok_or_else(|| {
+                resource_limit("picker item text", usize::MAX, MAX_PICKER_ITEM_TEXT_BYTES)
+            })?;
             if text_len > MAX_PICKER_ITEM_TEXT_BYTES {
                 return Err(resource_limit(
                     "picker item text",
@@ -465,14 +475,14 @@ pub fn execute_request(
             .score
             .cmp(&left.score)
             .then_with(|| {
-                request.items[left.index]
-                    .label
-                    .cmp(&request.items[right.index].label)
+                let left_label = request.items.get(left.index).map(|item| &item.label);
+                let right_label = request.items.get(right.index).map(|item| &item.label);
+                left_label.cmp(&right_label)
             })
             .then_with(|| {
-                request.items[left.index]
-                    .id
-                    .cmp(&request.items[right.index].id)
+                let left_id = request.items.get(left.index).map(|item| &item.id);
+                let right_id = request.items.get(right.index).map(|item| &item.id);
+                left_id.cmp(&right_id)
             })
     });
     matches.truncate(request.limit);
@@ -518,7 +528,7 @@ fn json_value_bytes(value: &serde_json::Value, depth: usize) -> Result<usize, Sh
         serde_json::Value::Number(number) => Ok(number.to_string().len()),
         serde_json::Value::String(value) => Ok(json_string_bytes(value)),
         serde_json::Value::Array(values) => values.iter().try_fold(2_usize, |total, value| {
-            let value = json_value_bytes(value, depth + 1)?;
+            let value = json_value_bytes(value, depth.saturating_add(1))?;
             total
                 .checked_add(1)
                 .and_then(|total| total.checked_add(value))
@@ -528,7 +538,7 @@ fn json_value_bytes(value: &serde_json::Value, depth: usize) -> Result<usize, Sh
         }),
         serde_json::Value::Object(values) => {
             values.iter().try_fold(2_usize, |total, (key, value)| {
-                let value = json_value_bytes(value, depth + 1)?;
+                let value = json_value_bytes(value, depth.saturating_add(1))?;
                 total
                     .checked_add(1)
                     .and_then(|total| total.checked_add(json_string_bytes(key)))
@@ -543,14 +553,16 @@ fn json_value_bytes(value: &serde_json::Value, depth: usize) -> Result<usize, Sh
 }
 
 fn json_string_bytes(value: &str) -> usize {
-    2 + value
-        .chars()
-        .map(|character| match character {
-            '"' | '\\' => 2,
-            '\u{0000}'..='\u{001f}' => 6,
-            _ => character.len_utf8(),
-        })
-        .sum::<usize>()
+    2_usize.saturating_add(
+        value
+            .chars()
+            .map(|character| match character {
+                '"' | '\\' => 2,
+                '\u{0000}'..='\u{001f}' => 6,
+                _ => character.len_utf8(),
+            })
+            .sum::<usize>(),
+    )
 }
 
 /// Stateless deterministic fuzzy ranker for synchronous callers.
@@ -582,8 +594,16 @@ impl Picker {
             right
                 .score
                 .cmp(&left.score)
-                .then_with(|| items[left.index].label.cmp(&items[right.index].label))
-                .then_with(|| items[left.index].id.cmp(&items[right.index].id))
+                .then_with(|| {
+                    let left_label = items.get(left.index).map(|item| &item.label);
+                    let right_label = items.get(right.index).map(|item| &item.label);
+                    left_label.cmp(&right_label)
+                })
+                .then_with(|| {
+                    let left_id = items.get(left.index).map(|item| &item.id);
+                    let right_id = items.get(right.index).map(|item| &item.id);
+                    left_id.cmp(&right_id)
+                })
         });
         matches
     }
@@ -600,7 +620,7 @@ impl Picker {
         self.rank(items, query)
             .into_iter()
             .take(limit)
-            .map(|matched| &items[matched.index])
+            .filter_map(|matched| items.get(matched.index))
             .collect()
     }
 }
@@ -613,7 +633,7 @@ fn rank_item(item: &PickItem, terms: &[&str]) -> Option<(i32, Vec<usize>)> {
         format!("{} {}", item.label, item.description)
     };
     let searchable = FoldedText::new(&searchable);
-    let mut score = 0;
+    let mut score: i32 = 0;
     let mut primary_indices = Vec::new();
     for raw_term in terms {
         let (inverse, term) = raw_term
@@ -629,8 +649,10 @@ fn rank_item(item: &PickItem, terms: &[&str]) -> Option<(i32, Vec<usize>)> {
         let matched = if exact {
             searchable.value.find(&term).map(|start| {
                 (
-                    20_000 - i32::try_from(searchable.grapheme_at(start)).unwrap_or(i32::MAX),
-                    searchable.indices_for(start, start + term.len()),
+                    20_000_i32.saturating_sub(
+                        i32::try_from(searchable.grapheme_at(start)).unwrap_or(i32::MAX),
+                    ),
+                    searchable.indices_for(start, start.saturating_add(term.len())),
                 )
             })
         } else {
@@ -643,7 +665,7 @@ fn rank_item(item: &PickItem, terms: &[&str]) -> Option<(i32, Vec<usize>)> {
             continue;
         }
         let (term_score, indices) = matched?;
-        score += term_score;
+        score = score.saturating_add(term_score);
         if primary_indices.is_empty() && indices.iter().all(|index| *index < label_graphemes) {
             primary_indices = indices;
         }
@@ -666,7 +688,7 @@ impl FoldedText {
             let lowercase = grapheme.to_lowercase();
             folded.push_str(&lowercase);
             grapheme_by_byte.extend(std::iter::repeat_n(index, lowercase.len()));
-            grapheme_count = index + 1;
+            grapheme_count = index.saturating_add(1);
         }
         Self {
             value: folded,
@@ -705,7 +727,7 @@ fn fuzzy_match(query: &str, candidate: &FoldedText) -> Option<(i32, Vec<usize>)>
     }
     if candidate.value.starts_with(query) {
         return Some((
-            10_000 - i32::try_from(candidate.grapheme_count).unwrap_or(i32::MAX),
+            10_000_i32.saturating_sub(i32::try_from(candidate.grapheme_count).unwrap_or(i32::MAX)),
             candidate.indices_for(0, query.len()),
         ));
     }
@@ -720,7 +742,10 @@ fn fuzzy_match(query: &str, candidate: &FoldedText) -> Option<(i32, Vec<usize>)>
     }
     let spread = i32::try_from(indices.last().copied().unwrap_or_default()).unwrap_or(i32::MAX);
     let length = i32::try_from(candidate.grapheme_count).unwrap_or(i32::MAX);
-    Some((1_000 - spread - length, indices))
+    Some((
+        1_000_i32.saturating_sub(spread).saturating_sub(length),
+        indices,
+    ))
 }
 
 #[cfg(test)]

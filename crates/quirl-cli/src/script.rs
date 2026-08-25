@@ -305,7 +305,13 @@ fn format_quirl_source(source: &str, source_name: &str) -> Result<String, ShellE
         .iter()
         .filter(|statement| statement.kind == NativeStatementKind::Data)
     {
-        let body = &source[statement.body.clone()];
+        let body = source.get(statement.body.clone()).ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::InvalidCommand,
+                "data statement span is outside the script",
+            )
+            .with_help("Report this internal script parser contract violation")
+        })?;
         let formatted = format_data_expression(body.trim(), DataSyntaxLimits::DEFAULT).map_err(
             |diagnostic| {
                 let leading_bytes = body.len().saturating_sub(body.trim_start().len());
@@ -317,8 +323,16 @@ fn format_quirl_source(source: &str, source_name: &str) -> Result<String, ShellE
                 ShellError::new(code, diagnostic.message)
                     .with_label(
                         Some(source_name.to_owned()),
-                        statement.body.start + leading_bytes + diagnostic.start,
-                        statement.body.start + leading_bytes + diagnostic.end,
+                        statement
+                            .body
+                            .start
+                            .saturating_add(leading_bytes)
+                            .saturating_add(diagnostic.start),
+                        statement
+                            .body
+                            .start
+                            .saturating_add(leading_bytes)
+                            .saturating_add(diagnostic.end),
                         "invalid data expression",
                     )
                     .with_help(diagnostic.help)
@@ -328,7 +342,10 @@ fn format_quirl_source(source: &str, source_name: &str) -> Result<String, ShellE
             let indentation = body
                 .lines()
                 .find(|line| !line.trim().is_empty())
-                .map(|line| &line[..line.len().saturating_sub(line.trim_start().len())])
+                .map(|line| {
+                    line.get(..line.len().saturating_sub(line.trim_start().len()))
+                        .unwrap_or_default()
+                })
                 .unwrap_or("  ");
             let newline = if body.contains("\r\n") { "\r\n" } else { "\n" };
             format!("{indentation}{formatted}{newline}")
@@ -361,18 +378,18 @@ pub fn test_paths(path: &Path) -> Result<i32, ShellError> {
         ));
     }
 
-    let mut total = 0;
-    let mut failed = 0;
+    let mut total = 0_usize;
+    let mut failed = 0_usize;
     for file in files {
         let runtime =
             LuaRuntime::new_with_process_host(LuaPolicy::script(), sandboxed_process_host())?;
         match runtime.test_file(&file) {
             Ok(count) => {
-                total += count;
+                total = total.saturating_add(count);
                 println!("✓ {count} Lua tests passed in {}", file.display());
             }
             Err(error) => {
-                failed += 1;
+                failed = failed.saturating_add(1);
                 eprintln!("{}", render_error(&error, false));
             }
         }
@@ -831,14 +848,22 @@ fn quirl_source_diagnostics(
             );
         }
         if statement.kind == NativeStatementKind::Data {
-            let body = &source[statement.body.clone()];
+            let body = source.get(statement.body.clone()).unwrap_or_default();
             let trimmed = body.trim();
             let leading_bytes = body.len().saturating_sub(body.trim_start().len());
             if let Err(diagnostic) = parse_data_expression(trimmed, DataSyntaxLimits::DEFAULT) {
                 diagnostics.push(QuirlSyntaxDiagnostic {
                     message: diagnostic.message,
-                    start: statement.body.start + leading_bytes + diagnostic.start,
-                    end: statement.body.start + leading_bytes + diagnostic.end,
+                    start: statement
+                        .body
+                        .start
+                        .saturating_add(leading_bytes)
+                        .saturating_add(diagnostic.start),
+                    end: statement
+                        .body
+                        .start
+                        .saturating_add(leading_bytes)
+                        .saturating_add(diagnostic.end),
                     help: diagnostic.help,
                     resource_limit: diagnostic.kind == DataSyntaxDiagnosticKind::ResourceLimit,
                     source: "quirl-data",
@@ -1247,7 +1272,18 @@ fn execute_quirl_script_plan(
     let mut status = 0;
     for statement in native_script_statements(plan.source().text(), plan.source().name())? {
         plan.ensure_active("between Quirl script statements")?;
-        let statement_source = &plan.source().text()[statement.body.clone()];
+        let statement_source = plan
+            .source()
+            .text()
+            .get(statement.body.clone())
+            .ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::InvalidCommand,
+                    "script statement span is outside the source",
+                )
+                .with_command(plan.source().text())
+                .with_help("Report this internal script parser contract violation")
+            })?;
         match statement.kind {
             NativeStatementKind::Data => {
                 let envelope = data
@@ -1383,7 +1419,7 @@ fn language_from_shebang(line: &str) -> Result<Option<ScriptLanguage>, ShellErro
                 .ok_or_else(|| unsupported_shebang_language(language));
         }
         if *word == "--lang" {
-            let language = words.get(index + 1).ok_or_else(|| {
+            let language = words.get(index.saturating_add(1)).ok_or_else(|| {
                 ShellError::new(
                     ErrorCode::InvalidArgument,
                     "script shebang has `--lang` without a language",
@@ -1691,8 +1727,9 @@ fn spawn_stream_reader(
             }
             let available = max_bytes.saturating_sub(retained.len());
             let keep = available.min(read);
-            retained.extend_from_slice(&buffer[..keep]);
-            discarded_bytes = discarded_bytes.saturating_add((read - keep) as u64);
+            retained.extend_from_slice(buffer.get(..keep).unwrap_or_default());
+            discarded_bytes = discarded_bytes
+                .saturating_add(u64::try_from(read.saturating_sub(keep)).unwrap_or(u64::MAX));
         }
         Ok(StreamCapture {
             value: String::from_utf8_lossy(&retained).into_owned(),
@@ -1781,16 +1818,17 @@ fn dialect_error_span(source: &str, stderr: &str) -> (usize, usize) {
         .filter_map(|digits| digits.parse::<usize>().ok())
         .find(|line| *line > 0 && *line <= source.lines().count())
         .unwrap_or(1);
-    let start = source
+    let start: usize = source
         .split_inclusive('\n')
         .take(line.saturating_sub(1))
         .map(str::len)
         .sum();
-    let end = start
-        + source
+    let end = start.saturating_add(
+        source
             .lines()
             .nth(line.saturating_sub(1))
-            .map_or(0, str::len);
+            .map_or(0, str::len),
+    );
     (start, end)
 }
 
@@ -1803,7 +1841,7 @@ fn truncate_capture(value: &str) -> String {
             .rev()
             .find(|index| value.is_char_boundary(*index))
             .unwrap_or(0);
-        format!("{}…", &value[..boundary])
+        format!("{}…", value.get(..boundary).unwrap_or_default())
     }
 }
 
@@ -1873,15 +1911,15 @@ fn native_script_statements(
 ) -> Result<Vec<NativeScriptStatement>, ShellError> {
     let mut statements = Vec::new();
     let mut open: Option<OpenNativeBlock> = None;
-    let mut offset = 0;
+    let mut offset = 0_usize;
 
     for (line_index, raw_line) in source.split_inclusive('\n').enumerate() {
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
         let line = line.strip_suffix('\r').unwrap_or(line);
         let leading_len = line.len().saturating_sub(line.trim_start().len());
         let trimmed = line.trim();
-        let trimmed_start = offset + leading_len;
-        let trimmed_end = trimmed_start + trimmed.len();
+        let trimmed_start = offset.saturating_add(leading_len);
+        let trimmed_end = trimmed_start.saturating_add(trimmed.len());
 
         if let Some(block) = &open {
             if is_native_block_opener(trimmed).is_some() {
@@ -1901,7 +1939,12 @@ fn native_script_statements(
                         "Retry the script; report this internal parser state failure",
                     ));
                 };
-                if source[block.body_start..offset].trim().is_empty() {
+                if source
+                    .get(block.body_start..offset)
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+                {
                     return Err(native_block_error(
                         source_name,
                         block.opener_span,
@@ -1911,11 +1954,11 @@ fn native_script_statements(
                 }
                 statements.push(NativeScriptStatement {
                     kind: block.kind,
-                    span: block.span_start..(offset + raw_line.len()),
+                    span: block.span_start..offset.saturating_add(raw_line.len()),
                     body: block.body_start..offset,
                     explicit: true,
                 });
-                offset += raw_line.len();
+                offset = offset.saturating_add(raw_line.len());
                 continue;
             }
             if block.kind == NativeStatementKind::Command && trimmed == "}" {
@@ -1926,16 +1969,16 @@ fn native_script_statements(
                     "Align the closing `}` with the `command {` line",
                 ));
             }
-            offset += raw_line.len();
+            offset = offset.saturating_add(raw_line.len());
             continue;
         }
 
         if line_index == 0 && trimmed.starts_with("#!") {
-            offset += raw_line.len();
+            offset = offset.saturating_add(raw_line.len());
             continue;
         }
         if trimmed.is_empty() || trimmed.starts_with('#') {
-            offset += raw_line.len();
+            offset = offset.saturating_add(raw_line.len());
             continue;
         }
         if let Some(kind) = is_native_block_opener(trimmed) {
@@ -1943,10 +1986,10 @@ fn native_script_statements(
                 kind,
                 span_start: trimmed_start,
                 opener_span: trimmed_start..trimmed_end,
-                body_start: offset + raw_line.len(),
-                indentation: line[..leading_len].to_owned(),
+                body_start: offset.saturating_add(raw_line.len()),
+                indentation: line.get(..leading_len).unwrap_or_default().to_owned(),
             });
-            offset += raw_line.len();
+            offset = offset.saturating_add(raw_line.len());
             continue;
         }
         if trimmed == "}" {
@@ -1973,8 +2016,9 @@ fn native_script_statements(
         };
         let body_start = match kind {
             NativeStatementKind::Data => {
-                trimmed_start + trimmed.len()
-                    - quirl_syntax::data_statement_expression(trimmed).map_or(0, str::len)
+                trimmed_start.saturating_add(trimmed.len()).saturating_sub(
+                    quirl_syntax::data_statement_expression(trimmed).map_or(0, str::len),
+                )
             }
             NativeStatementKind::Command => trimmed_start,
         };
@@ -1984,7 +2028,7 @@ fn native_script_statements(
             body: body_start..trimmed_end,
             explicit: false,
         });
-        offset += raw_line.len();
+        offset = offset.saturating_add(raw_line.len());
     }
 
     if let Some(block) = open {
@@ -2040,7 +2084,10 @@ fn native_block_error(
 fn script_without_explicit_blocks(source: &str, statements: &[NativeScriptStatement]) -> String {
     let mut bytes = source.as_bytes().to_vec();
     for statement in statements.iter().filter(|statement| statement.explicit) {
-        for byte in &mut bytes[statement.span.clone()] {
+        let Some(statement_bytes) = bytes.get_mut(statement.span.clone()) else {
+            continue;
+        };
+        for byte in statement_bytes {
             if !matches!(*byte, b'\n' | b'\r') {
                 *byte = b' ';
             }
@@ -2056,7 +2103,11 @@ fn command_block_diagnostics(
 ) -> Vec<quirl_syntax::CommandSyntaxError> {
     let mut diagnostics = Vec::new();
     let mut offset = statement.body.start;
-    for raw_line in source[statement.body.clone()].split_inclusive('\n') {
+    for raw_line in source
+        .get(statement.body.clone())
+        .unwrap_or_default()
+        .split_inclusive('\n')
+    {
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
         let line = line.strip_suffix('\r').unwrap_or(line);
         let leading = line.len().saturating_sub(line.trim_start().len());
@@ -2065,11 +2116,12 @@ fn command_block_diagnostics(
             && !trimmed.starts_with('#')
             && let Err(mut error) = parse_command_list(trimmed)
         {
-            error.start += offset + leading;
-            error.end += offset + leading;
+            let absolute_offset = offset.saturating_add(leading);
+            error.start = error.start.saturating_add(absolute_offset);
+            error.end = error.end.saturating_add(absolute_offset);
             diagnostics.push(error);
         }
-        offset += raw_line.len();
+        offset = offset.saturating_add(raw_line.len());
     }
     diagnostics
 }
@@ -2085,7 +2137,15 @@ fn execute_command_block(
         stderr: Some(String::new()),
     };
     let mut offset = body.start;
-    for raw_line in plan.source().text()[body].split_inclusive('\n') {
+    let block_source = plan.source().text().get(body).ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::InvalidCommand,
+            "command block span is outside the script source",
+        )
+        .with_command(plan.source().text())
+        .with_help("Report this internal script parser contract violation")
+    })?;
+    for raw_line in block_source.split_inclusive('\n') {
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
         let line = line.strip_suffix('\r').unwrap_or(line);
         let leading = line.len().saturating_sub(line.trim_start().len());
@@ -2095,7 +2155,8 @@ fn execute_command_block(
                 executor,
                 plan,
                 trimmed,
-                (offset + leading)..(offset + leading + trimmed.len()),
+                offset.saturating_add(leading)
+                    ..offset.saturating_add(leading).saturating_add(trimmed.len()),
             )?;
             outcome.status = line_outcome.status;
             if let Some(stdout) = line_outcome.stdout {
@@ -2116,7 +2177,7 @@ fn execute_command_block(
                 return Ok(outcome);
             }
         }
-        offset += raw_line.len();
+        offset = offset.saturating_add(raw_line.len());
     }
     Ok(outcome)
 }
@@ -2299,6 +2360,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "the braces are Bash parameter expansion syntax exercised verbatim by the test"
+    )]
     fn reference_runners_preserve_arguments_cwd_environment_status_and_captures() {
         for (language, executable) in [(ScriptLanguage::Bash, "bash"), (ScriptLanguage::Zsh, "zsh")]
         {

@@ -401,6 +401,10 @@ impl ObservedProcessGroupCleanup {
 }
 
 impl Drop for ObservedProcessGroupCleanup {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "negating a validated positive process group identifier is required by POSIX kill"
+    )]
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -603,6 +607,10 @@ fn execute_and_resume_with_marker(
     ensure_alternate_screen_unchanged(session, output_start, "marked command")
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the comparison suffix begins at an offset clamped to the captured screen bytes"
+)]
 fn ensure_alternate_screen_unchanged(
     session: &Session,
     output_start: usize,
@@ -629,6 +637,10 @@ fn execute_simple_with_marker(
     wait_for_terminal_owner(session)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "poll counts are bounded by the terminal ownership deadline"
+)]
 fn wait_for_terminal_owner(session: &mut Session) -> Result<(), Box<dyn Error>> {
     let child = session
         .pty
@@ -737,6 +749,10 @@ fn check_rich_editing(binary: &Path) -> Result<(), Box<dyn Error>> {
     )
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "captured output offsets come from successful marker searches"
+)]
 fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Error>> {
     let mut session = Session::new(
         binary,
@@ -833,6 +849,10 @@ fn check_mode_switch_and_palette_screen(binary: &Path) -> Result<(), Box<dyn Err
     )
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "captured output offsets come from successful marker searches"
+)]
 fn check_automatic_command_intelligence(binary: &Path) -> Result<(), Box<dyn Error>> {
     // Failure model: redraws may lag resize/input, commands may retain the PTY
     // foreground group, and any return path may strand raw or alternate-screen
@@ -1217,6 +1237,10 @@ fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), Box<dyn Er
     ensure_terminal_restored(&session, cleanup_start, "AI bootstrap activity EOF")
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "captured output offsets come from successful marker searches"
+)]
 fn check_durable_command_discovery(binary: &Path) -> Result<(), Box<dyn Error>> {
     // Failure model: a cold write may be partial, a warm read may rewrite state,
     // refresh may publish inside an editor turn, hostile declarations may run,
@@ -1671,6 +1695,11 @@ fn execute_cwd_history_command(session: &mut Session, command: &str) -> Result<(
     ensure_alternate_screen_unchanged(session, output_start, "cwd-history command")
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "cycle counts are fixed and captured output offsets come from successful marker searches"
+)]
 fn check_retained_output_cycles(binary: &Path) -> Result<(), Box<dyn Error>> {
     let mut session = Session::new(
         binary,
@@ -1967,6 +1996,10 @@ complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Prin
     )
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "captured output offsets come from successful marker searches"
+)]
 fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), Box<dyn Error>> {
     // Failure model: a child that reports progress with bare `\r` overwrites
     // (no trailing `\n`) — `git push`, `curl`, package-manager progress bars,
@@ -2064,6 +2097,10 @@ fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), Box
     )
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "captured output offsets come from successful marker searches"
+)]
 fn check_full_screen_program_takeover(binary: &Path) -> Result<(), Box<dyn Error>> {
     // Failure model: the rich viewport normally captures a foreground
     // command's stdout and stderr through a pipe and replays it inside its
@@ -2164,6 +2201,10 @@ fn check_full_screen_program_spawn_failure_restores_terminal(
     )
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "captured output offsets come from successful marker searches"
+)]
 fn check_ctrl_l_forces_full_repaint(binary: &Path) -> Result<(), Box<dyn Error>> {
     // Failure model: a raw ANSI clear wipes the real screen but does not by
     // itself invalidate ratatui's internal diff buffer, so the next draw
@@ -2446,6 +2487,10 @@ fn send_ctrl_d_and_wait_for_exit(pty: &mut PtySession) -> Result<i32, Box<dyn Er
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "captured output offsets come from successful marker searches"
+)]
 fn check_rich_review_regressions(binary: &Path) -> Result<(), Box<dyn Error>> {
     let mut session = Session::new(binary, SessionOptions::default())?;
     let startup = session.pty.wait_for(STARTUP_MARKER)?;
@@ -2556,6 +2601,10 @@ fn check_suspend_resume(binary: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "job counts and process identifiers are bounded by the fixed PTY scenario"
+)]
 fn check_native_job_control(binary: &Path) -> Result<(), Box<dyn Error>> {
     let mut session = Session::new(
         binary,
@@ -2760,6 +2809,10 @@ fn check_no_color_preserves_semantic_hints(binary: &Path) -> Result<(), Box<dyn 
     Ok(())
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "poll counts are bounded by the file wait deadline"
+)]
 fn wait_for_file(session: &mut Session, path: PathBuf) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + default_timeout();
     while !path.is_file() && Instant::now() < deadline {
@@ -2844,6 +2897,10 @@ fn clear_editor_in_mode(session: &mut Session, mode: &str) -> Result<(), Box<dyn
     wait_for_mode_status(session, mode)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "captured output offsets come from successful marker searches"
+)]
 fn ensure_terminal_restored(
     session: &Session,
     output_start: usize,
@@ -2906,6 +2963,10 @@ fn read_bounded_fixture(path: &Path, bytes_max: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "poll counts are bounded by the file-content deadline"
+)]
 fn wait_for_file_contents(
     session: &mut Session,
     path: &Path,

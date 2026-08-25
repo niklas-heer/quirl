@@ -258,7 +258,7 @@ impl McpServer {
             .collect::<Vec<_>>();
         let mut result = json!({ "tools": tools });
         if matches!(self.era, Some(ProtocolEra::Modern)) {
-            result["_meta"] = json!({
+            let metadata = json!({
                 "io.modelcontextprotocol/cache": {
                     "mode": "immutable",
                     "maxAgeSeconds": 3600,
@@ -266,6 +266,9 @@ impl McpServer {
                     "schemaHash": quirl_core::schema_fingerprint(MCP_SCHEMA_DESCRIPTOR)
                 }
             });
+            if let Some(result) = result.as_object_mut() {
+                result.insert("_meta".to_owned(), metadata);
+            }
         }
         Ok(result)
     }
@@ -618,8 +621,18 @@ fn serialized_response_size(response: &Response) -> usize {
 
 fn json_depth(value: &Value) -> usize {
     match value {
-        Value::Array(values) => 1 + values.iter().map(json_depth).max().unwrap_or_default(),
-        Value::Object(values) => 1 + values.values().map(json_depth).max().unwrap_or_default(),
+        Value::Array(values) => values
+            .iter()
+            .map(json_depth)
+            .max()
+            .unwrap_or_default()
+            .saturating_add(1),
+        Value::Object(values) => values
+            .values()
+            .map(json_depth)
+            .max()
+            .unwrap_or_default()
+            .saturating_add(1),
         _ => 0,
     }
 }
@@ -636,12 +649,14 @@ fn read_message(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, ShellError
             return Ok((!message.is_empty()).then_some(message));
         }
         let end = buffer.iter().position(|byte| *byte == b'\n');
-        let chunk = end.map_or(buffer.len(), |index| index + 1);
-        let content = if end.is_some() {
-            &buffer[..chunk - 1]
-        } else {
-            &buffer[..chunk]
-        };
+        let chunk = end.map_or(buffer.len(), |index| index.saturating_add(1));
+        let content = buffer
+            .get(..chunk)
+            .and_then(|content| end.map_or(Some(content), |_| content.strip_suffix(b"\n")))
+            .ok_or_else(|| {
+                ShellError::new(ErrorCode::Io, "MCP reader returned an invalid buffer range")
+                    .with_help("Report this internal buffered-reader contract violation")
+            })?;
         let observed_bytes = message.len().saturating_add(content.len());
         if observed_bytes > MAX_MESSAGE_BYTES {
             return Err(ShellError::new(

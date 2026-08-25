@@ -108,7 +108,7 @@ pub(crate) fn acquire(
                 }
             }
         }
-        if attempt + 1 < attempts_max {
+        if attempt.saturating_add(1) < attempts_max {
             thread::sleep(EXPLICIT_LOCK_RETRY_DELAY);
         }
     }
@@ -466,6 +466,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::exit,
+        reason = "the subprocess helper must exit while holding the lock to test OS cleanup"
+    )]
     fn cross_process_lock_helper() {
         let Ok(mode) = env::var(HELPER_MODE) else {
             return;

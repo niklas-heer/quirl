@@ -400,6 +400,10 @@ impl StableFoldedText {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the decrement is guarded by a nonzero offset and stops at a UTF-8 boundary"
+)]
 fn truncate_utf8_ref(value: &str, maximum: usize) -> &str {
     if value.len() <= maximum {
         return value;
@@ -408,7 +412,7 @@ fn truncate_utf8_ref(value: &str, maximum: usize) -> &str {
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
-    &value[..end]
+    value.get(..end).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,12 +426,22 @@ enum PickerInvocation {
 }
 
 impl PickerInvocation {
+    const fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::History => 1,
+            Self::File => 2,
+            Self::Action => 3,
+            Self::Help => 4,
+        }
+    }
+
     fn from_state(state: &AtomicU8) -> Self {
         match state.load(Ordering::Relaxed) {
-            value if value == Self::History as u8 => Self::History,
-            value if value == Self::File as u8 => Self::File,
-            value if value == Self::Action as u8 => Self::Action,
-            value if value == Self::Help as u8 => Self::Help,
+            value if value == Self::History.code() => Self::History,
+            value if value == Self::File.code() => Self::File,
+            value if value == Self::Action.code() => Self::Action,
+            value if value == Self::Help.code() => Self::Help,
             _ => Self::None,
         }
     }
@@ -443,7 +457,7 @@ impl PickerInvocation {
     }
 
     fn activate(self, state: &AtomicU8) {
-        state.store(self as u8, Ordering::Relaxed);
+        state.store(self.code(), Ordering::Relaxed);
     }
 }
 
@@ -617,7 +631,7 @@ fn configured_editor(
         dumb_terminal(),
     );
     let theme = Theme::from_config_or_default(&config, terminal_styles);
-    let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::None as u8));
+    let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::None.code()));
     let completer = Box::new(CatalogCompleter::with_extensions_and_picker(
         catalog.clone(),
         extension_completer,
@@ -743,7 +757,7 @@ fn picker_menu_event(menu: &str, replace_active: bool) -> ReedlineEvent {
 fn configured_edit_mode(keymap: &str) -> Box<dyn EditMode> {
     configured_edit_mode_with_picker(
         keymap,
-        Arc::new(AtomicU8::new(PickerInvocation::None as u8)),
+        Arc::new(AtomicU8::new(PickerInvocation::None.code())),
     )
 }
 
@@ -1543,7 +1557,7 @@ fn scan_worktree(root: &Path) -> WorktreeStamp {
             continue;
         };
         for entry in entries.flatten() {
-            if stamp.files as usize >= MAX_PROMPT_WORKTREE_ENTRIES {
+            if stamp.files >= u64::try_from(MAX_PROMPT_WORKTREE_ENTRIES).unwrap_or(u64::MAX) {
                 stamp.truncated = true;
                 return stamp;
             }
@@ -1766,6 +1780,11 @@ impl PromptSymbols {
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    reason = "the status marker is validated as ASCII and the suffix begins after that one-byte marker"
+)]
 fn render_nerd_git_state(value: &str) -> Option<String> {
     let mut rendered = String::with_capacity(value.len());
     let mut state_count = 0_usize;
@@ -2243,7 +2262,7 @@ impl CatalogCompleter {
             picker_items: Vec::new(),
             history_path: None,
             history_cache: None,
-            picker_invocation: Arc::new(AtomicU8::new(PickerInvocation::None as u8)),
+            picker_invocation: Arc::new(AtomicU8::new(PickerInvocation::None.code())),
             picker_ranker: Arc::new(StablePickerRanker),
         }
     }
@@ -2262,7 +2281,7 @@ impl CatalogCompleter {
             picker_items: Vec::new(),
             history_path: None,
             history_cache: None,
-            picker_invocation: Arc::new(AtomicU8::new(PickerInvocation::None as u8)),
+            picker_invocation: Arc::new(AtomicU8::new(PickerInvocation::None.code())),
             picker_ranker: Arc::new(StablePickerRanker),
         }
     }
@@ -2847,6 +2866,10 @@ fn safe_match_indices(original: &str, rendered: &str, indices: Vec<usize>) -> Ve
         .collect()
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the whitespace offset adds one encoded character within the already bounded input line"
+)]
 fn picker_query_and_span(kind: PickerItemKind, line: &str, pos: usize) -> (&str, usize, usize) {
     let end = pos.min(line.len());
     let before_cursor = line.get(..end).unwrap_or(line);
@@ -2863,7 +2886,11 @@ fn picker_query_and_span(kind: PickerItemKind, line: &str, pos: usize) -> (&str,
         .char_indices()
         .find(|(_, character)| character.is_whitespace())
         .map_or(suffix.len(), |(index, _)| index);
-    (&before_cursor[start..], start, end + suffix_len)
+    (
+        before_cursor.get(start..).unwrap_or_default(),
+        start,
+        end.saturating_add(suffix_len),
+    )
 }
 
 fn rank_picker_suggestions(
@@ -3004,6 +3031,10 @@ fn read_history_with_limits(
     read_history_file(&mut file, file_len, path, limits)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the retained suffix begins at an index clamped to the file byte length"
+)]
 fn read_history_file(
     file: &mut File,
     file_len: u64,
@@ -3078,6 +3109,10 @@ fn history_access_error(path: &Path, error: io::Error) -> ShellError {
     .with_help("Set QUIRL_HISTORY to a readable and writable file path")
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "source and item counts are bounded by picker resource limits before capacity calculation"
+)]
 fn picker_sources(catalog: &Catalog, mut items: Vec<PickerItem>) -> Vec<PickerItem> {
     let next_id = items.len();
     let catalog_remaining = PICKER_ITEMS_MAX.saturating_sub(items.len());
@@ -3205,13 +3240,17 @@ fn split_preserving_whitespace(input: &str) -> Vec<&str> {
     let mut whitespace = input.chars().next().is_some_and(char::is_whitespace);
     for (index, character) in input.char_indices() {
         if character.is_whitespace() != whitespace {
-            segments.push(&input[start..index]);
+            if let Some(segment) = input.get(start..index) {
+                segments.push(segment);
+            }
             start = index;
             whitespace = !whitespace;
         }
     }
-    if start < input.len() {
-        segments.push(&input[start..]);
+    if start < input.len()
+        && let Some(segment) = input.get(start..)
+    {
+        segments.push(segment);
     }
     segments
 }
@@ -3225,7 +3264,7 @@ fn split_preserving_whitespace(input: &str) -> Vec<&str> {
 /// branching on the error category.
 fn error_code_slug(code: ErrorCode) -> String {
     let debug = format!("{code:?}");
-    let mut slug = String::with_capacity(debug.len() + 4);
+    let mut slug = String::with_capacity(debug.len().saturating_add(4));
     for (index, character) in debug.char_indices() {
         if index > 0 && character.is_uppercase() {
             slug.push('-');
@@ -4704,7 +4743,7 @@ mod tests {
     #[test]
     fn every_keymap_submits_enter_and_closes_picker_state() {
         for keymap in ["emacs", "vim", "helix"] {
-            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
+            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History.code()));
             let mut edit_mode =
                 configured_edit_mode_with_picker(keymap, Arc::clone(&picker_invocation));
             let enter = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
@@ -4729,7 +4768,7 @@ mod tests {
     #[test]
     fn every_keymap_exposes_mode_toggle_and_history_search() {
         for keymap in ["emacs", "vim", "helix"] {
-            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::None as u8));
+            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::None.code()));
             let mut edit_mode =
                 configured_edit_mode_with_picker(keymap, Arc::clone(&picker_invocation));
             let toggle = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
@@ -4825,7 +4864,7 @@ mod tests {
     #[test]
     fn semantic_completion_clears_the_prior_picker_kind() {
         for keymap in ["emacs", "vim", "helix"] {
-            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
+            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History.code()));
             let mut edit_mode =
                 configured_edit_mode_with_picker(keymap, Arc::clone(&picker_invocation));
             let tab = ReedlineRawEvent::try_from(Event::Key(KeyEvent::new(
@@ -4849,7 +4888,7 @@ mod tests {
     #[test]
     fn cancelling_or_accepting_clears_the_picker_kind() {
         for code in [KeyCode::Esc, KeyCode::Enter] {
-            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
+            let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History.code()));
             let mut edit_mode =
                 configured_edit_mode_with_picker("emacs", Arc::clone(&picker_invocation));
             let event =
@@ -4881,7 +4920,7 @@ mod tests {
             ),
             picker_item(2, PickerItemKind::Action, "mode data", "action"),
         ];
-        let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
+        let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History.code()));
         let mut completer = CatalogCompleter::with_extensions_and_picker(
             Catalog::builtin(),
             None,
@@ -4929,7 +4968,7 @@ mod tests {
         assert_eq!(items[0].value, "cargo test");
         assert_eq!(items[1].value, "cargo clippy");
 
-        let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
+        let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History.code()));
         let fallback_items = vec![
             picker_item(0, PickerItemKind::History, "cargo test", "history"),
             picker_item(1, PickerItemKind::History, "cargo test", "history"),
@@ -5180,7 +5219,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let history_path = directory.join("history");
         fs::write(&history_path, "cargo test\n").unwrap();
-        let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History as u8));
+        let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::History.code()));
         let mut completer = CatalogCompleter::with_extensions_and_picker(
             Catalog::builtin(),
             None,

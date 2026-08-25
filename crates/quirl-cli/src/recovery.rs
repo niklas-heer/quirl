@@ -366,8 +366,9 @@ impl RecoveryJournal {
                 .with_context(error.to_string())
                 .with_help("Report this as a recovery schema defect")
         })?;
-        if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
-            return Err(oversized_snapshot_error(&snapshot.id, bytes.len() as u64));
+        let observed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if observed_bytes > MAX_SNAPSHOT_BYTES {
+            return Err(oversized_snapshot_error(&snapshot.id, observed_bytes));
         }
         reject_existing_snapshot_destination(&destination)?;
         let (temporary, mut file) = create_snapshot_temporary(&destination)?;
@@ -381,9 +382,10 @@ impl RecoveryJournal {
                 },
             )?;
         let split = bytes.len().div_ceil(2);
-        if let Err(error) = file.write_all(&bytes[..split]).and_then(|()| {
+        let (first_half, second_half) = bytes.split_at(split);
+        if let Err(error) = file.write_all(first_half).and_then(|()| {
             after_stage(SnapshotWriteStage::PartialWrite)?;
-            file.write_all(&bytes[split..])?;
+            file.write_all(second_half)?;
             file.sync_all()?;
             after_stage(SnapshotWriteStage::ContentSynced)
         }) {
@@ -448,7 +450,7 @@ impl RecoveryJournal {
             let size = validate_snapshot_path(&path, 1)?.len();
             if retained < MAX_SNAPSHOTS && retained_bytes.saturating_add(size) <= MAX_RECOVERY_BYTES
             {
-                retained += 1;
+                retained = retained.saturating_add(1);
                 retained_bytes = retained_bytes.saturating_add(size);
             } else {
                 // Retention is successful policy cleanup inside the secured
@@ -474,7 +476,7 @@ impl RecoveryJournal {
                 )
                 .with_context(format!(
                     "limit: {MAX_RECOVERY_DIRECTORY_ENTRIES}; observed: at least {}",
-                    entry_index + 1
+                    entry_index.saturating_add(1)
                 ))
                 .with_help("Remove stale recovery entries before retrying"));
             }
@@ -515,12 +517,14 @@ impl RecoveryJournal {
         if size > MAX_SNAPSHOT_BYTES {
             return Err(oversized_snapshot_error(id, size));
         }
-        let mut bytes = Vec::with_capacity(size as usize);
+        let capacity = usize::try_from(size).map_err(|_| oversized_snapshot_error(id, size))?;
+        let mut bytes = Vec::with_capacity(capacity);
         file.take(MAX_SNAPSHOT_BYTES.saturating_add(1))
             .read_to_end(&mut bytes)
             .map_err(|error| recovery_io_error("read", &path, error))?;
-        if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
-            return Err(oversized_snapshot_error(id, bytes.len() as u64));
+        let observed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if observed_bytes > MAX_SNAPSHOT_BYTES {
+            return Err(oversized_snapshot_error(id, observed_bytes));
         }
         decode_snapshot(&bytes, id)
     }
@@ -661,7 +665,7 @@ fn open_snapshot_no_follow(path: &Path) -> io::Result<File> {
         OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
         Mode::empty(),
     )
-    .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    .map_err(io::Error::from)?;
     Ok(File::from(descriptor))
 }
 
@@ -706,7 +710,7 @@ fn create_recovery_directories(directory: &Path) -> Result<(), ShellError> {
                     )
                     .with_context(format!(
                         "limit: {RECOVERY_DIRECTORY_DEPTH_MAX}; observed: at least {}",
-                        missing.len() + 1
+                        missing.len().saturating_add(1)
                     ))
                     .with_help("Choose a shallower recovery directory"));
                 }
@@ -1078,7 +1082,7 @@ fn redact_text(value: &str, secrets: &BTreeSet<String>) -> String {
     let mut authorization_credential_next = false;
     let mut redact_authorization_line = false;
     for (start, end) in spans {
-        let separator = &redacted[cursor..start];
+        let separator = redacted.get(cursor..start).unwrap_or("[redacted]");
         rendered.push_str(separator);
         if separator.contains(['\n', '\r']) {
             redact_next = false;
@@ -1086,7 +1090,7 @@ fn redact_text(value: &str, secrets: &BTreeSet<String>) -> String {
             authorization_credential_next = false;
             redact_authorization_line = false;
         }
-        let token = &redacted[start..end];
+        let token = redacted.get(start..end).unwrap_or("[redacted]");
         if redact_authorization_line {
             rendered.push_str(&redacted_token(token));
         } else if authorization_credential_next {
@@ -1127,7 +1131,7 @@ fn redact_text(value: &str, secrets: &BTreeSet<String>) -> String {
         }
         cursor = end;
     }
-    rendered.push_str(&redacted[cursor..]);
+    rendered.push_str(redacted.get(cursor..).unwrap_or("[redacted]"));
     rendered
 }
 
@@ -1192,7 +1196,7 @@ fn looks_like_common_secret(token: &str) -> bool {
         "rk_test_",
     ]
     .iter()
-    .any(|prefix| token.starts_with(prefix) && token.len() >= prefix.len() + 8);
+    .any(|prefix| token.starts_with(prefix) && token.len() >= prefix.len().saturating_add(8));
     let aws_access_key = token.len() == 20
         && token.starts_with("AKIA")
         && token
@@ -1211,36 +1215,94 @@ fn redact_url_credentials(token: &str) -> String {
     let Some(scheme) = token.find("://") else {
         return token.to_owned();
     };
-    let authority_start = scheme + 3;
-    let authority_end = token[authority_start..]
-        .find(['/', '?', '#'])
-        .map_or(token.len(), |offset| authority_start + offset);
+    let Some(authority_start) = scheme.checked_add(3) else {
+        return redacted_token(token);
+    };
+    let Some(authority) = token.get(authority_start..) else {
+        return redacted_token(token);
+    };
+    let authority_end = match authority.find(['/', '?', '#']) {
+        Some(offset) => {
+            let Some(end) = authority_start.checked_add(offset) else {
+                return redacted_token(token);
+            };
+            end
+        }
+        None => token.len(),
+    };
     let mut ranges = Vec::new();
-    if let Some(at_offset) = token[authority_start..authority_end].rfind('@') {
-        let at = authority_start + at_offset;
-        if let Some(colon_offset) = token[authority_start..at].find(':') {
-            ranges.push((authority_start + colon_offset + 1, at));
+    let Some(authority) = token.get(authority_start..authority_end) else {
+        return redacted_token(token);
+    };
+    if let Some(at_offset) = authority.rfind('@') {
+        let Some(at) = authority_start.checked_add(at_offset) else {
+            return redacted_token(token);
+        };
+        let Some(user_info) = token.get(authority_start..at) else {
+            return redacted_token(token);
+        };
+        if let Some(colon_offset) = user_info.find(':') {
+            let Some(password_start) = authority_start
+                .checked_add(colon_offset)
+                .and_then(|colon| colon.checked_add(1))
+            else {
+                return redacted_token(token);
+            };
+            ranges.push((password_start, at));
         }
     }
-    if let Some(query_offset) = token[authority_end..].find('?') {
-        let mut parameter_start = authority_end + query_offset + 1;
+    let Some(authority_tail) = token.get(authority_end..) else {
+        return redacted_token(token);
+    };
+    if let Some(query_offset) = authority_tail.find('?') {
+        let Some(mut parameter_start) = authority_end
+            .checked_add(query_offset)
+            .and_then(|query| query.checked_add(1))
+        else {
+            return redacted_token(token);
+        };
         while parameter_start < token.len() {
-            let parameter_end = token[parameter_start..]
-                .find(['&', ';', '#', '\'', '"'])
-                .map_or(token.len(), |offset| parameter_start + offset);
-            if let Some(equal_offset) = token[parameter_start..parameter_end].find('=') {
-                let equal = parameter_start + equal_offset;
-                if is_secret_parameter(&token[parameter_start..equal]) && equal + 1 < parameter_end
-                {
-                    ranges.push((equal + 1, parameter_end));
+            let Some(parameters) = token.get(parameter_start..) else {
+                return redacted_token(token);
+            };
+            let parameter_end = match parameters.find(['&', ';', '#', '\'', '"']) {
+                Some(offset) => {
+                    let Some(end) = parameter_start.checked_add(offset) else {
+                        return redacted_token(token);
+                    };
+                    end
+                }
+                None => token.len(),
+            };
+            let Some(parameter) = token.get(parameter_start..parameter_end) else {
+                return redacted_token(token);
+            };
+            if let Some(equal_offset) = parameter.find('=') {
+                let Some(equal) = parameter_start.checked_add(equal_offset) else {
+                    return redacted_token(token);
+                };
+                let Some(value_start) = equal.checked_add(1) else {
+                    return redacted_token(token);
+                };
+                let Some(key) = token.get(parameter_start..equal) else {
+                    return redacted_token(token);
+                };
+                if is_secret_parameter(key) && value_start < parameter_end {
+                    ranges.push((value_start, parameter_end));
                 }
             }
             if parameter_end >= token.len()
-                || matches!(token.as_bytes()[parameter_end], b'#' | b'\'' | b'"')
+                || matches!(
+                    token.as_bytes().get(parameter_end),
+                    Some(b'#' | b'\'' | b'"')
+                )
             {
                 break;
             }
-            parameter_start = parameter_end + 1;
+            let Some(next_parameter_start) = parameter_end.checked_add(1) else {
+                return redacted_token(token);
+            };
+            parameter_start = next_parameter_start;
         }
     }
     if ranges.is_empty() {
@@ -1253,11 +1315,17 @@ fn redact_url_credentials(token: &str) -> String {
         if start < cursor {
             continue;
         }
-        output.push_str(&token[cursor..start]);
+        let Some(unchanged) = token.get(cursor..start) else {
+            return redacted_token(token);
+        };
+        output.push_str(unchanged);
         output.push_str("[redacted]");
         cursor = end;
     }
-    output.push_str(&token[cursor..]);
+    let Some(unchanged) = token.get(cursor..) else {
+        return redacted_token(token);
+    };
+    output.push_str(unchanged);
     output
 }
 
@@ -1298,13 +1366,12 @@ fn shell_token_spans(value: &str) -> Vec<(usize, usize)> {
 }
 
 fn redacted_token(token: &str) -> String {
-    if token.len() >= 2 {
-        let first = token.as_bytes()[0];
-        let last = token.as_bytes()[token.len() - 1];
-        if matches!(first, b'\'' | b'"') && last == first {
-            let quote = first as char;
-            return format!("{quote}[redacted]{quote}");
-        }
+    if let (Some(&first), Some(&last)) = (token.as_bytes().first(), token.as_bytes().last())
+        && matches!(first, b'\'' | b'"')
+        && last == first
+    {
+        let quote = char::from(first);
+        return format!("{quote}[redacted]{quote}");
     }
     "[redacted]".to_owned()
 }
@@ -1340,7 +1407,7 @@ fn truncate(value: &str) -> (&str, u64) {
         .find(|index| value.is_char_boundary(*index))
         .unwrap_or(0);
     (
-        &value[..boundary],
+        value.get(..boundary).unwrap_or_default(),
         u64::try_from(value.len().saturating_sub(boundary)).unwrap_or(u64::MAX),
     )
 }
@@ -1353,7 +1420,7 @@ fn bounded_str(value: &str, limit: usize) -> &str {
         .rev()
         .find(|index| value.is_char_boundary(*index))
         .unwrap_or(0);
-    &value[..boundary]
+    value.get(..boundary).unwrap_or_default()
 }
 
 fn validate_id(id: &str) -> Result<(), ShellError> {
@@ -1839,7 +1906,11 @@ mod tests {
         for index in 0..20_u64 {
             let id = format!("{:020}-{:010}-{index:020}", 1_000 + index, 1);
             let path = directory.join(format!("{id}.json"));
-            fs::write(&path, vec![b'x'; MAX_SNAPSHOT_BYTES as usize - 1]).unwrap();
+            fs::write(
+                &path,
+                vec![b'x'; usize::try_from(MAX_SNAPSHOT_BYTES).unwrap() - 1],
+            )
+            .unwrap();
             #[cfg(unix)]
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
@@ -1858,7 +1929,11 @@ mod tests {
 
         let oversized_id = "99999999999999999999-0000000001-00000000000000000001";
         let oversized_path = directory.join(format!("{oversized_id}.json"));
-        fs::write(&oversized_path, vec![b'x'; MAX_SNAPSHOT_BYTES as usize + 1]).unwrap();
+        fs::write(
+            &oversized_path,
+            vec![b'x'; usize::try_from(MAX_SNAPSHOT_BYTES).unwrap() + 1],
+        )
+        .unwrap();
         #[cfg(unix)]
         fs::set_permissions(oversized_path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
@@ -1907,5 +1982,18 @@ mod tests {
         let source =
             "https://example.com/search?tokenize=true&signature_style=compact issue.AKIA.short";
         assert_eq!(redact_text(source, &BTreeSet::new()), source);
+    }
+
+    #[test]
+    fn structured_redaction_preserves_unicode_boundaries_while_removing_secrets() {
+        let source = "echo café https://álîçé:hunter2@example.com/路径?token=sëcret&safe=✓";
+        let redacted = redact_text(source, &BTreeSet::new());
+
+        assert_eq!(
+            redacted,
+            "echo café https://álîçé:[redacted]@example.com/路径?token=[redacted]&safe=✓"
+        );
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("sëcret"));
     }
 }

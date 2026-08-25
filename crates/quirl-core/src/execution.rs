@@ -658,12 +658,14 @@ fn validate_value_stack(mut stack: Vec<(&StructuredValue, usize)>) -> Result<(),
                 text_bytes = text_bytes.saturating_add(value.len())
             }
             StructuredValue::List(values) => {
-                stack.extend(values.iter().rev().map(|value| (value, depth + 1)));
+                let child_depth = depth.saturating_add(1);
+                stack.extend(values.iter().rev().map(|value| (value, child_depth)));
             }
             StructuredValue::Record(values) => {
+                let child_depth = depth.saturating_add(1);
                 for (key, value) in values.iter().rev() {
                     text_bytes = text_bytes.saturating_add(key.len());
-                    stack.push((value, depth + 1));
+                    stack.push((value, child_depth));
                 }
             }
             StructuredValue::Nothing

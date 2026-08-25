@@ -289,6 +289,10 @@ impl StreamingText {
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "slice bounds are returned by from_utf8 as the valid prefix and bounded error length"
+)]
 fn decode_utf8_chunk(tail: &mut Vec<u8>, bytes: &[u8]) -> String {
     let mut combined = Vec::with_capacity(tail.len().saturating_add(bytes.len()));
     combined.append(tail);
@@ -1571,6 +1575,10 @@ impl RichSurface {
             && row < area.bottom()
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the row is clamped to the rendered viewport before converting it to a scroll offset"
+    )]
     fn scrollbar_to_row(&mut self, row: u16) {
         let area = self.transcript_area;
         let visible_rows = usize::from(area.height);
@@ -1820,6 +1828,10 @@ impl RichSurface {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the encoded record size is checked against the configured history byte limit before writing"
+    )]
     fn append_history(&mut self, value: &str) -> Result<(), ShellError> {
         if self
             .history
@@ -1962,14 +1974,31 @@ fn running_notice(elapsed: Duration, symbols: SurfaceSymbols) -> String {
 ///
 /// Shared by the status-bar running notice and the prompt row's busy
 /// indicator so both spin in lockstep.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "spinner_frame always reduces the index modulo the non-empty compile-time glyph array"
+)]
 fn spinner_glyph(elapsed: Duration, symbols: SurfaceSymbols) -> char {
-    let frame = (elapsed.as_millis() / SPINNER_FRAME_MS) as usize;
     match symbols {
-        SurfaceSymbols::Plain => SPINNER_FRAMES_PLAIN[frame % SPINNER_FRAMES_PLAIN.len()],
+        SurfaceSymbols::Plain => {
+            let frame = spinner_frame(elapsed, SPINNER_FRAMES_PLAIN.len());
+            SPINNER_FRAMES_PLAIN[frame]
+        }
         SurfaceSymbols::Unicode | SurfaceSymbols::NerdFont => {
-            SPINNER_FRAMES_UNICODE[frame % SPINNER_FRAMES_UNICODE.len()]
+            let frame = spinner_frame(elapsed, SPINNER_FRAMES_UNICODE.len());
+            SPINNER_FRAMES_UNICODE[frame]
         }
     }
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "frame counts are tiny compile-time constants and elapsed milliseconds are reduced before conversion"
+)]
+fn spinner_frame(elapsed: Duration, frame_count: usize) -> usize {
+    let frame_count = u128::try_from(frame_count).unwrap_or(u128::MAX);
+    let frame = (elapsed.as_millis() / SPINNER_FRAME_MS) % frame_count;
+    usize::try_from(frame).unwrap_or(0)
 }
 
 /// Render `elapsed` as a compact `12.3s` or `4m05s` readout.
@@ -2337,6 +2366,11 @@ fn retain_error(slot: &mut Option<ShellError>, error: ShellError) {
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "indices are masked to six bits for the fixed 64-byte table and chunk access follows explicit length checks"
+)]
 fn encode_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let output_len = bytes.len().saturating_add(2) / 3 * 4;
@@ -2404,7 +2438,7 @@ fn history_file_needs_compaction(path: &Path) -> Result<bool, ShellError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             validate_history_file_type(path, &metadata)?;
-            Ok(metadata.len() > MAX_HISTORY_FILE_BYTES as u64)
+            Ok(metadata.len() > u64::try_from(MAX_HISTORY_FILE_BYTES).unwrap_or(u64::MAX))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(history_error(path)(error)),
@@ -2443,7 +2477,7 @@ fn read_history_file_for_update_with_hook(
             .min(HISTORY_REPLACEMENT_BYTES_MAX),
     );
     Read::by_ref(&mut file)
-        .take(HISTORY_REPLACEMENT_BYTES_MAX.saturating_add(1) as u64)
+        .take(u64::try_from(HISTORY_REPLACEMENT_BYTES_MAX.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)
         .map_err(history_error(path))?;
     if bytes.len() > HISTORY_REPLACEMENT_BYTES_MAX {
@@ -2688,6 +2722,10 @@ fn transcript_visible_rows_for_terminal(rows: u16, follows_tail: bool) -> usize 
     usize::from(rows.saturating_sub(reserved_rows).max(1))
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "the editor maintains cursor positions as UTF-8 boundaries"
+)]
 fn current_token_len(buffer: &str, cursor: usize) -> usize {
     buffer[..cursor.min(buffer.len())]
         .rsplit_once(char::is_whitespace)
@@ -2697,6 +2735,11 @@ fn current_token_len(buffer: &str, cursor: usize) -> usize {
         )
 }
 
+#[allow(
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    reason = "the editor maintains cursor positions as UTF-8 boundaries and token offsets are derived from char_indices"
+)]
 fn should_open_automatic_completion(
     catalog: &Catalog,
     buffer: &str,
@@ -2748,6 +2791,10 @@ fn should_open_automatic_completion(
     })
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the sample collection is bounded and non-empty before the percentile rank calculation"
+)]
 fn timing_p95(samples: &VecDeque<Duration>) -> Option<Duration> {
     if samples.is_empty() {
         return None;
@@ -2764,14 +2811,21 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn await_catalog_admission(surface: &mut RichSurface) -> Result<(), ShellError> {
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let started = Instant::now();
+        let timeout = Duration::from_secs(1);
         loop {
             match surface.poll_catalog_admission() {
                 Ok(true) => return Ok(()),
-                Ok(false) if Instant::now() < deadline => {
+                Ok(false) if started.elapsed() < timeout => {
                     thread::sleep(Duration::from_millis(1));
                 }
-                Ok(false) => panic!("catalog admission test exceeded its one-second bound"),
+                Ok(false) => {
+                    return Err(ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "catalog admission test exceeded its one-second bound",
+                    )
+                    .with_help("Inspect the blocked catalog admission worker"));
+                }
                 Err(error) => return Err(error),
             }
         }

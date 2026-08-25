@@ -152,7 +152,7 @@ pub(crate) fn read_model_input(path: &Path, bytes_max: u64) -> Result<Vec<u8>, S
         .with_help("Use a smaller local model")
     })?;
     let mut bytes = Vec::with_capacity(capacity);
-    let mut buffer = [0_u8; MODEL_FILE_READ_BUFFER_BYTES];
+    let mut buffer = vec![0_u8; MODEL_FILE_READ_BUFFER_BYTES];
     loop {
         let count = file
             .read(&mut buffer)
@@ -167,7 +167,15 @@ pub(crate) fn read_model_input(path: &Path, bytes_max: u64) -> Result<Vec<u8>, S
             )
             .with_help("Retry with an immutable private model directory"));
         }
-        bytes.extend_from_slice(&buffer[..count]);
+        let chunk = buffer.get(..count).ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::Io,
+                "local AI file reader returned an invalid byte count",
+            )
+            .with_context(format!("buffer bytes: {}; reported: {count}", buffer.len()))
+            .with_help("Report this internal reader contract violation")
+        })?;
+        bytes.extend_from_slice(chunk);
     }
     if bytes.len() != capacity {
         return Err(ShellError::new(
@@ -741,7 +749,10 @@ fn install_model_with_assets(
         let path = temporary.path.join(asset.name);
         download_asset(reader.as_mut(), &path, asset, &shared.cancelled, |bytes| {
             let observed = completed_bytes.saturating_add(bytes);
-            let percent = observed.saturating_mul(100) / total_bytes.max(1);
+            let percent = observed
+                .saturating_mul(100)
+                .checked_div(total_bytes.max(1))
+                .unwrap_or_default();
             shared.publish(format!(
                 "AI: downloading the Quirl command model ({percent}%)"
             ));
@@ -773,7 +784,7 @@ fn download_asset(
         .map_err(|error| model_io_error("create", destination, error))?;
     let mut hasher = Sha256::new();
     let mut observed = 0_u64;
-    let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
     loop {
         if cancelled.load(Ordering::Acquire) {
             return Err(ShellError::new(
@@ -794,7 +805,15 @@ fn download_asset(
         }
         file.write_all(&buffer[..count])
             .map_err(|error| model_io_error("write", destination, error))?;
-        hasher.update(&buffer[..count]);
+        let chunk = buffer.get(..count).ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::Io,
+                "local AI verifier returned an invalid byte count",
+            )
+            .with_context(format!("buffer bytes: {}; reported: {count}", buffer.len()))
+            .with_help("Report this internal reader contract violation")
+        })?;
+        hasher.update(chunk);
         progress(observed);
     }
     file.sync_all()
@@ -841,7 +860,7 @@ fn validate_asset(path: &Path, asset: AssetSpec) -> Result<(), ShellError> {
         }
     }
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
     let mut observed = 0_u64;
     loop {
         let count = file
@@ -854,7 +873,7 @@ fn validate_asset(path: &Path, asset: AssetSpec) -> Result<(), ShellError> {
         if observed > asset.bytes {
             return Err(asset_integrity_error(asset, observed));
         }
-        hasher.update(&buffer[..count]);
+        hasher.update(buffer.get(..count).unwrap_or_default());
     }
     let digest = format!("{:x}", hasher.finalize());
     if observed != asset.bytes || digest != asset.sha256 {
@@ -870,7 +889,7 @@ fn open_model_file(path: &Path) -> Result<File, ShellError> {
         OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
         FileMode::empty(),
     )
-    .map_err(|error| model_io_error("open", path, io::Error::from_raw_os_error(error as i32)))?;
+    .map_err(|error| model_io_error("open", path, io::Error::from(error)))?;
     Ok(File::from(descriptor))
 }
 
@@ -1039,7 +1058,7 @@ fn increment_counter(counter: &AtomicU64, name: &str) -> Result<u64, ShellError>
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             value.checked_add(1)
         })
-        .map(|previous| previous + 1)
+        .map(|previous| previous.saturating_add(1))
         .map_err(|observed| {
             ShellError::new(
                 ErrorCode::ResourceLimit,
@@ -1056,9 +1075,9 @@ fn truncate_utf8(value: &str, bytes_max: usize) -> String {
     }
     let mut end = bytes_max;
     while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
+        end = end.saturating_sub(1);
     }
-    value[..end].to_owned()
+    value.get(..end).map_or_else(String::new, str::to_owned)
 }
 
 fn asset_integrity_error(asset: AssetSpec, observed: u64) -> ShellError {
@@ -1325,12 +1344,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
         barrier.wait();
-        let outcomes = workers
-            .into_iter()
-            .map(|worker| worker.join().unwrap().unwrap())
-            .collect::<Vec<_>>();
+        let mut any_installed = false;
+        for worker in workers {
+            any_installed |= worker.join().unwrap().unwrap();
+        }
 
-        assert!(outcomes.contains(&true));
+        assert!(any_installed);
         assert_eq!(fetcher.opens.load(AtomicOrdering::Relaxed), 3);
         validate_model_assets(&destination, &TEST_ASSETS).unwrap();
         assert!(staging_entries(&directory.0).is_empty());

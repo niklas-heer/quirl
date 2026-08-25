@@ -738,7 +738,13 @@ pub(crate) fn execute_out_of_process_adapter(
         .with_context(error.to_string())
         .with_help("Report this as an adapter protocol defect")
     })?;
-    if request.len() > adapter.max_message_bytes as usize {
+    let message_bytes_max = usize::try_from(adapter.max_message_bytes).map_err(|_| {
+        adapter_limit_error(
+            "adapter message limit cannot be represented on this host",
+            adapter.max_message_bytes,
+        )
+    })?;
+    if request.len() > message_bytes_max {
         return Err(adapter_limit_error(
             "initialization request exceeds the adapter message limit",
             adapter.max_message_bytes,
@@ -783,7 +789,7 @@ pub(crate) fn execute_out_of_process_adapter(
         let _ = child.wait();
         error.with_help("Retry after restoring the adapter; process containment is required")
     })?;
-    let output_budget = Arc::new(AdapterOutputBudget::new(adapter.max_message_bytes as usize));
+    let output_budget = Arc::new(AdapterOutputBudget::new(message_bytes_max));
     let stdout = child
         .stdout
         .take()
@@ -814,7 +820,16 @@ pub(crate) fn execute_out_of_process_adapter(
         .with_help("Ensure the adapter accepts one JSON request on standard input"));
     }
 
-    let deadline = Instant::now() + Duration::from_millis(adapter.callback_timeout_ms);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(adapter.callback_timeout_ms))
+        .ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::ResourceLimit,
+                "isolated adapter deadline exceeds the platform clock range",
+            )
+            .with_context(format!("timeout: {} ms", adapter.callback_timeout_ms))
+            .with_help("Configure a smaller adapter callback timeout")
+        })?;
     let status = loop {
         if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             let termination = terminate_adapter(&mut child, &containment);
@@ -935,7 +950,7 @@ impl AdapterOutputBudget {
             let claimed = requested.min(self.limit.saturating_sub(consumed));
             match self.consumed.compare_exchange_weak(
                 consumed,
-                consumed + claimed,
+                consumed.saturating_add(claimed),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -960,8 +975,9 @@ fn spawn_adapter_reader(
                 break;
             }
             let retained = budget.claim(read);
-            bytes.extend_from_slice(&buffer[..retained]);
-            discarded_bytes = discarded_bytes.saturating_add((read - retained) as u64);
+            bytes.extend_from_slice(buffer.get(..retained).unwrap_or_default());
+            discarded_bytes = discarded_bytes
+                .saturating_add(u64::try_from(read.saturating_sub(retained)).unwrap_or(u64::MAX));
         }
         Ok(AdapterOutput {
             bytes,
@@ -1033,7 +1049,12 @@ fn adapter_limit_error(message: &str, limit: u64) -> ShellError {
 
 fn truncate_adapter_diagnostic(bytes: &[u8]) -> String {
     const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
-    String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DIAGNOSTIC_BYTES)]).into_owned()
+    String::from_utf8_lossy(
+        bytes
+            .get(..bytes.len().min(MAX_DIAGNOSTIC_BYTES))
+            .unwrap_or_default(),
+    )
+    .into_owned()
 }
 
 fn contribution_names(

@@ -392,15 +392,20 @@ impl CommandProposal {
                 COMMAND_PROPOSAL_PRODUCER_BYTES_MAX,
             )?;
             let (argument_index, specification) = resolve_argument(command, name, kind)?;
-            occurrence_counts[argument_index] = occurrence_counts[argument_index]
-                .checked_add(1)
-                .ok_or_else(|| {
-                    resource_error(
-                        "proposal argument occurrence count overflowed",
-                        "Reduce repeated argument occurrences",
-                    )
-                })?;
-            if occurrence_counts[argument_index] > 1 && !specification.repeatable {
+            let occurrence_count = occurrence_counts.get_mut(argument_index).ok_or_else(|| {
+                argument_error(
+                    command,
+                    format!("argument `{name}` resolved outside the catalog option table"),
+                    "Report this proposal validation state as a Quirl defect",
+                )
+            })?;
+            *occurrence_count = occurrence_count.checked_add(1).ok_or_else(|| {
+                resource_error(
+                    "proposal argument occurrence count overflowed",
+                    "Reduce repeated argument occurrences",
+                )
+            })?;
+            if *occurrence_count > 1 && !specification.repeatable {
                 return Err(argument_error(
                     command,
                     format!("argument `{name}` is not repeatable"),
@@ -448,8 +453,8 @@ impl CommandProposal {
             arguments.push(validated);
         }
 
-        for (index, specification) in command.options.iter().enumerate() {
-            if specification.required && occurrence_counts[index] == 0 {
+        for (specification, occurrence_count) in command.options.iter().zip(&occurrence_counts) {
+            if specification.required && *occurrence_count == 0 {
                 let name = canonical_argument_name(command, specification)?;
                 return Err(argument_error(
                     command,
@@ -457,7 +462,7 @@ impl CommandProposal {
                     "Supply a resolved value or an explicit unresolved slot",
                 ));
             }
-            if occurrence_counts[index] == 0 {
+            if *occurrence_count == 0 {
                 continue;
             }
             for conflict in &specification.conflicts {
@@ -466,7 +471,11 @@ impl CommandProposal {
                     .iter()
                     .enumerate()
                     .find(|(_, candidate)| candidate.names.iter().any(|name| name == conflict))
-                    && occurrence_counts[conflict_index] > 0
+                    && occurrence_counts
+                        .get(conflict_index)
+                        .copied()
+                        .unwrap_or_default()
+                        > 0
                 {
                     let name = canonical_argument_name(command, specification)?;
                     return Err(argument_error(
@@ -1257,7 +1266,7 @@ mod tests {
                 "argument" => value["arguments"][0]["future"] = serde_json::json!(true),
                 "value" => value["arguments"][0]["value"]["future"] = serde_json::json!(true),
                 "provenance" => value["provenance"]["future"] = serde_json::json!(true),
-                _ => unreachable!(),
+                _ => panic!("test supplies a fixed proposal path"),
             }
             assert!(
                 CommandProposal::from_json(&value.to_string()).is_err(),

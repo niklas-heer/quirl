@@ -1,7 +1,9 @@
 //! Bounded local command intelligence backed by SQLite and Model2Vec.
 
 use model2vec_rs::model::StaticModel;
-use quirl_catalog::{ArgumentKind, Catalog, CompletionSource, Confidence, ProvenanceInfo, Trust};
+use quirl_catalog::{
+    ArgumentKind, ArgumentSpec, Catalog, CompletionSource, Confidence, ProvenanceInfo, Trust,
+};
 use quirl_core::{ErrorCode, ShellError};
 use rusqlite::{Connection, MAIN_DB, Transaction, limits::Limit, params, serialize::Data};
 use serde::{Deserialize, Serialize};
@@ -1207,17 +1209,21 @@ pub(crate) fn record_local_negative_hit(
 // These function pointers keep the incremental contract lint-visible before
 // the process-side provider task wires it into the interactive completion path.
 // No provider is launched from this persistence owner.
+type ReadLocalOverlayFn = fn(&[u8], &Path, &LocalOverlayQuery) -> Result<LocalOverlay, ShellError>;
+type ReadLocalOverlaysFn =
+    fn(&[u8], &Path, &[LocalOverlayQuery]) -> Result<LocalOverlay, ShellError>;
+type MergeLocalProviderResultFn =
+    fn(&[u8], &Path, &str, &[LocalCompletionRecord]) -> Result<Vec<u8>, ShellError>;
+type RecordLocalNegativeHitFn =
+    fn(&[u8], &Path, &str, &LocalNegativeObservation) -> Result<Vec<u8>, ShellError>;
+
 const _: () = {
-    let _ = read_local_overlay
-        as fn(&[u8], &Path, &LocalOverlayQuery) -> Result<LocalOverlay, ShellError>;
-    let _ = read_local_overlays
-        as fn(&[u8], &Path, &[LocalOverlayQuery]) -> Result<LocalOverlay, ShellError>;
-    let _ = merge_local_provider_result
-        as fn(&[u8], &Path, &str, &[LocalCompletionRecord]) -> Result<Vec<u8>, ShellError>;
-    let _ = record_local_negative_hit
-        as fn(&[u8], &Path, &str, &LocalNegativeObservation) -> Result<Vec<u8>, ShellError>;
-    let _ = compose_primary_description
-        as fn(&[CompletionDescriptionFact]) -> Option<CompletionDescriptionFact>;
+    let _: ReadLocalOverlayFn = read_local_overlay;
+    let _: ReadLocalOverlaysFn = read_local_overlays;
+    let _: MergeLocalProviderResultFn = merge_local_provider_result;
+    let _: RecordLocalNegativeHitFn = record_local_negative_hit;
+    let _: fn(&[CompletionDescriptionFact]) -> Option<CompletionDescriptionFact> =
+        compose_primary_description;
     let _ = [
         CompletionCompositionTier::Curated,
         CompletionCompositionTier::CentralImported,
@@ -2206,7 +2212,7 @@ fn insert_catalog(transaction: &Transaction<'_>, catalog: &Catalog) -> Result<()
                     .map_err(database_error)?;
             }
             insert_indexed_strings(transaction, "argument", &argument_id, &argument.examples)?;
-            let document = argument_document(command, ordinal);
+            let document = argument_document(command, ordinal, argument);
             insert_document(transaction, &document)?;
             document_count = document_count.saturating_add(1);
             if document_count > DOCUMENTS_MAX {
@@ -2327,8 +2333,11 @@ fn command_document(command: &quirl_catalog::CommandSpec) -> SemanticDocument {
     }
 }
 
-fn argument_document(command: &quirl_catalog::CommandSpec, ordinal: usize) -> SemanticDocument {
-    let argument = &command.options[ordinal];
+fn argument_document(
+    command: &quirl_catalog::CommandSpec,
+    ordinal: usize,
+    argument: &ArgumentSpec,
+) -> SemanticDocument {
     let mut option_names = argument.names.clone();
     option_names.sort();
     option_names.dedup();
@@ -2546,16 +2555,22 @@ fn rank_lexical_documents_cancellable(
     // standard inverse-document-frequency term), so a distinctive word
     // pulls its actual weight and a word that appears almost everywhere
     // barely moves the score.
-    let total_documents = documents.len().max(1) as f32;
+    let total_documents = ranking_float(documents.len().max(1));
     let mut document_frequency = vec![0_usize; query_terms.len()];
     for matched in &document_matches {
         for &term_index in matched {
-            document_frequency[term_index] += 1;
+            if let Some(frequency) = document_frequency.get_mut(term_index) {
+                *frequency = frequency.saturating_add(1);
+            }
         }
     }
     let term_weight = document_frequency
         .iter()
-        .map(|&frequency| (total_documents / (1.0 + frequency as f32)).ln().max(0.1))
+        .map(|&frequency| {
+            (total_documents / (1.0 + ranking_float(frequency)))
+                .ln()
+                .max(0.1)
+        })
         .collect::<Vec<_>>();
     // A term matching in the short, focused title/summary field is a much
     // stronger relevance signal than the same term turning up somewhere in
@@ -2599,11 +2614,15 @@ fn rank_lexical_documents_cancellable(
                     Some(&local_matches)
                 };
                 let matches = matched_indices.map_or(0.0, |indices| {
-                    indices.iter().map(|&index| term_weight[index]).sum()
+                    indices
+                        .iter()
+                        .filter_map(|&index| term_weight.get(index))
+                        .sum()
                 });
                 let title_bonus = title_matched
                     .iter()
-                    .map(|&index| term_weight[index] * TITLE_MATCH_BONUS)
+                    .filter_map(|&index| term_weight.get(index))
+                    .map(|weight| weight * TITLE_MATCH_BONUS)
                     .sum::<f32>();
                 let command_bonus = if prefers_commands && document.kind == "command" {
                     COMMAND_PREFERENCE_BONUS
@@ -3105,7 +3124,14 @@ fn count_rows(connection: &Connection, path: &Path, table: &str) -> Result<usize
         "arguments" => "SELECT count(*) FROM arguments",
         "semantic_documents" => "SELECT count(*) FROM semantic_documents",
         "embeddings" => "SELECT count(*) FROM embeddings",
-        _ => unreachable!("table names are fixed by the command database schema"),
+        _ => {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "command database row-count request used an unknown table",
+            )
+            .with_context(format!("table: {table}"))
+            .with_help("Report this database schema mismatch as a Quirl defect"));
+        }
     };
     let count: i64 = connection
         .query_row(sql, [], |row| row.get(0))
@@ -3186,7 +3212,10 @@ fn bytes_to_vector(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>, ShellErr
     }
     let vector = bytes
         .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .map(|chunk| {
+            let encoded: [u8; 4] = chunk.try_into().unwrap_or_default();
+            f32::from_le_bytes(encoded)
+        })
         .collect::<Vec<_>>();
     if vector.iter().any(|value| !value.is_finite()) {
         return Err(ShellError::new(
@@ -3228,12 +3257,16 @@ fn haystack_contains_term(haystack: &str, term: &str) -> bool {
         return false;
     }
     haystack.match_indices(term).any(|(start, matched)| {
-        let end = start + matched.len();
-        let before_boundary = haystack[..start]
+        let end = start.saturating_add(matched.len());
+        let before_boundary = haystack
+            .get(..start)
+            .unwrap_or_default()
             .chars()
             .next_back()
             .is_none_or(|ch| !ch.is_alphanumeric());
-        let after_boundary = haystack[end..]
+        let after_boundary = haystack
+            .get(end..)
+            .unwrap_or_default()
             .chars()
             .next()
             .is_none_or(|ch| !ch.is_alphanumeric());
@@ -3312,7 +3345,8 @@ fn fuse_rankings(
             if position % CANCELLATION_CHECK_INTERVAL == 0 {
                 check_cancelled()?;
             }
-            let contribution = 1.0 / (FUSION_RANK_CONSTANT + position.saturating_add(1) as f32);
+            let contribution =
+                1.0 / (FUSION_RANK_CONSTANT + ranking_float(position.saturating_add(1)));
             result.semantic = true;
             result.mode = RetrievalMode::Hybrid;
             let entry = fused
@@ -3334,6 +3368,15 @@ fn fuse_rankings(
     sort_and_limit(&mut results, limit);
     check_cancelled()?;
     Ok(results)
+}
+
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_precision_loss,
+    reason = "ranking inputs are bounded to 65,536 and f32 precision is the scoring contract"
+)]
+fn ranking_float(value: usize) -> f32 {
+    value as f32
 }
 
 fn sort_and_limit(results: &mut Vec<SearchResult>, limit: usize) {
@@ -3675,18 +3718,24 @@ mod tests {
     }
 
     fn int8_safetensors(rows: usize, columns: usize) -> Vec<u8> {
-        let data_bytes = rows * columns;
+        let data_bytes = rows.checked_mul(columns).expect("fixture shape must fit");
         let mut header = format!(
             "{{\"embeddings\":{{\"dtype\":\"I8\",\"shape\":[{rows},{columns}],\"data_offsets\":[0,{data_bytes}]}}}}"
         )
         .into_bytes();
-        while header.len() % 8 != 0 {
+        while !header.len().is_multiple_of(8) {
             header.push(b' ');
         }
-        let mut bytes = Vec::with_capacity(8 + header.len() + data_bytes);
-        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        let capacity = 8_usize
+            .checked_add(header.len())
+            .and_then(|value| value.checked_add(data_bytes))
+            .expect("fixture capacity must fit");
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.extend_from_slice(&u64::try_from(header.len()).unwrap().to_le_bytes());
         bytes.extend_from_slice(&header);
-        bytes.extend((0..data_bytes).map(|index| u8::try_from(index + 1).unwrap()));
+        bytes.extend((0..data_bytes).map(|index| {
+            u8::try_from(index.checked_add(1).expect("fixture index must fit")).unwrap()
+        }));
         bytes
     }
 
@@ -4042,8 +4091,7 @@ mod tests {
 
     fn local_query(now_unix_ms: u64) -> LocalOverlayQuery {
         LocalOverlayQuery {
-            native_catalog_fingerprint: crate::native_catalog::embedded_database_identity()
-                .to_owned(),
+            native_catalog_fingerprint: crate::native_catalog::embedded_database_identity().clone(),
             executable_fingerprint: "exe:v1".to_owned(),
             provider_fingerprint: "provider:v1".to_owned(),
             cwd_class: LocalCwdClass::Repository,

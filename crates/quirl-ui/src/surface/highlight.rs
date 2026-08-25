@@ -414,6 +414,10 @@ fn is_executable_file(path: &Path) -> std::io::Result<bool> {
     fs::metadata(path).map(|metadata| metadata.is_file())
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "diagnostic spans originate from the syntax parser and are UTF-8 byte boundaries"
+)]
 fn diagnostic_for(
     catalog: &Catalog,
     path_commands: &PathCommandCache,
@@ -665,6 +669,10 @@ struct ShortOptionLookup<'a> {
 }
 
 impl<'a> ShortOptionLookup<'a> {
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the command contract guarantees the positional specification index after the preceding bounds checks"
+    )]
     fn new(command: &'a CommandSpec) -> Self {
         let mut lookup = Self {
             ascii: [None; 128],
@@ -720,6 +728,11 @@ fn presentation_flag(word: &Word) -> bool {
         .is_some_and(|part| part.quoting == Quoting::Unquoted && part.text.starts_with('-'))
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "matrix dimensions and neighbor indices are constructed together and bounded before every iteration"
+)]
 fn edit_distance_bounded(left: &str, right: &str, maximum: usize) -> Option<usize> {
     if left.len() > COMMAND_SUGGESTION_TOKEN_BYTES_MAX
         || right.len() > COMMAND_SUGGESTION_TOKEN_BYTES_MAX
@@ -767,6 +780,11 @@ fn edit_distance_bounded(left: &str, right: &str, maximum: usize) -> Option<usiz
         .filter(|distance| *distance <= maximum)
 }
 
+#[allow(
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    reason = "the truncation offset is walked backward until it is a UTF-8 boundary"
+)]
 fn bounded_command_label(command: &str) -> String {
     if command.len() <= COMMAND_SUGGESTION_TOKEN_BYTES_MAX {
         return command.to_owned();
@@ -785,6 +803,10 @@ fn record_timing(samples: &mut VecDeque<Duration>, elapsed: Duration) {
     samples.push_back(elapsed);
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the sample collection is bounded and non-empty before the percentile rank calculation"
+)]
 fn timing_p95(samples: &VecDeque<Duration>) -> Option<Duration> {
     if samples.is_empty() {
         return None;
@@ -866,7 +888,7 @@ mod tests {
         let diagnostic = analyzer.current().diagnostic.as_ref().unwrap();
         assert_eq!(diagnostic.severity, DiagnosticSeverity::Warning);
         let range = diagnostic.range.clone().unwrap();
-        assert_eq!(&input[range], "--definitely-invalid");
+        assert_eq!(input.get(range), Some("--definitely-invalid"));
     }
 
     #[test]
@@ -1022,7 +1044,7 @@ mod tests {
         let diagnostic = analyzer.current().diagnostic.as_ref().unwrap();
         assert_eq!(diagnostic.severity, DiagnosticSeverity::Warning);
         let range = diagnostic.range.clone().unwrap();
-        assert_eq!(&input[range], unknown);
+        assert_eq!(input.get(range), Some(unknown));
     }
 
     #[test]

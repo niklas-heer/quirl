@@ -252,6 +252,11 @@ impl EditorState {
         }
     }
 
+    #[allow(
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+        reason = "the editor maintains its cursor as a checked UTF-8 boundary and bounds every movement"
+    )]
     pub fn apply(&mut self, action: EditAction) -> bool {
         self.pasted_lines = None;
         self.resource_notice = None;
@@ -393,6 +398,10 @@ impl EditorState {
         true
     }
 
+    #[allow(
+        clippy::string_slice,
+        reason = "the editor cursor invariant guarantees a UTF-8 boundary before insertion"
+    )]
     pub fn insert_paste(&mut self, text: &str) {
         self.pasted_lines = None;
         self.resource_notice = None;
@@ -502,6 +511,10 @@ impl EditorState {
         }
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the history index is checked against the history length immediately before access"
+    )]
     fn history_previous(&mut self) {
         if self.history.is_empty() {
             return;
@@ -520,6 +533,11 @@ impl EditorState {
         }
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        reason = "the history index is checked against the history length immediately before movement and access"
+    )]
     fn history_next(&mut self) {
         let Some(current) = self.history_index else {
             return;
@@ -543,6 +561,10 @@ impl EditorState {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the decrement is guarded by index being nonzero"
+)]
 fn char_boundary_at_or_before(value: &str, mut index: usize) -> usize {
     while index > 0 && !value.is_char_boundary(index) {
         index -= 1;
@@ -588,6 +610,10 @@ fn bounded_history(history: Vec<String>) -> Vec<String> {
     retained
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "cursor is normalized to a UTF-8 boundary"
+)]
 fn previous_boundary(value: &str, cursor: usize) -> usize {
     value[..cursor.min(value.len())]
         .grapheme_indices(true)
@@ -595,6 +621,10 @@ fn previous_boundary(value: &str, cursor: usize) -> usize {
         .map_or(cursor, |(index, _)| index)
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "cursor is normalized to a UTF-8 boundary"
+)]
 fn next_boundary(value: &str, cursor: usize) -> usize {
     value[cursor.min(value.len())..]
         .grapheme_indices(true)
@@ -602,18 +632,30 @@ fn next_boundary(value: &str, cursor: usize) -> usize {
         .map_or(value.len(), |(offset, _)| cursor.saturating_add(offset))
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "cursor is normalized to a UTF-8 boundary"
+)]
 fn line_start(value: &str, cursor: usize) -> usize {
     value[..cursor.min(value.len())]
         .rfind('\n')
         .map_or(0, |index| index.saturating_add(1))
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "cursor is normalized to a UTF-8 boundary"
+)]
 fn line_end(value: &str, cursor: usize) -> usize {
     value[cursor.min(value.len())..]
         .find('\n')
         .map_or(value.len(), |offset| cursor.saturating_add(offset))
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "cursor is normalized to a UTF-8 boundary"
+)]
 fn word_left(value: &str, cursor: usize) -> usize {
     let prefix = &value[..cursor.min(value.len())];
     let trimmed = prefix.trim_end_matches(char::is_whitespace);
@@ -622,6 +664,10 @@ fn word_left(value: &str, cursor: usize) -> usize {
         .map_or(0, |index| index.saturating_add(1))
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "cursor is normalized to a UTF-8 boundary"
+)]
 fn word_right(value: &str, cursor: usize) -> usize {
     let suffix = &value[cursor.min(value.len())..];
     let leading = suffix
@@ -776,7 +822,7 @@ mod tests {
         assert!(editor.apply(EditAction::Yank));
         assert_eq!(editor.buffer(), "echo hello world");
         assert!(editor.apply(EditAction::MoveWordLeft));
-        assert_eq!(&editor.buffer()[editor.cursor()..], "world");
+        assert_eq!(editor.buffer().get(editor.cursor()..), Some("world"));
     }
 
     #[test]

@@ -86,7 +86,7 @@ fn stdin_items() -> Result<Vec<PickItem>, ShellError> {
 fn stdin_items_from(reader: impl Read) -> Result<Vec<PickItem>, ShellError> {
     let mut bytes = Vec::new();
     reader
-        .take(MAX_STDIN_BYTES.saturating_add(1) as u64)
+        .take(u64::try_from(MAX_STDIN_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)
         .map_err(|error| {
             ShellError::new(ErrorCode::Io, "could not read picker input")

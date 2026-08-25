@@ -262,7 +262,7 @@ impl ActiveSlot {
             }
             match active_slots.compare_exchange_weak(
                 observed,
-                observed + 1,
+                observed.saturating_add(1),
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
@@ -1130,9 +1130,10 @@ end
         fn retain(&mut self, stream: OutputStream, bytes: &[u8]) {
             let available = self.bytes_max.saturating_sub(self.retained_bytes());
             let retained = bytes.len().min(available);
+            let retained_bytes = bytes.get(..retained).unwrap_or_default();
             match stream {
-                OutputStream::Stdout => self.stdout.extend_from_slice(&bytes[..retained]),
-                OutputStream::Stderr => self.stderr.extend_from_slice(&bytes[..retained]),
+                OutputStream::Stdout => self.stdout.extend_from_slice(retained_bytes),
+                OutputStream::Stderr => self.stderr.extend_from_slice(retained_bytes),
             }
             self.observed_bytes = self.observed_bytes.saturating_add(bytes.len());
         }
@@ -1207,14 +1208,31 @@ end
         stderr: &mut ChildStderr,
         output: &mut ProviderOutput,
     ) -> Result<(), ShellError> {
-        let bytes_per_turn = IO_CHUNK_BYTES.saturating_mul(IO_READS_PER_TURN_MAX);
+        let bytes_per_turn = IO_CHUNK_BYTES
+            .checked_mul(IO_READS_PER_TURN_MAX)
+            .ok_or_else(|| {
+                resource_limit_error(
+                    "local completion drain budget overflowed",
+                    usize::MAX,
+                    output.bytes_max,
+                    "Reduce the configured completion output limit",
+                )
+            })?;
         let turns_max = output
             .bytes_max
-            .saturating_div(bytes_per_turn)
+            .checked_div(bytes_per_turn)
+            .ok_or_else(|| {
+                resource_limit_error(
+                    "local completion drain turn calculation failed",
+                    bytes_per_turn,
+                    output.bytes_max,
+                    "Use a non-zero completion I/O turn budget",
+                )
+            })?
             .saturating_add(2);
         let mut turns_used = 0_usize;
         for _ in 0..turns_max {
-            turns_used += 1;
+            turns_used = turns_used.saturating_add(1);
             let stdout_progress = drain_stream_turn(stdout, OutputStream::Stdout, output)?;
             let stderr_progress = drain_stream_turn(stderr, OutputStream::Stderr, output)?;
             output.ensure_within_limit()?;
@@ -1263,7 +1281,7 @@ end
             match reader.read(&mut buffer) {
                 Ok(0) => return Ok(progress),
                 Ok(bytes) => {
-                    output.retain(stream, &buffer[..bytes]);
+                    output.retain(stream, buffer.get(..bytes).unwrap_or_default());
                     progress = true;
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(progress),
@@ -1318,13 +1336,13 @@ end
         use std::os::unix::process::ExitStatusExt;
         status
             .code()
-            .or_else(|| status.signal().map(|signal| 128 + signal))
+            .or_else(|| status.signal().map(|signal| 128_i32.saturating_add(signal)))
             .unwrap_or(1)
     }
 
     fn terminal_safe_excerpt(bytes: &[u8], bytes_max: usize) -> String {
         let retained = bytes.len().min(bytes_max);
-        let text = String::from_utf8_lossy(&bytes[..retained]);
+        let text = String::from_utf8_lossy(bytes.get(..retained).unwrap_or_default());
         quirl_core::escape_terminal_line(&text)
     }
 
@@ -1411,8 +1429,18 @@ fn decode_header(bytes: &[u8], cursor: &mut usize) -> Result<(usize, usize), She
             "Fix or remove the malformed completion provider",
         )
     })?;
-    let candidate = decode_hex_length(&header[..8])?;
-    let description = decode_hex_length(&header[8..])?;
+    let candidate = decode_hex_length(header.get(..8).ok_or_else(|| {
+        protocol_error(
+            "local completion frame header is shorter than its candidate length",
+            "Fix or remove the malformed completion provider",
+        )
+    })?)?;
+    let description = decode_hex_length(header.get(8..).ok_or_else(|| {
+        protocol_error(
+            "local completion frame header is shorter than its description length",
+            "Fix or remove the malformed completion provider",
+        )
+    })?)?;
     *cursor = end;
     Ok((candidate, description))
 }
@@ -1424,18 +1452,26 @@ fn decode_hex_length(bytes: &[u8]) -> Result<usize, ShellError> {
             "Fix or remove the malformed completion provider",
         )
     })?;
-    u32::from_str_radix(text, 16)
-        .map(|value| value as usize)
-        .map_err(|error| {
-            protocol_error(
-                "local completion frame length is malformed",
-                "Fix or remove the malformed completion provider",
-            )
-            .with_context(format!(
-                "header `{}`: {error}",
-                quirl_core::escape_terminal_line(text)
-            ))
-        })
+    let value = u32::from_str_radix(text, 16).map_err(|error| {
+        protocol_error(
+            "local completion frame length is malformed",
+            "Fix or remove the malformed completion provider",
+        )
+        .with_context(format!(
+            "header `{}`: {error}",
+            quirl_core::escape_terminal_line(text)
+        ))
+    })?;
+    usize::try_from(value).map_err(|_| {
+        protocol_error(
+            "local completion frame length cannot be represented on this host",
+            "Reduce the completion field length and retry",
+        )
+        .with_context(format!(
+            "header `{}`",
+            quirl_core::escape_terminal_line(text)
+        ))
+    })
 }
 
 fn decode_field(
@@ -1505,7 +1541,14 @@ fn scalar_field_end(bytes: &[u8], start: usize, scalars: usize) -> Result<usize,
                 ))
             }
         },
-        |(offset, _)| Ok(start + offset),
+        |(offset, _)| {
+            start.checked_add(offset).ok_or_else(|| {
+                protocol_error(
+                    "local completion scalar field offset overflowed",
+                    "Fix or remove the malformed completion provider",
+                )
+            })
+        },
     )
 }
 

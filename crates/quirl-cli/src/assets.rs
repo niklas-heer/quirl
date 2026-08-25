@@ -630,14 +630,14 @@ pub(crate) fn execute(command: AssetsCommand) -> Result<i32, ShellError> {
         AssetsCommand::Retry { manifest, format } => {
             let paths = AssetPaths::discover()?;
             create_private_directory(&paths.cache)?;
-            let _guard = coordination::acquire(
+            let guard = coordination::acquire(
                 &paths.state,
                 CoordinationKind::Asset,
                 CoordinationWait::Explicit,
             )?
             .ok_or_else(asset_lock_busy)?;
             write_retry_state(&paths.state, &RetryState::new())?;
-            drop(_guard);
+            drop(guard);
             execute_update(manifest, format, UpdateMode::Retry)
         }
     }
@@ -792,7 +792,7 @@ fn update_from_source(
     };
     for asset in &manifest.assets {
         if cancelled.load(Ordering::Acquire) {
-            report.deferred += 1;
+            report.deferred = report.deferred.saturating_add(1);
             report.results.push(AssetUpdateResult {
                 logical_name: asset.logical_name.clone(),
                 state: "cancelled",
@@ -808,7 +808,7 @@ fn update_from_source(
             let blocked = entry.disposition == RetryDisposition::Permanent
                 || (matches!(mode, UpdateMode::Background) && entry.next_retry_unix_ms > now_ms);
             if blocked {
-                report.deferred += 1;
+                report.deferred = report.deferred.saturating_add(1);
                 report.results.push(AssetUpdateResult {
                     logical_name: asset.logical_name.clone(),
                     state: "deferred",
@@ -827,7 +827,7 @@ fn update_from_source(
         ) {
             Ok(InstallOutcome::Current) => {
                 retry.entries.remove(&asset.logical_name);
-                report.current += 1;
+                report.current = report.current.saturating_add(1);
                 report.results.push(AssetUpdateResult {
                     logical_name: asset.logical_name.clone(),
                     state: "current",
@@ -836,7 +836,7 @@ fn update_from_source(
             }
             Ok(InstallOutcome::Installed) => {
                 retry.entries.remove(&asset.logical_name);
-                report.installed += 1;
+                report.installed = report.installed.saturating_add(1);
                 report.results.push(AssetUpdateResult {
                     logical_name: asset.logical_name.clone(),
                     state: "installed",
@@ -845,7 +845,7 @@ fn update_from_source(
             }
             Err(failure) => {
                 record_failure(&mut retry, asset, identity, &failure, now_ms)?;
-                report.failed += 1;
+                report.failed = report.failed.saturating_add(1);
                 report.results.push(AssetUpdateResult {
                     logical_name: asset.logical_name.clone(),
                     state: if failure.permanent {
@@ -1347,7 +1347,7 @@ fn tar_text(bytes: &[u8]) -> Result<String, AssetFailure> {
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
-    std::str::from_utf8(&bytes[..end])
+    std::str::from_utf8(bytes.get(..end).unwrap_or_default())
         .map(str::to_owned)
         .map_err(|error| {
             AssetFailure::permanent(
@@ -1383,7 +1383,7 @@ fn copy_exact_tar_bytes(
 ) -> Result<(), AssetFailure> {
     let mut limited = archive.take(size);
     let mut copied = 0_u64;
-    let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
     loop {
         admission_checkpoint(cancelled, started)?;
         let count = limited.read(&mut buffer).map_err(|error| {
@@ -1392,9 +1392,11 @@ fn copy_exact_tar_bytes(
         if count == 0 {
             break;
         }
-        output.write_all(&buffer[..count]).map_err(|error| {
-            AssetFailure::transient(asset_io_error("extract", archive_path, error))
-        })?;
+        output
+            .write_all(buffer.get(..count).unwrap_or_default())
+            .map_err(|error| {
+                AssetFailure::transient(asset_io_error("extract", archive_path, error))
+            })?;
         copied = copied.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
     }
     if copied != size {
@@ -1414,7 +1416,7 @@ fn skip_tar_bytes(
 ) -> Result<(), AssetFailure> {
     let mut limited = archive.take(size);
     let mut copied = 0_u64;
-    let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
     loop {
         admission_checkpoint(cancelled, started)?;
         let count = limited.read(&mut buffer).map_err(|error| {
@@ -1440,7 +1442,11 @@ fn skip_tar_padding(
     cancelled: &AtomicBool,
     started: Instant,
 ) -> Result<(), AssetFailure> {
-    let padding = (512 - (size % 512)) % 512;
+    let remainder = size.checked_rem(512).unwrap_or_default();
+    let padding = 512_u64
+        .saturating_sub(remainder)
+        .checked_rem(512)
+        .unwrap_or_default();
     skip_tar_bytes(archive, padding, path, cancelled, started)
 }
 
@@ -1495,7 +1501,7 @@ fn download_and_verify(
     let started = Instant::now();
     let mut observed = 0_u64;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
     loop {
         if cancelled.load(Ordering::Acquire) {
             return Err(AssetFailure::transient(
@@ -1530,9 +1536,10 @@ fn download_and_verify(
         if observed > asset.byte_size || observed > ASSET_BYTES_MAX {
             return Err(integrity_failure(asset, observed, None));
         }
-        file.write_all(&buffer[..count])
+        let chunk = buffer.get(..count).unwrap_or_default();
+        file.write_all(chunk)
             .map_err(|error| AssetFailure::transient(asset_io_error("write", path, error)))?;
-        hasher.update(&buffer[..count]);
+        hasher.update(chunk);
     }
     file.sync_all()
         .map_err(|error| AssetFailure::transient(asset_io_error("sync", path, error)))?;
@@ -1566,7 +1573,7 @@ fn validate_payload_controlled(
     }
     let mut observed = 0_u64;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
     loop {
         admission_checkpoint(cancelled, started)?;
         let count = file
@@ -1579,7 +1586,7 @@ fn validate_payload_controlled(
         if observed > asset.byte_size {
             return Err(integrity_failure(asset, observed, None));
         }
-        hasher.update(&buffer[..count]);
+        hasher.update(buffer.get(..count).unwrap_or_default());
     }
     let digest = format!("{:x}", hasher.finalize());
     if observed != asset.byte_size || digest != asset.sha256 {
@@ -1616,7 +1623,7 @@ fn validate_manifest(manifest: &AssetManifest, allow_file: bool) -> Result<(), S
         ));
     }
     let mut total = 0_u64;
-    let mut names = BTreeMap::new();
+    let mut names = BTreeSet::new();
     for asset in &manifest.assets {
         validate_manifest_entry(asset, allow_file)?;
         validate_required_asset_contract(asset)?;
@@ -1626,7 +1633,7 @@ fn validate_manifest(manifest: &AssetManifest, allow_file: bool) -> Result<(), S
                 asset.logical_name, manifest.quirl_version
             )));
         }
-        if names.insert(asset.logical_name.as_str(), ()).is_some() {
+        if !names.insert(asset.logical_name.as_str()) {
             return Err(manifest_validation("duplicate logical asset name"));
         }
         total = total.checked_add(asset.byte_size).ok_or_else(|| {
@@ -1641,7 +1648,7 @@ fn validate_manifest(manifest: &AssetManifest, allow_file: bool) -> Result<(), S
         }
     }
     for (logical_name, _, _, _) in REQUIRED_ASSETS {
-        if !names.contains_key(logical_name) {
+        if !names.contains(logical_name) {
             return Err(manifest_validation(format!(
                 "runtime asset manifest is missing required {logical_name}"
             )));
@@ -1781,7 +1788,12 @@ fn validate_manifest_entry(asset: &AssetManifestEntry, allow_file: bool) -> Resu
             || values
                 .iter()
                 .any(|value| value.is_empty() || value.len() > 32)
-            || values.windows(2).any(|pair| pair[0] >= pair[1])
+            || values.windows(2).any(|pair| {
+                let Some([left, right]) = pair.first_chunk::<2>() else {
+                    return false;
+                };
+                left >= right
+            })
         {
             return Err(manifest_validation(
                 "asset compatibility list is invalid, duplicated, or unsorted",
@@ -1812,7 +1824,9 @@ fn validate_asset_notices(asset: &AssetManifestEntry, allow_file: bool) -> Resul
             "completion database must retain exactly one Carapace license notice",
         ));
     }
-    let notice = &asset.notices[0];
+    let notice = asset.notices.first().ok_or_else(|| {
+        manifest_validation("completion database is missing its required license notice")
+    })?;
     let text_bytes = notice.text.as_bytes();
     let observed_size = u64::try_from(text_bytes.len()).unwrap_or(u64::MAX);
     if notice.name != "Carapace"
@@ -2093,9 +2107,13 @@ fn retry_delay_ms(attempts: u8) -> u64 {
     let jitter_max = base / 4;
     let mut random = [0_u8; 8];
     let jitter = if getrandom::fill(&mut random).is_ok() {
-        u64::from_le_bytes(random) % jitter_max.saturating_add(1)
+        u64::from_le_bytes(random)
+            .checked_rem(jitter_max.saturating_add(1))
+            .unwrap_or_default()
     } else {
-        unix_time_ms() % jitter_max.saturating_add(1)
+        unix_time_ms()
+            .checked_rem(jitter_max.saturating_add(1))
+            .unwrap_or_default()
     };
     base.saturating_add(jitter).min(RETRY_DELAY_MS_MAX)
 }
@@ -2557,7 +2575,7 @@ fn read_bounded_file_controlled(
         .unwrap_or(bytes_max)
         .min(bytes_max);
     let mut bytes = Vec::with_capacity(capacity);
-    let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
     loop {
         admission_checkpoint(cancelled, started).map_err(|failure| failure.error)?;
         let count = file
@@ -2573,7 +2591,7 @@ fn read_bounded_file_controlled(
                 bytes.len().saturating_add(count),
             ));
         }
-        bytes.extend_from_slice(&buffer[..count]);
+        bytes.extend_from_slice(buffer.get(..count).unwrap_or_default());
     }
     Ok(bytes)
 }
@@ -2642,7 +2660,11 @@ fn read_bounded(
     label: &str,
 ) -> Result<Vec<u8>, ShellError> {
     let mut bytes = Vec::with_capacity(bytes_max.min(64 * 1024));
-    let mut limited = reader.take(u64::try_from(bytes_max).unwrap_or(u64::MAX) + 1);
+    let mut limited = reader.take(
+        u64::try_from(bytes_max)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+    );
     limited.read_to_end(&mut bytes).map_err(|error| {
         ShellError::new(ErrorCode::Io, format!("could not read {label}"))
             .with_context(error.to_string())
@@ -2679,7 +2701,7 @@ fn stream_https(agent: ureq::Agent, url: &str, sender: &mpsc::SyncSender<Downloa
         }
     };
     let mut reader = response.into_body().into_reader();
-    let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
+    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_BYTES];
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => {
@@ -2687,10 +2709,13 @@ fn stream_https(agent: ureq::Agent, url: &str, sender: &mpsc::SyncSender<Downloa
                 return;
             }
             Ok(count) => {
-                if sender
-                    .send(DownloadMessage::Data(buffer[..count].to_vec()))
-                    .is_err()
-                {
+                let Some(chunk) = buffer.get(..count) else {
+                    let _ = sender.send(DownloadMessage::Error(
+                        "HTTPS reader returned an invalid byte count".to_owned(),
+                    ));
+                    return;
+                };
+                if sender.send(DownloadMessage::Data(chunk.to_vec())).is_err() {
                     return;
                 }
             }
@@ -2875,9 +2900,9 @@ fn truncate_utf8(value: &str, bytes_max: usize) -> String {
     }
     let mut end = bytes_max;
     while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
+        end = end.saturating_sub(1);
     }
-    value[..end].to_owned()
+    value.get(..end).map_or_else(String::new, str::to_owned)
 }
 
 #[cfg(test)]
@@ -2980,10 +3005,11 @@ mod tests {
             if self.offset == self.bytes.len() {
                 return Ok(0);
             }
-            let remaining = self.bytes.len() - self.offset;
+            let remaining = self.bytes.len().saturating_sub(self.offset);
             let count = remaining.min(buffer.len()).min(4);
-            buffer[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
-            self.offset += count;
+            let end = self.offset.saturating_add(count);
+            buffer[..count].copy_from_slice(&self.bytes[self.offset..end]);
+            self.offset = end;
             self.cancelled.store(true, Ordering::Release);
             Ok(count)
         }
@@ -3069,9 +3095,9 @@ mod tests {
             header[148..156].copy_from_slice(checksum.as_bytes());
             archive.extend_from_slice(&header);
             archive.extend_from_slice(&bytes);
-            archive.resize(archive.len().div_ceil(512) * 512, 0);
+            archive.resize(archive.len().div_ceil(512).saturating_mul(512), 0);
         }
-        archive.resize(archive.len() + 1024, 0);
+        archive.resize(archive.len().saturating_add(1024), 0);
         archive
     }
 

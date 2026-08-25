@@ -109,7 +109,9 @@ pub fn import_fish(source: &str, origin: &str) -> ImportReport {
         let Some(complete_index) = tokens.iter().position(|token| token == "complete") else {
             continue;
         };
-        let declaration = &tokens[complete_index + 1..];
+        let declaration = tokens
+            .get(complete_index.saturating_add(1)..)
+            .unwrap_or_default();
         match parse_fish_declaration(declaration, origin, &fingerprint, &mut candidate_count) {
             Ok(commands) => {
                 if !retain_commands(
@@ -200,7 +202,9 @@ pub fn import_bash(source: &str, origin: &str) -> ImportReport {
         let Some(complete_index) = tokens.iter().position(|token| token == "complete") else {
             continue;
         };
-        let declaration = &tokens[complete_index + 1..];
+        let declaration = tokens
+            .get(complete_index.saturating_add(1)..)
+            .unwrap_or_default();
         match parse_bash_declaration(declaration, origin, &fingerprint, &mut candidate_count) {
             Ok(commands) => {
                 if !retain_commands(
@@ -291,7 +295,7 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
         };
         if let Some(call) = tokens.iter().position(|token| token == "_arguments") {
             let mut skip_next = false;
-            for spec in &tokens[call + 1..] {
+            for spec in tokens.get(call.saturating_add(1)..).unwrap_or_default() {
                 if skip_next {
                     skip_next = false;
                     continue;
@@ -325,7 +329,10 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
             }
         }
         if let Some(call) = tokens.iter().position(|token| token == "_describe") {
-            let candidates = zsh_call_candidates(&tokens[call + 1..], &arrays);
+            let candidates = zsh_call_candidates(
+                tokens.get(call.saturating_add(1)..).unwrap_or_default(),
+                &arrays,
+            );
             if candidates.dynamic {
                 if let Err(message) =
                     admit_candidates(&mut candidate_count, 1, "Zsh `_describe` candidates")
@@ -348,7 +355,10 @@ pub fn import_zsh(source: &str, origin: &str) -> ImportReport {
             described.extend(candidates.values);
         }
         if let Some(call) = tokens.iter().position(|token| token == "_values") {
-            let candidates = zsh_call_candidates(&tokens[call + 1..], &arrays);
+            let candidates = zsh_call_candidates(
+                tokens.get(call.saturating_add(1)..).unwrap_or_default(),
+                &arrays,
+            );
             if candidates.dynamic {
                 if let Err(message) =
                     admit_candidates(&mut candidate_count, 1, "Zsh `_values` candidates")
@@ -515,7 +525,7 @@ fn import_documentation(source: &str, origin: &str, source_kind: Provenance) -> 
         if options.len() == MAX_HELP_OPTIONS {
             diagnostics.push(diagnostic(
                 origin,
-                line + 1,
+                line.saturating_add(1),
                 format!("option ingestion stopped at {MAX_HELP_OPTIONS} entries"),
             ));
             break;
@@ -676,39 +686,55 @@ fn zsh_static_arrays(
     let mut arrays = HashMap::new();
     let mut index = 0usize;
     while index < bytes.len() {
-        if !matches!(bytes[index], b'a'..=b'z' | b'A'..=b'Z' | b'_')
-            || index > 0 && (bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_')
-        {
-            index += 1;
+        let Some(byte) = bytes.get(index) else {
+            break;
+        };
+        let preceded_by_identifier = index
+            .checked_sub(1)
+            .and_then(|previous| bytes.get(previous))
+            .is_some_and(|previous| previous.is_ascii_alphanumeric() || *previous == b'_');
+        if !matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'_') || preceded_by_identifier {
+            index = index.saturating_add(1);
             continue;
         }
         let start = index;
-        index += 1;
-        while index < bytes.len() && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+        index = index.saturating_add(1);
+        while bytes
+            .get(index)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
         {
-            index += 1;
+            index = index.saturating_add(1);
         }
-        let name = &source[start..index];
+        let Some(name) = source.get(start..index) else {
+            continue;
+        };
         let mut cursor = index;
         while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor += 1;
+            cursor = cursor.saturating_add(1);
         }
         if bytes.get(cursor) != Some(&b'=') {
             continue;
         }
-        cursor += 1;
+        cursor = cursor.saturating_add(1);
         while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-            cursor += 1;
+            cursor = cursor.saturating_add(1);
         }
-        if bytes.get(cursor) != Some(&b'(') || cursor > 0 && bytes[cursor - 1] == b'$' {
+        let preceded_by_dollar = cursor
+            .checked_sub(1)
+            .and_then(|previous| bytes.get(previous))
+            == Some(&b'$');
+        if bytes.get(cursor) != Some(&b'(') || preceded_by_dollar {
             continue;
         }
         let Some(end) = matching_parenthesis(source, cursor) else {
             continue;
         };
-        if let Ok(values) = shell_words(&source[cursor + 1..end]) {
+        let content_start = cursor.saturating_add(1);
+        if let Some(content) = source.get(content_start..end)
+            && let Ok(values) = shell_words(content)
+        {
             if values.iter().any(|value| is_dynamic_zsh(value)) {
-                index = end + 1;
+                index = end.saturating_add(1);
                 continue;
             }
             match admit_candidates(candidate_count, values.len(), "Zsh static array candidates") {
@@ -716,16 +742,18 @@ fn zsh_static_arrays(
                     arrays.insert(name.to_owned(), values);
                 }
                 Err(message) => {
-                    let line = source[..start]
+                    let line = source
+                        .get(..start)
+                        .unwrap_or_default()
                         .bytes()
                         .filter(|byte| *byte == b'\n')
                         .count()
-                        + 1;
+                        .saturating_add(1);
                     push_diagnostic(diagnostics, diagnostic(origin, line, message));
                 }
             }
         }
-        index = end + 1;
+        index = end.saturating_add(1);
     }
     arrays
 }
@@ -735,7 +763,7 @@ fn matching_parenthesis(source: &str, open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut quote = None;
     let mut escaped = false;
-    for (offset, byte) in bytes[open..].iter().enumerate() {
+    for (offset, byte) in bytes.get(open..)?.iter().enumerate() {
         if escaped {
             escaped = false;
             continue;
@@ -753,11 +781,11 @@ fn matching_parenthesis(source: &str, open: usize) -> Option<usize> {
         if matches!(*byte, b'\'' | b'"') {
             quote = Some(*byte);
         } else if *byte == b'(' {
-            depth += 1;
+            depth = depth.saturating_add(1);
         } else if *byte == b')' {
             depth = depth.saturating_sub(1);
             if depth == 0 {
-                return Some(open + offset);
+                return open.checked_add(offset);
             }
         }
     }
@@ -775,7 +803,9 @@ fn zsh_call_candidates(tokens: &[String], arrays: &HashMap<String, Vec<String>>)
     let mut positional = Vec::new();
     let mut index = 0_usize;
     while index < tokens.len() {
-        let token = &tokens[index];
+        let Some(token) = tokens.get(index) else {
+            break;
+        };
         if matches!(token.as_str(), "-t" | "-J" | "-V" | "-M" | "-o" | "-O") {
             index = index.saturating_add(2);
             continue;
@@ -790,13 +820,13 @@ fn zsh_call_candidates(tokens: &[String], arrays: &HashMap<String, Vec<String>>)
     let mut arguments = positional.into_iter();
     let _label = arguments.next();
     let remaining = arguments.cloned().collect::<Vec<_>>();
-    if remaining.len() == 1
-        && let Some(values) = arrays.get(&remaining[0])
+    if let [key] = remaining.as_slice()
+        && let Some(values) = arrays.get(key)
     {
         return ZshCandidates {
             values: values.clone(),
             dynamic: false,
-            source: remaining[0].clone(),
+            source: key.clone(),
             from_array: true,
         };
     }
@@ -834,14 +864,18 @@ fn is_dynamic_zsh(value: &str) -> bool {
 fn parse_zsh_argument(spec: &str, provenance: &ProvenanceInfo) -> Option<OptionSpec> {
     let spec = strip_zsh_exclusion(spec).trim_start_matches(['*', '!']);
     let mut names = if let Some(open) = spec.find('{') {
-        let close = spec[open + 1..].find('}')? + open + 1;
-        spec[open + 1..close]
+        let content_start = open.checked_add(1)?;
+        let close = spec
+            .get(content_start..)?
+            .find('}')?
+            .checked_add(content_start)?;
+        spec.get(content_start..close)?
             .split(',')
             .filter_map(normalize_zsh_option)
             .collect::<Vec<_>>()
     } else {
         let end = spec.find(['[', ':', '=', '+']).unwrap_or(spec.len());
-        spec[..end]
+        spec.get(..end)?
             .split(',')
             .filter_map(normalize_zsh_option)
             .collect::<Vec<_>>()
@@ -857,7 +891,8 @@ fn parse_zsh_argument(spec: &str, provenance: &ProvenanceInfo) -> Option<OptionS
         .to_owned();
     let after_description = spec
         .rfind(']')
-        .map_or(spec, |index| &spec[index.saturating_add(1)..]);
+        .and_then(|index| spec.get(index.saturating_add(1)..))
+        .unwrap_or(spec);
     let value =
         (spec.contains('=') || spec.contains('+') || after_description.contains(':')).then(|| {
             after_description
@@ -872,7 +907,9 @@ fn parse_zsh_argument(spec: &str, provenance: &ProvenanceInfo) -> Option<OptionS
 
 fn strip_zsh_exclusion(spec: &str) -> &str {
     if spec.starts_with('(') {
-        spec.find(')').map_or(spec, |end| &spec[end + 1..])
+        spec.find(')')
+            .and_then(|end| spec.get(end.saturating_add(1)..))
+            .unwrap_or(spec)
     } else {
         spec
     }
@@ -888,8 +925,12 @@ fn normalize_zsh_option(value: &str) -> Option<String> {
 
 fn bracketed(value: &str) -> Option<&str> {
     let open = value.find('[')?;
-    let close = value[open + 1..].find(']')? + open + 1;
-    Some(&value[open + 1..close])
+    let content_start = open.checked_add(1)?;
+    let close = value
+        .get(content_start..)?
+        .find(']')?
+        .checked_add(content_start)?;
+    value.get(content_start..close)
 }
 
 fn split_zsh_description(value: &str) -> (&str, Option<&str>) {
@@ -904,9 +945,9 @@ fn bounded_prefix(source: &str, limit: usize) -> (&str, bool) {
     }
     let mut end = limit;
     while !source.is_char_boundary(end) {
-        end -= 1;
+        end = end.saturating_sub(1);
     }
-    (&source[..end], true)
+    (source.get(..end).unwrap_or_default(), true)
 }
 
 fn documentation_command(lines: &[&str], origin: &str) -> Option<String> {
@@ -958,16 +999,22 @@ fn parse_mdoc_options(
     let mut options = Vec::new();
     let mut line_index = 0usize;
     while line_index < lines.len() && options.len() < MAX_HELP_OPTIONS {
-        let Some(names) = parse_mdoc_option_header(lines[line_index]) else {
-            line_index += 1;
+        let Some(line) = lines.get(line_index) else {
+            break;
+        };
+        let Some(names) = parse_mdoc_option_header(line) else {
+            line_index = line_index.saturating_add(1);
             continue;
         };
-        let option_line = line_index + 1;
-        line_index += 1;
+        let option_line = line_index.saturating_add(1);
+        line_index = line_index.saturating_add(1);
         let mut description = String::new();
         let mut description_truncated = false;
         while line_index < lines.len() {
-            let trimmed = lines[line_index].trim();
+            let Some(line) = lines.get(line_index) else {
+                break;
+            };
+            let trimmed = line.trim();
             if trimmed.starts_with(".It ") || trimmed == ".El" || trimmed.starts_with(".Sh ") {
                 break;
             }
@@ -988,7 +1035,7 @@ fn parse_mdoc_options(
                     description_truncated |= truncated;
                 }
             }
-            line_index += 1;
+            line_index = line_index.saturating_add(1);
         }
         if description_truncated {
             push_diagnostic(
@@ -1018,7 +1065,7 @@ fn parse_mdoc_options(
             diagnostics,
             diagnostic(
                 origin,
-                line_index + 1,
+                line_index.saturating_add(1),
                 format!("option ingestion stopped at {MAX_HELP_OPTIONS} entries"),
             ),
         );
@@ -1032,10 +1079,12 @@ fn parse_mdoc_option_header(line: &str) -> Option<Vec<String>> {
     let mut names = Vec::new();
     let mut index = 0usize;
     while index < tokens.len() {
-        if tokens[index] == "Fl" {
-            let flag = tokens.get(index + 1)?.trim_matches(|character: char| {
-                matches!(character, ',' | ';' | '|' | '[' | ']' | '(' | ')' | '"')
-            });
+        if tokens.get(index) == Some(&"Fl") {
+            let flag = tokens
+                .get(index.saturating_add(1))?
+                .trim_matches(|character: char| {
+                    matches!(character, ',' | ';' | '|' | '[' | ']' | '(' | ')' | '"')
+                });
             if !flag.is_empty() {
                 names.push(if flag.starts_with('-') {
                     flag.to_owned()
@@ -1043,9 +1092,9 @@ fn parse_mdoc_option_header(line: &str) -> Option<Vec<String>> {
                     format!("-{flag}")
                 });
             }
-            index += 2;
+            index = index.saturating_add(2);
         } else {
-            index += 1;
+            index = index.saturating_add(1);
         }
     }
     names.sort();
@@ -1172,16 +1221,17 @@ fn normalize_roff(line: &str) -> String {
 
 fn split_at_spacing(line: &str) -> (&str, &str) {
     let bytes = line.as_bytes();
-    let mut index = 0usize;
-    while index + 1 < bytes.len() {
-        if bytes[index].is_ascii_whitespace() && bytes[index + 1].is_ascii_whitespace() {
-            let mut description = index + 2;
+    for (index, [first, second]) in bytes.array_windows::<2>().enumerate() {
+        if first.is_ascii_whitespace() && second.is_ascii_whitespace() {
+            let mut description = index.saturating_add(2);
             while bytes.get(description).is_some_and(u8::is_ascii_whitespace) {
-                description += 1;
+                description = description.saturating_add(1);
             }
-            return (&line[..index], &line[description..]);
+            return (
+                line.get(..index).unwrap_or_default(),
+                line.get(description..).unwrap_or_default(),
+            );
         }
-        index += 1;
     }
     (line, "")
 }
@@ -1201,7 +1251,9 @@ fn parse_fish_declaration(
     let mut erase = false;
     let mut index = 0;
     while index < tokens.len() {
-        let token = &tokens[index];
+        let Some(token) = tokens.get(index) else {
+            break;
+        };
         match token.as_str() {
             "-c" | "--command" => commands.push(required_value(tokens, &mut index, token)?),
             "-s" | "--short-option" => {
@@ -1247,7 +1299,7 @@ fn parse_fish_declaration(
                 }
             }
         }
-        index += 1;
+        index = index.saturating_add(1);
     }
     if erase {
         return Ok(Vec::new());
@@ -1391,10 +1443,12 @@ fn parse_bash_declaration(
     let mut command_arguments = false;
     let mut index = 0;
     while index < tokens.len() {
-        let token = &tokens[index];
+        let Some(token) = tokens.get(index) else {
+            break;
+        };
         if command_arguments {
             commands.push(token.clone());
-            index += 1;
+            index = index.saturating_add(1);
             continue;
         }
         match token.as_str() {
@@ -1410,7 +1464,7 @@ fn parse_bash_declaration(
             "-r" => remove = true,
             "-D" | "-E" | "-I" | "-p" => {}
             value if value.starts_with("-W") && value.len() > 2 => {
-                word_lists.push(value[2..].to_owned())
+                word_lists.push(value.strip_prefix("-W").unwrap_or_default().to_owned());
             }
             value
                 if (value.starts_with("-F")
@@ -1418,12 +1472,14 @@ fn parse_bash_declaration(
                     || value.starts_with("-A"))
                     && value.len() > 2 =>
             {
-                providers.push(format!("{} {}", &value[..2], &value[2..]));
+                let provider_kind = value.get(..2).unwrap_or_default();
+                let provider = value.get(2..).unwrap_or_default();
+                providers.push(format!("{provider_kind} {provider}"));
             }
             value if value.starts_with('-') => {}
             value => commands.push(value.to_owned()),
         }
-        index += 1;
+        index = index.saturating_add(1);
     }
     if remove {
         return Ok(Vec::new());
@@ -1542,7 +1598,8 @@ fn enrich_imported_parent_commands(commands: &mut [CommandSpec]) {
             .details
             .find(" Static values:")
             .or_else(|| command.details.find(" Dynamic declarations"))
-            .map_or_else(String::new, |start| command.details[start..].to_owned());
+            .and_then(|start| command.details.get(start..))
+            .map_or_else(String::new, str::to_owned);
         command.details = format!(
             "Available subcommands: {}.",
             children
@@ -1689,7 +1746,7 @@ fn normalize_bash_option(candidate: &str) -> Option<String> {
 }
 
 fn required_value(tokens: &[String], index: &mut usize, option: &str) -> Result<String, String> {
-    *index += 1;
+    *index = index.saturating_add(1);
     tokens
         .get(*index)
         .cloned()
@@ -1732,7 +1789,7 @@ fn logical_lines(source: &str) -> (Vec<(usize, String)>, bool) {
     let mut buffer = String::new();
     let mut start = 1;
     for (offset, line) in source.lines().enumerate() {
-        let number = offset + 1;
+        let number = offset.saturating_add(1);
         if buffer.is_empty() {
             start = number;
         }
@@ -2213,12 +2270,9 @@ _values 'environment' staging production
 
     #[test]
     fn completion_import_sources_stop_at_exact_and_plus_one_byte_bounds() {
+        let fish_importer: fn(&str, &str) -> ImportReport = import_fish;
         for (declaration, origin, importer) in [
-            (
-                "complete -c fish\n#",
-                "source.fish",
-                import_fish as fn(&str, &str) -> ImportReport,
-            ),
+            ("complete -c fish\n#", "source.fish", fish_importer),
             ("complete bash\n#", "source.bash", import_bash),
             ("#compdef zsh\n#", "_source", import_zsh),
         ] {
@@ -2286,11 +2340,8 @@ _values 'environment' staging production
     #[test]
     fn completion_import_diagnostics_are_bounded_for_every_shell() {
         let malformed = "complete -c 'broken\n".repeat(MAX_IMPORT_DIAGNOSTICS + 1);
-        for importer in [
-            import_fish as fn(&str, &str) -> ImportReport,
-            import_bash,
-            import_zsh,
-        ] {
+        let fish_importer: fn(&str, &str) -> ImportReport = import_fish;
+        for importer in [fish_importer, import_bash, import_zsh] {
             let report = importer(&malformed, "malformed");
             assert_eq!(report.diagnostics.len(), MAX_IMPORT_DIAGNOSTICS);
         }

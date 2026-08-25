@@ -230,7 +230,15 @@ pub fn execute_watch(command: WatchCommand) -> Result<i32, ShellError> {
     ));
     let result = (|| {
         let runtime = DataRuntime::new();
-        for sequence in 1..=command.samples as u64 {
+        let samples = u64::try_from(command.samples).map_err(|_| {
+            ShellError::new(
+                ErrorCode::ResourceLimit,
+                "watch sample count cannot be represented by the runtime",
+            )
+            .with_context(format!("configured samples: {}", command.samples))
+            .with_help("Reduce --samples and retry")
+        })?;
+        for sequence in 1..=samples {
             if cancelled.load(Ordering::Relaxed) {
                 buffer.cancel();
                 break;
@@ -247,7 +255,7 @@ pub fn execute_watch(command: WatchCommand) -> Result<i32, ShellError> {
             if !buffer.push(LiveSample { sequence, value }) {
                 break;
             }
-            if sequence < command.samples as u64
+            if sequence < samples
                 && command.interval_ms > 0
                 && wait_interruptibly(command.interval_ms, &cancelled)
             {
@@ -408,7 +416,7 @@ fn read_process_table() -> Result<String, ShellError> {
                 .with_context(error.to_string())
                 .with_help("Retry the process view")
         })?;
-    if bytes.len() as u64 > MAX_PROCESS_OUTPUT_BYTES {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PROCESS_OUTPUT_BYTES {
         let _ = child.kill();
         let _ = child.wait();
         return Err(ShellError::new(
@@ -460,7 +468,7 @@ fn wait_interruptibly(interval_ms: u64, cancelled: &AtomicBool) -> bool {
         }
         let step = remaining.min(CANCELLATION_POLL_MS);
         thread::sleep(Duration::from_millis(step));
-        remaining -= step;
+        remaining = remaining.saturating_sub(step);
     }
     cancelled.load(Ordering::Relaxed)
 }
@@ -554,7 +562,11 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
-        fs::write(&path, vec![b' '; MAX_EVENT_TRACE_BYTES as usize + 1]).unwrap();
+        fs::write(
+            &path,
+            vec![b' '; usize::try_from(MAX_EVENT_TRACE_BYTES).unwrap() + 1],
+        )
+        .unwrap();
         let error = read_trace(&path).unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         fs::remove_file(path).unwrap();

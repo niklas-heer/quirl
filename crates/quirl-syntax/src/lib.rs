@@ -355,8 +355,8 @@ fn highlight_tokens(line: &str, tokens: &[Token]) -> Vec<HighlightSpan> {
 }
 
 fn classify_word(raw: &str, word: &Word) -> HighlightKind {
-    if word.parts.len() == 1 {
-        match word.parts[0].quoting {
+    if let [part] = word.parts.as_slice() {
+        match part.quoting {
             Quoting::Single => return HighlightKind::StringSingle,
             Quoting::Double => return HighlightKind::StringDouble,
             Quoting::Escaped => return HighlightKind::Escaped,
@@ -411,7 +411,9 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
     let mut index = 0;
 
     while index < tokens.len() {
-        let token = &tokens[index];
+        let Some(token) = tokens.get(index) else {
+            break;
+        };
         match &token.kind {
             TokenKind::Word(word) => {
                 words.push(word.text());
@@ -437,7 +439,7 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                         "Use descriptor 0 for input, 1 or 2 for output, or an explicit `bash { ... }`/`zsh { ... }` island",
                     ));
                 }
-                let Some([_, next]) = tokens[index..].array_windows::<2>().next() else {
+                let Some(next) = tokens.get(index.saturating_add(1)) else {
                     return Err(syntax_error(
                         token,
                         "redirection needs a path",
@@ -467,7 +469,7 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                     path: target.text(),
                     target: target.clone(),
                 });
-                index += 1;
+                index = index.saturating_add(1);
             }
             TokenKind::Pipe => {
                 commands.push(finish_command(
@@ -492,7 +494,13 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                     TokenKind::And => ListConnector::And,
                     TokenKind::Or => ListConnector::Or,
                     TokenKind::Semicolon => ListConnector::Sequence,
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(syntax_error(
+                            token,
+                            "invalid command-list connector",
+                            "Report this parser state as a Quirl defect",
+                        ));
+                    }
                 });
             }
             TokenKind::Background => {
@@ -506,7 +514,7 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                     commands: std::mem::take(&mut commands),
                     background: true,
                 });
-                if let Some([_, next]) = tokens[index..].array_windows::<2>().next() {
+                if let Some(next) = tokens.get(index.saturating_add(1)) {
                     return Err(syntax_error(
                         next,
                         "background marker must end a command list",
@@ -515,7 +523,7 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                 }
             }
         }
-        index += 1;
+        index = index.saturating_add(1);
     }
 
     if tokens.last().is_some_and(|token| {
@@ -556,7 +564,7 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
             background: false,
         });
     }
-    debug_assert_eq!(pipelines.len(), connectors.len() + 1);
+    debug_assert_eq!(pipelines.len(), connectors.len().saturating_add(1));
     Ok(CommandList {
         pipelines,
         connectors,
@@ -635,22 +643,27 @@ fn contains_unquoted_brace_expansion(word: &Word) -> bool {
         .filter(|part| part.quoting == Quoting::Unquoted)
         .map(|part| part.text.as_str())
         .collect::<String>();
-    let mut offset = 0;
-    while let Some(open) = text[offset..].find('{') {
-        let open = offset + open;
-        if text[..open].ends_with('$') {
-            offset = open + 1;
-            continue;
-        }
-        let content_start = open + 1;
-        let Some(close_relative) = text[content_start..].find('}') else {
+    let mut offset = 0_usize;
+    while let Some(open_relative) = text.get(offset..).and_then(|tail| tail.find('{')) {
+        let Some(open) = offset.checked_add(open_relative) else {
             return false;
         };
-        let content = &text[content_start..content_start + close_relative];
+        if text.get(..open).is_some_and(|prefix| prefix.ends_with('$')) {
+            offset = open.saturating_add(1);
+            continue;
+        }
+        let content_start = open.saturating_add(1);
+        let Some(close_relative) = text.get(content_start..).and_then(|tail| tail.find('}')) else {
+            return false;
+        };
+        let content_end = content_start.saturating_add(close_relative);
+        let Some(content) = text.get(content_start..content_end) else {
+            return false;
+        };
         if !content.is_empty() && (content.contains(',') || content.contains("..")) {
             return true;
         }
-        offset = content_start + close_relative + 1;
+        offset = content_end.saturating_add(1);
     }
     false
 }
@@ -678,7 +691,7 @@ pub fn data_statement_expression(line: &str) -> Option<&str> {
 /// file-reading callers must reject oversized source before invoking it.
 pub fn check_script(source: &str) -> Vec<CommandSyntaxError> {
     let mut diagnostics = Vec::new();
-    let mut offset = 0;
+    let mut offset = 0_usize;
     for (line_index, raw_line) in source.split_inclusive('\n').enumerate() {
         let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
         let trimmed = line.trim();
@@ -687,27 +700,28 @@ pub fn check_script(source: &str) -> Vec<CommandSyntaxError> {
             || trimmed.is_empty()
             || trimmed.starts_with('#')
         {
-            offset += raw_line.len();
+            offset = offset.saturating_add(raw_line.len());
             continue;
         }
         if let Some(expression) = data_statement_expression(trimmed) {
             if expression.is_empty() {
                 diagnostics.push(CommandSyntaxError {
                     message: "data statement requires an expression".to_owned(),
-                    start: offset + leading,
-                    end: offset + leading + trimmed.len(),
+                    start: offset.saturating_add(leading),
+                    end: offset.saturating_add(leading).saturating_add(trimmed.len()),
                     help: "Add a structured-data expression after `data`".to_owned(),
                 });
             }
-            offset += raw_line.len();
+            offset = offset.saturating_add(raw_line.len());
             continue;
         }
         if let Err(mut error) = parse_command_list(trimmed) {
-            error.start += offset + leading;
-            error.end += offset + leading;
+            let line_start = offset.saturating_add(leading);
+            error.start = error.start.saturating_add(line_start);
+            error.end = error.end.saturating_add(line_start);
             diagnostics.push(error);
         }
-        offset += raw_line.len();
+        offset = offset.saturating_add(raw_line.len());
     }
     diagnostics
 }
@@ -768,7 +782,14 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                 Some('\'') => Quoting::Single,
                 Some('"') => Quoting::Double,
                 None => Quoting::Unquoted,
-                _ => unreachable!(),
+                _ => {
+                    return Err(CommandSyntaxError {
+                        message: "invalid substitution quote state".to_owned(),
+                        start: index,
+                        end: index.saturating_add(character.len_utf8()),
+                        help: "Report this parser state as a Quirl defect".to_owned(),
+                    });
+                }
             };
             if substitution_escaped {
                 substitution_escaped = false;
@@ -950,7 +971,7 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                 return Err(CommandSyntaxError {
                     message: "process substitution requires an explicit dialect island".to_owned(),
                     start: index,
-                    end: index + 2,
+                    end: index.saturating_add(2),
                     help: "Use `bash { ... }` or `zsh { ... }` so the selected dialect owns file-descriptor lifecycle semantics".to_owned(),
                 });
             }
@@ -958,7 +979,7 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                 return Err(CommandSyntaxError {
                     message: "process substitution requires an explicit dialect island".to_owned(),
                     start: index,
-                    end: index + 2,
+                    end: index.saturating_add(2),
                     help: "Use `bash { ... }` or `zsh { ... }` so the selected dialect owns file-descriptor lifecycle semantics".to_owned(),
                 });
             }
@@ -974,7 +995,7 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                         3,
                     ))
                 } else {
-                    return Err(CommandSyntaxError { message: "here-documents require a multiline script parser".to_owned(), start: index, end: index + 2, help: "Use a here-string (`<<< value`) or an explicit `bash { ... }`/`zsh { ... }` island".to_owned() });
+                    return Err(CommandSyntaxError { message: "here-documents require a multiline script parser".to_owned(), start: index, end: index.saturating_add(2), help: "Use a here-string (`<<< value`) or an explicit `bash { ... }`/`zsh { ... }` island".to_owned() });
                 }
             }
             '<' if characters.peek().is_some_and(|(_, next)| *next == '&') => {
@@ -1035,7 +1056,7 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             tokens.push(Token {
                 kind,
                 start: index,
-                end: index + width,
+                end: index.saturating_add(width),
             });
         } else {
             word_start.get_or_insert(index);
@@ -1053,7 +1074,7 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
         return Err(CommandSyntaxError {
             message: format!("unclosed {active} quote in command substitution"),
             start,
-            end: start + active.len_utf8(),
+            end: start.saturating_add(active.len_utf8()),
             help: format!("Close the quote with {active} before closing the command substitution"),
         });
     }
@@ -1064,7 +1085,7 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
         return Err(CommandSyntaxError {
             message: "unclosed command substitution".to_owned(),
             start,
-            end: (start + 2).min(input.len()),
+            end: start.saturating_add(2).min(input.len()),
             help: "Close the command substitution with `)`".to_owned(),
         });
     }
@@ -1073,7 +1094,7 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
         return Err(CommandSyntaxError {
             message: format!("unclosed {active} quote"),
             start,
-            end: start + active.len_utf8(),
+            end: start.saturating_add(active.len_utf8()),
             help: format!("Close the quote with {active}"),
         });
     }
@@ -1099,8 +1120,8 @@ fn open_command_substitution(
     if observed > MAX_COMMAND_SUBSTITUTION_DEPTH {
         return Err(CommandSyntaxError {
             message: "command substitution nesting exceeds the supported limit".to_owned(),
-            start: parenthesis_index - 1,
-            end: parenthesis_index + 1,
+            start: parenthesis_index.saturating_sub(1),
+            end: parenthesis_index.saturating_add(1),
             help: format!(
                 "Reduce command substitution nesting to {MAX_COMMAND_SUBSTITUTION_DEPTH} levels or fewer"
             ),
@@ -1110,7 +1131,7 @@ fn open_command_substitution(
     *depth = observed;
     openings.push(SubstitutionOpening {
         depth: observed,
-        start: parenthesis_index - 1,
+        start: parenthesis_index.saturating_sub(1),
         suspended_quote,
     });
     Ok(())
@@ -1320,13 +1341,13 @@ mod tests {
         let source = "printf '%s' value | tr a-z A-Z";
         let spans = highlight(source, Mode::Command);
         assert!(spans.iter().any(|span| {
-            span.kind == HighlightKind::Command && &source[span.range.clone()] == "printf"
+            span.kind == HighlightKind::Command && source.get(span.range.clone()) == Some("printf")
         }));
         assert!(spans.iter().any(|span| {
-            span.kind == HighlightKind::Operator && &source[span.range.clone()] == "|"
+            span.kind == HighlightKind::Operator && source.get(span.range.clone()) == Some("|")
         }));
         assert!(spans.iter().any(|span| {
-            span.kind == HighlightKind::Command && &source[span.range.clone()] == "tr"
+            span.kind == HighlightKind::Command && source.get(span.range.clone()) == Some("tr")
         }));
     }
     use serde::Deserialize;
@@ -1458,7 +1479,10 @@ mod tests {
     fn fixed_width_token_transitions_report_the_following_token() {
         let redirect = parse_command_list("printf ok > | next").unwrap_err();
         assert_eq!(redirect.message, "redirection path must be a word");
-        assert_eq!(&"printf ok > | next"[redirect.start..redirect.end], "|");
+        assert_eq!(
+            "printf ok > | next".get(redirect.start..redirect.end),
+            Some("|")
+        );
 
         let background = parse_command_list("sleep 1 & echo after").unwrap_err();
         assert_eq!(
@@ -1466,8 +1490,8 @@ mod tests {
             "background marker must end a command list"
         );
         assert_eq!(
-            &"sleep 1 & echo after"[background.start..background.end],
-            "echo"
+            "sleep 1 & echo after".get(background.start..background.end),
+            Some("echo")
         );
     }
 
@@ -1477,8 +1501,14 @@ mod tests {
             "#!/usr/bin/env -S quirl run\ndata {\"ok\":true}\n  echo $HOME\nprintf ok |\ndata\n";
         let diagnostics = check_script(source);
         assert_eq!(diagnostics.len(), 2);
-        assert_eq!(&source[diagnostics[0].start..diagnostics[0].end], "|");
-        assert_eq!(&source[diagnostics[1].start..diagnostics[1].end], "data");
+        assert_eq!(
+            source.get(diagnostics[0].start..diagnostics[0].end),
+            Some("|")
+        );
+        assert_eq!(
+            source.get(diagnostics[1].start..diagnostics[1].end),
+            Some("data")
+        );
     }
 
     #[test]
@@ -1730,7 +1760,8 @@ mod tests {
         );
         assert!(parse_command_list(&exact).is_ok());
 
-        let plus_one = format!("printf $({}", &exact["printf ".len()..]);
+        let suffix = exact.get("printf ".len()..).unwrap();
+        let plus_one = format!("printf $({suffix}");
         let error = parse_command_list(&plus_one).unwrap_err();
         assert!(error.message.contains("nesting"));
         assert!(

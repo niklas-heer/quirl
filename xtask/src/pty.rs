@@ -134,6 +134,10 @@ impl VirtualScreen {
         Ok(())
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the escape scanner validates the fixed CSI prefix length before slicing"
+    )]
     pub(super) fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
         self.utf8_pending.extend_from_slice(bytes);
         let mut characters = Vec::new();
@@ -213,6 +217,10 @@ impl VirtualScreen {
         }
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "terminal cursor coordinates are maintained within the fixed screen bounds"
+    )]
     fn ground(&mut self, character: char) -> Option<Vec<u8>> {
         match character {
             '\u{1b}' => self.state = ParserState::Escape,
@@ -277,6 +285,11 @@ impl VirtualScreen {
         None
     }
 
+    #[allow(
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+        reason = "the CSI introducer is validated as ASCII and coordinates remain within fixed screen bounds"
+    )]
     fn apply_csi(&mut self, control: &str, final_character: char) -> Option<Vec<u8>> {
         let private = control.starts_with(['?', '>', '!']);
         let body = if private { &control[1..] } else { control };
@@ -379,6 +392,11 @@ impl VirtualScreen {
         None
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        reason = "row and column coordinates are clamped to the fixed terminal grid before access"
+    )]
     fn put(&mut self, character: char) {
         let width = UnicodeWidthChar::width(character).unwrap_or(0);
         if width == 0 {
@@ -440,6 +458,10 @@ impl VirtualScreen {
         self.cells.insert(self.scroll_top, blank_row(self.columns));
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "erase ranges are clamped to the fixed terminal grid"
+    )]
     fn erase_display(&mut self, mode: usize) {
         match mode {
             2 | 3 => self.cells = blank_cells(self.rows, self.columns),
@@ -463,6 +485,10 @@ impl VirtualScreen {
         self.wrap_pending = false;
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "erase ranges are clamped to the fixed terminal row"
+    )]
     fn erase_line(&mut self, mode: usize) {
         let (start, end) = match mode {
             1 => (0, self.cursor_column.saturating_add(1)),
@@ -529,6 +555,10 @@ pub(super) struct PtySession {
 }
 
 impl PtySession {
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "openpty populates both fixed descriptor slots before they are read"
+    )]
     pub(super) fn spawn(options: SpawnOptions) -> Result<Self, Box<dyn Error>> {
         validate_timeout(options.timeout)?;
         validate_screen_size(options.rows, options.columns)?;
@@ -666,11 +696,19 @@ impl PtySession {
         Ok(tcgetattr(master)?)
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bytes written cannot exceed the bounded caller-provided slice length"
+    )]
     pub(super) fn send(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         let deadline = Instant::now() + self.timeout;
         self.send_until(bytes, deadline)
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the write offset is bounded by the source slice length in the loop condition"
+    )]
     fn send_until(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), Box<dyn Error>> {
         let mut offset = 0;
         while offset < bytes.len() {
@@ -726,19 +764,20 @@ impl PtySession {
         };
         // SAFETY: master is a live PTY descriptor and winsize points to an
         // initialized kernel-compatible value for the duration of ioctl.
-        let result = unsafe {
-            nix::libc::ioctl(
-                master.as_raw_fd(),
-                nix::libc::TIOCSWINSZ,
-                &winsize as *const Winsize,
-            )
-        };
+        let winsize_pointer = std::ptr::from_ref(&winsize);
+        let result =
+            unsafe { nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCSWINSZ, winsize_pointer) };
         if result < 0 {
             return Err(io::Error::last_os_error().into());
         }
         Ok(())
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        reason = "read lengths are returned by the kernel for the fixed buffer and retained bytes are explicitly bounded"
+    )]
     pub(super) fn drain_for(&mut self, duration: Duration) -> Result<Vec<u8>, Box<dyn Error>> {
         validate_timeout(duration)?;
         let deadline = Instant::now() + duration;
@@ -748,7 +787,7 @@ impl PtySession {
             if !self.poll_master(PollFlags::POLLIN, remaining.min(Duration::from_millis(50)))? {
                 continue;
             }
-            let mut buffer = [0_u8; READ_BYTES_MAX];
+            let mut buffer = vec![0_u8; READ_BYTES_MAX];
             let master = self
                 .master
                 .as_mut()
@@ -758,7 +797,7 @@ impl PtySession {
                 Ok(read) => read,
                 Err(error)
                     if error.kind() == io::ErrorKind::WouldBlock
-                        || error.raw_os_error() == Some(Errno::EIO as i32) =>
+                        || error.raw_os_error() == Some(nix::libc::EIO) =>
                 {
                     continue;
                 }
@@ -786,6 +825,10 @@ impl PtySession {
         self.wait_for_since(marker, self.output.len(), self.timeout)
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "poll counts are bounded by the wait deadline"
+    )]
     pub(super) fn wait_for_since(
         &mut self,
         marker: &[u8],
@@ -811,6 +854,10 @@ impl PtySession {
         Ok(observed)
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "poll counts are bounded by the wait deadline"
+    )]
     pub(super) fn wait_for_screen(
         &mut self,
         description: &str,
@@ -849,6 +896,10 @@ impl PtySession {
     /// resending a keystroke that a still-alive child may have swallowed as
     /// something other than the intended action) that itself still has the
     /// full session timeout to work with.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "poll counts are bounded by the process deadline"
+    )]
     pub(super) fn wait_exit_within(&mut self, timeout: Duration) -> Result<i32, Box<dyn Error>> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -865,6 +916,10 @@ impl PtySession {
         Err(self.timeout_error("child exit", &[]))
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "poll counts are bounded by the close deadline"
+    )]
     pub(super) fn close(&mut self) -> Result<(), Box<dyn Error>> {
         if let Some(master) = self.master.as_ref()
             && let Ok(group) = tcgetpgrp(master)
@@ -923,6 +978,10 @@ impl PtySession {
         }
     }
 
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "diagnostic output is sliced at a byte count clamped to the observed buffer length"
+    )]
     fn timeout_error(&self, expected: &str, observed: &[u8]) -> Box<dyn Error> {
         let source = if observed.is_empty() {
             &self.output
@@ -1101,6 +1160,10 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "reply byte counts are bounded by the captured PTY byte limit"
+)]
 fn send_terminal_replies<E>(
     replies: impl IntoIterator<Item = Vec<u8>>,
     send_timeout: Duration,
@@ -1114,6 +1177,10 @@ fn send_terminal_replies<E>(
     Ok(())
 }
 
+#[allow(
+    clippy::as_conversions,
+    reason = "nix Signal is a repr(i32) wrapper over the platform signal number"
+)]
 fn wait_status_code(status: WaitStatus) -> i32 {
     match status {
         WaitStatus::Exited(_, code) => code,
@@ -1122,6 +1189,10 @@ fn wait_status_code(status: WaitStatus) -> i32 {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "negating a valid positive child process group identifier is required by POSIX kill"
+)]
 fn kill_group(group: Pid) {
     let raw = group.as_raw();
     if raw > 0 {

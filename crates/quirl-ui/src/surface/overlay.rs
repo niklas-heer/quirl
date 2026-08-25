@@ -220,6 +220,10 @@ pub fn contextual_help_query(catalog: &Catalog, line: &str, cursor: usize) -> St
     truncate_utf8(context.unwrap_or(prefix), PICKER_QUERY_BYTES_MAX)
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "highlight spans come from the ranker's character-boundary-aware matcher"
+)]
 pub fn items(
     kind: PickerKind,
     catalog: &Catalog,
@@ -340,6 +344,10 @@ fn completion_item_bytes(item: &CompletionItem) -> usize {
         .saturating_add(item.detail.len())
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the decrement is guarded by a nonzero offset and stops at a UTF-8 boundary"
+)]
 fn truncate_utf8(value: &str, maximum: usize) -> String {
     if value.len() <= maximum {
         return value.to_owned();
@@ -348,7 +356,7 @@ fn truncate_utf8(value: &str, maximum: usize) -> String {
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
-    value[..end].to_owned()
+    value.get(..end).unwrap_or_default().to_owned()
 }
 
 #[cfg(test)]

@@ -174,12 +174,20 @@ impl DeterministicRng {
         value
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the deterministic generator uses specified wrapping arithmetic"
+    )]
     fn bounded(&mut self, upper_exclusive: usize) -> usize {
         debug_assert!(upper_exclusive > 0);
         let upper = u64::try_from(upper_exclusive).unwrap_or(u64::MAX);
         usize::try_from(self.next() % upper).unwrap_or(0)
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "generated word lengths are bounded to a tiny fixed range"
+    )]
     fn word(&mut self) -> String {
         let length = 1 + self.bounded(12);
         (0..length)
@@ -318,6 +326,10 @@ struct SimulationCounts {
 }
 
 impl SimulationCounts {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "simulation counters are bounded by the configured case count"
+    )]
     fn observe(&mut self, classification: Classification, session: usize) {
         self.evaluated += 1;
         match classification {
@@ -387,6 +399,10 @@ fn create_run_directory(options: &SimulationOptions) -> io::Result<PathBuf> {
     Ok(run_directory)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "session and command counts are bounded by validated simulation limits"
+)]
 fn generate_session(
     generator: &mut DeterministicRng,
     steps_max: usize,
@@ -886,6 +902,10 @@ fn classify(
     Classification::Match
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "manifest entry counts are bounded by the simulation filesystem limit"
+)]
 fn filesystem_manifest(root: &Path) -> Result<FilesystemManifest, Box<dyn Error>> {
     let mut stack = vec![(root.to_path_buf(), 0_usize)];
     let mut files = Vec::new();

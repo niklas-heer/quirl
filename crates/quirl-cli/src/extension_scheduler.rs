@@ -184,7 +184,8 @@ impl ExtensionScheduler {
                 .spawn(move || worker_loop(shared))
             {
                 Ok(worker) => {
-                    lock_recover(&self.shared.state).workers_started += 1;
+                    let mut state = lock_recover(&self.shared.state);
+                    state.workers_started = state.workers_started.saturating_add(1);
                     self.workers.push(worker);
                 }
                 Err(error) => {
@@ -359,7 +360,7 @@ impl ExtensionScheduler {
                     .position(|item| item.priority == WorkPriority::Prompt)
                     .unwrap_or(state.queue.len());
                 for (offset, work) in queued.into_iter().enumerate() {
-                    state.queue.insert(insertion + offset, work);
+                    state.queue.insert(insertion.saturating_add(offset), work);
                 }
             }
             WorkPriority::Prompt => state.queue.extend(queued),

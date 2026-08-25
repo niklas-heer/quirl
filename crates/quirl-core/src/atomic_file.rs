@@ -375,12 +375,13 @@ fn prepare_candidate(
         after_stage,
     )?;
     let split = replacement.len().div_ceil(2);
+    let (first_half, second_half) = replacement.split_at(split);
     candidate
-        .write_all(&replacement[..split])
+        .write_all(first_half)
         .map_err(|error| transaction_io_error("write candidate", candidate_path, error))?;
     observe_stage(candidate_path, TransactionStage::PartialWrite, after_stage)?;
     candidate
-        .write_all(&replacement[split..])
+        .write_all(second_half)
         .map_err(|error| transaction_io_error("write candidate", candidate_path, error))?;
     candidate
         .flush()
@@ -613,7 +614,7 @@ fn inspect_target(
     }
     let mut bytes = Vec::with_capacity(expected.len().min(bytes_max));
     Read::by_ref(&mut file)
-        .take(bytes_max.saturating_add(1) as u64)
+        .take(u64::try_from(bytes_max.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)
         .map_err(|error| transaction_io_error("read target", path, error))?;
     if bytes.len() > bytes_max {
@@ -701,7 +702,7 @@ fn open_regular_no_follow(path: &Path) -> io::Result<File> {
         OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
         Mode::empty(),
     )
-    .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+    .map_err(io::Error::from)?;
     Ok(File::from(descriptor))
 }
 

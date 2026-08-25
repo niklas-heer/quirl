@@ -80,7 +80,8 @@ impl ValueUsage {
                 "Select fewer fields or raise the configured data field limit",
             ));
         }
-        let field_overhead = size_of::<String>().saturating_add(4 * size_of::<usize>());
+        let field_overhead =
+            size_of::<String>().saturating_add(4_usize.saturating_mul(size_of::<usize>()));
         self.retained_bytes = self
             .retained_bytes
             .saturating_add(fields.saturating_mul(field_overhead));
@@ -118,14 +119,16 @@ pub(super) fn validate_data_value(
             | DataValue::Pattern(value) => usage.observe_text(value.len(), limits)?,
             DataValue::List(values) => {
                 usage.observe_list(values.len(), limits)?;
-                stack.extend(values.iter().rev().map(|value| (value, depth + 1)));
+                let child_depth = depth.saturating_add(1);
+                stack.extend(values.iter().rev().map(|value| (value, child_depth)));
             }
             DataValue::Record(values) => {
                 let key_bytes = values
                     .keys()
                     .fold(0_usize, |total, key| total.saturating_add(key.len()));
                 usage.observe_record(values.len(), key_bytes, limits)?;
-                stack.extend(values.values().rev().map(|value| (value, depth + 1)));
+                let child_depth = depth.saturating_add(1);
+                stack.extend(values.values().rev().map(|value| (value, child_depth)));
             }
             DataValue::Nothing
             | DataValue::Bool(_)
@@ -172,11 +175,12 @@ pub(super) fn data_value_from_syntax(
                     SyntaxLiteralKind::List(values) => {
                         usage.observe_list(values.len(), limits)?;
                         work.push(SyntaxWork::FinishList(values.len()));
+                        let child_depth = depth.saturating_add(1);
                         work.extend(
                             values
                                 .iter()
                                 .rev()
-                                .map(|value| SyntaxWork::Visit(value, depth + 1)),
+                                .map(|value| SyntaxWork::Visit(value, child_depth)),
                         );
                     }
                     SyntaxLiteralKind::Record(fields) => {
@@ -190,11 +194,12 @@ pub(super) fn data_value_from_syntax(
                                 .map(|field| field.name.value.clone())
                                 .collect(),
                         ));
+                        let child_depth = depth.saturating_add(1);
                         work.extend(
                             fields
                                 .iter()
                                 .rev()
-                                .map(|field| SyntaxWork::Visit(&field.value, depth + 1)),
+                                .map(|field| SyntaxWork::Visit(&field.value, child_depth)),
                         );
                     }
                 }
@@ -253,11 +258,12 @@ pub(super) fn data_value_from_json(
                         let length = values.len();
                         usage.observe_list(length, limits)?;
                         work.push(JsonWork::FinishList(length));
+                        let child_depth = depth.saturating_add(1);
                         work.extend(
                             values
                                 .into_iter()
                                 .rev()
-                                .map(|value| JsonWork::Visit(value, depth + 1)),
+                                .map(|value| JsonWork::Visit(value, child_depth)),
                         );
                     }
                     JsonValue::Object(values) => {
@@ -267,11 +273,12 @@ pub(super) fn data_value_from_json(
                         usage.observe_record(values.len(), key_bytes, limits)?;
                         let (keys, values): (Vec<_>, Vec<_>) = values.into_iter().unzip();
                         work.push(JsonWork::FinishRecord(keys));
+                        let child_depth = depth.saturating_add(1);
                         work.extend(
                             values
                                 .into_iter()
                                 .rev()
-                                .map(|value| JsonWork::Visit(value, depth + 1)),
+                                .map(|value| JsonWork::Visit(value, child_depth)),
                         );
                     }
                 }
@@ -322,11 +329,12 @@ pub(super) fn data_value_from_toml(
                         let length = values.len();
                         usage.observe_list(length, limits)?;
                         work.push(TomlWork::FinishList(length));
+                        let child_depth = depth.saturating_add(1);
                         work.extend(
                             values
                                 .into_iter()
                                 .rev()
-                                .map(|value| TomlWork::Visit(value, depth + 1)),
+                                .map(|value| TomlWork::Visit(value, child_depth)),
                         );
                     }
                     toml::Value::Table(values) => {
@@ -336,11 +344,12 @@ pub(super) fn data_value_from_toml(
                         usage.observe_record(values.len(), key_bytes, limits)?;
                         let (keys, values): (Vec<_>, Vec<_>) = values.into_iter().unzip();
                         work.push(TomlWork::FinishRecord(keys));
+                        let child_depth = depth.saturating_add(1);
                         work.extend(
                             values
                                 .into_iter()
                                 .rev()
-                                .map(|value| TomlWork::Visit(value, depth + 1)),
+                                .map(|value| TomlWork::Visit(value, child_depth)),
                         );
                     }
                 }
@@ -388,11 +397,12 @@ pub(super) fn data_value_from_yaml(
                         let length = values.len();
                         usage.observe_list(length, limits)?;
                         work.push(YamlWork::FinishList(length));
+                        let child_depth = depth.saturating_add(1);
                         work.extend(
                             values
                                 .into_iter()
                                 .rev()
-                                .map(|value| YamlWork::Visit(value, depth + 1)),
+                                .map(|value| YamlWork::Visit(value, child_depth)),
                         );
                     }
                     serde_yaml_ng::Value::Mapping(values) => {
@@ -414,11 +424,12 @@ pub(super) fn data_value_from_yaml(
                             children.push(value);
                         }
                         work.push(YamlWork::FinishRecord(keys));
+                        let child_depth = depth.saturating_add(1);
                         work.extend(
                             children
                                 .into_iter()
                                 .rev()
-                                .map(|value| YamlWork::Visit(value, depth + 1)),
+                                .map(|value| YamlWork::Visit(value, child_depth)),
                         );
                     }
                     serde_yaml_ng::Value::Tagged(_) => {

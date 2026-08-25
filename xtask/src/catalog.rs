@@ -88,6 +88,10 @@ pub(crate) fn run(root: &Path, command: CatalogCommand) -> Result<(), Box<dyn Er
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "promotion requires exactly one matched draft before accessing it"
+)]
 fn promote_drafts(root: &Path, commands: &[String]) -> Result<(), Box<dyn Error>> {
     if commands.is_empty() || commands.len() > SOURCE_FILE_COUNT_MAX {
         return Err(resource_error(
@@ -645,6 +649,11 @@ fn parse_carapace_checkout(
     })
 }
 
+#[allow(
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    reason = "Go parser offsets come from ASCII delimiter searches and source byte limits bound accumulation"
+)]
 fn parse_go_file(source: &str, source_name: &str) -> Result<Vec<ParsedGoCommand>, Box<dyn Error>> {
     if source.len() > SOURCE_FILE_BYTES_MAX {
         return Err(resource_error(
@@ -733,6 +742,11 @@ enum GoLexState {
     Rune,
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "the scanner checks lookahead bounds and advances over ASCII Go comment delimiters"
+)]
 fn strip_go_comments(source: &str) -> Result<String, Box<dyn Error>> {
     let mut bytes = source.as_bytes().to_vec();
     let mut state = GoLexState::Code;
@@ -784,6 +798,11 @@ fn strip_go_comments(source: &str) -> Result<String, Box<dyn Error>> {
     String::from_utf8(bytes).map_err(|_| input_error("comment filtering produced invalid UTF-8"))
 }
 
+#[allow(
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    reason = "marker and identifier offsets come from ASCII delimiter searches"
+)]
 fn variable_before_marker(source: &str, marker: usize) -> Result<String, Box<dyn Error>> {
     let line_start = source[..marker].rfind('\n').map_or(0, |index| index + 1);
     let prefix = source[line_start..marker].trim();
@@ -848,6 +867,10 @@ fn keyed_go_string(body: &str, key: &str) -> Option<String> {
     })
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the keyed literal parser validates the key and opening delimiter before fixed access"
+)]
 fn keyed_go_string_slice(body: &str, key: &str) -> Result<Vec<String>, Box<dyn Error>> {
     let Some(line) = body.lines().find(|line| line.trim().starts_with(key)) else {
         return Ok(Vec::new());
@@ -865,6 +888,11 @@ fn keyed_go_string_slice(body: &str, key: &str) -> Result<Vec<String>, Box<dyn E
     Ok(values)
 }
 
+#[allow(
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    reason = "string offsets are produced by char_indices and bounded delimiter searches"
+)]
 fn first_go_string(input: &str) -> Option<Result<(String, usize), Box<dyn Error>>> {
     let start = input.find('"')?;
     let mut escaped = false;
@@ -886,6 +914,10 @@ fn first_go_string(input: &str) -> Option<Result<(String, usize), Box<dyn Error>
     Some(Err(input_error("unterminated quoted Go string")))
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "consumed offsets returned by the Go string parser are UTF-8 boundaries"
+)]
 fn quoted_go_strings(input: &str) -> Result<Vec<String>, Box<dyn Error>> {
     let mut values = Vec::new();
     let mut rest = input;
@@ -897,6 +929,12 @@ fn quoted_go_strings(input: &str) -> Result<Vec<String>, Box<dyn Error>> {
     Ok(values)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    reason = "flag parser offsets come from validated ASCII Go syntax and bounded search results"
+)]
 fn parse_go_flags(
     source: &str,
     source_name: &str,
@@ -1031,6 +1069,11 @@ fn parse_go_flags(
     Ok(ParsedFlags { flags, omissions })
 }
 
+#[allow(
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    reason = "action parser offsets come from ASCII delimiter searches in the bounded Go source"
+)]
 fn parse_go_flag_actions(
     source: &str,
     source_name: &str,
@@ -1101,6 +1144,10 @@ fn action_from_source(source: &str) -> Option<NativeCompletionAction> {
     }
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "the marker offset comes from an ASCII substring search"
+)]
 fn find_parent_variable(source: &str, child: &str) -> Option<String> {
     let needle = format!(".AddCommand({child})");
     source.lines().find_map(|line| {
@@ -1405,6 +1452,10 @@ fn validate_separation(
     Ok(())
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "artifact comparison validates equal bounded collections before paired access"
+)]
 fn validate_import_artifacts(root: &Path, drafts: &[NativeCatalog]) -> Result<(), Box<dyn Error>> {
     let configuration: ImportConfiguration = read_json_bounded(&root.join(IMPORT_CONFIGURATION))?;
     validate_import_configuration(&configuration)?;
@@ -1762,6 +1813,10 @@ fn checksum_line(bytes: &[u8]) -> String {
     output
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "SHA-256 is specified in terms of wrapping fixed-width arithmetic"
+)]
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut output = String::with_capacity(64 + "  catalog.sqlite3\n".len());
@@ -1988,7 +2043,7 @@ fn verify_checkout_sources(
         .flat_map(|root| root.files.iter().map(String::as_str))
         .chain(std::iter::once(configuration.license_file.as_str()))
         .collect::<Vec<_>>();
-    files.sort();
+    files.sort_unstable();
     for relative in &files {
         let object = format!("{revision}:{relative}");
         let arguments = vec!["cat-file".to_owned(), "-e".to_owned(), object];
@@ -2023,6 +2078,10 @@ fn verify_checkout_sources(
     )))
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "poll counts are bounded by the subprocess deadline"
+)]
 fn run_bounded_git(source: &Path, arguments: &[String]) -> Result<ExitStatus, Box<dyn Error>> {
     let mut child = Command::new("git")
         .args([
@@ -2072,6 +2131,10 @@ fn validate_revision(revision: &str) -> Result<(), Box<dyn Error>> {
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "platform tuples are validated as exactly two fields before access"
+)]
 fn parse_platforms(values: &[String]) -> Result<Vec<NativePlatform>, Box<dyn Error>> {
     if values.is_empty() {
         return Ok(vec![NativePlatform::Any]);

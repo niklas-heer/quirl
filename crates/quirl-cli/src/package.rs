@@ -220,48 +220,56 @@ fn contains_direct_lua_call(source: &str, path: &str) -> bool {
     let needle = path.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index..].starts_with(b"--[[") {
-            index = skip_until(bytes, index + 4, b"]]");
-        } else if bytes[index..].starts_with(b"--") {
-            index = skip_until(bytes, index + 2, b"\n");
-        } else if bytes[index..].starts_with(b"[[") {
-            index = skip_until(bytes, index + 2, b"]]");
-        } else if matches!(bytes[index], b'\'' | b'"') {
-            index = skip_quoted(bytes, index + 1, bytes[index]);
-        } else if bytes[index..].starts_with(needle)
+        let remaining = bytes.get(index..).unwrap_or_default();
+        let current = bytes.get(index).copied();
+        if remaining.starts_with(b"--[[") {
+            index = skip_until(bytes, index.saturating_add(4), b"]]");
+        } else if remaining.starts_with(b"--") {
+            index = skip_until(bytes, index.saturating_add(2), b"\n");
+        } else if remaining.starts_with(b"[[") {
+            index = skip_until(bytes, index.saturating_add(2), b"]]");
+        } else if matches!(current, Some(b'\'' | b'"')) {
+            index = skip_quoted(bytes, index.saturating_add(1), current.unwrap_or_default());
+        } else if remaining.starts_with(needle)
             && (index == 0
-                || !matches!(bytes[index - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.'))
+                || !matches!(
+                    bytes.get(index.saturating_sub(1)),
+                    Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.')
+                ))
         {
-            let mut after = index + needle.len();
-            while after < bytes.len() && bytes[after].is_ascii_whitespace() {
-                after += 1;
+            let mut after = index.saturating_add(needle.len());
+            while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
+                after = after.saturating_add(1);
             }
             if bytes.get(after) == Some(&b'(') {
                 return true;
             }
-            index += needle.len();
+            index = index.saturating_add(needle.len());
         } else {
-            index += 1;
+            index = index.saturating_add(1);
         }
     }
     false
 }
 
 fn skip_until(bytes: &[u8], mut index: usize, terminator: &[u8]) -> usize {
-    while index < bytes.len() && !bytes[index..].starts_with(terminator) {
-        index += 1;
+    while bytes
+        .get(index..)
+        .is_some_and(|remaining| !remaining.starts_with(terminator))
+    {
+        index = index.saturating_add(1);
     }
-    (index + terminator.len()).min(bytes.len())
+    index.saturating_add(terminator.len()).min(bytes.len())
 }
 
 fn skip_quoted(bytes: &[u8], mut index: usize, quote: u8) -> usize {
-    while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            index = (index + 2).min(bytes.len());
-        } else if bytes[index] == quote {
-            return index + 1;
+    while let Some(byte) = bytes.get(index).copied() {
+        if byte == b'\\' {
+            index = index.saturating_add(2).min(bytes.len());
+        } else if byte == quote {
+            return index.saturating_add(1);
         } else {
-            index += 1;
+            index = index.saturating_add(1);
         }
     }
     index
@@ -506,17 +514,20 @@ fn read_bounded_file<R: Read>(
     context: &str,
     help: &str,
 ) -> Result<Vec<u8>, ShellError> {
-    if size > limit as u64 {
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    if size > limit_u64 {
         return Err(package_limit_error(context, size, limit, help));
     }
-    let mut bytes = Vec::with_capacity(size as usize);
-    file.take(limit.saturating_add(1) as u64)
+    let capacity =
+        usize::try_from(size).map_err(|_| package_limit_error(context, size, limit, help))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)
         .map_err(|error| package_read_error(context, error, help))?;
     if bytes.len() > limit {
         return Err(package_limit_error(
             context,
-            bytes.len() as u64,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
             limit,
             help,
         ));
@@ -787,7 +798,7 @@ mod tests {
         let source = vec![b'x'; MAX_PACKAGE_MANIFEST_BYTES];
         let bytes = read_bounded_file(
             OneByteReader(Cursor::new(source)),
-            MAX_PACKAGE_MANIFEST_BYTES as u64,
+            u64::try_from(MAX_PACKAGE_MANIFEST_BYTES).unwrap(),
             MAX_PACKAGE_MANIFEST_BYTES,
             "package manifest",
             "shrink the manifest",

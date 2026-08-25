@@ -589,6 +589,10 @@ impl CompletionState {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the increment is guarded by a non-empty bounded completion list and reduced modulo its length"
+    )]
     pub fn next(&mut self) {
         self.automatic = false;
         if !self.items.is_empty() {
@@ -756,6 +760,10 @@ pub(crate) fn filesystem_completion_items(
     bounded_items(items)
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "all offsets come from char_indices or syntax token spans, which are UTF-8 boundaries"
+)]
 fn filesystem_completion_context(
     catalog: Option<&Catalog>,
     line: &str,
@@ -850,6 +858,10 @@ fn shell_segment_start(input: &str) -> usize {
     start
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "word boundaries are produced exclusively by char_indices"
+)]
 fn shell_words(segment: &str, absolute_start: usize) -> Vec<ShellWord<'_>> {
     #[derive(Clone, Copy)]
     enum Quote {
@@ -982,6 +994,10 @@ fn path_word_style(raw: &str) -> PathWordStyle {
     }
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "the split offset comes from rfind on an ASCII path separator"
+)]
 fn path_scan_parts(value: &str) -> Option<(PathBuf, String, String)> {
     let value = if value == "~" { "~/" } else { value };
     let separator = value.rfind('/');
@@ -1061,6 +1077,11 @@ struct CatalogRequest {
     data_ls_alias: bool,
 }
 
+#[allow(
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    reason = "cursor and word offsets are maintained as UTF-8 boundaries and bounded by the input line"
+)]
 fn catalog_request(line: &str, cursor: usize, mode: Mode) -> CatalogRequest {
     let mut cursor = cursor.min(line.len());
     while cursor > 0 && !line.is_char_boundary(cursor) {

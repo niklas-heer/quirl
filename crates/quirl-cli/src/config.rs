@@ -507,11 +507,22 @@ fn migration_candidate(source: &str) -> Result<(Option<u32>, String), ShellError
         .ok_or_else(|| patch_error("could not find a literal `quirl.config { ... }` table"))?;
     let values = field_values(&tokens, config_open, "schema_version");
     let Some(value) = values.first() else {
-        let insert_at = tokens[config_open].end;
-        let mut candidate = String::with_capacity(source.len() + 24);
-        candidate.push_str(&source[..insert_at]);
+        let insert_at = tokens
+            .get(config_open)
+            .ok_or_else(|| patch_error("configuration table token is missing"))?
+            .end;
+        let mut candidate = String::with_capacity(source.len().saturating_add(24));
+        candidate.push_str(
+            source
+                .get(..insert_at)
+                .ok_or_else(|| patch_error("configuration table boundary is invalid"))?,
+        );
         candidate.push_str(&format!("\n  schema_version = {CONFIG_SCHEMA_VERSION},"));
-        candidate.push_str(&source[insert_at..]);
+        candidate.push_str(
+            source
+                .get(insert_at..)
+                .ok_or_else(|| patch_error("configuration table boundary is invalid"))?,
+        );
         return Ok((None, candidate));
     };
     if values.len() != 1 {
@@ -519,17 +530,22 @@ fn migration_candidate(source: &str) -> Result<(Option<u32>, String), ShellError
             "expected at most one literal `schema_version` field during migration",
         ));
     }
-    let token = &tokens[*value];
+    let token = tokens
+        .get(*value)
+        .ok_or_else(|| patch_error("schema_version token is missing"))?;
     if !matches!(&token.kind, TokenKind::Other) {
         return Err(patch_error(
             "schema_version is code-controlled and cannot be migrated automatically",
         ));
     }
-    let tail = &source[token.start..];
+    let tail = source
+        .get(token.start..)
+        .ok_or_else(|| patch_error("schema_version token boundary is invalid"))?;
     let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
     if digits == 0
         || !matches!(
-            tail[digits..].trim_start().chars().next(),
+            tail.get(digits..)
+                .and_then(|tail| tail.trim_start().chars().next()),
             Some(',' | ';' | '}')
         )
     {
@@ -537,9 +553,13 @@ fn migration_candidate(source: &str) -> Result<(Option<u32>, String), ShellError
             "schema_version must be an integer literal for migration preview",
         ));
     }
-    let version = tail[..digits].parse::<u32>().map_err(|_| {
-        patch_error("schema_version must be an integer literal for migration preview")
-    })?;
+    let version = tail
+        .get(..digits)
+        .unwrap_or_default()
+        .parse::<u32>()
+        .map_err(|_| {
+            patch_error("schema_version must be an integer literal for migration preview")
+        })?;
     if version > CONFIG_SCHEMA_VERSION {
         return Err(ShellError::new(
             ErrorCode::Validation,
@@ -555,9 +575,21 @@ fn migration_candidate(source: &str) -> Result<(Option<u32>, String), ShellError
         return Ok((Some(version), source.to_owned()));
     }
     let mut candidate = String::with_capacity(source.len());
-    candidate.push_str(&source[..token.start]);
+    candidate.push_str(
+        source
+            .get(..token.start)
+            .ok_or_else(|| patch_error("schema_version token boundary is invalid"))?,
+    );
     candidate.push_str(&CONFIG_SCHEMA_VERSION.to_string());
-    candidate.push_str(&source[token.start + digits..]);
+    let literal_end = token
+        .start
+        .checked_add(digits)
+        .ok_or_else(|| patch_error("schema_version token boundary overflowed"))?;
+    candidate.push_str(
+        source
+            .get(literal_end..)
+            .ok_or_else(|| patch_error("schema_version token boundary is invalid"))?,
+    );
     Ok((Some(version), candidate))
 }
 
@@ -705,7 +737,9 @@ fn serve_web(
     file: &Path,
     session: &mut WebSession,
 ) -> Result<(), ShellError> {
-    let mut deadline = Instant::now() + WEB_IDLE_TIMEOUT;
+    let mut deadline = Instant::now()
+        .checked_add(WEB_IDLE_TIMEOUT)
+        .ok_or_else(|| request_error("local configuration server deadline overflowed"))?;
     while Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, peer)) => {
@@ -720,7 +754,14 @@ fn serve_web(
                     Err(error) => HttpResponse::error(400, &error.message),
                 };
                 match write_http_response(&mut stream, &response) {
-                    Ok(()) => deadline = Instant::now() + WEB_IDLE_TIMEOUT,
+                    Ok(()) => {
+                        deadline =
+                            Instant::now()
+                                .checked_add(WEB_IDLE_TIMEOUT)
+                                .ok_or_else(|| {
+                                    request_error("local configuration server deadline overflowed")
+                                })?;
+                    }
                     // Browsers are free to abandon a navigation while the form
                     // response is being produced. That peer-local failure must
                     // not terminate the loopback server for every other tab.
@@ -1187,10 +1228,15 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, ShellError> 
             if end > WEB_MAX_HEADER_BYTES {
                 return Err(request_error("request headers are too large"));
             }
-            break end + 4;
+            break end
+                .checked_add(4)
+                .ok_or_else(|| request_error("request header boundary overflowed"))?;
         }
     };
-    let head = std::str::from_utf8(&bytes[..header_end])
+    let head_bytes = bytes
+        .get(..header_end)
+        .ok_or_else(|| request_error("request header boundary is invalid"))?;
+    let head = std::str::from_utf8(head_bytes)
         .map_err(|_| request_error("request headers must be UTF-8"))?;
     let (method, target, headers) = parse_http_head(head)?;
     let target = target.to_owned();
@@ -1202,7 +1248,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, ShellError> 
     if !request_size_is_allowed(header_end, content_length) {
         return Err(request_error("request body is too large"));
     }
-    let body_end = header_end + content_length;
+    let body_end = header_end
+        .checked_add(content_length)
+        .ok_or_else(|| request_error("request size overflowed"))?;
     if bytes.len() > body_end {
         return Err(request_error(
             "request contains bytes past its declared body",
@@ -1215,7 +1263,10 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, ShellError> 
             return Err(request_error("request ended before its body"));
         }
     }
-    let body = std::str::from_utf8(&bytes[header_end..header_end + content_length])
+    let body_bytes = bytes
+        .get(header_end..body_end)
+        .ok_or_else(|| request_error("request body boundary is invalid"))?;
+    let body = std::str::from_utf8(body_bytes)
         .map_err(|_| request_error("request body must be UTF-8"))?
         .to_owned();
     let (path, query) = target
@@ -1239,8 +1290,17 @@ fn read_http_bytes(stream: &mut TcpStream, bytes: &mut Vec<u8>, limit: usize) ->
     let remaining = limit.saturating_sub(bytes.len());
     let mut buffer = [0_u8; 2048];
     let buffer_limit = remaining.min(buffer.len());
-    let count = stream.read(&mut buffer[..buffer_limit])?;
-    bytes.extend_from_slice(&buffer[..count]);
+    let bounded_buffer = buffer.get_mut(..buffer_limit).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "request read limit is invalid")
+    })?;
+    let count = stream.read(bounded_buffer)?;
+    let received = buffer.get(..count).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request read exceeded its buffer",
+        )
+    })?;
+    bytes.extend_from_slice(received);
     Ok(count)
 }
 
@@ -1367,33 +1427,41 @@ fn parse_form(input: &str) -> Result<BTreeMap<String, String>, ShellError> {
 
 fn percent_decode(value: &str) -> Result<String, ShellError> {
     let mut output = Vec::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        match byte {
             b'+' => output.push(b' '),
             b'%' => {
-                let high = *bytes
-                    .get(index + 1)
+                let high = bytes
+                    .next()
                     .ok_or_else(|| request_error("incomplete percent escape"))?;
-                let low = *bytes
-                    .get(index + 2)
+                let low = bytes
+                    .next()
                     .ok_or_else(|| request_error("incomplete percent escape"))?;
-                output.push((hex_value(high)? << 4) | hex_value(low)?);
-                index += 2;
+                let high = hex_value(high)?
+                    .checked_shl(4)
+                    .ok_or_else(|| request_error("invalid percent escape"))?;
+                output.push(high | hex_value(low)?);
             }
             byte => output.push(byte),
         }
-        index += 1;
     }
     String::from_utf8(output).map_err(|_| request_error("form fields must be UTF-8"))
 }
 
 fn hex_value(byte: u8) -> Result<u8, ShellError> {
     match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        b'0'..=b'9' => byte
+            .checked_sub(b'0')
+            .ok_or_else(|| request_error("invalid percent escape")),
+        b'a'..=b'f' => byte
+            .checked_sub(b'a')
+            .and_then(|value| value.checked_add(10))
+            .ok_or_else(|| request_error("invalid percent escape")),
+        b'A'..=b'F' => byte
+            .checked_sub(b'A')
+            .and_then(|value| value.checked_add(10))
+            .ok_or_else(|| request_error("invalid percent escape")),
         _ => Err(request_error("invalid percent escape")),
     }
 }
@@ -1426,7 +1494,7 @@ fn read_config_source(file: &Path) -> Result<String, ShellError> {
         .metadata()
         .map_err(|error| file_error("inspect", file, error))?
         .len();
-    if size > MAX_LUA_SOURCE_BYTES as u64 {
+    if size > u64::try_from(MAX_LUA_SOURCE_BYTES).unwrap_or(u64::MAX) {
         return Err(ShellError::new(
             ErrorCode::ResourceLimit,
             format!(
@@ -1437,9 +1505,9 @@ fn read_config_source(file: &Path) -> Result<String, ShellError> {
         .with_context(format!("bytes: {size}; limit: {MAX_LUA_SOURCE_BYTES}"))
         .with_help("Keep config.lua below 4 MiB and load large data through bounded adapters"));
     }
-    let mut bytes = Vec::with_capacity(size as usize);
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(MAX_LUA_SOURCE_BYTES));
     input
-        .take(MAX_LUA_SOURCE_BYTES.saturating_add(1) as u64)
+        .take(u64::try_from(MAX_LUA_SOURCE_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)
         .map_err(|error| file_error("read", file, error))?;
     if bytes.len() > MAX_LUA_SOURCE_BYTES {
@@ -2155,7 +2223,10 @@ fn patch_literal(
                 "expected exactly one literal `{section} = {{ ... }}` section"
             )));
         };
-        if !matches!(&tokens[*section_value].kind, TokenKind::Symbol(b'{')) {
+        if !matches!(
+            tokens.get(*section_value).map(|token| &token.kind),
+            Some(TokenKind::Symbol(b'{'))
+        ) {
             return Err(patch_error(&format!(
                 "`{section}` is code-controlled instead of a literal table"
             )));
@@ -2181,7 +2252,10 @@ fn patch_literal(
         | ConfigField::PromptSymbols
         | ConfigField::UiTheme
         | ConfigField::UiSurface => {
-            matches!(&tokens[*value].kind, TokenKind::String)
+            matches!(
+                tokens.get(*value).map(|token| &token.kind),
+                Some(TokenKind::String)
+            )
         }
         ConfigField::UiThemes => false,
         ConfigField::EditorSemanticHints
@@ -2189,10 +2263,13 @@ fn patch_literal(
         | ConfigField::PromptTransient
         | ConfigField::UiStatuslineHints
         | ConfigField::CompletionAuto => matches!(
-            &tokens[*value].kind,
-            TokenKind::Identifier(value) if value == "true" || value == "false"
+            tokens.get(*value).map(|token| &token.kind),
+            Some(TokenKind::Identifier(value)) if value == "true" || value == "false"
         ),
-        ConfigField::CompletionMinChars => matches!(&tokens[*value].kind, TokenKind::Other),
+        ConfigField::CompletionMinChars => matches!(
+            tokens.get(*value).map(|token| &token.kind),
+            Some(TokenKind::Other)
+        ),
         ConfigField::PromptLeft | ConfigField::PromptRight => literal_end_index.is_some(),
     } && literal_end_index
         .is_some_and(|index| literal_value_ends(&tokens, index));
@@ -2201,20 +2278,33 @@ fn patch_literal(
             "`{section}.{name}` is code-controlled instead of a recognized literal"
         )));
     }
-    let token = &tokens[*value];
+    let token = tokens
+        .get(*value)
+        .ok_or_else(|| patch_error("configuration value token is missing"))?;
     let end = literal_end_index
-        .map(|index| tokens[index].end)
+        .and_then(|index| tokens.get(index).map(|token| token.end))
         .ok_or_else(|| patch_error("literal configuration value is incomplete"))?;
-    let mut patched = String::with_capacity(source.len() + replacement.len());
-    patched.push_str(&source[..token.start]);
+    let mut patched = String::with_capacity(source.len().saturating_add(replacement.len()));
+    patched.push_str(
+        source
+            .get(..token.start)
+            .ok_or_else(|| patch_error("configuration value boundary is invalid"))?,
+    );
     patched.push_str(replacement);
-    patched.push_str(&source[end..]);
+    patched.push_str(
+        source
+            .get(end..)
+            .ok_or_else(|| patch_error("configuration value boundary is invalid"))?,
+    );
     Ok(patched)
 }
 
 fn literal_value_ends(tokens: &[Token], end: usize) -> bool {
+    let Some(next) = end.checked_add(1) else {
+        return false;
+    };
     matches!(
-        tokens.get(end + 1).map(|token| &token.kind),
+        tokens.get(next).map(|token| &token.kind),
         None | Some(TokenKind::Symbol(b',' | b';' | b'}'))
     )
 }
@@ -2226,7 +2316,7 @@ fn literal_string_array_end(tokens: &[Token], start: usize) -> Option<usize> {
     ) {
         return None;
     }
-    let mut index = start + 1;
+    let mut index = start.checked_add(1)?;
     let mut expects_value = true;
     while let Some(token) = tokens.get(index) {
         match &token.kind {
@@ -2238,7 +2328,7 @@ fn literal_string_array_end(tokens: &[Token], start: usize) -> Option<usize> {
             TokenKind::Symbol(b'}') if !expects_value => return Some(index),
             _ => return None,
         }
-        index += 1;
+        index = index.checked_add(1)?;
     }
     None
 }
@@ -2247,40 +2337,55 @@ fn find_config_table(tokens: &[Token]) -> Option<usize> {
     tokens
         .windows(4)
         .position(|tokens| {
-            identifier_is(&tokens[0], "quirl")
-                && matches!(&tokens[1].kind, TokenKind::Symbol(b'.'))
-                && identifier_is(&tokens[2], "config")
-                && matches!(&tokens[3].kind, TokenKind::Symbol(b'{'))
+            let [quirl, dot, config, open] = tokens else {
+                return false;
+            };
+            identifier_is(quirl, "quirl")
+                && matches!(&dot.kind, TokenKind::Symbol(b'.'))
+                && identifier_is(config, "config")
+                && matches!(&open.kind, TokenKind::Symbol(b'{'))
         })
-        .map(|index| index + 3)
+        .and_then(|index| index.checked_add(3))
 }
 
 fn field_values(tokens: &[Token], open: usize, field: &str) -> Vec<usize> {
     let mut values = Vec::new();
     let mut depth = 0usize;
-    let mut index = open + 1;
-    while index < tokens.len() {
-        match &tokens[index].kind {
+    let Some(mut index) = open.checked_add(1) else {
+        return values;
+    };
+    while let Some(token) = tokens.get(index) {
+        match &token.kind {
             TokenKind::Symbol(b'{') | TokenKind::Symbol(b'(') | TokenKind::Symbol(b'[') => {
-                depth += 1;
+                depth = depth.saturating_add(1);
             }
             TokenKind::Symbol(b'}') if depth == 0 => break,
             TokenKind::Symbol(b'}') | TokenKind::Symbol(b')') | TokenKind::Symbol(b']') => {
                 depth = depth.saturating_sub(1);
             }
             _ if depth == 0
-                && identifier_is(&tokens[index], field)
+                && identifier_is(token, field)
                 && matches!(
-                    tokens.get(index + 1).map(|token| &token.kind),
+                    index
+                        .checked_add(1)
+                        .and_then(|index| tokens.get(index))
+                        .map(|token| &token.kind),
                     Some(TokenKind::Symbol(b'='))
                 )
-                && tokens.get(index + 2).is_some() =>
+                && index
+                    .checked_add(2)
+                    .is_some_and(|index| tokens.get(index).is_some()) =>
             {
-                values.push(index + 2);
+                if let Some(value_index) = index.checked_add(2) {
+                    values.push(value_index);
+                }
             }
             _ => {}
         }
-        index += 1;
+        let Some(next) = index.checked_add(1) else {
+            break;
+        };
+        index = next;
     }
     values
 }
@@ -2293,19 +2398,27 @@ fn tokenize(source: &str) -> Vec<Token> {
     let bytes = source.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0usize;
-    while index < bytes.len() {
-        if bytes[index].is_ascii_whitespace() {
-            index += 1;
+    while let Some(&byte) = bytes.get(index) {
+        if byte.is_ascii_whitespace() {
+            index = index.saturating_add(1);
             continue;
         }
-        if bytes[index..].starts_with(b"--") {
-            if let Some(end) = long_bracket_end(bytes, index + 2) {
+        if bytes
+            .get(index..)
+            .is_some_and(|tail| tail.starts_with(b"--"))
+        {
+            let comment_start = index.saturating_add(2);
+            if let Some(end) = long_bracket_end(bytes, comment_start) {
                 index = end;
             } else {
-                index = bytes[index..]
+                index = bytes
+                    .get(index..)
+                    .unwrap_or_default()
                     .iter()
                     .position(|byte| *byte == b'\n')
-                    .map_or(bytes.len(), |offset| index + offset + 1);
+                    .and_then(|offset| index.checked_add(offset))
+                    .and_then(|newline| newline.checked_add(1))
+                    .unwrap_or(bytes.len());
             }
             continue;
         }
@@ -2319,36 +2432,41 @@ fn tokenize(source: &str) -> Vec<Token> {
             continue;
         }
         let start = index;
-        let kind = match bytes[index] {
+        let kind = match byte {
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
-                index += 1;
-                while index < bytes.len()
-                    && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                index = index.saturating_add(1);
+                while bytes
+                    .get(index)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
                 {
-                    index += 1;
+                    index = index.saturating_add(1);
                 }
-                TokenKind::Identifier(source[start..index].to_owned())
+                source
+                    .get(start..index)
+                    .map_or(TokenKind::Other, |identifier| {
+                        TokenKind::Identifier(identifier.to_owned())
+                    })
             }
             quote @ (b'\'' | b'"') => {
-                index += 1;
-                while index < bytes.len() {
-                    if bytes[index] == b'\\' {
-                        index = (index + 2).min(bytes.len());
-                    } else if bytes[index] == quote {
-                        index += 1;
+                index = index.saturating_add(1);
+                while let Some(&string_byte) = bytes.get(index) {
+                    if string_byte == b'\\' {
+                        index = index.saturating_add(2).min(bytes.len());
+                    } else if string_byte == quote {
+                        index = index.saturating_add(1);
                         break;
                     } else {
-                        index += 1;
+                        index = index.saturating_add(1);
                     }
                 }
                 TokenKind::String
             }
             symbol @ (b'.' | b'=' | b'{' | b'}' | b'(' | b')' | b'[' | b']' | b',' | b';') => {
-                index += 1;
+                index = index.saturating_add(1);
                 TokenKind::Symbol(symbol)
             }
             _ => {
-                index += 1;
+                index = index.saturating_add(1);
                 TokenKind::Other
             }
         };
@@ -2365,23 +2483,30 @@ fn long_bracket_end(bytes: &[u8], start: usize) -> Option<usize> {
     if bytes.get(start) != Some(&b'[') {
         return None;
     }
+    let equals_start = start.checked_add(1)?;
     let mut equals = 0usize;
-    while bytes.get(start + 1 + equals) == Some(&b'=') {
-        equals += 1;
+    while equals_start
+        .checked_add(equals)
+        .is_some_and(|index| bytes.get(index) == Some(&b'='))
+    {
+        equals = equals.checked_add(1)?;
     }
-    if bytes.get(start + 1 + equals) != Some(&b'[') {
+    let second_open = equals_start.checked_add(equals)?;
+    if bytes.get(second_open) != Some(&b'[') {
         return None;
     }
-    let mut index = start + 2 + equals;
-    while index < bytes.len() {
-        if bytes[index] == b']'
-            && bytes.get(index + 1..index + 1 + equals)
-                == Some(&bytes[start + 1..start + 1 + equals])
-            && bytes.get(index + 1 + equals) == Some(&b']')
+    let opening_equals = bytes.get(equals_start..second_open)?;
+    let mut index = second_open.checked_add(1)?;
+    while let Some(&byte) = bytes.get(index) {
+        let closing_equals_start = index.checked_add(1)?;
+        let closing_equals_end = closing_equals_start.checked_add(equals)?;
+        if byte == b']'
+            && bytes.get(closing_equals_start..closing_equals_end) == Some(opening_equals)
+            && bytes.get(closing_equals_end) == Some(&b']')
         {
-            return Some(index + 2 + equals);
+            return closing_equals_end.checked_add(1);
         }
-        index += 1;
+        index = index.checked_add(1)?;
     }
     Some(bytes.len())
 }

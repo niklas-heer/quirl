@@ -159,6 +159,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the benchmark instruction limit is a small compile-time constant"
+)]
 fn lua_host() -> Result<(Lua, Function), mlua::Error> {
     let lua = Lua::new();
     let host_add = lua.create_function(|_, value: i64| Ok(value + 1))?;
@@ -173,6 +177,10 @@ fn load_fennel(lua: &Lua, source: &str) -> Result<Table, mlua::Error> {
     lua.load(source).set_name("@fennel.lua").eval()
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the benchmark instruction limit is a small compile-time constant"
+)]
 fn fennel_host(source: &str) -> Result<(Lua, Function), mlua::Error> {
     let lua = Lua::new();
     let host_add = lua.create_function(|_, value: i64| Ok(value + 1))?;
@@ -194,6 +202,11 @@ fn argument_value(name: &str) -> Option<String> {
     None
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "the non-empty timing vector is sorted before bounded percentile indexing and averaging"
+)]
 fn measure(
     runtime: &'static str,
     case: &'static str,

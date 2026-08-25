@@ -1742,10 +1742,10 @@ impl Catalog {
     /// the nearest valid boundary so malformed protocol input cannot create a panic.
     pub fn complete(&self, input: &str, cursor: usize) -> Vec<Completion> {
         let cursor = clamped_cursor(input, cursor);
-        let before = &input[..cursor];
+        let before = input.get(..cursor).unwrap_or(input);
         let (segment_start, segment) = current_command_segment(before);
-        let leading_whitespace = segment.len() - segment.trim_start().len();
-        let query_start = segment_start + leading_whitespace;
+        let leading_whitespace = segment.len().saturating_sub(segment.trim_start().len());
+        let query_start = segment_start.saturating_add(leading_whitespace);
         let query = segment.trim_start();
 
         if let Some((command, option, token_start, token, values)) =
@@ -1793,9 +1793,13 @@ impl Catalog {
             };
             let bundle_prefix = (!token.starts_with("--") && token.chars().count() > 2)
                 .then(|| {
-                    let split = token.len() - token.chars().next_back().map_or(0, char::len_utf8);
-                    let prefix = &token[..split];
-                    prefix[1..]
+                    let split = token
+                        .char_indices()
+                        .next_back()
+                        .map_or(0, |(index, _)| index);
+                    let prefix = token.get(..split)?;
+                    prefix
+                        .strip_prefix('-')?
                         .chars()
                         .all(|flag| {
                             let mut candidate = String::from('-');
@@ -1809,7 +1813,11 @@ impl Catalog {
                 })
                 .flatten();
             let (match_query, insert_start, bundling) = match bundle_prefix {
-                Some(prefix) => (&token[prefix.len()..], token_start + prefix.len(), true),
+                Some(prefix) => (
+                    token.strip_prefix(prefix).unwrap_or(token),
+                    token_start.saturating_add(prefix.len()),
+                    true,
+                ),
                 None => (token, token_start, false),
             };
             let mut choices = command
@@ -1820,7 +1828,11 @@ impl Catalog {
                     !bundling || (option.kind == ArgumentKind::Flag && is_short_flag_name(name))
                 })
                 .filter_map(|(name, option)| {
-                    let insert = if bundling { &name[1..] } else { name.as_str() };
+                    let insert = if bundling {
+                        name.strip_prefix('-').unwrap_or(name)
+                    } else {
+                        name.as_str()
+                    };
                     fuzzy_match(match_query, insert).map(|(score, indices)| {
                         (
                             score,
@@ -2214,14 +2226,14 @@ impl Catalog {
         query: &'query str,
         leading_whitespace: usize,
     ) -> Option<(&'catalog CommandSpec, usize, &'query str)> {
-        let token_start = query
-            .rfind(char::is_whitespace)
-            .map_or(0, |index| index + whitespace_width_at(query, index));
-        let token = &query[token_start..];
+        let token_start = query.rfind(char::is_whitespace).map_or(0, |index| {
+            index.saturating_add(whitespace_width_at(query, index))
+        });
+        let token = query.get(token_start..)?;
         if !token.starts_with('-') {
             return None;
         }
-        let command_text = query[..token_start].trim_end();
+        let command_text = query.get(..token_start)?.trim_end();
         let command = self
             .commands
             .iter()
@@ -2230,7 +2242,11 @@ impl Catalog {
                     || command_text.starts_with(&format!("{} ", command.path))
             })
             .max_by_key(|command| command.path.len())?;
-        Some((command, leading_whitespace + token_start, token))
+        Some((
+            command,
+            leading_whitespace.saturating_add(token_start),
+            token,
+        ))
     }
 
     fn static_value_context<'catalog, 'query>(
@@ -2244,28 +2260,31 @@ impl Catalog {
         &'query str,
         &'catalog [String],
     )> {
-        let token_start = query
-            .rfind(char::is_whitespace)
-            .map_or(0, |index| index + whitespace_width_at(query, index));
-        let token = &query[token_start..];
+        let token_start = query.rfind(char::is_whitespace).map_or(0, |index| {
+            index.saturating_add(whitespace_width_at(query, index))
+        });
+        let token = query.get(token_start..)?;
         let (option_name, value_query, replace_start, command_text) =
             if let Some((name, value)) = token.split_once('=') {
                 (
                     name,
                     value,
-                    leading_whitespace + token_start + name.len() + 1,
-                    query[..token_start].trim_end(),
+                    leading_whitespace
+                        .saturating_add(token_start)
+                        .saturating_add(name.len())
+                        .saturating_add(1),
+                    query.get(..token_start)?.trim_end(),
                 )
             } else {
-                let preceding = query[..token_start].trim_end();
-                let option_start = preceding
-                    .rfind(char::is_whitespace)
-                    .map_or(0, |index| index + whitespace_width_at(preceding, index));
+                let preceding = query.get(..token_start)?.trim_end();
+                let option_start = preceding.rfind(char::is_whitespace).map_or(0, |index| {
+                    index.saturating_add(whitespace_width_at(preceding, index))
+                });
                 (
-                    &preceding[option_start..],
+                    preceding.get(option_start..)?,
                     token,
-                    leading_whitespace + token_start,
-                    preceding[..option_start].trim_end(),
+                    leading_whitespace.saturating_add(token_start),
+                    preceding.get(..option_start)?.trim_end(),
                 )
             };
         if !option_name.starts_with('-') {
@@ -2302,7 +2321,7 @@ fn unsupported_catalog_schema_error(found: &str) -> serde_json::Error {
 fn clamped_cursor(input: &str, cursor: usize) -> usize {
     let mut cursor = cursor.min(input.len());
     while !input.is_char_boundary(cursor) {
-        cursor -= 1;
+        cursor = cursor.saturating_sub(1);
     }
     cursor
 }
@@ -2340,17 +2359,25 @@ fn current_command_segment(input: &str) -> (usize, &str) {
                 '\\' => escaped = true,
                 '\'' => quote = Quote::Single,
                 '"' => quote = Quote::Double,
-                '|' | '&' | ';' | '\n' => segment_start = index + character.len_utf8(),
+                '|' | '&' | ';' | '\n' => {
+                    segment_start = index.saturating_add(character.len_utf8());
+                }
                 _ => {}
             },
         }
     }
 
-    (segment_start, &input[segment_start..])
+    (
+        segment_start,
+        input.get(segment_start..).unwrap_or_default(),
+    )
 }
 
 fn whitespace_width_at(input: &str, index: usize) -> usize {
-    input[index..].chars().next().map_or(0, char::len_utf8)
+    input
+        .get(index..)
+        .and_then(|suffix| suffix.chars().next())
+        .map_or(0, char::len_utf8)
 }
 
 fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
@@ -2386,7 +2413,13 @@ fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
             .copied()
             .collect::<Vec<_>>();
         indices.dedup();
-        return Some((10_000 - candidate.len() as i32 + case_bonus, indices));
+        let candidate_len = i32::try_from(candidate.len()).unwrap_or(i32::MAX);
+        return Some((
+            10_000_i32
+                .saturating_sub(candidate_len)
+                .saturating_add(case_bonus),
+            indices,
+        ));
     }
 
     let mut indices = Vec::new();
@@ -2398,9 +2431,13 @@ fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
             indices.push(original_index);
         }
     }
-    let spread = indices.last().copied().unwrap_or_default() as i32;
+    let spread = i32::try_from(indices.last().copied().unwrap_or_default()).unwrap_or(i32::MAX);
+    let candidate_len = i32::try_from(candidate.len()).unwrap_or(i32::MAX);
     Some((
-        1_000 - spread - candidate.len() as i32 + case_bonus,
+        1_000_i32
+            .saturating_sub(spread)
+            .saturating_sub(candidate_len)
+            .saturating_add(case_bonus),
         indices,
     ))
 }

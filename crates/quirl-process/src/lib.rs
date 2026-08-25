@@ -315,18 +315,16 @@ pub fn validate_runner_protocol_version(version: u32) -> Result<(), quirl_core::
     .with_help("Use a client and Quirl build that both implement runner protocol v2"))
 }
 
-fn allocate_job_id(next_job_id: &mut u32, visible_ids: &[u32]) -> u32 {
+fn allocate_job_id(next_job_id: &mut u32, visible_ids: &[u32]) -> Option<u32> {
     let mut candidate = (*next_job_id).max(1);
     for _ in 0..=visible_ids.len() {
         if !visible_ids.contains(&candidate) {
             *next_job_id = candidate.checked_add(1).unwrap_or(1);
-            return candidate;
+            return Some(candidate);
         }
         candidate = candidate.checked_add(1).unwrap_or(1);
     }
-    // The retained table is much smaller than the nonzero u32 ID space, so a
-    // free candidate must exist after at most visible_ids.len() + 1 probes.
-    unreachable!("bounded job id search exhausted the nonzero u32 space")
+    None
 }
 
 fn validate_native_source(input: &str) -> Result<(), quirl_core::ShellError> {
@@ -376,7 +374,7 @@ fn validate_native_plan(graph: &quirl_syntax::CommandList) -> Result<(), quirl_c
             )
             .with_context(format!(
                 "limit {NATIVE_PIPELINE_STAGES_MAX} stages; pipeline {} has {} stages",
-                index + 1,
+                index.saturating_add(1),
                 pipeline.commands.len()
             ))
             .with_help("Split the pipeline or use intermediate files"));
@@ -435,7 +433,7 @@ mod simulation_support {
             value ^= value << 17;
             self.0 = value;
             let upper = u64::try_from(upper).unwrap();
-            usize::try_from(value % upper).unwrap()
+            usize::try_from(value.checked_rem(upper).unwrap()).unwrap()
         }
     }
 
@@ -603,7 +601,7 @@ mod platform {
                 let claimed = requested.min(self.limit.saturating_sub(retained));
                 match self.retained.compare_exchange_weak(
                     retained,
-                    retained + claimed,
+                    retained.saturating_add(claimed),
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 ) {
@@ -1347,7 +1345,14 @@ mod platform {
                 ));
             }
             let visible_ids = self.jobs.iter().map(|job| job.state.id).collect::<Vec<_>>();
-            Ok(allocate_job_id(&mut self.next_job_id, &visible_ids))
+            allocate_job_id(&mut self.next_job_id, &visible_ids).ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "native job identifier space was exhausted",
+                )
+                .with_context(format!("visible jobs: {}", visible_ids.len()))
+                .with_help("Finish active jobs and retry")
+            })
         }
 
         /// Terminate job `id`, reap its children, and return the final snapshot.
@@ -1450,7 +1455,17 @@ mod platform {
             let mut captured_stderr = String::new();
             for (index, pipeline) in graph.pipelines.iter().enumerate() {
                 if index > 0 {
-                    let connector = graph.connectors[index - 1];
+                    let connector = graph
+                        .connectors
+                        .get(index.saturating_sub(1))
+                        .copied()
+                        .ok_or_else(|| {
+                            ShellError::new(
+                                ErrorCode::InvalidCommand,
+                                "command list is missing a pipeline connector",
+                            )
+                            .with_help("Re-enter the command so it can be parsed again")
+                        })?;
                     if (matches!(connector, ListConnector::And) && last.status != 0)
                         || (matches!(connector, ListConnector::Or) && last.status == 0)
                     {
@@ -1506,8 +1521,15 @@ mod platform {
                 ));
             }
             if pipeline.commands.len() == 1 {
+                let Some(command) = pipeline.commands.first() else {
+                    return Err(ShellError::new(
+                        ErrorCode::InvalidCommand,
+                        "native pipeline contains no command",
+                    )
+                    .with_help("Provide at least one command in each pipeline"));
+                };
                 if self.noninteractive_host
-                    && pipeline.commands[0].words.first().is_some_and(|name| {
+                    && command.words.first().is_some_and(|name| {
                         matches!(name.as_str(), "cd" | "export" | "jobs" | "fg" | "bg")
                     })
                 {
@@ -1517,7 +1539,7 @@ mod platform {
                     ));
                 }
                 if pipeline.background
-                    && pipeline.commands[0].words.first().is_some_and(|name| {
+                    && command.words.first().is_some_and(|name| {
                         matches!(name.as_str(), "cd" | "export" | "jobs" | "fg" | "bg")
                     })
                 {
@@ -1528,9 +1550,7 @@ mod platform {
                     .with_command(source)
                     .with_help("Run the built-in without `&`"));
                 }
-                if let Some(result) =
-                    self.execute_control_builtin(&pipeline.commands[0], capture)?
-                {
+                if let Some(result) = self.execute_control_builtin(command, capture)? {
                     return Ok(result);
                 }
             }
@@ -1641,7 +1661,12 @@ mod platform {
         ) -> Result<(), ShellError> {
             let mut index = 0;
             while index < text.len() {
-                let rest = &text[index..];
+                let rest = text.get(index..).ok_or_else(|| {
+                    expansion_error(
+                        "expansion cursor is not a UTF-8 boundary",
+                        "Re-enter the command without malformed text",
+                    )
+                })?;
                 if let Some(arithmetic) = rest.strip_prefix("$((") {
                     let Some(close) = matching_double_paren(arithmetic) else {
                         return Err(expansion_error(
@@ -1649,9 +1674,18 @@ mod platform {
                             "Close the `))` in `$((...))`",
                         ));
                     };
-                    let value = evaluate_arithmetic(&arithmetic[..close])?.to_string();
+                    let expression = arithmetic.get(..close).ok_or_else(|| {
+                        expansion_error(
+                            "arithmetic expansion boundary is invalid",
+                            "Re-enter the arithmetic expansion",
+                        )
+                    })?;
+                    let value = evaluate_arithmetic(expression)?.to_string();
                     budget.append(output, &value)?;
-                    index += 3 + close + 2;
+                    index = index
+                        .saturating_add(3)
+                        .saturating_add(close)
+                        .saturating_add(2);
                     continue;
                 }
                 if let Some(after) = rest.strip_prefix("$(") {
@@ -1661,7 +1695,12 @@ mod platform {
                             "Close the `)` in `$(...)`",
                         ));
                     };
-                    let source = &after[..close];
+                    let source = after.get(..close).ok_or_else(|| {
+                        expansion_error(
+                            "command substitution boundary is invalid",
+                            "Re-enter the command substitution",
+                        )
+                    })?;
                     if source.len() > limit {
                         return Err(expansion_error(
                             "command substitution exceeds its source budget",
@@ -1675,7 +1714,7 @@ mod platform {
                             "Flatten nested substitutions or use an explicit pipeline",
                         ));
                     }
-                    self.substitution_depth += 1;
+                    self.substitution_depth = self.substitution_depth.saturating_add(1);
                     let nested = self.execute_inner_with_request(source, true, request);
                     self.substitution_depth = self.substitution_depth.saturating_sub(1);
                     let nested = nested?;
@@ -1687,7 +1726,10 @@ mod platform {
                         ));
                     }
                     budget.append(output, stdout.trim_end_matches('\n'))?;
-                    index += 2 + close + 1;
+                    index = index
+                        .saturating_add(2)
+                        .saturating_add(close)
+                        .saturating_add(1);
                     continue;
                 }
                 if let Some(after) = rest.strip_prefix("${") {
@@ -1698,14 +1740,19 @@ mod platform {
                         ));
                     };
                     let value = self.expand_parameter(
-                        &after[..close],
+                        after.get(..close).ok_or_else(|| {
+                            expansion_error(
+                                "parameter expansion boundary is invalid",
+                                "Re-enter the parameter expansion",
+                            )
+                        })?,
                         limit,
                         request,
                         previous_status,
                         budget,
                     )?;
                     budget.append(output, &value)?;
-                    index += 3 + close;
+                    index = index.saturating_add(3).saturating_add(close);
                     continue;
                 }
                 if let Some(after) = rest.strip_prefix('$') {
@@ -1716,13 +1763,13 @@ mod platform {
                     if character == '?' {
                         let value = previous_status.to_string();
                         budget.append(output, &value)?;
-                        index += 2;
+                        index = index.saturating_add(2);
                         continue;
                     }
                     if character == '$' {
                         let value = std::process::id().to_string();
                         budget.append(output, &value)?;
-                        index += 2;
+                        index = index.saturating_add(2);
                         continue;
                     }
                     if character == '_' || character.is_ascii_alphabetic() {
@@ -1731,15 +1778,27 @@ mod platform {
                             .take_while(|value| *value == '_' || value.is_ascii_alphanumeric())
                             .map(char::len_utf8)
                             .sum();
-                        let value = self.environment.value(&after[..length]);
+                        let name = after.get(..length).ok_or_else(|| {
+                            expansion_error(
+                                "variable expansion boundary is invalid",
+                                "Re-enter the variable name",
+                            )
+                        })?;
+                        let value = self.environment.value(name);
                         budget.append(output, &value)?;
-                        index += 1 + length;
+                        index = index.saturating_add(1).saturating_add(length);
                         continue;
                     }
                 }
                 let character = rest.chars().next().unwrap_or_default();
-                budget.append(output, &rest[..character.len_utf8()])?;
-                index += character.len_utf8();
+                let character_text = rest.get(..character.len_utf8()).ok_or_else(|| {
+                    expansion_error(
+                        "expansion character boundary is invalid",
+                        "Re-enter the command without malformed text",
+                    )
+                })?;
+                budget.append(output, character_text)?;
+                index = index.saturating_add(character.len_utf8());
             }
             Ok(())
         }
@@ -1771,8 +1830,8 @@ mod platform {
                 }
             }
             let name_length = identifier_length(spec);
-            let name = &spec[..name_length];
-            let operator = &spec[name_length..];
+            let name = spec.get(..name_length).unwrap_or_default();
+            let operator = spec.get(name_length..).unwrap_or_default();
             if operator.is_empty() || name.is_empty() {
                 // Either a bare `${VAR}` lookup, or a shape this expander does
                 // not model (for example a positional parameter); both fall
@@ -1900,7 +1959,7 @@ mod platform {
                         )
                         .with_help("Use `export NAME=value`"));
                     }
-                    let mut assignments = Vec::with_capacity(command.words.len() - 1);
+                    let mut assignments = Vec::with_capacity(command.words.len().saturating_sub(1));
                     for assignment in command.words.iter().skip(1) {
                         let Some((name, value)) = assignment.split_once('=') else {
                             return Err(ShellError::new(
@@ -1978,7 +2037,7 @@ mod platform {
             };
 
             for (index, command) in pipeline.commands.iter().enumerate() {
-                let last = index + 1 == pipeline.commands.len();
+                let last = index.saturating_add(1) == pipeline.commands.len();
                 if stderr_duplication_precedes_stdout_redirect(command) {
                     return Err(ShellError::new(
                         ErrorCode::InvalidCommand,
@@ -2099,9 +2158,13 @@ mod platform {
                 .collect::<Vec<_>>();
 
             if pipeline.background {
-                let Some(id) = background_job_id else {
-                    unreachable!("background pipeline reserved no job id");
-                };
+                let id = background_job_id.ok_or_else(|| {
+                    ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "background pipeline has no reserved job identifier",
+                    )
+                    .with_help("Finish active jobs and retry the background command")
+                })?;
                 let process_group = spawned.process_group;
                 let (children, process_group_anchor) = spawned.release();
                 self.jobs.push(Job {
@@ -2252,6 +2315,10 @@ mod platform {
             }
         }
 
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "select_job returns an index into the same jobs slice and no mutation occurs before these accesses"
+        )]
         fn foreground(&mut self, id: Option<u32>) -> Result<CommandOutcome, ShellError> {
             self.refresh_jobs();
             let index = select_job(&self.jobs, id)?;
@@ -2350,6 +2417,10 @@ mod platform {
             terminal.current_modes()
         }
 
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "select_job returns an index into the same jobs slice and the slice length is unchanged throughout this transition"
+        )]
         fn background(&mut self, id: Option<u32>) -> Result<CommandOutcome, ShellError> {
             self.refresh_jobs();
             let index = select_job(&self.jobs, id)?;
@@ -2424,9 +2495,17 @@ mod platform {
             Box::new(0..=characters.len())
         };
         for length in lengths {
-            let candidate = characters[..length].iter().collect::<String>();
+            let candidate = characters
+                .get(..length)
+                .unwrap_or_default()
+                .iter()
+                .collect::<String>();
             if glob_matches(pattern, &candidate, false) {
-                return Ok(characters[length..].iter().collect());
+                return Ok(characters
+                    .get(length..)
+                    .unwrap_or_default()
+                    .iter()
+                    .collect());
             }
         }
         Ok(value.to_owned())
@@ -2447,9 +2526,13 @@ mod platform {
             Box::new((0..=characters.len()).rev())
         };
         for start in starts {
-            let candidate = characters[start..].iter().collect::<String>();
+            let candidate = characters
+                .get(start..)
+                .unwrap_or_default()
+                .iter()
+                .collect::<String>();
             if glob_matches(pattern, &candidate, false) {
-                return Ok(characters[..start].iter().collect());
+                return Ok(characters.get(..start).unwrap_or_default().iter().collect());
             }
         }
         Ok(value.to_owned())
@@ -2498,7 +2581,12 @@ mod platform {
             match character {
                 '(' => depth = depth.saturating_add(1),
                 ')' if depth > 0 => depth = depth.saturating_sub(1),
-                ')' if source[index..].starts_with("))") => return Some(index),
+                ')' if source
+                    .get(index..)
+                    .is_some_and(|tail| tail.starts_with("))")) =>
+                {
+                    return Some(index);
+                }
                 ')' => return None,
                 _ => {}
             }
@@ -2530,7 +2618,7 @@ mod platform {
                     .get(self.index)
                     .is_some_and(u8::is_ascii_whitespace)
                 {
-                    self.index += 1;
+                    self.index = self.index.saturating_add(1);
                 }
             }
             fn expression(&mut self, depth: usize) -> Result<i64, ShellError> {
@@ -2539,7 +2627,7 @@ mod platform {
                     self.skip();
                     match self.input.get(self.index).copied() {
                         Some(b'+') => {
-                            self.index += 1;
+                            self.index = self.index.saturating_add(1);
                             value = value.checked_add(self.term(depth)?).ok_or_else(|| {
                                 expansion_error(
                                     "arithmetic expansion overflowed",
@@ -2548,7 +2636,7 @@ mod platform {
                             })?;
                         }
                         Some(b'-') => {
-                            self.index += 1;
+                            self.index = self.index.saturating_add(1);
                             value = value.checked_sub(self.term(depth)?).ok_or_else(|| {
                                 expansion_error(
                                     "arithmetic expansion overflowed",
@@ -2566,7 +2654,7 @@ mod platform {
                     self.skip();
                     match self.input.get(self.index).copied() {
                         Some(b'*') => {
-                            self.index += 1;
+                            self.index = self.index.saturating_add(1);
                             value = value.checked_mul(self.factor(depth)?).ok_or_else(|| {
                                 expansion_error(
                                     "arithmetic expansion overflowed",
@@ -2575,7 +2663,7 @@ mod platform {
                             })?;
                         }
                         Some(b'/') => {
-                            self.index += 1;
+                            self.index = self.index.saturating_add(1);
                             let divisor = self.factor(depth)?;
                             if divisor == 0 {
                                 return Err(expansion_error(
@@ -2612,7 +2700,7 @@ mod platform {
             fn factor(&mut self, depth: usize) -> Result<i64, ShellError> {
                 self.skip();
                 if self.input.get(self.index) == Some(&b'(') {
-                    self.index += 1;
+                    self.index = self.index.saturating_add(1);
                     let value = self.expression(Self::nested_depth(depth)?)?;
                     self.skip();
                     if self.input.get(self.index) != Some(&b')') {
@@ -2621,11 +2709,11 @@ mod platform {
                             "Balance parentheses in `$((...))`",
                         ));
                     }
-                    self.index += 1;
+                    self.index = self.index.saturating_add(1);
                     return Ok(value);
                 }
                 if self.input.get(self.index) == Some(&b'-') {
-                    self.index += 1;
+                    self.index = self.index.saturating_add(1);
                     return self
                         .factor(Self::nested_depth(depth)?)?
                         .checked_neg()
@@ -2638,7 +2726,7 @@ mod platform {
                 }
                 let start = self.index;
                 while self.input.get(self.index).is_some_and(u8::is_ascii_digit) {
-                    self.index += 1;
+                    self.index = self.index.saturating_add(1);
                 }
                 if start == self.index {
                     return Err(expansion_error(
@@ -2646,7 +2734,13 @@ mod platform {
                         "Use integer literals and +, -, *, /, or parentheses",
                     ));
                 }
-                let text = std::str::from_utf8(&self.input[start..self.index]).map_err(|_| {
+                let digits = self.input.get(start..self.index).ok_or_else(|| {
+                    expansion_error(
+                        "arithmetic operand boundary is invalid",
+                        "Use ASCII integer literals",
+                    )
+                })?;
+                let text = std::str::from_utf8(digits).map_err(|_| {
                     expansion_error(
                         "non-numeric digits in arithmetic expansion",
                         "Use ASCII integer literals",
@@ -2794,6 +2888,11 @@ mod platform {
     /// begins with `.` (so a bare `*` does not silently sweep up dotfiles).
     /// Parameter-expansion pattern removal (`${VAR#pattern}` and friends)
     /// has no such convention, so its callers pass `false`.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing,
+        reason = "all dynamic-programming and character indices are constructed from the exact vector lengths checked by their loop ranges"
+    )]
     fn glob_matches(pattern: &str, candidate: &str, hide_leading_dot: bool) -> bool {
         enum GlobAtom {
             Star,
@@ -3123,9 +3222,15 @@ mod platform {
         if command.words.len() > 2 {
             return Err(ShellError::new(
                 ErrorCode::InvalidArgument,
-                format!("{} accepts at most one job id", command.words[0]),
+                format!(
+                    "{} accepts at most one job id",
+                    command.words.first().map_or("command", String::as_str)
+                ),
             )
-            .with_help(format!("Usage: {} [%job]", command.words[0])));
+            .with_help(format!(
+                "Usage: {} [%job]",
+                command.words.first().map_or("command", String::as_str)
+            )));
         }
         command
             .words
@@ -3271,7 +3376,7 @@ mod platform {
             if let Ok(Some(status)) = child_status {
                 let exit_status = status
                     .code()
-                    .or_else(|| status.signal().map(|signal| 128 + signal))
+                    .or_else(|| status.signal().map(|signal| 128_i32.saturating_add(signal)))
                     .unwrap_or(1);
                 return Ok(ProcessGroupVerification::Exited(exit_status));
             }
@@ -3571,16 +3676,19 @@ mod platform {
                     break;
                 }
                 let retained = budget.claim(count);
-                bytes.extend_from_slice(&chunk[..retained]);
+                let retained_chunk = chunk.get(..retained).unwrap_or_default();
+                bytes.extend_from_slice(retained_chunk);
                 if retained > 0
                     && let Some((sender, stream)) = &output
                 {
                     let _ = sender.send(OutputEvent {
                         stream: *stream,
-                        bytes: chunk[..retained].to_vec(),
+                        bytes: retained_chunk.to_vec(),
                     });
                 }
-                discarded_bytes = discarded_bytes.saturating_add((count - retained) as u64);
+                discarded_bytes = discarded_bytes.saturating_add(
+                    u64::try_from(count.saturating_sub(retained)).unwrap_or(u64::MAX),
+                );
             }
             Ok(ReaderCapture {
                 bytes,
@@ -3716,6 +3824,10 @@ mod platform {
         ))
     }
 
+    #[allow(
+        clippy::as_conversions,
+        reason = "nix Signal is a repr(i32) wrapper over the platform signal number"
+    )]
     fn record_wait_status(
         status: WaitStatus,
         child_status: &mut JobStatus,
@@ -3728,11 +3840,11 @@ mod platform {
             }
             WaitStatus::Signaled(_, signal, _) => {
                 *child_status = JobStatus::Done;
-                *exit_status = Some(128 + signal as i32);
+                *exit_status = Some(128_i32.saturating_add(signal as i32));
             }
             WaitStatus::Stopped(_, signal) => {
                 *child_status = JobStatus::Stopped;
-                *exit_status = Some(128 + signal as i32);
+                *exit_status = Some(128_i32.saturating_add(signal as i32));
             }
             WaitStatus::Continued(_) => {
                 *child_status = JobStatus::Running;
@@ -3745,12 +3857,12 @@ mod platform {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             WaitStatus::PtraceEvent(_, signal, _) => {
                 *child_status = JobStatus::Stopped;
-                *exit_status = Some(128 + signal as i32);
+                *exit_status = Some(128_i32.saturating_add(signal as i32));
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
             WaitStatus::PtraceSyscall(_) => {
                 *child_status = JobStatus::Stopped;
-                *exit_status = Some(128 + Signal::SIGTRAP as i32);
+                *exit_status = Some(128_i32.saturating_add(Signal::SIGTRAP as i32));
             }
         }
         true
@@ -5840,7 +5952,14 @@ mod platform {
                 ));
             }
             let visible_ids = self.jobs.iter().map(|job| job.state.id).collect::<Vec<_>>();
-            Ok(allocate_job_id(&mut self.next_job_id, &visible_ids))
+            allocate_job_id(&mut self.next_job_id, &visible_ids).ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::ResourceLimit,
+                    "native job identifier space was exhausted",
+                )
+                .with_context(format!("visible jobs: {}", visible_ids.len()))
+                .with_help("Finish active jobs and retry")
+            })
         }
 
         /// Terminate job `id`, reap its children, and return the final snapshot.
@@ -6751,9 +6870,9 @@ fn summarize_job_lifecycle(
     for (status, exit_status) in children {
         last_exit_status = exit_status;
         if status != JobStatus::Done {
-            live_count += 1;
+            live_count = live_count.saturating_add(1);
             if status == JobStatus::Stopped {
-                stopped_count += 1;
+                stopped_count = stopped_count.saturating_add(1);
             }
         }
     }
@@ -7160,9 +7279,9 @@ mod backend_contract_tests {
     #[test]
     fn job_id_allocation_wraps_and_skips_every_visible_id() {
         let mut next = u32::MAX;
-        assert_eq!(allocate_job_id(&mut next, &[1, 2]), u32::MAX);
+        assert_eq!(allocate_job_id(&mut next, &[1, 2]), Some(u32::MAX));
         assert_eq!(next, 1);
-        assert_eq!(allocate_job_id(&mut next, &[1, 2, u32::MAX]), 3);
+        assert_eq!(allocate_job_id(&mut next, &[1, 2, u32::MAX]), Some(3));
         assert_eq!(next, 4);
     }
 

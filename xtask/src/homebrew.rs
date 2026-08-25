@@ -197,8 +197,9 @@ fn validate_manifest(root: &Path, manifest: &ReleaseManifest) -> Result<(), Box<
     }
     .validate_for_release(&manifest.version)?;
     if manifest.assets.iter().any(|asset| {
-        asset.source_revision != manifest.candidate_commit
-            || asset.source_date_epoch != manifest.source_date_epoch
+        let revision_mismatch = asset.source_revision != manifest.candidate_commit;
+        let epoch_mismatch = asset.source_date_epoch != manifest.source_date_epoch;
+        revision_mismatch || epoch_mismatch
     }) {
         return Err(input_error(
             "release asset source identity does not match the native candidate",
@@ -347,6 +348,10 @@ struct NativePackage {
     third_party_licenses: Vec<u8>,
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "archive header slices are preceded by complete fixed-header length validation"
+)]
 fn extract_native_package(archive: &[u8]) -> Result<NativePackage, Box<dyn Error>> {
     if archive.len() < 1_536 || !archive.len().is_multiple_of(512) {
         return Err(input_error(
@@ -411,6 +416,10 @@ struct PackageTarEntry<'a> {
     next_offset: usize,
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "all tar field ranges are fixed and the complete header is validated before parsing"
+)]
 fn parse_package_tar_entry(
     archive: &[u8],
     offset: usize,

@@ -311,16 +311,23 @@ impl RuntimeSurfaceState {
         let mut previous = std::mem::take(&mut self.panels);
         let mut next = Vec::with_capacity(batch.panels.len());
         for panel in batch.panels.into_iter().take(PANEL_UPDATES_PER_TURN_MAX) {
-            let mut slot = previous
-                .iter()
-                .position(|slot| slot.id == panel.id)
-                .map(|index| previous.swap_remove(index))
-                .unwrap_or_else(|| PanelSlot {
+            let mut slot = if let Some(index) = previous.iter().position(|slot| slot.id == panel.id)
+            {
+                previous.swap_remove(index)
+            } else {
+                let updates = match LiveBuffer::new(LIVE_GENERATIONS_MAX) {
+                    Ok(updates) => updates,
+                    Err(error) => {
+                        self.notice = Some(escape_terminal_line(&error.message));
+                        return false;
+                    }
+                };
+                PanelSlot {
                     id: panel.id.clone(),
                     model: panel.model.clone(),
-                    updates: LiveBuffer::new(LIVE_GENERATIONS_MAX)
-                        .unwrap_or_else(|_| unreachable!("fixed live-buffer capacity is valid")),
-                });
+                    updates,
+                }
+            };
             let encoded = serde_json::to_value(&panel.model).unwrap_or(serde_json::Value::Null);
             let _ = slot.updates.push(LiveSample {
                 sequence: batch.generation,
@@ -338,6 +345,10 @@ impl RuntimeSurfaceState {
         true
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the increment is reduced modulo a validated non-empty panel list"
+    )]
     pub(crate) fn cycle_panel_focus(&mut self) -> bool {
         if self.panels.len() < 2 {
             return false;
@@ -575,6 +586,10 @@ fn truncate_chars(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the decrement is guarded by a nonzero offset and stops at a UTF-8 boundary"
+)]
 fn truncate_bytes(value: &str, max: usize) -> String {
     if value.len() <= max {
         return value.to_owned();
@@ -583,7 +598,7 @@ fn truncate_bytes(value: &str, max: usize) -> String {
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
-    value[..end].to_owned()
+    value.get(..end).unwrap_or_default().to_owned()
 }
 
 #[cfg(test)]

@@ -780,6 +780,10 @@ fn verify_remote_tag_absent(root: &Path, tag: &str) -> Result<(), Box<dyn Error>
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "target-specific package matches are validated before selection"
+)]
 fn release_dependencies_for_target(
     root: &Path,
     target: &str,
@@ -957,6 +961,11 @@ fn validate_dependency_inventory(
     )))
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "inventory records validate field counts and the total input is resource-bounded"
+)]
 fn parse_dependency_inventory(source: &str) -> Result<Vec<InventoryRecord>, Box<dyn Error>> {
     let mut records = Vec::new();
     let mut previous = None::<DependencyContract>;
@@ -1120,6 +1129,10 @@ fn render_third_party_license_report(
     Ok(report)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "dependency and license file counts are bounded by release validation limits"
+)]
 fn collect_dependency_license_files(
     package_root: &Path,
 ) -> Result<Vec<PackageLicenseFile>, Box<dyn Error>> {
@@ -1321,6 +1334,10 @@ fn package(root: &Path, target: &str, output: &Path) -> Result<(), Box<dyn Error
     })
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "archive sizes are checked against configured release limits before aggregation"
+)]
 fn aggregate(root: &Path, input: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     let plan = plan(root)?;
     validate_release_candidate(root, &plan, &format!("v{}", plan.next_version))?;
@@ -1593,6 +1610,10 @@ fn changelog_section(source: &str, heading: &str) -> Option<String> {
     in_section.then(|| lines.join("\n").trim().to_owned())
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "the conventional-commit prefix ends at an ASCII delimiter returned by find"
+)]
 fn render_commit_release_notes(version: &str, commits: &[ReleaseCommit]) -> String {
     let mut output = format!("# Quirl {version}\n");
     for (category, heading) in [
@@ -1635,6 +1656,11 @@ fn sanitize_markdown(value: &str) -> String {
         .collect()
 }
 
+#[allow(
+    clippy::string_slice,
+    clippy::arithmetic_side_effects,
+    reason = "section offsets come from ASCII heading searches in the bounded changelog"
+)]
 fn update_changelog(source: &str, version: &str, date: &str) -> Result<String, Box<dyn Error>> {
     let release_heading = format!("## [{version}]");
     if source
@@ -1686,6 +1712,10 @@ fn replace_workspace_version(source: &str, version: &str) -> Result<String, Box<
     Ok(output)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "lockfile line counts are bounded by the checked input size"
+)]
 fn replace_lock_workspace_versions(
     source: &str,
     current_version: &str,
@@ -1735,6 +1765,10 @@ pub(crate) fn workspace_version(root: &Path) -> Result<String, Box<dyn Error>> {
     Err(input_error("Cargo.toml has no workspace.package version"))
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "semantic versions are validated as exactly three numeric components before access"
+)]
 fn parse_version(value: &str) -> Result<SemanticVersion, Box<dyn Error>> {
     if value.is_empty() || value.len() > 64 || value.contains(['-', '+']) {
         return Err(input_error(format!(
@@ -1840,6 +1874,10 @@ fn target_binary(root: &Path, target: &str) -> PathBuf {
         .join(format!("quirl{}", env::consts::EXE_SUFFIX))
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "tar payload slices are bounded by each validated entry length"
+)]
 pub(crate) fn render_tar_entries(
     entries: &[(&str, &[u8], u64)],
     modified: u64,
@@ -1895,6 +1933,11 @@ pub(crate) fn render_tar_entries(
     Ok(output)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "tar field length is validated before fixed trailer writes and octal width arithmetic"
+)]
 fn write_tar_octal(field: &mut [u8], value: u64) -> Result<(), Box<dyn Error>> {
     let digits = format!("{:0width$o}", value, width = field.len() - 1);
     if digits.len() + 1 != field.len() {
@@ -1905,6 +1948,10 @@ fn write_tar_octal(field: &mut [u8], value: u64) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "checksum field length is validated before fixed-format byte writes"
+)]
 fn write_tar_checksum(field: &mut [u8], value: u64) -> Result<(), Box<dyn Error>> {
     let digits = format!("{value:06o}");
     if digits.len() != 6 || field.len() != 8 {
@@ -1916,6 +1963,10 @@ fn write_tar_checksum(field: &mut [u8], value: u64) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "visited file counts are bounded by the release asset limit"
+)]
 fn collect_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let metadata = fs::symlink_metadata(root)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -1960,6 +2011,10 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     Ok(files)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the candidate count is validated as exactly one before access"
+)]
 fn unique_file_named<'a>(files: &'a [PathBuf], name: &str) -> Result<&'a Path, Box<dyn Error>> {
     let matching = files
         .iter()
@@ -2053,6 +2108,10 @@ pub(crate) fn verify_binary_version(
     Ok(())
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "poll counts are bounded by the subprocess deadline"
+)]
 pub(crate) fn run_status_bounded(
     command: &mut Command,
     timeout: Duration,
@@ -2114,6 +2173,10 @@ fn command_output(
     command_output_with_directory(program, arguments, directory, timeout, bytes_max)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "poll counts are bounded by the subprocess deadline"
+)]
 fn command_output_with_directory(
     program: &Path,
     arguments: &[&OsStr],
@@ -2184,6 +2247,10 @@ fn terminate_process_group(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the read size is clamped to the fixed buffer length before slicing"
+)]
 fn read_stream_bounded(mut stream: impl Read, bytes_max: usize) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut buffer = [0_u8; 16 * 1024];

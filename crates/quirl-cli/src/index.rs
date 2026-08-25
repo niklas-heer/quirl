@@ -225,8 +225,10 @@ struct RefreshDeadline {
 
 impl RefreshDeadline {
     fn starting_now(limit: Duration) -> Self {
+        let now = Instant::now();
         Self {
-            expires_at: Instant::now() + limit,
+            // An unrepresentable deadline is treated as already expired.
+            expires_at: now.checked_add(limit).unwrap_or(now),
             limit,
         }
     }
@@ -837,10 +839,14 @@ pub fn initialize_interactive_catalog() {
     let deadline = if env::var_os("QUIRL_TEST_CATALOG_FORCE_TIMEOUT").is_some() {
         Instant::now()
     } else {
-        Instant::now() + DISCOVERY_DEADLINE
+        Instant::now()
+            .checked_add(DISCOVERY_DEADLINE)
+            .unwrap_or_else(Instant::now)
     };
     #[cfg(not(debug_assertions))]
-    let deadline = Instant::now() + DISCOVERY_DEADLINE;
+    let deadline = Instant::now()
+        .checked_add(DISCOVERY_DEADLINE)
+        .unwrap_or_else(Instant::now);
     let _ = initialize_interactive_catalog_with_deadline(&config, deadline);
 }
 
@@ -1037,7 +1043,7 @@ fn increment_generation(counter: &AtomicU64, name: &str) -> Result<u64, ShellErr
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             value.checked_add(1)
         })
-        .map(|value| value + 1)
+        .map(|value| value.saturating_add(1))
         .map_err(|_| {
             ShellError::new(ErrorCode::ResourceLimit, format!("{name} was exhausted"))
                 .with_help("Restart Quirl to reset the bounded generation counter")
@@ -1098,7 +1104,7 @@ fn refresh_catalog_cache(
         let state = DiscoveryState {
             version: DISCOVERY_STATE_VERSION,
             catalog_schema_version: catalog.schema_version,
-            native_catalog_identity: crate::native_catalog::embedded_database_identity().to_owned(),
+            native_catalog_identity: crate::native_catalog::embedded_database_identity().clone(),
             refreshed_unix_ms: unix_time_ms(),
             source_fingerprint: snapshot.fingerprint.clone(),
             catalog_fingerprint,
@@ -1194,7 +1200,13 @@ fn command_path_for_probe(line: &str, cursor: usize) -> Result<Option<Vec<String
         )
         .with_help("Submit a cursor on a valid command-line character boundary"));
     }
-    let prefix = &line[..cursor];
+    let prefix = line.get(..cursor).ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::InvalidArgument,
+            "local completion cursor is outside the command line",
+        )
+        .with_help("Submit a cursor within the command-line byte length")
+    })?;
     let Ok(parsed) = parse_command_list(prefix) else {
         return Ok(None);
     };
@@ -1213,7 +1225,10 @@ fn command_path_for_probe(line: &str, cursor: usize) -> Result<Option<Vec<String
         .into_iter()
         .take_while(|word| !word.starts_with('-'))
         .collect::<Vec<_>>();
-    if command_path.is_empty() || command_path[0].contains('/') {
+    if command_path
+        .first()
+        .is_none_or(|command| command.contains('/'))
+    {
         return Ok(None);
     }
     validate_local_probe_path(&command_path)?;
@@ -1480,7 +1495,7 @@ fn probe_local_completion_paths(
         };
         for context in provider_contexts {
             queries.push(intelligence::LocalOverlayQuery {
-                native_catalog_fingerprint: native_catalog_fingerprint.to_owned(),
+                native_catalog_fingerprint: native_catalog_fingerprint.clone(),
                 executable_fingerprint: executable_source.fingerprint.clone(),
                 provider_fingerprint: context.identity.provider_fingerprint.clone(),
                 cwd_class: intelligence::LocalCwdClass::Any,
@@ -1845,9 +1860,10 @@ fn merge_local_overlay_catalog(
     for ((command_path, kind, insertion_text), observations) in grouped {
         let owner_path = command_path.join(" ");
         let selected = select_local_description(&observations);
-        let record = selected
-            .as_ref()
-            .map_or(observations[0], |(_, record)| *record);
+        let Some(fallback) = observations.first().copied() else {
+            continue;
+        };
+        let record = selected.as_ref().map_or(fallback, |(_, record)| *record);
         let provenance = selected
             .map(|(fact, _)| fact.provenance)
             .unwrap_or_else(|| local_record_provenance(record));
@@ -2058,11 +2074,12 @@ fn build_index(
     write_catalog_atomically_unlocked(&output, &catalog, None)?;
     let report = BuildReport {
         index: output,
-        source_files: fish_files.len()
-            + bash_files.len()
-            + zsh_files.len()
-            + help_files.len()
-            + man_files.len(),
+        source_files: fish_files
+            .len()
+            .saturating_add(bash_files.len())
+            .saturating_add(zsh_files.len())
+            .saturating_add(help_files.len())
+            .saturating_add(man_files.len()),
         commands: catalog.commands.len(),
         options: catalog
             .commands
@@ -2305,7 +2322,8 @@ impl Write for BoundedBytesWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let remaining = self.bytes_max.saturating_sub(self.bytes.len());
         if bytes.len() > remaining {
-            self.bytes.extend_from_slice(&bytes[..remaining]);
+            self.bytes
+                .extend_from_slice(bytes.get(..remaining).unwrap_or_default());
             self.exceeded = true;
             return Err(io::Error::other("bounded index output exceeded"));
         }
@@ -2664,7 +2682,14 @@ fn select_man_candidates(
     budget: &mut IndexBuildBudget,
     pages_max: usize,
 ) -> Result<(Vec<PathBuf>, Vec<ImportDiagnostic>), ShellError> {
-    assert!(pages_max > 0, "man-page selection limit must be positive");
+    if pages_max == 0 {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "man-page selection limit must be positive",
+        )
+        .with_context("configured limit: 0")
+        .with_help("Configure the index to retain at least one man page"));
+    }
     candidates.sort_by(|left, right| {
         right
             .prioritized
@@ -2781,9 +2806,9 @@ fn truncate_utf8_owned(value: &str, bytes_max: usize) -> String {
     }
     let mut end = bytes_max;
     while !value.is_char_boundary(end) {
-        end -= 1;
+        end = end.saturating_sub(1);
     }
-    value[..end].to_owned()
+    value.get(..end).map_or_else(String::new, str::to_owned)
 }
 
 fn format_index_error(prefix: &str, error: &ShellError) -> String {
@@ -3484,8 +3509,22 @@ fn install_new_index_with_hook(
         ))
     })?;
     let split = encoded.len().div_ceil(2);
-    file.write_all(&encoded[..split])
-        .and_then(|()| file.write_all(&encoded[split..]))
+    let first = encoded.get(..split).ok_or_else(|| {
+        guard.cleanup(index_io_error(
+            "write",
+            guard.path(),
+            io::Error::other("index write split exceeded its input"),
+        ))
+    })?;
+    let second = encoded.get(split..).ok_or_else(|| {
+        guard.cleanup(index_io_error(
+            "write",
+            guard.path(),
+            io::Error::other("index write split exceeded its input"),
+        ))
+    })?;
+    file.write_all(first)
+        .and_then(|()| file.write_all(second))
         .and_then(|()| file.sync_all())
         .and_then(|()| after_stage(IndexWriteStage::ContentSynced))
         .map_err(|error| guard.cleanup(index_io_error("write", guard.path(), error)))?;
@@ -3670,7 +3709,7 @@ pub(crate) fn create_index_directories(directory: &Path) -> Result<(), ShellErro
                     return Err(index_limit_error(
                         "output directory depth",
                         DEPTH_MAX,
-                        missing.len() + 1,
+                        missing.len().saturating_add(1),
                     ));
                 }
                 missing.push(cursor.to_path_buf());
@@ -3851,10 +3890,10 @@ mod tests {
         // product bug): each fake provider is a trivial shell script, but a
         // busy machine can still delay scheduling it well past a couple of
         // seconds.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let started_at = Instant::now();
         while counter.load(Ordering::Acquire) == 0 {
             assert!(
-                Instant::now() < deadline,
+                started_at.elapsed() < Duration::from_secs(10),
                 "background catalog observation exceeded its test deadline"
             );
             thread::sleep(Duration::from_millis(5));
@@ -4726,6 +4765,22 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn man_page_selection_rejects_a_zero_limit_without_panicking() {
+        let mut budget = test_budget();
+
+        let error = select_man_candidates(Vec::new(), Vec::new(), &mut budget, 0).unwrap_err();
+
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|value| value.contains('0'))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn automatic_man_discovery_isolates_bad_pages_and_deduplicates_aliases() {
@@ -4879,7 +4934,7 @@ mod tests {
             let guard = worker_wake.0.lock().unwrap();
             let _guard = worker_wake
                 .1
-                .wait_while(guard, |_| !worker_cancelled.load(Ordering::Acquire))
+                .wait_while(guard, |()| !worker_cancelled.load(Ordering::Acquire))
                 .unwrap();
             worker_finished.store(true, Ordering::Release);
         });

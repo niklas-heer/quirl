@@ -27,6 +27,14 @@ task runner or system Lua installation is needed. On Unix, that Rust-owned
 `xtask` also runs the bounded real-PTY harness in `xtask/src/pty.rs` and
 `xtask/src/rich_pty.rs`; no separate scripting-language toolchain is required.
 
+Editors that do not bundle Rust Analyzer can use the server and standard-library
+sources matched to the pinned toolchain. These editor-only components stay
+optional so CI and command-line-only contributors do not download them:
+
+```sh
+rustup component add rust-analyzer rust-src
+```
+
 ```sh
 git clone git@github.com:niklas-heer/quirl.git
 cd quirl
@@ -37,6 +45,11 @@ cargo run -p quirl-cli
 `cargo xtask check` is the canonical local gate and must pass before every
 commit. It checks formatting, Quirl source formatting, Clippy, all workspace
 tests, the real-PTY interaction matrix on Unix, and the guest-side Lua tests.
+The workspace denies Clippy's `pedantic` and `nursery` groups behind an explicit
+compatibility allowlist, plus production safety restrictions such as unchecked
+casts, panics, placeholder macros, and unreachable branches. Test-only unwrap,
+panic, and indexing allowances live in `clippy.toml`; do not weaken the
+workspace policy to make production code compile.
 Generated shell cases use a stable seed; replay or expand them with
 `cargo xtask test --seed <seed> --cases <count>`. Stateful compatibility swarms
 run with `cargo xtask simulate --seed <seed> --sessions <count>`, producing an

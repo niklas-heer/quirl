@@ -81,6 +81,10 @@ impl PanelModel {
     /// An empty row set returns the trimmed fallback plus one newline. Otherwise
     /// headings and rows are padded using UTF-8 byte widths and the result ends
     /// with a newline. Call [`Self::validate`] after any direct field mutation.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "column indices are bounded by the validated rectangular panel shape"
+    )]
     pub fn render_plain(&self) -> String {
         if self.rows.is_empty() {
             return format!("{}\n", self.plain_fallback.trim_end());
@@ -249,6 +253,10 @@ impl LiveBuffer {
     ///
     /// Returns `false` without mutation after cancellation; otherwise returns
     /// `true`. Sequence ordering is the producer's responsibility.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the bounded deque length cannot overflow before the configured capacity check"
+    )]
     pub fn push(&mut self, sample: LiveSample) -> bool {
         if self.cancelled {
             return false;
@@ -277,6 +285,11 @@ impl LiveBuffer {
     }
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "row indices are bounded by iteration and widths are derived from the same rectangular panel"
+)]
 fn render_row(output: &mut String, row: &[String], widths: &[usize]) {
     for (index, cell) in row.iter().enumerate() {
         if index > 0 {

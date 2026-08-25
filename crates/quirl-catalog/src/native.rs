@@ -567,7 +567,15 @@ fn parse_document(
     source_name: &str,
     limits: NativeCatalogLimits,
 ) -> Result<NativeCatalog, NativeCatalogDiagnostic> {
-    if document.nodes().len() != 1 || document.nodes()[0].name().value() != "catalog" {
+    let [root] = document.nodes() else {
+        return Err(validation_diagnostic(
+            source_name,
+            None,
+            "the document must contain exactly one `catalog` root node",
+            "Wrap one provenance node and one or more command nodes in `catalog \"name\" { ... }`",
+        ));
+    };
+    if root.name().value() != "catalog" {
         return Err(validation_diagnostic(
             source_name,
             None,
@@ -575,7 +583,6 @@ fn parse_document(
             "Wrap one provenance node and one or more command nodes in `catalog \"name\" { ... }`",
         ));
     }
-    let root = &document.nodes()[0];
     validate_entries(root, 1, &[], source_name)?;
     let name = required_argument_string(root, 0, "catalog name", source_name, limits)?;
     validate_identifier(&name, "catalog name", root, source_name)?;
@@ -608,7 +615,15 @@ fn parse_document(
             ));
         }
     }
-    let provenance = parse_provenance(provenance_nodes[0], source_name, limits)?;
+    let [provenance_node] = provenance_nodes.as_slice() else {
+        return Err(node_diagnostic(
+            root,
+            source_name,
+            "catalog requires exactly one `provenance` node",
+            "Add one provenance node with author, license, revision, and source properties",
+        ));
+    };
+    let provenance = parse_provenance(provenance_node, source_name, limits)?;
     let command_nodes = children
         .nodes()
         .iter()
@@ -1261,7 +1276,10 @@ fn effective_platforms(
     source_name: &str,
 ) -> Result<Vec<NativePlatform>, NativeCatalogDiagnostic> {
     declared.sort_unstable();
-    if declared.windows(2).any(|pair| pair[0] == pair[1]) {
+    if declared
+        .array_windows::<2>()
+        .any(|[first, second]| first == second)
+    {
         return Err(node_diagnostic(
             node,
             source_name,
@@ -1310,9 +1328,9 @@ fn validate_unique_strings(
 ) -> Result<(), NativeCatalogDiagnostic> {
     values.sort();
     if let Some(duplicate) = values
-        .windows(2)
-        .find(|pair| pair[0] == pair[1])
-        .map(|pair| pair[0].clone())
+        .array_windows::<2>()
+        .find(|[first, second]| first == second)
+        .map(|[first, _]| first.clone())
     {
         return Err(node_diagnostic(
             node,
@@ -1389,7 +1407,7 @@ fn validate_argument_set(
             ));
         }
         optional_seen |= !argument.required;
-        if argument.repeatable && index + 1 != arguments.len() {
+        if argument.repeatable && index != arguments.len().saturating_sub(1) {
             return Err(node_diagnostic(
                 node,
                 source_name,
@@ -1492,8 +1510,7 @@ fn valid_long_flag(value: &str) -> bool {
 }
 
 fn valid_short_flag(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 2 && bytes[0] == b'-' && bytes[1].is_ascii_alphanumeric()
+    matches!(value.as_bytes(), [b'-', name] if name.is_ascii_alphanumeric())
 }
 
 fn valid_flag_name(value: &str) -> bool {
@@ -1501,11 +1518,11 @@ fn valid_flag_name(value: &str) -> bool {
 }
 
 fn valid_windows_flag(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() >= 2
-        && bytes[0] == b'/'
-        && bytes[1].is_ascii_alphanumeric()
-        && bytes[2..]
+    let [b'/', name, suffix @ ..] = value.as_bytes() else {
+        return false;
+    };
+    name.is_ascii_alphanumeric()
+        && suffix
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
@@ -1853,7 +1870,14 @@ fn insert_catalog(
     let mut next_argument_id = 1_i64;
     let mut next_document_id = 1_i64;
     for flat in &flattened {
-        let command_id = ids[flat.path.as_str()];
+        let command_id = ids.get(flat.path.as_str()).copied().ok_or_else(|| {
+            validation_diagnostic(
+                "<native catalog>",
+                None,
+                "flattened command is missing its assigned database identifier",
+                "Report this catalog serializer state as a Quirl defect",
+            )
+        })?;
         let parent_id = flat
             .parent_path
             .as_deref()
@@ -2060,8 +2084,14 @@ fn sqlite_id(index: usize, label: &str) -> Result<i64, NativeCatalogDiagnostic> 
 }
 
 fn sqlite_usize(value: usize, label: &str) -> Result<i64, NativeCatalogDiagnostic> {
-    i64::try_from(value)
-        .map_err(|_| resource_diagnostic("<native catalog>", label, i64::MAX as usize, value))
+    i64::try_from(value).map_err(|_| {
+        resource_diagnostic(
+            "<native catalog>",
+            label,
+            usize::try_from(i64::MAX).unwrap_or(usize::MAX),
+            value,
+        )
+    })
 }
 
 fn validate_typed_catalog(
@@ -2387,7 +2417,7 @@ fn validate_typed_arguments(
             ));
         }
         optional_seen |= !argument.required;
-        if argument.repeatable && index + 1 != arguments.len() {
+        if argument.repeatable && index != arguments.len().saturating_sub(1) {
             return Err(validation_diagnostic(
                 "<native catalog>",
                 None,

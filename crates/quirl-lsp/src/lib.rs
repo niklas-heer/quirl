@@ -609,11 +609,11 @@ fn quirl_hover(catalog: &Catalog, text: &str, offset: usize) -> Option<Value> {
 }
 
 fn lua_signature(text: &str, offset: usize) -> Option<Value> {
-    let before = &text[..offset.min(text.len())];
+    let before = text.get(..offset.min(text.len()))?;
     let open = before.rfind('(')?;
     let name = token_before(before, open);
     let spec = HOST_API.iter().find(|spec| spec.path == name)?;
-    let active_parameter = before[open + 1..].matches(',').count();
+    let active_parameter = before.get(open.checked_add(1)?..)?.matches(',').count();
     Some(json!({
         "signatures": [{
             "label": host_signature(spec.path, spec.parameters, spec.returns),
@@ -714,10 +714,13 @@ fn offset_to_position(text: &str, offset: usize) -> Option<(usize, usize)> {
     if offset > text.len() || !text.is_char_boundary(offset) {
         return None;
     }
-    let before = &text[..offset];
+    let before = text.get(..offset)?;
     let line = before.bytes().filter(|byte| *byte == b'\n').count();
-    let line_start = before.rfind('\n').map(|index| index + 1).unwrap_or(0);
-    let character = text[line_start..offset].encode_utf16().count();
+    let line_start = before
+        .rfind('\n')
+        .and_then(|index| index.checked_add(1))
+        .unwrap_or(0);
+    let character = text.get(line_start..offset)?.encode_utf16().count();
     Some((line, character))
 }
 
@@ -732,17 +735,23 @@ fn position_to_offset(
         if ch == '\n' {
             if line == target_line {
                 return character_to_offset(
-                    &text[line_start..offset],
+                    text.get(line_start..offset)
+                        .ok_or_else(|| invalid_params("line offsets are not UTF-8 boundaries"))?,
                     line_start,
                     target_character,
                 );
             }
-            line += 1;
-            line_start = offset + 1;
+            line = line.saturating_add(1);
+            line_start = offset.saturating_add(1);
         }
     }
     if line == target_line {
-        character_to_offset(&text[line_start..], line_start, target_character)
+        character_to_offset(
+            text.get(line_start..)
+                .ok_or_else(|| invalid_params("line start is not a UTF-8 boundary"))?,
+            line_start,
+            target_character,
+        )
     } else {
         Err(invalid_params(
             "position line is past the end of the document",
@@ -758,9 +767,13 @@ fn character_to_offset(
     let mut character = 0;
     for (offset, ch) in line.char_indices() {
         if character == target_character {
-            return Ok(line_start + offset);
+            return line_start
+                .checked_add(offset)
+                .ok_or_else(|| invalid_params("position offset overflowed"));
         }
-        let next_character = character + ch.len_utf16();
+        let next_character = character
+            .checked_add(ch.len_utf16())
+            .ok_or_else(|| invalid_params("UTF-16 position overflowed"))?;
         if target_character < next_character {
             return Err(invalid_params(
                 "position character splits a UTF-16 surrogate pair",
@@ -769,7 +782,9 @@ fn character_to_offset(
         character = next_character;
     }
     if character == target_character {
-        Ok(line_start + line.len())
+        line_start
+            .checked_add(line.len())
+            .ok_or_else(|| invalid_params("position offset overflowed"))
     } else {
         Err(invalid_params(
             "position character is past the end of the line",
@@ -781,31 +796,37 @@ fn token_at(text: &str, offset: usize) -> (usize, usize, &str) {
     let offset = offset.min(text.len());
     let mut start = offset;
     let mut end = offset;
-    while let Some(ch) = text[..start].chars().next_back() {
+    while let Some(ch) = text
+        .get(..start)
+        .and_then(|prefix| prefix.chars().next_back())
+    {
         if !token_char(ch) {
             break;
         }
-        start -= ch.len_utf8();
+        start = start.saturating_sub(ch.len_utf8());
     }
-    while let Some(ch) = text[end..].chars().next() {
+    while let Some(ch) = text.get(end..).and_then(|suffix| suffix.chars().next()) {
         if !token_char(ch) {
             break;
         }
-        end += ch.len_utf8();
+        end = end.saturating_add(ch.len_utf8());
     }
-    (start, end, &text[start..end])
+    (start, end, text.get(start..end).unwrap_or_default())
 }
 
 fn token_before(text: &str, offset: usize) -> &str {
     let offset = offset.min(text.len());
     let mut start = offset;
-    while let Some(ch) = text[..start].chars().next_back() {
+    while let Some(ch) = text
+        .get(..start)
+        .and_then(|prefix| prefix.chars().next_back())
+    {
         if !token_char(ch) {
             break;
         }
-        start -= ch.len_utf8();
+        start = start.saturating_sub(ch.len_utf8());
     }
-    &text[start..offset]
+    text.get(start..offset).unwrap_or_default()
 }
 
 fn token_char(ch: char) -> bool {
@@ -814,24 +835,30 @@ fn token_char(ch: char) -> bool {
 
 fn current_line(text: &str, offset: usize) -> &str {
     let offset = offset.min(text.len());
-    let start = text[..offset]
+    let start = text
+        .get(..offset)
+        .unwrap_or_default()
         .rfind('\n')
-        .map(|index| index + 1)
+        .and_then(|index| index.checked_add(1))
         .unwrap_or(0);
-    let end = text[offset..]
+    let end = text
+        .get(offset..)
+        .unwrap_or_default()
         .find('\n')
-        .map(|index| offset + index)
+        .and_then(|index| offset.checked_add(index))
         .unwrap_or(text.len());
-    &text[start..end]
+    text.get(start..end).unwrap_or_default()
 }
 
 fn current_line_before(text: &str, offset: usize) -> &str {
     let offset = offset.min(text.len());
-    let start = text[..offset]
+    let start = text
+        .get(..offset)
+        .unwrap_or_default()
         .rfind('\n')
-        .map(|index| index + 1)
+        .and_then(|index| index.checked_add(1))
         .unwrap_or(0);
-    &text[start..offset]
+    text.get(start..offset).unwrap_or_default()
 }
 
 fn is_lua(uri: &str, document: &Document) -> bool {
@@ -953,8 +980,10 @@ fn retained_accounting_error() -> ShellError {
 
 fn rpc_error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
     let mut error = json!({"code": code, "message": message});
-    if let Some(data) = data {
-        error["data"] = data;
+    if let Some(data) = data
+        && let Some(object) = error.as_object_mut()
+    {
+        object.insert("data".to_owned(), data);
     }
     json!({"jsonrpc": "2.0", "id": id, "error": error})
 }
@@ -1019,7 +1048,10 @@ fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, ShellErro
     let mut body = vec![0; length];
     let mut received = 0;
     while received < length {
-        match reader.read(&mut body[received..]) {
+        let remaining = body
+            .get_mut(received..)
+            .ok_or_else(|| protocol_error("message receive offset exceeded body length"))?;
+        match reader.read(remaining) {
             Ok(0) => {
                 return Err(protocol_error(
                     "unexpected end of input while reading the language-service message body",
@@ -1044,7 +1076,7 @@ fn read_header_line<R: BufRead>(
     let mut line = Vec::new();
     let read_limit = remaining.saturating_add(1);
     let read = reader
-        .take(read_limit as u64)
+        .take(u64::try_from(read_limit).unwrap_or(u64::MAX))
         .read_until(b'\n', &mut line)
         .map_err(io_error)?;
     if read == 0 {
@@ -1140,8 +1172,13 @@ mod tests {
         let expected = service
             .documents
             .iter()
-            .map(|(uri, document)| uri.len() + document.language_id.len() + document.text.len())
-            .sum::<usize>();
+            .try_fold(0_usize, |total, (uri, document)| {
+                total
+                    .checked_add(uri.len())
+                    .and_then(|total| total.checked_add(document.language_id.len()))
+                    .and_then(|total| total.checked_add(document.text.len()))
+            })
+            .unwrap();
         assert_eq!(service.retained_document_bytes, expected);
     }
 

@@ -36,7 +36,7 @@ pub(crate) fn resolve_natural_command_slots(
             escape_terminal_controls(slot.name()),
             slot.value_kind().name()
         )
-        .and_then(|_| writer.flush())
+        .and_then(|()| writer.flush())
         .map_err(slot_io_error)?;
         let Some(literal) = read_slot_literal(reader)? else {
             return Ok(false);
@@ -223,9 +223,9 @@ pub(crate) fn confirm_natural_command(
         .with_help("Choose a command with fewer or shorter arguments"));
     }
     writeln!(writer, "exact command preview:")
-        .and_then(|_| writeln!(writer, "{}", escape_terminal_controls(preview)))
-        .and_then(|_| write!(writer, "type `yes` to accept this generated command: "))
-        .and_then(|_| writer.flush())
+        .and_then(|()| writeln!(writer, "{}", escape_terminal_controls(preview)))
+        .and_then(|()| write!(writer, "type `yes` to accept this generated command: "))
+        .and_then(|()| writer.flush())
         .map_err(confirmation_io_error)?;
     if read_confirmation(reader)? != "yes" {
         return Ok(false);
@@ -243,7 +243,7 @@ pub(crate) fn confirm_natural_command(
             writeln!(writer, "- {}", reason.description()).map_err(confirmation_io_error)?;
         }
         write!(writer, "type `run high-risk` to confirm these effects: ")
-            .and_then(|_| writer.flush())
+            .and_then(|()| writer.flush())
             .map_err(confirmation_io_error)?;
         if read_confirmation(reader)? != "run high-risk" {
             return Ok(false);
@@ -273,7 +273,7 @@ fn read_slot_literal(reader: &mut impl Read) -> Result<Option<String>, ShellErro
             )
             .with_context(format!(
                 "limit: {COMMAND_PROPOSAL_VALUE_BYTES_MAX}; observed: at least {}",
-                bytes.len() + 1
+                bytes.len().saturating_add(1)
             ))
             .with_help("Enter a shorter literal value"));
         }
@@ -305,7 +305,7 @@ fn read_confirmation(reader: &mut impl Read) -> Result<String, ShellError> {
             )
             .with_context(format!(
                 "limit: {CONFIRMATION_BYTES_MAX}; observed: at least {}",
-                bytes.len() + 1
+                bytes.len().saturating_add(1)
             ))
             .with_help("Type exactly the short confirmation phrase shown in the prompt"));
         }

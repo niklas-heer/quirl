@@ -665,8 +665,12 @@ pub fn build_agent_context(
     }
     sort_context(&mut context);
     context.estimated_tokens = token_count_to_wire(estimate_payload_tokens(&context)?);
-    context.truncated =
-        content_truncated || context.commands.len() + context.host_api.len() < candidate_count;
+    context.truncated = content_truncated
+        || context
+            .commands
+            .len()
+            .saturating_add(context.host_api.len())
+            < candidate_count;
     Ok(context)
 }
 
@@ -913,16 +917,13 @@ fn relevance_score(query: &str, title: &str, summary: &str, details: &str) -> i3
         .split(|character: char| !character.is_alphanumeric())
         .filter(|term| !term.is_empty())
         .collect::<BTreeSet<_>>();
-    let exact = i32::from(title == query) * 10_000;
-    exact
-        + terms
-            .into_iter()
-            .map(|term| {
-                i32::from(title.contains(term)) * 400
-                    + i32::from(summary.contains(term)) * 100
-                    + i32::from(details.contains(term)) * 25
-            })
-            .sum::<i32>()
+    let exact = if title == query { 10_000_i32 } else { 0_i32 };
+    terms.into_iter().fold(exact, |score, term| {
+        score
+            .saturating_add(if title.contains(term) { 400 } else { 0 })
+            .saturating_add(if summary.contains(term) { 100 } else { 0 })
+            .saturating_add(if details.contains(term) { 25 } else { 0 })
+    })
 }
 
 fn sort_context(context: &mut AgentContext) {

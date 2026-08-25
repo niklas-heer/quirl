@@ -276,7 +276,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     let pty = measure_pty(
         &quirl,
         pty_samples,
-        Duration::from_millis(pty_timeout_ms as u64),
+        Duration::from_millis(u64::try_from(pty_timeout_ms).unwrap_or(u64::MAX)),
         rich_status_identity.as_deref(),
     );
     let cold = measure_cli_startup(&quirl, cold_samples)?;
@@ -510,6 +510,10 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "sample counts are bounded benchmark parameters validated before the loop"
+)]
 fn measure_pty(
     path: &Path,
     samples: usize,
@@ -579,6 +583,10 @@ fn editable_command_frame(screen: &str, rich_status_identity: Option<&str>) -> b
     prompt_is_visible && mode_is_visible && identity_is_visible
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "the captured prompt marker is ASCII and find returns a UTF-8 boundary"
+)]
 fn measure_pty_sample(
     path: &Path,
     fixture: &PtyFixture,
@@ -666,6 +674,10 @@ impl Drop for PtyFixture {
 }
 
 impl PtySession {
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "the PTY descriptor pair is populated by openpty before either fixed slot is read"
+    )]
     fn spawn(path: &Path, fixture: &PtyFixture) -> Result<Self, Box<dyn Error>> {
         let pair = native_pty_system().openpty(PtySize {
             rows: 40,
@@ -760,6 +772,10 @@ impl PtySession {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "poll counts are bounded by the benchmark deadline"
+    )]
     fn wait_for_stable_screen(
         &mut self,
         marker: &str,
@@ -803,6 +819,10 @@ impl PtySession {
         }
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "poll counts are bounded by the benchmark deadline"
+    )]
     fn wait_for_editable_command_frame(
         &mut self,
         rich_status_identity: Option<&str>,
@@ -867,6 +887,10 @@ impl PtySession {
         Ok(())
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "poll counts are bounded by the benchmark deadline"
+    )]
     fn wait_for_screen(
         &mut self,
         marker: &str,
@@ -916,6 +940,10 @@ impl PtySession {
         }
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "the cursor reply count is bounded by the captured PTY byte limit"
+    )]
     fn answer_cursor_queries(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         let previous_length = self.query_tail.len();
         self.query_tail.extend_from_slice(bytes);
@@ -1210,6 +1238,10 @@ fn semantic_highlight_proxy<'line>(
         .collect()
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "segment offsets are produced exclusively by char_indices"
+)]
 fn split_preserving_whitespace(input: &str) -> Vec<&str> {
     let mut segments = Vec::new();
     let mut start = 0;
@@ -1243,6 +1275,11 @@ fn timed(
     statistics(timings).ok_or_else(|| "sample counts must be greater than zero".into())
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "the timing vector is proven non-empty and sorted before bounded percentile indexing and averaging"
+)]
 fn statistics(mut timings: Vec<Duration>) -> Option<Statistics> {
     if timings.is_empty() {
         return None;
@@ -1257,6 +1294,11 @@ fn statistics(mut timings: Vec<Duration>) -> Option<Statistics> {
     })
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "callers pass a non-empty sorted sample and a percentile within zero through one hundred"
+)]
 fn nearest_rank(sorted: &[Duration], percentile: usize) -> Duration {
     let rank = percentile.saturating_mul(sorted.len()).div_ceil(100);
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
@@ -1665,10 +1707,14 @@ fn build_info_matches_harness_source(info: &QuirlBuildInfo) -> bool {
         && info.source_dirty == Some(false)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the checksum parser first validates the required digest token"
+)]
 fn binary_sha256(path: &Path) -> Option<String> {
     let mut file = fs::File::open(path).ok()?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer).ok()?;
         if read == 0 {

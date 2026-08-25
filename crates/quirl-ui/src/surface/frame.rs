@@ -294,9 +294,12 @@ impl FrameModel<'_> {
         };
         let left_spans = if let Some(branch_start) = left.find("on ") {
             vec![
-                Span::styled(left[..branch_start].to_owned(), self.theme.context()),
                 Span::styled(
-                    left[branch_start..].to_owned(),
+                    left.get(..branch_start).unwrap_or_default().to_owned(),
+                    self.theme.context(),
+                ),
+                Span::styled(
+                    left.get(branch_start..).unwrap_or_default().to_owned(),
                     self.theme.context_secondary(),
                 ),
             ]
@@ -353,10 +356,18 @@ impl FrameModel<'_> {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "line offsets accumulate disjoint substrings of one bounded editor buffer"
+    )]
     fn input_render(&self, width: usize) -> InputRender {
         let mut lines = Vec::new();
         let mut offset = 0_usize;
-        let cursor_line = self.editor.buffer()[..self.editor.cursor()]
+        let cursor_line = self
+            .editor
+            .buffer()
+            .get(..self.editor.cursor())
+            .unwrap_or_default()
             .bytes()
             .filter(|byte| *byte == b'\n')
             .count();
@@ -794,7 +805,12 @@ fn horizontal_viewport(
     let desired_left_width = available_width.saturating_mul(2) / 3;
     let mut start = cursor;
     let mut used_left = 0_usize;
-    for (index, grapheme) in value[..cursor].grapheme_indices(true).rev() {
+    for (index, grapheme) in value
+        .get(..cursor)
+        .unwrap_or_default()
+        .grapheme_indices(true)
+        .rev()
+    {
         let grapheme_width = escaped_width(grapheme);
         if used_left.saturating_add(grapheme_width) > desired_left_width {
             break;
@@ -805,7 +821,11 @@ fn horizontal_viewport(
 
     let mut end = start;
     let mut used = 0_usize;
-    for (offset, grapheme) in value[start..].grapheme_indices(true) {
+    for (offset, grapheme) in value
+        .get(start..)
+        .unwrap_or_default()
+        .grapheme_indices(true)
+    {
         let grapheme_width = escaped_width(grapheme);
         if used.saturating_add(grapheme_width) > available_width {
             break;
@@ -836,7 +856,7 @@ fn diagnostic_glyph(severity: DiagnosticSeverity, symbols: SurfaceSymbols) -> &'
 }
 
 fn cursor_visual_position(value: &str, cursor: usize) -> (usize, usize) {
-    let prefix = &value[..cursor.min(value.len())];
+    let prefix = value.get(..cursor.min(value.len())).unwrap_or_default();
     let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
     let column_text = prefix.rsplit_once('\n').map_or(prefix, |(_, tail)| tail);
     let escaped_column = escape_terminal_controls(column_text);

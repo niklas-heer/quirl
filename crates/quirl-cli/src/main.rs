@@ -327,7 +327,7 @@ fn main() -> ExitCode {
     }
     let wants_json = cli.wants_json();
     match run(cli) {
-        Ok(status) => ExitCode::from(status.clamp(0, 255) as u8),
+        Ok(status) => ExitCode::from(u8::try_from(status.clamp(0, 255)).unwrap_or(u8::MAX)),
         Err(error) if wants_json => {
             match serde_json::to_string_pretty(&error) {
                 Ok(json) => println!("{}", escape_json_terminal_controls(&json)),
@@ -467,7 +467,7 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
                     let json = serde_json::to_string_pretty(&completions).map_err(json_error)?;
                     println!("{}", escape_json_terminal_controls(&json));
                 }
-                _ => {
+                CompletionFormat::Text => {
                     for completion in completions {
                         println!(
                             "{:<28} {}",
@@ -1009,7 +1009,12 @@ fn execute_native_plan(
             None => executor.execute_capture_request(request)?,
         },
         ExecutionOutputTarget::Inherit => executor.execute_interactive_request(request)?,
-        ExecutionOutputTarget::Value => unreachable!("value output was rejected above"),
+        ExecutionOutputTarget::Value => {
+            return Err(representation_error(
+                plan,
+                "native commands cannot produce structured values",
+            ));
+        }
     };
     let mut normalized = ExecutionOutcome::from_command(outcome, plan.output())?;
     if executor
@@ -1116,7 +1121,13 @@ fn execute_reference_plan(
     let language = match plan.mode() {
         ExecutionMode::Bash => ScriptLanguage::Bash,
         ExecutionMode::Zsh => ScriptLanguage::Zsh,
-        _ => unreachable!("reference adapter received a non-reference mode"),
+        _ => {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "reference adapter received a non-reference execution mode",
+            )
+            .with_help("Report this execution-plan mismatch as a Quirl defect"));
+        }
     };
     let cancellation = script::ScriptCancellation::from_atomic(plan.cancellation().atomic());
     let outcome = script::run_interactive_island(script::InteractiveIslandRequest {
@@ -1130,7 +1141,10 @@ fn execute_reference_plan(
                 max_bytes_per_stream,
             } => max_bytes_per_stream,
             ExecutionOutputTarget::Inherit | ExecutionOutputTarget::Value => {
-                unreachable!("reference representation was validated above")
+                return Err(representation_error(
+                    plan,
+                    "explicit Bash/Zsh execution requires bounded byte capture",
+                ));
             }
         },
         cancellation: &cancellation,
@@ -1495,7 +1509,12 @@ fn execute_command_or_dialect_island_with_extensions(
             ScriptLanguage::Bash => ExecutionMode::Bash,
             ScriptLanguage::Zsh => ExecutionMode::Zsh,
             ScriptLanguage::Lua | ScriptLanguage::Quirl => {
-                unreachable!("interactive islands admit only Bash or Zsh")
+                return Err(ShellError::new(
+                    ErrorCode::Validation,
+                    "interactive dialect island selected a non-shell language",
+                )
+                .with_command(source)
+                .with_help("Use an explicit Bash or Zsh island"));
             }
         };
         let (mode, engine_source, source_name, target) = (
@@ -1558,10 +1577,13 @@ fn recovery_journal(
     if slot.is_none() {
         *slot = Some(recovery::RecoveryJournal::discover()?);
     }
-    match slot {
-        Some(journal) => Ok(journal),
-        None => unreachable!("recovery journal was inserted above"),
-    }
+    slot.as_ref().ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::Io,
+            "recovery journal initialization did not retain its owner",
+        )
+        .with_help("Restart Quirl and retry the recovery operation")
+    })
 }
 
 /// Recognize a deliberately tiny, explicit bridge form. The body is passed verbatim to the
@@ -1573,10 +1595,13 @@ fn interactive_dialect_island(source: &str) -> Option<(ScriptLanguage, &str)> {
             continue;
         };
         let rest = rest.trim_start();
-        if !rest.starts_with('{') || !rest.ends_with('}') {
+        let Some(body) = rest
+            .strip_prefix('{')
+            .and_then(|body| body.strip_suffix('}'))
+        else {
             continue;
-        }
-        return Some((language, rest[1..rest.len().saturating_sub(1)].trim()));
+        };
+        return Some((language, body.trim()));
     }
     None
 }
@@ -1745,7 +1770,7 @@ fn truncate_utf8_owned(mut value: String, bytes_max: usize) -> String {
     }
     let mut end = bytes_max;
     while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
+        end = end.saturating_sub(1);
     }
     value.truncate(end);
     value
@@ -1824,7 +1849,10 @@ impl Write for BoundedTranscriptWriter {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let remaining = INTERACTIVE_TRANSCRIPT_OUTPUT_BYTES_MAX.saturating_sub(self.bytes.len());
         let retained = remaining.min(buffer.len());
-        self.bytes.extend_from_slice(&buffer[..retained]);
+        let retained_bytes = buffer
+            .get(..retained)
+            .ok_or_else(|| io::Error::other("bounded transcript retained an invalid byte count"))?;
+        self.bytes.extend_from_slice(retained_bytes);
         self.discarded_bytes = self.discarded_bytes.saturating_add(
             u64::try_from(buffer.len().saturating_sub(retained)).unwrap_or(u64::MAX),
         );
@@ -1882,7 +1910,13 @@ fn render_interactive_data_output(
             Ok(stream_bytes)
         }
         DataOutput::Option(None) => write_interactive_data_bytes(b"none\n", cancelled, writer),
-        DataOutput::Option(Some(_)) => unreachable!("nested options were flattened above"),
+        DataOutput::Option(Some(_)) => {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "interactive data output retained an unflattened nested option",
+            )
+            .with_help("Report this data-output state as a Quirl defect"));
+        }
     }?);
     for _ in 0..option_depth {
         bytes = bytes.saturating_add(write_interactive_data_bytes(b")\n", cancelled, writer)?);
@@ -3727,7 +3761,7 @@ fn eval_lua(
 fn run_stdin() -> Result<i32, ShellError> {
     let mut bytes = Vec::new();
     io::stdin()
-        .take(MAX_LUA_SOURCE_BYTES.saturating_add(1) as u64)
+        .take(u64::try_from(MAX_LUA_SOURCE_BYTES.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)
         .map_err(|error| {
             ShellError::new(ErrorCode::Io, "could not read standard input")
@@ -4019,7 +4053,12 @@ mod tests {
         }
 
         fn bounded(&mut self, upper_exclusive: usize) -> usize {
-            usize::try_from(self.next() % u64::try_from(upper_exclusive).unwrap()).unwrap()
+            usize::try_from(
+                self.next()
+                    .checked_rem(u64::try_from(upper_exclusive).unwrap())
+                    .expect("generator bounds must be nonzero"),
+            )
+            .unwrap()
         }
 
         fn word(&mut self) -> String {
@@ -4484,7 +4523,7 @@ mod tests {
             let executable = match mode {
                 ExecutionMode::Bash => "bash",
                 ExecutionMode::Zsh => "zsh",
-                _ => unreachable!(),
+                _ => panic!("test iterates only reference-shell modes"),
             };
             if !shell_is_available(executable) {
                 continue;

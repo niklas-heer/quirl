@@ -526,16 +526,25 @@ pub fn parse_data_expression(
             "Add a data source before the first transform",
         )
     })?;
-    let source_node = parse_source(source, &tokens[first.clone()], limits, &mut nodes)?;
+    let first_tokens = tokens.get(first.clone()).ok_or_else(|| {
+        syntax_error(
+            "source stage range is outside the token stream",
+            token_range(&tokens),
+            "Report this parser state as a Quirl defect",
+        )
+    })?;
+    let source_node = parse_source(source, first_tokens, limits, &mut nodes)?;
     let mut transforms = Vec::with_capacity(stage_ranges.len().saturating_sub(1));
     for stage in stage_ranges.iter().skip(1) {
-        count_node(&mut nodes, limits, token_range(&tokens[stage.clone()]))?;
-        transforms.push(parse_transform(
-            source,
-            &tokens[stage.clone()],
-            limits,
-            &mut nodes,
-        )?);
+        let stage_tokens = tokens.get(stage.clone()).ok_or_else(|| {
+            syntax_error(
+                "transform stage range is outside the token stream",
+                token_range(&tokens),
+                "Report this parser state as a Quirl defect",
+            )
+        })?;
+        count_node(&mut nodes, limits, token_range(stage_tokens))?;
+        transforms.push(parse_transform(source, stage_tokens, limits, &mut nodes)?);
     }
     let expression_start = tokens.first().map_or(0, |token| token.span.start);
     let expression_end = tokens.last().map_or(0, |token| token.span.end);
@@ -576,7 +585,7 @@ pub fn highlight_data_expression(source: &str, limits: DataSyntaxLimits) -> Vec<
     let classified = tokens
         .iter()
         .map(|token| {
-            let text = &source[token.span.clone()];
+            let text = source.get(token.span.clone()).unwrap_or_default();
             let kind = match token.kind {
                 TokenKind::Quoted(_) => DataHighlightKind::String,
                 TokenKind::Pipe
@@ -629,36 +638,41 @@ fn lex(source: &str, limits: DataSyntaxLimits) -> Result<Vec<Token>, DataSyntaxD
     let bytes = source.as_bytes();
     let mut index = 0_usize;
     while index < bytes.len() {
-        if bytes[index].is_ascii_whitespace() {
-            index += 1;
+        let Some(current) = bytes.get(index).copied() else {
+            break;
+        };
+        if current.is_ascii_whitespace() {
+            index = index.saturating_add(1);
             continue;
         }
         let start = index;
         let depth = delimiters.len();
-        let kind = match bytes[index] {
+        let kind = match current {
             b'\'' | b'"' => {
-                let quote = bytes[index];
-                index += 1;
+                let quote = current;
+                index = index.saturating_add(1);
                 let mut escaped = false;
                 let mut closed = false;
                 while index < bytes.len() {
-                    let byte = bytes[index];
+                    let Some(byte) = bytes.get(index).copied() else {
+                        break;
+                    };
                     if escaped {
                         escaped = false;
-                        index += 1;
+                        index = index.saturating_add(1);
                         continue;
                     }
                     if byte == b'\\' {
                         escaped = true;
-                        index += 1;
+                        index = index.saturating_add(1);
                         continue;
                     }
                     if byte == quote {
-                        index += 1;
+                        index = index.saturating_add(1);
                         closed = true;
                         break;
                     }
-                    index += 1;
+                    index = index.saturating_add(1);
                 }
                 if !closed {
                     return Err(syntax_error(
@@ -674,73 +688,91 @@ fn lex(source: &str, limits: DataSyntaxLimits) -> Result<Vec<Token>, DataSyntaxD
                 })
             }
             b'[' | b'{' | b'(' => {
-                let opener = bytes[index];
+                let opener = current;
                 delimiters.push((opener, index));
                 if delimiters.len() > limits.nesting_depth_max {
                     return Err(limit_error(
                         "data expression exceeds the nesting depth limit",
-                        index..index + 1,
+                        index..index.saturating_add(1),
                         "nesting depth",
                         limits.nesting_depth_max,
                         delimiters.len(),
                     ));
                 }
-                index += 1;
+                index = index.saturating_add(1);
                 match opener {
                     b'[' => TokenKind::LeftBracket,
                     b'{' => TokenKind::LeftBrace,
                     b'(' => TokenKind::LeftParenthesis,
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(syntax_error(
+                            "invalid opening delimiter state",
+                            index..index.saturating_add(1),
+                            "Report this parser state as a Quirl defect",
+                        ));
+                    }
                 }
             }
             b']' | b'}' | b')' => {
-                let closer = bytes[index];
+                let closer = current;
                 let expected = match closer {
                     b']' => b'[',
                     b'}' => b'{',
                     b')' => b'(',
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(syntax_error(
+                            "invalid closing delimiter state",
+                            index..index.saturating_add(1),
+                            "Report this parser state as a Quirl defect",
+                        ));
+                    }
                 };
                 let Some((opener, _)) = delimiters.pop() else {
                     return Err(syntax_error(
                         "closing delimiter has no opener",
-                        index..index + 1,
+                        index..index.saturating_add(1),
                         "Remove the delimiter or add its matching opener",
                     ));
                 };
                 if opener != expected {
                     return Err(syntax_error(
                         "closing delimiter does not match its opener",
-                        index..index + 1,
+                        index..index.saturating_add(1),
                         "Use `]` for lists and `}` for records",
                     ));
                 }
-                index += 1;
+                index = index.saturating_add(1);
                 match closer {
                     b']' => TokenKind::RightBracket,
                     b'}' => TokenKind::RightBrace,
                     b')' => TokenKind::RightParenthesis,
-                    _ => unreachable!(),
+                    _ => {
+                        return Err(syntax_error(
+                            "invalid closing delimiter state",
+                            index..index.saturating_add(1),
+                            "Report this parser state as a Quirl defect",
+                        ));
+                    }
                 }
             }
             b':' => {
-                index += 1;
+                index = index.saturating_add(1);
                 TokenKind::Colon
             }
             b',' => {
-                index += 1;
+                index = index.saturating_add(1);
                 TokenKind::Comma
             }
             b'|' => {
-                index += 1;
+                index = index.saturating_add(1);
                 TokenKind::Pipe
             }
             b'=' | b'!' | b'<' | b'>' => {
-                let first = bytes[index];
-                index += 1;
+                let first = current;
+                index = index.saturating_add(1);
                 let has_equal = bytes.get(index) == Some(&b'=');
                 if has_equal {
-                    index += 1;
+                    index = index.saturating_add(1);
                 }
                 match (first, has_equal) {
                     (b'=', true) => TokenKind::Equal,
@@ -759,36 +791,38 @@ fn lex(source: &str, limits: DataSyntaxLimits) -> Result<Vec<Token>, DataSyntaxD
                 }
             }
             _ => {
-                while index < bytes.len()
-                    && !bytes[index].is_ascii_whitespace()
-                    && !matches!(
-                        bytes[index],
-                        b'\''
-                            | b'"'
-                            | b'['
-                            | b']'
-                            | b'{'
-                            | b'}'
-                            | b'('
-                            | b')'
-                            | b':'
-                            | b','
-                            | b'|'
-                            | b'='
-                            | b'!'
-                            | b'<'
-                            | b'>'
-                    )
-                {
-                    index += 1;
+                while bytes.get(index).is_some_and(|byte| {
+                    !byte.is_ascii_whitespace()
+                        && !matches!(
+                            byte,
+                            b'\''
+                                | b'"'
+                                | b'['
+                                | b']'
+                                | b'{'
+                                | b'}'
+                                | b'('
+                                | b')'
+                                | b':'
+                                | b','
+                                | b'|'
+                                | b'='
+                                | b'!'
+                                | b'<'
+                                | b'>'
+                        )
+                }) {
+                    index = index.saturating_add(1);
                 }
                 if index == start {
-                    let character_len = source[index..]
+                    let character_len = source
+                        .get(index..)
+                        .unwrap_or_default()
                         .chars()
                         .next()
                         .map(char::len_utf8)
                         .unwrap_or(1);
-                    index += character_len;
+                    index = index.saturating_add(character_len);
                 }
                 TokenKind::Bare
             }
@@ -821,7 +855,7 @@ fn lex(source: &str, limits: DataSyntaxLimits) -> Result<Vec<Token>, DataSyntaxD
     if let Some((_, start)) = delimiters.pop() {
         return Err(syntax_error(
             "data expression has an unclosed delimiter",
-            start..start + 1,
+            start..start.saturating_add(1),
             "Close every list with `]` and every record with `}`",
         ));
     }
@@ -844,7 +878,7 @@ fn stage_token_ranges(
                 ));
             }
             stages.push(start..index);
-            start = index + 1;
+            start = index.saturating_add(1);
         }
     }
     if start == tokens.len() {
@@ -867,7 +901,14 @@ fn parse_source(
 ) -> Result<Spanned<DataSource>, DataSyntaxDiagnostic> {
     let span = token_range(tokens);
     count_node(nodes, limits, span.clone())?;
-    let first = token_text(source, &tokens[0]);
+    let first_token = tokens.first().ok_or_else(|| {
+        syntax_error(
+            "source stage has no tokens",
+            span.clone(),
+            "Add a data source before the first transform",
+        )
+    })?;
+    let first = token_text(source, first_token);
     let value = match first {
         "pwd" if tokens.len() == 1 => DataSource::Pwd,
         "pwd" => {
@@ -890,9 +931,16 @@ fn parse_source(
             })?,
         },
         "^external" => {
-            let command_start = tokens[0].span.end;
+            let command_start = first_token.span.end;
             let command_end = span.end;
-            let raw = source[command_start..command_end].trim();
+            let untrimmed = source.get(command_start..command_end).ok_or_else(|| {
+                syntax_error(
+                    "external command span is outside the source",
+                    command_start..command_end,
+                    "Report this parser state as a Quirl defect",
+                )
+            })?;
+            let raw = untrimmed.trim();
             if raw.is_empty() {
                 return Err(usage_error(
                     span,
@@ -909,14 +957,12 @@ fn parse_source(
                     raw.len(),
                 ));
             }
-            let leading = source[command_start..command_end]
-                .len()
-                .saturating_sub(source[command_start..command_end].trim_start().len());
-            let start = command_start + leading;
+            let leading = untrimmed.len().saturating_sub(untrimmed.trim_start().len());
+            let start = command_start.saturating_add(leading);
             DataSource::External {
                 command: Spanned {
                     value: raw.to_owned(),
-                    span: start..start + raw.len(),
+                    span: start..start.saturating_add(raw.len()),
                 },
             }
         }
@@ -932,32 +978,61 @@ fn parse_transform(
     nodes: &mut usize,
 ) -> Result<Spanned<DataTransform>, DataSyntaxDiagnostic> {
     let span = token_range(tokens);
-    let command = token_text(source, &tokens[0]);
+    let command_token = tokens.first().ok_or_else(|| {
+        syntax_error(
+            "transform stage has no tokens",
+            span.clone(),
+            "Add a transform after the pipeline operator",
+        )
+    })?;
+    let command = token_text(source, command_token);
     let value = match command {
         "length" if tokens.len() == 1 => DataTransform::Length,
         "first" if tokens.len() == 1 => DataTransform::First,
         "lines" if tokens.len() == 1 => DataTransform::Lines,
         "get" if tokens.len() == 2 => DataTransform::Get {
-            path: decode_bare_name(source, &tokens[1], "get field path")?,
+            path: decode_bare_name(
+                source,
+                tokens.get(1).ok_or_else(|| {
+                    usage_error(
+                        span.clone(),
+                        "get requires a field path",
+                        "Use `get <field>`",
+                    )
+                })?,
+                "get field path",
+            )?,
         },
         "select" if tokens.len() >= 2 => {
-            let field_count = tokens.len() - 1;
+            let field_count = tokens.len().saturating_sub(1);
             check_field_count(field_count, limits, span.clone())?;
             DataTransform::Select {
-                fields: tokens[1..]
+                fields: tokens
+                    .get(1..)
+                    .unwrap_or_default()
                     .iter()
                     .map(|token| decode_bare_name(source, token, "select field"))
                     .collect::<Result<Vec<_>, _>>()?,
             }
         }
         "sort" if matches!(tokens.len(), 2 | 3) => {
-            let field = decode_bare_name(source, &tokens[1], "sort field path")?;
+            let field_token = tokens.get(1).ok_or_else(|| {
+                usage_error(
+                    span.clone(),
+                    "sort requires a field path",
+                    "Use `sort <field> [asc|desc]`",
+                )
+            })?;
+            let field = decode_bare_name(source, field_token, "sort field path")?;
             let direction = match tokens.get(2).map(|token| token_text(source, token)) {
                 None | Some("asc") => SortDirection::Ascending,
                 Some("desc") => SortDirection::Descending,
                 Some(_) => {
+                    let direction_span = tokens
+                        .get(2)
+                        .map_or_else(|| span.clone(), |token| token.span.clone());
                     return Err(usage_error(
-                        tokens[2].span.clone(),
+                        direction_span,
                         "sort direction must be `asc` or `desc`",
                         "Use `sort <field> [asc|desc]`",
                     ));
@@ -966,10 +1041,13 @@ fn parse_transform(
             DataTransform::Sort { field, direction }
         }
         "take" if tokens.len() == 2 => {
-            let text = token_text(source, &tokens[1]);
+            let count_token = tokens.get(1).ok_or_else(|| {
+                usage_error(span.clone(), "take requires a count", "Use `take <count>`")
+            })?;
+            let text = token_text(source, count_token);
             let count = text.parse::<u64>().map_err(|_| {
                 usage_error(
-                    tokens[1].span.clone(),
+                    count_token.span.clone(),
                     "take count must be a non-negative integer",
                     "Use `take <count>`",
                 )
@@ -977,19 +1055,31 @@ fn parse_transform(
             DataTransform::Take {
                 count: Spanned {
                     value: count,
-                    span: tokens[1].span.clone(),
+                    span: count_token.span.clone(),
                 },
             }
         }
-        "from" if tokens.len() == 2 && token_text(source, &tokens[1]) == "json" => {
+        "from"
+            if tokens.len() == 2
+                && tokens
+                    .get(1)
+                    .is_some_and(|token| token_text(source, token) == "json") =>
+        {
             DataTransform::FromJson
         }
-        "to" if tokens.len() == 2 && token_text(source, &tokens[1]) == "json" => {
+        "to" if tokens.len() == 2
+            && tokens
+                .get(1)
+                .is_some_and(|token| token_text(source, token) == "json") =>
+        {
             DataTransform::ToJson
         }
-        "where" if tokens.len() >= 4 => {
-            DataTransform::Where(parse_predicate(source, &tokens[1..], limits, nodes)?)
-        }
+        "where" if tokens.len() >= 4 => DataTransform::Where(parse_predicate(
+            source,
+            tokens.get(1..).unwrap_or_default(),
+            limits,
+            nodes,
+        )?),
         "where" => {
             return Err(usage_error(
                 span,
@@ -1019,7 +1109,7 @@ fn parse_transform(
             };
             return Err(syntax_error(
                 format!("unknown data transform `{command}`"),
-                tokens[0].span.clone(),
+                command_token.span.clone(),
                 help,
             ));
         }
@@ -1040,7 +1130,7 @@ fn nearest_transform_keyword(command: &str) -> Option<&'static str> {
     TRANSFORM_KEYWORDS
         .iter()
         .map(|&keyword| (keyword, levenshtein_distance(command, keyword)))
-        .filter(|&(keyword, distance)| distance <= 2 && distance * 2 <= keyword.len())
+        .filter(|&(keyword, distance)| distance <= 2 && distance.saturating_mul(2) <= keyword.len())
         .min_by_key(|&(_, distance)| distance)
         .map(|(keyword, _)| keyword)
 }
@@ -1050,18 +1140,36 @@ fn levenshtein_distance(left: &str, right: &str) -> usize {
     let left: Vec<char> = left.chars().collect();
     let right: Vec<char> = right.chars().collect();
     let mut previous_row: Vec<usize> = (0..=right.len()).collect();
-    let mut current_row = vec![0usize; right.len() + 1];
+    let mut current_row = vec![0usize; right.len().saturating_add(1)];
     for (left_index, &left_char) in left.iter().enumerate() {
-        current_row[0] = left_index + 1;
+        if let Some(first) = current_row.first_mut() {
+            *first = left_index.saturating_add(1);
+        }
         for (right_index, &right_char) in right.iter().enumerate() {
             let cost = usize::from(left_char != right_char);
-            current_row[right_index + 1] = (previous_row[right_index + 1] + 1)
-                .min(current_row[right_index] + 1)
-                .min(previous_row[right_index] + cost);
+            let column = right_index.saturating_add(1);
+            let deletion = previous_row
+                .get(column)
+                .copied()
+                .unwrap_or(usize::MAX)
+                .saturating_add(1);
+            let insertion = current_row
+                .get(right_index)
+                .copied()
+                .unwrap_or(usize::MAX)
+                .saturating_add(1);
+            let substitution = previous_row
+                .get(right_index)
+                .copied()
+                .unwrap_or(usize::MAX)
+                .saturating_add(cost);
+            if let Some(cell) = current_row.get_mut(column) {
+                *cell = deletion.min(insertion).min(substitution);
+            }
         }
         std::mem::swap(&mut previous_row, &mut current_row);
     }
-    previous_row[right.len()]
+    previous_row.last().copied().unwrap_or_default()
 }
 
 fn parse_predicate(
@@ -1090,17 +1198,27 @@ fn parse_predicate(
                 "Add `<field> <comparison> <value>` after the Boolean operator",
             ));
         }
+        let condition_end = index.saturating_add(3);
+        let Some([field_token, comparison_token, expected_token]) =
+            tokens.get(index..condition_end)
+        else {
+            return Err(usage_error(
+                token_range(tokens),
+                "where predicate ends before a complete comparison",
+                "Add `<field> <comparison> <value>` after the Boolean operator",
+            ));
+        };
         count_node(
             nodes,
             limits,
-            tokens[index].span.start..tokens[index + 2].span.end,
+            field_token.span.start..expected_token.span.end,
         )?;
-        let field = decode_bare_name(source, &tokens[index], "predicate field")?;
+        let field = decode_bare_name(source, field_token, "predicate field")?;
         let comparison = Spanned {
-            value: comparison_operator(&tokens[index + 1])?,
-            span: tokens[index + 1].span.clone(),
+            value: comparison_operator(comparison_token)?,
+            span: comparison_token.span.clone(),
         };
-        let expected = parse_predicate_literal(source, &tokens[index + 2], limits, nodes)?;
+        let expected = parse_predicate_literal(source, expected_token, limits, nodes)?;
         check_field_count(
             conditions.len().saturating_add(1),
             limits,
@@ -1111,11 +1229,17 @@ fn parse_predicate(
             comparison,
             expected,
         });
-        index += 3;
+        index = index.saturating_add(3);
         if index == tokens.len() {
             break;
         }
-        let operator_token = &tokens[index];
+        let operator_token = tokens.get(index).ok_or_else(|| {
+            usage_error(
+                token_range(tokens),
+                "where predicate has no Boolean operator",
+                "Use `and` or `or` between complete comparisons",
+            )
+        })?;
         let operator = match token_text(source, operator_token) {
             "and" => BooleanOperator::And,
             "or" => BooleanOperator::Or,
@@ -1131,7 +1255,7 @@ fn parse_predicate(
             value: operator,
             span: operator_token.span.clone(),
         });
-        index += 1;
+        index = index.saturating_add(1);
     }
     Ok(DataPredicate {
         conditions,
@@ -1247,13 +1371,21 @@ fn parse_literal(
             } else if root.replace(value).is_some() {
                 return Err(syntax_error(
                     "literal contains trailing tokens",
-                    tokens[index.saturating_sub(1)].span.clone(),
+                    tokens
+                        .get(index.saturating_sub(1))
+                        .map_or_else(|| token_range(tokens), |token| token.span.clone()),
                     "Keep exactly one JSON-compatible source value before the pipeline",
                 ));
             }
             continue;
         }
-        let token = &tokens[index];
+        let token = tokens.get(index).ok_or_else(|| {
+            syntax_error(
+                "literal cursor is outside the token stream",
+                token_range(tokens),
+                "Report this parser state as a Quirl defect",
+            )
+        })?;
         if let Some(frame) = stack.last_mut() {
             match frame {
                 LiteralFrame::List {
@@ -1273,7 +1405,7 @@ fn parse_literal(
                             let start = *start;
                             let values = std::mem::take(values);
                             stack.pop();
-                            index += 1;
+                            index = index.saturating_add(1);
                             completed = Some(SyntaxLiteral {
                                 kind: SyntaxLiteralKind::List(values),
                                 span: start..token.span.end,
@@ -1284,14 +1416,14 @@ fn parse_literal(
                         match token.kind {
                             TokenKind::Comma => {
                                 *expecting_value = true;
-                                index += 1;
+                                index = index.saturating_add(1);
                                 continue;
                             }
                             TokenKind::RightBracket => {
                                 let start = *start;
                                 let values = std::mem::take(values);
                                 stack.pop();
-                                index += 1;
+                                index = index.saturating_add(1);
                                 completed = Some(SyntaxLiteral {
                                     kind: SyntaxLiteralKind::List(values),
                                     span: start..token.span.end,
@@ -1326,7 +1458,7 @@ fn parse_literal(
                             let start = *start;
                             let fields = std::mem::take(fields);
                             stack.pop();
-                            index += 1;
+                            index = index.saturating_add(1);
                             completed = Some(SyntaxLiteral {
                                 kind: SyntaxLiteralKind::Record(fields),
                                 span: start..token.span.end,
@@ -1358,7 +1490,7 @@ fn parse_literal(
                             span: token.span.clone(),
                         });
                         *state = RecordState::Colon;
-                        index += 1;
+                        index = index.saturating_add(1);
                         continue;
                     }
                     RecordState::Colon => {
@@ -1370,21 +1502,21 @@ fn parse_literal(
                             ));
                         }
                         *state = RecordState::Value;
-                        index += 1;
+                        index = index.saturating_add(1);
                         continue;
                     }
                     RecordState::Value => {}
                     RecordState::CommaOrEnd => match token.kind {
                         TokenKind::Comma => {
                             *state = RecordState::Name;
-                            index += 1;
+                            index = index.saturating_add(1);
                             continue;
                         }
                         TokenKind::RightBrace => {
                             let start = *start;
                             let fields = std::mem::take(fields);
                             stack.pop();
-                            index += 1;
+                            index = index.saturating_add(1);
                             completed = Some(SyntaxLiteral {
                                 kind: SyntaxLiteralKind::Record(fields),
                                 span: start..token.span.end,
@@ -1417,7 +1549,7 @@ fn parse_literal(
                     values: Vec::new(),
                     expecting_value: true,
                 });
-                index += 1;
+                index = index.saturating_add(1);
             }
             TokenKind::LeftBrace => {
                 stack.push(LiteralFrame::Record {
@@ -1426,14 +1558,14 @@ fn parse_literal(
                     state: RecordState::Name,
                     pending_name: None,
                 });
-                index += 1;
+                index = index.saturating_add(1);
             }
             TokenKind::Quoted(QuoteStyle::Double) => {
                 completed = Some(SyntaxLiteral {
                     kind: SyntaxLiteralKind::String(decode_quoted(source, token, true, limits)?),
                     span: token.span.clone(),
                 });
-                index += 1;
+                index = index.saturating_add(1);
             }
             TokenKind::Quoted(QuoteStyle::Single) => {
                 return Err(usage_error(
@@ -1460,7 +1592,7 @@ fn parse_literal(
                     kind,
                     span: token.span.clone(),
                 });
-                index += 1;
+                index = index.saturating_add(1);
             }
             _ => {
                 return Err(syntax_error(
@@ -1543,9 +1675,22 @@ fn decode_source_argument(
     required: bool,
     limits: DataSyntaxLimits,
 ) -> Result<Option<Spanned<String>>, DataSyntaxDiagnostic> {
-    let first_end = tokens[0].span.end;
+    let first_token = tokens.first().ok_or_else(|| {
+        syntax_error(
+            "source argument parser has no command token",
+            0..0,
+            "Report this parser state as a Quirl defect",
+        )
+    })?;
+    let first_end = first_token.span.end;
     let stage_end = tokens.last().map_or(first_end, |token| token.span.end);
-    let untrimmed = &source[first_end..stage_end];
+    let untrimmed = source.get(first_end..stage_end).ok_or_else(|| {
+        syntax_error(
+            "source argument span is outside the source",
+            first_end..stage_end,
+            "Report this parser state as a Quirl defect",
+        )
+    })?;
     let raw = untrimmed.trim();
     if raw.is_empty() {
         return if required {
@@ -1559,17 +1704,29 @@ fn decode_source_argument(
         };
     }
     let leading = untrimmed.len().saturating_sub(untrimmed.trim_start().len());
-    let start = first_end + leading;
-    let span = start..start + raw.len();
+    let start = first_end.saturating_add(leading);
+    let span = start..start.saturating_add(raw.len());
     if matches!(raw.as_bytes().first(), Some(b'\'' | b'"')) {
-        if tokens.len() != 2 || tokens[1].span != span {
+        let path_token = tokens.get(1);
+        if tokens.len() != 2 || path_token.is_none_or(|token| token.span != span) {
             return Err(usage_error(
                 span,
                 "source accepts exactly one path",
                 "Quote the complete path as one value",
             ));
         }
-        return decode_word(source, &tokens[1], limits).map(Some);
+        return decode_word(
+            source,
+            path_token.ok_or_else(|| {
+                usage_error(
+                    span.clone(),
+                    "source requires a path",
+                    "Add one path argument",
+                )
+            })?,
+            limits,
+        )
+        .map(Some);
     }
     if raw.chars().any(char::is_whitespace) {
         return Err(usage_error(
@@ -1642,7 +1799,10 @@ fn decode_quoted(
 }
 
 fn decode_shell_quoted(raw: &str, span: Range<usize>) -> Result<String, DataSyntaxDiagnostic> {
-    let mut characters = raw[1..raw.len().saturating_sub(1)].chars();
+    let mut characters = raw
+        .get(1..raw.len().saturating_sub(1))
+        .unwrap_or_default()
+        .chars();
     let mut output = String::new();
     while let Some(character) = characters.next() {
         if character != '\\' {
@@ -1703,7 +1863,7 @@ fn check_field_count(
 }
 
 fn token_text<'a>(source: &'a str, token: &Token) -> &'a str {
-    &source[token.span.clone()]
+    source.get(token.span.clone()).unwrap_or_default()
 }
 
 fn token_range(tokens: &[Token]) -> Range<usize> {
@@ -1733,7 +1893,11 @@ fn format_transform(transform: &DataTransform) -> String {
             for (index, condition) in predicate.conditions.iter().enumerate() {
                 if index > 0 {
                     output.push(' ');
-                    output.push_str(match predicate.operators[index - 1].value {
+                    let operator = predicate
+                        .operators
+                        .get(index.saturating_sub(1))
+                        .map_or(BooleanOperator::And, |operator| operator.value);
+                    output.push_str(match operator {
                         BooleanOperator::And => "and",
                         BooleanOperator::Or => "or",
                     });
@@ -1976,8 +2140,8 @@ mod tests {
         let source = r#"{"naïve": [1, 2, {"ok": true}]} | get naïve"#;
         let expression = parse(source).unwrap();
         assert_eq!(
-            &source[expression.source.span.clone()],
-            r#"{"naïve": [1, 2, {"ok": true}]}"#
+            source.get(expression.source.span.clone()),
+            Some(r#"{"naïve": [1, 2, {"ok": true}]}"#)
         );
         let DataSource::Literal(literal) = expression.source.value else {
             panic!("expected literal source");

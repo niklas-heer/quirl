@@ -156,7 +156,7 @@ fn read_bounded(mut reader: impl Read) -> Result<(Vec<u8>, bool), std::io::Error
         }
         let remaining = PROBE_OUTPUT_BYTES_MAX.saturating_sub(retained.len());
         let retained_now = remaining.min(read);
-        retained.extend_from_slice(&buffer[..retained_now]);
+        retained.extend_from_slice(buffer.get(..retained_now).unwrap_or_default());
         overflowed |= retained_now < read;
         if overflowed {
             // Closing the pipe lets the child observe overflow immediately.
@@ -268,8 +268,12 @@ fn parse_git_status(output: &str) -> Option<GitStatus> {
             status.stash = parse_count(value)?;
         } else if line.starts_with("1 ") || line.starts_with("2 ") {
             let state = line.as_bytes().get(2..4)?;
-            status.staged = status.staged.saturating_add(u16::from(state[0] != b'.'));
-            status.modified = status.modified.saturating_add(u16::from(state[1] != b'.'));
+            status.staged = status
+                .staged
+                .saturating_add(u16::from(state.first().copied()? != b'.'));
+            status.modified = status
+                .modified
+                .saturating_add(u16::from(state.get(1).copied()? != b'.'));
         } else if line.starts_with("u ") {
             status.conflicted = status.conflicted.saturating_add(1);
         } else if line.starts_with("? ") {

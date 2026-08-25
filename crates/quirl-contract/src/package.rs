@@ -819,7 +819,7 @@ fn parse_version(version: &str) -> Option<[u64; 3]> {
         return None;
     }
     for (index, part) in parts.into_iter().enumerate() {
-        parsed[index] = part.parse().ok()?;
+        *parsed.get_mut(index)? = part.parse().ok()?;
     }
     Some(parsed)
 }

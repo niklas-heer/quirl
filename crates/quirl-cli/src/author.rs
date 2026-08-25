@@ -545,9 +545,17 @@ fn write_new_file(
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|error| io_error("secure", path, error))?;
     let split = contents.len().div_ceil(2);
-    file.write_all(&contents[..split])
+    let first = contents.get(..split).ok_or_else(|| {
+        ShellError::new(ErrorCode::Io, "authoring write split exceeded its input")
+            .with_help("Report this internal bounded-write contract violation")
+    })?;
+    let second = contents.get(split..).ok_or_else(|| {
+        ShellError::new(ErrorCode::Io, "authoring write split exceeded its input")
+            .with_help("Report this internal bounded-write contract violation")
+    })?;
+    file.write_all(first)
         .and_then(|()| after_stage(CreateStage::PartialWrite))
-        .and_then(|()| file.write_all(&contents[split..]))
+        .and_then(|()| file.write_all(second))
         .and_then(|()| file.sync_all())
         .map_err(|error| io_error("write", path, error))?;
     validate_regular_output(path, Some(&file), 1)
@@ -736,7 +744,7 @@ fn create_directories(
             )
             .with_context(format!(
                 "limit: {DIRECTORY_DEPTH_MAX}; observed: at least {}",
-                missing.len() + 1
+                missing.len().saturating_add(1)
             ))
             .with_help("Choose a shallower authoring directory"));
         }
@@ -1285,14 +1293,14 @@ mod tests {
         atomic_write(&path, &vec![b'x'; DOCUMENT_OUTPUT_BYTES_MAX]).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().len(),
-            DOCUMENT_OUTPUT_BYTES_MAX as u64
+            u64::try_from(DOCUMENT_OUTPUT_BYTES_MAX).unwrap()
         );
 
         let error = atomic_write(&path, &vec![b'x'; DOCUMENT_OUTPUT_BYTES_MAX + 1]).unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert_eq!(
             fs::metadata(&path).unwrap().len(),
-            DOCUMENT_OUTPUT_BYTES_MAX as u64
+            u64::try_from(DOCUMENT_OUTPUT_BYTES_MAX).unwrap()
         );
         fs::remove_dir_all(directory).unwrap();
     }

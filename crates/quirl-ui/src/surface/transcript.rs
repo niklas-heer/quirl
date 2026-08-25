@@ -402,6 +402,10 @@ impl Transcript {
     }
 }
 
+#[allow(
+    clippy::string_slice,
+    reason = "the suffix start is advanced until Rust confirms it is a UTF-8 boundary"
+)]
 fn utf8_suffix(text: &str, retained_bytes_max: usize) -> (&str, usize) {
     let mut start = text.len().saturating_sub(retained_bytes_max);
     while start < text.len() && !text.is_char_boundary(start) {

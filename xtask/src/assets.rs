@@ -627,6 +627,10 @@ fn validate_record(
     Ok(())
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "notice lookup returns exactly one candidate before fixed-slot access"
+)]
 fn validate_notices(
     record: &AssetRecord,
     version: &str,
@@ -679,6 +683,10 @@ fn content_addressed_file(
     Ok(format!("{stem}-v{quirl_version}-{sha256}.{extension}"))
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "visited file counts are bounded by the release asset limit"
+)]
 fn collect_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     if !fs::symlink_metadata(root)?.file_type().is_dir() {
         return Err(input_error("asset manifest input must be a directory"));
@@ -720,6 +728,10 @@ fn collect_files(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     Ok(files)
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "the candidate count is validated as exactly one before access"
+)]
 fn unique_file_named<'a>(files: &'a [PathBuf], name: &str) -> Result<&'a Path, Box<dyn Error>> {
     let matching = files
         .iter()

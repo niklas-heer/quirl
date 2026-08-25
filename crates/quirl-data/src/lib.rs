@@ -401,12 +401,15 @@ impl DataStream {
                 if offset >= bytes.len() {
                     return Ok(None);
                 }
-                let remaining = &bytes[offset..];
+                let remaining = bytes.get(offset..).unwrap_or_default();
                 let (line, consumed) = match remaining.find('\n') {
-                    Some(index) => (&remaining[..index], index + 1),
+                    Some(index) => (
+                        remaining.get(..index).unwrap_or_default(),
+                        index.saturating_add(1),
+                    ),
                     None => (remaining, remaining.len()),
                 };
-                offset += consumed;
+                offset = offset.saturating_add(consumed);
                 Ok(Some(DataValue::String(
                     line.strip_suffix('\r').unwrap_or(line).to_owned(),
                 )))
@@ -469,7 +472,7 @@ impl DataStream {
                 }
                 let value = source.next(cancelled)?;
                 if value.is_some() {
-                    remaining -= 1;
+                    remaining = remaining.saturating_sub(1);
                 }
                 Ok(value)
             },
@@ -498,7 +501,7 @@ impl DataStream {
         let value = (self.pull)(cancelled)?;
         if let Some(value) = &value {
             validate_data_value(value, self.limits)?;
-            self.emitted += 1;
+            self.emitted = self.emitted.saturating_add(1);
         }
         Ok(value)
     }
@@ -1300,12 +1303,20 @@ impl<R: Read> Read for BoundedReader<R> {
             return Ok(0);
         }
         if self.consumed < self.limit {
-            let remaining = self.limit - self.consumed;
+            let remaining = self.limit.saturating_sub(self.consumed);
             let allowed = usize::try_from(remaining)
                 .unwrap_or(usize::MAX)
                 .min(buffer.len());
-            let read = self.inner.read(&mut buffer[..allowed])?;
-            self.consumed += u64::try_from(read).unwrap_or(u64::MAX);
+            let target = buffer.get_mut(..allowed).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "bounded read size exceeds the destination buffer",
+                )
+            })?;
+            let read = self.inner.read(target)?;
+            self.consumed = self
+                .consumed
+                .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
             return Ok(read);
         }
 
@@ -1545,7 +1556,9 @@ fn reject_yaml_references(contents: &str, path: &Path) -> Result<(), ShellError>
         let mut escaped = false;
         let mut index = 0_usize;
         while index < bytes.len() {
-            let byte = bytes[index];
+            let Some(byte) = bytes.get(index).copied() else {
+                break;
+            };
             if double_quoted {
                 if escaped {
                     escaped = false;
@@ -1554,18 +1567,18 @@ fn reject_yaml_references(contents: &str, path: &Path) -> Result<(), ShellError>
                 } else if byte == b'"' {
                     double_quoted = false;
                 }
-                index += 1;
+                index = index.saturating_add(1);
                 continue;
             }
             if single_quoted {
                 if byte == b'\'' {
-                    if bytes.get(index + 1) == Some(&b'\'') {
-                        index += 2;
+                    if bytes.get(index.saturating_add(1)) == Some(&b'\'') {
+                        index = index.saturating_add(2);
                         continue;
                     }
                     single_quoted = false;
                 }
-                index += 1;
+                index = index.saturating_add(1);
                 continue;
             }
             match byte {
@@ -1581,7 +1594,7 @@ fn reject_yaml_references(contents: &str, path: &Path) -> Result<(), ShellError>
                 b'&' | b'*'
                     if yaml_indicator_boundary(bytes.get(index.wrapping_sub(1)).copied())
                         && bytes
-                            .get(index + 1)
+                            .get(index.saturating_add(1))
                             .is_some_and(|next| !next.is_ascii_whitespace()) =>
                 {
                     let kind = if byte == b'&' { "anchor" } else { "alias" };
@@ -1600,7 +1613,7 @@ fn reject_yaml_references(contents: &str, path: &Path) -> Result<(), ShellError>
                 }
                 _ => {}
             }
-            index += 1;
+            index = index.saturating_add(1);
         }
         offset = offset.saturating_add(line.len());
     }
@@ -1649,7 +1662,7 @@ fn open_csv_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
     let display = path.display().to_string();
     let source_path = path.to_path_buf();
     let iterator = lines.enumerate().map(move |(index, line)| {
-        let line_number = index + 2;
+        let line_number = index.saturating_add(2);
         let line = line.map_err(|error| {
             bounded_text_io_error("read", &source_path, limits.max_file_bytes, error)
         })?;
@@ -1815,7 +1828,10 @@ fn open_tar_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
             let mut header = [0_u8; 512];
             let mut read = 0;
             while read < header.len() {
-                let count = reader.read(&mut header[read..]).map_err(|error| {
+                let target = header.get_mut(read..).ok_or_else(|| {
+                    tar_error_display(&display, "header read offset exceeds header bounds")
+                })?;
+                let count = reader.read(target).map_err(|error| {
                     bounded_io_error("read", &source_path, limits.max_file_bytes, error)
                 })?;
                 if count == 0 {
@@ -1825,7 +1841,7 @@ fn open_tar_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
                     }
                     return Err(tar_error_display(&display, "truncated header"));
                 }
-                read += count;
+                read = read.saturating_add(count);
             }
             if header.iter().all(|byte| *byte == 0) {
                 finished = true;
@@ -1876,19 +1892,22 @@ fn open_tar_stream(path: &Path, limits: DataLimits) -> Result<DataStream, ShellE
             let mut discard = [0_u8; 8192];
             while remaining > 0 {
                 check_cancelled(cancelled)?;
-                let wanted =
-                    usize::try_from(remaining.min(discard.len() as u64)).map_err(|_| {
-                        tar_error_display(&display, "entry size cannot be represented on this host")
-                    })?;
-                let count = reader.read(&mut discard[..wanted]).map_err(|error| {
+                let discard_len = u64::try_from(discard.len()).unwrap_or(u64::MAX);
+                let wanted = usize::try_from(remaining.min(discard_len)).map_err(|_| {
+                    tar_error_display(&display, "entry size cannot be represented on this host")
+                })?;
+                let target = discard.get_mut(..wanted).ok_or_else(|| {
+                    tar_error_display(&display, "payload read size exceeds discard buffer")
+                })?;
+                let count = reader.read(target).map_err(|error| {
                     bounded_io_error("read", &source_path, limits.max_file_bytes, error)
                 })?;
                 if count == 0 {
                     return Err(tar_error_display(&display, "entry payload is truncated"));
                 }
-                remaining -= u64::try_from(count).map_err(|_| {
+                remaining = remaining.saturating_sub(u64::try_from(count).map_err(|_| {
                     tar_error_display(&display, "read size cannot be represented on this host")
-                })?;
+                })?);
             }
             Ok(Some(DataValue::Record(IndexMap::from([
                 ("kind".to_owned(), DataValue::String(kind.to_owned())),
@@ -1928,7 +1947,7 @@ fn tar_text(bytes: &[u8], display: &str, field: &str) -> Result<String, ShellErr
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(bytes.len());
-    std::str::from_utf8(&bytes[..end])
+    std::str::from_utf8(bytes.get(..end).unwrap_or_default())
         .map(str::to_owned)
         .map_err(|_| tar_error_display(display, format!("{field} is not valid UTF-8")))
 }
@@ -2130,7 +2149,7 @@ fn write_typed_json_envelope(
                 }
                 stack.push(EnvelopeJsonFrame::Stream {
                     items,
-                    index: index + 1,
+                    index: index.saturating_add(1),
                 });
                 write_typed_json_value(writer, value)?;
             }
@@ -2234,7 +2253,7 @@ fn write_typed_json_value(writer: &mut impl Write, value: &DataValue) -> Result<
                 }
                 stack.push(TypedJsonFrame::List {
                     values,
-                    index: index + 1,
+                    index: index.saturating_add(1),
                 });
                 stack.push(TypedJsonFrame::Value(value));
             }
@@ -2280,7 +2299,10 @@ fn write_terminal_safe(writer: &mut impl Write, value: &str) -> Result<(), Shell
         if !escaped {
             continue;
         }
-        write_output(writer, &value.as_bytes()[safe_start..index])?;
+        write_output(
+            writer,
+            value.as_bytes().get(safe_start..index).unwrap_or_default(),
+        )?;
         for escaped_character in character.escape_default() {
             let mut encoded = [0_u8; 4];
             write_output(
@@ -2288,9 +2310,12 @@ fn write_terminal_safe(writer: &mut impl Write, value: &str) -> Result<(), Shell
                 escaped_character.encode_utf8(&mut encoded).as_bytes(),
             )?;
         }
-        safe_start = index + character.len_utf8();
+        safe_start = index.saturating_add(character.len_utf8());
     }
-    write_output(writer, &value.as_bytes()[safe_start..])
+    write_output(
+        writer,
+        value.as_bytes().get(safe_start..).unwrap_or_default(),
+    )
 }
 
 fn write_plain_data_value(
@@ -2382,7 +2407,7 @@ fn write_json_compatible_value(
                 }
                 stack.push(JsonCompatibleFrame::List {
                     values,
-                    index: index + 1,
+                    index: index.saturating_add(1),
                 });
                 stack.push(JsonCompatibleFrame::Value(value));
             }
@@ -2422,16 +2447,22 @@ fn write_json_string(writer: &mut impl Write, value: &str) -> Result<(), ShellEr
             character if character.is_control() => None,
             _ => continue,
         };
-        write_output(writer, &value.as_bytes()[safe_start..index])?;
+        write_output(
+            writer,
+            value.as_bytes().get(safe_start..index).unwrap_or_default(),
+        )?;
         if let Some(escape) = escape {
             write_output(writer, escape.as_bytes())?;
         } else {
             let code = u32::from(character);
             write_output(writer, format!("\\u{code:04x}").as_bytes())?;
         }
-        safe_start = index + character.len_utf8();
+        safe_start = index.saturating_add(character.len_utf8());
     }
-    write_output(writer, &value.as_bytes()[safe_start..])?;
+    write_output(
+        writer,
+        value.as_bytes().get(safe_start..).unwrap_or_default(),
+    )?;
     write_output(writer, b"\"")
 }
 
@@ -3344,7 +3375,7 @@ mod tests {
         let mut header = [0_u8; 512];
         header[..name.len()].copy_from_slice(name.as_bytes());
         let size = format!("{:011o}\0", contents.len());
-        header[124..124 + size.len()].copy_from_slice(size.as_bytes());
+        header[124..124_usize.saturating_add(size.len())].copy_from_slice(size.as_bytes());
         header[156] = b'0';
         header[148..156].fill(b' ');
         let checksum = header.iter().map(|byte| u64::from(*byte)).sum::<u64>();
@@ -3352,7 +3383,10 @@ mod tests {
         header[148..156].copy_from_slice(checksum.as_bytes());
         let mut archive = header.to_vec();
         archive.extend_from_slice(contents);
-        archive.resize(512 + contents.len().div_ceil(512) * 512, 0);
+        archive.resize(
+            512_usize.saturating_add(contents.len().div_ceil(512).saturating_mul(512)),
+            0,
+        );
         archive
     }
 
@@ -3374,7 +3408,7 @@ mod tests {
 
     impl Write for CancelAfterFirstWrite<'_> {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.writes += 1;
+            self.writes = self.writes.saturating_add(1);
             self.output.extend_from_slice(buffer);
             if self.writes == 1 {
                 self.cancelled.store(true, AtomicOrdering::Relaxed);

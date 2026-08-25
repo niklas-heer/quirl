@@ -1278,7 +1278,11 @@ fn execute_operation(
         .as_ref()
         .ok_or_else(|| protocol_violation("Lua worker request preceded initialization"))?;
     let value = match operation {
-        Operation::Initialize { .. } => unreachable!(),
+        Operation::Initialize { .. } => {
+            return Err(protocol_violation(
+                "Lua worker received duplicate initialization",
+            ));
+        }
         Operation::Eval { source } => encode_value(runtime.eval(&source)?)?,
         Operation::Check {
             source,
@@ -1571,6 +1575,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(
+        clippy::exit,
+        reason = "the subprocess test entrypoint must emit exact worker exit statuses"
+    )]
     fn worker_entrypoint() {
         if std::env::var_os(TEST_WORKER_ENV).is_none() {
             return;

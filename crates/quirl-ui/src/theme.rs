@@ -27,7 +27,10 @@ impl Rgb {
             return Err(invalid_theme_color(field, value));
         }
         let parse_component = |range: std::ops::Range<usize>| {
-            u8::from_str_radix(&hex[range], 16).map_err(|_| invalid_theme_color(field, value))
+            let component = hex
+                .get(range)
+                .ok_or_else(|| invalid_theme_color(field, value))?;
+            u8::from_str_radix(component, 16).map_err(|_| invalid_theme_color(field, value))
         };
         Ok(Self::new(
             parse_component(0..2)?,

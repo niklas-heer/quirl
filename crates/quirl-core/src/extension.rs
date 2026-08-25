@@ -536,7 +536,7 @@ pub fn escape_json_terminal_controls(serialized: &str) -> String {
     let mut rendered = String::with_capacity(serialized.len());
     for character in serialized.chars() {
         if character.is_control() && !matches!(character, '\n' | '\t') {
-            rendered.push_str(&format!("\\u{:04x}", character as u32));
+            rendered.push_str(&format!("\\u{:04x}", u32::from(character)));
         } else {
             rendered.push(character);
         }
@@ -775,7 +775,7 @@ mod tests {
         let mut exact = Value::Array(vec![Value::Null; JSON_TERMINAL_VALUE_NODES_MAX - 1]);
         reject_json_terminal_controls("contribution", &exact).unwrap();
         let Value::Array(values) = &mut exact else {
-            unreachable!("the test constructs an array")
+            panic!("the test constructs an array")
         };
         values.push(Value::Null);
         let excess = exact;

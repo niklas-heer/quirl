@@ -144,7 +144,10 @@ impl HistoryDatabase {
             .map_err(history_sql_error)?;
         let rows = statement
             .query_map(
-                params![HISTORY_SNAPSHOT_MAX as i64, mode.to_string()],
+                params![
+                    i64::try_from(HISTORY_SNAPSHOT_MAX).unwrap_or(i64::MAX),
+                    mode.to_string()
+                ],
                 |row| {
                     let command_line: String = row.get(0)?;
                     let directory: String = row.get(1)?;
@@ -237,9 +240,10 @@ fn prune_history(transaction: &rusqlite::Transaction<'_>) -> Result<(), ShellErr
         )
         .map_err(history_sql_error)?;
     let rows = statement
-        .query_map([HISTORY_ROWS_MAX.saturating_add(1) as i64], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-        })
+        .query_map(
+            [i64::try_from(HISTORY_ROWS_MAX.saturating_add(1)).unwrap_or(i64::MAX)],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
         .map_err(history_sql_error)?;
     let mut retained_bytes = 0_usize;
     let mut minimum_id = None;

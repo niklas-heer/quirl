@@ -928,7 +928,9 @@ impl LuaExtensionHost {
                         && refresh.request_id == self.prompt_request_id =>
                 {
                     let index = result.plugin_index;
-                    refresh.results[index] = Some(result);
+                    if let Some(slot) = refresh.results.get_mut(index) {
+                        *slot = Some(result);
+                    }
                 }
                 Ok(_) => {}
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -957,7 +959,9 @@ impl LuaExtensionHost {
             match result.invocation {
                 ScheduledInvocation::Finished(Ok(segments)) if !callback_failed => {
                     if self.prompt_cache_accepts(result.plugin_index, &segments) {
-                        self.prompt_cache[result.plugin_index] = segments;
+                        if let Some(slot) = self.prompt_cache.get_mut(result.plugin_index) {
+                            *slot = segments;
+                        }
                     } else {
                         self.record_error(
                             ShellError::new(
@@ -1178,7 +1182,9 @@ impl LuaExtensionHost {
                         && refresh.request_id == self.panel_request_id =>
                 {
                     let index = result.plugin_index;
-                    refresh.results[index] = Some(result);
+                    if let Some(slot) = refresh.results.get_mut(index) {
+                        *slot = Some(result);
+                    }
                 }
                 Ok(_) => {}
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
@@ -1208,8 +1214,10 @@ impl LuaExtensionHost {
             match result.invocation {
                 ScheduledInvocation::Finished(Ok(panels)) if !callback_failed => {
                     if self.panel_cache_accepts(result.plugin_index, &panels) {
-                        changed |= self.panel_cache[result.plugin_index] != panels;
-                        self.panel_cache[result.plugin_index] = panels;
+                        if let Some(slot) = self.panel_cache.get_mut(result.plugin_index) {
+                            changed |= *slot != panels;
+                            *slot = panels;
+                        }
                     } else {
                         self.record_error(panel_cache_limit_error());
                     }
@@ -1287,13 +1295,15 @@ impl LuaExtensionHost {
             );
             return Vec::new();
         }
-        let before = &line[..position];
+        let before = line.get(..position).unwrap_or_default();
         let token_start = before
             .char_indices()
             .rev()
             .find(|(_, character)| character.is_whitespace())
-            .map_or(0, |(index, character)| index + character.len_utf8());
-        let query = &before[token_start..];
+            .map_or(0, |(index, character)| {
+                index.saturating_add(character.len_utf8())
+            });
+        let query = before.get(token_start..).unwrap_or_default();
         let context = json!({ "line": line, "cursor": position, "query": query });
         let mut suggestions = Vec::new();
         let started = Instant::now();
@@ -1674,9 +1684,11 @@ impl LuaExtensionHost {
             match receiver.recv_timeout(remaining) {
                 Ok(outcome) if outcome.plugin_index < outcomes.len() => {
                     let index = outcome.plugin_index;
-                    if outcomes[index].is_none() {
+                    if let Some(slot) = outcomes.get_mut(index)
+                        && slot.is_none()
+                    {
                         completed_plugins = completed_plugins.saturating_add(1);
-                        outcomes[index] = Some(outcome);
+                        *slot = Some(outcome);
                     }
                 }
                 Ok(_) => {}
@@ -2175,11 +2187,13 @@ fn bind_plugin_invocation(
     let Some((path_words, command)) = matched else {
         return Ok(None);
     };
-    let simple = parsed.pipelines.len() == 1
-        && parsed.connectors.is_empty()
-        && parsed.pipelines[0].commands.len() == 1
-        && !parsed.pipelines[0].background
-        && parsed.pipelines[0].commands[0].redirects.is_empty();
+    let simple = parsed.connectors.is_empty()
+        && matches!(
+            parsed.pipelines.as_slice(),
+            [pipeline]
+                if !pipeline.background
+                    && matches!(pipeline.commands.as_slice(), [command] if command.redirects.is_empty())
+        );
     if !simple {
         return Err(ShellError::new(
             ErrorCode::Validation,
@@ -2191,7 +2205,7 @@ fn bind_plugin_invocation(
         .with_command(source)
         .with_help("Remove byte pipes, redirects, backgrounding, and command-list operators"));
     }
-    let arguments = first_words[path_words..].to_vec();
+    let arguments = first_words.get(path_words..).unwrap_or_default().to_vec();
     validate_plugin_arguments(command, &arguments)?;
     Ok(Some(InstalledPluginCommand {
         command: command.clone(),
@@ -2212,7 +2226,9 @@ fn validate_plugin_arguments(
     let mut observed = BTreeMap::<String, usize>::new();
     let mut index = 0_usize;
     while index < arguments.len() {
-        let token = &arguments[index];
+        let Some(token) = arguments.get(index) else {
+            break;
+        };
         let (specification, consumed_value) = if token.starts_with('-') && token != "-" {
             let (name, inline_value) = token
                 .split_once('=')
@@ -2250,7 +2266,12 @@ fn validate_plugin_arguments(
                     };
                     (specification, Some(value))
                 }
-                ArgumentKind::Positional => unreachable!("named lookup excluded positionals"),
+                ArgumentKind::Positional => {
+                    return Err(plugin_argument_error(
+                        command,
+                        format!("named argument `{name}` resolved to a positional contract"),
+                    ));
+                }
             }
         } else {
             let specification = positionals.get(positional_index).copied().ok_or_else(|| {
@@ -2562,7 +2583,12 @@ fn validate_plugin_value(
             }
             StructuredValue::List(values) => {
                 validate_plugin_container_depth(description, depth)?;
-                stack.extend(values.iter().rev().map(|value| (value, depth + 1)));
+                stack.extend(
+                    values
+                        .iter()
+                        .rev()
+                        .map(|value| (value, depth.saturating_add(1))),
+                );
             }
             StructuredValue::Record(values) => {
                 validate_plugin_container_depth(description, depth)?;
@@ -2575,7 +2601,7 @@ fn validate_plugin_value(
                 )?;
                 for (key, value) in values.iter().rev() {
                     budget.text_bytes = budget.text_bytes.saturating_add(key.len());
-                    stack.push((value, depth + 1));
+                    stack.push((value, depth.saturating_add(1)));
                 }
             }
             StructuredValue::Nothing
@@ -2683,9 +2709,11 @@ fn validate_plugin_outcome(
             }
             Ok(())
         }
-        ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => {
-            unreachable!("the closed value output contract rejected byte-oriented output")
-        }
+        ExecutionOutput::Inherited | ExecutionOutput::Bytes { .. } => Err(ShellError::new(
+            ErrorCode::Validation,
+            "plugin returned byte-oriented output for a closed value contract",
+        )
+        .with_help("Return the structured value type declared by the plugin command")),
     }
 }
 
@@ -3329,7 +3357,7 @@ fn is_subsequence(query: &str, candidate: &str) -> bool {
 
 fn floor_char_boundary(value: &str, mut index: usize) -> usize {
     while !value.is_char_boundary(index) {
-        index -= 1;
+        index = index.saturating_sub(1);
     }
     index
 }
@@ -4920,7 +4948,7 @@ quirl.prompt.add_segment {
                 "contribution" => source.push_str(&format!(
                     "quirl.extension.contribute {{ kind = 'completion', name = '{prefix}-{index}', deadline_ms = 8, provide = function(_) return {{}} end }}\n"
                 )),
-                _ => unreachable!("test supplies a fixed registration kind"),
+                _ => panic!("test supplies a fixed registration kind"),
             }
         }
         source
