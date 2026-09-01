@@ -345,7 +345,7 @@ enum EditAction {
 | `Alt-Q`, then a mnemonic | Quirl leader for modes, pickers, jobs, and results | collision-free internal command namespace |
 | `Ctrl-Space` | Command/data mode toggle compatibility alias | some terminals cannot distinguish this from NUL |
 | `Ctrl-R` or `Up` | Cwd-aware fuzzy history | conventional history entrypoint |
-| `Alt-Q f/c/p/j/r` | Files / directory explorer / palette / jobs / results | Quirl leader namespace |
+| `Alt-Q f/c/p/j/r/e` | Files / directory explorer / palette / jobs / results / Environment Explorer | Quirl leader namespace; both explorers preserve the edit buffer, while only the directory explorer can commit `cd` |
 | `Ctrl-G` / `Alt-D` | Active jobs / cached typed-data picker | snapshots only; selection inserts a revalidated command or data expression |
 | `Ctrl-C` | Clear line, dismiss popup; never exits | |
 | `Ctrl-D` | EOF on empty line → exit | |
@@ -519,6 +519,34 @@ honoring `picker.layout`:
 - `adaptive` / `bottom`: inside the shared full-screen frame, max 10 result rows.
 - `full`: terminal-height picker using the same full-screen frame and RAII
   lifecycle as ordinary editing.
+
+`Alt-Q e` opens a dedicated full-screen Environment Explorer. Its source is the
+process executor's private, generation-tracked environment rather than the host
+process environment, so session exports and authorized extension updates appear
+at the next prompt. Wide terminals show Miller-style category, variable/path,
+and detail columns; narrower layouts collapse to the focused list plus details.
+Developer-oriented categories keep terminal integrations such as cmux, Ghostty,
+and Atuin separate from toolchains, project context, lookup paths, locale, and
+sensitive values. `PATH` sorts first in command lookup and drills through:
+
+```text
+Command lookup → PATH → ordered directory → executable
+```
+
+The executable view identifies the effective winner and every retained shadowed
+candidate. Its filesystem scan runs away from the input loop and enforces fixed
+bounds on directories, entries per directory, total commands, and retained name
+bytes. `/` filters only the focused column. `y` copies, `i` inserts a safe
+reference into the preserved command buffer, `v` reveals a selected secret, and
+`r` refreshes PATH. `w` enters a global resolved-command column: its rows name
+the winning PATH position and shadowed-candidate count, while details show the
+complete retained resolution order. Health rows show their concrete path and a
+remediation hint; accepting one focuses the exact affected PATH entry. The
+bounded PATH worker starts on explorer entry, so Health renders `scanning…`
+until one complete snapshot arrives, `clean` only after a complete zero-finding
+scan, and otherwise the final finding count. A masked secret must be revealed
+before copying. Inspection does not execute a candidate, modify the environment,
+or change the grammar mode.
 
 The shipped `Alt-Q p` command palette always requests a terminal-height
 region and positions its bounded adaptive content against the bottom edge. It

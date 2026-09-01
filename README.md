@@ -104,8 +104,16 @@ Inside an interactive session, <kbd>Tab</kbd> opens semantic completion,
 help, and <kbd>Ctrl-R</kbd> or <kbd>Up</kbd> searches cwd-aware history.
 <kbd>Alt-Q</kbd> opens Quirl's leader menu: then press <kbd>n</kbd>,
 <kbd>d</kbd>, or <kbd>i</kbd> for Normal, Data, or AI mode, or <kbd>f</kbd> for
-the file picker. AI mode searches local command knowledge as you type; Enter
-inserts the selected command into Normal mode for review and never executes it.
+the file picker. <kbd>Alt-Q e</kbd> opens the full-screen Environment Explorer:
+developer-oriented categories lead into variables, and `PATH` drills into its
+ordered directories, executables, winning resolutions, and shadowed commands.
+Use <kbd>/</kbd> to filter, <kbd>w</kbd> to resolve a command across all of
+`PATH`, <kbd>y</kbd> to copy, or <kbd>i</kbd> to insert a safe reference for
+review. A bounded health scan starts immediately; Health reads `scanning…`,
+`clean`, or the final finding count instead of treating unchecked state as zero.
+Findings explain the concrete PATH entry and jump directly to it. AI mode
+searches local command knowledge as you type;
+Enter inserts the selected command into Normal mode and never executes it.
 
 For requirements and a guided first session, see the website's
 [getting-started section](website/content/docs/getting-started/index.mdx).

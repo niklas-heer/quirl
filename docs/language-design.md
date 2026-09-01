@@ -129,6 +129,33 @@ Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unl
 
 > **Scripts never depend on invisible mode.** Interactive mode is session state. In native Quirl files, `data { ... }` and `command { ... }` make every grammar boundary explicit. Their opening and closing delimiters occupy their own lines, with the closing `}` aligned to the opener; commands inside a `command` block run one non-comment line at a time. The older one-line `data <expression>` and command form remains accepted for compatibility. Lua remains the general-purpose scripting language.
 
+`Alt-Q e` opens the full-screen **Environment Explorer**, a searchable,
+read-only UI mode over the private environment that Quirl will pass to future
+child processes. Its Miller-style navigation groups variables into developer
+categories such as project, toolchains, terminal sessions, shell/editor,
+locale, and secrets. Drilling into `PATH` shows its ordered directories and the
+executables retained from a bounded asynchronous scan, including the effective
+winner and shadowed candidates for each name. `/` filters the focused column;
+`w` opens a global command-resolution search equivalent to a visual, PATH-aware
+`which -a`, with the effective winner first and every retained shadowed
+candidate below it. Health findings show the concrete PATH value, a suggested
+remediation, and navigate directly to the affected directory. The bounded PATH
+audit starts when the explorer opens; Health remains explicitly `scanning…`
+until the complete snapshot is published, then becomes `clean` or shows the
+final finding count. `y` copies a
+selected value or path, while `i` inserts a variable reference, quoted
+directory, or exact winning executable path into the preserved editor buffer
+for review. Sensitive values are masked and cannot be copied until explicitly
+revealed with `v`. Inspection never runs an executable or mutates the session
+environment.
+
+The explorer does not introduce a fourth grammar: dismissing it preserves both
+the edit buffer and the active Normal, Data, or AI mode. Snapshots refresh after
+session `export` or extension environment updates and are bounded to 4,096
+variables, 1 MiB of terminal-safe retained text, and 6 KiB per displayed name
+or value. PATH discovery is separately bounded by directory, entry, command,
+and retained-name-byte limits and remains cancellable between filesystem calls.
+
 ```quirl
 data {
   [1, 2, 3] | length
@@ -579,7 +606,7 @@ The input buffer is parsed continuously, understands command schemas and annotat
 fzf proves fuzzy selection is a terminal primitive. Quirl includes a native, typed picker in the line editor and exposes the same engine to commands, scripts, and plugins. Users should not have to install a finder and wire shell-specific bindings merely to search history or files.
 
 - **Typed selection:** displays labels, highlights, metadata, and previews but returns the original value. Picking a `Process`, `Path`, history entry, or plugin record never round-trips through lossy display text.
-- **Shared muscle memory:** `Ctrl-R` or `Up` opens fuzzy history, `Alt-Q` owns Quirl-internal chords (`f` files, `c` Miller-column directory explorer, `p` actions, `j` jobs, `r` results), and `Shift-Tab` expands completion into the full picker. The directory explorer preserves unfinished input, previews syntax-highlighted source and bounded raster images, and commits `cd` only on Enter. Conventional shell editing chords remain available.
+- **Shared muscle memory:** `Ctrl-R` or `Up` opens fuzzy history, `Alt-Q` owns Quirl-internal chords (`f` files, `c` Miller-column directory explorer, `p` actions, `j` jobs, `r` results, `e` Environment Explorer), and `Shift-Tab` expands completion into the full picker. The directory explorer preserves unfinished input, previews syntax-highlighted source and bounded raster images, and commits `cd` only on Enter; the Environment Explorer remains read-only until an explicit copy or insert action. Conventional shell editing chords remain available.
 - **Interactive contract:** single/multi-select, exact/fuzzy/inverse terms, source switching, live reload, safe previews, named actions, cancellable/backpressured providers, and virtualized rendering.
 - **Script contract:** `pick` accepts byte lines or typed streams and emits selected values. `--query`, `--multi`, `--preview`, `--format`, and non-interactive fallback rules are testable.
 
