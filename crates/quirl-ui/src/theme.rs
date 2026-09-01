@@ -154,6 +154,10 @@ impl Theme {
         Self { color, ..self }
     }
 
+    pub(crate) const fn color_enabled(self) -> bool {
+        self.color
+    }
+
     pub(crate) fn accent(self, mode: Mode) -> RatatuiStyle {
         self.ratatui_foreground(self.accent_color(mode))
             .add_modifier(Modifier::BOLD)

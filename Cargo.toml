@@ -32,6 +32,9 @@ clap = { version = "4.5", features = ["derive"] }
 color-eyre = { version = "=0.6.5", default-features = false, features = ["track-caller"] }
 crossterm = "0.29"
 getrandom = "0.3"
+# Explorer image previews admit only four common raster formats and disable
+# encoders, parallelism, and high-cost formats such as AVIF, EXR, and TIFF.
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 indexmap = { version = "2.14", features = ["serde"] }
 # Source spans support inert diagnostics; legacy-v1 and fallback parsing stay disabled.
 kdl = { version = "6.5", default-features = false, features = ["span"] }
@@ -48,6 +51,9 @@ serde_yaml_ng = "0.10"
 sha2 = "0.10"
 signal-hook = "0.3"
 model2vec-rs = { version = "0.2.1", default-features = false, features = ["local-only", "onig"] }
+# Bundled syntax dumps avoid runtime discovery. Semantic scopes are mapped to
+# Quirl's active theme; the existing Oniguruma engine is reused by the CLI.
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "regex-onig"] }
 toml = "0.9"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"

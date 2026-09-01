@@ -137,6 +137,16 @@ impl EditorState {
         self.cursor
     }
 
+    pub fn restore(&mut self, buffer: String, cursor: usize) {
+        debug_assert!(buffer.len() <= MAX_EDITOR_BUFFER_BYTES);
+        self.buffer = buffer;
+        self.cursor = cursor.min(self.buffer.len());
+        while !self.buffer.is_char_boundary(self.cursor) {
+            self.cursor = self.cursor.saturating_sub(1);
+        }
+        self.revision = self.revision.saturating_add(1);
+    }
+
     /// Monotonically identifies the buffer contents for single-line analysis caches.
     pub const fn revision(&self) -> u64 {
         self.revision

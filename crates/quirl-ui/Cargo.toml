@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 crossterm.workspace = true
+image.workspace = true
 nu-ansi-term.workspace = true
 quirl-catalog = { path = "../quirl-catalog" }
 quirl-core = { path = "../quirl-core" }
@@ -22,5 +23,6 @@ ratatui.workspace = true
 reedline = { workspace = true, features = ["helix"] }
 serde.workspace = true
 serde_json.workspace = true
+syntect.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true

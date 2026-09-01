@@ -1,6 +1,7 @@
 pub(crate) mod completion;
 mod degrade;
 mod editor;
+mod explorer;
 mod frame;
 pub(crate) mod highlight;
 mod overlay;
@@ -42,6 +43,7 @@ pub struct InteractiveHistoryEntry {
 use self::{
     completion::{CompletionState, IntentCompletionState},
     editor::{EditAction, EditorState},
+    explorer::{DirectoryExplorer, ExplorerAction},
     frame::FrameModel,
     highlight::InputAnalyzer,
     overlay::{PickerLayout, PickerOverlay, contextual_help_query},
@@ -350,6 +352,15 @@ pub enum InteractiveSignal {
     CtrlD,
     /// Opaque command for the composition root rather than child-process execution.
     HostCommand(String),
+    /// A Miller-column session accepted a new working directory while preserving input.
+    ChangeDirectory {
+        /// Exact filesystem path selected by the user.
+        path: PathBuf,
+        /// Editor buffer to restore after the composition root commits the transition.
+        buffer: String,
+        /// UTF-8 byte cursor within `buffer`.
+        cursor: usize,
+    },
     /// The host should suspend the shell after performing platform job control.
     Suspend,
 }
@@ -367,6 +378,8 @@ pub struct RichSurface {
     catalog_admission: Option<CatalogAdmission>,
     completion: CompletionState,
     picker: PickerOverlay,
+    explorer: Option<DirectoryExplorer>,
+    pending_input: Option<(String, usize)>,
     picker_layout: PickerLayout,
     picker_preview: bool,
     expand_completion_pending: bool,
@@ -439,6 +452,8 @@ impl RichSurface {
         Ok(Self {
             completion: CompletionState::new(Arc::clone(&catalog), extension_completer),
             picker: PickerOverlay::new(picker_ranker),
+            explorer: None,
+            pending_input: None,
             picker_layout: PickerLayout::from_config(&config.picker.layout),
             picker_preview: config.picker.preview,
             expand_completion_pending: false,
@@ -506,6 +521,8 @@ impl RichSurface {
             catalog_admission: None,
             completion: CompletionState::unpublished(extension_completer),
             picker: PickerOverlay::new(picker_ranker),
+            explorer: None,
+            pending_input: None,
             picker_layout: PickerLayout::from_config(&config.picker.layout),
             picker_preview: config.picker.preview,
             expand_completion_pending: false,
@@ -747,9 +764,14 @@ impl RichSurface {
         };
         self.transcript_area =
             model.transcript_area(Rect::new(0, 0, terminal_width, terminal_height));
-        self.visible_screen =
-            self.terminal
-                .draw(&model, self.screen_selection, theme.selected(prompt.mode))?;
+        self.visible_screen = self.terminal.draw(
+            &model,
+            None,
+            prompt.mode,
+            symbols,
+            self.screen_selection,
+            theme.selected(prompt.mode),
+        )?;
         Ok(())
     }
 
@@ -882,6 +904,31 @@ impl RichSurface {
         self.history = history;
     }
 
+    /// Restore an editor buffer after a modal shell action completed between prompts.
+    pub fn restore_input(&mut self, buffer: String, cursor: usize) -> Result<(), ShellError> {
+        if buffer.len() > editor::MAX_EDITOR_BUFFER_BYTES {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "restored editor input exceeds the rich-surface buffer limit",
+            )
+            .with_context(format!(
+                "limit {} bytes; observed {} bytes",
+                editor::MAX_EDITOR_BUFFER_BYTES,
+                buffer.len()
+            ))
+            .with_help("Shorten the input before opening another modal action"));
+        }
+        if cursor > buffer.len() || !buffer.is_char_boundary(cursor) {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "restored editor cursor is not a UTF-8 boundary",
+            )
+            .with_help("Restart the interactive editor to discard the invalid saved cursor"));
+        }
+        self.pending_input = Some((buffer, cursor));
+        Ok(())
+    }
+
     /// Install the bounded local intent-search provider used by AI mode.
     pub fn set_intent_completer(&mut self, completer: Box<dyn ExtensionCompleter + Send>) {
         self.intent_completion.install(completer);
@@ -921,6 +968,9 @@ impl RichSurface {
                 .map(|entry| entry.command_line.clone())
                 .collect(),
         );
+        if let Some((buffer, cursor)) = self.pending_input.take() {
+            editor.restore(buffer, cursor);
+        }
         let symbols = prompt.surface_symbols();
         self.terminal.enter()?;
         let unicode = symbols.uses_unicode();
@@ -987,6 +1037,9 @@ impl RichSurface {
                 let started = Instant::now();
                 self.visible_screen = self.terminal.draw(
                     &model,
+                    self.explorer.as_ref(),
+                    prompt.mode,
+                    symbols,
                     self.screen_selection,
                     theme.selected(prompt.mode),
                 )?;
@@ -1049,6 +1102,10 @@ impl RichSurface {
                 Event::Paste(text) => {
                     self.output_notice = None;
                     self.return_to_tail_for_input();
+                    if let Some(explorer) = self.explorer.as_mut() {
+                        explorer.insert_query(&text);
+                        continue;
+                    }
                     if self.picker.active() {
                         self.update_picker_query(|picker| picker.insert_query(&text));
                         continue;
@@ -1077,6 +1134,27 @@ impl RichSurface {
                         continue;
                     }
                     self.output_notice = None;
+                    if self.explorer.is_some() {
+                        let action = self
+                            .explorer
+                            .as_mut()
+                            .map_or(ExplorerAction::Dismiss, |explorer| explorer.handle_key(key));
+                        match action {
+                            ExplorerAction::Pending => continue,
+                            ExplorerAction::Dismiss => {
+                                self.explorer = None;
+                                continue;
+                            }
+                            ExplorerAction::ChangeDirectory(path) => {
+                                self.explorer = None;
+                                return Ok(InteractiveSignal::ChangeDirectory {
+                                    path,
+                                    buffer: editor.buffer().to_owned(),
+                                    cursor: editor.cursor(),
+                                });
+                            }
+                        }
+                    }
                     if self.leader_active {
                         self.return_to_tail_for_input();
                         self.handle_leader_key(key.code, prompt, editor.buffer(), editor.cursor())?;
@@ -1355,7 +1433,7 @@ impl RichSurface {
             ("h", "History", "Search commands from every directory"),
             ("p", "Command palette", "Browse Quirl commands and help"),
             ("f", "Files", "Find a file in this directory"),
-            ("c", "Directories", "Find a directory"),
+            ("c", "Explorer", "Browse columns, preview, and jump"),
             ("j", "Jobs", "Inspect background jobs"),
             ("r", "Results", "Inspect recent typed data"),
             ("o", "Output", "Scroll and copy retained command output"),
@@ -1411,7 +1489,7 @@ impl RichSurface {
                 self.open_picker(editor::PickerKind::Files, line, cursor, "files")
             }
             KeyCode::Char('c') => {
-                self.open_picker(editor::PickerKind::Directories, line, cursor, "directories")
+                self.open_directory_explorer()?;
             }
             KeyCode::Char('j') => self.open_picker(editor::PickerKind::Jobs, line, cursor, "jobs"),
             KeyCode::Char('r') => {
@@ -1420,6 +1498,20 @@ impl RichSurface {
             KeyCode::Char('o') if self.transcript.line_count() > 0 => self.open_output_focus(),
             _ => {}
         }
+        Ok(())
+    }
+
+    fn open_directory_explorer(&mut self) -> Result<(), ShellError> {
+        let current_dir = env::current_dir().map_err(|error| {
+            ShellError::new(ErrorCode::Io, "could not read the current directory")
+                .with_context(error.to_string())
+                .with_help("Change to an accessible directory before opening the explorer")
+        })?;
+        self.dismiss_picker();
+        self.completion.dismiss();
+        self.help_active = false;
+        self.help_detail_scroll = 0;
+        self.explorer = Some(DirectoryExplorer::open(&current_dir)?);
         Ok(())
     }
 
@@ -2193,6 +2285,9 @@ impl SurfaceTerminal {
     fn draw(
         &mut self,
         model: &FrameModel<'_>,
+        explorer: Option<&DirectoryExplorer>,
+        mode: Mode,
+        symbols: SurfaceSymbols,
         selection: Option<ScreenSelection>,
         selection_style: Style,
     ) -> Result<VisibleScreen, ShellError> {
@@ -2227,6 +2322,9 @@ impl SurfaceTerminal {
         let result = terminal
             .draw(|frame| {
                 model.render(frame);
+                if let Some(explorer) = explorer {
+                    explorer.render(frame, frame.area(), model.theme, mode, symbols);
+                }
                 let buffer = frame.buffer_mut();
                 visible_screen =
                     VisibleScreen::capture(buffer, selection, TRANSCRIPT_COPY_BYTES_MAX);

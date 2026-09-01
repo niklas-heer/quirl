@@ -14,11 +14,22 @@ pub mod local_completion;
 
 pub use developer_context::{DeveloperContextProbe, DeveloperContextSnapshot};
 
+use std::path::Path;
+
 use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     process::Command,
 };
+
+/// Change the working directory used by Quirl and subsequently spawned children.
+///
+/// The transition is committed only after the operating system accepts `path`.
+/// Failures retain the previous directory and are returned as an actionable
+/// [`quirl_core::ShellError`].
+pub fn change_directory(path: &Path) -> Result<(), quirl_core::ShellError> {
+    builtin::change_directory(path)
+}
 
 /// Maximum variables retained by one native executor's environment snapshot.
 pub const SESSION_ENVIRONMENT_VARIABLES_MAX: usize = 65_536;

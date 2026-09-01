@@ -57,7 +57,7 @@ use quirl_lua::{LuaPolicy, MAX_LUA_SOURCE_BYTES, QuirlConfig, sdk_json, sdk_lua,
 use quirl_picker::{ItemKind, MAX_PICKER_ITEMS, PickItem, Picker};
 use quirl_process::{
     DEFAULT_CAPTURE_BYTES, JobStatus, NativeExecutor, ObservedActivity, OutputObserver,
-    sandboxed_process_host,
+    change_directory, sandboxed_process_host,
 };
 use quirl_syntax::{InteractiveLine, Mode, classify, parse_command_list};
 use quirl_ui::{
@@ -2651,6 +2651,21 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                     }
                 }
             }
+            Ok(InteractiveSignal::ChangeDirectory {
+                path,
+                buffer,
+                cursor,
+            }) => {
+                line_editor.restore_input(buffer, cursor)?;
+                if let Err(error) = change_directory(&path) {
+                    last_status = 1;
+                    line_editor.append_command_error(
+                        "directory explorer",
+                        &error,
+                        Duration::ZERO,
+                    )?;
+                }
+            }
             Ok(InteractiveSignal::CtrlC) => {
                 last_status = 130;
                 let mut annotations = BTreeMap::new();
@@ -3096,6 +3111,17 @@ impl SessionEditor {
     fn install_runtime_snapshot(&mut self, snapshot: InteractiveRuntimeSnapshot) {
         if let Self::Rich(editor) = self {
             editor.install_runtime_snapshot(snapshot);
+        }
+    }
+
+    fn restore_input(&mut self, buffer: String, cursor: usize) -> Result<(), ShellError> {
+        match self {
+            Self::Rich(editor) => editor.restore_input(buffer, cursor),
+            Self::Simple(_) => Err(ShellError::new(
+                ErrorCode::Validation,
+                "the simple editor cannot restore a rich modal buffer",
+            )
+            .with_help("Retry the directory change from the rich surface")),
         }
     }
 
