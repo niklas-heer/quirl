@@ -1,0 +1,109 @@
+# ADR 0028: Own a bounded Miller-column directory explorer
+
+- Status: Accepted
+- Date: 2026-09-01
+- Decision owners: Quirl maintainers
+- Extends: [ADR 0012](0012-rich-interactive-surface.md)
+- Preserves: [ADR 0016](0016-runtime-layering-contract.md)
+
+## Context
+
+Changing a shell's working directory cannot be delegated to a child file-manager
+process: a child can report a path, but it cannot mutate its parent's process
+state. Quirl therefore needs an explicit handoff between directory navigation,
+terminal ownership, and the process composition root.
+
+Miller columns provide more spatial context than a flat picker: the parent,
+current directory, and selected child's preview remain visible together. Existing
+Rust file explorers demonstrate the interaction well, but importing a complete
+application would also import its traversal, mutation, preview, dependency, and
+terminal-lifecycle decisions. Those decisions do not satisfy Quirl's required
+resource and error contracts without a substantial audit and rewrite.
+
+## Decision
+
+The rich surface owns a Quirl-native Miller-column explorer opened with
+`Alt-Q c`. It uses the existing Ratatui/Crossterm stack and the bounded directory
+lister in `quirl-core`. Bundled source grammars come from `syntect`; bounded
+raster decoding comes from `image` with only GIF, JPEG, PNG, and WebP enabled.
+Both are in-process Rust dependencies with unnecessary discovery, encoder,
+parallel, and high-cost format features disabled.
+
+Syntect 5.3.0 contributes 75 bundled syntax definitions. Some are embedded
+helpers rather than standalone languages, and its bundle does not include TOML,
+so Quirl owns a small bounded TOML lexer for previews. Both sources reduce
+grammar scopes to semantic roles such as comment, string, number, keyword,
+property, operator, and error. Rendering resolves those roles through the active
+Quirl theme instead of retaining colors from an unrelated syntax theme; custom
+themes and `NO_COLOR` therefore apply consistently to the editor and explorer.
+
+The explorer is a modal transaction:
+
+1. The UI snapshots the current directory and preserves the editor buffer and
+   UTF-8 cursor.
+2. Left/right navigation changes only explorer-local paths. Syntax-highlighted
+   text, bounded raster images, binary data, metadata, and immediate-child
+   previews are read without executing content.
+3. Escape discards the explorer. Enter returns a typed path after the rich
+   terminal is released.
+4. `quirl-cli` restores the editor input and asks `quirl-process` to commit the
+   directory transition. A failed commit retains the previous process directory
+   and becomes a normal rich diagnostic.
+
+Listings retain at most 4,096 entries and 2 MiB of filename text. Search retains
+at most 1,024 UTF-8 bytes. Text previews read at most 128 KiB, retain at most
+4,096 lines and 32,768 styled spans, and use one process-wide immutable grammar
+and semantic-scope cache. Binary previews render only the first 4 KiB as hexadecimal.
+Image previews admit at most 16 MiB of encoded input, reject either dimension
+above 8,192 pixels, give the decoder a 64 MiB allocation budget, and retain at
+most a 160×100 RGBA thumbnail. Directory previews are non-recursive and use the
+same listing bounds. Sorting, hidden-file display, refresh, and navigation
+rebuild bounded snapshots rather than accumulating prior views.
+
+Image pixels render through Ratatui cells. Unicode terminals use upper-half
+blocks for two vertical pixels per cell; the plain-symbol profile uses colored
+cell backgrounds. This avoids terminal-specific image escape protocols and
+external preview helpers. `NO_COLOR` keeps metadata visible and suppresses pixel
+rendering.
+
+The first version deliberately excludes file mutation. Rename, copy, move,
+create, and delete require separate collision, symlink, permission, partial-copy,
+durability, cancellation, and confirmation contracts. They must not be inherited
+implicitly from an application dependency or hidden behind generic callbacks.
+
+## Failure model and invariants
+
+- Browsing, preview failure, refresh failure, and dismissal never change the
+  process working directory.
+- The process directory changes only through `quirl-process`, after the rich
+  surface has returned a typed path to the composition root.
+- A failed `set_current_dir` leaves the prior directory active and produces an
+  actionable `ShellError`.
+- Every retained collection and byte buffer in the explorer has a fixed bound.
+  Listings and previews never recurse.
+- Filesystem names and error text are escaped before terminal rendering. File
+  contents are data only; no preview handler executes them or dispatches to an
+  external program.
+- Text preview requires valid UTF-8 and no NUL byte. Supported raster formats
+  cross encoded-byte, dimension, and allocation checks before pixels are
+  retained. Other data is rendered as a bounded hexadecimal view. No decoded
+  bytes are interpreted as terminal control sequences.
+- The preserved editor cursor is validated as an in-bounds UTF-8 boundary before
+  it is accepted for restoration.
+- Terminal restoration remains owned by the rich-surface guard on acceptance,
+  dismissal, I/O failure, and unwind.
+
+Individual filesystem calls can still wait on an unresponsive kernel or remote
+mount; stable Rust does not provide cancellable directory and ordinary-file I/O.
+The retained work around each call is bounded, and no background thread or child
+process is leaked when it returns.
+
+## Consequences
+
+Quirl gains contextual, keyboard-first directory jumping with highlighted source
+and portable raster previews while keeping shell state and terminal cleanup
+explicit. Bundled grammars and four image decoders add binary size and
+supply-chain review cost; disabling unrelated features and retaining only a
+small thumbnail bounds that cost at runtime. File mutation remains a follow-up
+design rather than an accidental expansion of the first release's data-loss
+surface.

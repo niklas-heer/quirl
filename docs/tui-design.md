@@ -345,13 +345,33 @@ enum EditAction {
 | `Alt-Q`, then a mnemonic | Quirl leader for modes, pickers, jobs, and results | collision-free internal command namespace |
 | `Ctrl-Space` | Command/data mode toggle compatibility alias | some terminals cannot distinguish this from NUL |
 | `Ctrl-R` or `Up` | Cwd-aware fuzzy history | conventional history entrypoint |
-| `Alt-Q f/c/p/j/r` | Files / directories / palette / jobs / results | Quirl leader namespace |
+| `Alt-Q f/c/p/j/r` | Files / directory explorer / palette / jobs / results | Quirl leader namespace |
 | `Ctrl-G` / `Alt-D` | Active jobs / cached typed-data picker | snapshots only; selection inserts a revalidated command or data expression |
 | `Ctrl-C` | Clear line, dismiss popup; never exits | |
 | `Ctrl-D` | EOF on empty line → exit | |
 | `Ctrl-Z` | Release terminal, `SIGTSTP` self | resume redraws frame |
 | `Ctrl-L` | Clear screen above frame, redraw | |
 | `Esc` | Popup dismiss → helix `NOR` | layered: popup first |
+
+### Directory explorer
+
+`Alt-Q c` opens a modal Miller-column explorer. At 96 columns or wider it shows
+the parent, current directory, and selected-entry preview; medium terminals keep
+the current and preview columns, and narrow terminals prioritize navigation.
+The explorer preserves the unfinished command buffer while it is open.
+
+`j`/`k` or arrows select, `h`/`l` or left/right move between directories,
+`Enter` changes the shell directory, and `Esc` cancels without changing it.
+`/` filters the current snapshot, `.` toggles hidden entries, `s` cycles name,
+size, modification-time, and kind sorting, `r` reloads, and `~` opens the home
+directory. Source previews use 75 bundled syntax definitions plus Quirl's native
+TOML highlighter. Grammar scopes map to the active Quirl theme's semantic roles,
+so built-in and custom themes stay coherent across the prompt and preview. GIF,
+JPEG, PNG, and WebP render as bounded color half-block thumbnails; terminals
+honoring `NO_COLOR` retain image metadata without emitting pixel colors. Other
+binary data uses a hex view. Every preview is bounded and never executes file
+content. The exact state, resource, and terminal invariants are recorded in
+[ADR 0028](decisions/0028-bounded-miller-column-explorer.md).
 
 ---
 

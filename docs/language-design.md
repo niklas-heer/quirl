@@ -579,7 +579,7 @@ The input buffer is parsed continuously, understands command schemas and annotat
 fzf proves fuzzy selection is a terminal primitive. Quirl includes a native, typed picker in the line editor and exposes the same engine to commands, scripts, and plugins. Users should not have to install a finder and wire shell-specific bindings merely to search history or files.
 
 - **Typed selection:** displays labels, highlights, metadata, and previews but returns the original value. Picking a `Process`, `Path`, history entry, or plugin record never round-trips through lossy display text.
-- **Shared muscle memory:** `Ctrl-R` or `Up` opens fuzzy history, `Alt-Q` owns Quirl-internal chords (`f` files, `c` directories, `p` actions, `j` jobs, `r` results), and `Shift-Tab` expands completion into the full picker. Conventional shell editing chords remain available.
+- **Shared muscle memory:** `Ctrl-R` or `Up` opens fuzzy history, `Alt-Q` owns Quirl-internal chords (`f` files, `c` Miller-column directory explorer, `p` actions, `j` jobs, `r` results), and `Shift-Tab` expands completion into the full picker. The directory explorer preserves unfinished input, previews syntax-highlighted source and bounded raster images, and commits `cd` only on Enter. Conventional shell editing chords remain available.
 - **Interactive contract:** single/multi-select, exact/fuzzy/inverse terms, source switching, live reload, safe previews, named actions, cancellable/backpressured providers, and virtualized rendering.
 - **Script contract:** `pick` accepts byte lines or typed streams and emits selected values. `--query`, `--multi`, `--preview`, `--format`, and non-interactive fallback rules are testable.
 
