@@ -1,6 +1,7 @@
 use super::{
     completion::CompletionState,
     editor::EditorState,
+    environment::EnvironmentExplorer,
     highlight::{DiagnosticSeverity, SurfaceDiagnostic},
     overlay::PickerLayout,
     runtime::{PANEL_VISIBLE_ROWS_MAX, RuntimeSurfaceState},
@@ -41,6 +42,7 @@ pub struct FrameModel<'a> {
     pub picker_layout: PickerLayout,
     pub picker_preview: bool,
     pub detail_scroll: u16,
+    pub environment: Option<&'a EnvironmentExplorer>,
     pub runtime: &'a RuntimeSurfaceState,
     pub transcript: Option<&'a Transcript>,
     pub transcript_truncated: bool,
@@ -55,6 +57,9 @@ pub struct FrameModel<'a> {
 impl FrameModel<'_> {
     /// Return the transcript rectangle produced by the same partition used for drawing.
     pub(super) fn transcript_area(&self, area: Rect) -> Rect {
+        if self.environment.is_some() {
+            return Rect::default();
+        }
         let input = self.input_render(usize::from(area.width));
         frame_layout(
             area,
@@ -69,6 +74,10 @@ impl FrameModel<'_> {
     pub fn render(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
         if area.height == 0 || area.width == 0 {
+            return;
+        }
+        if let Some(environment) = self.environment {
+            environment.render(frame, area, self.theme, self.mode, self.symbols);
             return;
         }
         let input = self.input_render(usize::from(area.width));
@@ -921,6 +930,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    environment: None,
                     runtime: &runtime,
                     transcript: None,
                     transcript_truncated: false,
@@ -987,6 +997,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    environment: None,
                     runtime,
                     transcript: None,
                     transcript_truncated: false,
@@ -1046,6 +1057,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    environment: None,
                     runtime: &runtime,
                     transcript: None,
                     transcript_truncated: false,
@@ -1107,6 +1119,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    environment: None,
                     runtime: &runtime,
                     transcript: None,
                     transcript_truncated: false,
@@ -1197,6 +1210,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    environment: None,
                     runtime: &runtime,
                     transcript: None,
                     transcript_truncated: false,
@@ -1308,6 +1322,7 @@ mod tests {
             picker_layout: PickerLayout::Adaptive,
             picker_preview: true,
             detail_scroll: 0,
+            environment: None,
             runtime: &runtime,
             transcript: None,
             transcript_truncated: false,
@@ -1389,6 +1404,7 @@ mod tests {
             picker_layout: PickerLayout::Adaptive,
             picker_preview: true,
             detail_scroll: 0,
+            environment: None,
             runtime: &runtime,
             transcript: None,
             transcript_truncated: false,
@@ -1448,6 +1464,7 @@ mod tests {
                         picker_layout: PickerLayout::Adaptive,
                         picker_preview: true,
                         detail_scroll: 0,
+                        environment: None,
                         runtime: &runtime,
                         transcript: Some(transcript),
                         transcript_truncated: false,
@@ -1543,6 +1560,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    environment: None,
                     runtime: &runtime,
                     transcript: Some(&transcript),
                     transcript_truncated: false,
@@ -1620,6 +1638,7 @@ mod tests {
                         picker_layout: PickerLayout::Adaptive,
                         picker_preview: true,
                         detail_scroll: 0,
+                        environment: None,
                         runtime: &runtime,
                         transcript: Some(&transcript),
                         transcript_truncated: false,
@@ -1735,6 +1754,7 @@ mod tests {
                     picker_layout: PickerLayout::Full,
                     picker_preview: false,
                     detail_scroll: 0,
+                    environment: None,
                     runtime: &runtime,
                     transcript: None,
                     transcript_truncated: false,
@@ -1794,6 +1814,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    environment: None,
                     runtime: &runtime,
                     transcript: None,
                     transcript_truncated: false,
@@ -1919,6 +1940,7 @@ mod tests {
                     picker_layout: PickerLayout::Adaptive,
                     picker_preview: true,
                     detail_scroll: 0,
+                    environment: None,
                     runtime: &runtime,
                     transcript: None,
                     transcript_truncated: false,

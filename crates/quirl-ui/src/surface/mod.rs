@@ -1,6 +1,7 @@
 pub(crate) mod completion;
 mod degrade;
 mod editor;
+mod environment;
 mod explorer;
 mod frame;
 pub(crate) mod highlight;
@@ -12,12 +13,13 @@ mod transcript;
 
 pub use degrade::{SurfaceKind, select_surface};
 pub use runtime::{
-    ACTIVITY_MESSAGE_BYTES_MAX, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX,
-    InteractiveActivityProvider, InteractiveActivitySnapshot, InteractiveDataSnapshot,
-    InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch,
-    InteractivePanelProvider, InteractivePanelSnapshot, InteractiveRuntimeSnapshot,
-    JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX,
-    PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+    ACTIVITY_MESSAGE_BYTES_MAX, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, ENVIRONMENT_ITEMS_MAX,
+    ENVIRONMENT_RETAINED_BYTES_MAX, InteractiveActivityProvider, InteractiveActivitySnapshot,
+    InteractiveDataSnapshot, InteractiveEnvironmentSnapshot, InteractiveJobAction,
+    InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
+    InteractivePanelSnapshot, InteractiveRuntimeSnapshot, JOB_ACTION_ITEMS_MAX,
+    JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
+    PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
 };
 
 /// One-shot rich-session loader that returns the complete immutable catalog.
@@ -43,7 +45,8 @@ pub struct InteractiveHistoryEntry {
 use self::{
     completion::{CompletionState, IntentCompletionState},
     editor::{EditAction, EditorState},
-    explorer::{DirectoryExplorer, ExplorerAction},
+    environment::{EnvironmentExplorer, ExplorerAction as EnvironmentExplorerAction},
+    explorer::{DirectoryExplorer, ExplorerAction as DirectoryExplorerAction},
     frame::FrameModel,
     highlight::InputAnalyzer,
     overlay::{PickerLayout, PickerOverlay, contextual_help_query},
@@ -397,6 +400,7 @@ pub struct RichSurface {
     help_active: bool,
     help_detail_scroll: u16,
     leader_active: bool,
+    environment: EnvironmentExplorer,
     theme: Theme,
     runtime: RuntimeSurfaceState,
     transcript: Transcript,
@@ -474,6 +478,7 @@ impl RichSurface {
             help_active: false,
             help_detail_scroll: 0,
             leader_active: false,
+            environment: EnvironmentExplorer::new(),
             theme,
             runtime: RuntimeSurfaceState::new(),
             transcript: Transcript::new(TranscriptLimits {
@@ -540,6 +545,7 @@ impl RichSurface {
             help_active: false,
             help_detail_scroll: 0,
             leader_active: false,
+            environment: EnvironmentExplorer::new(),
             theme,
             runtime: RuntimeSurfaceState::new(),
             transcript: Transcript::new(TranscriptLimits {
@@ -755,6 +761,7 @@ impl RichSurface {
             picker_layout: self.picker_layout,
             picker_preview: self.picker_preview,
             detail_scroll: 0,
+            environment: None,
             runtime: &self.runtime,
             transcript: Some(&self.transcript),
             transcript_truncated: self.transcript_truncated,
@@ -959,6 +966,7 @@ impl RichSurface {
     /// return [`ShellError`]; the drop guard retries terminal cleanup on error.
     pub fn read_line(&mut self, prompt: &mut QuirlPrompt) -> Result<InteractiveSignal, ShellError> {
         self.dismiss_picker();
+        self.environment.close();
         self.intent_completion.cancel();
         self.expand_completion_pending = false;
         let mut editor = EditorState::new(
@@ -1025,6 +1033,7 @@ impl RichSurface {
                     },
                     picker_preview: self.picker_preview,
                     detail_scroll: self.help_detail_scroll,
+                    environment: self.environment.active().then_some(&self.environment),
                     runtime: &self.runtime,
                     transcript: Some(&self.transcript),
                     transcript_truncated: self.transcript_truncated,
@@ -1086,6 +1095,10 @@ impl RichSurface {
                 dirty = true;
                 continue;
             }
+            if self.environment.poll() {
+                dirty = true;
+                continue;
+            }
             if !event::poll(EVENT_POLL).map_err(terminal_error("poll terminal input"))? {
                 continue;
             }
@@ -1101,6 +1114,10 @@ impl RichSurface {
             match input_event {
                 Event::Paste(text) => {
                     self.output_notice = None;
+                    if self.environment.active() {
+                        self.environment.insert_filter_text(&text);
+                        continue;
+                    }
                     self.return_to_tail_for_input();
                     if let Some(explorer) = self.explorer.as_mut() {
                         explorer.insert_query(&text);
@@ -1116,6 +1133,9 @@ impl RichSurface {
                 }
                 Event::Resize(_, _) => continue,
                 Event::Mouse(mouse) => {
+                    if self.environment.active() {
+                        continue;
+                    }
                     self.handle_mouse(mouse);
                     continue;
                 }
@@ -1138,14 +1158,16 @@ impl RichSurface {
                         let action = self
                             .explorer
                             .as_mut()
-                            .map_or(ExplorerAction::Dismiss, |explorer| explorer.handle_key(key));
+                            .map_or(DirectoryExplorerAction::Dismiss, |explorer| {
+                                explorer.handle_key(key)
+                            });
                         match action {
-                            ExplorerAction::Pending => continue,
-                            ExplorerAction::Dismiss => {
+                            DirectoryExplorerAction::Pending => continue,
+                            DirectoryExplorerAction::Dismiss => {
                                 self.explorer = None;
                                 continue;
                             }
-                            ExplorerAction::ChangeDirectory(path) => {
+                            DirectoryExplorerAction::ChangeDirectory(path) => {
                                 self.explorer = None;
                                 return Ok(InteractiveSignal::ChangeDirectory {
                                     path,
@@ -1158,6 +1180,10 @@ impl RichSurface {
                     if self.leader_active {
                         self.return_to_tail_for_input();
                         self.handle_leader_key(key.code, prompt, editor.buffer(), editor.cursor())?;
+                        continue;
+                    }
+                    if self.environment.active() {
+                        self.handle_environment_key(key, &mut editor, prompt.mode)?;
                         continue;
                     }
                     if key.code == KeyCode::F(6) {
@@ -1436,6 +1462,11 @@ impl RichSurface {
             ("c", "Explorer", "Browse columns, preview, and jump"),
             ("j", "Jobs", "Inspect background jobs"),
             ("r", "Results", "Inspect recent typed data"),
+            (
+                "e",
+                "Environment",
+                "Inspect PATH and variables inherited by commands",
+            ),
             ("o", "Output", "Scroll and copy retained command output"),
         ];
         let items = entries
@@ -1494,6 +1525,9 @@ impl RichSurface {
             KeyCode::Char('j') => self.open_picker(editor::PickerKind::Jobs, line, cursor, "jobs"),
             KeyCode::Char('r') => {
                 self.open_picker(editor::PickerKind::Data, line, cursor, "results")
+            }
+            KeyCode::Char('e') => {
+                self.environment.open(self.runtime.environment())?;
             }
             KeyCode::Char('o') if self.transcript.line_count() > 0 => self.open_output_focus(),
             _ => {}
@@ -1844,6 +1878,35 @@ impl RichSurface {
         } else {
             self.open_picker_items(items, label, false);
         }
+    }
+
+    fn handle_environment_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        editor: &mut EditorState,
+        mode: Mode,
+    ) -> Result<(), ShellError> {
+        match self.environment.handle_key(key)? {
+            EnvironmentExplorerAction::Repaint => {}
+            EnvironmentExplorerAction::Close => self.environment.close(),
+            EnvironmentExplorerAction::Insert(text) => {
+                self.environment.close();
+                editor.insert_paste(&text);
+                self.refresh_completion_after_edit(editor, mode)?;
+            }
+            EnvironmentExplorerAction::Copy(text) => {
+                if let Err(error) = self.terminal.copy_to_clipboard(&text) {
+                    self.environment
+                        .set_notice(format!("copy failed: {}", error.message));
+                } else {
+                    self.environment.set_notice(format!(
+                        "copied {} bytes via terminal clipboard",
+                        text.len()
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn open_context_help(&mut self, line: &str, cursor: usize) {
@@ -3144,6 +3207,36 @@ mod tests {
             assert!(!surface.completion.open);
             assert!(!surface.help_active);
         }
+    }
+
+    #[test]
+    fn alt_q_e_opens_the_full_screen_environment_explorer() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface.install_runtime_snapshot(InteractiveRuntimeSnapshot {
+            generation: 1,
+            environment: Some(vec![InteractiveEnvironmentSnapshot {
+                name: "RUST_LOG".to_owned(),
+                value: "debug".to_owned(),
+            }]),
+            ..InteractiveRuntimeSnapshot::default()
+        });
+        let mut prompt = QuirlPrompt::with_config(Mode::Command, &config);
+
+        surface
+            .handle_leader_key(KeyCode::Char('e'), &mut prompt, "git status", 3)
+            .unwrap();
+
+        assert!(surface.environment.active());
+        assert!(!surface.picker.active());
+        assert_eq!(prompt.mode(), Mode::Command);
     }
 
     #[test]

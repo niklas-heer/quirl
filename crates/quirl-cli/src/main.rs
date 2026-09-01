@@ -62,13 +62,14 @@ use quirl_process::{
 use quirl_syntax::{InteractiveLine, Mode, classify, parse_command_list};
 use quirl_ui::{
     CatalogLoader, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, ExtensionCompleter,
-    ExtensionSuggestion, InteractiveDataSnapshot, InteractiveHistoryEntry, InteractiveJobAction,
-    InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
-    InteractiveRuntimeSnapshot, InteractiveSignal, MODE_TOGGLE_HOST_COMMAND, NativeProjectContext,
-    PROMPT_FIRST_PAINT_BUDGET, PickerItem, PickerItemKind, PickerMatch, PickerRanker,
-    PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind,
-    editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
-    set_product_identity, terminal_supports_nerd_font, terminal_supports_unicode, terminal_width,
+    ExtensionSuggestion, InteractiveDataSnapshot, InteractiveEnvironmentSnapshot,
+    InteractiveHistoryEntry, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
+    InteractivePanelBatch, InteractivePanelProvider, InteractiveRuntimeSnapshot, InteractiveSignal,
+    MODE_TOGGLE_HOST_COMMAND, NativeProjectContext, PROMPT_FIRST_PAINT_BUDGET, PickerItem,
+    PickerItemKind, PickerMatch, PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface,
+    SurfaceKind, editor_with_extensions_config_history_and_picker, history_path, render_error,
+    select_surface, set_product_identity, terminal_supports_nerd_font, terminal_supports_unicode,
+    terminal_width,
 };
 use recovery::RecoveryCommand;
 use script::ScriptLanguage;
@@ -2005,6 +2006,19 @@ fn interactive_job_snapshots(jobs: &[quirl_process::JobState]) -> Vec<Interactiv
         .collect()
 }
 
+fn interactive_environment_snapshot(
+    executor: &NativeExecutor,
+) -> Result<Vec<InteractiveEnvironmentSnapshot>, ShellError> {
+    Ok(executor
+        .environment_snapshot()?
+        .into_iter()
+        .map(|(name, value)| InteractiveEnvironmentSnapshot {
+            name: name.to_string_lossy().into_owned(),
+            value: value.to_string_lossy().into_owned(),
+        })
+        .collect())
+}
+
 fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     set_product_identity(&product_build_identity())?;
     let mut executor = NativeExecutor::default();
@@ -2046,6 +2060,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     let mut recovery = None;
     let mut data_cache = InteractiveDataCache::default();
     let mut runtime_snapshot_generation = 0_u64;
+    let mut installed_environment_generation = None;
     // Script evaluation remains lazy. Extension VMs load before the first editor
     // view, but first paint reads only their bounded prompt cache; Lua refreshes
     // on the fixed worker pool after the snapshot is returned.
@@ -2204,11 +2219,19 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                 )
                 .with_help("Restart Quirl before preparing another interactive prompt")
             })?;
+        let environment_generation = executor.environment_generation();
+        let environment = if installed_environment_generation == Some(environment_generation) {
+            None
+        } else {
+            Some(interactive_environment_snapshot(&executor)?)
+        };
         line_editor.install_runtime_snapshot(InteractiveRuntimeSnapshot {
             generation: runtime_snapshot_generation,
             jobs: interactive_job_snapshots(&job_states),
             data: data_cache.snapshot(),
+            environment,
         });
+        installed_environment_generation = Some(environment_generation);
         let history_directory = std::env::current_dir().unwrap_or_default();
         line_editor.install_history_snapshot(history_database.snapshot(&history_directory, mode)?);
         let signal = line_editor.read_line(&mut prompt);

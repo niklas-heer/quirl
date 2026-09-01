@@ -1258,6 +1258,25 @@ mod platform {
             self.environment.generation
         }
 
+        /// Clone the complete private environment inherited by future children.
+        ///
+        /// Capture is already limited to
+        /// [`SESSION_ENVIRONMENT_VARIABLES_MAX`](crate::SESSION_ENVIRONMENT_VARIABLES_MAX)
+        /// entries and [`SESSION_ENVIRONMENT_BYTES_MAX`](crate::SESSION_ENVIRONMENT_BYTES_MAX)
+        /// aggregate name/value bytes. The returned order is deterministic by
+        /// platform string order.
+        pub fn environment_snapshot(
+            &self,
+        ) -> Result<Vec<(std::ffi::OsString, std::ffi::OsString)>, ShellError> {
+            self.environment.ensure_valid()?;
+            Ok(self
+                .environment
+                .variables
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect())
+        }
+
         #[cfg(test)]
         pub(crate) fn replace_environment_for_test(&mut self, environment: SessionEnvironment) {
             self.environment = environment;
@@ -5898,6 +5917,25 @@ mod platform {
             self.environment.generation
         }
 
+        /// Clone the complete private environment inherited by future children.
+        ///
+        /// Capture is already limited to
+        /// [`SESSION_ENVIRONMENT_VARIABLES_MAX`](crate::SESSION_ENVIRONMENT_VARIABLES_MAX)
+        /// entries and [`SESSION_ENVIRONMENT_BYTES_MAX`](crate::SESSION_ENVIRONMENT_BYTES_MAX)
+        /// aggregate name/value bytes. The returned order is deterministic by
+        /// platform string order.
+        pub fn environment_snapshot(
+            &self,
+        ) -> Result<Vec<(std::ffi::OsString, std::ffi::OsString)>, ShellError> {
+            self.environment.ensure_valid()?;
+            Ok(self
+                .environment
+                .variables
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect())
+        }
+
         #[cfg(test)]
         pub(crate) fn replace_environment_for_test(&mut self, environment: SessionEnvironment) {
             self.environment = environment;
@@ -7217,6 +7255,22 @@ mod backend_contract_tests {
 
         assert_eq!(read_test_environment(&mut executor, name), "owned");
         assert!(std::env::var_os(name).is_none());
+    }
+
+    #[test]
+    fn environment_snapshot_observes_private_atomic_updates() {
+        let mut executor = NativeExecutor::default();
+        executor
+            .set_environment_variable(
+                "QUIRL_ENVIRONMENT_INSPECTOR_TEST".to_owned(),
+                "private".to_owned(),
+            )
+            .unwrap();
+
+        let snapshot = executor.environment_snapshot().unwrap();
+        assert!(snapshot.iter().any(|(name, value)| {
+            name == "QUIRL_ENVIRONMENT_INSPECTOR_TEST" && value == "private"
+        }));
     }
 
     #[cfg(unix)]

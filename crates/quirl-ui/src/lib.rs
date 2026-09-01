@@ -18,7 +18,8 @@ pub use panel::{
 };
 pub use surface::{
     ACTIVITY_MESSAGE_BYTES_MAX, CatalogLoader, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX,
-    InteractiveActivityProvider, InteractiveActivitySnapshot, InteractiveDataSnapshot,
+    ENVIRONMENT_ITEMS_MAX, ENVIRONMENT_RETAINED_BYTES_MAX, InteractiveActivityProvider,
+    InteractiveActivitySnapshot, InteractiveDataSnapshot, InteractiveEnvironmentSnapshot,
     InteractiveHistoryEntry, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
     InteractivePanelBatch, InteractivePanelProvider, InteractivePanelSnapshot,
     InteractiveRuntimeSnapshot, InteractiveSignal, JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX,

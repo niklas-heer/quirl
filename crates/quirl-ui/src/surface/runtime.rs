@@ -26,6 +26,10 @@ pub const DATA_ITEMS_MAX: usize = 128;
 pub const DATA_RETAINED_BYTES_MAX: usize = 512 * 1024;
 /// Maximum Unicode scalar values displayed in one data picker label.
 pub const DATA_LABEL_CHARS_MAX: usize = 256;
+/// Maximum environment variables retained by the environment inspector.
+pub const ENVIRONMENT_ITEMS_MAX: usize = 4_096;
+/// Maximum aggregate terminal-safe environment text retained by the inspector.
+pub const ENVIRONMENT_RETAINED_BYTES_MAX: usize = 1024 * 1024;
 /// Maximum state-valid job actions retained for picker composition.
 pub const JOB_ACTION_ITEMS_MAX: usize = 256;
 /// Maximum aggregate terminal-safe text retained by job picker snapshots.
@@ -34,6 +38,7 @@ pub const JOB_RETAINED_BYTES_MAX: usize = 512 * 1024;
 pub const ACTIVITY_MESSAGE_BYTES_MAX: usize = 512;
 const LIVE_GENERATIONS_MAX: usize = 4;
 const PANEL_BATCHES_MAX: usize = PANEL_QUEUE_UPDATES_MAX / PANEL_COUNT_MAX;
+const ENVIRONMENT_FIELD_BYTES_MAX: usize = 6 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Process state copied from the process-owned job table.
@@ -99,8 +104,17 @@ pub struct InteractiveDataSnapshot {
     pub insertion: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// One variable from the private environment inherited by future child processes.
+pub struct InteractiveEnvironmentSnapshot {
+    /// Platform environment variable name, converted lossily when it is not UTF-8.
+    pub name: String,
+    /// Platform environment variable value, converted lossily when it is not UTF-8.
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
-/// Complete immutable job and data sources for one prompt generation.
+/// Complete immutable job, data, and environment sources for one prompt generation.
 pub struct InteractiveRuntimeSnapshot {
     /// Monotonically increasing composition-root generation.
     pub generation: u64,
@@ -108,6 +122,9 @@ pub struct InteractiveRuntimeSnapshot {
     pub jobs: Vec<InteractiveJobSnapshot>,
     /// Previously successful typed values retained by the bounded CLI cache.
     pub data: Vec<InteractiveDataSnapshot>,
+    /// New session-private variables inherited by future child processes.
+    /// `None` retains the environment from the preceding generation.
+    pub environment: Option<Vec<InteractiveEnvironmentSnapshot>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +183,7 @@ pub(crate) struct RuntimeSurfaceState {
     snapshot_generation: u64,
     jobs: Vec<InteractiveJobSnapshot>,
     data: Vec<InteractiveDataSnapshot>,
+    environment: Vec<InteractiveEnvironmentSnapshot>,
     panel_generation: u64,
     panels: Vec<PanelSlot>,
     panel_focus: usize,
@@ -189,6 +207,7 @@ impl RuntimeSurfaceState {
             snapshot_generation: 0,
             jobs: Vec::new(),
             data: Vec::new(),
+            environment: Vec::new(),
             panel_generation: 0,
             panels: Vec::new(),
             panel_focus: 0,
@@ -228,6 +247,9 @@ impl RuntimeSurfaceState {
         self.notice = None;
         self.jobs = bounded_jobs(&mut snapshot.jobs, &mut self.notice);
         self.data = bounded_data(&mut snapshot.data, &mut self.notice);
+        if let Some(mut environment) = snapshot.environment {
+            self.environment = bounded_environment(&mut environment, &mut self.notice);
+        }
     }
 
     pub(crate) fn poll_panels(&mut self) -> bool {
@@ -428,6 +450,10 @@ impl RuntimeSurfaceState {
             .collect()
     }
 
+    pub(crate) fn environment(&self) -> &[InteractiveEnvironmentSnapshot] {
+        &self.environment
+    }
+
     #[cfg(test)]
     pub(crate) fn live_generation_count(&self) -> usize {
         self.panels
@@ -512,6 +538,40 @@ fn bounded_data(
         retained.push(item);
     }
     retained.reverse();
+    retained
+}
+
+fn bounded_environment(
+    environment: &mut Vec<InteractiveEnvironmentSnapshot>,
+    notice: &mut Option<String>,
+) -> Vec<InteractiveEnvironmentSnapshot> {
+    environment.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut retained = Vec::new();
+    let mut retained_bytes = 0_usize;
+    for mut variable in environment.drain(..) {
+        let escaped_name = escape_terminal_line(&variable.name);
+        let escaped_value = escape_terminal_line(&variable.value);
+        let field_was_truncated = escaped_name.len() > ENVIRONMENT_FIELD_BYTES_MAX
+            || escaped_value.len() > ENVIRONMENT_FIELD_BYTES_MAX;
+        variable.name = truncate_bytes(&escaped_name, ENVIRONMENT_FIELD_BYTES_MAX);
+        variable.value = truncate_bytes(&escaped_value, ENVIRONMENT_FIELD_BYTES_MAX);
+        let bytes = variable.name.len().saturating_add(variable.value.len());
+        if field_was_truncated
+            || retained.len() == ENVIRONMENT_ITEMS_MAX
+            || retained_bytes.saturating_add(bytes) > ENVIRONMENT_RETAINED_BYTES_MAX
+        {
+            *notice = Some(format!(
+                "environment inspector reached its {ENVIRONMENT_ITEMS_MAX}-item, {ENVIRONMENT_RETAINED_BYTES_MAX}-byte, or {ENVIRONMENT_FIELD_BYTES_MAX}-byte field limit"
+            ));
+            if retained.len() == ENVIRONMENT_ITEMS_MAX
+                || retained_bytes.saturating_add(bytes) > ENVIRONMENT_RETAINED_BYTES_MAX
+            {
+                break;
+            }
+        }
+        retained_bytes = retained_bytes.saturating_add(bytes);
+        retained.push(variable);
+    }
     retained
 }
 
@@ -746,8 +806,12 @@ mod tests {
     }
 
     #[test]
-    fn job_and_data_picker_items_use_real_snapshot_kinds_and_revalidated_commands() {
+    fn runtime_picker_items_use_bounded_typed_snapshots() {
         let mut state = RuntimeSurfaceState::new();
+        let path = std::env::join_paths(["/usr/bin", "/opt/tools"])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         state.install_snapshot(InteractiveRuntimeSnapshot {
             generation: 1,
             jobs: vec![
@@ -777,6 +841,16 @@ mod tests {
                 value: StructuredValue::Int(42),
                 insertion: "42".to_owned(),
             }],
+            environment: Some(vec![
+                InteractiveEnvironmentSnapshot {
+                    name: "TOKEN".to_owned(),
+                    value: "safe\u{1b}[31m".to_owned(),
+                },
+                InteractiveEnvironmentSnapshot {
+                    name: "PATH".to_owned(),
+                    value: path.clone(),
+                },
+            ]),
         });
 
         let jobs = state.job_items(0);
@@ -793,5 +867,34 @@ mod tests {
         let data = state.data_items(0);
         assert_eq!(data[0].value, "42");
         assert_eq!(data[0].kind, super::super::completion::CompletionKind::Data);
+
+        let environment = state.environment();
+        assert_eq!(environment.len(), 2);
+        assert_eq!(environment[0].name, "PATH");
+        assert_eq!(environment[0].value, path);
+        assert_eq!(environment[1].name, "TOKEN");
+        assert!(!environment[1].value.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn environment_snapshot_truncates_oversized_terminal_text_with_a_notice() {
+        let mut state = RuntimeSurfaceState::new();
+        state.install_snapshot(InteractiveRuntimeSnapshot {
+            generation: 1,
+            environment: Some(vec![InteractiveEnvironmentSnapshot {
+                name: "OVERSIZED".to_owned(),
+                value: format!("\u{1b}{}", "x".repeat(ENVIRONMENT_FIELD_BYTES_MAX + 1)),
+            }]),
+            ..InteractiveRuntimeSnapshot::default()
+        });
+
+        assert_eq!(state.environment.len(), 1);
+        assert!(state.environment[0].value.len() <= ENVIRONMENT_FIELD_BYTES_MAX);
+        assert!(!state.environment[0].value.contains('\u{1b}'));
+        assert!(
+            state.notice().is_some_and(|notice| {
+                notice.contains(&ENVIRONMENT_FIELD_BYTES_MAX.to_string())
+            })
+        );
     }
 }
