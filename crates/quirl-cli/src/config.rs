@@ -2,8 +2,10 @@ use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::{Subcommand, ValueEnum};
 use quirl_core::{ErrorCode, ShellError, escape_json_terminal_controls, escape_terminal_controls};
 use quirl_lua::{
-    CONFIG_SCHEMA_VERSION, LuaPolicy, MAX_LUA_SOURCE_BYTES, MAX_THEME_NAME_BYTES, QuirlConfig,
-    ThemeColors, builtin_theme, builtin_theme_names, format_source,
+    CONFIG_SCHEMA_VERSION, LuaPolicy, MAX_LUA_SOURCE_BYTES, MAX_PROJECT_DISCOVERY_DEPTH,
+    MAX_PROJECT_REFRESH_INTERVAL_SECONDS, MAX_THEME_NAME_BYTES,
+    MIN_PROJECT_REFRESH_INTERVAL_SECONDS, ProjectsConfig, QuirlConfig, ThemeColors, builtin_theme,
+    builtin_theme_names, format_source,
 };
 use serde::Serialize;
 use std::{
@@ -255,6 +257,31 @@ fn tui(file: &Path) -> Result<i32, ShellError> {
     println!(
         "completion.min_chars = {}  (0..4096)",
         config.completion.min_chars
+    );
+    println!("\n[projects]");
+    println!(
+        "projects.discovery = {}  (auto | disabled)",
+        escape_terminal_controls(&config.projects.discovery)
+    );
+    println!(
+        "projects.roots = {}  (edit directly in config.lua)",
+        escape_terminal_controls(&ConfigField::ProjectsRoots.value(&config))
+    );
+    println!(
+        "projects.excludes = {}  (edit directly in config.lua)",
+        escape_terminal_controls(&ConfigField::ProjectsExcludes.value(&config))
+    );
+    println!(
+        "projects.refresh_interval_seconds = {}  (60..86400)",
+        config.projects.refresh_interval_seconds
+    );
+    println!(
+        "projects.max_depth = {}  (1..64)",
+        config.projects.max_depth
+    );
+    println!(
+        "projects.follow_symlinks = {}  (true | false)",
+        config.projects.follow_symlinks
     );
     println!("\nOpen the synchronized form with `quirl config web <file>`.");
     Ok(0)
@@ -966,6 +993,30 @@ fn apply_web_form(
         required_form_value(form, "completion_min_chars")?,
         &session.config.completion.min_chars.to_string(),
     )?;
+    collect_web_change(
+        &mut replacements,
+        ConfigField::ProjectsDiscovery,
+        required_form_value(form, "projects_discovery")?,
+        &session.config.projects.discovery,
+    )?;
+    collect_web_change(
+        &mut replacements,
+        ConfigField::ProjectsRefreshIntervalSeconds,
+        required_form_value(form, "projects_refresh_interval_seconds")?,
+        &session.config.projects.refresh_interval_seconds.to_string(),
+    )?;
+    collect_web_change(
+        &mut replacements,
+        ConfigField::ProjectsMaxDepth,
+        required_form_value(form, "projects_max_depth")?,
+        &session.config.projects.max_depth.to_string(),
+    )?;
+    collect_web_change(
+        &mut replacements,
+        ConfigField::ProjectsFollowSymlinks,
+        required_form_value(form, "projects_follow_symlinks")?,
+        &session.config.projects.follow_symlinks.to_string(),
+    )?;
     if replacements.is_empty() {
         return Ok("No changes to save.".to_owned());
     }
@@ -1144,6 +1195,7 @@ fn render_form(session: &WebSession, notice: Option<&str>) -> String {
 <fieldset><legend>Prompt</legend><label for=\"prompt-symbols\">Symbols <select id=\"prompt-symbols\" name=\"prompt_symbols\"><option value=\"auto\"{symbols_auto}>auto — detect bundled Nerd symbols</option><option value=\"plain\"{symbols_plain}>plain — ASCII only</option><option value=\"unicode\"{symbols_unicode}>unicode</option><option value=\"nerd_font\"{symbols_nerd_font}>Nerd Font / Powerline</option></select></label><p><strong>Nerd Font</strong> icons are selected automatically in terminals with a documented bundled fallback. Choose nerd_font explicitly for patched fonts in other terminals. Segment lists use one name per line.</p><label for=\"prompt-left\">Left <textarea id=\"prompt-left\" name=\"prompt_left\">{prompt_left}</textarea></label><label for=\"prompt-right\">Right <textarea id=\"prompt-right\" name=\"prompt_right\">{prompt_right}</textarea></label><label for=\"prompt-transient\">Transient prompt <select id=\"prompt-transient\" name=\"prompt_transient\"><option value=\"true\"{transient_true}>true</option><option value=\"false\"{transient_false}>false</option></select></label></fieldset>
 <fieldset><legend>Interactive surface</legend><label for=\"ui-surface\">Surface <select id=\"ui-surface\" name=\"ui_surface\"><option value=\"auto\"{surface_auto}>auto</option><option value=\"rich\"{surface_rich}>rich</option><option value=\"simple\"{surface_simple}>simple</option></select></label><label for=\"ui-statusline-hints\">Status-line hints <select id=\"ui-statusline-hints\" name=\"ui_statusline_hints\"><option value=\"true\"{statusline_true}>true</option><option value=\"false\"{statusline_false}>false</option></select></label></fieldset>
 <fieldset><legend>Completion</legend><label for=\"completion-auto\">Open automatically <select id=\"completion-auto\" name=\"completion_auto\"><option value=\"true\"{completion_auto_true}>true</option><option value=\"false\"{completion_auto_false}>false</option></select></label><label for=\"completion-min-chars\">Minimum characters <input id=\"completion-min-chars\" name=\"completion_min_chars\" type=\"number\" min=\"0\" max=\"4096\" value=\"{completion_min_chars}\"></label></fieldset>
+<fieldset><legend>Projects</legend><label for=\"projects-discovery\">Discovery <select id=\"projects-discovery\" name=\"projects_discovery\"><option value=\"auto\"{projects_discovery_auto}>automatic</option><option value=\"disabled\"{projects_discovery_disabled}>disabled</option></select></label><p>Configured roots and exclusions are code-controlled; edit these path lists directly in <code>config.lua</code>.</p><label>Roots <textarea readonly>{projects_roots}</textarea></label><label>Exclusions <textarea readonly>{projects_excludes}</textarea></label><label for=\"projects-refresh\">Refresh interval (seconds) <input id=\"projects-refresh\" name=\"projects_refresh_interval_seconds\" type=\"number\" min=\"60\" max=\"86400\" value=\"{projects_refresh_interval_seconds}\"></label><label for=\"projects-max-depth\">Maximum depth <input id=\"projects-max-depth\" name=\"projects_max_depth\" type=\"number\" min=\"1\" max=\"64\" value=\"{projects_max_depth}\"></label><label for=\"projects-follow-symlinks\">Follow symlinks <select id=\"projects-follow-symlinks\" name=\"projects_follow_symlinks\"><option value=\"false\"{projects_follow_symlinks_false}>false — safer default</option><option value=\"true\"{projects_follow_symlinks_true}>true</option></select></label></fieldset>
 <button type=\"submit\">Save configuration</button></form></main></body></html>",
         token = html_escape(&session.token),
         revision = html_escape(&source_revision(&session.source)),
@@ -1178,6 +1230,16 @@ fn render_form(session: &WebSession, notice: Option<&str>) -> String {
         completion_auto_true = selected(&config.completion.auto.to_string(), "true"),
         completion_auto_false = selected(&config.completion.auto.to_string(), "false"),
         completion_min_chars = config.completion.min_chars,
+        projects_discovery_auto = selected(&config.projects.discovery, "auto"),
+        projects_discovery_disabled = selected(&config.projects.discovery, "disabled"),
+        projects_roots = html_escape(&config.projects.roots.join("\n")),
+        projects_excludes = html_escape(&config.projects.excludes.join("\n")),
+        projects_refresh_interval_seconds = config.projects.refresh_interval_seconds,
+        projects_max_depth = config.projects.max_depth,
+        projects_follow_symlinks_false =
+            selected(&config.projects.follow_symlinks.to_string(), "false"),
+        projects_follow_symlinks_true =
+            selected(&config.projects.follow_symlinks.to_string(), "true"),
     )
 }
 
@@ -1486,6 +1548,31 @@ fn session_token() -> Result<String, ShellError> {
 
 fn load(file: &Path) -> Result<QuirlConfig, ShellError> {
     LuaRuntime::new(LuaPolicy::config())?.load_config_file(file)
+}
+
+/// Load the active project-discovery policy without activating plugins.
+///
+/// A missing config file means the validated default policy. Any other read or
+/// validation failure is returned so an explicit refresh cannot accidentally
+/// replace configured-root observations with a default-home scan.
+pub(crate) fn load_discovered_projects() -> Result<ProjectsConfig, ShellError> {
+    let Some(directory) = crate::extensions::resolve_config_directory(
+        std::env::var_os("QUIRL_CONFIG_DIR"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    ) else {
+        return Ok(ProjectsConfig::default());
+    };
+    load_projects_from_directory(&directory)
+}
+
+fn load_projects_from_directory(directory: &Path) -> Result<ProjectsConfig, ShellError> {
+    let file = directory.join("config.lua");
+    match fs::metadata(&file) {
+        Ok(_) => load(&file).map(|config| config.projects),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ProjectsConfig::default()),
+        Err(error) => Err(file_error("inspect", &file, error)),
+    }
 }
 
 fn read_config_source(file: &Path) -> Result<String, ShellError> {
@@ -1944,10 +2031,16 @@ enum ConfigField {
     UiStatuslineHints,
     CompletionAuto,
     CompletionMinChars,
+    ProjectsDiscovery,
+    ProjectsRoots,
+    ProjectsExcludes,
+    ProjectsRefreshIntervalSeconds,
+    ProjectsMaxDepth,
+    ProjectsFollowSymlinks,
 }
 
 impl ConfigField {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 21] = [
         Self::EditorKeymap,
         Self::EditorSemanticHints,
         Self::EditorBanner,
@@ -1963,6 +2056,12 @@ impl ConfigField {
         Self::UiStatuslineHints,
         Self::CompletionAuto,
         Self::CompletionMinChars,
+        Self::ProjectsDiscovery,
+        Self::ProjectsRoots,
+        Self::ProjectsExcludes,
+        Self::ProjectsRefreshIntervalSeconds,
+        Self::ProjectsMaxDepth,
+        Self::ProjectsFollowSymlinks,
     ];
 
     const fn key(self) -> &'static str {
@@ -1982,6 +2081,12 @@ impl ConfigField {
             Self::UiStatuslineHints => "ui.statusline.hints",
             Self::CompletionAuto => "completion.auto",
             Self::CompletionMinChars => "completion.min_chars",
+            Self::ProjectsDiscovery => "projects.discovery",
+            Self::ProjectsRoots => "projects.roots",
+            Self::ProjectsExcludes => "projects.excludes",
+            Self::ProjectsRefreshIntervalSeconds => "projects.refresh_interval_seconds",
+            Self::ProjectsMaxDepth => "projects.max_depth",
+            Self::ProjectsFollowSymlinks => "projects.follow_symlinks",
         }
     }
 
@@ -2002,6 +2107,12 @@ impl ConfigField {
             "ui.statusline.hints" => Ok(Self::UiStatuslineHints),
             "completion.auto" => Ok(Self::CompletionAuto),
             "completion.min_chars" => Ok(Self::CompletionMinChars),
+            "projects.discovery" => Ok(Self::ProjectsDiscovery),
+            "projects.roots" => Ok(Self::ProjectsRoots),
+            "projects.excludes" => Ok(Self::ProjectsExcludes),
+            "projects.refresh_interval_seconds" => Ok(Self::ProjectsRefreshIntervalSeconds),
+            "projects.max_depth" => Ok(Self::ProjectsMaxDepth),
+            "projects.follow_symlinks" => Ok(Self::ProjectsFollowSymlinks),
             _ => Err(ShellError::new(
                 ErrorCode::InvalidArgument,
                 format!("`{key}` is not a recognized configuration field"),
@@ -2010,7 +2121,7 @@ impl ConfigField {
         }
     }
 
-    const KEYS: [&'static str; 15] = [
+    const KEYS: [&'static str; 21] = [
         "editor.keymap",
         "editor.semantic_hints",
         "editor.banner",
@@ -2026,6 +2137,12 @@ impl ConfigField {
         "ui.statusline.hints",
         "completion.auto",
         "completion.min_chars",
+        "projects.discovery",
+        "projects.roots",
+        "projects.excludes",
+        "projects.refresh_interval_seconds",
+        "projects.max_depth",
+        "projects.follow_symlinks",
     ];
 
     const fn parts(self) -> (&'static str, &'static str) {
@@ -2045,6 +2162,12 @@ impl ConfigField {
             Self::UiStatuslineHints => ("ui.statusline", "hints"),
             Self::CompletionAuto => ("completion", "auto"),
             Self::CompletionMinChars => ("completion", "min_chars"),
+            Self::ProjectsDiscovery => ("projects", "discovery"),
+            Self::ProjectsRoots => ("projects", "roots"),
+            Self::ProjectsExcludes => ("projects", "excludes"),
+            Self::ProjectsRefreshIntervalSeconds => ("projects", "refresh_interval_seconds"),
+            Self::ProjectsMaxDepth => ("projects", "max_depth"),
+            Self::ProjectsFollowSymlinks => ("projects", "follow_symlinks"),
         }
     }
 
@@ -2068,14 +2191,23 @@ impl ConfigField {
                 matches!(value, "auto" | "plain" | "unicode" | "nerd_font")
             }
             Self::UiTheme => valid_theme_name(value),
-            Self::UiThemes => false,
+            Self::UiThemes | Self::ProjectsRoots | Self::ProjectsExcludes => false,
             Self::UiSurface => matches!(value, "auto" | "rich" | "simple"),
             Self::CompletionMinChars => value.parse::<u16>().is_ok_and(|value| value <= 4096),
+            Self::ProjectsDiscovery => matches!(value, "auto" | "disabled"),
+            Self::ProjectsRefreshIntervalSeconds => value.parse::<u32>().is_ok_and(|value| {
+                (MIN_PROJECT_REFRESH_INTERVAL_SECONDS..=MAX_PROJECT_REFRESH_INTERVAL_SECONDS)
+                    .contains(&value)
+            }),
+            Self::ProjectsMaxDepth => value
+                .parse::<u16>()
+                .is_ok_and(|value| (1..=MAX_PROJECT_DISCOVERY_DEPTH).contains(&value)),
             Self::EditorSemanticHints
             | Self::PickerPreview
             | Self::PromptTransient
             | Self::UiStatuslineHints
-            | Self::CompletionAuto => matches!(value, "true" | "false"),
+            | Self::CompletionAuto
+            | Self::ProjectsFollowSymlinks => matches!(value, "true" | "false"),
             Self::PromptLeft | Self::PromptRight => serde_json::from_str::<Vec<String>>(value)
                 .map(|values| values.iter().all(|item| valid_prompt_item(item)))
                 .unwrap_or(false),
@@ -2092,11 +2224,17 @@ impl ConfigField {
                 Self::UiThemes => "custom theme definitions edited directly in Lua",
                 Self::UiSurface => "auto, rich, or simple",
                 Self::CompletionMinChars => "an integer from 0 through 4096",
+                Self::ProjectsDiscovery => "auto or disabled",
+                Self::ProjectsRoots => "project roots edited directly in Lua",
+                Self::ProjectsExcludes => "project exclusions edited directly in Lua",
+                Self::ProjectsRefreshIntervalSeconds => "an integer from 60 through 86400 seconds",
+                Self::ProjectsMaxDepth => "an integer from 1 through 64",
                 Self::EditorSemanticHints
                 | Self::PickerPreview
                 | Self::PromptTransient
                 | Self::UiStatuslineHints
-                | Self::CompletionAuto => "true or false",
+                | Self::CompletionAuto
+                | Self::ProjectsFollowSymlinks => "true or false",
                 Self::PromptLeft | Self::PromptRight => {
                     "a JSON array of non-empty prompt segment names"
                 }
@@ -2113,7 +2251,8 @@ impl ConfigField {
             | Self::PickerLayout
             | Self::PromptSymbols
             | Self::UiTheme
-            | Self::UiSurface => {
+            | Self::UiSurface
+            | Self::ProjectsDiscovery => {
                 format!("\"{value}\"")
             }
             Self::UiThemes => {
@@ -2123,12 +2262,22 @@ impl ConfigField {
                 )
                 .with_help("Edit custom theme definitions directly in config.lua"));
             }
+            Self::ProjectsRoots | Self::ProjectsExcludes => {
+                return Err(ShellError::new(
+                    ErrorCode::InvalidArgument,
+                    format!("{} is code-controlled", self.key()),
+                )
+                .with_help("Edit project path lists directly in config.lua"));
+            }
             Self::EditorSemanticHints
             | Self::PickerPreview
             | Self::PromptTransient
             | Self::UiStatuslineHints
             | Self::CompletionAuto
-            | Self::CompletionMinChars => value.to_owned(),
+            | Self::CompletionMinChars
+            | Self::ProjectsRefreshIntervalSeconds
+            | Self::ProjectsMaxDepth
+            | Self::ProjectsFollowSymlinks => value.to_owned(),
             Self::PromptLeft | Self::PromptRight => {
                 let values = serde_json::from_str::<Vec<String>>(value).map_err(|_| {
                     ShellError::new(ErrorCode::InvalidArgument, "invalid prompt segment list")
@@ -2156,6 +2305,18 @@ impl ConfigField {
             Self::UiStatuslineHints => config.ui.statusline.hints.to_string(),
             Self::CompletionAuto => config.completion.auto.to_string(),
             Self::CompletionMinChars => config.completion.min_chars.to_string(),
+            Self::ProjectsDiscovery => config.projects.discovery.clone(),
+            Self::ProjectsRoots => {
+                serde_json::to_string(&config.projects.roots).unwrap_or_default()
+            }
+            Self::ProjectsExcludes => {
+                serde_json::to_string(&config.projects.excludes).unwrap_or_default()
+            }
+            Self::ProjectsRefreshIntervalSeconds => {
+                config.projects.refresh_interval_seconds.to_string()
+            }
+            Self::ProjectsMaxDepth => config.projects.max_depth.to_string(),
+            Self::ProjectsFollowSymlinks => config.projects.follow_symlinks.to_string(),
         }
     }
 }
@@ -2251,22 +2412,26 @@ fn patch_literal(
         | ConfigField::PickerLayout
         | ConfigField::PromptSymbols
         | ConfigField::UiTheme
-        | ConfigField::UiSurface => {
+        | ConfigField::UiSurface
+        | ConfigField::ProjectsDiscovery => {
             matches!(
                 tokens.get(*value).map(|token| &token.kind),
                 Some(TokenKind::String)
             )
         }
-        ConfigField::UiThemes => false,
+        ConfigField::UiThemes | ConfigField::ProjectsRoots | ConfigField::ProjectsExcludes => false,
         ConfigField::EditorSemanticHints
         | ConfigField::PickerPreview
         | ConfigField::PromptTransient
         | ConfigField::UiStatuslineHints
-        | ConfigField::CompletionAuto => matches!(
+        | ConfigField::CompletionAuto
+        | ConfigField::ProjectsFollowSymlinks => matches!(
             tokens.get(*value).map(|token| &token.kind),
             Some(TokenKind::Identifier(value)) if value == "true" || value == "false"
         ),
-        ConfigField::CompletionMinChars => matches!(
+        ConfigField::CompletionMinChars
+        | ConfigField::ProjectsRefreshIntervalSeconds
+        | ConfigField::ProjectsMaxDepth => matches!(
             tokens.get(*value).map(|token| &token.kind),
             Some(TokenKind::Other)
         ),
@@ -2574,10 +2739,9 @@ return config
     }
 
     fn test_directory() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        static NEXT_TEST_DIRECTORY: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let nonce = NEXT_TEST_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!("quirl-config-test-{}-{nonce}", std::process::id()))
     }
 
@@ -2589,6 +2753,44 @@ return config
         assert!(patched.contains("render = function() return \"ok\" end"));
         assert!(patched.contains("-- editor note"));
         assert_eq!(patched.matches("keymap =").count(), 1);
+    }
+
+    #[test]
+    fn explicit_project_refresh_loads_configured_roots_and_rejects_invalid_config() {
+        let directory = test_directory();
+        fs::create_dir_all(&directory).unwrap();
+        assert_eq!(
+            load_projects_from_directory(&directory).unwrap(),
+            ProjectsConfig::default()
+        );
+
+        let file = directory.join("config.lua");
+        fs::write(
+            &file,
+            r#"return quirl.config {
+  projects = {
+    discovery = "auto",
+    roots = { "/srv/source" },
+    excludes = { "/srv/source/vendor" },
+    refresh_interval_seconds = 120,
+    max_depth = 4,
+    follow_symlinks = false,
+  },
+}"#,
+        )
+        .unwrap();
+        let projects = load_projects_from_directory(&directory).unwrap();
+        assert_eq!(projects.roots, ["/srv/source"]);
+        assert_eq!(projects.excludes, ["/srv/source/vendor"]);
+        assert_eq!(projects.refresh_interval_seconds, 120);
+
+        fs::write(
+            &file,
+            "return quirl.config { projects = { max_depth = 0 } }",
+        )
+        .unwrap();
+        assert!(load_projects_from_directory(&directory).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2906,6 +3108,42 @@ return config
         assert!(!literal.contains(&"editor.keymap"));
         assert!(code_controlled.contains(&"editor.keymap"));
         assert!(code_controlled.contains(&"ui.themes"));
+        assert!(code_controlled.contains(&"projects.roots"));
+        assert!(code_controlled.contains(&"projects.excludes"));
+    }
+
+    #[test]
+    fn project_scalar_fields_are_bounded_literals_while_path_lists_are_code_controlled() {
+        assert_eq!(
+            ConfigField::ProjectsDiscovery
+                .lua_literal("disabled")
+                .unwrap(),
+            "\"disabled\""
+        );
+        assert!(
+            ConfigField::ProjectsDiscovery
+                .lua_literal("manual")
+                .is_err()
+        );
+        assert!(
+            ConfigField::ProjectsRefreshIntervalSeconds
+                .lua_literal("59")
+                .is_err()
+        );
+        assert_eq!(
+            ConfigField::ProjectsMaxDepth.lua_literal("64").unwrap(),
+            "64"
+        );
+        assert!(ConfigField::ProjectsMaxDepth.lua_literal("65").is_err());
+        assert!(ConfigField::ProjectsRoots.lua_literal("[]").is_err());
+        assert!(ConfigField::ProjectsExcludes.lua_literal("[]").is_err());
+
+        let source = r#"return quirl.config {
+  projects = { discovery = "auto", roots = {}, excludes = {}, refresh_interval_seconds = 900, max_depth = 8, follow_symlinks = false },
+}"#;
+        let patched = patch_literal(source, ConfigField::ProjectsMaxDepth, "12").unwrap();
+        assert!(patched.contains("max_depth = 12"));
+        assert!(patch_literal(source, ConfigField::ProjectsRoots, "{ \"~/Code\" }").is_err());
     }
 
     #[test]
@@ -2970,6 +3208,13 @@ return config
             ("ui_statusline_hints".to_owned(), "true".to_owned()),
             ("completion_auto".to_owned(), "true".to_owned()),
             ("completion_min_chars".to_owned(), "1".to_owned()),
+            ("projects_discovery".to_owned(), "auto".to_owned()),
+            (
+                "projects_refresh_interval_seconds".to_owned(),
+                "900".to_owned(),
+            ),
+            ("projects_max_depth".to_owned(), "8".to_owned()),
+            ("projects_follow_symlinks".to_owned(), "false".to_owned()),
         ])
     }
 
@@ -3001,6 +3246,9 @@ return config
         assert!(page.contains("value=\"custom-preview\""));
         assert!(page.contains("ui_surface"));
         assert!(page.contains("completion_min_chars"));
+        assert!(page.contains("projects_discovery"));
+        assert!(page.contains("projects_refresh_interval_seconds"));
+        assert!(page.contains("Configured roots and exclusions are code-controlled"));
         assert!(!page.contains("Cache-Control"));
         assert!(!page.contains("<script"));
     }

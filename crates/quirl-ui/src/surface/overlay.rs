@@ -71,7 +71,16 @@ impl PickerOverlay {
         items: Vec<CompletionItem>,
         label: &'static str,
     ) -> Vec<CompletionItem> {
-        let visible = self.open_with_query(items, label, false, "");
+        self.open_bottom_anchored_with_query(items, label, "")
+    }
+
+    pub(super) fn open_bottom_anchored_with_query(
+        &mut self,
+        items: Vec<CompletionItem>,
+        label: &'static str,
+        query: &str,
+    ) -> Vec<CompletionItem> {
+        let visible = self.open_with_query(items, label, false, query);
         self.bottom_anchored = true;
         visible
     }
@@ -282,7 +291,7 @@ pub fn items(
                 .map_or(0, |index| index.saturating_add(1));
             directory_items(kind, Path::new("."), start, cursor)
         }
-        PickerKind::Jobs | PickerKind::Data => Vec::new(),
+        PickerKind::Projects | PickerKind::Jobs | PickerKind::Data => Vec::new(),
     }
 }
 
@@ -328,6 +337,7 @@ const fn picker_item_kind(kind: CompletionKind) -> PickerItemKind {
     match kind {
         CompletionKind::History => PickerItemKind::History,
         CompletionKind::Path => PickerItemKind::File,
+        CompletionKind::Directory => PickerItemKind::Directory,
         CompletionKind::Job => PickerItemKind::Job,
         CompletionKind::Data => PickerItemKind::Data,
         CompletionKind::Command | CompletionKind::Flag | CompletionKind::Value => {

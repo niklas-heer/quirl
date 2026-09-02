@@ -24,6 +24,8 @@ static HELD_LOCK_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 pub(crate) enum CoordinationKind {
     /// Coordinate catalog indexing, encoding, and atomic publication.
     Catalog,
+    /// Coordinate mutable project-index discovery and publication.
+    Project,
     /// Coordinate model validation, download, quarantine, and installation.
     #[cfg(test)]
     Model,
@@ -35,6 +37,7 @@ impl CoordinationKind {
     fn label(self) -> &'static str {
         match self {
             Self::Catalog => "command-database",
+            Self::Project => "project-discovery",
             #[cfg(test)]
             Self::Model => "AI-model",
             Self::Asset => "runtime-asset",

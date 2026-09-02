@@ -1,6 +1,6 @@
 ---@type quirl.Config
 local config = quirl.config {
-  schema_version = 4,
+  schema_version = 5,
   editor = { keymap = "emacs", semantic_hints = true, banner = "full" },
   picker = { layout = "adaptive", preview = true },
   prompt = {

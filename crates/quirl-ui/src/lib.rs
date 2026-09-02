@@ -23,10 +23,12 @@ pub use surface::{
     InteractiveHistoryEntry, InteractiveIntentPlanner, InteractiveIntentPlannerUpdate,
     InteractiveIntentTokenUsage, InteractiveJobAction, InteractiveJobSnapshot,
     InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
-    InteractivePanelSnapshot, InteractiveRuntimeSnapshot, InteractiveSignal, JOB_ACTION_ITEMS_MAX,
-    JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
-    PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX, RichSurface, SurfaceKind, select_surface,
-    set_product_identity,
+    InteractivePanelSnapshot, InteractiveProjectEntry, InteractiveProjectProvider,
+    InteractiveProjectSnapshot, InteractiveRuntimeSnapshot, InteractiveSignal,
+    JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX,
+    PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX, PROJECT_FIELD_BYTES_MAX,
+    PROJECT_ITEMS_MAX, PROJECT_RETAINED_BYTES_MAX, PROJECT_STATUS_BYTES_MAX, RichSurface,
+    SurfaceKind, select_surface, set_product_identity,
 };
 
 use crossterm::{

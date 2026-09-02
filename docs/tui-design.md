@@ -554,6 +554,22 @@ does not perform another screen transition. The existing terminal guard retains
 the shared alternate screen across ordinary foreground captured execution and releases it
 for suspension, explicit compatibility handoff, fatal error cleanup, or exit.
 
+`Alt-Q g` opens the Git-project picker from the last complete bounded
+`projects.sqlite3` snapshot. Accepting a repository returns its exact path to
+the composition root, which revalidates the directory and `.git` marker before
+changing directory while preserving unfinished input. The picker never waits
+for discovery: one session-owned worker refreshes after first paint, on a
+bounded periodic interval, and after coalesced directory, Git-command,
+configuration, and stale-picker hints. Automatic home discovery prunes found
+repositories, symlinks, other filesystems, hidden/cache/application-data trees,
+and configured exclusions. Partial or failed scans retain the previous complete
+generation. Before fuzzy matching, the cached snapshot is ordered by the newest
+of its last Quirl open and bounded repository-activity timestamp, then by open
+count and stable path. An empty query therefore presents recent active work
+first; with a query, fuzzy relevance remains primary and cached activity order
+breaks equal-score ties. Selecting a repository updates its Quirl open signals.
+See [ADR 0030](decisions/0030-bounded-project-discovery.md).
+
 The picker engine, ranking, and typed-value return stay in `quirl-picker`;
 the surface uses it through the `PickerRanker` composition adapter. Source
 items are capped at 4 096 and 2 MiB retained data, queries at 1 024 bytes, and

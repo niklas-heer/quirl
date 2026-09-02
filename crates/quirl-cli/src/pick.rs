@@ -1,6 +1,8 @@
+use crate::projects;
 use clap::{Args, ValueEnum};
 use quirl_catalog::Catalog;
 use quirl_core::{ErrorCode, ShellError, escape_json_terminal_controls, escape_terminal_controls};
+use quirl_lua::ProjectsConfig;
 use quirl_picker::{ItemKind, PickItem, Picker};
 use std::{
     fs,
@@ -33,11 +35,24 @@ pub struct PickCommand {
     /// Root for the file source.
     #[arg(long, default_value = ".")]
     root: PathBuf,
+    /// Refresh Git projects before selecting instead of reading the cache.
+    #[arg(long)]
+    refresh: bool,
 }
 
 impl PickCommand {
     pub fn wants_json(&self) -> bool {
         matches!(self.format, PickFormat::Json)
+    }
+
+    /// Whether this invocation needs the evaluated project configuration.
+    pub fn wants_project_refresh(&self) -> bool {
+        matches!(self.source, PickSource::Projects) && self.refresh
+    }
+
+    /// Whether this invocation needs the composed command catalog.
+    pub fn wants_catalog(&self) -> bool {
+        matches!(self.source, PickSource::Actions)
     }
 }
 
@@ -47,6 +62,7 @@ enum PickSource {
     History,
     Files,
     Actions,
+    Projects,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -55,12 +71,23 @@ enum PickFormat {
     Json,
 }
 
-pub fn execute(command: PickCommand, catalog: &Catalog) -> Result<i32, ShellError> {
+pub fn execute(
+    command: PickCommand,
+    catalog: Option<&Catalog>,
+    projects_config: Option<&ProjectsConfig>,
+) -> Result<i32, ShellError> {
     let items = match command.source {
         PickSource::Stdin => stdin_items()?,
         PickSource::History => history_items()?,
         PickSource::Files => file_items(&command.root)?,
-        PickSource::Actions => action_items(catalog),
+        PickSource::Actions => action_items(catalog.ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::Validation,
+                "the actions picker requires the composed command catalog",
+            )
+            .with_help("Retry after loading the installed command catalog")
+        })?),
+        PickSource::Projects => project_items(command.refresh, projects_config)?,
     };
     let limit = if command.multi {
         command.limit.max(1)
@@ -214,6 +241,51 @@ fn action_items(catalog: &Catalog) -> Vec<PickItem> {
         .collect()
 }
 
+fn project_items(
+    refresh: bool,
+    projects_config: Option<&ProjectsConfig>,
+) -> Result<Vec<PickItem>, ShellError> {
+    let snapshot = if refresh {
+        let projects_config = projects_config.ok_or_else(|| {
+            ShellError::new(
+                ErrorCode::Validation,
+                "project refresh requires the active project configuration",
+            )
+            .with_help("Retry after loading the active config.lua project settings")
+        })?;
+        let config = projects::ProjectDiscoveryConfig::from_config(projects_config)?.ok_or_else(
+            || {
+                ShellError::new(
+                    ErrorCode::Validation,
+                    "project discovery is disabled by the active configuration",
+                )
+                .with_help(
+                    "Set projects.discovery to `auto`, or retry without --refresh to read the cache",
+                )
+            },
+        )?;
+        projects::refresh_default(&config)?
+    } else {
+        projects::cached_default()?
+    };
+    Ok(snapshot
+        .repositories
+        .into_iter()
+        .enumerate()
+        .map(|(index, repository)| {
+            let path = repository.path.to_string_lossy().into_owned();
+            PickItem {
+                id: format!("project-{index}"),
+                kind: ItemKind::Directory,
+                label: repository.name.to_string_lossy().into_owned(),
+                description: repository.inferred_root.to_string_lossy().into_owned(),
+                preview: Some(path.clone()),
+                value: serde_json::Value::String(path),
+            }
+        })
+        .collect())
+}
+
 fn text_item(index: usize, kind: ItemKind, value: &str) -> PickItem {
     PickItem {
         id: index.to_string(),
@@ -255,6 +327,33 @@ mod tests {
         let items = action_items(&Catalog::builtin());
         let selected = Picker.select(&items, "'index 'explain", 1);
         assert_eq!(selected[0].value, "quirl index explain");
+    }
+
+    #[test]
+    fn only_explicit_project_refreshes_load_project_configuration() {
+        let command = PickCommand {
+            source: PickSource::Projects,
+            query: String::new(),
+            multi: false,
+            limit: 20,
+            format: PickFormat::Text,
+            root: PathBuf::from("."),
+            refresh: true,
+        };
+        assert!(command.wants_project_refresh());
+
+        let cached = PickCommand {
+            refresh: false,
+            ..command
+        };
+        assert!(!cached.wants_project_refresh());
+        assert!(!cached.wants_catalog());
+
+        let actions = PickCommand {
+            source: PickSource::Actions,
+            ..cached
+        };
+        assert!(actions.wants_catalog());
     }
 
     #[test]
