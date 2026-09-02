@@ -16,7 +16,8 @@ bodies fail without dispatch. It implements:
 
 - `initialize`, `initialized`, `shutdown`, and `exit`
 - `textDocument/didOpen`, `didChange`, and `didClose` with full-document sync
-- `textDocument/completion`, `hover`, `signatureHelp`, and `diagnostic`
+- `textDocument/completion`, `completionItem/resolve`, `hover`,
+  `signatureHelp`, and `diagnostic`
 - `quirl/moduleDocs`, which returns generated Markdown for the Lua host module
   and installed command catalog
 
@@ -31,6 +32,14 @@ versioned `Catalog` used by the REPL and `quirl complete`. The Phase 2 service
 also reports deterministic structural diagnostics for mismatched delimiters,
 unterminated strings, and empty pipeline stages. It does not spawn commands or
 resolve ambient shell state.
+
+Native completion preserves the catalog's fuzzy ranking and returns exact
+UTF-16 text edits for command paths, options, bundled short flags, and static
+argument values. A response retains at most 200 items and 256 KiB of encoded
+JSON; truncated responses set `isIncomplete`. Documentation and detail are
+resolved lazily only when the client advertises support for both properties.
+Other clients receive them in the initial response, using Markdown or plain
+text according to the client's declared formats.
 
 The CLI composition root supplies the complete native analyzer to the LSP.
 Command blocks continue to use `quirl-syntax`; inline and explicit data bodies
@@ -61,6 +70,77 @@ open or change preserves the prior text, version, and accounting. Close,
 shutdown, and exit release retained state. These are UTF-8 byte limits, and
 limit failures include configured and observed usage where it is safe to do
 so.
+
+## Neovim 0.11 and newer
+
+The supported Neovim runtime in `editors/neovim` registers `quirl` as the
+filetype for `.qrl`, `.quirl`, and `.🌀` files, then enables a native
+Neovim LSP configuration that launches `quirl lsp`. When the server advertises
+completion, a client-local `on_attach` callback enables Neovim's builtin
+completion with automatic triggering on Quirl's advertised trigger characters.
+It does not create a global `LspAttach` autocmd or depend on `nvim-lspconfig` or
+a completion plugin.
+
+First install `quirl` and confirm that Neovim can find the same executable as
+your shell:
+
+```console
+quirl --version
+nvim --clean --headless '+lua print(vim.fn.exepath("quirl"))' +qa
+```
+
+To use the integration from a source checkout, expose the runtime directory as
+a native Neovim package. Replace `/path/to/quirl` with the absolute checkout
+path; replace the data directory if `:echo stdpath('data')` reports a different
+location:
+
+```console
+mkdir -p "${XDG_DATA_HOME:-$HOME/.local/share}/nvim/site/pack/quirl/start"
+ln -s /path/to/quirl/editors/neovim \
+  "${XDG_DATA_HOME:-$HOME/.local/share}/nvim/site/pack/quirl/start/quirl"
+```
+
+A plugin manager that supports local plugins can add
+`/path/to/quirl/editors/neovim` to Neovim's `runtimepath` instead. The package
+enables the server automatically; no `vim.lsp.config` entry is required in
+`init.lua`.
+
+Open any of the supported native file extensions and verify the integration:
+
+```vim
+:set filetype?
+:checkhealth vim.lsp
+:lua =vim.lsp.get_clients({ bufnr = 0 })
+```
+
+The filetype should be `quirl`, and the buffer should have a client named
+`quirl`. Neovim publishes diagnostics automatically and requests builtin
+completion after `.`, `-`, and space, the trigger characters advertised by the
+server. When the server returns candidates, use `CTRL-Y` to accept an offered
+item. Use `CTRL-X CTRL-O` in Insert mode to request completion manually, `K`
+for hover, and `CTRL-S` in Insert mode for signature help. These are Neovim's
+builtin LSP behaviors and may be replaced by the user's configuration.
+
+To disable the packaged automatic completion or replace its attachment
+behavior, define a higher-precedence callback in `init.lua` before the package
+loads:
+
+```lua
+vim.lsp.config("quirl", {
+  on_attach = function() end,
+})
+```
+
+The runtime `lsp/quirl.lua` file is the low-precedence default, so a custom
+`on_attach` callback in the user's named `quirl` configuration replaces the
+packaged callback without changing filetype detection or server startup.
+
+The current Quirl server provides completion, hover, signature help, and
+diagnostics. The Neovim package does not yet add Quirl syntax highlighting,
+semantic tokens, formatting, navigation, rename, code actions, or inlay hints.
+If the client does not attach, check that Neovim is version 0.11 or newer and
+that `:echo executable('quirl')` returns `1`; then inspect
+`:checkhealth vim.lsp` and `:messages` for the process startup error.
 
 ## Custom module documentation request
 
