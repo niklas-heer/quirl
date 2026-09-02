@@ -13,7 +13,7 @@
     )
 )]
 
-use quirl_catalog::{Catalog, CommandSpec};
+use quirl_catalog::{Catalog, CommandSpec, CompletionSource, ContextualCompletion};
 use quirl_core::{ErrorCode, ShellError};
 use quirl_lua::{HOST_API, LuaRuntime};
 use quirl_syntax::check_script;
@@ -35,6 +35,13 @@ const MAX_LANGUAGE_ID_BYTES: usize = 64;
 const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 const MAX_RETAINED_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTENT_CHANGES: usize = 1;
+const MAX_COMPLETION_ITEMS: usize = 200;
+const MAX_COMPLETION_RESULT_BYTES: usize = 256 * 1024;
+const MAX_COMPLETION_RESOLVE_DATA_BYTES: usize = 1024;
+const MAX_COMPLETION_RESOLVE_ITEM_BYTES: usize = 64 * 1024;
+const MAX_COMPLETION_DOCUMENTATION_BYTES: usize = 32 * 1024;
+const MAX_COMPLETION_COMMAND_ID_BYTES: usize = 512;
+const COMPLETION_RESOLVE_DATA_VERSION: u64 = 1;
 
 #[derive(Debug, Clone)]
 struct Document {
@@ -66,6 +73,8 @@ pub struct LanguageService {
     native_analyzer: Option<NativeAnalyzer>,
     documents: HashMap<String, Document>,
     retained_document_bytes: usize,
+    defer_completion_details: bool,
+    completion_documentation_kind: &'static str,
     shutdown: bool,
     exit: bool,
 }
@@ -84,6 +93,8 @@ impl LanguageService {
             native_analyzer: None,
             documents: HashMap::new(),
             retained_document_bytes: 0,
+            defer_completion_details: false,
+            completion_documentation_kind: "markdown",
             shutdown: false,
             exit: false,
         }
@@ -167,7 +178,14 @@ impl LanguageService {
             .with_help("Send `exit`, then start a new language-service process"));
         }
         match method {
-            "initialize" => Ok(Dispatch::Result(initialize_result())),
+            "initialize" => {
+                let (defer_details, documentation_kind) = completion_client_capabilities(&params);
+                self.defer_completion_details = defer_details;
+                self.completion_documentation_kind = documentation_kind;
+                Ok(Dispatch::Result(initialize_result(
+                    self.defer_completion_details,
+                )))
+            }
             "initialized" => Ok(Dispatch::None),
             "shutdown" => {
                 self.documents.clear();
@@ -185,6 +203,7 @@ impl LanguageService {
             "textDocument/didChange" => self.did_change(&params),
             "textDocument/didClose" => self.did_close(&params),
             "textDocument/completion" => self.completion(&params),
+            "completionItem/resolve" => self.resolve_completion(&params),
             "textDocument/hover" => self.hover(&params),
             "textDocument/signatureHelp" => self.signature_help(&params),
             "textDocument/diagnostic" => self.document_diagnostic(&params),
@@ -312,12 +331,82 @@ impl LanguageService {
         let items = if is_lua(uri, document) {
             lua_completions(prefix)
         } else {
-            quirl_completions(&self.catalog, &document.text, offset, prefix)
+            quirl_completions(
+                &self.catalog,
+                &document.text,
+                offset,
+                self.defer_completion_details,
+                self.completion_documentation_kind,
+            )?
         };
-        Ok(Dispatch::Result(json!({
-            "isIncomplete": false,
-            "items": items,
-        })))
+        Ok(Dispatch::Result(bounded_completion_result(items)?))
+    }
+
+    fn resolve_completion(&self, params: &Value) -> Result<Dispatch, ShellError> {
+        let encoded_params = serde_json::to_vec(params)
+            .map_err(|_| invalid_completion_resolve("completion item is not serializable"))?;
+        validate_byte_limit(
+            "completion item to resolve",
+            encoded_params.len(),
+            MAX_COMPLETION_RESOLVE_ITEM_BYTES,
+        )?;
+        if params.get("data").is_none() {
+            return Ok(Dispatch::Result(params.clone()));
+        }
+        let (command_id, argument_index) = completion_resolve_key(params)?;
+        let mut commands = self
+            .catalog
+            .commands
+            .iter()
+            .filter(|command| command.id == command_id);
+        let command = commands.next().ok_or_else(|| {
+            invalid_completion_resolve("completion command is not in the catalog")
+        })?;
+        if commands.next().is_some() {
+            return Err(invalid_completion_resolve(
+                "completion command identifier is ambiguous",
+            ));
+        }
+
+        let (detail, documentation) = if let Some(index) = argument_index {
+            let argument = command.options.get(index).ok_or_else(|| {
+                invalid_completion_resolve("completion argument is not in the catalog command")
+            })?;
+            (
+                format!("{} · {}", argument.names.join(", "), argument.value_type),
+                argument.documentation.clone(),
+            )
+        } else {
+            (command.signature.clone(), command_documentation(command))
+        };
+        validate_byte_limit(
+            "resolved completion detail",
+            detail.len(),
+            MAX_COMPLETION_DOCUMENTATION_BYTES,
+        )?;
+        validate_byte_limit(
+            "resolved completion documentation",
+            documentation.len(),
+            MAX_COMPLETION_DOCUMENTATION_BYTES,
+        )?;
+
+        let mut resolved = params.clone();
+        let object = resolved
+            .as_object_mut()
+            .ok_or_else(|| invalid_completion_resolve("completion item must be an object"))?;
+        object.insert("detail".to_owned(), Value::String(detail));
+        object.insert(
+            "documentation".to_owned(),
+            json!({"kind": self.completion_documentation_kind, "value": documentation}),
+        );
+        let encoded_result = serde_json::to_vec(&resolved)
+            .map_err(|_| invalid_completion_resolve("resolved completion is not serializable"))?;
+        validate_byte_limit(
+            "resolved completion item",
+            encoded_result.len(),
+            MAX_COMPLETION_RESOLVE_ITEM_BYTES,
+        )?;
+        Ok(Dispatch::Result(resolved))
     }
 
     fn hover(&self, params: &Value) -> Result<Dispatch, ShellError> {
@@ -419,11 +508,14 @@ fn serve_session<R: BufRead, W: Write>(
     Ok(())
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(resolve_provider: bool) -> Value {
     json!({
         "capabilities": {
             "textDocumentSync": {"openClose": true, "change": 1},
-            "completionProvider": {"triggerCharacters": [".", "-", " "]},
+            "completionProvider": {
+                "triggerCharacters": [".", "-", " "],
+                "resolveProvider": resolve_provider
+            },
             "hoverProvider": true,
             "signatureHelpProvider": {"triggerCharacters": ["(", ",", " "]},
             "diagnosticProvider": {
@@ -434,6 +526,41 @@ fn initialize_result() -> Value {
         },
         "serverInfo": {"name": "quirl-lsp", "version": env!("CARGO_PKG_VERSION")}
     })
+}
+
+fn completion_client_capabilities(params: &Value) -> (bool, &'static str) {
+    let completion_item = params
+        .get("capabilities")
+        .and_then(|value| value.get("textDocument"))
+        .and_then(|value| value.get("completion"))
+        .and_then(|value| value.get("completionItem"));
+    let properties = completion_item
+        .and_then(|value| value.get("resolveSupport"))
+        .and_then(|value| value.get("properties"))
+        .and_then(Value::as_array);
+    let resolves_detail = properties.is_some_and(|properties| {
+        ["detail", "documentation"].iter().all(|required| {
+            properties
+                .iter()
+                .any(|property| property.as_str() == Some(required))
+        })
+    });
+    let supports_markdown = completion_item
+        .and_then(|value| value.get("documentationFormat"))
+        .and_then(Value::as_array)
+        .is_some_and(|formats| {
+            formats
+                .iter()
+                .any(|format| format.as_str() == Some("markdown"))
+        });
+    (
+        resolves_detail,
+        if supports_markdown {
+            "markdown"
+        } else {
+            "plaintext"
+        },
+    )
 }
 
 fn diagnostics(
@@ -542,40 +669,279 @@ fn lua_completions(prefix: &str) -> Vec<Value> {
         .collect()
 }
 
-fn quirl_completions(catalog: &Catalog, text: &str, offset: usize, prefix: &str) -> Vec<Value> {
-    let line = current_line_before(text, offset).trim_start();
-    let prefix = prefix.to_ascii_lowercase();
-    let mut items = Vec::new();
+fn quirl_completions(
+    catalog: &Catalog,
+    text: &str,
+    offset: usize,
+    defer_details: bool,
+    documentation_kind: &str,
+) -> Result<Vec<Value>, ShellError> {
+    // Retain one sentinel candidate so the LSP can report `isIncomplete`
+    // without materializing the remainder of a broad catalog.
+    let candidates = catalog.complete_bounded(text, offset, MAX_COMPLETION_ITEMS + 1);
+    let Some(first) = candidates.first() else {
+        return Ok(Vec::new());
+    };
+    let replace_start = first.completion.replace_start;
+    let replace_end = first.completion.replace_end;
+    if candidates.iter().any(|candidate| {
+        candidate.completion.replace_start != replace_start
+            || candidate.completion.replace_end != replace_end
+    }) || replace_start > offset
+        || offset > replace_end
+    {
+        return Err(invalid_completion_range(
+            text,
+            replace_start,
+            replace_end,
+            offset,
+        ));
+    }
+    let (start_line, start_character) = offset_to_position(text, replace_start)
+        .ok_or_else(|| invalid_completion_range(text, replace_start, replace_end, offset))?;
+    let (end_line, end_character) = offset_to_position(text, replace_end)
+        .ok_or_else(|| invalid_completion_range(text, replace_start, replace_end, offset))?;
+    let (cursor_line, _) = offset_to_position(text, offset)
+        .ok_or_else(|| invalid_completion_range(text, replace_start, replace_end, offset))?;
+    if start_line != end_line || end_line != cursor_line {
+        return Err(invalid_completion_range(
+            text,
+            replace_start,
+            replace_end,
+            offset,
+        ));
+    }
+    let edit_range = json!({
+        "start": {"line": start_line, "character": start_character},
+        "end": {"line": end_line, "character": end_character},
+    });
+
+    let mut command_by_id = HashMap::new();
     for command in &catalog.commands {
-        if prefix.is_empty()
-            || command.path.to_ascii_lowercase().starts_with(&prefix)
-            || command.path.starts_with(line)
-        {
-            items.push(json!({
-                "label": command.path,
-                "kind": 3,
-                "detail": command.signature,
-                "documentation": {"kind": "markdown", "value": command_documentation(command)},
-                "insertText": command.path,
-            }));
-        }
-        if command_starts_line(command, line) {
-            for option in &command.options {
-                if let Some(name) = option.names.first()
-                    && (prefix.is_empty() || name.to_ascii_lowercase().starts_with(&prefix))
-                {
-                    items.push(json!({
-                        "label": name,
-                        "kind": 5,
-                        "detail": option.value_type,
-                        "documentation": {"kind": "markdown", "value": option.documentation},
-                        "insertText": name,
-                    }));
+        command_by_id
+            .entry(command.id.as_str())
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(command));
+    }
+
+    candidates
+        .into_iter()
+        .enumerate()
+        .map(|(rank, candidate)| {
+            let ContextualCompletion {
+                completion,
+                command_id,
+                argument_index,
+            } = candidate;
+            let command = command_by_id
+                .get(command_id.as_str())
+                .and_then(|entry| *entry);
+            let argument = command
+                .and_then(|command| argument_index.and_then(|index| command.options.get(index)));
+            let kind = if argument_index.is_none() {
+                14
+            } else if argument.is_some_and(|argument| {
+                matches!(argument.values, Some(CompletionSource::Static { .. }))
+            }) {
+                12
+            } else {
+                5
+            };
+            // Only advertise lazy resolution when the catalog identity is
+            // unique. Invalid caller-supplied catalogs still receive useful
+            // eager completion data instead of an item that cannot resolve.
+            let data = command.and_then(|_| resolve_data(&command_id, argument_index));
+            let documentation = command.map_or_else(
+                || completion.summary.clone(),
+                |command| {
+                    argument.map_or_else(
+                        || command_documentation(command),
+                        |argument| argument.documentation.clone(),
+                    )
+                },
+            );
+            let detail = command.map_or_else(
+                || completion.detail.clone(),
+                |command| {
+                    argument.map_or_else(
+                        || command.signature.clone(),
+                        |argument| {
+                            format!("{} · {}", argument.names.join(", "), argument.value_type)
+                        },
+                    )
+                },
+            );
+            let mut item = json!({
+                "label": completion.value,
+                "kind": kind,
+                "sortText": format!("{rank:08}"),
+                "textEdit": {
+                    "range": edit_range.clone(),
+                    "newText": completion.value,
+                },
+            });
+            if let Some(object) = item.as_object_mut() {
+                if let Some(data) = data.as_ref() {
+                    object.insert("data".to_owned(), data.clone());
+                }
+                if !defer_details || data.is_none() {
+                    object.insert("detail".to_owned(), Value::String(detail));
+                    object.insert(
+                        "documentation".to_owned(),
+                        json!({"kind": documentation_kind, "value": documentation}),
+                    );
                 }
             }
-        }
+            Ok(item)
+        })
+        .collect()
+}
+
+fn resolve_data(command_id: &str, argument_index: Option<usize>) -> Option<Value> {
+    if command_id.is_empty() || command_id.len() > MAX_COMPLETION_COMMAND_ID_BYTES {
+        return None;
     }
-    items
+    let mut data = json!({
+        "version": COMPLETION_RESOLVE_DATA_VERSION,
+        "commandId": command_id,
+    });
+    if let Some(argument_index) = argument_index {
+        data.as_object_mut()?.insert(
+            "argumentIndex".to_owned(),
+            Value::from(u64::try_from(argument_index).ok()?),
+        );
+    }
+    (serde_json::to_vec(&data).ok()?.len() <= MAX_COMPLETION_RESOLVE_DATA_BYTES).then_some(data)
+}
+
+fn completion_resolve_key(params: &Value) -> Result<(&str, Option<usize>), ShellError> {
+    let data = field(params, "data")?;
+    let encoded = serde_json::to_vec(data)
+        .map_err(|_| invalid_completion_resolve("completion resolve data is not serializable"))?;
+    validate_byte_limit(
+        "completion resolve data",
+        encoded.len(),
+        MAX_COMPLETION_RESOLVE_DATA_BYTES,
+    )?;
+    let object = data
+        .as_object()
+        .ok_or_else(|| invalid_completion_resolve("completion resolve data must be an object"))?;
+    if object.len() < 2
+        || object.len() > 3
+        || object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "version" | "commandId" | "argumentIndex"))
+    {
+        return Err(invalid_completion_resolve(
+            "completion resolve data has an unsupported shape",
+        ));
+    }
+    if object.get("version").and_then(Value::as_u64) != Some(COMPLETION_RESOLVE_DATA_VERSION) {
+        return Err(invalid_completion_resolve(
+            "completion resolve data version is unsupported",
+        ));
+    }
+    let command_id = object
+        .get("commandId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_completion_resolve("completion command identifier is missing"))?;
+    if command_id.is_empty() || command_id.len() > MAX_COMPLETION_COMMAND_ID_BYTES {
+        return Err(invalid_completion_resolve(
+            "completion command identifier is invalid",
+        ));
+    }
+    let argument_index = object
+        .get("argumentIndex")
+        .map(|value| {
+            let index = value.as_u64().ok_or_else(|| {
+                invalid_completion_resolve("completion argument index must be an integer")
+            })?;
+            usize::try_from(index)
+                .map_err(|_| invalid_completion_resolve("completion argument index is too large"))
+        })
+        .transpose()?;
+    Ok((command_id, argument_index))
+}
+
+fn bounded_completion_result(mut items: Vec<Value>) -> Result<Value, ShellError> {
+    let mut is_incomplete = items.len() > MAX_COMPLETION_ITEMS;
+    items.truncate(MAX_COMPLETION_ITEMS);
+
+    let item_bytes = items
+        .iter()
+        .map(|item| {
+            serde_json::to_vec(item)
+                .map(|encoded| encoded.len())
+                .map_err(|_| {
+                    ShellError::new(
+                        ErrorCode::Validation,
+                        "language-service completion item is not serializable",
+                    )
+                    .with_help("Report the catalog entry that produced the completion")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut encoded_item_prefix_bytes = Vec::with_capacity(item_bytes.len());
+    let mut encoded_items_bytes = 0_usize;
+    for (index, item_bytes) in item_bytes.into_iter().enumerate() {
+        encoded_items_bytes = encoded_items_bytes
+            .checked_add(item_bytes)
+            .and_then(|total| total.checked_add(usize::from(index > 0)))
+            .ok_or_else(|| {
+                resource_limit_error(
+                    "language-service completion result",
+                    "bytes",
+                    usize::MAX,
+                    MAX_COMPLETION_RESULT_BYTES,
+                )
+            })?;
+        encoded_item_prefix_bytes.push(encoded_items_bytes);
+    }
+    let response_bytes = |incomplete: bool, count: usize| -> Result<usize, ShellError> {
+        let wrapper_bytes = serde_json::to_vec(&json!({
+            "isIncomplete": incomplete,
+            "items": [],
+        }))
+        .map_err(|_| {
+            ShellError::new(
+                ErrorCode::Validation,
+                "language-service completion result is not serializable",
+            )
+            .with_help("Report the catalog entry that produced the completion")
+        })?;
+        encoded_item_prefix_bytes
+            .get(count.saturating_sub(1))
+            .copied()
+            .unwrap_or(0)
+            .checked_add(wrapper_bytes.len())
+            .ok_or_else(|| {
+                resource_limit_error(
+                    "language-service completion result",
+                    "bytes",
+                    usize::MAX,
+                    MAX_COMPLETION_RESULT_BYTES,
+                )
+            })
+    };
+
+    if response_bytes(is_incomplete, items.len())? > MAX_COMPLETION_RESULT_BYTES {
+        is_incomplete = true;
+        let mut retained_count = 0_usize;
+        for count in 1..=items.len() {
+            if response_bytes(true, count)? > MAX_COMPLETION_RESULT_BYTES {
+                break;
+            }
+            retained_count = count;
+        }
+        items.truncate(retained_count);
+    }
+
+    let result = json!({"isIncomplete": is_incomplete, "items": items});
+    debug_assert!(
+        serde_json::to_vec(&result)
+            .is_ok_and(|encoded| encoded.len() <= MAX_COMPLETION_RESULT_BYTES)
+    );
+    Ok(result)
 }
 
 fn lua_hover(text: &str, offset: usize) -> Option<Value> {
@@ -850,17 +1216,6 @@ fn current_line(text: &str, offset: usize) -> &str {
     text.get(start..end).unwrap_or_default()
 }
 
-fn current_line_before(text: &str, offset: usize) -> &str {
-    let offset = offset.min(text.len());
-    let start = text
-        .get(..offset)
-        .unwrap_or_default()
-        .rfind('\n')
-        .and_then(|index| index.checked_add(1))
-        .unwrap_or(0);
-    text.get(start..offset).unwrap_or_default()
-}
-
 fn is_lua(uri: &str, document: &Document) -> bool {
     document.language_id.eq_ignore_ascii_case("lua") || uri.ends_with(".lua")
 }
@@ -895,6 +1250,11 @@ fn invalid_params(message: &str) -> ShellError {
         .with_help("Send the standard LSP textDocument and position fields")
 }
 
+fn invalid_completion_resolve(message: &str) -> ShellError {
+    ShellError::new(ErrorCode::InvalidArgument, message)
+        .with_help("Resolve an unchanged completion item returned by this language-service session")
+}
+
 fn invalid_diagnostic_range(text: &str, start: usize, end: usize) -> ShellError {
     ShellError::new(
         ErrorCode::Validation,
@@ -905,6 +1265,18 @@ fn invalid_diagnostic_range(text: &str, start: usize, end: usize) -> ShellError 
         text.len()
     ))
     .with_help("Report the diagnostic producer that returned the invalid source range")
+}
+
+fn invalid_completion_range(text: &str, start: usize, end: usize, cursor: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        "catalog completion range is invalid for an LSP text edit",
+    )
+    .with_context(format!(
+        "start_bytes: {start}; end_bytes: {end}; cursor_bytes: {cursor}; document_bytes: {}",
+        text.len()
+    ))
+    .with_help("Report the catalog completion that crossed a line or excluded the cursor")
 }
 
 fn retained_bytes(uri: &str, language_id: &str, text: &str) -> Result<usize, ShellError> {
@@ -1204,6 +1576,10 @@ mod tests {
         let response = request(&mut LanguageService::default(), 1, "initialize", json!({}));
         assert_eq!(response["result"]["capabilities"]["hoverProvider"], true);
         assert_eq!(
+            response["result"]["capabilities"]["completionProvider"]["resolveProvider"],
+            false
+        );
+        assert_eq!(
             response["result"]["capabilities"]["diagnosticProvider"]["identifier"],
             "quirl"
         );
@@ -1292,6 +1668,192 @@ mod tests {
                 .iter()
                 .any(|item| item["label"] == "quirl check")
         );
+    }
+
+    #[test]
+    fn native_completion_uses_catalog_fuzzy_matching_and_static_values() {
+        let mut service = LanguageService::default();
+        open(&mut service, "file:///fuzzy.qrl", "quirl", "git cmt");
+        let fuzzy = request(
+            &mut service,
+            1,
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": "file:///fuzzy.qrl"},
+                "position": {"line": 0, "character": 7}
+            }),
+        );
+        assert!(
+            fuzzy["result"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["label"] == "git commit")
+        );
+
+        let mut service = LanguageService::default();
+        let source = "quirl index build --format j";
+        open(&mut service, "file:///value.qrl", "quirl", source);
+        let completion = request(
+            &mut service,
+            2,
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": "file:///value.qrl"},
+                "position": {"line": 0, "character": source.len()}
+            }),
+        );
+        let item = completion["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["label"] == "json")
+            .unwrap();
+        assert_eq!(item["kind"], 12);
+        assert!(item.get("documentation").is_some());
+        assert!(item.get("filterText").is_none());
+        assert_eq!(item["textEdit"]["newText"], "json");
+    }
+
+    #[test]
+    fn native_completion_keeps_document_relative_utf16_edit_ranges() {
+        let mut service = LanguageService::default();
+        let source = "echo café\n🙂 | git c";
+        open(&mut service, "file:///unicode.qrl", "quirl", source);
+        let completion = request(
+            &mut service,
+            1,
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": "file:///unicode.qrl"},
+                "position": {"line": 1, "character": 10}
+            }),
+        );
+        let item = completion["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["label"] == "git commit")
+            .unwrap();
+        assert_eq!(
+            item["textEdit"]["range"],
+            json!({
+                "start": {"line": 1, "character": 5},
+                "end": {"line": 1, "character": 10}
+            })
+        );
+    }
+
+    #[test]
+    fn completion_resolve_loads_catalog_docs_and_rejects_untrusted_data() {
+        let mut service = LanguageService::default();
+        let initialized = request(
+            &mut service,
+            0,
+            "initialize",
+            json!({"capabilities": {"textDocument": {"completion": {"completionItem": {
+                "documentationFormat": ["markdown"],
+                "resolveSupport": {"properties": ["detail", "documentation"]}
+            }}}}}),
+        );
+        assert_eq!(
+            initialized["result"]["capabilities"]["completionProvider"]["resolveProvider"],
+            true
+        );
+        open(&mut service, "file:///resolve.qrl", "quirl", "git cmt");
+        let completion = request(
+            &mut service,
+            1,
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": "file:///resolve.qrl"},
+                "position": {"line": 0, "character": 7}
+            }),
+        );
+        let mut item = completion["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["label"] == "git commit")
+            .unwrap()
+            .clone();
+        assert!(item.get("detail").is_none());
+        let preserved_label = item["label"].clone();
+        let preserved_sort_text = item["sortText"].clone();
+        let preserved_text_edit = item["textEdit"].clone();
+        item.as_object_mut().unwrap().insert(
+            "documentation".to_owned(),
+            json!({"kind": "markdown", "value": "client supplied"}),
+        );
+        let resolved = request(&mut service, 2, "completionItem/resolve", item);
+        assert_eq!(resolved["result"]["detail"], "git commit [options]");
+        assert_eq!(resolved["result"]["label"], preserved_label);
+        assert_eq!(resolved["result"]["sortText"], preserved_sort_text);
+        assert_eq!(resolved["result"]["textEdit"], preserved_text_edit);
+        assert!(
+            resolved["result"]["documentation"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("Input:")
+        );
+        assert_ne!(
+            resolved["result"]["documentation"]["value"],
+            "client supplied"
+        );
+
+        let invalid = request(
+            &mut service,
+            3,
+            "completionItem/resolve",
+            json!({
+                "label": "forged",
+                "data": {
+                    "version": COMPLETION_RESOLVE_DATA_VERSION,
+                    "commandId": "command:git/commit",
+                    "unexpected": "client payload"
+                }
+            }),
+        );
+        assert_eq!(invalid["error"]["code"], -32602);
+
+        let lua_item = json!({
+            "label": "quirl.cwd",
+            "kind": 3,
+            "detail": "quirl.cwd() -> string",
+            "documentation": {"kind": "markdown", "value": "Return the current directory"}
+        });
+        let unchanged = request(&mut service, 4, "completionItem/resolve", lua_item.clone());
+        assert_eq!(unchanged["result"], lua_item);
+    }
+
+    #[test]
+    fn completion_result_is_capped_by_item_count_and_encoded_bytes() {
+        let mut catalog = Catalog::builtin();
+        let template = catalog.find("git commit").unwrap().clone();
+        catalog.commands.clear();
+        for index in 0..MAX_COMPLETION_ITEMS + 25 {
+            let mut command = template.clone();
+            command.id = format!("test:completion/{index}");
+            command.path = format!("tool-{index:04}-{}", "x".repeat(1_400));
+            command.aliases.clear();
+            catalog.commands.push(command);
+        }
+        let mut service = LanguageService::new(catalog);
+        open(&mut service, "file:///bounded.qrl", "quirl", "");
+        let completion = request(
+            &mut service,
+            1,
+            "textDocument/completion",
+            json!({
+                "textDocument": {"uri": "file:///bounded.qrl"},
+                "position": {"line": 0, "character": 0}
+            }),
+        );
+        let result = &completion["result"];
+        let item_count = result["items"].as_array().unwrap().len();
+        assert!(item_count < MAX_COMPLETION_ITEMS);
+        assert_eq!(result["isIncomplete"], true);
+        assert!(serde_json::to_vec(result).unwrap().len() <= MAX_COMPLETION_RESULT_BYTES);
     }
 
     #[test]
@@ -1411,13 +1973,18 @@ mod tests {
         assert!(docs.contains("demo run"));
         assert!(docs.contains("Input: `Path`"));
         assert!(docs.contains("Output: `Values<String>`"));
-        let completions = quirl_completions(&service.catalog, "demo r", "demo r".len(), "r");
+        let completions =
+            quirl_completions(&service.catalog, "demo r", "demo r".len(), true, "markdown")
+                .unwrap();
         let completion = completions
             .iter()
             .find(|completion| completion["label"] == "demo run")
-            .unwrap();
+            .unwrap()
+            .clone();
+        assert!(completion.get("documentation").is_none());
+        let completion = request(&mut service, 2, "completionItem/resolve", completion);
         assert!(
-            completion["documentation"]["value"]
+            completion["result"]["documentation"]["value"]
                 .as_str()
                 .unwrap()
                 .contains("Output: `Values<String>`")

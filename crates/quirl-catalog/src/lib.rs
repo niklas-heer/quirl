@@ -9,7 +9,10 @@
 )]
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BinaryHeap},
+};
 
 /// Schema version emitted by [`Catalog`] serialization and by built-in catalogs.
 pub const CATALOG_SCHEMA_VERSION: u32 = 4;
@@ -381,6 +384,20 @@ pub struct Completion {
     pub replace_end: usize,
     /// Character indices in [`Completion::value`] that contributed to the fuzzy match.
     pub match_indices: Vec<usize>,
+}
+
+/// A completion paired with stable catalog identity for trusted lazy lookup.
+///
+/// This in-process projection intentionally leaves the serialized completion
+/// protocol unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextualCompletion {
+    /// User-visible insertion, documentation, and replacement span.
+    pub completion: Completion,
+    /// Stable identifier of the command that produced the candidate.
+    pub command_id: String,
+    /// Zero-based argument index, or `None` for a command-path candidate.
+    pub argument_index: Option<usize>,
 }
 
 /// Versioned completion work submitted by an interactive client. The owning UI
@@ -1741,6 +1758,32 @@ impl Catalog {
     /// A cursor past the input or inside a UTF-8 code point is clamped backward to
     /// the nearest valid boundary so malformed protocol input cannot create a panic.
     pub fn complete(&self, input: &str, cursor: usize) -> Vec<Completion> {
+        self.complete_contextual(input, cursor, usize::MAX)
+            .into_iter()
+            .map(|candidate| candidate.completion)
+            .collect()
+    }
+
+    /// Complete with a strict retained-result bound and stable catalog identity.
+    ///
+    /// `limit` is clamped to [`MAX_COMPLETION_RESULTS`]. Catalog traversal retains
+    /// no more than that many ranked candidates, so untrusted catalog breadth cannot
+    /// grow the result allocation.
+    pub fn complete_bounded(
+        &self,
+        input: &str,
+        cursor: usize,
+        limit: usize,
+    ) -> Vec<ContextualCompletion> {
+        self.complete_contextual(input, cursor, limit.min(MAX_COMPLETION_RESULTS))
+    }
+
+    fn complete_contextual(
+        &self,
+        input: &str,
+        cursor: usize,
+        limit: usize,
+    ) -> Vec<ContextualCompletion> {
         let cursor = clamped_cursor(input, cursor);
         let before = input.get(..cursor).unwrap_or(input);
         let (segment_start, segment) = current_command_segment(before);
@@ -1751,32 +1794,36 @@ impl Catalog {
         if let Some((command, option, token_start, token, values)) =
             self.static_value_context(query, query_start)
         {
-            let mut choices = values
+            let argument_index = command
+                .options
                 .iter()
-                .filter_map(|value| {
+                .position(|candidate| std::ptr::eq(candidate, option));
+            return bounded_ranked_completions(
+                values.iter().filter_map(|value| {
                     fuzzy_match(token, value).map(|(score, indices)| {
                         (
                             score,
-                            Completion {
-                                value: value.clone(),
-                                display: value.clone(),
-                                summary: option.documentation.clone(),
-                                detail: format!("{} · {}", command.signature, option.value_type),
-                                replace_start: token_start,
-                                replace_end: cursor,
-                                match_indices: indices,
+                            ContextualCompletion {
+                                completion: Completion {
+                                    value: value.clone(),
+                                    display: value.clone(),
+                                    summary: option.documentation.clone(),
+                                    detail: format!(
+                                        "{} · {}",
+                                        command.signature, option.value_type
+                                    ),
+                                    replace_start: token_start,
+                                    replace_end: cursor,
+                                    match_indices: indices,
+                                },
+                                command_id: command.id.clone(),
+                                argument_index,
                             },
                         )
                     })
-                })
-                .collect::<Vec<_>>();
-            choices.sort_by(|left, right| {
-                right
-                    .0
-                    .cmp(&left.0)
-                    .then_with(|| left.1.value.cmp(&right.1.value))
-            });
-            return choices.into_iter().map(|(_, item)| item).collect();
+                }),
+                limit,
+            );
         }
 
         if let Some((command, token_start, token)) = self.option_context(query, query_start) {
@@ -1820,81 +1867,82 @@ impl Catalog {
                 ),
                 None => (token, token_start, false),
             };
-            let mut choices = command
-                .options
-                .iter()
-                .flat_map(|option| option.names.iter().map(move |name| (name, option)))
-                .filter(|(name, option)| {
-                    !bundling || (option.kind == ArgumentKind::Flag && is_short_flag_name(name))
-                })
-                .filter_map(|(name, option)| {
-                    let insert = if bundling {
-                        name.strip_prefix('-').unwrap_or(name)
-                    } else {
-                        name.as_str()
-                    };
-                    fuzzy_match(match_query, insert).map(|(score, indices)| {
-                        (
-                            score,
-                            Completion {
-                                value: insert.to_owned(),
-                                display: match option.kind {
-                                    ArgumentKind::Flag => name.clone(),
-                                    _ => format!("{name} <{}>", option.value_type),
-                                },
-                                summary: option.documentation.clone(),
-                                detail: command.signature.clone(),
-                                replace_start: insert_start,
-                                replace_end: cursor,
-                                match_indices: indices,
-                            },
-                        )
+            return bounded_ranked_completions(
+                command
+                    .options
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(argument_index, option)| {
+                        option
+                            .names
+                            .iter()
+                            .map(move |name| (name, option, argument_index))
                     })
-                })
-                .collect::<Vec<_>>();
-            choices.sort_by(|left, right| {
-                right
-                    .0
-                    .cmp(&left.0)
-                    .then_with(|| left.1.value.cmp(&right.1.value))
-            });
-            return choices.into_iter().map(|(_, item)| item).collect();
+                    .filter(|(name, option, _)| {
+                        !bundling || (option.kind == ArgumentKind::Flag && is_short_flag_name(name))
+                    })
+                    .filter_map(|(name, option, argument_index)| {
+                        let insert = if bundling {
+                            name.strip_prefix('-').unwrap_or(name)
+                        } else {
+                            name.as_str()
+                        };
+                        fuzzy_match(match_query, insert).map(|(score, indices)| {
+                            (
+                                score,
+                                ContextualCompletion {
+                                    completion: Completion {
+                                        value: insert.to_owned(),
+                                        display: match option.kind {
+                                            ArgumentKind::Flag => name.clone(),
+                                            _ => format!("{name} <{}>", option.value_type),
+                                        },
+                                        summary: option.documentation.clone(),
+                                        detail: command.signature.clone(),
+                                        replace_start: insert_start,
+                                        replace_end: cursor,
+                                        match_indices: indices,
+                                    },
+                                    command_id: command.id.clone(),
+                                    argument_index: Some(argument_index),
+                                },
+                            )
+                        })
+                    }),
+                limit,
+            );
         }
 
-        let mut choices = self
-            .commands
-            .iter()
-            .flat_map(|command| {
+        bounded_ranked_completions(
+            self.commands.iter().flat_map(|command| {
                 std::iter::once(&command.path)
                     .chain(command.aliases.iter())
                     .filter_map(move |candidate| {
                         fuzzy_match(query, candidate).map(|(score, indices)| {
                             (
                                 score,
-                                Completion {
-                                    value: candidate.clone(),
-                                    display: command.signature.clone(),
-                                    summary: command.summary.clone(),
-                                    detail: format!(
-                                        "{} · {:?}",
-                                        command.details, command.provenance
-                                    ),
-                                    replace_start: query_start,
-                                    replace_end: cursor,
-                                    match_indices: indices,
+                                ContextualCompletion {
+                                    completion: Completion {
+                                        value: candidate.clone(),
+                                        display: command.signature.clone(),
+                                        summary: command.summary.clone(),
+                                        detail: format!(
+                                            "{} · {:?}",
+                                            command.details, command.provenance
+                                        ),
+                                        replace_start: query_start,
+                                        replace_end: cursor,
+                                        match_indices: indices,
+                                    },
+                                    command_id: command.id.clone(),
+                                    argument_index: None,
                                 },
                             )
                         })
                     })
-            })
-            .collect::<Vec<_>>();
-        choices.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| left.1.value.cmp(&right.1.value))
-        });
-        choices.into_iter().map(|(_, item)| item).collect()
+            }),
+            limit,
+        )
     }
 
     /// Resolve a trimmed command path or alias, falling back to the first path prefix.
@@ -2306,6 +2354,82 @@ impl Catalog {
             return None;
         };
         Some((command, option, replace_start, value_query, values))
+    }
+}
+
+fn bounded_ranked_completions(
+    candidates: impl Iterator<Item = (i32, ContextualCompletion)>,
+    limit: usize,
+) -> Vec<ContextualCompletion> {
+    let mut retained = BinaryHeap::with_capacity(limit.min(64));
+    for (sequence, (score, completion)) in candidates.enumerate() {
+        if limit == 0 {
+            break;
+        }
+        let candidate = RankedCompletion {
+            score,
+            sequence,
+            completion,
+        };
+        if retained.len() < limit {
+            retained.push(candidate);
+        } else if retained.peek().is_some_and(|worst| candidate < *worst) {
+            retained.pop();
+            retained.push(candidate);
+        }
+    }
+    let mut retained = retained.into_vec();
+    retained.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                left.completion
+                    .completion
+                    .value
+                    .cmp(&right.completion.completion.value)
+            })
+            .then_with(|| left.sequence.cmp(&right.sequence))
+    });
+    retained
+        .into_iter()
+        .map(|ranked| ranked.completion)
+        .collect()
+}
+
+#[derive(Debug, Eq)]
+struct RankedCompletion {
+    score: i32,
+    sequence: usize,
+    completion: ContextualCompletion,
+}
+
+impl Ord for RankedCompletion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .cmp(&self.score)
+            .then_with(|| {
+                self.completion
+                    .completion
+                    .value
+                    .cmp(&other.completion.completion.value)
+            })
+            .then_with(|| self.sequence.cmp(&other.sequence))
+    }
+}
+
+impl PartialOrd for RankedCompletion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedCompletion {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score
+            && self.sequence == other.sequence
+            && self.completion.completion.value == other.completion.completion.value
     }
 }
 
@@ -2920,6 +3044,57 @@ mod tests {
             "echo 🌀; quirl index build --format ".len()
         );
         assert_eq!(values[0].replace_end, value_line.len());
+    }
+
+    #[test]
+    fn bounded_completion_preserves_order_and_catalog_identity() {
+        let catalog = Catalog::builtin();
+        for input in ["git c", "git commit --am", "quirl index build --format j"] {
+            let complete = catalog.complete(input, input.len());
+            let bounded = catalog.complete_bounded(input, input.len(), 3);
+            assert_eq!(
+                bounded
+                    .iter()
+                    .map(|candidate| &candidate.completion)
+                    .collect::<Vec<_>>(),
+                complete.iter().take(3).collect::<Vec<_>>()
+            );
+            assert!(
+                bounded
+                    .iter()
+                    .all(|candidate| !candidate.command_id.is_empty())
+            );
+        }
+
+        let value = catalog.complete_bounded(
+            "quirl index build --format j",
+            "quirl index build --format j".len(),
+            1,
+        );
+        assert_eq!(value[0].completion.value, "json");
+        assert!(value[0].argument_index.is_some());
+        assert!(catalog.complete_bounded("git c", 5, 0).is_empty());
+    }
+
+    #[test]
+    fn bounded_completion_clamps_requested_result_count() {
+        let mut catalog = Catalog::builtin();
+        let template = catalog.find("git commit").unwrap().clone();
+        catalog.commands.clear();
+        for index in 0..MAX_COMPLETION_RESULTS + 5 {
+            let mut command = template.clone();
+            command.id = format!("test:bounded/{index}");
+            command.path = format!("bounded-{index:04}");
+            command.aliases.clear();
+            catalog.commands.push(command);
+        }
+        let completions = catalog.complete_bounded("", 0, usize::MAX);
+        assert_eq!(completions.len(), MAX_COMPLETION_RESULTS);
+        assert_eq!(completions[0].completion.value, "bounded-0000");
+        assert_eq!(
+            completions[MAX_COMPLETION_RESULTS - 1].completion.value,
+            "bounded-0999"
+        );
     }
 
     #[test]
