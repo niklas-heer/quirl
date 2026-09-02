@@ -551,7 +551,7 @@ impl Catalog {
                     "mode",
                     "mode <normal|data|ai|toggle>",
                     "Switch the visible interactive grammar",
-                    "Normal mode carries bytes and process status. Data mode evaluates Quirl's native structured values and pipelines. AI mode searches the local command database and inserts suggestions for review without executing them.",
+                    "Normal mode carries bytes and process status. Data mode evaluates Quirl's native structured values and pipelines. AI mode asks an installed Codex CLI for a typed proposal from a bounded compact view of the complete admitted catalog, then inserts the validated command for review without executing it. It has no local suggestion or planner fallback.",
                     vec![],
                     &["mode data", "mode ai", "mode normal", "mode toggle"],
                     &[],
@@ -1166,7 +1166,7 @@ impl Catalog {
                     "quirl ai run",
                     "quirl ai run <query...>",
                     "Preview and explicitly confirm one catalog-backed command",
-                    "Uses bounded hybrid retrieval and the retrieval-only CommandProposal fallback to select a current catalog command ID. Quirl asks the user for each unresolved required value and parses it as the catalog-declared type; neither retrieval nor the slot resolver may invent shell text. Trusted Rust code revalidates the completed proposal, renders the exact quoted command, and requires explicit acceptance before the existing execution path is entered. Unknown effects, filesystem mutation, process spawning, and session changes show their reason and require a distinct second high-risk confirmation.",
+                    "Sends the bounded natural-language intent and a compact projection of the complete admitted command catalog to one installed, authenticated Codex CLI process. Codex runs ephemerally with user configuration, rules, and agent tools disabled, and may return only a schema-constrained command ID plus typed catalog arguments. There is no local-planner fallback. Quirl asks for unresolved required values, revalidates against the current complete catalog, renders the exact quoted command, and requires explicit acceptance before execution. Unknown effects, filesystem mutation, process spawning, and session changes show their reason and require a distinct second high-risk confirmation.",
                     vec![],
                     &["quirl ai run 'show the current working directory'"],
                     &[

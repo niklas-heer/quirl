@@ -1,0 +1,138 @@
+# ADR 0029: Codex CLI provides the first hosted command planner
+
+- Status: Accepted
+- Date: 2026-09-02
+- Extends: [ADR 0021](0021-sqlite-local-command-intelligence.md) and
+  [ADR 0025](0025-fine-tuned-command-retrieval-model.md)
+
+## Context
+
+Quirl's pinned local retrieval experiment could not reliably choose among
+neighboring commands, infer typed optional arguments, or turn a complete
+natural-language task into a useful proposal. Making it the first gate also
+prevented Codex from considering admitted commands that retrieval omitted.
+Building and distributing a competitive generative model would add a large
+operational surface while producing a worse result than agent software many
+intended users already have.
+
+Codex CLI supports ChatGPT subscription authentication, non-interactive
+execution, ephemeral sessions, schema-constrained output, and a documented
+JSONL app-server protocol. The first `codex exec` integration proved the safety
+boundary but paid process initialization on every interactive intent and
+released the rich editor while planning. Its quoted proposal transcript looked
+like a completed command even though it was only an editable suggestion.
+
+The boundary handles untrusted intent text, catalog strings, executable
+resolution through `PATH`, inherited authentication, child output, timeouts,
+and model responses. A prompt-injected planner must not gain filesystem,
+process, plugin, browser, or execution authority. A failed or stale response
+must not weaken the existing trusted preview and confirmation path.
+
+## Decision
+
+AI mode and `quirl ai run` use Codex exclusively. The interactive rich editor
+owns one background worker and one long-lived `codex app-server` process for the
+shell session. The worker starts concurrently with the first rich frame so
+process startup, JSONL initialization, and model discovery normally complete
+before the first intent is submitted. It prefers `gpt-5.6-luna` at high
+reasoning effort when both are advertised, and otherwise uses the selected
+model's advertised default effort. The actual model and effort are rendered in
+the assistant panel. One ephemeral thread represents one open AI session;
+every follow-up is another turn on that thread, and closing AI mode discards
+its conversation.
+The noninteractive `quirl ai run` path retains its fresh `codex exec` process
+because a one-command process has no session over which to amortize a server.
+
+The first interactive turn and every noninteractive request receive the bounded
+intent plus a compact projection of every admitted catalog command. Follow-up
+turns send only the new user message and reuse the bounded thread history. The
+projection retains command identity, path,
+signature, summary, and each argument's accepted names, kind, value type, and
+required state. It excludes `quirl ai run` to prevent recursive planning. AI
+mode shows no local suggestions, starts no local model, and has no local
+fallback. The interactive conversation is limited to 16 turns and 128 KiB of
+cumulative user text. Catalog generation changes reset it rather than mixing
+contracts.
+
+The Codex process runs in a private empty temporary directory. Quirl disables
+shell, unified-execution, app, browser, computer-use, and multi-agent features,
+requests `never` approvals and a read-only sandbox, removes shell-startup
+injection variables, and supplies exact base instructions plus a JSON output
+schema. Any streamed command, file, MCP, browser, collaboration, or other tool
+item fails the turn even if user Codex configuration exposes one. The complete
+app-server process tree is contained and reaped when the
+worker ends. Protocol lines, queued publications, events, aggregate turn bytes,
+input, catalog commands and arguments, temporary-name attempts, cancellation,
+and wall time have fixed limits.
+
+The long-lived local client uses app-server's supported newline-delimited JSON
+transport over the contained child's stdin and stdout. The documented
+WebSocket listener is experimental and unsupported; switching the local hop to
+it would add listener readiness, address ownership, framing, queue-overload,
+and retry states without removing process startup or hosted model latency.
+Quirl therefore keeps the process warm and measures end-to-end latency before
+considering another transport. A future supported shared service may replace
+stdio only with benchmark evidence and equivalent lifecycle containment.
+
+The two user surfaces retain deliberately different output contracts.
+Noninteractive `quirl ai run` returns one command ID plus typed catalog argument
+occurrences and keeps the existing catalog-owned renderer. Interactive AI mode
+returns a conversational outcome, short message, and—only for a proposal
+outcome—at most 64 KiB of source for one editor submission. That source may
+compose admitted commands using native pipes, boolean or sequential lists, and
+redirects, or use Quirl's explicit `lua` bridge for a small restricted Lua
+chunk. Quirl rejects controls and editor actions, parses native command graphs,
+and syntax-checks Lua without running it. Ambiguity that materially changes the
+result or safety produces a question instead of source.
+
+Interactive AI mode stays inside the alternate-screen editor while the worker
+runs. A content-sized rounded Ratatui conversation card appears below the input
+with a large animated activity glyph, `CODEX` identity, actual model and
+effort, bounded recent user/assistant turns, elapsed time, the latest turn and
+open-session token totals reported by app-server, and the current validated
+source. Typed Enter sends another turn; Tab or empty Enter moves a ready
+proposal into Normal mode for review. Esc cancels or closes the session.
+Narrow terminals collapse the card rather than hiding input. The panel adds no proposal or fake exit record
+to the transcript and never executes the result. `quirl ai run`
+retains exact preview, ordinary acceptance, separate high-risk confirmation,
+catalog drift detection, and the existing native execution path.
+
+Quirl does not copy, inspect, or manage Codex credentials. Codex reuses its own
+saved ChatGPT or API authentication. The user-visible documentation states that
+Codex planning sends the intent and bounded compact catalog to OpenAI. Missing
+installation, missing authentication, nonzero exit, invalid output, output
+overflow, and deadline expiry are ordinary `ShellError` failures. None silently
+fall back to local planning.
+
+## Invariants
+
+1. AI mode performs no local semantic discovery or local model bootstrap.
+2. Codex receives no project working directory or Quirl process authority.
+3. Interactive turns share one contained app-server process and one bounded
+   ephemeral thread per open AI session; protocol work, queues, cancellation, deadline, and
+   process-tree cleanup remain bounded and observable.
+4. Tool features are disabled independently of prompt instructions; model text
+   alone is not a security boundary.
+5. Model output is schema-constrained and bounded. Noninteractive output stays
+   catalog-owned; interactive source is parsed as native Quirl command source
+   or syntax-checked as restricted Lua before it can enter the editor.
+6. Interactive planning never leaves or writes to the rich transcript. Tab or
+   empty Enter explicitly transfers the validated proposal to a normally
+   rendered Normal-mode buffer. A later Enter is required to execute it.
+7. Codex failure never causes automatic execution or silently switches to a
+   local or different hosted provider.
+
+## Consequences
+
+- Users with Codex CLI can use their existing ChatGPT subscription instead of
+  configuring a separate Quirl API key.
+- Quirl gains substantially stronger planning without a new Rust SDK,
+  credential store, or per-intent CLI startup in an interactive session.
+- A compact complete-catalog projection costs more context than local
+  preselection, but it removes the weak retrieval gate and uses one Codex turn.
+- Local search remains available as an explicit diagnostic command, not as the
+  AI-mode planner or fallback.
+- Codex CLI installation and authentication become optional runtime
+  prerequisites for hosted planning, not Quirl installation requirements.
+- The complete catalog still dominates the first turn's context cost. Follow-up
+  turns reuse the ephemeral conversation and do not resend it.

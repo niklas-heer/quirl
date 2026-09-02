@@ -36,16 +36,23 @@ and <kbd>d</kbd> selects typed data. The textual forms are `mode normal`,
 ## Find a command in AI mode
 
 Press <kbd>Alt-Q</kbd>, then <kbd>i</kbd>, and describe what you want in everyday
-language. Results update from Quirl's local command catalog as you type. Press
-<kbd>Up</kbd> or <kbd>Down</kbd> to select a result, then <kbd>Enter</kbd> to
-insert it into Normal mode for review. AI mode never executes the suggestion.
+language, then press <kbd>Enter</kbd>. Quirl asks an installed, authenticated
+Codex CLI to produce a typed proposal from the intent and a bounded compact
+projection of the complete admitted command catalog. The rich editor keeps one
+local Codex app-server connection and begins warming it with the first rich UI
+frame. While planning, a bordered activity card directly below the intent shows
+a high-contrast spinner, `CODEX`, the actual selected model, current phase, and
+elapsed time. Quirl prefers Luna when that model is available to the signed-in
+account. <kbd>Esc</kbd> or <kbd>Ctrl-C</kbd> cancels without losing the intent.
+Quirl validates the result and replaces the intent with a normally rendered
+command for review; it adds no fake command output and AI mode never executes
+it. Codex planning sends that bounded context to OpenAI and can reuse a ChatGPT
+subscription login. AI mode has no local suggestion or planner fallback.
 
-The completion database and command model are separate bounded runtime assets.
-When an update is eligible, Quirl schedules it in the background without
-delaying the first prompt. Until the assets are available, Quirl remains usable
-and AI discovery falls back to deterministic lexical ranking over admitted
-local knowledge. Use `quirl assets status` to inspect readiness and
-`quirl ai status` to inspect database, model, and index state.
+The completion database remains available to ordinary command completion and
+the explicit `quirl ai search` diagnostics, but AI-mode planning does not load
+or depend on Quirl's local model. Use `quirl assets status` to inspect readiness
+and `quirl ai status` to inspect database, model, and index state.
 
 ## Discover as you type
 

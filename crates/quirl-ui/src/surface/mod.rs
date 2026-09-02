@@ -29,6 +29,70 @@ pub use runtime::{
 /// the complete catalog is published atomically on the surface thread.
 pub type CatalogLoader = Box<dyn FnOnce() -> Result<Arc<Catalog>, ShellError> + Send>;
 
+/// One nonblocking update from an interactive natural-language planner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractiveIntentPlannerUpdate {
+    /// Planning is still active and the bounded status text should be rendered in place.
+    Progress {
+        /// Actual model selected by the local planner connection, when known.
+        model: Option<String>,
+        /// Short terminal-independent description of the current phase.
+        message: String,
+    },
+    /// One conversational reply, optionally carrying a validated command proposal.
+    Reply {
+        /// Shell-safe command text available for explicit insertion with Tab.
+        command: Option<String>,
+        /// Short assistant reply explaining, clarifying, or declining the proposal.
+        message: String,
+        /// Actual model used to construct the reply.
+        model: String,
+        /// Actual reasoning effort used for the turn.
+        effort: String,
+        /// Token totals reported by the planner for this turn and open conversation.
+        token_usage: Option<InteractiveIntentTokenUsage>,
+        /// End-to-end planning latency in milliseconds.
+        elapsed_ms: u64,
+    },
+}
+
+/// Bounded token totals reported after one interactive planner turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteractiveIntentTokenUsage {
+    /// Tokens consumed by the most recently completed turn.
+    pub turn_total: u64,
+    /// Tokens consumed by the complete open planner conversation.
+    pub session_total: u64,
+}
+
+/// Asynchronous planner used by the rich editor's natural-language mode.
+///
+/// Implementations may own a persistent local service, but these methods must
+/// never perform blocking process, network, or filesystem work on the render
+/// thread. At most one request is active at a time. [`Self::cancel`] must make
+/// cancellation observable to the worker without waiting for it to finish.
+pub trait InteractiveIntentPlanner: Send {
+    /// Begin nonblocking connection preparation before the user submits an intent.
+    fn prepare(&mut self) {}
+
+    /// Start a new bounded conversation while preserving the warm local connection.
+    fn begin_session(&mut self) {}
+
+    /// Discard conversation history and cancel any active turn.
+    fn end_session(&mut self) {
+        self.cancel();
+    }
+
+    /// Schedule one bounded intent against the complete admitted catalog.
+    fn start(&mut self, intent: &str, catalog: Arc<Catalog>) -> Result<(), ShellError>;
+
+    /// Return the newest completed update without blocking.
+    fn poll_cached(&mut self) -> Result<Option<InteractiveIntentPlannerUpdate>, ShellError>;
+
+    /// Request cancellation of the active plan, if any.
+    fn cancel(&mut self);
+}
+
 /// Bounded history metadata installed by the product's durable history store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractiveHistoryEntry {
@@ -72,7 +136,8 @@ use crossterm::{
 };
 use quirl_catalog::Catalog;
 use quirl_core::{
-    AtomicReplaceOptions, ErrorCode, OutputStream, ShellError, replace_file_atomically,
+    AtomicReplaceOptions, ErrorCode, OutputStream, ShellError, escape_terminal_line,
+    replace_file_atomically,
 };
 use quirl_lua::QuirlConfig;
 use quirl_syntax::{Mode, parse_command_list};
@@ -115,6 +180,9 @@ const STREAM_CHUNK_BYTES_MAX: usize = 8 * 1024;
 const ANSI_CSI_BYTES_MAX: usize = 64;
 const ANSI_OSC_BYTES_MAX: usize = 4 * 1024;
 const PRODUCT_IDENTITY_BYTES_MAX: usize = 64;
+const INTENT_CONVERSATION_MESSAGES_MAX: usize = 8;
+const INTENT_CONVERSATION_RETAINED_BYTES_MAX: usize = 8 * 1024;
+const INTENT_CONVERSATION_MESSAGE_BYTES_MAX: usize = 2 * 1024;
 static PRODUCT_IDENTITY: OnceLock<String> = OnceLock::new();
 #[cfg(test)]
 static HISTORY_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -420,6 +488,14 @@ pub struct RichSurface {
     screen_copy_pending: bool,
     mouse_drag: Option<MouseDrag>,
     intent_completion: IntentCompletionState,
+    intent_planner: Option<Box<dyn InteractiveIntentPlanner>>,
+    intent_planning_started: Option<Instant>,
+    intent_conversation: VecDeque<IntentConversationMessage>,
+    intent_proposal: Option<String>,
+    intent_model: Option<(String, String)>,
+    intent_token_usage: Option<InteractiveIntentTokenUsage>,
+    intent_phase: Option<String>,
+    pending_prefill: Option<String>,
     stream_stdout: StreamingText,
     stream_stderr: StreamingText,
     /// Stream currently occupying the transcript's uncommitted live line, if any.
@@ -433,6 +509,17 @@ pub struct RichSurface {
 struct CatalogAdmission {
     receiver: Receiver<Result<Arc<Catalog>, ShellError>>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy)]
+enum IntentConversationRole {
+    User,
+    Assistant,
+}
+
+struct IntentConversationMessage {
+    role: IntentConversationRole,
+    text: String,
 }
 
 impl RichSurface {
@@ -497,6 +584,14 @@ impl RichSurface {
             screen_copy_pending: false,
             mouse_drag: None,
             intent_completion: IntentCompletionState::default(),
+            intent_planner: None,
+            intent_planning_started: None,
+            intent_conversation: VecDeque::new(),
+            intent_proposal: None,
+            intent_model: None,
+            intent_token_usage: None,
+            intent_phase: None,
+            pending_prefill: None,
             stream_stdout: StreamingText::default(),
             stream_stderr: StreamingText::default(),
             live_output_owner: None,
@@ -564,6 +659,14 @@ impl RichSurface {
             screen_copy_pending: false,
             mouse_drag: None,
             intent_completion: IntentCompletionState::default(),
+            intent_planner: None,
+            intent_planning_started: None,
+            intent_conversation: VecDeque::new(),
+            intent_proposal: None,
+            intent_model: None,
+            intent_token_usage: None,
+            intent_phase: None,
+            pending_prefill: None,
             stream_stdout: StreamingText::default(),
             stream_stderr: StreamingText::default(),
             live_output_owner: None,
@@ -941,6 +1044,28 @@ impl RichSurface {
         self.intent_completion.install(completer);
     }
 
+    /// Seed the next editor session with one bounded command for human review.
+    ///
+    /// The pending value is consumed once by [`Self::read_line`]. This method
+    /// never accepts or executes the command and rejects values larger than the
+    /// editor's normal input ceiling.
+    pub fn prefill_command(&mut self, command: &str) -> Result<(), ShellError> {
+        if command.len() > editor::MAX_EDITOR_BUFFER_BYTES {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "command prefill exceeded the editor byte limit",
+            )
+            .with_context(format!(
+                "limit: {}; observed: {}",
+                editor::MAX_EDITOR_BUFFER_BYTES,
+                command.len()
+            ))
+            .with_help("Use a shorter generated command"));
+        }
+        self.pending_prefill = Some(command.to_owned());
+        Ok(())
+    }
+
     /// Attach a nonblocking provider of completed asynchronous panel snapshots.
     pub fn set_panel_provider(&mut self, provider: Box<dyn InteractivePanelProvider>) {
         self.runtime.set_provider(provider);
@@ -952,6 +1077,11 @@ impl RichSurface {
         if self.catalog.is_some() {
             self.runtime.catalog_admitted();
         }
+    }
+
+    /// Attach the nonblocking planner used when Enter is pressed in natural mode.
+    pub fn set_intent_planner(&mut self, planner: Box<dyn InteractiveIntentPlanner>) {
+        self.intent_planner = Some(planner);
     }
 
     /// Run one blocking interactive edit session and return after terminal release.
@@ -978,6 +1108,12 @@ impl RichSurface {
         );
         if let Some((buffer, cursor)) = self.pending_input.take() {
             editor.restore(buffer, cursor);
+        }
+        if let Some(prefill) = self.pending_prefill.take() {
+            editor.replace(0, 0, &prefill);
+        }
+        if prompt.mode == Mode::Natural {
+            self.begin_intent_session();
         }
         let symbols = prompt.surface_symbols();
         self.terminal.enter()?;
@@ -1039,7 +1175,7 @@ impl RichSurface {
                     transcript_truncated: self.transcript_truncated,
                     output_focus: self.output_focus,
                     output_notice: self.output_notice.as_deref(),
-                    busy_glyph: None,
+                    busy_glyph: self.busy_glyph,
                 };
                 let transcript_area =
                     model.transcript_area(Rect::new(0, 0, terminal_width, terminal_height));
@@ -1099,10 +1235,36 @@ impl RichSurface {
                 dirty = true;
                 continue;
             }
+            if self.poll_intent_planner(&mut editor, prompt)? {
+                dirty = true;
+                continue;
+            }
             if !event::poll(EVENT_POLL).map_err(terminal_error("poll terminal input"))? {
                 continue;
             }
             let input_event = event::read().map_err(terminal_error("read terminal input"))?;
+            if self.intent_planning_started.is_some() {
+                if let Event::Key(key) = input_event
+                    && key.kind != KeyEventKind::Release
+                    && (key.code == KeyCode::Esc
+                        || (key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)))
+                {
+                    if let Some(planner) = self.intent_planner.as_mut() {
+                        planner.cancel();
+                    }
+                    self.intent_planning_started = None;
+                    self.busy_glyph = None;
+                    self.intent_phase = None;
+                    self.push_intent_message(
+                        IntentConversationRole::Assistant,
+                        "Cancelled. You can edit the request and try again.",
+                    );
+                    self.refresh_intent_notice(Duration::ZERO);
+                }
+                dirty = true;
+                continue;
+            }
             if self.semantic_hints && !prompt_prepared {
                 // The empty first frame cannot use PATH discovery. Start the
                 // bounded worker when input first arrives, then publish only a
@@ -1113,7 +1275,7 @@ impl RichSurface {
             dirty = true;
             match input_event {
                 Event::Paste(text) => {
-                    self.output_notice = None;
+                    self.clear_transient_output_notice();
                     if self.environment.active() {
                         self.environment.insert_filter_text(&text);
                         continue;
@@ -1153,7 +1315,7 @@ impl RichSurface {
                         self.handle_output_key(key.code, key.modifiers)?;
                         continue;
                     }
-                    self.output_notice = None;
+                    self.clear_transient_output_notice();
                     if self.explorer.is_some() {
                         let action = self
                             .explorer
@@ -1283,6 +1445,19 @@ impl RichSurface {
                             _ => {}
                         }
                     }
+                    if prompt.mode == Mode::Natural
+                        && key.code == KeyCode::Tab
+                        && self.accept_intent_proposal(&mut editor, prompt)?
+                    {
+                        continue;
+                    }
+                    if prompt.mode == Mode::Natural && key.code == KeyCode::Esc {
+                        self.end_intent_session();
+                        prompt.set_mode(Mode::Command);
+                        editor.clear();
+                        self.completion.dismiss();
+                        continue;
+                    }
                     if self.completion.open && !self.picker.active() {
                         match key.code {
                             KeyCode::Up if prompt.mode == Mode::Natural => {
@@ -1303,7 +1478,7 @@ impl RichSurface {
                                 self.completion.next();
                                 continue;
                             }
-                            KeyCode::Enter if prompt.mode == Mode::Natural => {
+                            KeyCode::Tab if prompt.mode == Mode::Natural => {
                                 if let Some(item) = self.completion.selected_item().cloned() {
                                     editor.replace(0, editor.buffer().len(), &item.value);
                                     prompt.set_mode(Mode::Command);
@@ -1313,7 +1488,10 @@ impl RichSurface {
                                 }
                                 continue;
                             }
-                            KeyCode::Enter if self.completion.accepts_enter() => {
+                            KeyCode::Enter
+                                if prompt.mode != Mode::Natural
+                                    && self.completion.accepts_enter() =>
+                            {
                                 if let Some(item) = self.completion.selected_item().cloned() {
                                     editor.replace(
                                         item.replace_start,
@@ -1336,11 +1514,10 @@ impl RichSurface {
                     let action = editor.apply_key(key, self.completion.open);
                     match action {
                         EditAction::Accept => {
-                            if prompt.mode == Mode::Natural {
-                                // AI mode is an intent-to-command editor, not an
-                                // execution grammar. Search happens as the user
-                                // types; Enter either accepts the highlighted
-                                // safe suggestion above or keeps the query live.
+                            if prompt.mode == Mode::Natural
+                                && editor.buffer().trim().is_empty()
+                                && self.accept_intent_proposal(&mut editor, prompt)?
+                            {
                                 continue;
                             }
                             if input_is_incomplete(editor.buffer(), prompt.mode) {
@@ -1356,6 +1533,30 @@ impl RichSurface {
                                 // command history.
                                 self.append_transcript_line("❯");
                                 editor.clear();
+                                self.dismiss_picker();
+                                continue;
+                            }
+                            if prompt.mode == Mode::Natural && self.intent_planner.is_some() {
+                                let catalog = self.catalog.clone().ok_or_else(|| {
+                                    ShellError::new(
+                                        ErrorCode::Io,
+                                        "Codex planning requires the admitted command catalog",
+                                    )
+                                    .with_help("Wait for catalog loading to finish and retry")
+                                })?;
+                                let intent = editor.buffer().to_owned();
+                                if let Some(planner) = self.intent_planner.as_mut() {
+                                    planner.start(&intent, catalog)?;
+                                }
+                                self.push_intent_message(IntentConversationRole::User, &intent);
+                                editor.clear();
+                                self.intent_proposal = None;
+                                self.intent_token_usage = None;
+                                self.intent_planning_started = Some(Instant::now());
+                                self.busy_glyph =
+                                    Some(spinner_glyph(Duration::ZERO, prompt.surface_symbols()));
+                                self.intent_phase = Some("connecting to Codex".to_owned());
+                                self.refresh_intent_notice(Duration::ZERO);
                                 self.dismiss_picker();
                                 continue;
                             }
@@ -1435,6 +1636,89 @@ impl RichSurface {
         }
     }
 
+    fn poll_intent_planner(
+        &mut self,
+        _editor: &mut EditorState,
+        prompt: &mut QuirlPrompt,
+    ) -> Result<bool, ShellError> {
+        let Some(started) = self.intent_planning_started else {
+            return Ok(false);
+        };
+        let elapsed = started.elapsed();
+        let next_glyph = spinner_glyph(elapsed, prompt.surface_symbols());
+        let mut changed = self.busy_glyph != Some(next_glyph);
+        self.busy_glyph = Some(next_glyph);
+        let update = match self.intent_planner.as_mut() {
+            Some(planner) => planner.poll_cached(),
+            None => return Ok(false),
+        };
+        match update {
+            Ok(None) => {
+                self.refresh_intent_notice(elapsed);
+                Ok(changed)
+            }
+            Err(error) => {
+                self.intent_planning_started = None;
+                self.busy_glyph = None;
+                self.intent_phase = None;
+                self.push_intent_message(
+                    IntentConversationRole::Assistant,
+                    &format!("I couldn't finish that: {}", error.message),
+                );
+                self.refresh_intent_notice(elapsed);
+                Ok(true)
+            }
+            Ok(Some(InteractiveIntentPlannerUpdate::Progress { model, message })) => {
+                if let Some(label) = model {
+                    let safe = escape_terminal_line(&label);
+                    self.intent_model = safe
+                        .rsplit_once(" · ")
+                        .map(|(model, effort)| (model.to_owned(), effort.to_owned()))
+                        .or_else(|| Some((safe, "default".to_owned())));
+                }
+                self.intent_phase = Some(escape_terminal_line(&message));
+                self.refresh_intent_notice(elapsed);
+                Ok(true)
+            }
+            Ok(Some(InteractiveIntentPlannerUpdate::Reply {
+                command,
+                message,
+                model,
+                effort,
+                token_usage,
+                elapsed_ms,
+            })) => {
+                if let Some(command) = command.as_ref()
+                    && (command.is_empty() || command.len() > editor::MAX_EDITOR_BUFFER_BYTES)
+                {
+                    return Err(ShellError::new(
+                        ErrorCode::ResourceLimit,
+                        "Codex returned a command outside the editor byte limit",
+                    )
+                    .with_context(format!(
+                        "limit: {}; observed: {}",
+                        editor::MAX_EDITOR_BUFFER_BYTES,
+                        command.len()
+                    ))
+                    .with_help("Retry with a request that produces a shorter command"));
+                }
+                self.intent_proposal = command;
+                self.intent_model =
+                    Some((escape_terminal_line(&model), escape_terminal_line(&effort)));
+                self.intent_token_usage = token_usage;
+                self.push_intent_message(IntentConversationRole::Assistant, &message);
+                self.intent_planning_started = None;
+                self.busy_glyph = None;
+                self.intent_phase = None;
+                self.intent_completion.cancel();
+                self.completion.dismiss();
+                self.refresh_intent_notice(Duration::from_millis(elapsed_ms));
+                changed = true;
+                Ok(changed)
+            }
+        }
+    }
+
     fn toggle_grammar_mode(&mut self, prompt: &mut QuirlPrompt) {
         // Failure model: releasing the alternate screen here destroys the
         // editor state, while host feedback commits an unbounded line per
@@ -1443,11 +1727,112 @@ impl RichSurface {
         // the buffer and cursor, invalidate mode-sensitive transient UI, and
         // let the already-dirty loop repaint exactly one current frame.
         prompt.toggle_mode();
+        if prompt.mode == Mode::Natural {
+            self.begin_intent_session();
+        } else {
+            self.end_intent_session();
+        }
         self.expand_completion_pending = false;
         self.completion.cancel_for_edit();
         self.picker.dismiss();
         self.help_active = false;
         self.help_detail_scroll = 0;
+    }
+
+    fn accept_intent_proposal(
+        &mut self,
+        editor: &mut EditorState,
+        prompt: &mut QuirlPrompt,
+    ) -> Result<bool, ShellError> {
+        let Some(command) = self.intent_proposal.take() else {
+            return Ok(false);
+        };
+        editor.replace(0, editor.buffer().len(), &command);
+        self.end_intent_session();
+        prompt.set_mode(Mode::Command);
+        self.completion.dismiss();
+        self.refresh_completion_after_edit(editor, prompt.mode)?;
+        Ok(true)
+    }
+
+    fn begin_intent_session(&mut self) {
+        self.intent_planning_started = None;
+        self.intent_conversation.clear();
+        self.intent_proposal = None;
+        self.intent_model = None;
+        self.intent_token_usage = None;
+        self.intent_phase = None;
+        self.output_notice = None;
+        self.busy_glyph = None;
+        if let Some(planner) = self.intent_planner.as_mut() {
+            planner.begin_session();
+        }
+    }
+
+    fn end_intent_session(&mut self) {
+        if let Some(planner) = self.intent_planner.as_mut() {
+            planner.end_session();
+        }
+        self.intent_planning_started = None;
+        self.intent_conversation.clear();
+        self.intent_proposal = None;
+        self.intent_model = None;
+        self.intent_token_usage = None;
+        self.intent_phase = None;
+        self.output_notice = None;
+        self.busy_glyph = None;
+    }
+
+    fn push_intent_message(&mut self, role: IntentConversationRole, text: &str) {
+        let safe = escape_terminal_line(text);
+        let text = truncate_utf8(&safe, INTENT_CONVERSATION_MESSAGE_BYTES_MAX);
+        self.intent_conversation
+            .push_back(IntentConversationMessage { role, text });
+        while self.intent_conversation.len() > INTENT_CONVERSATION_MESSAGES_MAX
+            || self
+                .intent_conversation
+                .iter()
+                .map(|message| message.text.len())
+                .sum::<usize>()
+                > INTENT_CONVERSATION_RETAINED_BYTES_MAX
+        {
+            self.intent_conversation.pop_front();
+        }
+    }
+
+    fn refresh_intent_notice(&mut self, elapsed: Duration) {
+        let (model, effort) = self
+            .intent_model
+            .as_ref()
+            .map(|(model, effort)| (model.as_str(), effort.as_str()))
+            .unwrap_or(("Codex", "model pending"));
+        let mut notice = format!("MODEL\t{model}\t{effort}");
+        if let Some(usage) = self.intent_token_usage {
+            notice.push_str("\nTOKENS\t");
+            notice.push_str(&usage.turn_total.to_string());
+            notice.push('\t');
+            notice.push_str(&usage.session_total.to_string());
+        }
+        for message in &self.intent_conversation {
+            notice.push('\n');
+            notice.push_str(match message.role {
+                IntentConversationRole::User => "USER\t",
+                IntentConversationRole::Assistant => "ASSISTANT\t",
+            });
+            notice.push_str(&message.text);
+        }
+        if let Some(command) = self.intent_proposal.as_deref() {
+            notice.push_str("\nCOMMAND\t");
+            let safe = escape_terminal_line(command);
+            notice.push_str(&truncate_utf8(&safe, INTENT_CONVERSATION_MESSAGE_BYTES_MAX));
+        }
+        if let Some(phase) = self.intent_phase.as_deref() {
+            notice.push_str("\nBUSY\t");
+            notice.push_str(phase);
+            notice.push('\t');
+            notice.push_str(&format_elapsed(elapsed));
+        }
+        self.output_notice = Some(notice);
     }
 
     fn open_leader(&mut self, replace_end: usize) {
@@ -1508,6 +1893,9 @@ impl RichSurface {
             }
             KeyCode::Char('i') => {
                 prompt.set_mode(Mode::Natural);
+                if let Some(planner) = self.intent_planner.as_mut() {
+                    planner.prepare();
+                }
                 self.refresh_completion_after_text(line, cursor, prompt.mode)?;
             }
             KeyCode::Char('h') => {
@@ -1557,6 +1945,12 @@ impl RichSurface {
     fn return_to_tail_for_input(&mut self) {
         self.transcript.scroll_to_end();
         self.dismiss_output_selection();
+    }
+
+    fn clear_transient_output_notice(&mut self) {
+        if self.intent_conversation.is_empty() {
+            self.output_notice = None;
+        }
     }
 
     fn open_output_focus(&mut self) {
@@ -1742,11 +2136,18 @@ impl RichSurface {
     fn dismiss_output_selection(&mut self) {
         self.output_focus = false;
         self.output_anchor_line = None;
-        self.output_notice = None;
         self.mouse_drag = None;
         self.screen_selection = None;
         self.screen_copy_pending = false;
         self.transcript.clear_selection();
+        if self.intent_conversation.is_empty() {
+            self.output_notice = None;
+        } else {
+            let elapsed = self
+                .intent_planning_started
+                .map_or(Duration::ZERO, |started| started.elapsed());
+            self.refresh_intent_notice(elapsed);
+        }
     }
 
     fn select_output_range(&mut self) {
@@ -2105,8 +2506,10 @@ impl Drop for RichSurface {
 
 /// Frame length of one spinner glyph, matching the observer's tick cadence
 /// so every delivered tick advances the spinner by exactly one frame.
-const SPINNER_FRAME_MS: u128 = 100;
-const SPINNER_FRAMES_UNICODE: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPINNER_FRAME_MS: u128 = 70;
+const SPINNER_FRAMES_UNICODE: [char; 12] = [
+    '🕛', '🕐', '🕑', '🕒', '🕓', '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚',
+];
 const SPINNER_FRAMES_PLAIN: [char; 4] = ['|', '/', '-', '\\'];
 
 /// Build the running-command status text: a spinner glyph that advances
@@ -2164,6 +2567,19 @@ fn format_elapsed(elapsed: Duration) -> String {
     } else {
         format!("{}m{:02}s", total_seconds / 60, total_seconds % 60)
     }
+}
+
+fn truncate_utf8(value: &str, byte_limit: usize) -> String {
+    if value.len() <= byte_limit {
+        return value.to_owned();
+    }
+    let mut end = byte_limit;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut truncated = value.get(..end).unwrap_or_default().to_owned();
+    truncated.push('…');
+    truncated
 }
 
 #[derive(Default)]
@@ -2971,6 +3387,22 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    struct ReadyIntentPlanner {
+        update: Option<InteractiveIntentPlannerUpdate>,
+    }
+
+    impl InteractiveIntentPlanner for ReadyIntentPlanner {
+        fn start(&mut self, _intent: &str, _catalog: Arc<Catalog>) -> Result<(), ShellError> {
+            Ok(())
+        }
+
+        fn poll_cached(&mut self) -> Result<Option<InteractiveIntentPlannerUpdate>, ShellError> {
+            Ok(self.update.take())
+        }
+
+        fn cancel(&mut self) {}
+    }
+
     fn await_catalog_admission(surface: &mut RichSurface) -> Result<(), ShellError> {
         let started = Instant::now();
         let timeout = Duration::from_secs(1);
@@ -2996,6 +3428,144 @@ mod tests {
     fn incomplete_quotes_continue_instead_of_executing() {
         assert!(input_is_incomplete("printf 'hello", Mode::Command));
         assert!(!input_is_incomplete("printf hello", Mode::Command));
+    }
+
+    #[test]
+    fn unicode_spinner_uses_the_twelve_clock_seventy_millisecond_cycle() {
+        let expected = [
+            '🕛', '🕐', '🕑', '🕒', '🕓', '🕔', '🕕', '🕖', '🕗', '🕘', '🕙', '🕚', '🕛',
+        ];
+        for (index, glyph) in expected.into_iter().enumerate() {
+            let elapsed = Duration::from_millis(u64::try_from(index).unwrap() * 70);
+            assert_eq!(spinner_glyph(elapsed, SurfaceSymbols::Unicode), glyph);
+        }
+    }
+
+    #[test]
+    fn rejected_command_prefill_preserves_the_previous_bounded_value() {
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface.prefill_command("'quirl' 'status'").unwrap();
+        assert_eq!(surface.pending_prefill.as_deref(), Some("'quirl' 'status'"));
+
+        let oversized = "x".repeat(editor::MAX_EDITOR_BUFFER_BYTES.saturating_add(1));
+        let error = surface.prefill_command(&oversized).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_eq!(surface.pending_prefill.as_deref(), Some("'quirl' 'status'"));
+    }
+
+    #[test]
+    fn completed_intent_stays_conversational_until_the_proposal_is_accepted() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface.set_intent_planner(Box::new(ReadyIntentPlanner {
+            update: Some(InteractiveIntentPlannerUpdate::Reply {
+                command: Some("ls -a".to_owned()),
+                message: "This lists hidden entries too.".to_owned(),
+                model: "GPT-5.6 Luna".to_owned(),
+                effort: "high".to_owned(),
+                token_usage: Some(InteractiveIntentTokenUsage {
+                    turn_total: 1_842,
+                    session_total: 6_724,
+                }),
+                elapsed_ms: 1_250,
+            }),
+        }));
+        surface.intent_planning_started = Some(Instant::now());
+        let mut prompt = QuirlPrompt::with_config(Mode::Natural, &config);
+        let mut editor = EditorState::new("emacs", Vec::new());
+        surface.push_intent_message(IntentConversationRole::User, "list all files");
+
+        assert!(
+            surface
+                .poll_intent_planner(&mut editor, &mut prompt)
+                .unwrap()
+        );
+        assert_eq!(prompt.mode(), Mode::Natural);
+        assert_eq!(editor.buffer(), "");
+        assert_eq!(surface.intent_proposal.as_deref(), Some("ls -a"));
+        assert_eq!(surface.transcript.line_count(), 0);
+        assert_eq!(surface.busy_glyph, None);
+        assert!(
+            surface
+                .output_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("MODEL\tGPT-5.6 Luna\thigh"))
+        );
+        assert!(surface.output_notice.as_deref().is_some_and(|notice| {
+            notice.contains("ASSISTANT\tThis lists hidden entries too.")
+                && notice.contains("COMMAND\tls -a")
+                && notice.contains("TOKENS\t1842\t6724")
+        }));
+    }
+
+    #[test]
+    fn typing_a_follow_up_keeps_the_open_codex_conversation_visible() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface.intent_model = Some(("GPT-5.6 Luna".to_owned(), "high".to_owned()));
+        surface.push_intent_message(IntentConversationRole::User, "list all files");
+        surface.push_intent_message(
+            IntentConversationRole::Assistant,
+            "Which files should I include?",
+        );
+        surface.refresh_intent_notice(Duration::from_millis(850));
+        let notice = surface.output_notice.clone();
+
+        let mut editor = EditorState::new("emacs", Vec::new());
+        assert!(editor.apply(EditAction::Insert('a')));
+        surface.clear_transient_output_notice();
+        surface.return_to_tail_for_input();
+
+        assert_eq!(surface.output_notice, notice);
+        assert_eq!(editor.buffer(), "a");
+    }
+
+    #[test]
+    fn empty_enter_accepts_the_current_intent_proposal_for_review() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface.intent_proposal = Some("find . -type f | sort | head -n 1".to_owned());
+        surface.output_notice = Some("MODEL\tGPT-5.6 Luna\thigh".to_owned());
+        let mut prompt = QuirlPrompt::with_config(Mode::Natural, &config);
+        let mut editor = EditorState::new("emacs", Vec::new());
+
+        assert!(
+            surface
+                .accept_intent_proposal(&mut editor, &mut prompt)
+                .unwrap()
+        );
+        assert_eq!(prompt.mode(), Mode::Command);
+        assert_eq!(editor.buffer(), "find . -type f | sort | head -n 1");
+        assert_eq!(surface.intent_proposal, None);
+        assert_eq!(surface.output_notice, None);
     }
 
     #[test]

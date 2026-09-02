@@ -6,6 +6,7 @@ mod ai_bootstrap;
 mod assets;
 mod author;
 mod bounded_file;
+mod codex;
 mod config;
 mod coordination;
 mod extension_scheduler;
@@ -44,7 +45,7 @@ use pick::PickCommand;
 use platform::{EventsCommand, ViewCommand, WatchCommand};
 use plugin::PluginCommand;
 use quirl_catalog::{Catalog, CommandSpec, Completion, Effect as CatalogEffect};
-use quirl_contract::CommandProposal;
+use quirl_contract::{CommandPlanner, CommandPlanningRequest, CommandProposal};
 use quirl_core::{
     CommandOutcome, ErrorCode, ExecutionCancellation, ExecutionCleanupState, ExecutionEffect,
     ExecutionEffects, ExecutionInput, ExecutionMode, ExecutionOutcome, ExecutionOutput,
@@ -185,7 +186,7 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// Search and index local command intelligence without network inference.
+    /// Search locally or plan a reviewed command through Codex CLI.
     Ai {
         #[command(subcommand)]
         command: AiCommand,
@@ -496,40 +497,23 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
 
 fn execute_natural_command(query: &[String]) -> Result<i32, ShellError> {
     let intent = join_natural_query(query)?;
-    let results = index::search_default_database_kind(
-        &intent,
-        intelligence::SEARCH_RESULTS_MAX,
-        intelligence::SearchDocumentKind::Command,
-    )?;
-    let candidate = natural_command_candidate(&results).ok_or_else(|| {
-        ShellError::new(
-            ErrorCode::InvalidCommand,
-            "natural command retrieval found no catalog command",
-        )
-        .with_help("Refresh the local index or describe the task with more command-specific words")
-    })?;
     let catalog = load_composed_catalog()?;
-    let command = catalog
-        .commands
-        .iter()
-        .find(|command| command.path == candidate.command)
-        .ok_or_else(|| {
-            ShellError::new(
-                ErrorCode::Validation,
-                "the ranked command is absent from the current catalog",
-            )
-            .with_context(format!("ranked path: {}", candidate.command))
-            .with_help("Refresh the command index and retry the natural-language request")
-        })?;
-    let mut proposal = CommandProposal::retrieval_fallback(
-        &catalog,
-        command.id.clone(),
-        format!("retrieved `{}` for the supplied task", command.path),
-        "quirl-bounded-hybrid-retrieval-v1",
-    )?;
+    let mut proposal = plan_natural_command(&intent, &catalog)?;
+    complete_and_execute_natural_proposal(&mut proposal, &catalog)
+}
+
+fn plan_natural_command(intent: &str, catalog: &Catalog) -> Result<CommandProposal, ShellError> {
+    let request = CommandPlanningRequest::new(intent)?;
+    codex::CodexPlanner::default().propose(&request, catalog)
+}
+
+fn complete_and_execute_natural_proposal(
+    proposal: &mut CommandProposal,
+    catalog: &Catalog,
+) -> Result<i32, ShellError> {
     let mut input = io::stdin().lock();
     let mut output = io::stderr().lock();
-    if !ai::resolve_natural_command_slots(&mut proposal, &catalog, &mut input, &mut output)? {
+    if !ai::resolve_natural_command_slots(proposal, catalog, &mut input, &mut output)? {
         writeln!(output, "natural command cancelled").map_err(|error| {
             ShellError::new(
                 ErrorCode::Io,
@@ -540,7 +524,7 @@ fn execute_natural_command(query: &[String]) -> Result<i32, ShellError> {
         })?;
         return Ok(1);
     }
-    let validated = proposal.validate(&catalog)?;
+    let validated = proposal.validate(catalog)?;
     let preview = validated.render_trusted()?;
     let risk = validated.risk();
     let risk_reasons = validated.risk_reasons().to_vec();
@@ -583,14 +567,6 @@ fn execute_natural_command(query: &[String]) -> Result<i32, ShellError> {
     let outcome = execute_execution_request(&mut NativeExecutor::default(), request, None)?;
     print_execution_outcome(&outcome)?;
     Ok(outcome.status_code())
-}
-
-fn natural_command_candidate(
-    results: &[intelligence::SearchResult],
-) -> Option<&intelligence::SearchResult> {
-    results
-        .iter()
-        .find(|result| result.command != "quirl ai run")
 }
 
 fn join_natural_query(query: &[String]) -> Result<String, ShellError> {
@@ -2049,11 +2025,17 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         &history_path,
     )?;
     print_banner(&active_config);
-    // Scheduling returns immediately; the guard only joins after cancellation
-    // during shell shutdown, so no download can delay the first prompt.
-    let _asset_refresh = assets::schedule_background_update();
-    let _periodic_asset_refresh =
-        assets::schedule_periodic_update(ai_bootstrap.asset_update_signal());
+    // The Codex-only preview deliberately leaves the legacy automatic local
+    // model path disabled. Keeping ownership conditional avoids starting a
+    // downloader or model worker while retaining explicit asset commands.
+    let (_asset_refresh, _periodic_asset_refresh) = if ai_bootstrap.local_model_enabled() {
+        (
+            assets::schedule_background_update(),
+            assets::schedule_periodic_update(ai_bootstrap.asset_update_signal()),
+        )
+    } else {
+        (None, None)
+    };
     let mut mode = Mode::Command;
     // Recovery snapshots are only needed once a native command is accepted.
     // Environment capture can be deferred past the first interactive paint.
@@ -2530,23 +2512,39 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                     }
                     InteractiveLine::Natural(query) => {
                         let started = Instant::now();
-                        match index::search_default_database(query, 8) {
-                            Ok(results) => {
-                                last_status = i32::from(results.is_empty());
-                                let stdout = ai::render_results_text(&results).into_bytes();
-                                let mut stderr = Vec::new();
-                                if results.is_empty() {
-                                    stderr.extend_from_slice(
-                                        b"no matching commands; refresh with `quirl index build`\n",
-                                    );
-                                }
-                                line_editor.emit_output(
-                                    query,
-                                    &stdout,
-                                    &stderr,
-                                    last_status,
-                                    started.elapsed(),
-                                )?;
+                        eprintln!("planning with Codex; press Ctrl-C to cancel the process...");
+                        let planned = (|| {
+                            let published_catalog = catalog.as_deref().ok_or_else(|| {
+                                ShellError::new(
+                                    ErrorCode::Io,
+                                    "interactive catalog publication is incomplete",
+                                )
+                                .with_help(
+                                    "Wait for catalog loading to finish and retry the intent",
+                                )
+                            })?;
+                            let mut proposal = plan_natural_command(query, published_catalog)?;
+                            let mut input = io::stdin().lock();
+                            let mut output = io::stderr().lock();
+                            if !ai::resolve_natural_command_slots(
+                                &mut proposal,
+                                published_catalog,
+                                &mut input,
+                                &mut output,
+                            )? {
+                                return Err(ShellError::new(
+                                    ErrorCode::Validation,
+                                    "Codex command proposal was cancelled",
+                                )
+                                .with_help("Submit the intent again when the required values are available"));
+                            }
+                            proposal.validate(published_catalog)?.render_for_editing()
+                        })();
+                        match planned {
+                            Ok(preview) => {
+                                last_status = 0;
+                                line_editor.prefill_command(&preview)?;
+                                mode = Mode::Command;
                             }
                             Err(error) => {
                                 last_status = 1;
@@ -2562,7 +2560,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         history_database.record(
                             query,
                             &history_directory,
-                            mode,
+                            Mode::Natural,
                             last_status,
                             Some(elapsed),
                         )?;
@@ -3154,6 +3152,17 @@ impl SessionEditor {
         }
     }
 
+    fn prefill_command(&mut self, command: &str) -> Result<(), ShellError> {
+        match self {
+            Self::Rich(editor) => editor.prefill_command(command),
+            Self::Simple(editor) => {
+                editor
+                    .run_edit_commands(&[reedline::EditCommand::InsertString(command.to_owned())]);
+                Ok(())
+            }
+        }
+    }
+
     fn command_output_mode(&self) -> ExecutionOutputMode {
         match self {
             Self::Rich(_) => ExecutionOutputMode::RichViewport,
@@ -3336,7 +3345,7 @@ fn configured_initial_editor(
         )?;
         editor.set_panel_provider(Box::new(CachedPanelAdapter::new(Arc::clone(extensions))));
         editor.set_activity_provider(Box::new(ai_bootstrap.activity_provider()));
-        editor.set_intent_completer(Box::new(AiIntentCompleter::default()));
+        editor.set_intent_planner(Box::new(codex::CodexIntentPlanner::new()?));
         return Ok((SessionEditor::Rich(Box::new(editor)), None));
     }
 
@@ -3362,19 +3371,17 @@ fn configured_editor(
     );
     let picker_ranker: Arc<dyn PickerRanker> = Arc::new(SharedPickerRanker);
     if select_surface(&config.ui.surface) == SurfaceKind::Rich {
-        return RichSurface::new(
+        let mut editor = RichSurface::new(
             Arc::clone(catalog),
             Some(Box::new(completion_adapter)),
             Arc::clone(&picker_ranker),
             &config,
             history_path.to_path_buf(),
-        )
-        .map(|mut editor| {
-            editor.set_panel_provider(Box::new(CachedPanelAdapter::new(Arc::clone(extensions))));
-            editor.set_activity_provider(Box::new(ai_bootstrap.activity_provider()));
-            editor.set_intent_completer(Box::new(AiIntentCompleter::default()));
-            SessionEditor::Rich(Box::new(editor))
-        });
+        )?;
+        editor.set_panel_provider(Box::new(CachedPanelAdapter::new(Arc::clone(extensions))));
+        editor.set_activity_provider(Box::new(ai_bootstrap.activity_provider()));
+        editor.set_intent_planner(Box::new(codex::CodexIntentPlanner::new()?));
+        return Ok(SessionEditor::Rich(Box::new(editor)));
     }
     editor_with_extensions_config_history_and_picker(
         catalog.as_ref().clone(),
@@ -3407,55 +3414,6 @@ impl ExtensionCompleter for LocalAwareCompletionAdapter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
         self.local.request(line, pos);
         self.lua.complete(line, pos)
-    }
-}
-
-#[derive(Default)]
-struct AiIntentCompleter {
-    search: Option<intelligence::SearchSession>,
-}
-
-impl ExtensionCompleter for AiIntentCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
-        let Some(query) = line
-            .get(..pos)
-            .map(str::trim)
-            .filter(|query| !query.is_empty())
-        else {
-            return Vec::new();
-        };
-        if self.search.is_none() {
-            let Ok(search) = index::open_default_search_session() else {
-                return Vec::new();
-            };
-            self.search = Some(search);
-        }
-        let Some(search) = &self.search else {
-            return Vec::new();
-        };
-        search
-            .search(query, 8)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|result| ExtensionSuggestion {
-                value: result.target.clone(),
-                display: result.target,
-                summary: result.summary.clone(),
-                detail: format!(
-                    "{} · {} · score {:.3}: {}",
-                    if result.semantic {
-                        "semantic"
-                    } else {
-                        "lexical"
-                    },
-                    result.kind,
-                    result.score,
-                    result.summary
-                ),
-                replace_start: 0,
-                replace_end: pos,
-            })
-            .collect()
     }
 }
 
@@ -3718,10 +3676,10 @@ fn mode_feedback(mode: Mode, unicode: bool) -> String {
     let (separator, description) = match (unicode, mode) {
         (true, Mode::Command) => (" → ", "processes and byte pipelines"),
         (true, Mode::Data) => (" → ", "typed values and data pipelines"),
-        (true, Mode::Natural) => (" → ", "local command and option suggestions"),
+        (true, Mode::Natural) => (" → ", "Codex command planning"),
         (false, Mode::Command) => (": ", "processes and byte pipelines"),
         (false, Mode::Data) => (": ", "typed values and data pipelines"),
-        (false, Mode::Natural) => (": ", "local command and option suggestions"),
+        (false, Mode::Natural) => (": ", "Codex command planning"),
     };
     let detail_separator = if unicode { " · " } else { " - " };
     format!("mode{separator}{mode}{detail_separator}{description}")
@@ -4013,21 +3971,18 @@ mod tests {
     const DEFAULT_DIFFERENTIAL_SEED: u64 = 7_640_891_576_956_012_809;
 
     #[test]
-    fn natural_command_never_selects_its_own_composition_entrypoint() {
-        let bytes = intelligence::encode_database(&Catalog::builtin(), None).unwrap();
-        let results = intelligence::search_kind(
-            &bytes,
-            Path::new("catalog.sqlite3"),
-            "show the current working directory",
-            intelligence::SEARCH_RESULTS_MAX,
-            None,
-            intelligence::SearchDocumentKind::Command,
-        )
-        .unwrap();
-        assert_eq!(results[0].command, "quirl ai run");
-        assert_ne!(
-            natural_command_candidate(&results).unwrap().command,
-            "quirl ai run"
+    fn natural_command_is_codex_only() {
+        let parsed = Cli::try_parse_from(["quirl", "ai", "run", "show", "cwd"]).unwrap();
+        let Some(Command::Ai {
+            command: AiCommand::Run { query },
+        }) = parsed.command
+        else {
+            panic!("expected the natural-command entrypoint");
+        };
+        assert_eq!(query, ["show", "cwd"]);
+        assert!(
+            Cli::try_parse_from(["quirl", "ai", "run", "--provider", "local", "show", "cwd"])
+                .is_err()
         );
     }
 
@@ -4240,7 +4195,7 @@ mod tests {
         );
         assert_eq!(
             mode_feedback(Mode::Natural, true),
-            "mode → ai · local command and option suggestions"
+            "mode → ai · Codex command planning"
         );
     }
 

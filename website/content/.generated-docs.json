@@ -54,5 +54,6 @@
   "architecture/decisions/0024-kdl-native-command-catalog.mdx",
   "architecture/decisions/0025-fine-tuned-command-retrieval-model.mdx",
   "architecture/decisions/0026-rust-native-releases-and-runtime-assets.mdx",
-  "architecture/decisions/0027-lua-5-5-1-runtime.mdx"
+  "architecture/decisions/0027-lua-5-5-1-runtime.mdx",
+  "architecture/decisions/0029-codex-command-planner.mdx"
 ]

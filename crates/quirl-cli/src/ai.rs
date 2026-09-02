@@ -78,7 +78,7 @@ pub(crate) enum AiCommand {
     },
     /// Propose, preview, confirm, and run one catalog-backed command.
     Run {
-        /// Natural-language task description. Retrieval never invents shell text.
+        /// Natural-language task description. Codex never returns shell text.
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
     },

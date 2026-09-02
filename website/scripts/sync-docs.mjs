@@ -70,6 +70,7 @@ const documents = [
   ['docs/decisions/0025-fine-tuned-command-retrieval-model.md', 'architecture/decisions/0025-fine-tuned-command-retrieval-model.mdx'],
   ['docs/decisions/0026-rust-native-releases-and-runtime-assets.md', 'architecture/decisions/0026-rust-native-releases-and-runtime-assets.mdx'],
   ['docs/decisions/0027-lua-5-5-1-runtime.md', 'architecture/decisions/0027-lua-5-5-1-runtime.mdx'],
+  ['docs/decisions/0029-codex-command-planner.md', 'architecture/decisions/0029-codex-command-planner.mdx'],
 ];
 
 const pageBySource = new Map(documents);

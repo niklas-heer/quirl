@@ -7,13 +7,24 @@ of truth, and the existing process layer remains the sole native executor.
 
 ## Failure model
 
-- The query, catalog cache, discovered metadata, model directory, stored
-  embeddings, planner response, terminal input, and accepted argument values are
+- The query, catalog cache, discovered metadata, planner response, terminal
+  input, and accepted argument values are
   untrusted. Any can be malformed, stale, mismatched, oversized, replaced while
   being read, cancelled, or crafted to consume CPU or memory.
-- Lexical or semantic ranking can be wrong. A rank is never authority to execute.
-  The retrieval-only planner may select only a current catalog command ID and
-  validated argument slots; it cannot return command text.
+- Codex may select the wrong command or arguments from the compact complete
+  catalog. Noninteractive planning may return only a current catalog command ID
+  and typed arguments. The rich conversational path may instead return one
+  bounded editor submission containing native command source or a `lua` chunk;
+  Quirl parses or syntax-checks it before display and never executes it on
+  acceptance.
+- The Codex executable, inherited authentication state, long-lived app-server,
+  protocol messages, model response, and diagnostics can be absent, stale,
+  malicious, oversized, or slow. Interactive planning uses one ephemeral
+  conversation thread per open AI session over one contained connection. Tool features are disabled, read-only
+  and never-approve policies are explicit, and any tool lifecycle item is
+  rejected. Protocol lines, events, queues, input, temporary files, cancellation,
+  process cleanup, and wall time are bounded. Failure has no local-planner
+  fallback and never grants execution authority.
 - Catalog contents can change between retrieval, proposal construction,
   preview, confirmation, and execution. Every transition re-resolves the stable
   command ID and revalidates arguments against the current catalog.
@@ -45,8 +56,14 @@ of truth, and the existing process layer remains the sole native executor.
 | Embedding dimensions / retained vector bytes | 2,048 / 128 MiB | Model and SQLite admission. |
 | Lexical and semantic candidate pools | 65,536 each | Admitted document ceiling before reciprocal-rank fusion. |
 | Fused/final candidates | 65,536 / 100 | Fusion map and public result validation. |
-| Proposal arguments / catalog arguments | 256 / 1,024 | Planner and current-catalog admission. |
-| One proposal value / all proposal values | 16 KiB / 64 KiB | Proposal validation before preview. |
+| Codex catalog commands / arguments | 8,192 / 65,536 | Compact complete-catalog projection before serialization. |
+| Codex catalog request / protocol line | 1 MiB / 2 MiB | Bounded serialization before launch or JSONL transmission. |
+| Codex protocol turn / event count | 8 MiB / 4,096 | Fresh response and notification admission for each request or turn. |
+| Codex conversation turns / user bytes | 16 / 128 KiB | Before appending another turn to the ephemeral AI session. |
+| Codex prepare-and-plan / update queues | 2 / 32 | Bounded synchronous channels between editor, worker, and protocol reader. |
+| Codex wall deadline | 90 s | Polling supervisor terminates and reaps the complete process tree. |
+| Proposal arguments / catalog arguments | 256 / 1,024 | Noninteractive planner and current-catalog admission. |
+| One proposal value / rich source | 16 KiB / 64 KiB | Typed-value validation or editor-source admission before preview. |
 | Preview bytes | 16 KiB | Trusted renderer before terminal output. |
 | Retrieval deadline | 750 ms | Checked before and after bounded local encoding and ranking. |
 | Worker queue | one replaceable query generation | Existing latest-generation completion worker. |
@@ -54,12 +71,15 @@ of truth, and the existing process layer remains the sole native executor.
 | Database image | 128 MiB | Existing hardened SQLite admission/publication. |
 | Evaluation queries / retained fixture bytes | 4,096 / 8 MiB | Versioned fixture admission. |
 
-Expected interactive work is one preloaded model query plus two linear scans of
-the admitted document count and bounded sorting of candidate pools. Catalog
-documents and their embeddings are generated once per catalog/model identity,
-never per keystroke. Model memory is expected to remain near the 8 MiB
-automatic int8 command-model footprint, plus bounded document and vector
-storage.
+Expected planning work is one linear compact projection of the admitted
+catalog, one bounded serialization, and one Codex turn. The rich session pays
+app-server initialization and model discovery once in a background worker that
+starts with the first rich frame, prefers advertised Luna access at high effort,
+and creates one ephemeral thread for the open AI session. Other models use
+their advertised default effort. The first turn sends the complete catalog,
+while follow-up turns send only the new message and reuse the thread's bounded
+history. AI mode does not load the local command
+model or rank a local candidate pool.
 
 ## Invariants
 
@@ -75,21 +95,25 @@ storage.
    cannot remove lexical candidates.
 4. Reciprocal-rank fusion and exact-name/path/alias/option/type boosts are
    deterministic. Equal scores use stable catalog/document identities.
-5. `CommandProposal` is deny-unknown and versioned. It contains a catalog
-   command ID, typed values, unresolved slots, explanation, and provenance; it
-   contains no shell source or executable path supplied by a model.
-6. Trusted Rust code resolves the current catalog record, validates slot names,
-   kinds, types, cardinality, static values, conflicts, and required arguments,
-   then renders an exact quoted command. Preview bytes are exactly the bytes
-   later submitted to the existing parser/execution path.
-7. No proposal executes automatically. Ordinary acceptance is distinct from
-   proposal selection; high-risk confirmation is an additional state transition
-   and cannot be satisfied by the ordinary acceptance event.
-8. Cancellation and every error before execution leave terminal state and the
+5. Noninteractive `CommandProposal` remains deny-unknown and versioned, with a
+   catalog command ID, typed values, explanation, and provenance rather than
+   model-supplied source. Rich AI mode uses a separate deny-unknown response
+   containing an outcome, a short message, and at most 64 KiB of source.
+6. A rich proposal may compose admitted commands with native pipes, lists, and
+   redirects, or use the explicit `lua` bridge. It must satisfy the requested
+   final postcondition rather than substitute related intermediate output.
+7. Trusted Rust validates noninteractive catalog records and typed arguments as
+   before. For rich proposals it rejects control characters and editor actions,
+   parses native command graphs, and syntax-checks Lua without running it.
+8. No proposal executes automatically. Tab or empty Enter transfers rich source
+   into the normal editor; execution requires a later, separate Enter after the
+   user can inspect or edit it. Noninteractive high-risk confirmation remains a
+   separate state transition.
+9. Cancellation and every error before execution leave terminal state and the
    existing catalog/model/database generation unchanged. Once execution starts,
    existing process containment, recovery, and terminal cleanup remain the only
    lifecycle owner.
-9. The evaluation corpus is not an indexing source. Command-group train,
+10. The evaluation corpus is not an indexing source. Command-group train,
    validation, and test partitions are disjoint, and reports bind schema,
    document generation, catalog, model, index, fixture, and executable
    identities to Recall@1/5/10, MRR, required slices, latency, RSS, and model

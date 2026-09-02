@@ -118,7 +118,7 @@ Like Vim, Quirl gains power by changing what syntax means in a visible mode. Unl
 | --- | --- | --- | --- |
 | Normal | Bytes and processes; commands resolve through the session `PATH`; non-zero exits set status; familiar process control | `docker ps \| grep healthy`, `ls -al`, `false \|\| echo recovered` | `mode normal` (legacy: `mode command`) |
 | Data `▦` | Unambiguous Quirl grammar; typed, lazy values; external programs require an adapter or `^command`; failures are `Result` values | `ps \| where cpu > 20 \| sort cpu desc`, `open users.json \| get users \| select name email` | `mode data`; one-shot `data { ... }` |
-| AI `✧` | Live command and option discovery over the SQLite catalog; Quirl's pinned command-tuned int8 model downloads and indexes automatically after first paint. Enter inserts the selected suggestion into normal mode for review and never executes it directly. | `copy a directory while preserving permissions`, `find the option that follows symlinks` | `mode ai`; `Alt-Q i` selects it. `mode natural`, `mode nl`, and `mode human` remain aliases. |
+| AI `✧` | One open AI session is a bounded Codex conversation. The first Enter sends the intent plus a compact projection of the complete admitted command catalog; typed follow-ups reuse the same ephemeral thread. The card shows the actual model, effort, latest-turn tokens, and cumulative session tokens. Codex may compose a full pipeline, command list, redirect, or sandboxed Lua chunk. Tab—or empty Enter when a proposal is ready—moves the syntax-validated source into normal mode for review without executing it. | `find the biggest regular file recursively`, `write a small Lua transform for these values` | `mode ai`; `Alt-Q i` selects it. `mode natural`, `mode nl`, and `mode human` remain aliases. |
 
 ```quirl
 ▦ http get /health | match {
@@ -976,7 +976,7 @@ and accessible text output, per the release criterion in §10.
 
 On 15 August 2026, the following decisions were reviewed and agreed:
 
-- **Three explicit interactive modes:** normal mode uses bytes and compatibility syntax; data mode uses typed value pipelines; AI mode searches local command knowledge and inserts a selected command for review without execution.
+- **Three explicit interactive modes:** normal mode uses bytes and compatibility syntax; data mode uses typed value pipelines; AI mode delegates a bounded conversation to an installed Codex CLI and exposes bounded, syntax-validated command, pipeline, or Lua source for explicit review without execution.
 - **C0–C4 compatibility levels:** optimize copy/paste and common interactive syntax; use reference interpreters for exact dialect behavior.
 - **Result-based errors outside command mode:** retain traditional status interactively; require explicit failure handling in data pipelines and scripts.
 - **Lua as the extension language:** Rust implements the product; one pinned Lua 5.5.1 runtime and generated `quirl` SDK serve config, scripts, trusted plugins; annotations improve tooling while Rust schemas enforce boundaries.

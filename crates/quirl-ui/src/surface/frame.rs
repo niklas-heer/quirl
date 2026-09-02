@@ -17,7 +17,10 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -65,6 +68,7 @@ impl FrameModel<'_> {
             area,
             u16::try_from(input.lines.len()).unwrap_or(u16::MAX),
             self.diagnostic.is_some() && !self.compact,
+            self.intent_activity_rows(area.width),
             self.transcript.map_or(0, Transcript::line_count),
             self.transcript.is_none_or(Transcript::follows_tail),
         )
@@ -85,6 +89,7 @@ impl FrameModel<'_> {
             area,
             u16::try_from(input.lines.len()).unwrap_or(u16::MAX),
             self.diagnostic.is_some() && !self.compact,
+            self.intent_activity_rows(area.width),
             self.transcript.map_or(0, Transcript::line_count),
             self.transcript.is_none_or(Transcript::follows_tail),
         );
@@ -106,6 +111,10 @@ impl FrameModel<'_> {
             .take(usize::from(layout.input.height))
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(visible_input), layout.input);
+
+        if let Some(activity_area) = layout.intent_activity {
+            self.render_intent_activity(frame, activity_area);
+        }
 
         if let Some((diagnostic, diagnostic_area)) = self
             .diagnostic
@@ -156,7 +165,11 @@ impl FrameModel<'_> {
                 .diagnostic
                 .filter(|_| self.compact)
                 .map(|diagnostic| diagnostic.message.as_str())
-                .or(self.output_notice)
+                .or_else(|| {
+                    (!self.intent_activity_visible())
+                        .then_some(self.output_notice)
+                        .flatten()
+                })
                 .or_else(|| {
                     self.output_focus
                         .then_some("OUTPUT · drag/↑↓ select · y or Ctrl-C copy · Esc return")
@@ -174,6 +187,10 @@ impl FrameModel<'_> {
                 .or_else(|| self.runtime.activity()),
             timings: self.timings,
             symbols: self.symbols,
+            assistant_busy: self.mode == Mode::Natural && self.busy_glyph.is_some(),
+            assistant_has_proposal: self
+                .output_notice
+                .is_some_and(|notice| notice.lines().any(|line| line.starts_with("COMMAND\t"))),
         };
         frame.render_widget(Paragraph::new(status.line(self.theme)), layout.status);
 
@@ -247,6 +264,176 @@ impl FrameModel<'_> {
         }
     }
 
+    fn intent_activity_visible(&self) -> bool {
+        self.mode == Mode::Natural && self.output_notice.is_some()
+    }
+
+    fn intent_activity_rows(&self, area_width: u16) -> u16 {
+        if !self.intent_activity_visible() {
+            return 0;
+        }
+        let Some(notice) = self.output_notice else {
+            return 0;
+        };
+        let parsed = intent_panel_parts(notice);
+        let horizontal_inset = u16::from(area_width > 56).saturating_mul(2);
+        let inner_width = usize::from(
+            area_width
+                .saturating_sub(horizontal_inset)
+                .clamp(1, 96)
+                .saturating_sub(2)
+                .max(1),
+        );
+        let content_width = u16::try_from(
+            inner_width
+                .saturating_sub(usize::from(INTENT_ROLE_WIDTH))
+                .max(1),
+        )
+        .unwrap_or(u16::MAX);
+        let mut content_rows = parsed
+            .lines
+            .iter()
+            .map(|(_, text)| intent_wrapped_rows(text, content_width))
+            .fold(0_usize, usize::saturating_add);
+        if let Some((phase, elapsed)) = parsed.busy.as_ref() {
+            let text = format!("{}  {elapsed}", sentence_case(phase));
+            content_rows = content_rows.saturating_add(intent_wrapped_rows(&text, content_width));
+        }
+        u16::try_from(content_rows.clamp(1, 8))
+            .unwrap_or(8)
+            .saturating_add(2)
+    }
+
+    fn render_intent_activity(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(notice) = self.output_notice else {
+            return;
+        };
+        let parsed = intent_panel_parts(notice);
+        if area.height < 3 {
+            let summary = parsed
+                .busy
+                .as_ref()
+                .map(|(phase, elapsed)| format!("CODEX  {phase}  {elapsed}"))
+                .or_else(|| {
+                    parsed
+                        .lines
+                        .last()
+                        .map(|(_, text)| format!("CODEX  {text}"))
+                })
+                .unwrap_or_else(|| "CODEX".to_owned());
+            let line = Line::from(Span::styled(summary, self.theme.accent(Mode::Natural)));
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
+
+        let horizontal_inset = u16::from(area.width > 56).saturating_mul(2);
+        let card_width = area.width.saturating_sub(horizontal_inset).clamp(1, 96);
+        let card_area = Rect::new(
+            area.x.saturating_add(horizontal_inset),
+            area.y,
+            card_width,
+            area.height,
+        );
+        let title = Line::from(vec![
+            Span::styled(" CODEX ", self.theme.selected(Mode::Natural)),
+            Span::styled(
+                format!("  {} ", parsed.model),
+                self.theme.context_secondary(),
+            ),
+            Span::styled("· ", self.theme.dim()),
+            Span::styled(
+                format!("{} ", parsed.effort.to_uppercase()),
+                self.theme.context(),
+            ),
+        ]);
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(
+                self.theme
+                    .context_secondary()
+                    .remove_modifier(Modifier::BOLD),
+            )
+            .title(title);
+        if let Some((turn_total, session_total)) = parsed.token_usage {
+            block = block.title(
+                Line::from(Span::styled(
+                    token_usage_title(turn_total, session_total),
+                    self.theme.dim(),
+                ))
+                .right_aligned(),
+            );
+        }
+        let inner = block.inner(card_area);
+        frame.render_widget(block, card_area);
+        let mut entries = parsed
+            .lines
+            .into_iter()
+            .map(|(role, text)| IntentRenderEntry::Conversation { role, text })
+            .collect::<Vec<_>>();
+        if let Some((phase, elapsed)) = parsed.busy {
+            entries.push(IntentRenderEntry::Busy {
+                spinner: self.busy_glyph.unwrap_or('•'),
+                phase,
+                elapsed,
+            });
+        }
+        self.render_intent_entries(frame, inner, entries);
+    }
+
+    fn render_intent_entries(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        entries: Vec<IntentRenderEntry>,
+    ) {
+        let role_width = INTENT_ROLE_WIDTH.min(area.width);
+        let content_width = area.width.saturating_sub(role_width);
+        if content_width == 0 || area.height == 0 {
+            return;
+        }
+        let heights = entries
+            .iter()
+            .map(|entry| entry.rows(content_width))
+            .collect::<Vec<_>>();
+        let total_rows = heights.iter().copied().fold(0_usize, usize::saturating_add);
+        let mut rows_to_skip = total_rows.saturating_sub(usize::from(area.height));
+        let mut y = area.y;
+        for (entry, entry_rows) in entries.into_iter().zip(heights) {
+            if rows_to_skip >= entry_rows {
+                rows_to_skip = rows_to_skip.saturating_sub(entry_rows);
+                continue;
+            }
+            let scroll = rows_to_skip;
+            rows_to_skip = 0;
+            let visible_rows = entry_rows
+                .saturating_sub(scroll)
+                .min(usize::from(area.bottom().saturating_sub(y)));
+            if visible_rows == 0 {
+                break;
+            }
+            let height = u16::try_from(visible_rows).unwrap_or(u16::MAX);
+            if scroll == 0 {
+                frame.render_widget(
+                    Paragraph::new(entry.role_line(self.theme)),
+                    Rect::new(area.x, y, role_width, 1),
+                );
+            }
+            let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
+            let paragraph = Paragraph::new(entry.content_line(content_width, self.theme))
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0));
+            frame.render_widget(
+                paragraph,
+                Rect::new(area.x.saturating_add(role_width), y, content_width, height),
+            );
+            y = y.saturating_add(height);
+            if y >= area.bottom() {
+                break;
+            }
+        }
+    }
+
     fn render_transcript(&self, frame: &mut Frame<'_>, area: Rect, transcript: &Transcript) {
         if area.height == 0 || transcript.line_count() == 0 {
             return;
@@ -258,13 +445,10 @@ impl FrameModel<'_> {
             .clone()
             .filter_map(|line_index| {
                 let text = transcript.line(line_index)?;
-                let style = if text.starts_with('❯') {
-                    self.theme.accent(self.mode)
-                } else if text.starts_with("── exit ") {
-                    self.theme.dim()
-                } else {
-                    Default::default()
-                };
+                if text.starts_with('│') && !transcript_line_is_selected(line_index, selection) {
+                    return Some(table_transcript_line(text, self.theme));
+                }
+                let style = transcript_base_style(text, self.theme, self.mode);
                 Some(transcript_line(
                     text,
                     line_index,
@@ -381,7 +565,10 @@ impl FrameModel<'_> {
             .filter(|byte| *byte == b'\n')
             .count();
         let mut cursor_column = 0_usize;
-        let busy_indicator = self.busy_glyph.map(|glyph| format!("{glyph} "));
+        let busy_indicator = self
+            .busy_glyph
+            .filter(|_| self.mode != Mode::Natural)
+            .map(|glyph| format!("{glyph} "));
         for (line_index, part) in self.editor.buffer().split('\n').enumerate() {
             let indicator = if line_index == 0 {
                 busy_indicator
@@ -652,6 +839,68 @@ fn scrollbar_metrics(
     })
 }
 
+fn transcript_base_style(text: &str, theme: Theme, mode: Mode) -> Style {
+    if text.starts_with('❯') {
+        theme.accent(mode)
+    } else if text.starts_with("── exit ") {
+        theme.dim()
+    } else if matches!(text.chars().next(), Some('╭' | '├' | '╰')) {
+        theme.border()
+    } else {
+        Style::default()
+    }
+}
+
+fn transcript_line_is_selected(
+    line_index: usize,
+    selection: Option<(
+        super::transcript::TextPosition,
+        super::transcript::TextPosition,
+    )>,
+) -> bool {
+    selection.is_some_and(|(start, end)| {
+        line_index >= start.line_index
+            && line_index <= end.line_index
+            && (start.line_index != end.line_index || start.byte_offset < end.byte_offset)
+    })
+}
+
+fn table_transcript_line(text: &str, theme: Theme) -> Line<'static> {
+    let content_style = if table_heading_line(text) {
+        theme.accent(Mode::Command)
+    } else {
+        Style::default()
+    };
+    let mut spans = Vec::new();
+    let mut content_start = 0_usize;
+    for (index, character) in text.char_indices() {
+        if character != '│' {
+            continue;
+        }
+        if content_start < index {
+            spans.push(Span::styled(
+                escape_terminal_line(text.get(content_start..index).unwrap_or_default()),
+                content_style,
+            ));
+        }
+        spans.push(Span::styled("│", theme.border()));
+        content_start = index.saturating_add(character.len_utf8());
+    }
+    if content_start < text.len() {
+        spans.push(Span::styled(
+            escape_terminal_line(text.get(content_start..).unwrap_or_default()),
+            content_style,
+        ));
+    }
+    Line::from(spans)
+}
+
+fn table_heading_line(text: &str) -> bool {
+    text.strip_prefix('│')
+        .and_then(|text| text.split_once('│'))
+        .is_some_and(|(first_cell, _)| first_cell.trim() == "#")
+}
+
 fn transcript_line(
     text: &str,
     line_index: usize,
@@ -701,6 +950,7 @@ struct FrameLayout {
     transcript: Rect,
     context: Option<Rect>,
     input: Rect,
+    intent_activity: Option<Rect>,
     diagnostic: Option<Rect>,
     information: Rect,
     status: Rect,
@@ -710,6 +960,7 @@ fn frame_layout(
     area: Rect,
     input_rows: u16,
     diagnostic_visible: bool,
+    intent_activity_rows: u16,
     transcript_line_count: usize,
     follows_tail: bool,
 ) -> FrameLayout {
@@ -724,6 +975,7 @@ fn frame_layout(
             transcript,
             context: None,
             input: Rect::new(area.x, status_y, area.width, 0),
+            intent_activity: None,
             diagnostic: None,
             information: Rect::new(area.x, status_y, area.width, 0),
             status,
@@ -732,10 +984,17 @@ fn frame_layout(
 
     let context_height = u16::from(rows_above_status >= 2);
     let available_after_context = rows_above_status.saturating_sub(context_height);
-    let diagnostic_height = u16::from(diagnostic_visible && available_after_context >= 2);
-    let input_height = input_rows.min(available_after_context.saturating_sub(diagnostic_height));
+    // Ask only for the rows the content needs. Preserve one editor row on a
+    // short terminal, then degrade to a one-line summary instead of reserving
+    // a mostly empty fixed-height rectangle.
+    let intent_activity_height =
+        intent_activity_rows.min(available_after_context.saturating_sub(1));
+    let available_after_activity = available_after_context.saturating_sub(intent_activity_height);
+    let diagnostic_height = u16::from(diagnostic_visible && available_after_activity >= 2);
+    let input_height = input_rows.min(available_after_activity.saturating_sub(diagnostic_height));
     let current_height = context_height
         .saturating_add(input_height)
+        .saturating_add(intent_activity_height)
         .saturating_add(diagnostic_height);
     let transcript_height = u16::try_from(transcript_line_count)
         .unwrap_or(u16::MAX)
@@ -745,7 +1004,14 @@ fn frame_layout(
     let context = (context_height == 1).then_some(Rect::new(area.x, context_y, area.width, 1));
     let input_y = context_y.saturating_add(context_height);
     let input = Rect::new(area.x, input_y, area.width, input_height);
-    let diagnostic_y = input.bottom();
+    let intent_activity_y = input.bottom();
+    let intent_activity = (intent_activity_height > 0).then_some(Rect::new(
+        area.x,
+        intent_activity_y,
+        area.width,
+        intent_activity_height,
+    ));
+    let diagnostic_y = intent_activity_y.saturating_add(intent_activity_height);
     let diagnostic = (diagnostic_height == 1).then_some(Rect::new(
         area.x,
         diagnostic_y,
@@ -763,10 +1029,281 @@ fn frame_layout(
         transcript,
         context,
         input,
+        intent_activity,
         diagnostic,
         information,
         status,
     }
+}
+
+struct IntentPanelParts {
+    model: String,
+    effort: String,
+    token_usage: Option<(u64, u64)>,
+    lines: Vec<(IntentPanelRole, String)>,
+    busy: Option<(String, String)>,
+}
+
+#[derive(Clone, Copy)]
+enum IntentPanelRole {
+    User,
+    Assistant,
+    Command,
+}
+
+const INTENT_ROLE_WIDTH: u16 = 9;
+
+enum IntentRenderEntry {
+    Conversation {
+        role: IntentPanelRole,
+        text: String,
+    },
+    Busy {
+        spinner: char,
+        phase: String,
+        elapsed: String,
+    },
+}
+
+impl IntentRenderEntry {
+    fn rows(&self, content_width: u16) -> usize {
+        match self {
+            Self::Conversation { text, .. } => intent_wrapped_rows(text, content_width),
+            Self::Busy { phase, elapsed, .. } => intent_wrapped_rows(
+                &format!("{}  {elapsed}", sentence_case(phase)),
+                content_width,
+            ),
+        }
+    }
+
+    fn role_line(&self, theme: Theme) -> Line<'static> {
+        match self {
+            Self::Conversation { role, .. } => intent_role_line(*role, theme),
+            Self::Busy { spinner, .. } => Line::from(Span::styled(
+                format!("  {spinner}"),
+                theme.context_secondary(),
+            )),
+        }
+    }
+
+    fn content_line(&self, content_width: u16, theme: Theme) -> Line<'static> {
+        match self {
+            Self::Conversation { role, text } => intent_content_line(*role, text, theme),
+            Self::Busy { phase, elapsed, .. } => {
+                intent_busy_line(phase, elapsed, usize::from(content_width), theme)
+            }
+        }
+    }
+}
+
+fn intent_panel_parts(notice: &str) -> IntentPanelParts {
+    let mut model = "Codex".to_owned();
+    let mut effort = "model pending".to_owned();
+    let mut token_usage = None;
+    let mut lines = Vec::new();
+    let mut busy = None;
+    for line in notice.lines() {
+        let mut fields = line.splitn(3, '\t');
+        match fields.next().unwrap_or_default() {
+            "MODEL" => {
+                model = fields.next().unwrap_or("Codex").to_owned();
+                effort = fields.next().unwrap_or("default").to_owned();
+            }
+            "TOKENS" => {
+                let turn_total = fields.next().and_then(|value| value.parse::<u64>().ok());
+                let session_total = fields.next().and_then(|value| value.parse::<u64>().ok());
+                token_usage = turn_total
+                    .zip(session_total)
+                    .filter(|(turn_total, session_total)| session_total >= turn_total);
+            }
+            "USER" => lines.push((
+                IntentPanelRole::User,
+                fields.next().unwrap_or_default().to_owned(),
+            )),
+            "ASSISTANT" => lines.push((
+                IntentPanelRole::Assistant,
+                fields.next().unwrap_or_default().to_owned(),
+            )),
+            "COMMAND" => lines.push((
+                IntentPanelRole::Command,
+                fields.next().unwrap_or_default().to_owned(),
+            )),
+            "BUSY" => {
+                busy = Some((
+                    fields.next().unwrap_or("working").to_owned(),
+                    fields.next().unwrap_or_default().to_owned(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    IntentPanelParts {
+        model,
+        effort,
+        token_usage,
+        lines,
+        busy,
+    }
+}
+
+fn token_usage_title(turn_total: u64, session_total: u64) -> String {
+    if turn_total == session_total {
+        format!(" {} tokens ", compact_token_count(turn_total))
+    } else {
+        format!(
+            " {} turn · {} session ",
+            compact_token_count(turn_total),
+            compact_token_count(session_total)
+        )
+    }
+}
+
+fn compact_token_count(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    if tokens < 1_000_000 {
+        return compact_scaled_count(tokens, 1_000, "k");
+    }
+    compact_scaled_count(tokens, 1_000_000, "m")
+}
+
+fn compact_scaled_count(value: u64, scale: u64, suffix: &str) -> String {
+    let tenths = value
+        .saturating_mul(10)
+        .checked_div(scale)
+        .unwrap_or_default();
+    let whole = tenths.checked_div(10).unwrap_or_default();
+    if tenths.is_multiple_of(10) {
+        format!("{whole}{suffix}")
+    } else {
+        let decimal = tenths.checked_rem(10).unwrap_or_default();
+        format!("{whole}.{decimal:01}{suffix}")
+    }
+}
+
+fn intent_role_line(role: IntentPanelRole, theme: Theme) -> Line<'static> {
+    match role {
+        IntentPanelRole::User => Line::from(Span::styled("  you", theme.context_secondary())),
+        IntentPanelRole::Assistant => {
+            Line::from(Span::styled("  codex", theme.accent(Mode::Natural)))
+        }
+        IntentPanelRole::Command => Line::from(Span::styled("  ›", theme.context_secondary())),
+    }
+}
+
+fn intent_content_line(role: IntentPanelRole, text: &str, theme: Theme) -> Line<'static> {
+    if !matches!(role, IntentPanelRole::Command) {
+        return Line::from(text.to_owned());
+    }
+    let spans = quirl_syntax::highlight(text, Mode::Command)
+        .into_iter()
+        .map(|span| {
+            let text = text.get(span.range).unwrap_or_default();
+            Span::styled(escape_terminal_controls(text), theme.highlight(span.kind))
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
+}
+
+fn intent_busy_line(
+    phase: &str,
+    elapsed: &str,
+    content_width: usize,
+    theme: Theme,
+) -> Line<'static> {
+    let phase = sentence_case(phase);
+    let occupied =
+        UnicodeWidthStr::width(phase.as_str()).saturating_add(UnicodeWidthStr::width(elapsed));
+    let gap = content_width.saturating_sub(occupied).max(2);
+    Line::from(vec![
+        Span::styled(phase, theme.accent(Mode::Natural)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(elapsed.to_owned(), theme.dim()),
+    ])
+}
+
+fn intent_wrapped_rows(text: &str, content_width: u16) -> usize {
+    let content_width = usize::from(content_width);
+    if content_width == 0 {
+        return 0;
+    }
+    let mut rows = 0_usize;
+    let mut line_width = 0_usize;
+    let mut word_width = 0_usize;
+    let mut whitespace_width = 0_usize;
+    let mut whitespace = std::collections::VecDeque::new();
+    let mut previous_was_non_whitespace = false;
+    for grapheme in text.graphemes(true) {
+        let is_whitespace = grapheme.chars().all(char::is_whitespace);
+        let symbol_width = UnicodeWidthStr::width(grapheme);
+        if symbol_width > content_width {
+            continue;
+        }
+        let word_found = previous_was_non_whitespace && is_whitespace;
+        let untrimmed_overflow = line_width == 0
+            && word_width
+                .saturating_add(whitespace_width)
+                .saturating_add(symbol_width)
+                > content_width;
+        if word_found || untrimmed_overflow {
+            line_width = line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width);
+            whitespace.clear();
+            whitespace_width = 0;
+            word_width = 0;
+        }
+
+        let line_full = line_width >= content_width;
+        let pending_word_overflow = symbol_width > 0
+            && line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width)
+                >= content_width;
+        if line_full || pending_word_overflow {
+            rows = rows.saturating_add(1);
+            let mut remaining_width = content_width.saturating_sub(line_width);
+            line_width = 0;
+            while whitespace
+                .front()
+                .is_some_and(|width| *width <= remaining_width)
+            {
+                let Some(width) = whitespace.pop_front() else {
+                    break;
+                };
+                whitespace_width = whitespace_width.saturating_sub(width);
+                remaining_width = remaining_width.saturating_sub(width);
+            }
+            if is_whitespace && whitespace.is_empty() {
+                previous_was_non_whitespace = false;
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace_width = whitespace_width.saturating_add(symbol_width);
+            whitespace.push_back(symbol_width);
+        } else {
+            word_width = word_width.saturating_add(symbol_width);
+        }
+        previous_was_non_whitespace = !is_whitespace;
+    }
+    if line_width > 0 || whitespace_width > 0 || word_width > 0 || rows == 0 {
+        rows = rows.saturating_add(1);
+    }
+    rows
+}
+
+fn sentence_case(value: &str) -> String {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return String::new();
+    };
+    let mut rendered = String::with_capacity(value.len());
+    rendered.extend(first.to_uppercase());
+    rendered.extend(characters);
+    rendered
 }
 
 fn visible_input_start(line_count: usize, cursor_line: usize, visible_rows: usize) -> usize {
@@ -887,6 +1424,37 @@ mod tests {
     use quirl_catalog::Catalog;
     use ratatui::{Terminal, backend::TestBackend, style::Color};
 
+    #[test]
+    fn transcript_tables_use_theme_roles_without_embedded_ansi() {
+        let theme = Theme::new(true);
+
+        assert_eq!(
+            transcript_base_style("╭───┬──────╮", theme, Mode::Command),
+            theme.border()
+        );
+        assert_eq!(
+            transcript_base_style("│ # │ name │", theme, Mode::Command),
+            Style::default()
+        );
+        assert_eq!(
+            transcript_base_style("│ 0 │ file │", theme, Mode::Command),
+            Style::default()
+        );
+
+        let heading = table_transcript_line("│ # │ name │", theme);
+        assert_eq!(heading.spans[0].content, "│");
+        assert_eq!(heading.spans[0].style, theme.border());
+        assert_eq!(heading.spans[1].content, " # ");
+        assert_eq!(heading.spans[1].style, theme.accent(Mode::Command));
+        assert_eq!(heading.spans[2].content, "│");
+        assert_eq!(heading.spans[2].style, theme.border());
+
+        let row = table_transcript_line("│ 0 │ file │", theme);
+        assert_eq!(row.spans[0].style, theme.border());
+        assert_eq!(row.spans[1].style, Style::default());
+        assert_eq!(row.spans[2].style, theme.border());
+    }
+
     fn rendered_model_in_mode(
         width: u16,
         height: u16,
@@ -970,6 +1538,26 @@ mod tests {
             .collect::<String>()
     }
 
+    fn cell_sequence_column(
+        terminal: &Terminal<TestBackend>,
+        y: u16,
+        expected: &str,
+    ) -> Option<u16> {
+        let buffer = terminal.backend().buffer();
+        let expected = expected
+            .chars()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        (0..buffer.area.width).find(|start| {
+            expected.iter().enumerate().all(|(offset, symbol)| {
+                let offset = u16::try_from(offset).unwrap_or(u16::MAX);
+                buffer
+                    .cell((start.saturating_add(offset), y))
+                    .is_some_and(|cell| cell.symbol() == symbol)
+            })
+        })
+    }
+
     fn draw_runtime_model(
         terminal: &mut Terminal<TestBackend>,
         editor: &EditorState,
@@ -1020,6 +1608,125 @@ mod tests {
             terminal.backend().buffer().cell((2, 1)).unwrap().fg,
             Color::Rgb(158, 206, 106)
         );
+    }
+
+    #[test]
+    fn codex_activity_renders_as_an_accented_card_below_the_intent() {
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("list all files");
+        let completion = CompletionState::new(Catalog::builtin(), None);
+        let runtime = RuntimeSurfaceState::new();
+        let mut terminal = Terminal::new(TestBackend::new(96, 7)).unwrap();
+        terminal
+            .draw(|frame| {
+                FrameModel {
+                    context_left: "~/project",
+                    context_right: "",
+                    editor: &editor,
+                    completion: &completion,
+                    mode: Mode::Natural,
+                    diagnostic: None,
+                    highlight_spans: &[],
+                    theme: Theme::new(true),
+                    unicode: true,
+                    symbols: SurfaceSymbols::Unicode,
+                    semantic_hints: true,
+                    hints: true,
+                    timings: None,
+                    compact: false,
+                    picker_query: None,
+                    picker_layout: PickerLayout::Adaptive,
+                    picker_preview: true,
+                    detail_scroll: 0,
+                    environment: None,
+                    runtime: &runtime,
+                    transcript: None,
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: Some(
+                        "MODEL\tGPT-5.6-Luna\thigh\nUSER\tlist all files\nBUSY\tchecking the command semantics\t2.4s",
+                    ),
+                    busy_glyph: Some('🕑'),
+                }
+                .render(frame);
+            })
+            .unwrap();
+
+        assert!(row(&terminal, 1).contains("list all files"));
+        assert!(row(&terminal, 2).contains("CODEX"));
+        assert!(row(&terminal, 2).contains("GPT-5.6-Luna"));
+        let busy_row = row(&terminal, 4);
+        assert!(busy_row.contains("🕑"));
+        assert!(busy_row.contains("Checking the command semantics"));
+        assert!(busy_row.contains("2.4s"));
+        let user_column = cell_sequence_column(&terminal, 3, "list all files");
+        let busy_column = cell_sequence_column(&terminal, 4, "Checking the command semantics");
+        assert_eq!(user_column, busy_column);
+        assert!(busy_row.find("2.4s").is_some_and(|index| {
+            UnicodeWidthStr::width(busy_row.get(..index).unwrap_or_default()) >= 88
+        }));
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((5, 4))
+                .unwrap()
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(
+            terminal.backend().buffer().cell((2, 4)).unwrap().fg,
+            Color::Rgb(187, 154, 247)
+        );
+        assert!(!row(&terminal, 6).contains("choosing the best command"));
+    }
+
+    #[test]
+    fn codex_wrapped_messages_keep_every_continuation_in_the_content_column() {
+        let editor = EditorState::new("emacs", Vec::new());
+        let completion = CompletionState::new(Catalog::builtin(), None);
+        let runtime = RuntimeSurfaceState::new();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        let message = "A".repeat(60);
+        terminal
+            .draw(|frame| {
+                FrameModel {
+                    context_left: "~/project",
+                    context_right: "",
+                    editor: &editor,
+                    completion: &completion,
+                    mode: Mode::Natural,
+                    diagnostic: None,
+                    highlight_spans: &[],
+                    theme: Theme::new(true),
+                    unicode: true,
+                    symbols: SurfaceSymbols::Unicode,
+                    semantic_hints: true,
+                    hints: true,
+                    timings: None,
+                    compact: false,
+                    picker_query: None,
+                    picker_layout: PickerLayout::Adaptive,
+                    picker_preview: true,
+                    detail_scroll: 0,
+                    environment: None,
+                    runtime: &runtime,
+                    transcript: None,
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: Some(&format!(
+                        "MODEL\tGPT-5.6-Luna\thigh\nASSISTANT\t{message}"
+                    )),
+                    busy_glyph: None,
+                }
+                .render(frame);
+            })
+            .unwrap();
+
+        let content_columns = (3..=5)
+            .filter_map(|y| cell_sequence_column(&terminal, y, "A"))
+            .collect::<Vec<_>>();
+        assert_eq!(content_columns, vec![10, 10, 10]);
     }
 
     #[test]
@@ -1136,6 +1843,57 @@ mod tests {
             terminal.backend().buffer().cell((0, 1)).unwrap().fg,
             Color::Rgb(158, 206, 106)
         );
+    }
+
+    #[test]
+    fn codex_reply_renders_conversation_and_a_normal_command_proposal() {
+        let editor = EditorState::new("emacs", Vec::new());
+        let completion = CompletionState::new(Catalog::builtin(), None);
+        let runtime = RuntimeSurfaceState::new();
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                FrameModel {
+                    context_left: "~/project",
+                    context_right: "",
+                    editor: &editor,
+                    completion: &completion,
+                    mode: Mode::Natural,
+                    diagnostic: None,
+                    highlight_spans: &[],
+                    theme: Theme::new(true),
+                    unicode: true,
+                    symbols: SurfaceSymbols::Unicode,
+                    semantic_hints: true,
+                    hints: true,
+                    timings: None,
+                    compact: false,
+                    picker_query: None,
+                    picker_layout: PickerLayout::Adaptive,
+                    picker_preview: true,
+                    detail_scroll: 0,
+                    environment: None,
+                    runtime: &runtime,
+                    transcript: None,
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: Some(
+                        "MODEL\tGPT-5.6-Luna\thigh\nTOKENS\t1842\t6724\nUSER\tshow hidden files\nASSISTANT\tThis includes dotfiles.\nCOMMAND\tls -a",
+                    ),
+                    busy_glyph: None,
+                }
+                .render(frame);
+            })
+            .unwrap();
+
+        let rendered = (0..10).map(|y| row(&terminal, y)).collect::<String>();
+        assert!(rendered.contains("GPT-5.6-Luna"));
+        assert!(rendered.contains("HIGH"));
+        assert!(rendered.contains("1.8k turn · 6.7k session"));
+        assert!(rendered.contains("you"));
+        assert!(rendered.contains("This includes dotfiles."));
+        assert!(rendered.contains("›      ls -a"));
+        assert!(row(&terminal, 9).contains("Enter/Tab use"));
     }
 
     #[test]
@@ -1339,18 +2097,25 @@ mod tests {
 
     #[test]
     fn tiny_layout_prioritizes_status_then_editor_without_out_of_bounds_regions() {
-        let one_row = frame_layout(Rect::new(0, 0, 1, 1), 1, true, 0, true);
+        let one_row = frame_layout(Rect::new(0, 0, 1, 1), 1, true, 0, 0, true);
         assert_eq!(one_row.status, Rect::new(0, 0, 1, 1));
         assert_eq!(one_row.input.height, 0);
         assert_eq!(one_row.information.height, 0);
         assert!(one_row.context.is_none());
         assert!(one_row.diagnostic.is_none());
 
-        let two_rows = frame_layout(Rect::new(0, 0, 1, 2), u16::MAX, true, 0, true);
+        let two_rows = frame_layout(Rect::new(0, 0, 1, 2), u16::MAX, true, 0, 0, true);
         assert_eq!(two_rows.input, Rect::new(0, 0, 1, 1));
         assert_eq!(two_rows.status, Rect::new(0, 1, 1, 1));
         assert!(two_rows.context.is_none());
         assert!(two_rows.diagnostic.is_none());
+
+        let compact_activity = frame_layout(Rect::new(0, 0, 80, 4), 1, false, 7, 0, true);
+        assert_eq!(compact_activity.input.height, 1);
+        assert_eq!(compact_activity.intent_activity.unwrap().height, 1);
+        let full_activity = frame_layout(Rect::new(0, 0, 80, 7), 1, false, 7, 0, true);
+        assert_eq!(full_activity.input.height, 1);
+        assert_eq!(full_activity.intent_activity.unwrap().height, 4);
 
         let editor = EditorState::new("emacs", Vec::new());
         let completion = CompletionState::new(Catalog::builtin(), None);

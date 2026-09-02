@@ -13,6 +13,8 @@ pub struct StatusBarModel<'a> {
     pub notice: Option<&'a str>,
     pub timings: Option<&'a str>,
     pub symbols: SurfaceSymbols,
+    pub assistant_busy: bool,
+    pub assistant_has_proposal: bool,
 }
 
 impl StatusBarModel<'_> {
@@ -69,7 +71,13 @@ impl StatusBarModel<'_> {
             String::new()
         };
 
-        let right = if self.completion.open && self.completion.automatic {
+        let right = if self.mode == Mode::Natural && self.assistant_busy {
+            "Esc cancel".to_owned()
+        } else if self.mode == Mode::Natural && self.assistant_has_proposal {
+            "Enter/Tab use · type to refine · Esc close".to_owned()
+        } else if self.mode == Mode::Natural {
+            "Enter send · Esc close".to_owned()
+        } else if self.completion.open && self.completion.automatic {
             if unicode {
                 "↑↓ select · Tab choose · Enter run · Esc close".to_owned()
             } else {

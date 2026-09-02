@@ -20,11 +20,13 @@ pub use surface::{
     ACTIVITY_MESSAGE_BYTES_MAX, CatalogLoader, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX,
     ENVIRONMENT_ITEMS_MAX, ENVIRONMENT_RETAINED_BYTES_MAX, InteractiveActivityProvider,
     InteractiveActivitySnapshot, InteractiveDataSnapshot, InteractiveEnvironmentSnapshot,
-    InteractiveHistoryEntry, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
-    InteractivePanelBatch, InteractivePanelProvider, InteractivePanelSnapshot,
-    InteractiveRuntimeSnapshot, InteractiveSignal, JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX,
-    PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX,
-    PANEL_ROWS_MAX, RichSurface, SurfaceKind, select_surface, set_product_identity,
+    InteractiveHistoryEntry, InteractiveIntentPlanner, InteractiveIntentPlannerUpdate,
+    InteractiveIntentTokenUsage, InteractiveJobAction, InteractiveJobSnapshot,
+    InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
+    InteractivePanelSnapshot, InteractiveRuntimeSnapshot, InteractiveSignal, JOB_ACTION_ITEMS_MAX,
+    JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
+    PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX, RichSurface, SurfaceKind, select_surface,
+    set_product_identity,
 };
 
 use crossterm::{

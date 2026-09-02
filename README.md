@@ -111,9 +111,19 @@ Use <kbd>/</kbd> to filter, <kbd>w</kbd> to resolve a command across all of
 `PATH`, <kbd>y</kbd> to copy, or <kbd>i</kbd> to insert a safe reference for
 review. A bounded health scan starts immediately; Health reads `scanning…`,
 `clean`, or the final finding count instead of treating unchecked state as zero.
-Findings explain the concrete PATH entry and jump directly to it. AI mode
-searches local command knowledge as you type;
-Enter inserts the selected command into Normal mode and never executes it.
+Findings explain the concrete PATH entry and jump directly to it. AI mode sends
+the submitted intent and a bounded compact view
+of the complete admitted command catalog to an installed, authenticated Codex
+CLI. One open AI session is a bounded conversation: Enter follows up, Tab moves
+the current validated proposal into Normal mode for review, and an empty Enter
+does the same once a proposal is ready. Typing a follow-up before Enter keeps
+the conversation open. Proposals may be complete pipelines, command lists,
+redirects, or a syntax-checked chunk for Quirl's sandboxed Lua runtime; nothing
+runs automatically. The compact panel shows Codex, the selected model and
+reasoning effort, recent turns, and a visible activity indicator without
+reserving empty rows. There is no local-planner fallback. Codex can
+reuse the user's existing ChatGPT subscription login; the submitted context is
+sent to OpenAI.
 
 For requirements and a guided first session, see the website's
 [getting-started section](website/content/docs/getting-started/index.mdx).

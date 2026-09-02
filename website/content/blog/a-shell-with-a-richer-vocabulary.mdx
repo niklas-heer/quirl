@@ -11,8 +11,8 @@ delimiters, quoting rules, and a growing collection of text-processing tools.
 
 Quirl keeps that familiar shell intact, then adds a richer vocabulary beside
 it. Normal mode speaks in processes and bytes. Data mode speaks in typed
-values. AI mode searches local command knowledge and returns a suggestion for
-review. Lua handles general-purpose extension logic inside a deliberately
+values. AI mode asks Codex for a catalog-constrained proposal to review. Lua
+handles general-purpose extension logic inside a deliberately
 small, resource-bounded runtime.
 
 The important part is that Quirl does not pretend these are the same thing.
@@ -83,17 +83,19 @@ It is a bounded data pipeline for the work shells routinely make awkward.
 
 ## Search by intent, run by choice
 
-AI mode is local command retrieval, not an agent silently operating the shell.
-Type an outcome such as:
+AI mode asks an installed Codex CLI for a typed proposal on Enter. It is not an
+agent silently operating
+the shell. Type an outcome such as:
 
 ```text
 copy a directory while preserving permissions
 ```
 
-Quirl searches the same semantic catalog used by completion, help,
-documentation, and agent exports. Selecting a result inserts it into Normal
-mode. It does not execute the suggestion. That review step is part of the
-product contract, not a temporary safety prompt.
+Quirl sends a bounded compact projection of the same admitted catalog used by
+completion, help, documentation, and agent exports to Codex, then validates the
+typed response against the full catalog. The resulting quoted command is
+inserted into Normal mode and never executed automatically. That review step is
+part of the product contract, not a temporary safety prompt.
 
 ## Extend one small boundary
 

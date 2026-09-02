@@ -631,16 +631,6 @@ pub(crate) fn default_embedding_index_identity()
     intelligence::embedding_index_identity(&bytes, &path)
 }
 
-/// Open one validated, reusable search generation for interactive AI mode.
-pub(crate) fn open_default_search_session() -> Result<intelligence::SearchSession, ShellError> {
-    let path = default_database_path()?;
-    let bytes = read_index(&path).map_err(|error| {
-        error.with_help("Run `quirl index build` to create the command database")
-    })?;
-    let model_path = intelligence::default_model_path();
-    intelligence::SearchSession::open(&bytes, &path, model_path.as_deref())
-}
-
 /// Rebuild pinned Quirl-model embeddings in one in-memory transaction and atomically
 /// replace the database only after every vector passes validation.
 pub(crate) fn build_default_embeddings() -> Result<intelligence::EmbeddingReport, ShellError> {

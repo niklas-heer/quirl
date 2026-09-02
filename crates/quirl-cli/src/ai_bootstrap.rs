@@ -256,8 +256,12 @@ impl InteractiveAiBootstrap {
         }
     }
 
+    pub(crate) fn local_model_enabled(&self) -> bool {
+        self.shared.local_model_enabled
+    }
+
     pub(crate) fn request_reindex(&self) {
-        if automatic_ai_disabled() {
+        if !self.shared.local_model_enabled || automatic_ai_disabled() {
             return;
         }
         self.shared.start_worker();
@@ -345,6 +349,7 @@ impl InteractiveActivityProvider for ActivityAdapter {
 }
 
 struct Shared {
+    local_model_enabled: bool,
     admitted: AtomicBool,
     started: AtomicBool,
     cancelled: Arc<AtomicBool>,
@@ -366,6 +371,7 @@ struct ActivityState {
 impl Shared {
     fn new() -> Self {
         Self {
+            local_model_enabled: false,
             admitted: AtomicBool::new(false),
             started: AtomicBool::new(false),
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -404,12 +410,12 @@ impl Shared {
         if !automatic_catalog_refresh_disabled() {
             self.start_catalog_refresh();
         }
-        if automatic_ai_disabled() {
-            return Ok(());
+        if self.local_model_enabled && !automatic_ai_disabled() {
+            self.publish("AI: preparing local model".to_owned());
+            self.start_worker();
+            self.request()?;
         }
-        self.publish("AI: preparing local model".to_owned());
-        self.start_worker();
-        self.request()
+        Ok(())
     }
 
     fn start_catalog_refresh(self: &Arc<Self>) {
@@ -507,7 +513,7 @@ struct CatalogObserver {
 impl index::CatalogRefreshObserver for CatalogObserver {
     fn refresh_started(&self) {
         if let Some(shared) = self.shared.upgrade() {
-            shared.publish_discovery("AI: discovering local commands".to_owned());
+            shared.publish_discovery("Catalog: discovering installed commands".to_owned());
             #[cfg(debug_assertions)]
             if std::env::var_os("QUIRL_TEST_AI_BOOTSTRAP_FAKE").is_some() {
                 let _ = wait_test_discovery_stage(&shared);
@@ -518,7 +524,8 @@ impl index::CatalogRefreshObserver for CatalogObserver {
     fn refresh_published(&self) {
         if let Some(shared) = self.shared.upgrade() {
             shared.clear_discovery();
-            if !automatic_ai_disabled()
+            if shared.local_model_enabled
+                && !automatic_ai_disabled()
                 && let Err(error) = shared.request()
             {
                 shared.publish(format!("AI index deferred: {}", error.message));
@@ -552,7 +559,7 @@ impl index::CatalogRefreshObserver for CatalogObserver {
                     )
                 })
                 .unwrap_or_default();
-            shared.publish_discovery(format!("AI discovery failed: {message}{context}"));
+            shared.publish_discovery(format!("Catalog discovery failed: {message}{context}"));
         }
     }
 }
@@ -1420,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_activity_is_visible_and_publication_requests_latest_index() {
+    fn discovery_activity_is_visible_without_requesting_a_local_index() {
         let shared = Arc::new(Shared::new());
         let observer = CatalogObserver {
             shared: Arc::downgrade(&shared),
@@ -1429,10 +1436,10 @@ mod tests {
         index::CatalogRefreshObserver::refresh_started(&observer);
         assert_eq!(
             shared.snapshot().unwrap().message.as_deref(),
-            Some("AI: discovering local commands")
+            Some("Catalog: discovering installed commands")
         );
         index::CatalogRefreshObserver::refresh_published(&observer);
-        assert_eq!(shared.requested_generation.load(Ordering::Acquire), 1);
+        assert_eq!(shared.requested_generation.load(Ordering::Acquire), 0);
         assert_eq!(shared.snapshot().unwrap().message, None);
     }
 
@@ -1451,7 +1458,7 @@ mod tests {
         index::CatalogRefreshObserver::refresh_failed(&observer, &error);
 
         let message = shared.snapshot().unwrap().message.unwrap();
-        assert!(message.starts_with("AI discovery failed: source limit"));
+        assert!(message.starts_with("Catalog discovery failed: source limit"));
         assert!(message.contains("limit: 4096; observed: 4097"));
         assert!(!message.contains('\u{1b}'));
         assert!(message.len() <= ACTIVITY_MESSAGE_BYTES_MAX);

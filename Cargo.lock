@@ -2035,6 +2035,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "toml",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

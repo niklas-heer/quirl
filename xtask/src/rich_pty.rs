@@ -35,7 +35,7 @@ const CHECK_NAMES: &[&str] = &[
     "rich-editing",
     "mode-switch-and-palette-screen",
     "automatic-command-intelligence",
-    "automatic-ai-bootstrap-activity",
+    "codex-only-ai-mode",
     "durable-command-discovery",
     "deferred-catalog-admission",
     "catalog-failure-restores-terminal",
@@ -466,8 +466,8 @@ fn checks() -> [CheckCase; 24] {
             run: check_automatic_command_intelligence,
         },
         CheckCase {
-            name: "automatic-ai-bootstrap-activity",
-            run: check_automatic_ai_bootstrap_activity,
+            name: "codex-only-ai-mode",
+            run: check_codex_only_ai_mode,
         },
         CheckCase {
             name: "durable-command-discovery",
@@ -1180,7 +1180,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), TaskError> 
     ensure_terminal_restored(&session, cleanup_start, "command-intelligence EOF")
 }
 
-fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), TaskError> {
+fn check_codex_only_ai_mode(binary: &Path) -> Result<(), TaskError> {
     let fixtures = TempDirectory::new("quirl-idle-ai-bootstrap")?;
     let binary_dir = fixtures.path.join("bin");
     let index_dir = fixtures.path.join("index");
@@ -1207,36 +1207,23 @@ fn check_automatic_ai_bootstrap_activity(binary: &Path) -> Result<(), TaskError>
     session.pty.wait_for(STARTUP_MARKER)?;
     session
         .pty
-        .wait_for_screen("live AI discovery status", |screen| {
+        .wait_for_screen("live catalog discovery status", |screen| {
             screen
                 .bottom_line()
-                .contains("AI: discovering local commands")
-        })?;
-    session
-        .pty
-        .wait_for_screen("live AI download status", |screen| {
-            screen
-                .bottom_line()
-                .contains("AI: downloading the Quirl command model")
-        })?;
-    session
-        .pty
-        .wait_for_screen("live AI indexing status", |screen| {
-            screen.bottom_line().contains("AI: indexing local commands")
+                .contains("Catalog: discovering installed commands")
         })?;
     wait_for_file_contents(&mut session, &catalog_path, b"idle-background-tool")?;
-    wait_for_file_contents(
-        &mut session,
-        &catalog_path,
-        b"niklas-heer/quirl-command-v3-int8",
-    )?;
+    let catalog = fs::read(&catalog_path)?;
+    if contains(&catalog, b"niklas-heer/quirl-command-v3-int8") {
+        return Err(io::Error::other("Codex-only mode built a local model index").into());
+    }
     let cleanup_start = session.pty.output().len();
     ensure_status(
         send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
         0,
-        "AI bootstrap activity EOF",
+        "Codex-only AI mode EOF",
     )?;
-    ensure_terminal_restored(&session, cleanup_start, "AI bootstrap activity EOF")
+    ensure_terminal_restored(&session, cleanup_start, "Codex-only AI mode EOF")
 }
 
 #[allow(
@@ -1307,31 +1294,30 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), TaskError> {
         })?;
     let natural_output_start = cold.pty.output().len();
     cold.pty.type_text("installed command discovered")?;
-    cold.pty
-        .wait_for_screen("live AI command suggestions", |screen| {
-            screen.text().contains("cold-tool") && screen.bottom_line().contains("AI intent")
-        })?;
+    cold.pty.wait_for_screen("Codex-only AI intent", |screen| {
+        screen.text().contains("installed command discovered")
+            && screen.bottom_line().contains("Enter send")
+    })?;
     let natural_output = &cold.pty.output()[natural_output_start..];
     if contains(natural_output, ALTERNATE_SCREEN_LEAVE) {
         return Err(io::Error::other(
-            "AI search released the rich session instead of updating it in place",
+            "AI input released the rich session instead of updating it in place",
         )
         .into());
     }
-    cold.pty.send(key::ENTER)?;
+    cold.pty.send(key::TAB)?;
     cold.pty
-        .wait_for_screen("accepted AI suggestion", |screen| {
-            screen.bottom_line().contains("NORMAL") && screen.text().contains("cold-tool")
+        .wait_for_screen("Tab does not accept a local AI suggestion", |screen| {
+            screen.bottom_line().contains("Enter send")
+                && screen.text().contains("installed command discovered")
         })?;
     if contains(
         &cold.pty.output()[natural_output_start..],
         ALTERNATE_SCREEN_LEAVE,
     ) {
-        return Err(
-            io::Error::other("accepting an AI suggestion released the rich session").into(),
-        );
+        return Err(io::Error::other("AI-mode Tab released the rich session").into());
     }
-    clear_editor(&mut cold)?;
+    clear_editor_in_mode(&mut cold, "AI")?;
     ensure_status(
         send_ctrl_d_and_wait_for_exit(&mut cold.pty)?,
         0,

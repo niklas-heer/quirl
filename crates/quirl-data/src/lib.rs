@@ -32,13 +32,14 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use syntax::{
     BooleanOperator as SyntaxBooleanOperator, ComparisonOperator as SyntaxComparisonOperator,
     DataPredicate as SyntaxPredicate, DataSource, DataSyntaxDiagnostic, DataSyntaxDiagnosticKind,
     DataSyntaxLimits, DataTransform, SortDirection, Spanned,
 };
+use unicode_width::UnicodeWidthStr;
 use value_boundary::{
     ValueUsage, data_value_from_json, data_value_from_syntax, data_value_from_toml,
     data_value_from_yaml, json_from_data_value, validate_data_value,
@@ -352,7 +353,7 @@ pub enum DataRenderFormat {
     Json,
     /// Terminal-safe line-oriented text.
     Plain,
-    /// A human-readable table that collects streams within their configured row bound.
+    /// A framed, Unicode-width-aligned table that collects streams within their configured row bound.
     Table,
 }
 
@@ -2582,34 +2583,436 @@ fn render_table_rows_to(
         }
         return Ok(());
     }
-    let columns: Vec<_> = columns.into_iter().collect();
-    for (index, column) in columns.iter().enumerate() {
-        if index > 0 {
-            write_output(writer, b"\t")?;
-        }
-        write_terminal_safe(writer, column)?;
-    }
-    write_output(writer, b"\n")?;
-    for row in rows {
+    let layout = table_layout(columns, rows, limits)?;
+    write_table_rule(writer, &layout.widths, TableRule::Top)?;
+    write_table_header(writer, &layout)?;
+    write_table_rule(writer, &layout.widths, TableRule::Header)?;
+    for (row_index, row) in rows.iter().enumerate() {
         if let Some(cancelled) = cancelled {
             check_cancelled(cancelled)?;
         }
-        let DataValue::Record(row) = row else {
-            write_plain_data_value(writer, row, limits)?;
-            write_output(writer, b"\n")?;
-            continue;
-        };
-        for (index, column) in columns.iter().enumerate() {
-            if index > 0 {
-                write_output(writer, b"\t")?;
+        write_table_value_row(writer, row_index, row, &layout, limits)?;
+    }
+    if rows.len() >= TABLE_REPEAT_HEADER_ROW_MIN {
+        write_table_rule(writer, &layout.widths, TableRule::Header)?;
+        write_table_header(writer, &layout)?;
+    }
+    write_table_rule(writer, &layout.widths, TableRule::Bottom)
+}
+
+const TABLE_PADDING_CHUNK_BYTES: usize = 64;
+const TABLE_REPEAT_HEADER_ROW_MIN: usize = 16;
+const TABLE_HORIZONTAL_RULE_CHUNK: &str = "────────────────";
+const TABLE_HORIZONTAL_RULE_CHUNK_CELLS: usize = 16;
+const _: () =
+    assert!(TABLE_HORIZONTAL_RULE_CHUNK.len() == TABLE_HORIZONTAL_RULE_CHUNK_CELLS * "─".len());
+
+#[derive(Clone, Copy)]
+enum TableAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Clone, Copy)]
+enum TableRule {
+    Top,
+    Header,
+    Bottom,
+}
+
+struct TableLayout<'a> {
+    columns: Vec<TableColumn<'a>>,
+    rendered_columns: Vec<String>,
+    widths: Vec<usize>,
+    now_unix_seconds: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct TableColumn<'a> {
+    key: &'a str,
+    heading: &'a str,
+}
+
+fn table_layout<'a>(
+    columns: IndexSet<&'a str>,
+    rows: &[DataValue],
+    limits: DataLimits,
+) -> Result<TableLayout<'a>, ShellError> {
+    let now_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs());
+    let columns = table_columns(columns, rows);
+    let rendered_columns = columns
+        .iter()
+        .map(|column| render_table_text(column.heading, limits))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut widths = rendered_columns
+        .iter()
+        .map(|column| UnicodeWidthStr::width(column.as_str()))
+        .collect::<Vec<_>>();
+    for row in rows {
+        match row {
+            DataValue::Record(row) => {
+                for (index, column) in columns.iter().enumerate() {
+                    let Some(value) = row.get(column.key) else {
+                        continue;
+                    };
+                    let width = UnicodeWidthStr::width(
+                        render_table_value(Some(column.key), value, limits, now_unix_seconds)?
+                            .as_str(),
+                    );
+                    let Some(column_width) = widths.get_mut(index) else {
+                        return Err(table_shape_error());
+                    };
+                    *column_width = (*column_width).max(width);
+                }
             }
-            if let Some(value) = row.get(*column) {
-                write_plain_data_value(writer, value, limits)?;
+            value => {
+                let rendered = render_table_value(None, value, limits, now_unix_seconds)?;
+                let Some(first_width) = widths.first_mut() else {
+                    return Err(table_shape_error());
+                };
+                *first_width = (*first_width).max(UnicodeWidthStr::width(rendered.as_str()));
             }
         }
-        write_output(writer, b"\n")?;
+    }
+    let last_row_index = rows.len().saturating_sub(1);
+    let row_index_width = last_row_index.to_string().len().max(1);
+    widths.insert(0, row_index_width);
+    Ok(TableLayout {
+        columns,
+        rendered_columns,
+        widths,
+        now_unix_seconds,
+    })
+}
+
+fn table_columns<'a>(columns: IndexSet<&'a str>, rows: &[DataValue]) -> Vec<TableColumn<'a>> {
+    const DIRECTORY_FIELDS: [&str; 8] = [
+        "hidden", "kind", "modified", "name", "path", "readonly", "size", "target",
+    ];
+    let is_directory_table = columns.len() == DIRECTORY_FIELDS.len()
+        && DIRECTORY_FIELDS.iter().all(|field| columns.contains(field));
+    if !is_directory_table {
+        return columns
+            .into_iter()
+            .map(|column| TableColumn {
+                key: column,
+                heading: column,
+            })
+            .collect();
+    }
+
+    let mut displayed = vec![
+        TableColumn {
+            key: "name",
+            heading: "name",
+        },
+        TableColumn {
+            key: "kind",
+            heading: "type",
+        },
+        TableColumn {
+            key: "size",
+            heading: "size",
+        },
+        TableColumn {
+            key: "modified",
+            heading: "modified",
+        },
+    ];
+    for field in ["target", "readonly", "hidden"] {
+        if rows
+            .iter()
+            .any(|row| directory_field_is_not_default(row, field))
+        {
+            displayed.push(TableColumn {
+                key: field,
+                heading: field,
+            });
+        }
+    }
+    displayed
+}
+
+fn directory_field_is_not_default(row: &DataValue, field: &str) -> bool {
+    let DataValue::Record(row) = row else {
+        return false;
+    };
+    match row.get(field) {
+        Some(DataValue::Nothing | DataValue::Bool(false)) | None => false,
+        Some(_) => true,
+    }
+}
+
+fn write_table_header(writer: &mut impl Write, layout: &TableLayout<'_>) -> Result<(), ShellError> {
+    write_table_row(
+        writer,
+        std::iter::once(("#", TableAlignment::Center)).chain(
+            layout
+                .rendered_columns
+                .iter()
+                .map(|column| (column.as_str(), TableAlignment::Center)),
+        ),
+        &layout.widths,
+    )
+}
+
+fn write_table_value_row(
+    writer: &mut impl Write,
+    row_index: usize,
+    value: &DataValue,
+    layout: &TableLayout<'_>,
+    limits: DataLimits,
+) -> Result<(), ShellError> {
+    let rendered_row_index = row_index.to_string();
+    let DataValue::Record(row) = value else {
+        let rendered = render_table_value(None, value, limits, layout.now_unix_seconds)?;
+        let trailing_cells = std::iter::repeat_n(
+            ("", TableAlignment::Left),
+            layout.widths.len().saturating_sub(2),
+        );
+        return write_table_row(
+            writer,
+            std::iter::once((rendered_row_index.as_str(), TableAlignment::Right))
+                .chain(std::iter::once((rendered.as_str(), table_alignment(value))))
+                .chain(trailing_cells),
+            &layout.widths,
+        );
+    };
+    write_table_record(writer, &rendered_row_index, row, layout, limits)
+}
+
+fn write_table_record(
+    writer: &mut impl Write,
+    rendered_row_index: &str,
+    row: &IndexMap<String, DataValue>,
+    layout: &TableLayout<'_>,
+    limits: DataLimits,
+) -> Result<(), ShellError> {
+    let rendered = layout
+        .columns
+        .iter()
+        .map(|column| {
+            row.get(column.key)
+                .map(|value| {
+                    render_table_value(Some(column.key), value, limits, layout.now_unix_seconds)
+                        .map(|rendered| (rendered, table_alignment(value)))
+                })
+                .transpose()
+                .map(|value| value.unwrap_or_else(|| (String::new(), TableAlignment::Left)))
+        })
+        .collect::<Result<Vec<_>, ShellError>>()?;
+    write_table_row(
+        writer,
+        std::iter::once((rendered_row_index, TableAlignment::Right)).chain(
+            rendered
+                .iter()
+                .map(|(value, alignment)| (value.as_str(), *alignment)),
+        ),
+        &layout.widths,
+    )
+}
+
+fn table_alignment(value: &DataValue) -> TableAlignment {
+    match value {
+        DataValue::Int(_)
+        | DataValue::UInt(_)
+        | DataValue::Decimal(_)
+        | DataValue::Duration { .. }
+        | DataValue::Size { .. } => TableAlignment::Right,
+        _ => TableAlignment::Left,
+    }
+}
+
+fn render_table_text(value: &str, limits: DataLimits) -> Result<String, ShellError> {
+    collect_rendered(limits.max_materialized_bytes, |writer| {
+        write_terminal_safe(writer, value)
+    })
+}
+
+fn render_table_value(
+    column: Option<&str>,
+    value: &DataValue,
+    limits: DataLimits,
+    now_unix_seconds: Option<u64>,
+) -> Result<String, ShellError> {
+    if let (Some("kind"), DataValue::String(kind)) = (column, value) {
+        return Ok(match kind.as_str() {
+            "directory" => "dir".to_owned(),
+            "symlink" => "link".to_owned(),
+            _ => kind.clone(),
+        });
+    }
+    match value {
+        DataValue::Nothing => return Ok("—".to_owned()),
+        DataValue::Bool(true) => return Ok("✓".to_owned()),
+        DataValue::Bool(false) => return Ok("·".to_owned()),
+        _ => {}
+    }
+    if let DataValue::Size { bytes } = value {
+        return Ok(format_table_size(*bytes));
+    }
+    if let (DataValue::DateTime(value), Some(now_unix_seconds)) = (value, now_unix_seconds)
+        && let Some(modified_unix_seconds) = value
+            .strip_prefix("unix:")
+            .and_then(|seconds| seconds.parse::<u64>().ok())
+    {
+        return Ok(format_relative_time(
+            modified_unix_seconds,
+            now_unix_seconds,
+        ));
+    }
+    collect_rendered(limits.max_materialized_bytes, |writer| {
+        write_plain_data_value(writer, value, limits)
+    })
+}
+
+fn format_table_size(bytes: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "kB", "MB", "GB", "TB", "PB", "EB"];
+    if bytes < 1_000 {
+        return format!("{bytes} B");
+    }
+    let bytes = u128::from(bytes);
+    let mut unit_index = 0_usize;
+    let mut divisor = 1_u128;
+    while unit_index.saturating_add(1) < UNITS.len() && bytes >= divisor.saturating_mul(1_000) {
+        divisor = divisor.saturating_mul(1_000);
+        unit_index = unit_index.saturating_add(1);
+    }
+    let tenths = bytes
+        .saturating_mul(10)
+        .checked_div(divisor)
+        .unwrap_or_default();
+    format!(
+        "{}.{} {}",
+        tenths / 10,
+        tenths % 10,
+        UNITS.get(unit_index).copied().unwrap_or("B")
+    )
+}
+
+fn format_relative_time(timestamp: u64, now: u64) -> String {
+    let future = timestamp > now;
+    let elapsed = timestamp.abs_diff(now);
+    if elapsed == 0 {
+        return "now".to_owned();
+    }
+    let (quantity, unit) = if elapsed < 60 {
+        (elapsed, "second")
+    } else if elapsed < 60 * 60 {
+        (elapsed / 60, "minute")
+    } else if elapsed < 24 * 60 * 60 {
+        (elapsed / (60 * 60), "hour")
+    } else if elapsed < 7 * 24 * 60 * 60 {
+        (elapsed / (24 * 60 * 60), "day")
+    } else if elapsed < 30 * 24 * 60 * 60 {
+        (elapsed / (7 * 24 * 60 * 60), "week")
+    } else if elapsed < 365 * 24 * 60 * 60 {
+        (elapsed / (30 * 24 * 60 * 60), "month")
+    } else {
+        (elapsed / (365 * 24 * 60 * 60), "year")
+    };
+    let duration = relative_duration(quantity, unit);
+    if future {
+        format!("in {duration}")
+    } else {
+        format!("{duration} ago")
+    }
+}
+
+fn relative_duration(quantity: u64, unit: &str) -> String {
+    if quantity == 1 {
+        let article = if unit == "hour" { "an" } else { "a" };
+        format!("{article} {unit}")
+    } else {
+        format!("{quantity} {unit}s")
+    }
+}
+
+fn write_table_row<'a>(
+    writer: &mut impl Write,
+    cells: impl Iterator<Item = (&'a str, TableAlignment)>,
+    widths: &[usize],
+) -> Result<(), ShellError> {
+    write_output(writer, "│".as_bytes())?;
+    for (index, (cell, alignment)) in cells.enumerate() {
+        let width = widths.get(index).copied().ok_or_else(table_shape_error)?;
+        let cell_width = UnicodeWidthStr::width(cell);
+        let padding = width.saturating_sub(cell_width);
+        let (left_padding, right_padding) = match alignment {
+            TableAlignment::Left => (0, padding),
+            TableAlignment::Center => (padding / 2, padding.saturating_sub(padding / 2)),
+            TableAlignment::Right => (padding, 0),
+        };
+        write_output(writer, b" ")?;
+        write_table_padding(writer, left_padding)?;
+        write_output(writer, cell.as_bytes())?;
+        write_table_padding(writer, right_padding)?;
+        write_output(writer, b" ")?;
+        write_output(writer, "│".as_bytes())?;
+    }
+    write_output(writer, b"\n")
+}
+
+fn write_table_rule(
+    writer: &mut impl Write,
+    widths: &[usize],
+    rule: TableRule,
+) -> Result<(), ShellError> {
+    let (left, junction, right) = match rule {
+        TableRule::Top => ("╭", "┬", "╮"),
+        TableRule::Header => ("├", "┼", "┤"),
+        TableRule::Bottom => ("╰", "┴", "╯"),
+    };
+    write_output(writer, left.as_bytes())?;
+    for (index, width) in widths.iter().copied().enumerate() {
+        write_table_horizontal_rule(writer, width.saturating_add(2))?;
+        let boundary = if index.saturating_add(1) < widths.len() {
+            junction
+        } else {
+            right
+        };
+        write_output(writer, boundary.as_bytes())?;
+    }
+    write_output(writer, b"\n")
+}
+
+fn write_table_horizontal_rule(
+    writer: &mut impl Write,
+    mut count: usize,
+) -> Result<(), ShellError> {
+    while count > 0 {
+        let cells = count.min(TABLE_HORIZONTAL_RULE_CHUNK_CELLS);
+        let bytes = cells.saturating_mul("─".len());
+        let chunk = TABLE_HORIZONTAL_RULE_CHUNK
+            .as_bytes()
+            .get(..bytes)
+            .ok_or_else(table_shape_error)?;
+        write_output(writer, chunk)?;
+        count = count.saturating_sub(cells);
     }
     Ok(())
+}
+
+fn write_table_padding(writer: &mut impl Write, mut count: usize) -> Result<(), ShellError> {
+    const PADDING: [u8; TABLE_PADDING_CHUNK_BYTES] = [b' '; TABLE_PADDING_CHUNK_BYTES];
+    while count > 0 {
+        let chunk = count.min(PADDING.len());
+        write_output(writer, PADDING.get(..chunk).unwrap_or_default())?;
+        count = count.saturating_sub(chunk);
+    }
+    Ok(())
+}
+
+fn table_shape_error() -> ShellError {
+    ShellError::new(
+        ErrorCode::Validation,
+        "table row and column widths have inconsistent shapes",
+    )
+    .with_help("Report this bounded table-renderer invariant failure")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4106,21 +4509,29 @@ mod tests {
             DataValue::String("value".to_owned()),
         )]));
         let rendered = render_stream_with_limit(
-            vec![row.clone(), row],
+            vec![row.clone(), row.clone()],
             DataRenderFormat::Table,
             DataLimits::DEFAULT.max_materialized_bytes,
         )
         .unwrap();
-        assert_eq!(rendered, "na\\u{1b}me\nvalue\nvalue\n");
-        let error = render_stream_with_limit(
-            vec![DataValue::Record(IndexMap::from([(
-                "na\u{001b}me".to_owned(),
-                DataValue::String("value".to_owned()),
-            )]))],
+        assert_eq!(
+            rendered,
+            "╭───┬────────────╮\n\
+             │ # │ na\\u{1b}me │\n\
+             ├───┼────────────┤\n\
+             │ 0 │ value      │\n\
+             │ 1 │ value      │\n\
+             ╰───┴────────────╯\n"
+        );
+        let single_row = render_stream_with_limit(
+            vec![row.clone()],
             DataRenderFormat::Table,
-            "na\\u{1b}me\nvalue\n".len() - 1,
+            DataLimits::DEFAULT.max_materialized_bytes,
         )
-        .unwrap_err();
+        .unwrap();
+        let error =
+            render_stream_with_limit(vec![row], DataRenderFormat::Table, single_row.len() - 1)
+                .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
     }
 
@@ -4161,8 +4572,139 @@ mod tests {
         .unwrap();
         assert_eq!(
             rendered,
-            "service\tregion\tstatus\napi\tus\t\n\t\tdegraded\n"
+            "╭───┬─────────┬────────┬──────────╮\n\
+             │ # │ service │ region │  status  │\n\
+             ├───┼─────────┼────────┼──────────┤\n\
+             │ 0 │ api     │ us     │          │\n\
+             │ 1 │         │        │ degraded │\n\
+             ╰───┴─────────┴────────┴──────────╯\n"
         );
+    }
+
+    #[test]
+    fn table_rendering_uses_display_width_and_right_aligns_typed_numbers() {
+        let rendered = render_stream_with_limit(
+            vec![
+                DataValue::Record(IndexMap::from([
+                    ("name".to_owned(), DataValue::String("東京".to_owned())),
+                    ("size".to_owned(), DataValue::Size { bytes: 2 }),
+                ])),
+                DataValue::Record(IndexMap::from([
+                    ("name".to_owned(), DataValue::String("é".to_owned())),
+                    ("size".to_owned(), DataValue::Size { bytes: 100 }),
+                ])),
+            ],
+            DataRenderFormat::Table,
+            DataLimits::DEFAULT.max_materialized_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            "╭───┬──────┬───────╮\n\
+             │ # │ name │ size  │\n\
+             ├───┼──────┼───────┤\n\
+             │ 0 │ 東京 │   2 B │\n\
+             │ 1 │ é    │ 100 B │\n\
+             ╰───┴──────┴───────╯\n"
+        );
+        for line in rendered.lines() {
+            assert_eq!(UnicodeWidthStr::width(line), 20);
+        }
+    }
+
+    #[test]
+    fn table_rendering_keeps_mixed_rows_inside_the_frame() {
+        let rendered = render_stream_with_limit(
+            vec![
+                DataValue::Record(IndexMap::from([
+                    ("name".to_owned(), DataValue::String("api".to_owned())),
+                    ("count".to_owned(), DataValue::UInt(2)),
+                ])),
+                DataValue::String("fallback".to_owned()),
+            ],
+            DataRenderFormat::Table,
+            DataLimits::DEFAULT.max_materialized_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            "╭───┬──────────┬───────╮\n\
+             │ # │   name   │ count │\n\
+             ├───┼──────────┼───────┤\n\
+             │ 0 │ api      │     2 │\n\
+             │ 1 │ fallback │       │\n\
+             ╰───┴──────────┴───────╯\n"
+        );
+    }
+
+    #[test]
+    fn filesystem_table_projects_display_fields_without_losing_typed_metadata() {
+        let row = DataValue::Record(IndexMap::from([
+            ("hidden".to_owned(), DataValue::Bool(false)),
+            ("kind".to_owned(), DataValue::String("directory".to_owned())),
+            (
+                "modified".to_owned(),
+                DataValue::DateTime("2026-08-17T00:00:00Z".to_owned()),
+            ),
+            ("name".to_owned(), DataValue::String("assets".to_owned())),
+            ("path".to_owned(), DataValue::Path("./assets".to_owned())),
+            ("readonly".to_owned(), DataValue::Bool(false)),
+            ("size".to_owned(), DataValue::Size { bytes: 1_500 }),
+            ("target".to_owned(), DataValue::Nothing),
+        ]));
+        let rendered = render_stream_with_limit(
+            vec![row],
+            DataRenderFormat::Table,
+            DataLimits::DEFAULT.max_materialized_bytes,
+        )
+        .unwrap();
+
+        assert!(rendered.contains("│ # │  name  │ type │  size  │       modified       │"));
+        assert!(rendered.contains("│ 0 │ assets │ dir  │ 1.5 kB │ 2026-08-17T00:00:00Z │"));
+        assert!(!rendered.contains("path"));
+        assert!(!rendered.contains("readonly"));
+        assert!(!rendered.contains("hidden"));
+        assert!(!rendered.contains("target"));
+    }
+
+    #[test]
+    fn table_sizes_and_relative_times_are_compact_and_deterministic() {
+        assert_eq!(format_table_size(0), "0 B");
+        assert_eq!(format_table_size(999), "999 B");
+        assert_eq!(format_table_size(1_000), "1.0 kB");
+        assert_eq!(format_table_size(95_167), "95.1 kB");
+        assert_eq!(format_table_size(u64::MAX), "18.4 EB");
+
+        let now = 2_000_000;
+        assert_eq!(format_relative_time(now, now), "now");
+        assert_eq!(format_relative_time(now - 59, now), "59 seconds ago");
+        assert_eq!(format_relative_time(now - 60, now), "a minute ago");
+        assert_eq!(format_relative_time(now - 7_200, now), "2 hours ago");
+        assert_eq!(format_relative_time(now - 604_800, now), "a week ago");
+        assert_eq!(format_relative_time(now + 3_600, now), "in an hour");
+    }
+
+    #[test]
+    fn long_tables_repeat_the_centered_heading_at_the_bottom() {
+        let rows = (0..TABLE_REPEAT_HEADER_ROW_MIN)
+            .map(|index| {
+                DataValue::Record(IndexMap::from([(
+                    "value".to_owned(),
+                    DataValue::UInt(u64::try_from(index).unwrap()),
+                )]))
+            })
+            .collect();
+        let rendered = render_stream_with_limit(
+            rows,
+            DataRenderFormat::Table,
+            DataLimits::DEFAULT.max_materialized_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(rendered.matches("│ #  │ value │").count(), 2);
+        assert!(rendered.ends_with("│ #  │ value │\n╰────┴───────╯\n"));
     }
 
     #[test]
@@ -4429,7 +4971,14 @@ mod tests {
         assert!(json.contains("\"state\": \"complete\""));
         assert!(json.contains("\"type\": \"string\""));
         let table = envelope.render(DataRenderFormat::Table).unwrap();
-        assert_eq!(table, "name\tport\napi\t8080\n");
+        assert_eq!(
+            table,
+            "╭───┬──────┬──────╮\n\
+             │ # │ name │ port │\n\
+             ├───┼──────┼──────┤\n\
+             │ 0 │ api  │ 8080 │\n\
+             ╰───┴──────┴──────╯\n"
+        );
     }
 
     #[test]

@@ -68,6 +68,7 @@ pub(super) mod key {
     pub const CTRL_U: &[u8] = b"\x15";
     pub const ESCAPE: &[u8] = b"\x1b";
     pub const ENTER: &[u8] = b"\r";
+    pub const TAB: &[u8] = b"\t";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

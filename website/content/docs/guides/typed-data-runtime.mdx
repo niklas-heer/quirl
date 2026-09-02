@@ -52,6 +52,20 @@ quirl data 'open users.json' --format json
 quirl data '^external printf "{\"ok\":true}" | from json'
 ```
 
+Table output measures rendered Unicode cell widths and presents records in a
+compact rounded frame with padded cells and a header divider. Numeric, size,
+and duration values are right-aligned. It never relies on terminal tab stops,
+so alignment is stable in the rich viewport and redirected text.
+
+Filesystem tables use a focused display projection (`#`, `name`, `type`,
+`size`, and `modified`): sizes use decimal units and Unix modification times
+are shown relative to one time captured for the complete render. The underlying
+records retain `path`, `hidden`, `readonly`, and `target` for transforms and
+machine formats; exceptional values are added to the table only when present.
+The rich surface keeps every outline glyph in one subdued theme color and
+applies the accent only to heading text; redirected table output remains free
+of ANSI escapes.
+
 ## Syntax ownership and analysis
 
 `quirl-data` owns the focused data lexer, AST, inert diagnostics, formatter,

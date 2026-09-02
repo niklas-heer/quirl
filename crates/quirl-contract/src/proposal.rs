@@ -612,6 +612,52 @@ impl ValidatedCommandProposal {
     /// empty values and values containing shell operators. Rendering grants no
     /// execution authority and does not replace the required confirmation.
     pub fn render_trusted(&self) -> Result<String, ShellError> {
+        let words = self.resolved_words()?;
+        let mut rendered = String::new();
+        for (index, word) in words.iter().enumerate() {
+            if index > 0 {
+                rendered.push(' ');
+            }
+            push_single_quoted(&mut rendered, word);
+            validate_limit(
+                "rendered command proposal bytes",
+                rendered.len(),
+                COMMAND_PROPOSAL_RENDER_BYTES_MAX,
+            )?;
+        }
+        Ok(rendered)
+    }
+
+    /// Render a deterministic command for insertion into an interactive editor.
+    ///
+    /// Plain portable words are left unquoted so the result reads like a normal
+    /// command. Empty values and words containing whitespace, expansion syntax,
+    /// operators, or other shell-significant bytes retain the same literal
+    /// single-quote protection as [`Self::render_trusted`]. The output therefore
+    /// preserves the validated argument vector while remaining safe to review
+    /// and parse before execution.
+    pub fn render_for_editing(&self) -> Result<String, ShellError> {
+        let words = self.resolved_words()?;
+        let mut rendered = String::new();
+        for (index, word) in words.iter().enumerate() {
+            if index > 0 {
+                rendered.push(' ');
+            }
+            if !word.is_empty() && word.chars().all(editable_word_character) {
+                rendered.push_str(word);
+            } else {
+                push_single_quoted(&mut rendered, word);
+            }
+            validate_limit(
+                "rendered command proposal bytes",
+                rendered.len(),
+                COMMAND_PROPOSAL_RENDER_BYTES_MAX,
+            )?;
+        }
+        Ok(rendered)
+    }
+
+    fn resolved_words(&self) -> Result<Vec<String>, ShellError> {
         let mut words = self
             .command_path
             .split_whitespace()
@@ -633,21 +679,16 @@ impl ValidatedCommandProposal {
                 ValidatedArgument::Flag { name } => words.push(name.clone()),
             }
         }
-
-        let mut rendered = String::new();
-        for (index, word) in words.iter().enumerate() {
-            if index > 0 {
-                rendered.push(' ');
-            }
-            push_single_quoted(&mut rendered, word);
-            validate_limit(
-                "rendered command proposal bytes",
-                rendered.len(),
-                COMMAND_PROPOSAL_RENDER_BYTES_MAX,
-            )?;
-        }
-        Ok(rendered)
+        Ok(words)
     }
+}
+
+fn editable_word_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '_' | '-' | '.' | '/' | ':' | '@' | '%' | '+' | '=' | ','
+        )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1179,6 +1220,10 @@ mod tests {
         assert_eq!(
             validated.render_trusted().unwrap(),
             "'demo' 'run' 'a'\\''b;$(touch nope)' '--count' '2' '--force'"
+        );
+        assert_eq!(
+            validated.render_for_editing().unwrap(),
+            "demo run 'a'\\''b;$(touch nope)' --count 2 --force"
         );
     }
 
