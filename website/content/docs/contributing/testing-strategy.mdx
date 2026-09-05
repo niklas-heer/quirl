@@ -69,6 +69,9 @@ its metadata-persistence assertions from host scheduling, including when the
 harness selects an optimized artifact. The ordinary provider budget remains
 400 ms, the fixture cannot extend the enclosing refresh deadline, and separate
 deadline and cancellation tests continue to prove child cleanup.
+The real Zsh adapter regression also admits an insecure function directory and
+proves initialization does not wait for an interactive confirmation, safe nested
+candidates still return, and unsafe autoloaded completion code is never run.
 
 The durable-discovery fixture opts into `QUIRL_TEST_CATALOG_PUBLICATIONS` in a
 private temporary directory. It waits for a bounded marker naming the exact

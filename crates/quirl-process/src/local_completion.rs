@@ -123,7 +123,8 @@ pub struct LocalCompletionRequest {
     /// An empty final string represents completion after a space.
     pub arguments: Vec<String>,
     /// Search roots admitted for this request. The adapters replace their
-    /// native completion/function paths with exactly these roots.
+    /// native completion/function paths with these roots. Zsh's security audit
+    /// excludes insecure roots without prompting or trusting their contents.
     pub completion_roots: Vec<PathBuf>,
     /// Completion scripts explicitly admitted for sourcing by this request.
     pub completion_scripts: Vec<PathBuf>,
@@ -692,7 +693,9 @@ shift script_count
 completion_tokens=( "${@[1,token_count]}" )
 fpath=( "${admitted_roots[@]}" )
 autoload -Uz compinit || exit 70
-compinit -D || exit 70
+# This worker has no user to answer compaudit's interactive security prompt.
+# Ignore insecure roots instead of trusting them or waiting for input forever.
+compinit -D -i || exit 70
 local admitted_script
 for admitted_script in "${admitted_scripts[@]}"; do
     source "$admitted_script" || exit 70
@@ -1817,6 +1820,76 @@ compdef _qtool qtool
         assert!(values.contains(&"add"), "candidates: {values:?}");
         assert!(values.contains(&"admin"), "candidates: {values:?}");
         assert!(!startup_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zsh_completion_skips_insecure_roots_without_prompting_or_loading_them() {
+        let Some(shell) = shell_path(&["/bin/zsh", "/usr/bin/zsh"]) else {
+            return;
+        };
+        let directory = TestDirectory::new();
+        let insecure_root = directory.path.join("insecure");
+        fs::create_dir(&insecure_root).unwrap();
+        fs::set_permissions(&insecure_root, fs::Permissions::from_mode(0o777)).unwrap();
+        let marker = directory.path.join("unsafe-completion-executed");
+        fs::write(
+            insecure_root.join("_quirl_unsafe_completion"),
+            "#autoload\nprint -r -- unsafe > \"$UNSAFE_COMPLETION_MARKER\"\n",
+        )
+        .unwrap();
+        let script = directory.script(
+            "qtool.zsh",
+            r#"
+_qtool() {
+    # With unsafe compinit -u this helper is autoloaded, so merely returning
+    # valid candidates would not prove the insecure root was excluded.
+    if (( ${+functions[_quirl_unsafe_completion]} )); then
+        _quirl_unsafe_completion
+    fi
+    compadd -- add admin
+}
+compdef _qtool qtool
+"#,
+        );
+        let mut request = request(LocalCompletionProvider::Zsh, shell.clone());
+        // The same finite functional budget as the nested-path fixture keeps
+        // slow installed function-tree scans separate from deadline policy.
+        request.deadline = Duration::from_secs(10);
+        request.command_path = vec!["qtool".to_owned(), "remote".to_owned()];
+        request.arguments = vec!["a".to_owned()];
+        request.completion_roots = zsh_function_roots(&shell);
+        request.completion_roots.insert(0, insecure_root);
+        request.completion_scripts = vec![script];
+        request.environment = vec![
+            (
+                "HOME".to_owned(),
+                directory.path.to_string_lossy().into_owned(),
+            ),
+            (
+                "UNSAFE_COMPLETION_MARKER".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ),
+        ];
+        let result = completed(
+            LocalCompletionProcess::new(1)
+                .unwrap()
+                .complete(request)
+                .unwrap(),
+        );
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.value == "add")
+        );
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.value == "admin")
+        );
+        assert!(!marker.exists(), "an insecure completion root was loaded");
     }
 
     #[cfg(unix)]

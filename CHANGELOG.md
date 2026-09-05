@@ -46,6 +46,9 @@ which versions are published.
 
 ### Fixed
 
+- Zsh completion initialization skips insecure function directories instead of
+  waiting for an interactive security confirmation inside the capture PTY.
+  Safe completions continue to work within the existing request deadline.
 - Model loading reads unknown-token metadata directly instead of serializing
   the entire tokenizer, preserving inference across all four supported models
   while avoiding a temporary copy of the vocabulary and processing graph.

@@ -73,6 +73,10 @@ with `--no-config`, Zsh starts with `-d -f` and disables both user and global rc
 loading, and both see only admitted completion roots and scripts. Bash remains
 a typed later-provider contract in the SQLite overlay and composition tiers; it
 is not executed by this generation. Carapace is neither selected nor linked.
+Zsh's completion security audit ignores insecure function directories without
+asking an interactive question. It does not bypass the audit or trust unsafe
+directories; valid completion functions remain available within the same
+request deadline.
 Provider candidates are normalized before persistence: leading-dash candidates
 become flags, non-dash candidates from a command-path probe become one-segment
 child commands, controls and path separators are rejected, duplicates are
