@@ -78,7 +78,7 @@ impl StatusBarModel<'_> {
             "Enter/Tab use · type to refine · Esc close".to_owned()
         } else if self.mode == Mode::Natural {
             "Enter send · Esc close".to_owned()
-        } else if self.completion.open && self.completion.automatic {
+        } else if self.completion.open && !self.completion.accepts_enter() {
             if unicode {
                 "↑ history · ↓/Tab choose · Enter run · Esc close".to_owned()
             } else {

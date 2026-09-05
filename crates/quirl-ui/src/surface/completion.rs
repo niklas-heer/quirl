@@ -10,7 +10,7 @@ use quirl_catalog::{
 use quirl_core::ShellError;
 use quirl_syntax::Mode;
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
@@ -304,6 +304,7 @@ struct DeferredCompletion {
 }
 
 pub struct CompletionState {
+    pub(crate) home_directory: super::runtime::InteractiveHomeDirectory,
     worker: Option<CompletionWorker>,
     catalog: Option<Arc<Catalog>>,
     extension_source: Option<Box<dyn ExtensionCompleter + Send>>,
@@ -333,6 +334,7 @@ impl CompletionState {
         extensions: Option<Box<dyn ExtensionCompleter + Send>>,
     ) -> Self {
         Self {
+            home_directory: super::runtime::InteractiveHomeDirectory::from_process_environment(),
             worker: None,
             catalog: Some(catalog.into()),
             extension_source: extensions,
@@ -359,6 +361,7 @@ impl CompletionState {
 
     pub fn unpublished(extensions: Option<Box<dyn ExtensionCompleter + Send>>) -> Self {
         Self {
+            home_directory: super::runtime::InteractiveHomeDirectory::from_process_environment(),
             worker: None,
             catalog: None,
             extension_source: extensions,
@@ -480,8 +483,26 @@ impl CompletionState {
         self.request_id = self.request_id.saturating_add(1);
         self.items.clear();
         self.extension_pending = None;
-        self.filesystem_pending =
-            filesystem_completion_items(self.catalog.as_deref(), line, cursor, mode);
+        self.filesystem_pending = filesystem_completion_items(
+            self.catalog.as_deref(),
+            line,
+            cursor,
+            mode,
+            self.home_directory.snapshot().as_deref(),
+        );
+        if automatic
+            && filesystem_completion_context(self.catalog.as_deref(), line, cursor, mode)
+                .is_some_and(|context| {
+                    let filename = context.decoded.rsplit('/').next().unwrap_or_default();
+                    self.filesystem_pending
+                        .iter()
+                        .any(|item| item.kind == CompletionKind::Path && item.display == filename)
+                })
+        {
+            // A complete filename is ready to execute, even when sibling names
+            // share its prefix. Explicit Tab still offers those alternatives.
+            self.filesystem_pending.clear();
+        }
         self.items.clone_from(&self.filesystem_pending);
         self.catalog_ready = false;
         self.extension_ready = self.extension_worker.is_none();
@@ -516,6 +537,11 @@ impl CompletionState {
     }
 
     pub fn cancel_for_edit(&mut self) {
+        self.resource_notice = None;
+        self.dismiss();
+    }
+
+    fn cancel_workers(&mut self) {
         if self.request_id > 0 {
             if let Some(worker) = &mut self.worker {
                 let _ = worker.cancel(CompletionCancellation {
@@ -531,8 +557,6 @@ impl CompletionState {
         self.filesystem_pending.clear();
         self.catalog_ready = false;
         self.extension_ready = self.extension_worker.is_none();
-        self.resource_notice = None;
-        self.dismiss();
     }
 
     pub fn resource_notice(&self) -> Option<&str> {
@@ -664,10 +688,18 @@ impl CompletionState {
     }
 
     pub fn accepts_enter(&self) -> bool {
-        self.open && !self.automatic
+        self.open
+            && (!self.automatic
+                || self.selected_item().is_some_and(|item| {
+                    item.source == "filesystem"
+                        && matches!(item.kind, CompletionKind::Path | CompletionKind::Directory)
+                }))
     }
 
     pub fn dismiss(&mut self) {
+        // Escape must also invalidate in-flight and already published results:
+        // otherwise a late provider can reopen the menu and steal the next Enter.
+        self.cancel_workers();
         self.deferred = None;
         self.items.clear();
         self.filesystem_pending.clear();
@@ -753,13 +785,22 @@ pub(crate) fn filesystem_completion_items(
     line: &str,
     cursor: usize,
     mode: Mode,
+    home: Option<&str>,
 ) -> Vec<CompletionItem> {
     let Some(context) = filesystem_completion_context(catalog, line, cursor, mode) else {
         return Vec::new();
     };
     let cursor = clamped_utf8_cursor(line, cursor);
-    let style = path_word_style(&context.raw_token);
-    let Some((scan_directory, shown_directory, name_prefix)) = path_scan_parts(&context.decoded)
+    let expand_home = context.raw_token == "~" || context.raw_token.starts_with("~/");
+    let style = if context.decoded.starts_with('~') && !expand_home {
+        // Preserve a quoted or escaped literal tilde when replacing the whole
+        // token; removing its original quoting would change which path runs.
+        PathWordStyle::SingleQuoted { closed: true }
+    } else {
+        path_word_style(&context.raw_token)
+    };
+    let Some((scan_directory, shown_directory, name_prefix)) =
+        path_scan_parts(&context.decoded, expand_home, home)
     else {
         return Vec::new();
     };
@@ -802,7 +843,11 @@ pub(crate) fn filesystem_completion_items(
             replace_start: context.replace_start,
             replace_end: cursor,
             match_indices: Vec::new(),
-            kind: CompletionKind::Path,
+            kind: if is_directory {
+                CompletionKind::Directory
+            } else {
+                CompletionKind::Path
+            },
             source: "filesystem",
             trust: "local",
         });
@@ -1118,15 +1163,22 @@ fn path_word_style(raw: &str) -> PathWordStyle {
     clippy::string_slice,
     reason = "the split offset comes from rfind on an ASCII path separator"
 )]
-fn path_scan_parts(value: &str) -> Option<(PathBuf, String, String)> {
-    let value = if value == "~" { "~/" } else { value };
+fn path_scan_parts(
+    value: &str,
+    expand_home: bool,
+    home: Option<&str>,
+) -> Option<(PathBuf, String, String)> {
+    let value = if expand_home && value == "~" {
+        "~/"
+    } else {
+        value
+    };
     let separator = value.rfind('/');
     let (shown_directory, name_prefix) = separator.map_or(("", value), |index| {
         (&value[..=index], &value[index.saturating_add(1)..])
     });
-    let scan_directory = if shown_directory == "~/" || shown_directory.starts_with("~/") {
-        let home = env::var_os("HOME").map(PathBuf::from)?;
-        home.join(shown_directory.trim_start_matches("~/"))
+    let scan_directory = if expand_home && shown_directory.starts_with("~/") {
+        Path::new(home?).join(shown_directory.strip_prefix("~/")?)
     } else if shown_directory.is_empty() {
         PathBuf::from(".")
     } else {
@@ -1145,6 +1197,12 @@ fn encode_shell_path(path: &str, style: PathWordStyle) -> String {
             // Backslash-newline is shell continuation, not a literal filename
             // character. A quoted word preserves the selected path's identity.
             if path.contains(['\n', '\r']) {
+                if let Some(suffix) = path.strip_prefix("~/") {
+                    return format!(
+                        "~/{}",
+                        encode_shell_path(suffix, PathWordStyle::SingleQuoted { closed: true })
+                    );
+                }
                 return encode_shell_path(path, PathWordStyle::SingleQuoted { closed: true });
             }
             let mut escaped = String::with_capacity(path.len());
@@ -1633,7 +1691,7 @@ mod tests {
         let catalog = Catalog::builtin();
 
         assert!(
-            filesystem_completion_items(Some(&catalog), &line, line.len(), Mode::Command)
+            filesystem_completion_items(Some(&catalog), &line, line.len(), Mode::Command, None)
                 .is_empty()
         );
         assert!(!should_open_automatic_filesystem_completion(
@@ -1745,6 +1803,97 @@ mod tests {
     }
 
     #[test]
+    fn path_scanning_expands_only_the_requested_leading_home_prefix() {
+        let (scan, shown, prefix) = path_scan_parts("~/~/child", false, None).unwrap();
+        assert_eq!(scan, PathBuf::from("~/~/"));
+        assert_eq!(shown, "~/~/");
+        assert_eq!(prefix, "child");
+        let (scan, shown, prefix) = path_scan_parts("~", false, None).unwrap();
+        assert_eq!(scan, PathBuf::from("."));
+        assert!(shown.is_empty());
+        assert_eq!(prefix, "~");
+        let (scan, _, _) = path_scan_parts("~/~/child", true, Some("/private home")).unwrap();
+        assert_eq!(scan, PathBuf::from("/private home").join("~/"));
+        assert!(path_scan_parts("~/", true, None).is_none());
+    }
+
+    #[test]
+    fn rich_and_simple_completions_follow_private_home_changes_and_clear_missing_home() {
+        use reedline::Completer;
+        let root = std::env::temp_dir().join(format!("quirl-private-home-{}", std::process::id()));
+        let first = root.join("first");
+        let next = root.join("second raw\n雪");
+        fs::create_dir_all(first.join("ORIGINAL_CHILD")).unwrap();
+        fs::create_dir_all(next.join("UPDATED_CHILD")).unwrap();
+        let home = super::super::runtime::InteractiveHomeDirectory::default();
+        let mut rich = CompletionState::new(Catalog::builtin(), None);
+        rich.home_directory = home.clone();
+        let mut simple =
+            crate::CatalogCompleter::new(Catalog::builtin()).with_home_directory(home.clone());
+        for (directory, wanted, absent) in [
+            (&first, "~/ORIGINAL_CHILD/", "~/UPDATED_CHILD/"),
+            (&next, "~/UPDATED_CHILD/", "~/ORIGINAL_CHILD/"),
+        ] {
+            home.update(Some(directory.as_os_str()));
+            rich.request("cd ~/", 5, Mode::Command).unwrap();
+            assert!(rich.items.iter().any(|item| item.value == wanted));
+            assert!(!rich.items.iter().any(|item| item.value == absent));
+            let suggestions = simple.complete("cd ~/", 5);
+            assert!(suggestions.iter().any(|item| item.value == wanted));
+            assert!(!suggestions.iter().any(|item| item.value == absent));
+        }
+        home.update(None);
+        rich.request("cd ~/", 5, Mode::Command).unwrap();
+        assert!(rich.filesystem_pending.is_empty());
+        assert!(
+            !simple
+                .complete("cd ~/", 5)
+                .iter()
+                .any(|item| item.value.starts_with("~/"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn newline_path_quoting_keeps_home_expansion_outside_the_literal_suffix() {
+        let encoded = encode_shell_path("~/line\nbreak/", PathWordStyle::Unquoted);
+        assert_eq!(encoded, "~/'line\nbreak/'");
+        let parsed = quirl_syntax::parse_command_list(&format!("cd {encoded}")).unwrap();
+        let word = &parsed.pipelines[0].commands[0].word_ir[1];
+        assert_eq!(word.text(), "~/line\nbreak/");
+        assert_eq!(word.parts.len(), 2);
+    }
+
+    #[test]
+    fn automatic_complete_files_run_while_partial_paths_and_explicit_tab_still_accept() {
+        let root =
+            std::env::temp_dir().join(format!("quirl-complete-file-enter-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("notes.txt"), b"fixture").unwrap();
+        fs::write(root.join("notes.txt.backup"), b"sibling").unwrap();
+        let mut state = CompletionState::new(Catalog::builtin(), None);
+        for mode in [Mode::Command, Mode::Data] {
+            let command = if mode == Mode::Data { "open" } else { "cat" };
+            for argument in [
+                format!("{}/notes.txt", root.display()),
+                format!("'{}/notes.txt'", root.display()),
+                format!("{}/notes\".txt\"", root.display()),
+            ] {
+                let line = format!("{command} {argument}");
+                state.request_automatic(&line, line.len(), mode).unwrap();
+                poll_completion_until(&mut state, &line, |state| !state.streaming);
+                assert!(!state.accepts_enter(), "{line}");
+                state.request(&line, line.len(), mode).unwrap();
+                assert!(state.accepts_enter(), "explicit Tab: {line}");
+            }
+            let line = format!("{command} {}/notes.tx", root.display());
+            state.request_automatic(&line, line.len(), mode).unwrap();
+            assert!(state.accepts_enter(), "partial: {line}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn automatic_completion_retains_filesystem_candidates() {
         let root = std::env::temp_dir().join(format!(
             "quirl-automatic-path-completion-{}-{}",
@@ -1763,6 +1912,11 @@ mod tests {
             .unwrap();
 
         assert!(state.automatic);
+        assert!(state.accepts_enter());
+        assert_eq!(
+            state.selected_item().unwrap().kind,
+            CompletionKind::Directory
+        );
         assert!(
             state
                 .items
@@ -1792,6 +1946,7 @@ mod tests {
             &line,
             line.len(),
             Mode::Command,
+            None,
         );
         assert!(
             directories
@@ -1810,6 +1965,7 @@ mod tests {
             &line,
             line.len(),
             Mode::Command,
+            None,
         );
         assert!(
             escaped
@@ -1823,6 +1979,7 @@ mod tests {
             &line,
             line.len(),
             Mode::Command,
+            None,
         );
         assert!(
             files
@@ -1835,8 +1992,13 @@ mod tests {
     #[test]
     fn known_subcommand_prefix_does_not_mix_in_filesystem_fallbacks() {
         let catalog = Catalog::builtin();
-        let items =
-            filesystem_completion_items(Some(&catalog), "git c", "git c".len(), Mode::Command);
+        let items = filesystem_completion_items(
+            Some(&catalog),
+            "git c",
+            "git c".len(),
+            Mode::Command,
+            None,
+        );
         assert!(items.is_empty());
     }
 
@@ -1880,6 +2042,48 @@ mod tests {
         control.release.send(()).unwrap();
         poll_completion_until(&mut state, "git st", |state| !state.streaming);
         assert!(state.items.iter().any(|item| item.source == "plugin"));
+        control.finish(state);
+    }
+
+    #[test]
+    fn dismissing_completion_discards_ready_catalog_and_in_flight_extension_results() {
+        let (control, completer) = CompletionControl::new();
+        let mut state = CompletionState::new(Catalog::builtin(), Some(Box::new(completer)));
+        state.request("git st", 6, Mode::Command).unwrap();
+        control.wait_for_start("git st");
+        // Leave the catalog response queued while the extension callback is
+        // gated. Escape must invalidate both sides of this timing boundary.
+        let deadline = Instant::now() + COMPLETION_TEST_TIMEOUT;
+        while state
+            .worker
+            .as_ref()
+            .unwrap()
+            .response
+            .lock()
+            .unwrap()
+            .is_none()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "catalog response was not published"
+            );
+            std::thread::yield_now();
+        }
+        state.dismiss();
+        assert!(!state.poll("git st", 6));
+        assert!(!state.open);
+        assert!(!state.accepts_enter());
+        assert!(state.items.is_empty());
+        assert_ne!(
+            state
+                .extension_worker
+                .as_ref()
+                .unwrap()
+                .latest_request_id
+                .load(Ordering::Acquire),
+            state.request_id
+        );
+        control.release.send(()).unwrap();
         control.finish(state);
     }
 

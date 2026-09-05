@@ -13,13 +13,13 @@ mod transcript;
 
 pub use degrade::{SurfaceKind, select_surface};
 pub use runtime::{
-    ACTIVITY_MESSAGE_BYTES_MAX, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, ENVIRONMENT_ITEMS_MAX,
-    ENVIRONMENT_RETAINED_BYTES_MAX, InteractiveActivityProvider, InteractiveActivitySnapshot,
-    InteractiveDataSnapshot, InteractiveEnvironmentSnapshot, InteractiveJobAction,
-    InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
-    InteractivePanelSnapshot, InteractiveRuntimeSnapshot, JOB_ACTION_ITEMS_MAX,
-    JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX,
-    PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+    ACTIVITY_MESSAGE_BYTES_MAX, COMPLETION_HOME_BYTES_MAX, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX,
+    ENVIRONMENT_ITEMS_MAX, ENVIRONMENT_RETAINED_BYTES_MAX, InteractiveActivityProvider,
+    InteractiveActivitySnapshot, InteractiveDataSnapshot, InteractiveEnvironmentSnapshot,
+    InteractiveHomeDirectory, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
+    InteractivePanelBatch, InteractivePanelProvider, InteractivePanelSnapshot,
+    InteractiveRuntimeSnapshot, JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX,
+    PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
 };
 
 /// One-shot rich-session loader that returns the complete immutable catalog.
@@ -1188,6 +1188,12 @@ impl RichSurface {
         self.runtime.install_snapshot(snapshot);
     }
 
+    /// Share the composition root's bounded raw HOME with filesystem completion.
+    /// Updates apply on later completion requests without rereading process globals.
+    pub fn set_home_directory(&mut self, home: InteractiveHomeDirectory) {
+        self.completion.home_directory = home;
+    }
+
     /// Replace the next editor and fuzzy picker history with a bounded snapshot.
     pub fn install_history_snapshot(&mut self, history: Vec<InteractiveHistoryEntry>) {
         self.history = history;
@@ -1685,12 +1691,7 @@ impl RichSurface {
                                         self.dismiss_picker();
                                         return Ok(signal);
                                     }
-                                    editor.replace(
-                                        item.replace_start,
-                                        item.replace_end,
-                                        &item.value,
-                                    );
-                                    self.dismiss_picker();
+                                    self.accept_selected_completion(&mut editor, prompt.mode)?;
                                 }
                                 continue;
                             }
@@ -1772,17 +1773,11 @@ impl RichSurface {
                             }
                             KeyCode::Enter
                                 if prompt.mode != Mode::Natural
-                                    && self.completion.accepts_enter() =>
+                                    && self.completion.accepts_enter()
+                                    && self.completion.selected_item().is_some() =>
                             {
-                                if let Some(item) = self.completion.selected_item().cloned() {
-                                    editor.replace(
-                                        item.replace_start,
-                                        item.replace_end,
-                                        &item.value,
-                                    );
-                                    self.completion.dismiss();
-                                    continue;
-                                }
+                                self.accept_selected_completion(&mut editor, prompt.mode)?;
+                                continue;
                             }
                             _ => {}
                         }
@@ -2562,7 +2557,7 @@ impl RichSurface {
     }
 
     fn handle_completion_up(&mut self, mode: Mode, line: &str, cursor: usize) {
-        if mode == Mode::Natural || !self.completion.automatic {
+        if mode == Mode::Natural || self.completion.accepts_enter() {
             self.completion.previous();
         } else {
             // Informational popups do not capture normal history recall. Once
@@ -2570,6 +2565,34 @@ impl RichSurface {
             self.completion.dismiss();
             self.open_picker(editor::PickerKind::History, line, cursor, "history");
         }
+    }
+
+    /// Accepting a path is an edit, never command execution. Directory choices
+    /// start one fresh bounded request so Enter can continue through children.
+    /// Cancel old workers before publishing the new path; a rejected oversized
+    /// replacement retains both the buffer and its actionable resource notice.
+    fn accept_selected_completion(
+        &mut self,
+        editor: &mut EditorState,
+        mode: Mode,
+    ) -> Result<(), ShellError> {
+        let Some(item) = self.completion.selected_item().cloned() else {
+            return Ok(());
+        };
+        let revision = editor.revision();
+        editor.replace(item.replace_start, item.replace_end, &item.value);
+        if editor.revision() == revision {
+            return Ok(());
+        }
+        let browse_directory =
+            item.source == "filesystem" && item.kind == completion::CompletionKind::Directory;
+        self.completion.cancel_for_edit();
+        self.dismiss_picker();
+        if browse_directory {
+            self.completion
+                .request(editor.buffer(), editor.cursor(), mode)?;
+        }
+        Ok(())
     }
 
     fn open_picker(
@@ -5198,6 +5221,65 @@ mod tests {
         assert!(!surface.picker.active());
         assert_eq!(surface.completion.selected, 0);
         assert!(surface.completion.accepts_enter());
+    }
+
+    #[test]
+    fn accepting_directories_browses_children_without_submitting_the_command() {
+        let root = std::env::temp_dir().join(format!(
+            "quirl-directory-accept-{}-{}",
+            std::process::id(),
+            HISTORY_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("parent/child")).unwrap();
+        let mut surface = cold_help_surface(Catalog::builtin());
+        surface.begin_catalog_admission().unwrap();
+        await_catalog_admission(&mut surface).unwrap();
+        let mut editor = EditorState::new("emacs", Vec::new());
+        let line = format!("cd {}/par", root.display());
+        editor.replace(0, 0, &line);
+        surface
+            .completion
+            .request_automatic(&line, line.len(), Mode::Command)
+            .unwrap();
+        assert!(surface.completion.accepts_enter());
+        surface
+            .accept_selected_completion(&mut editor, Mode::Command)
+            .unwrap();
+        assert!(editor.buffer().ends_with("/parent/"));
+        assert!(surface.completion.accepts_enter());
+        assert_eq!(
+            surface.completion.selected_item().unwrap().display,
+            "child/"
+        );
+        surface
+            .accept_selected_completion(&mut editor, Mode::Command)
+            .unwrap();
+        assert!(editor.buffer().ends_with("/parent/child/"));
+        surface.dismiss_picker();
+        assert!(!surface.completion.accepts_enter());
+        assert!(editor.buffer().ends_with("/parent/child/"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejected_completion_keeps_the_edit_and_resource_diagnostic() {
+        let mut surface = cold_help_surface(Catalog::builtin());
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.replace(0, 0, &"x".repeat(editor::MAX_EDITOR_BUFFER_BYTES));
+        let before = editor.buffer().to_owned();
+        let mut item = overlay::palette_items(&Catalog::builtin(), 0).remove(0);
+        item.replace_start = before.len();
+        item.replace_end = before.len();
+        item.value = "extra/".to_owned();
+        item.kind = completion::CompletionKind::Directory;
+        item.source = "filesystem";
+        surface.completion.open_manual(vec![item], "filesystem");
+        surface
+            .accept_selected_completion(&mut editor, Mode::Command)
+            .unwrap();
+        assert_eq!(editor.buffer(), before);
+        assert!(editor.resource_notice().is_some());
+        assert!(surface.completion.open);
     }
 
     #[test]

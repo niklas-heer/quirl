@@ -1,4 +1,12 @@
 //! Native command graph execution and background-job lifecycle.
+//!
+//! On Unix, leading unquoted `~` and `~/` in native words and redirection
+//! targets expand from the executor's private `HOME`. Its bytes remain literal
+//! and count toward [`EXPANSION_BYTES_MAX`]. Missing, empty, non-UTF-8, or
+//! NUL-containing values fail before the affected pipeline opens redirections
+//! or spawns its stages. Earlier command substitutions retain their normal
+//! evaluation order. Quoted or escaped tildes and named-user forms such as
+//! `~other` remain literal.
 
 #![cfg_attr(
     test,
@@ -634,6 +642,12 @@ mod platform {
 
     struct ExpansionBudget {
         retained_bytes: usize,
+    }
+
+    struct ExpandedWord {
+        value: String,
+        pathname: bool,
+        literal_prefix_bytes: usize,
     }
 
     impl ExpansionBudget {
@@ -1766,15 +1780,19 @@ mod platform {
                 }
                 let mut words = Vec::new();
                 for word in &forms {
-                    let (value, glob) = self.expand_word(
+                    let ExpandedWord {
+                        value,
+                        pathname,
+                        literal_prefix_bytes,
+                    } = self.expand_word(
                         word,
                         MAX_SUBSTITUTION_BYTES,
                         request,
                         previous_status,
                         &mut budget,
                     )?;
-                    let matches = if glob {
-                        pathname_expand(&value, budget.retained_bytes)?
+                    let matches = if pathname {
+                        pathname_expand(&value, literal_prefix_bytes, budget.retained_bytes)?
                     } else {
                         Vec::new()
                     };
@@ -1789,14 +1807,14 @@ mod platform {
                 }
                 command.words = words;
                 for redirect in &mut command.redirects {
-                    let (path, _) = self.expand_word(
+                    let expanded_target = self.expand_word(
                         &redirect.target,
                         MAX_SUBSTITUTION_BYTES,
                         request,
                         previous_status,
                         &mut budget,
                     )?;
-                    redirect.path = path;
+                    redirect.path = expanded_target.value;
                 }
             }
             Ok(expanded)
@@ -1809,29 +1827,57 @@ mod platform {
             request: Option<RequestContext<'_>>,
             previous_status: i32,
             budget: &mut ExpansionBudget,
-        ) -> Result<(String, bool), ShellError> {
+        ) -> Result<ExpandedWord, ShellError> {
+            // HOME is data, not shell source: append it once under the shared
+            // expansion budget, never rescan it for substitutions or globs.
+            // Resolve before this pipeline spawns stages or opens redirects.
+            // Earlier command substitutions keep their evaluation order. A byte
+            // boundary costs no second copy and protects wildcard-bearing home
+            // directory names when an unquoted suffix requests pathname expansion.
             let mut value = String::new();
             let mut pathname = false;
-            for part in &word.parts {
+            let mut literal_prefix_bytes = 0;
+            for (index, part) in word.parts.iter().enumerate() {
+                let expand_home = index == 0
+                    && part.quoting == Quoting::Unquoted
+                    && (part.text.starts_with("~/") || (part.text == "~" && word.parts.len() == 1));
+                let text = if expand_home {
+                    let home = self
+                        .environment
+                        .variables
+                        .get(std::ffi::OsStr::new("HOME"))
+                        .and_then(|home| home.to_str())
+                        .filter(|home| !home.is_empty())
+                        .ok_or_else(|| {
+                            ShellError::new(
+                                ErrorCode::InvalidArgument,
+                                "home expansion requires a nonempty UTF-8 HOME value",
+                            )
+                            .with_help(
+                                "Set HOME with `export HOME=/your/home` or use an explicit path",
+                            )
+                        })?;
+                    budget.append(&mut value, home)?;
+                    literal_prefix_bytes = value.len();
+                    part.text.strip_prefix('~').unwrap_or(&part.text)
+                } else {
+                    &part.text
+                };
                 if matches!(part.quoting, Quoting::Single | Quoting::Escaped) {
-                    budget.append(&mut value, &part.text)?;
+                    budget.append(&mut value, text)?;
                     continue;
                 }
                 pathname |= part.quoting == Quoting::Unquoted
-                    && part
-                        .text
+                    && text
                         .chars()
                         .any(|character| matches!(character, '*' | '?' | '['));
-                self.expand_fragment(
-                    &part.text,
-                    limit,
-                    request,
-                    previous_status,
-                    &mut value,
-                    budget,
-                )?;
+                self.expand_fragment(text, limit, request, previous_status, &mut value, budget)?;
             }
-            Ok((value, pathname))
+            Ok(ExpandedWord {
+                value,
+                pathname,
+                literal_prefix_bytes,
+            })
         }
 
         fn expand_fragment(
@@ -2990,6 +3036,7 @@ mod platform {
 
     fn pathname_expand(
         pattern: &str,
+        literal_prefix_bytes: usize,
         retained_before_paths: usize,
     ) -> Result<Vec<String>, ShellError> {
         const MAX_GLOB_MATCHES: usize = 10_000;
@@ -2999,10 +3046,18 @@ mod platform {
         } else {
             PathBuf::new()
         }];
-        for component in pattern.split('/').filter(|component| !component.is_empty()) {
-            let has_pattern = component
-                .chars()
-                .any(|character| matches!(character, '*' | '?' | '['));
+        let mut component_end = 0_usize;
+        for section in pattern.split_inclusive('/') {
+            let component = section.strip_suffix('/').unwrap_or(section);
+            let component_start = component_end;
+            component_end = component_end.saturating_add(section.len());
+            if component.is_empty() {
+                continue;
+            }
+            let has_pattern = component_start >= literal_prefix_bytes
+                && component
+                    .chars()
+                    .any(|character| matches!(character, '*' | '?' | '['));
             let mut next = Vec::new();
             let previous_path_bytes = paths
                 .iter()
@@ -5271,6 +5326,179 @@ mod platform {
                 .unwrap_err();
             assert_eq!(error.code, ErrorCode::ResourceLimit);
             assert!(error.message.contains("stage limit"));
+        }
+
+        #[test]
+        fn home_expansion_respects_quote_boundaries_and_private_environment_updates() {
+            let mut executor = NativeExecutor::default();
+            executor
+                .set_environment_variable("HOME".into(), "/home/with spaces/$literal".into())
+                .unwrap();
+            let graph = parse_command_list(
+                "printf ~ ~/Projects ~/\"two words\" '~' \"~/file\" \\~/file ''~/file \"\"~/file ~\"\" ~\"/file\" ~\\/file ~other/file prefix~/file $HOME",
+            ).unwrap();
+            let expanded = executor
+                .expand_pipeline(&graph.pipelines[0], None, 0)
+                .unwrap();
+            assert_eq!(
+                expanded.commands[0].words,
+                [
+                    "printf",
+                    "/home/with spaces/$literal",
+                    "/home/with spaces/$literal/Projects",
+                    "/home/with spaces/$literal/two words",
+                    "~",
+                    "~/file",
+                    "~/file",
+                    "~/file",
+                    "~/file",
+                    "~",
+                    "~/file",
+                    "~/file",
+                    "~other/file",
+                    "prefix~/file",
+                    "/home/with spaces/$literal",
+                ]
+            );
+            executor
+                .set_environment_variable("HOME".into(), "/next home".into())
+                .unwrap();
+            let graph = parse_command_list("cd ~/Projects").unwrap();
+            let expanded = executor
+                .expand_pipeline(&graph.pipelines[0], None, 0)
+                .unwrap();
+            assert_eq!(expanded.commands[0].words, ["cd", "/next home/Projects"]);
+        }
+
+        #[test]
+        fn home_expansion_preserves_literal_home_globs_and_expands_only_the_suffix() {
+            let directory = temporary_path("home [literal]*?");
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("one.txt"), "one").unwrap();
+            fs::write(directory.join("two.txt"), "two").unwrap();
+            let mut executor = NativeExecutor::default();
+            executor
+                .set_environment_variable("HOME".into(), directory.to_str().unwrap().into())
+                .unwrap();
+            let graph = parse_command_list("printf ~/*.txt ~/\"*.txt\"").unwrap();
+            let expanded = executor
+                .expand_pipeline(&graph.pipelines[0], None, 0)
+                .unwrap();
+            assert_eq!(
+                expanded.commands[0].words,
+                [
+                    "printf".to_owned(),
+                    directory.join("one.txt").to_str().unwrap().to_owned(),
+                    directory.join("two.txt").to_str().unwrap().to_owned(),
+                    directory.join("*.txt").to_str().unwrap().to_owned(),
+                ]
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn home_expansion_reaches_child_arguments_and_redirects_without_splitting() {
+            let directory = temporary_path("home with spaces");
+            fs::create_dir_all(&directory).unwrap();
+            let mut executor = NativeExecutor::default();
+            executor
+                .set_environment_variable("HOME".into(), directory.to_str().unwrap().into())
+                .unwrap();
+            let request = bounded_request(
+                "printf '%s' ~/Projects > ~/output; cat < ~/output; cat <<< ~/Projects".into(),
+                Duration::from_secs(5),
+            );
+            let result = executor.execute_capture_request(request).unwrap();
+            let expected_path = directory.join("Projects").to_str().unwrap().to_owned();
+            assert_eq!(result.status, 0);
+            assert_eq!(
+                result.stdout,
+                Some(format!("{expected_path}{expected_path}\n"))
+            );
+            assert_eq!(
+                fs::read_to_string(directory.join("output")).unwrap(),
+                expected_path
+            );
+            assert!(executor.jobs().is_empty());
+            fs::remove_dir_all(directory).unwrap();
+        }
+
+        #[test]
+        fn invalid_home_expansion_fails_before_builtin_mutation_or_redirect_creation() {
+            use std::os::unix::ffi::OsStringExt;
+            let mut executor = NativeExecutor::default();
+            let output = temporary_path("home-failure-output");
+            let source = format!(
+                "export QUIRL_HOME_PROOF=changed > ~ > '{}'",
+                output.display()
+            );
+            for home in [
+                None,
+                Some(std::ffi::OsString::new()),
+                Some(std::ffi::OsString::from_vec(vec![0xff])),
+                Some(std::ffi::OsString::from_vec(b"/home/\0invalid".to_vec())),
+            ] {
+                executor
+                    .environment
+                    .variables
+                    .remove(std::ffi::OsStr::new("HOME"));
+                if let Some(home) = home {
+                    executor.environment.variables.insert("HOME".into(), home);
+                }
+                let request = bounded_request(source.clone(), Duration::from_secs(5));
+                let error = executor.execute_capture_request(request).unwrap_err();
+                assert!(matches!(
+                    error.code,
+                    ErrorCode::InvalidArgument | ErrorCode::InvalidCommand
+                ));
+                assert!(!error.details.help.is_empty());
+                assert!(!executor.environment.is_set("QUIRL_HOME_PROOF"));
+                assert!(!output.exists());
+                assert!(executor.jobs().is_empty());
+            }
+            executor
+                .set_environment_variable("HOME".into(), "/valid".into())
+                .unwrap();
+            let graph = parse_command_list("printf ~/again").unwrap();
+            assert_eq!(
+                executor
+                    .expand_pipeline(&graph.pipelines[0], None, 0)
+                    .unwrap()
+                    .commands[0]
+                    .words[1],
+                "/valid/again"
+            );
+        }
+
+        #[test]
+        fn home_expansion_admits_exact_byte_budget_and_rejects_the_next_byte() {
+            let mut executor = NativeExecutor::default();
+            executor
+                .set_environment_variable(
+                    "HOME".into(),
+                    "h".repeat(EXPANSION_BYTES_MAX - "printf".len()),
+                )
+                .unwrap();
+            let exact = parse_command_list("printf ~").unwrap();
+            let expanded = executor
+                .expand_pipeline(&exact.pipelines[0], None, 0)
+                .unwrap();
+            assert_eq!(
+                expanded.commands[0]
+                    .words
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+                EXPANSION_BYTES_MAX
+            );
+            let oversized = parse_command_list("printf ~/").unwrap();
+            let error = executor
+                .expand_pipeline(&oversized.pipelines[0], None, 0)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(error.details.context.iter().any(|value| {
+                value.contains(&format!("observed {} bytes", EXPANSION_BYTES_MAX + 1))
+            }));
         }
 
         #[test]

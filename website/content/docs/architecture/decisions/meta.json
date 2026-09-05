@@ -26,6 +26,7 @@
     "0033-bounded-simple-editor",
     "0034-release-binary-budget",
     "0035-cold-interactive-startup",
-    "0036-advisory-release-binary-size"
+    "0036-advisory-release-binary-size",
+    "0037-navigation-completion-space"
   ]
 }

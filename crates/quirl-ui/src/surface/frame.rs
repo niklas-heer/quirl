@@ -71,6 +71,7 @@ impl FrameModel<'_> {
             self.intent_activity_rows(area.width),
             self.transcript.map_or(0, Transcript::line_count),
             self.transcript.is_none_or(Transcript::follows_tail),
+            self.information_rows(area),
         )
         .transcript
     }
@@ -92,6 +93,7 @@ impl FrameModel<'_> {
             self.intent_activity_rows(area.width),
             self.transcript.map_or(0, Transcript::line_count),
             self.transcript.is_none_or(Transcript::follows_tail),
+            self.information_rows(area),
         );
         if let Some(transcript) = self.transcript {
             self.render_transcript(frame, layout.transcript, transcript);
@@ -131,16 +133,7 @@ impl FrameModel<'_> {
                 diagnostic_area,
             );
         }
-        let information_requested = self.completion.open || self.runtime.focused_panel().is_some();
-        let information_area = information_area(
-            &layout,
-            information_requested,
-            self.picker_layout == PickerLayout::Full,
-        );
-        if information_area != layout.information {
-            frame.render_widget(Clear, information_area);
-        }
-        self.render_information(frame, information_area);
+        self.render_information(frame, layout.information);
 
         let status = StatusBarModel {
             editor: self.editor,
@@ -197,20 +190,52 @@ impl FrameModel<'_> {
         frame.set_cursor_position(Position::new(x, y));
     }
 
+    fn information_rows(&self, area: Rect) -> u16 {
+        if self.completion.open {
+            if self.picker_query.is_some() && self.picker_layout == PickerLayout::Full {
+                return u16::MAX;
+            }
+            return self.completion_height(area.width, area.height);
+        }
+        self.runtime.focused_panel().map_or(0, |(_, panel)| {
+            u16::try_from(panel.rows.len().min(PANEL_VISIBLE_ROWS_MAX))
+                .unwrap_or(u16::MAX)
+                .saturating_add(3)
+        })
+    }
+
+    fn completion_docs_allowed(&self, width: u16) -> bool {
+        self.picker_query.map_or(width >= 72, |_| {
+            self.picker_preview
+                && (width >= 100 || (self.picker_layout == PickerLayout::Full && width >= 72))
+        })
+    }
+
+    fn completion_height(&self, width: u16, available_rows: u16) -> u16 {
+        let row_limit = if self.picker_query.is_some() && self.picker_layout == PickerLayout::Full {
+            usize::from(available_rows)
+        } else {
+            10
+        };
+        // Documentation needs borders, source metadata, and readable usage text.
+        // Without a documentation pane, reserve only the bounded result rows.
+        let minimum_rows = if self.completion_docs_allowed(width) {
+            12
+        } else {
+            3
+        };
+        u16::try_from(self.completion.items.len().min(row_limit))
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .saturating_add(u16::from(self.picker_query.is_some()))
+            .max(minimum_rows)
+    }
+
     fn render_information(&self, frame: &mut Frame<'_>, area: Rect) {
         if self.completion.open && area.height >= 2 {
-            let row_limit =
-                if self.picker_query.is_some() && self.picker_layout == PickerLayout::Full {
-                    usize::from(area.height)
-                } else {
-                    10
-                };
-            let desired_popup_height = u16::try_from(self.completion.items.len().min(row_limit))
-                .unwrap_or(u16::MAX)
-                .saturating_add(2)
-                .saturating_add(u16::from(self.picker_query.is_some()))
-                .max(if area.width >= 100 { 12 } else { 3 });
-            let popup_height = area.height.min(desired_popup_height);
+            let popup_height = area
+                .height
+                .min(self.completion_height(area.width, area.height));
             let replace_start = self
                 .completion
                 .selected_item()
@@ -230,11 +255,7 @@ impl FrameModel<'_> {
                 area.width.saturating_sub(offset),
                 popup_height,
             );
-            let docs_allowed = self.picker_query.map_or(area.width >= 72, |_| {
-                self.picker_preview
-                    && (area.width >= 100
-                        || (self.picker_layout == PickerLayout::Full && area.width >= 72))
-            });
+            let docs_allowed = self.completion_docs_allowed(area.width);
             self.render_completion(frame, popup_area, docs_allowed);
         } else if area.height >= 3
             && let Some((id, panel)) = self.runtime.focused_panel()
@@ -943,31 +964,6 @@ struct FrameLayout {
     status: Rect,
 }
 
-/// Prefer enough rows to read documentation, borrowing transcript rows without
-/// moving the editor. Border/source rows alone are not a usable help panel.
-fn information_area(layout: &FrameLayout, requested: bool, full: bool) -> Rect {
-    // Borders, source metadata, and a wrapped usage example can consume eight
-    // rows before the first explanatory paragraph becomes visible.
-    const READABLE_ROWS_MIN: u16 = 12;
-    if !requested || layout.information.height >= READABLE_ROWS_MIN {
-        return layout.information;
-    }
-    let height = if full {
-        layout.transcript.height
-    } else {
-        layout.transcript.height.min(READABLE_ROWS_MIN)
-    };
-    if height <= layout.information.height {
-        return layout.information;
-    }
-    Rect::new(
-        layout.transcript.x,
-        layout.transcript.bottom().saturating_sub(height),
-        layout.transcript.width,
-        height,
-    )
-}
-
 fn frame_layout(
     area: Rect,
     input_rows: u16,
@@ -975,9 +971,11 @@ fn frame_layout(
     intent_activity_rows: u16,
     transcript_line_count: usize,
     follows_tail: bool,
+    information_rows: u16,
 ) -> FrameLayout {
-    // Completion and panel state deliberately do not participate in this partition. Both reuse
-    // the remaining bounded rectangle, so asynchronous completion transitions cannot move input.
+    // Reserve popup rows before allocating the transcript viewport. Opening a
+    // panel moves the live prompt upward and scrolls older output out of view;
+    // it never paints over history, the editor, or the fixed bottom status.
     let status_y = area.bottom().saturating_sub(1);
     let status = Rect::new(area.x, status_y, area.width, 1);
     let rows_above_status = status_y.saturating_sub(area.y);
@@ -1010,7 +1008,11 @@ fn frame_layout(
         .saturating_add(diagnostic_height);
     let transcript_height = u16::try_from(transcript_line_count)
         .unwrap_or(u16::MAX)
-        .min(rows_above_status.saturating_sub(current_height));
+        .min(
+            rows_above_status
+                .saturating_sub(current_height)
+                .saturating_sub(information_rows),
+        );
     let transcript = Rect::new(area.x, area.y, area.width, transcript_height);
     let context_y = transcript.bottom();
     let context = (context_height == 1).then_some(Rect::new(area.x, context_y, area.width, 1));
@@ -2109,23 +2111,23 @@ mod tests {
 
     #[test]
     fn tiny_layout_prioritizes_status_then_editor_without_out_of_bounds_regions() {
-        let one_row = frame_layout(Rect::new(0, 0, 1, 1), 1, true, 0, 0, true);
+        let one_row = frame_layout(Rect::new(0, 0, 1, 1), 1, true, 0, 0, true, 0);
         assert_eq!(one_row.status, Rect::new(0, 0, 1, 1));
         assert_eq!(one_row.input.height, 0);
         assert_eq!(one_row.information.height, 0);
         assert!(one_row.context.is_none());
         assert!(one_row.diagnostic.is_none());
 
-        let two_rows = frame_layout(Rect::new(0, 0, 1, 2), u16::MAX, true, 0, 0, true);
+        let two_rows = frame_layout(Rect::new(0, 0, 1, 2), u16::MAX, true, 0, 0, true, 0);
         assert_eq!(two_rows.input, Rect::new(0, 0, 1, 1));
         assert_eq!(two_rows.status, Rect::new(0, 1, 1, 1));
         assert!(two_rows.context.is_none());
         assert!(two_rows.diagnostic.is_none());
 
-        let compact_activity = frame_layout(Rect::new(0, 0, 80, 4), 1, false, 7, 0, true);
+        let compact_activity = frame_layout(Rect::new(0, 0, 80, 4), 1, false, 7, 0, true, 0);
         assert_eq!(compact_activity.input.height, 1);
         assert_eq!(compact_activity.intent_activity.unwrap().height, 1);
-        let full_activity = frame_layout(Rect::new(0, 0, 80, 7), 1, false, 7, 0, true);
+        let full_activity = frame_layout(Rect::new(0, 0, 80, 7), 1, false, 7, 0, true, 0);
         assert_eq!(full_activity.input.height, 1);
         assert_eq!(full_activity.intent_activity.unwrap().height, 4);
 
@@ -2380,43 +2382,59 @@ mod tests {
     }
 
     #[test]
-    fn help_uses_readable_transcript_space_when_only_header_rows_remain() {
-        let layout = frame_layout(Rect::new(0, 0, 120, 40), 1, false, 0, 33, true);
-        assert_eq!(layout.information.height, 4);
-        let area = information_area(&layout, true, false);
-        assert_eq!(area.height, 12);
-        assert!(area.bottom() <= layout.input.y);
-        assert_eq!(information_area(&layout, false, false), layout.information);
-
-        let short = frame_layout(Rect::new(0, 0, 60, 8), 1, false, 0, 2, true);
-        assert_eq!(information_area(&short, true, false), short.information);
-        let roomy = frame_layout(Rect::new(0, 0, 120, 40), 1, false, 0, 0, true);
-        assert_eq!(information_area(&roomy, true, false), roomy.information);
-    }
-
-    #[test]
-    fn help_keeps_explanatory_text_visible_at_intermediate_pane_heights() {
-        for rows in 4_u16..12 {
+    fn help_reserves_readable_rows_below_input_without_overlapping_history() {
+        for existing_information_rows in 0_u16..12 {
             let layout = frame_layout(
                 Rect::new(0, 0, 120, 40),
                 1,
                 false,
                 0,
-                usize::from(37 - rows),
+                usize::from(37 - existing_information_rows),
                 true,
+                12,
             );
-            assert_eq!(layout.information.height, rows);
-            let area = information_area(&layout, true, false);
-            assert_eq!(area.height, 12);
-            assert!(area.bottom() <= layout.input.y);
+            assert_eq!(layout.information.height, 12);
+            assert_eq!(layout.transcript.height, 25);
+            assert_eq!(layout.input.bottom(), layout.information.y);
+            assert_eq!(layout.information.bottom(), layout.status.y);
+            assert!(layout.transcript.bottom() <= layout.input.y);
         }
-        let layout = frame_layout(Rect::new(0, 0, 120, 40), 1, false, 0, 25, true);
-        assert_eq!(layout.information.height, 12);
-        assert_eq!(information_area(&layout, true, false), layout.information);
     }
 
     #[test]
-    fn full_transcript_completion_overlays_output_without_moving_the_prompt() {
+    fn reserved_panels_clamp_to_small_terminals_and_respect_history_scrolling() {
+        for height in 1..=16 {
+            for requested in [0, 3, 12, u16::MAX] {
+                let area = Rect::new(2, 3, 60, height);
+                let layout = frame_layout(area, 3, true, 0, 100, true, requested);
+                assert_eq!(layout.status.bottom(), area.bottom());
+                assert_eq!(layout.input.height > 0, height > 1);
+                assert!(layout.transcript.bottom() <= layout.input.y);
+                assert!(layout.input.bottom() <= layout.information.y);
+                assert_eq!(layout.information.bottom(), layout.status.y);
+                for region in [
+                    layout.transcript,
+                    layout.input,
+                    layout.information,
+                    layout.status,
+                ] {
+                    assert!(region.y >= area.y);
+                    assert!(region.bottom() <= area.bottom());
+                }
+            }
+        }
+        let scrolled = frame_layout(Rect::new(0, 0, 80, 24), 1, false, 0, 100, false, 12);
+        assert_eq!(scrolled.transcript.height, 23);
+        assert_eq!(scrolled.input.height, 0);
+        assert_eq!(scrolled.information.height, 0);
+        let full = frame_layout(Rect::new(0, 0, 80, 24), 1, false, 0, 100, true, u16::MAX);
+        assert_eq!(full.transcript.height, 0);
+        assert_eq!(full.information.height, 21);
+        assert_eq!(full.input.bottom(), full.information.y);
+    }
+
+    #[test]
+    fn full_transcript_completion_scrolls_history_up_and_reserves_rows_below_input() {
         let mut editor = EditorState::new("emacs", Vec::new());
         editor.insert_paste("git st");
         let mut completion = CompletionState::new(Catalog::builtin(), None);
@@ -2425,10 +2443,10 @@ mod tests {
             line_count_max: 64,
             retained_bytes_max: 4_096,
         });
-        for index in 0..20 {
+        for index in 0..40 {
             transcript.append_line(&format!("output-{index}"));
         }
-        let mut terminal = Terminal::new(TestBackend::new(78, 12)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(78, 24)).unwrap();
         let draw = |terminal: &mut Terminal<TestBackend>, completion: &CompletionState| {
             terminal
                 .draw(|frame| {
@@ -2466,7 +2484,7 @@ mod tests {
 
         draw(&mut terminal, &completion);
         let cursor_at_rest = terminal.get_cursor_position().unwrap();
-        assert_eq!(cursor_at_rest.y, 10);
+        assert_eq!(cursor_at_rest.y, 22);
         completion.open_manual(
             vec![CompletionItem {
                 value: "git status".to_owned(),
@@ -2483,11 +2501,29 @@ mod tests {
             "catalog",
         );
         draw(&mut terminal, &completion);
-        assert_eq!(terminal.get_cursor_position().unwrap(), cursor_at_rest);
-        let rendered = (0..12).map(|y| row(&terminal, y)).collect::<String>();
-        assert!(rendered.contains("completions"));
+        assert_eq!(terminal.get_cursor_position().unwrap().y, 10);
+        for y in 0..9 {
+            assert!(row(&terminal, y).contains(&format!("output-{}", 31 + y)));
+        }
         assert!(row(&terminal, 10).contains("git st"));
-        assert!(row(&terminal, 11).contains("NORMAL"));
+        assert!(row(&terminal, 11).contains("completions"));
+        assert!(row(&terminal, 15).contains("git status [--short]"));
+        assert!(row(&terminal, 23).contains("NORMAL"));
+        assert_eq!(transcript.line_count(), 40);
+
+        terminal.backend_mut().resize(60, 24);
+        draw(&mut terminal, &completion);
+        assert_eq!(terminal.get_cursor_position().unwrap().y, 19);
+        assert!(row(&terminal, 17).contains("output-39"));
+        assert!(row(&terminal, 20).contains("completions"));
+        assert!(row(&terminal, 21).contains("status"));
+        assert!(row(&terminal, 23).contains("NORMAL"));
+
+        completion.dismiss();
+        draw(&mut terminal, &completion);
+        assert_eq!(terminal.get_cursor_position().unwrap(), cursor_at_rest);
+        assert!(row(&terminal, 20).contains("output-39"));
+        assert!(row(&terminal, 22).contains("git st"));
     }
 
     #[test]
@@ -2495,6 +2531,45 @@ mod tests {
         let terminal = rendered_model(78, 4, "gti status", Some("unknown command `gti`"), |_| {});
         assert!(row(&terminal, 2).contains("unknown command `gti`"));
         assert!(row(&terminal, 3).contains("NORMAL"));
+    }
+
+    #[test]
+    fn automatic_completion_footer_distinguishes_path_acceptance_from_catalog_execution() {
+        for (kind, source, accepts_enter) in [
+            (CompletionKind::Directory, "filesystem", true),
+            (CompletionKind::Path, "filesystem", true),
+            (CompletionKind::Command, "catalog", false),
+        ] {
+            let terminal = rendered_model(120, 20, "ls s", None, |completion| {
+                completion.open_manual(
+                    vec![CompletionItem {
+                        value: "src/".to_owned(),
+                        display: "src/".to_owned(),
+                        summary: "candidate".to_owned(),
+                        detail: "candidate details".to_owned(),
+                        replace_start: 3,
+                        replace_end: 4,
+                        match_indices: vec![0],
+                        kind,
+                        source,
+                        trust: "builtin",
+                    }],
+                    source,
+                );
+                completion.automatic = true;
+            });
+            let footer = row(&terminal, 19);
+            assert_eq!(
+                footer.contains("Enter accept"),
+                accepts_enter,
+                "{source}: {footer}"
+            );
+            assert_eq!(
+                footer.contains("Enter run"),
+                !accepts_enter,
+                "{source}: {footer}"
+            );
+        }
     }
 
     #[test]

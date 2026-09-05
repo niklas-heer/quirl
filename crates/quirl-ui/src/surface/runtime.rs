@@ -4,6 +4,57 @@ use crate::{LiveBuffer, LiveSample, PanelModel};
 use quirl_core::{ErrorCode, ShellError, StructuredValue, escape_terminal_line};
 use std::collections::VecDeque;
 
+/// Maximum raw UTF-8 bytes retained for home-directory completion.
+pub const COMPLETION_HOME_BYTES_MAX: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Default)]
+/// Session-owned home path shared by rich and simple completion.
+///
+/// The composition root publishes only at environment-generation boundaries.
+/// Reads clone an `Arc`, not the environment or path. Missing, empty, non-UTF-8,
+/// NUL-containing, and oversized values disable home completion; they never
+/// fall back to a different home or retain the preceding generation's path.
+pub struct InteractiveHomeDirectory {
+    value: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<str>>>>,
+}
+
+impl InteractiveHomeDirectory {
+    /// Replace the raw path without terminal escaping or lossy conversion.
+    ///
+    /// Invalid or over-limit input clears the path before returning. Completion
+    /// is best effort: an unavailable path produces no `~/` candidates, while
+    /// execution remains responsible for its own actionable HOME diagnostic.
+    pub fn update(&self, value: Option<&std::ffi::OsStr>) {
+        // Admission precedes copying. Invalidation must replace the old value:
+        // keeping a stale home would offer a path different from execution.
+        let admitted = value
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= COMPLETION_HOME_BYTES_MAX
+                    && !value.contains('\0')
+            })
+            .map(std::sync::Arc::<str>::from);
+        *self
+            .value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = admitted;
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<std::sync::Arc<str>> {
+        self.value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn from_process_environment() -> Self {
+        let home = Self::default();
+        home.update(std::env::var_os("HOME").as_deref());
+        home
+    }
+}
+
 /// Maximum extension panels retained by the rich surface.
 pub const PANEL_COUNT_MAX: usize = 8;
 /// Maximum columns accepted in one interactive panel.
@@ -663,6 +714,39 @@ fn truncate_bytes(value: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_home_admission_preserves_raw_identity_and_clears_invalid_updates() {
+        use super::{COMPLETION_HOME_BYTES_MAX, InteractiveHomeDirectory};
+        use std::ffi::OsStr;
+        let home = InteractiveHomeDirectory::default();
+        let reader = home.clone();
+        let raw = "/home/raw\n\u{1b}[31m 雪";
+        home.update(Some(OsStr::new(raw)));
+        assert_eq!(reader.snapshot().as_deref(), Some(raw));
+        let first = home.snapshot().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &reader.snapshot().unwrap()));
+        for invalid in [None, Some(""), Some("/nul\0path")] {
+            home.update(invalid.map(OsStr::new));
+            assert!(reader.snapshot().is_none());
+            home.update(Some(OsStr::new(raw)));
+        }
+        let exact = "x".repeat(COMPLETION_HOME_BYTES_MAX);
+        home.update(Some(OsStr::new(&exact)));
+        assert_eq!(reader.snapshot().unwrap().len(), COMPLETION_HOME_BYTES_MAX);
+        home.update(Some(OsStr::new(&format!("{exact}x"))));
+        assert!(reader.snapshot().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_home_non_utf8_update_clears_the_previous_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let home = super::InteractiveHomeDirectory::default();
+        home.update(Some(std::ffi::OsStr::new("/valid")));
+        home.update(Some(std::ffi::OsStr::from_bytes(b"/invalid\xff")));
+        assert!(home.snapshot().is_none());
+    }
+
     use super::*;
 
     fn panel(title: &str) -> PanelModel {

@@ -18,18 +18,18 @@ pub use panel::{
     process_panel,
 };
 pub use surface::{
-    ACTIVITY_MESSAGE_BYTES_MAX, CatalogLoader, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX,
-    ENVIRONMENT_ITEMS_MAX, ENVIRONMENT_RETAINED_BYTES_MAX, InteractiveActivityProvider,
-    InteractiveActivitySnapshot, InteractiveDataSnapshot, InteractiveEnvironmentSnapshot,
-    InteractiveHistoryEntry, InteractiveIntentPlanner, InteractiveIntentPlannerUpdate,
-    InteractiveIntentTokenUsage, InteractiveJobAction, InteractiveJobSnapshot,
-    InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
-    InteractivePanelSnapshot, InteractiveProjectEntry, InteractiveProjectProvider,
-    InteractiveProjectSnapshot, InteractiveRuntimeSnapshot, InteractiveSignal,
-    JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX, PANEL_COUNT_MAX,
-    PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX, PROJECT_FIELD_BYTES_MAX,
-    PROJECT_ITEMS_MAX, PROJECT_RETAINED_BYTES_MAX, PROJECT_STATUS_BYTES_MAX, RichSurface,
-    SurfaceKind, select_surface, set_product_identity,
+    ACTIVITY_MESSAGE_BYTES_MAX, COMPLETION_HOME_BYTES_MAX, CatalogLoader, DATA_ITEMS_MAX,
+    DATA_RETAINED_BYTES_MAX, ENVIRONMENT_ITEMS_MAX, ENVIRONMENT_RETAINED_BYTES_MAX,
+    InteractiveActivityProvider, InteractiveActivitySnapshot, InteractiveDataSnapshot,
+    InteractiveEnvironmentSnapshot, InteractiveHistoryEntry, InteractiveHomeDirectory,
+    InteractiveIntentPlanner, InteractiveIntentPlannerUpdate, InteractiveIntentTokenUsage,
+    InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch,
+    InteractivePanelProvider, InteractivePanelSnapshot, InteractiveProjectEntry,
+    InteractiveProjectProvider, InteractiveProjectSnapshot, InteractiveRuntimeSnapshot,
+    InteractiveSignal, JOB_ACTION_ITEMS_MAX, JOB_RETAINED_BYTES_MAX, PANEL_COLUMNS_MAX,
+    PANEL_COUNT_MAX, PANEL_FIELD_BYTES_MAX, PANEL_GENERATION_BYTES_MAX, PANEL_ROWS_MAX,
+    PROJECT_FIELD_BYTES_MAX, PROJECT_ITEMS_MAX, PROJECT_RETAINED_BYTES_MAX,
+    PROJECT_STATUS_BYTES_MAX, RichSurface, SurfaceKind, select_surface, set_product_identity,
 };
 
 use crossterm::{
@@ -594,7 +594,10 @@ pub fn editor_with_extensions_and_config(
         None,
         Vec::new(),
         None,
-        Arc::new(StablePickerRanker),
+        EditorCompletionContext {
+            picker_ranker: Arc::new(StablePickerRanker),
+            home_directory: InteractiveHomeDirectory::from_process_environment(),
+        },
     )
 }
 
@@ -635,6 +638,30 @@ pub fn editor_with_extensions_config_history_and_picker(
     history_path: PathBuf,
     picker_ranker: Arc<dyn PickerRanker>,
 ) -> Result<Reedline, ShellError> {
+    editor_with_session_home(
+        catalog,
+        extension_completer,
+        config,
+        history_path,
+        picker_ranker,
+        InteractiveHomeDirectory::from_process_environment(),
+    )
+}
+
+/// Create a durable-history editor with session-private home completion.
+///
+/// This shares the same history, picker, and error contracts as
+/// [`editor_with_extensions_config_history_and_picker`]. The bounded raw home
+/// handle is updated by the host at safe environment-generation boundaries;
+/// completion never reads the process-global HOME or inspector display text.
+pub fn editor_with_session_home(
+    catalog: Catalog,
+    extension_completer: Option<Box<dyn ExtensionCompleter + Send>>,
+    config: QuirlConfig,
+    history_path: PathBuf,
+    picker_ranker: Arc<dyn PickerRanker>,
+    home_directory: InteractiveHomeDirectory,
+) -> Result<Reedline, ShellError> {
     Theme::from_config(&config, true)?;
     let mut history = BoundedFileHistory::with_file(history_path.clone())?;
     let history_items = history_picker_items(history.entries.make_contiguous());
@@ -645,8 +672,16 @@ pub fn editor_with_extensions_config_history_and_picker(
         Some(history),
         history_items,
         Some(history_path),
-        picker_ranker,
+        EditorCompletionContext {
+            picker_ranker,
+            home_directory,
+        },
     ))
+}
+
+struct EditorCompletionContext {
+    picker_ranker: Arc<dyn PickerRanker>,
+    home_directory: InteractiveHomeDirectory,
 }
 
 fn configured_editor(
@@ -656,7 +691,7 @@ fn configured_editor(
     history: Option<BoundedFileHistory>,
     history_items: Vec<PickerItem>,
     history_path: Option<PathBuf>,
-    picker_ranker: Arc<dyn PickerRanker>,
+    completion: EditorCompletionContext,
 ) -> Reedline {
     let terminal_styles = terminal_styling_enabled(
         std::io::stdout().is_terminal(),
@@ -665,14 +700,16 @@ fn configured_editor(
     );
     let theme = Theme::from_config_or_default(&config, terminal_styles);
     let picker_invocation = Arc::new(AtomicU8::new(PickerInvocation::None.code()));
-    let completer = Box::new(CatalogCompleter::with_extensions_and_picker(
+    let mut completer = CatalogCompleter::with_extensions_and_picker(
         catalog.clone(),
         extension_completer,
         picker_sources(&catalog, history_items),
         history_path,
         Arc::clone(&picker_invocation),
-        picker_ranker,
-    ));
+        completion.picker_ranker,
+    );
+    completer.home_directory = completion.home_directory;
+    let completer = Box::new(completer);
     let completion_menu = Box::new(configured_completion_menu(&config));
     let help_menu = Box::new(configured_help_menu());
     let history_picker_menu = Box::new(configured_picker_menu(
@@ -2329,6 +2366,7 @@ struct HistoryPickerCache {
 /// Picker candidate sets are capped before ranking; extension providers are
 /// responsible for returning bounded suggestions with valid UTF-8 byte spans.
 pub struct CatalogCompleter {
+    home_directory: InteractiveHomeDirectory,
     catalog: Catalog,
     extensions: Option<Box<dyn ExtensionCompleter + Send>>,
     picker_items: Vec<PickerItem>,
@@ -2339,9 +2377,17 @@ pub struct CatalogCompleter {
 }
 
 impl CatalogCompleter {
+    /// Use session-private home completion instead of the constructor's snapshot.
+    /// The shared handle admits at most [`COMPLETION_HOME_BYTES_MAX`] raw bytes.
+    pub fn with_home_directory(mut self, home: InteractiveHomeDirectory) -> Self {
+        self.home_directory = home;
+        self
+    }
+
     /// Construct a catalog-only completer with the built-in stable picker ranker.
     pub fn new(catalog: Catalog) -> Self {
         Self {
+            home_directory: InteractiveHomeDirectory::from_process_environment(),
             catalog,
             extensions: None,
             picker_items: Vec::new(),
@@ -2361,6 +2407,7 @@ impl CatalogCompleter {
         extensions: Option<Box<dyn ExtensionCompleter + Send>>,
     ) -> Self {
         Self {
+            home_directory: InteractiveHomeDirectory::from_process_environment(),
             catalog,
             extensions,
             picker_items: Vec::new(),
@@ -2380,6 +2427,7 @@ impl CatalogCompleter {
         picker_ranker: Arc<dyn PickerRanker>,
     ) -> Self {
         Self {
+            home_directory: InteractiveHomeDirectory::from_process_environment(),
             catalog,
             extensions,
             picker_items,
@@ -2724,6 +2772,7 @@ impl Completer for CatalogCompleter {
             line,
             pos,
             Mode::Command,
+            self.home_directory.snapshot().as_deref(),
         )
         .into_iter()
         .map(filesystem_suggestion)

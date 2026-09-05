@@ -72,14 +72,14 @@ use quirl_syntax::{InteractiveLine, Mode, classify, parse_command_list};
 use quirl_ui::{
     CatalogLoader, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, ExtensionCompleter,
     ExtensionSuggestion, InteractiveDataSnapshot, InteractiveEnvironmentSnapshot,
-    InteractiveHistoryEntry, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
-    InteractivePanelBatch, InteractivePanelProvider, InteractiveProjectEntry,
-    InteractiveProjectProvider, InteractiveProjectSnapshot, InteractiveRuntimeSnapshot,
-    InteractiveSignal, MODE_TOGGLE_HOST_COMMAND, NativeProjectContext, PROJECT_ITEMS_MAX,
-    PROMPT_FIRST_PAINT_BUDGET, PickerItem, PickerItemKind, PickerMatch, PickerRanker,
-    PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind,
-    editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
-    set_product_identity, terminal_supports_nerd_font, terminal_supports_unicode, terminal_width,
+    InteractiveHistoryEntry, InteractiveHomeDirectory, InteractiveJobAction,
+    InteractiveJobSnapshot, InteractiveJobStatus, InteractivePanelBatch, InteractivePanelProvider,
+    InteractiveProjectEntry, InteractiveProjectProvider, InteractiveProjectSnapshot,
+    InteractiveRuntimeSnapshot, InteractiveSignal, MODE_TOGGLE_HOST_COMMAND, NativeProjectContext,
+    PROJECT_ITEMS_MAX, PROMPT_FIRST_PAINT_BUDGET, PickerItem, PickerItemKind, PickerMatch,
+    PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind,
+    editor_with_session_home, history_path, render_error, select_surface, set_product_identity,
+    terminal_supports_nerd_font, terminal_supports_unicode, terminal_width,
 };
 use recovery::RecoveryCommand;
 use script::ScriptLanguage;
@@ -2072,9 +2072,15 @@ fn interactive_job_snapshots(jobs: &[quirl_process::JobState]) -> Vec<Interactiv
 
 fn interactive_environment_snapshot(
     executor: &NativeExecutor,
+    home_directory: &InteractiveHomeDirectory,
 ) -> Result<Vec<InteractiveEnvironmentSnapshot>, ShellError> {
-    Ok(executor
-        .environment_snapshot()?
+    let variables = executor.environment_snapshot()?;
+    // Publish execution identity before converting the inspector's display
+    // strings. This runs once per private environment generation, not per key.
+    home_directory.update(variables.iter().find_map(|(name, value)| {
+        (name == std::ffi::OsStr::new("HOME")).then_some(value.as_os_str())
+    }));
+    Ok(variables
         .into_iter()
         .map(|(name, value)| InteractiveEnvironmentSnapshot {
             name: name.to_string_lossy().into_owned(),
@@ -2106,11 +2112,13 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     let history_path = history_path()?;
     let mut history_database = history::HistoryDatabase::open_default(&history_path)?;
     let ai_bootstrap = InteractiveAiBootstrap::new();
+    let home_directory = InteractiveHomeDirectory::default();
     let (mut line_editor, mut catalog) = configured_initial_editor(
         &extensions,
         &ai_bootstrap,
         active_config.clone(),
         &history_path,
+        &home_directory,
     )?;
     print_banner(&active_config);
     let mut project_refresh = configured_project_refresh(&active_config.projects);
@@ -2237,6 +2245,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                     &ai_bootstrap,
                     active_config.clone(),
                     &history_path,
+                    &home_directory,
                 )?;
                 attach_project_refresh(&mut line_editor, project_refresh.as_ref());
             }
@@ -2254,6 +2263,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                     &ai_bootstrap,
                     active_config.clone(),
                     &history_path,
+                    &home_directory,
                 )?;
                 attach_project_refresh(&mut line_editor, project_refresh.as_ref());
             }
@@ -2306,7 +2316,10 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         let environment = if installed_environment_generation == Some(environment_generation) {
             None
         } else {
-            Some(interactive_environment_snapshot(&executor)?)
+            Some(interactive_environment_snapshot(
+                &executor,
+                &home_directory,
+            )?)
         };
         line_editor.install_runtime_snapshot(InteractiveRuntimeSnapshot {
             generation: runtime_snapshot_generation,
@@ -3575,6 +3588,7 @@ fn configured_initial_editor(
     ai_bootstrap: &InteractiveAiBootstrap,
     config: QuirlConfig,
     history_path: &Path,
+    home_directory: &InteractiveHomeDirectory,
 ) -> Result<(SessionEditor, Option<Arc<Catalog>>), ShellError> {
     if select_surface(&config.ui.surface) == SurfaceKind::Rich {
         let completion_adapter = LocalAwareCompletionAdapter::new(
@@ -3590,6 +3604,7 @@ fn configured_initial_editor(
             &config,
             history_path.to_path_buf(),
         )?;
+        editor.set_home_directory(home_directory.clone());
         editor.set_panel_provider(Box::new(CachedPanelAdapter::new(Arc::clone(extensions))));
         editor.set_activity_provider(Box::new(ai_bootstrap.activity_provider()));
         editor.set_intent_planner(Box::new(codex::CodexIntentPlanner::new()?));
@@ -3601,7 +3616,14 @@ fn configured_initial_editor(
     index::initialize_interactive_catalog();
     let catalog = Arc::new(load_composed_catalog()?);
     ai_bootstrap.catalog_admitted();
-    let editor = configured_editor(&catalog, extensions, ai_bootstrap, config, history_path)?;
+    let editor = configured_editor(
+        &catalog,
+        extensions,
+        ai_bootstrap,
+        config,
+        history_path,
+        home_directory,
+    )?;
     Ok((editor, Some(catalog)))
 }
 
@@ -3611,6 +3633,7 @@ fn configured_editor(
     ai_bootstrap: &InteractiveAiBootstrap,
     config: QuirlConfig,
     history_path: &Path,
+    home_directory: &InteractiveHomeDirectory,
 ) -> Result<SessionEditor, ShellError> {
     let completion_adapter = LocalAwareCompletionAdapter::new(
         Arc::clone(extensions),
@@ -3625,17 +3648,19 @@ fn configured_editor(
             &config,
             history_path.to_path_buf(),
         )?;
+        editor.set_home_directory(home_directory.clone());
         editor.set_panel_provider(Box::new(CachedPanelAdapter::new(Arc::clone(extensions))));
         editor.set_activity_provider(Box::new(ai_bootstrap.activity_provider()));
         editor.set_intent_planner(Box::new(codex::CodexIntentPlanner::new()?));
         return Ok(SessionEditor::Rich(Box::new(editor)));
     }
-    editor_with_extensions_config_history_and_picker(
+    editor_with_session_home(
         catalog.as_ref().clone(),
         Some(Box::new(completion_adapter)),
         config,
         history_path.to_path_buf(),
         picker_ranker,
+        home_directory.clone(),
     )
     .map(|editor| SessionEditor::Simple(Box::new(editor)))
 }

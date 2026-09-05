@@ -164,8 +164,9 @@ Rules:
   before transcript admission. Non-interactive Quirl invocations keep stable,
   undecorated, control-sequence-free stdout (§12).
 - The bounded active region (context, editor, diagnostics, completion, and
-  panels) is aligned immediately above the status bar, keeping the editing locus
-  stable as overlays open and close. It is clipped to the current screen, while
+  panels) reserves its own rows above the status bar. Opening a panel moves
+  the editor upward and scrolls older output out of the visible tail instead
+  of drawing over history. It is clipped to the current screen, while
   the status bar is always rendered at `height - 1`. Tiny dimensions use saturating layout and the
   capability probe keeps terminals shorter than five rows on the simple path.
 - Width is bounded to 512 columns and height to 256 rows (131,072 cells) at
@@ -235,8 +236,12 @@ The transcript begins at the top and pushes the context/editor downward like a
 normal shell session. Once the viewport fills, the live context/editor remains
 immediately above the status bar on the physical bottom row and the transcript
 scrolls behind it. A scrolled-away viewport gives the transcript the full body.
-Completion, documentation, and picker overlays reuse a bounded transcript
-region without changing the logical scroll anchor or moving the live prompt.
+Completion, documentation, and picker panels reserve a bounded region below
+the editor. The visible transcript shrinks from its older end, keeping the most
+recent output readable above the input; no panel paints over those rows. Closing
+a panel restores the larger transcript viewport. Scrolling away from the tail
+hides input panels and gives history the available body. See
+[ADR 0037](/docs/architecture/decisions/0037-navigation-completion-space).
 
 One active transcript record accumulates terminal-safe lines equivalent to:
 
@@ -487,9 +492,15 @@ git che▌
 - Always-on context: typing an exact catalog command opens its explanation;
   typing a flag prefix after a known command opens that command's options. This
   happens even when broad `completion.auto` fuzzy matching is disabled. An
-  untouched informational popup leaves Enter bound to command execution; Tab
-  or Down converts it to a selectable completion menu. Up and Down then navigate
-  within that menu; untouched automatic completion keeps Up bound to history.
+  untouched informational command/flag popup leaves Enter bound to command
+  execution; Tab or Down converts it to a selectable menu. Filesystem candidates
+  are selectable immediately: Enter inserts the highlighted path, and a directory
+  selection opens its children for another Enter. Escape then Enter executes the
+  chosen intermediate directory; accepting a file closes the menu, so the next
+  Enter executes. An already complete filename leaves Enter bound to execution,
+  even when other files share its prefix; Tab still offers those alternatives.
+  Up and Down navigate selectable menus; untouched informational
+  completion keeps Up bound to history. These navigation changes follow 0.2.0.
   Ctrl-R remains the explicit history entrypoint in either state.
 - Streaming: catalog and extension completion run on separate workers. Catalog
   results normally paint first; later extension results merge without moving a

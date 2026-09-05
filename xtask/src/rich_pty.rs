@@ -52,6 +52,7 @@ const CHECK_NAMES: &[&str] = &[
     "deferred-catalog-admission",
     "catalog-failure-restores-terminal",
     "completion",
+    "directory-navigation",
     "interactive-runtime",
     "cwd-history",
     "restart-history",
@@ -508,7 +509,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 38] {
+fn checks() -> [CheckCase; 39] {
     [
         CheckCase {
             name: "rich-editing",
@@ -545,6 +546,10 @@ fn checks() -> [CheckCase; 38] {
         CheckCase {
             name: "completion",
             run: check_completion,
+        },
+        CheckCase {
+            name: "directory-navigation",
+            run: check_directory_navigation,
         },
         CheckCase {
             name: "interactive-runtime",
@@ -713,6 +718,7 @@ fn wait_for_rich_input_since(session: &mut Session, start: usize) -> Result<(), 
 fn execute_and_resume(session: &mut Session, command: &str) -> Result<(), TaskError> {
     let output_start = session.pty.output().len();
     session.pty.type_text(command)?;
+    dismiss_directory_navigation_for_execution(session, command)?;
     session.pty.send(key::ENTER)?;
     let command_record = format!("❯ {command}");
     session
@@ -726,6 +732,31 @@ fn execute_and_resume(session: &mut Session, command: &str) -> Result<(), TaskEr
         })?;
     wait_for_rich_input_since(session, output_start)?;
     ensure_alternate_screen_unchanged(session, output_start, "completed command")
+}
+
+fn dismiss_directory_navigation_for_execution(
+    session: &mut Session,
+    command: &str,
+) -> Result<(), TaskError> {
+    if !command.starts_with("cd ") {
+        return Ok(());
+    }
+    // These callers request execution of an already chosen directory. Enter
+    // otherwise accepts the automatic candidate and begins browsing children.
+    // The navigation journey separately exercises that intentional edit path.
+    let editor_line = format!("> {command}");
+    session
+        .pty
+        .wait_for_screen("complete chosen directory command", |screen| {
+            screen.has_completed_frame()
+                && screen.lines().iter().any(|line| line.trim() == editor_line)
+        })?;
+    let dismissal_start = session.pty.output().len();
+    session.pty.send(key::ESCAPE)?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[?25h", dismissal_start, default_timeout())?;
+    wait_for_standard_status(session)
 }
 
 fn execute_and_resume_with_marker(
@@ -1766,6 +1797,196 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), TaskError> {
     ensure_terminal_restored(&degraded, cleanup_start, "corrupt-cache fallback")
 }
 
+fn check_directory_navigation(binary: &Path) -> Result<(), TaskError> {
+    // Failure model: automatic candidates can submit too early, directory
+    // acceptance can retain stale children, and a bottom-anchored panel can
+    // erase recent output. One private six-directory tree and 30 short output
+    // rows exercise these transitions without host files, retries, or sleeps.
+    // Every execution requires a fresh input lease plus an actual result;
+    // every editing transition requires the matching completed screen frame.
+    let mut session = Session::new(
+        binary,
+        SessionOptions {
+            rows: Some(24),
+            columns: Some(120),
+            ..SessionOptions::default()
+        },
+    )?;
+    let mut directory = session.private.path.clone();
+    for component in ["Projects", "alpha", "nested", "leaf"] {
+        directory.push(component);
+        create_private_directory(&directory)?;
+    }
+    let nested = session.private.path.join("Projects/alpha/nested");
+    fs::write(
+        nested.join("notes space.txt"),
+        b"NAVIGATION_FILE_CONFIRMED\n",
+    )?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    let numbers = (1..=30)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    execute_and_resume_with_marker(
+        &mut session,
+        &format!("/usr/bin/printf 'NAV_RECENT_%02d\\n' {numbers}"),
+        b"NAV_RECENT_30",
+    )?;
+    session.pty.type_text("cd ~/Projects/")?;
+    wait_navigation_completion(&mut session, "> cd ~/Projects/", "alpha/")?;
+    session.pty.send(key::ENTER)?;
+    wait_navigation_completion(&mut session, "> cd ~/Projects/alpha/", "nested/")?;
+    session.pty.send(key::ENTER)?;
+    wait_navigation_completion(&mut session, "> cd ~/Projects/alpha/nested/", "leaf/")?;
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(&mut session)?;
+    let cd_start = session.pty.output().len();
+    session.pty.send(key::ENTER)?;
+    wait_for_rich_input_since(&mut session, cd_start)?;
+    check_navigation_file_acceptance(&mut session)?;
+
+    check_navigation_pwd(&mut session, &nested)?;
+    // Untouched catalog information must continue to run the typed command.
+    wait_for_command_information(&mut session, "cd", &["Enter run"])?;
+    let home_start = session.pty.output().len();
+    session.pty.send(key::ENTER)?;
+    wait_for_rich_input_since(&mut session, home_start)?;
+    let home = session.private.path.clone();
+    check_navigation_pwd(&mut session, &home)?;
+    check_navigation_changed_home(&mut session)?;
+    let cleanup_start = session.pty.output().len();
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "directory navigation",
+    )?;
+    ensure_terminal_restored(&session, cleanup_start, "directory navigation")
+}
+
+fn check_navigation_changed_home(session: &mut Session) -> Result<(), TaskError> {
+    // Export changes only the shell's private environment. A unique child and
+    // the absence of the original HOME's Projects entry catch stale UI scans.
+    let home = session.private.path.join("updated home");
+    let child = home.join("HOME_UPDATED_CHILD");
+    create_private_directory(&home)?;
+    create_private_directory(&child)?;
+    execute_and_resume(session, &format!("export HOME={}", shell_quote(&home)))?;
+    session.pty.type_text("cd ~/")?;
+    session
+        .pty
+        .wait_for_screen("completion follows private HOME export", |screen| {
+            let lines = screen.lines();
+            // A history suggestion may visually follow the typed prefix; the
+            // fresh result rows must still come from the newly exported HOME.
+            let Some(input) = lines.iter().position(|line| line.starts_with("> cd ~/")) else {
+                return false;
+            };
+            let mut panel = lines.iter().skip(input.saturating_add(1));
+            screen.has_completed_frame()
+                && panel
+                    .clone()
+                    .any(|line| line.contains("HOME_UPDATED_CHILD/"))
+                && !panel.any(|line| line.contains("Projects/"))
+        })?;
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("changed HOME child accepted without execution", |screen| {
+            screen.has_completed_frame()
+                && screen
+                    .lines()
+                    .iter()
+                    .any(|line| line.trim() == "> cd ~/HOME_UPDATED_CHILD/")
+        })?;
+    session.pty.send(key::ESCAPE)?;
+    wait_for_standard_status(session)?;
+    let execution_start = session.pty.output().len();
+    session.pty.send(key::ENTER)?;
+    wait_for_rich_input_since(session, execution_start)?;
+    check_navigation_pwd(session, &child)
+}
+
+fn check_navigation_pwd(session: &mut Session, expected: &Path) -> Result<(), TaskError> {
+    execute_and_resume(session, "pwd")?;
+    session
+        .pty
+        .wait_for_screen("pwd reports the chosen directory", |screen| {
+            screen.has_completed_frame()
+                && screen.lines().iter().any(|line| {
+                    // The transcript scrollbar occupies the last column; it is
+                    // not part of this fixture's controlled absolute path.
+                    line.trim_end_matches([' ', '#', '|']) == expected.to_string_lossy()
+                })
+        })?;
+    Ok(())
+}
+
+fn wait_navigation_completion(
+    session: &mut Session,
+    editor: &str,
+    child: &str,
+) -> Result<(), TaskError> {
+    session.pty.wait_for_screen(
+        "directory children below input preserve recent output",
+        |screen| {
+            let lines = screen.lines();
+            let input = lines.iter().position(|line| line.trim() == editor);
+            let item = lines
+                .iter()
+                .position(|line| line.contains(child) && line.trim() != editor);
+            let recent = lines
+                .iter()
+                .position(|line| line.split_whitespace().next() == Some("NAV_RECENT_30"));
+            screen.has_completed_frame()
+                && input.zip(item).is_some_and(|(input, item)| input < item)
+                && recent
+                    .zip(input)
+                    .is_some_and(|(recent, input)| recent < input)
+                && lines
+                    .iter()
+                    .any(|line| line.split_whitespace().next() == Some("NAV_RECENT_29"))
+        },
+    )?;
+    Ok(())
+}
+
+fn check_navigation_file_acceptance(session: &mut Session) -> Result<(), TaskError> {
+    session.pty.type_text("cat ./notes")?;
+    session
+        .pty
+        .wait_for_screen("automatic file candidate with spaces", |screen| {
+            screen.has_completed_frame()
+                && screen
+                    .lines()
+                    .iter()
+                    .any(|line| line.trim() == "> cat ./notes")
+                && screen.text().contains("notes space.txt")
+        })?;
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("file acceptance preserves an escaped argument", |screen| {
+            screen.has_completed_frame()
+                && screen
+                    .lines()
+                    .iter()
+                    .any(|line| line.trim() == r"> cat ./notes\ space.txt")
+        })?;
+    let execution_start = session.pty.output().len();
+    session.pty.send(key::ENTER)?;
+    wait_for_rich_input_since(session, execution_start)?;
+    session
+        .pty
+        .wait_for_screen("accepted file executes exactly", |screen| {
+            screen.has_completed_frame()
+                && screen
+                    .lines()
+                    .iter()
+                    .any(|line| line.split_whitespace().next() == Some("NAVIGATION_FILE_CONFIRMED"))
+        })?;
+    Ok(())
+}
+
 fn check_completion(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(binary, SessionOptions::default())?;
     let path_target = session.private.path.join("path-target");
@@ -2162,6 +2383,21 @@ fn execute_cwd_history_command(session: &mut Session, command: &str) -> Result<(
         .wait_for_screen("complete cwd-history command in editor", |screen| {
             screen.lines().iter().any(|line| line == &editor_line)
         })?;
+    if command.starts_with("cd ") {
+        // This fixture owns an existing absolute directory. Make the popup
+        // observable before dismissing it so an older standard footer cannot
+        // satisfy the execution-intent handshake during cold admission.
+        session.pty.send(b"\t")?;
+        session.pty.wait_for_screen(
+            "chosen cwd directory is available for acceptance",
+            |screen| {
+                screen.has_completed_frame()
+                    && screen.bottom_line().contains("Enter accept")
+                    && screen.lines().iter().any(|line| line == &editor_line)
+            },
+        )?;
+    }
+    dismiss_directory_navigation_for_execution(session, command)?;
     session.pty.send(key::ENTER)?;
     let command_record = format!("❯ {command}");
     session

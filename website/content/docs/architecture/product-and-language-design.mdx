@@ -898,7 +898,11 @@ evidence required for that decision; they are not a current task list:
   confidence recorded, and the index can explain every fact's source.
 - **C1 core with evidence.** On Unix, the quote-aware command IR supports
   lists, standard-descriptor redirects, here-strings, bounded command
-  substitution, parameter/arithmetic expansion, and pathname expansion. The
+  substitution, parameter/arithmetic expansion, and pathname expansion.
+  Post-0.2.0 Unix source also expands leading unquoted `~` and `~/` from the
+  session `HOME`, retaining its bytes literally within the existing expansion
+  budget. Quoted or escaped tildes and named-user forms remain literal; a missing
+  or invalid home produces an actionable error. The
   matrix records exact Bash/Zsh evidence; here-documents, process substitution,
   loops, functions, conditionals, and dialect control forms remain explicit
   bounded `bash { ... }` / `zsh { ... }` islands for 1.0 rather than an implied

@@ -76,6 +76,8 @@ pub struct SimpleCommand {
 ///
 /// Quote delimiters and escape backslashes are not retained; each part records
 /// how its text appeared so the process layer can decide which expansions apply.
+/// Empty quoted fragments are retained because their origin can suppress a
+/// leading tilde expansion even when they add no bytes to the word.
 pub struct Word {
     /// Contiguous fragments in source order.
     pub parts: Vec<WordPart>,
@@ -777,6 +779,7 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
     let mut word_start = None;
     let mut quote = None;
     let mut quote_open = None;
+    let mut quote_parts_start = 0;
     let mut parts = Vec::new();
     let mut fragment = String::new();
     let mut fragment_quoting = Quoting::Unquoted;
@@ -902,6 +905,14 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                 continue;
             }
             if character == active {
+                // Empty quotes still suppress leading tilde expansion. Keep
+                // their origin even though they contribute no argument bytes.
+                if fragment.is_empty() && parts.len() == quote_parts_start {
+                    parts.push(WordPart {
+                        text: String::new(),
+                        quoting,
+                    });
+                }
                 push_fragment(&mut parts, &mut fragment, fragment_quoting);
                 quote = None;
                 quote_open = None;
@@ -936,6 +947,7 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
         if matches!(character, '\'' | '"') {
             word_start.get_or_insert(index);
             push_fragment(&mut parts, &mut fragment, fragment_quoting);
+            quote_parts_start = parts.len();
             quote = Some(character);
             quote_open = Some(index);
             continue;
@@ -1704,6 +1716,27 @@ mod tests {
                 feature.id
             );
         }
+    }
+
+    #[test]
+    fn empty_quotes_preserve_the_origin_that_suppresses_home_expansion() {
+        for (source, quoting) in [
+            ("printf ''~/file", Quoting::Single),
+            ("printf \"\"~/file", Quoting::Double),
+        ] {
+            let graph = parse_command_list(source).unwrap();
+            let word = &graph.pipelines[0].commands[0].word_ir[1];
+            assert_eq!(word.text(), "~/file");
+            assert_eq!(word.parts[0].text, "");
+            assert_eq!(word.parts[0].quoting, quoting);
+            assert_eq!(word.parts[1].quoting, Quoting::Unquoted);
+        }
+        let graph = parse_command_list("printf ~\"\" \"\\\n\"~/file").unwrap();
+        assert_eq!(graph.pipelines[0].commands[0].word_ir[1].parts.len(), 2);
+        assert_eq!(
+            graph.pipelines[0].commands[0].word_ir[2].parts[0].quoting,
+            Quoting::Double
+        );
     }
 
     #[test]
