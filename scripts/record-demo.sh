@@ -1,10 +1,16 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 2 ]; then
-  echo "usage: scripts/record-demo.sh <release-binary> <expected-sha256>" >&2
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+  echo "usage: scripts/record-demo.sh <release-binary> <expected-sha256> [local-asset-manifest]" >&2
   echo "Build and measure the exact candidate before recording it." >&2
   exit 2
+fi
+
+if [ "$#" -eq 3 ]; then
+  demo_manifest_dir=$(CDPATH='' cd "$(dirname "$3")" && pwd -P)
+  QUIRL_DEMO_ASSET_MANIFEST=$demo_manifest_dir/$(basename "$3")
+  export QUIRL_DEMO_ASSET_MANIFEST
 fi
 
 demo_bin_input=$1

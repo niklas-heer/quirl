@@ -477,10 +477,18 @@ pub const PROMPT_FIRST_PAINT_BUDGET: Duration = Duration::from_millis(8);
 
 /// Return the active terminal width without emitting a terminal query.
 ///
-/// Crossterm uses the platform terminal API for this lookup. Callers should
-/// retain a conservative fallback for redirected or unusually limited output.
+/// This uses only the platform terminal API, never a subprocess fallback.
+/// Callers should retain a conservative fallback for redirected or unusually
+/// limited output.
 pub fn terminal_width() -> Option<u16> {
-    crossterm::terminal::size().ok().map(|(columns, _)| columns)
+    terminal_size().ok().map(|(columns, _)| columns)
+}
+
+/// Query dimensions without invoking Crossterm's external `tput` fallback.
+pub(crate) fn terminal_size() -> io::Result<(u16, u16)> {
+    // `size()` starts an unbounded subprocess when the platform lookup fails,
+    // including redirected output. Terminal rendering must remain process-free.
+    crossterm::terminal::window_size().map(|size| (size.columns, size.rows))
 }
 
 /// Whether conservative UI chrome may use broadly supported Unicode glyphs.

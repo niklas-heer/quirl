@@ -22,7 +22,7 @@ pub enum SurfaceKind {
 pub fn select_surface(requested: &str) -> SurfaceKind {
     let stderr_is_terminal = std::io::stderr().is_terminal();
     let term_is_dumb = env::var("TERM").is_ok_and(|term| term.eq_ignore_ascii_case("dumb"));
-    let terminal_size = crossterm::terminal::size().ok();
+    let terminal_size = crate::terminal_size().ok();
     select_surface_for_capabilities(requested, stderr_is_terminal, term_is_dumb, terminal_size)
 }
 

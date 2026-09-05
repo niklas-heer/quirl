@@ -803,8 +803,13 @@ mod platform {
     const PROCESS_GROUP_ANCHOR_STATUS_EVENTS_PER_TURN_MAX: usize = 16;
     const PROCESS_GROUP_ANCHOR_PATH: &str = "/bin/sh";
     const PROCESS_GROUP_ANCHOR_READY: u8 = b'R';
+    // An owner can die without running Drop while its children occupy a
+    // different process group. EOF on the private keepalive then makes the
+    // still-live anchor kill its own group before releasing that identity.
+    // The shell builtin's group zero also handles anchors that joined a group
+    // led by another process; no released numeric PID is addressed.
     const PROCESS_GROUP_ANCHOR_SCRIPT: &str =
-        "trap '' HUP INT QUIT TERM TTIN TTOU; trap - TSTP; printf R; IFS= read -r _";
+        "trap '' HUP INT QUIT TERM TTIN TTOU; trap - TSTP; printf R; IFS= read -r _; kill -KILL 0";
     const PROCESS_GROUP_LEADER_STAGE_SCRIPT: &str =
         "command -v \"$1\" >/dev/null 2>&1 || exit 127; kill -STOP $$; exec \"$@\"";
 
@@ -877,6 +882,8 @@ mod platform {
         ///
         /// The anchor adds one direct child and fails if absolute `/bin/sh`
         /// cannot complete its bounded readiness handshake.
+        /// If the owner exits without cleanup, closing its private keepalive
+        /// pipe makes the anchor terminate the group before exiting itself.
         pub fn new() -> Result<Self, ShellError> {
             let anchor = ProcessGroupAnchor::spawn()?;
             Ok(Self {
@@ -6311,6 +6318,73 @@ mod platform {
         }
 
         #[test]
+        fn keepalive_eof_terminates_a_contained_probe_group() {
+            use std::os::unix::process::ExitStatusExt;
+
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "exec sleep 30"]);
+            let mut child = crate::ContainedChild::spawn(&mut command).unwrap();
+            assert!(child.try_wait().unwrap().is_none());
+            // Closing the sole writer reproduces the kernel's action when
+            // the owner dies without running Rust destructors. Keep the RAII
+            // owner here so a regression still cleans up the fixture.
+            {
+                let mut state = child.containment.state.lock().unwrap();
+                match &mut *state {
+                    ContainedProcessGroup::Assigned(anchor) => {
+                        drop(anchor.keepalive.take());
+                    }
+                    _ => panic!("contained child must own an assigned anchor"),
+                }
+            }
+            let deadline = Instant::now().checked_add(Duration::from_secs(5)).unwrap();
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(status.and_then(|status| status.signal()), Some(9));
+        }
+
+        #[test]
+        fn keepalive_eof_terminates_every_stage_of_a_joined_pipeline_group() {
+            let mut guard = PipelineConstructionGuard::new();
+            spawn_test_pipeline_stage(&mut guard, "exec sleep 30");
+            spawn_test_pipeline_stage(&mut guard, "exec sleep 30");
+            let anchor = guard.process_group_anchor.as_mut().unwrap();
+            assert_ne!(
+                i32::try_from(anchor.child.id()).unwrap(),
+                anchor.process_group()
+            );
+            // An anchor joining an existing group must target that group,
+            // rather than assuming its own PID is the process-group ID.
+            drop(anchor.keepalive.take());
+            let deadline = Instant::now().checked_add(Duration::from_secs(5)).unwrap();
+            loop {
+                for child in &mut guard.children {
+                    poll_child(child);
+                }
+                if guard
+                    .children
+                    .iter()
+                    .all(|child| child.status == JobStatus::Done)
+                    || Instant::now() >= deadline
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            for child in &guard.children {
+                assert_eq!(child.status, JobStatus::Done);
+                assert_eq!(child.exit_status, Some(137));
+            }
+        }
+
+        #[test]
         fn anchor_spawn_and_readiness_failures_return_without_partial_ownership() {
             let missing = ProcessGroupAnchor::spawn_with(
                 "/definitely/missing/quirl-process-group-anchor",
@@ -7853,6 +7927,8 @@ pub use platform::{ChildProcessTree, JobState, JobStatus, NativeExecutor};
 /// Construction establishes containment before returning. Every drop path
 /// terminates the contained tree and reaps the direct child, including callers
 /// that fail while taking pipes or starting protocol readers.
+/// On Unix, an independently running group anchor also terminates the group
+/// when owner-process death closes its private keepalive pipe.
 pub struct ContainedChild {
     containment: ChildProcessTree,
     child: std::process::Child,

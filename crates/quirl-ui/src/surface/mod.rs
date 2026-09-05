@@ -994,7 +994,7 @@ impl RichSurface {
         let theme = self.theme.with_color(color);
         let context_left = prompt.surface_context_left();
         let context_right = prompt.surface_context_right();
-        let (terminal_width, terminal_height) = terminal::size().unwrap_or((80, 24));
+        let (terminal_width, terminal_height) = crate::terminal_size().unwrap_or((80, 24));
         let model = FrameModel {
             context_left: &context_left,
             context_right: &context_right,
@@ -1401,7 +1401,7 @@ impl RichSurface {
                 dirty = true;
             }
             if dirty {
-                let (terminal_width, terminal_height) = terminal::size().unwrap_or((80, 24));
+                let (terminal_width, terminal_height) = crate::terminal_size().unwrap_or((80, 24));
                 if self.catalog.is_some() {
                     self.input_analysis
                         .ensure(editor.revision(), editor.buffer(), prompt.mode);
@@ -2220,7 +2220,7 @@ impl RichSurface {
     }
 
     fn transcript_visible_rows(&self) -> usize {
-        let rows = terminal::size().map_or(24, |(_, rows)| rows);
+        let rows = crate::terminal_size().map_or(24, |(_, rows)| rows);
         transcript_visible_rows_for_terminal(rows, self.transcript.follows_tail())
     }
 
@@ -3056,7 +3056,8 @@ impl SurfaceTerminal {
             }
             return Ok(());
         }
-        let size = terminal::size().map_err(terminal_error("measure the interactive terminal"))?;
+        let size =
+            crate::terminal_size().map_err(terminal_error("measure the interactive terminal"))?;
         validate_rich_terminal_size(size)?;
         terminal::enable_raw_mode().map_err(terminal_error("enable terminal raw mode"))?;
         self.active = true;
@@ -3209,7 +3210,8 @@ impl SurfaceTerminal {
     /// no read from the terminal at all, so use it here and for the
     /// full-screen takeover resume path instead.
     fn force_repaint(&mut self) -> Result<(), ShellError> {
-        let size = terminal::size().map_err(terminal_error("measure the terminal for repaint"))?;
+        let size =
+            crate::terminal_size().map_err(terminal_error("measure the terminal for repaint"))?;
         if let Some(terminal) = self.terminal.as_mut() {
             terminal
                 .resize(Rect::new(0, 0, size.0, size.1))
@@ -3227,7 +3229,7 @@ impl SurfaceTerminal {
         selection: Option<ScreenSelection>,
         selection_style: Style,
     ) -> Result<VisibleScreen, ShellError> {
-        let size = match terminal::size() {
+        let size = match crate::terminal_size() {
             Ok(size) => size,
             Err(error) => {
                 self.reset_best_effort();
@@ -3348,7 +3350,7 @@ impl SurfaceTerminal {
             // here would strand the session with no way back to a prompt.
             // `resize` clears the same viewport through already-known size
             // and local cursor-set/erase calls only, with no read at all.
-            if let Ok(size) = terminal::size() {
+            if let Ok(size) = crate::terminal_size() {
                 let _ = terminal.resize(Rect::new(0, 0, size.0, size.1));
             }
             let _ = terminal.show_cursor();

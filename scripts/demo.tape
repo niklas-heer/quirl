@@ -7,6 +7,7 @@ Output website/public/quirl-demo.webm
 Require bash
 
 Set Shell "bash"
+Set WaitTimeout 370s
 Set FontFamily "JetBrainsMono Nerd Font"
 Set FontSize 18
 Set Width 1200
@@ -26,6 +27,7 @@ Type `scripts/demo-session.sh --nerd-font --ai-ready "$QUIRL_DEMO_BIN"`
 Enter
 Wait+Screen /v[0-9]+\.[0-9]+\.[0-9]+/
 Wait+Screen /Alt-Q Quirl/
+Set WaitTimeout 40s
 
 # Open on a brand card instead of an empty prompt.
 Type "./tour intro"
@@ -98,9 +100,18 @@ Ctrl+L
 Type "mode normal"
 Enter
 Wait+Screen /NORMAL/
+# Rebuild only after real startup discovery; the helper fails instead of
+# presenting stale lexical results as semantic search. Its output stays hidden.
+Type "./prepare-search"
+Enter
+Wait+Screen /DEMO_HYBRID_READY/
 Show
+Type "# discover candidates · review suggestions before choosing"
+Sleep 2s
+Ctrl+U
 Type `quirl ai search "copy a directory while preserving permissions" --limit 3`
 Enter
+Wait+Screen /hybrid/
 Sleep 6s
 
 # Full Bash compatibility stays explicit and visible.

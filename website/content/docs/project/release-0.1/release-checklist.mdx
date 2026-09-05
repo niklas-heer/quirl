@@ -283,6 +283,28 @@ timing, but every visible frame must still come from a real invocation of the
 candidate binary. A missing recording prerequisite is a preflight failure, not
 permission to substitute fabricated terminal output.
 
+The local-search scene installs native command facts using the existing verified
+runtime-asset updater, then builds embeddings from the pinned local model. By
+default the updater uses the published release manifest. For an unpublished
+candidate or offline recording, pass a local manifest containing both required
+assets and local `file://` URLs as the optional third argument. The text tour
+accepts the same manifest through `QUIRL_DEMO_ASSET_MANIFEST`:
+
+```sh
+scripts/record-demo.sh target/release/quirl "$QUIRL_EXPECTED_SHA256" /absolute/path/runtime-assets.json
+```
+
+AI preparation also requires GNU `timeout` (`gtimeout` on macOS). Its three setup
+phases each have a 120-second limit and two-second termination grace. After real
+interactive discovery, the tape runs the private `./prepare-search` helper with
+one 30-second limit. It first waits for a harmless private PATH executable to
+appear in `index explain`, proving discovery published, then rebuilds the current
+index and checks both semantic readiness and actual hybrid retrieval. Failure stops the take; it must not be
+replaced with lexical output labeled as semantic search. Suggestions are
+candidates for human review, not verified executable plans or evidence that
+model rankings are always correct. The recording remains a real PTY capture,
+not physical-terminal testing.
+
 Recommended shot list:
 
 1. Start the exact release binary and show that `auto` selected the inline

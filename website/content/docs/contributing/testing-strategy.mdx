@@ -105,6 +105,10 @@ count, and fails the evidence gate rather than reporting the remaining samples
 as successful. Stage and sample progress go to stderr so a stalled runner can
 be diagnosed independently of the final JSON report.
 
+Terminal dimension queries use the platform API directly. An unavailable
+terminal retains the caller's conservative fallback or operating error; it must
+not start an external `tput` process, including during redirected prompt probes.
+
 ## Layers
 
 | Layer | What it proves | Typical evidence |

@@ -66,6 +66,16 @@ which versions are published.
   stop sampling and leave the evidence gate failed.
   Failed measurements preserve the exact packaged executable for investigation
   while continuing to block aggregation and publication.
+- Terminal dimension queries use the native platform API directly. Redirected
+  or unavailable terminals no longer trigger an external `tput` fallback during
+  prompt rendering or surface selection.
+- Contained subprocess groups terminate when their owner's keepalive pipe
+  closes, including abrupt shell termination. Background probes and joined
+  pipeline stages no longer depend on the parent reaching Rust cleanup.
+- The recording recipe installs verified native command assets and waits for
+  interactive discovery before rebuilding the local search index. Its search
+  scene requires actual hybrid retrieval and presents suggestions as candidates
+  for review.
 - Background catalog lock contention preserves queued refresh generations and
   local completion requests. A bounded, cancellable retry replaces the lost
   work and minute-long delay caused by treating contention as completion.
