@@ -90,6 +90,32 @@ jobs:
           --target "$RELEASE_TARGET"
           --output "${{ runner.temp }}/package"
 
+      - name: Measure the exact native release artifact
+        env:
+          RELEASE_TARGET: ${{ matrix.target }}
+          EVIDENCE_PATH: ${{ runner.temp }}/release-performance.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target "$RELEASE_TARGET" -p quirl-bench
+          binary="target/$RELEASE_TARGET/release/quirl"
+          if command -v sha256sum >/dev/null 2>&1; then
+            digest=$(sha256sum "$binary" | awk '{print $1}')
+          else
+            digest=$(shasum -a 256 "$binary" | awk '{print $1}')
+          fi
+          "target/$RELEASE_TARGET/release/quirl-bench" release \
+            --quirl "$binary" --expected-sha256 "$digest" --json > "$EVIDENCE_PATH"
+
+      - name: Preserve native performance evidence even on a budget failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: performance-${{ matrix.target }}
+          path: ${{ runner.temp }}/release-performance.json
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Preserve the candidate package
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

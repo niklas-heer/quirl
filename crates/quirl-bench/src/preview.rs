@@ -31,7 +31,7 @@ const MINIMUM_ACCEPTED_PTY_SAMPLES: usize = 20;
 // The ideal and soft cap are advisory; the hard ceiling is an enforcing gate.
 const BINARY_IDEAL_BYTES: u64 = 5 * 1024 * 1024;
 const BINARY_SOFT_CAP_BYTES: u64 = 8 * 1024 * 1024;
-const BINARY_HARD_CEILING_BYTES: u64 = 10 * 1024 * 1024;
+const BINARY_HARD_CEILING_BYTES: u64 = 12 * 1024 * 1024;
 const _: () = assert!(BINARY_IDEAL_BYTES < BINARY_SOFT_CAP_BYTES);
 const _: () = assert!(BINARY_SOFT_CAP_BYTES < BINARY_HARD_CEILING_BYTES);
 const COLD_START_TARGET_MS: f64 = 25.0;
@@ -472,12 +472,12 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
         environment,
         methodology: Methodology {
             percentile_method: "nearest-rank over independently timed wall-clock samples",
-            pty_end_to_end: "Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with a short input marker, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
+            pty_end_to_end: "The PTY suite uses a private initially empty home, configuration, history, catalog, project database, and XDG directories, shared across its samples; project discovery remains enabled. Explicit Rustup/Cargo homes preserve inherited toolchain lookup, and Quirl environment overrides/test hooks are cleared. Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with a short input marker, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
             cold_start: "Starts a new Quirl process for every sample and waits for `quirl --version` to exit. This measures process creation, dynamic loading, and CLI argument parsing, not cold-to-editable startup. OS filesystem caches are not flushed.",
             headless_edit_frame: "Calls Quirl's real CatalogCompleter and Prompt render methods, plus a benchmark-owned equivalent of the current semantic token classification, for `git commit --am`. No Reedline layout or terminal I/O occurs.",
             first_prompt: "Constructs a fresh configured QuirlPrompt and renders left, right, and indicator strings for every sample. Filesystem metadata may be served from OS cache. No terminal I/O occurs.",
             stream_window: "Pushes a fixed-size typed sample sequence through Quirl's production LiveBuffer at capacities 1, 16, and 256, then verifies retained and dropped counts and records serialized snapshot bytes. This proves retention is bounded by window size for bounded records; it is not a producer-backpressure or allocator-RSS measurement.",
-            binary_size: "Copies the executable passed with `--quirl` into a private read-only staging directory, verifies its SHA-256 when enforcing the release gate, then measures that exact staged executable. Binary units are MiB (1 MiB = 1,048,576 bytes): 5 MiB is ideal, more than 8 MiB warns, and more than 10 MiB fails the hard gate. `--max-binary-bytes` may impose a stricter hard limit but cannot relax the 10 MiB project ceiling.",
+            binary_size: "Copies the executable passed with `--quirl` into a private read-only staging directory, verifies its SHA-256 when enforcing the release gate, then measures that exact staged executable. Binary units are MiB (1 MiB = 1,048,576 bytes): 5 MiB is ideal, more than 8 MiB warns, and more than 12 MiB fails the hard gate. `--max-binary-bytes` may impose a stricter hard limit but cannot relax the 12 MiB project ceiling.",
             limitations: vec![
                 "A completed frame means the expected screen state was reconstructed from the PTY byte stream; physical terminal-emulator scheduling, GPU composition, and monitor scanout are not measured.",
                 "The UI highlighter is private; the edit proxy reproduces its command/option/quote classification but not StyledText allocation or rendering.",
@@ -648,22 +648,62 @@ struct PtyFixture {
 
 impl PtyFixture {
     fn create() -> Result<Self, Box<dyn Error>> {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let root =
-            env::temp_dir().join(format!("quirl-preview-pty-{}-{nonce}", std::process::id()));
-        let config_dir = root.join("config");
-        fs::create_dir_all(&config_dir)?;
-        // macOS exposes /var as a symlink to /private/var. Canonicalizing once
-        // prevents Quirl's no-symlink database admission from rejecting the
-        // benchmark's own otherwise-private fixture path.
-        let root = fs::canonicalize(root)?;
-        let config_dir = root.join("config");
-        Ok(Self {
-            history: root.join("history"),
-            index: root.join("catalog.json"),
-            root,
-            config_dir,
-        })
+        // Own cleanup before initializing children so partial setup cannot leave
+        // fixture state behind. Canonical paths avoid macOS /var symlink admission.
+        let mut fixture = Self {
+            root: create_staging_directory()?,
+            config_dir: PathBuf::new(),
+            history: PathBuf::new(),
+            index: PathBuf::new(),
+        };
+        fixture.root = fs::canonicalize(&fixture.root)?;
+        fixture.config_dir = fixture.root.join("config");
+        fixture.history = fixture.root.join("history");
+        fixture.index = fixture.root.join("catalog.json");
+        for name in ["config", "home", "data", "cache", "state", "runtime"] {
+            let directory = fixture.root.join(name);
+            fs::create_dir(&directory)?;
+            make_staging_directory_private(&directory)?;
+        }
+        Ok(fixture)
+    }
+
+    fn configure_environment(&self, command: &mut CommandBuilder) {
+        // Project discovery must remain enabled without scanning the operator's
+        // home or sharing a warmed database. Preserve toolchain lookup before
+        // replacing HOME; do not mutate the harness's own metadata environment.
+        if let Some(home) = command.get_env("HOME").map(PathBuf::from) {
+            for (key, directory) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
+                if command.get_env(key).is_none_or(|value| value.is_empty()) {
+                    command.env(key, home.join(directory));
+                }
+            }
+        }
+        // Inspect inherited names separately: a non-UTF-8 override value must
+        // not evade removal through CommandBuilder's string-only iterator.
+        let overrides = env::vars_os()
+            .map(|(key, _)| key)
+            .chain(command.iter_extra_env_as_str().map(|(key, _)| key.into()))
+            .filter(|key| key.to_str().is_some_and(|key| key.starts_with("QUIRL_")))
+            .collect::<Vec<_>>();
+        for key in overrides {
+            command.env_remove(key);
+        }
+        for (key, directory) in [
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_RUNTIME_DIR", "runtime"),
+        ] {
+            command.env(key, self.root.join(directory));
+        }
+        command.env("QUIRL_CONFIG_DIR", &self.config_dir);
+        command.env("QUIRL_HISTORY", &self.history);
+        command.env("QUIRL_HISTORY_DB", self.root.join("history.sqlite3"));
+        command.env("QUIRL_INDEX_PATH", &self.index);
+        command.env("QUIRL_PROJECTS_DB", self.root.join("projects.sqlite3"));
     }
 }
 
@@ -697,9 +737,7 @@ impl PtySession {
             },
         );
         command.env_remove("NO_COLOR");
-        command.env("QUIRL_CONFIG_DIR", &fixture.config_dir);
-        command.env("QUIRL_HISTORY", &fixture.history);
-        command.env("QUIRL_INDEX_PATH", &fixture.index);
+        fixture.configure_environment(&mut command);
         command.cwd(env::current_dir()?);
 
         let child = pair.slave.spawn_command(command)?;
@@ -1181,7 +1219,7 @@ fn binary_size_measurement(bytes: Option<u64>, enforced_limit_bytes: u64) -> Bin
         hard_gate_passed,
         release_gate_accepted: hard_gate_passed,
         warning,
-        explanation: "Binary units are MiB (1 MiB = 1,048,576 bytes). At or below 5 MiB is ideal; more than 8 MiB emits a warning; more than 10 MiB fails the release gate.",
+        explanation: "Binary units are MiB (1 MiB = 1,048,576 bytes). At or below 5 MiB is ideal; more than 8 MiB emits a warning; more than 12 MiB fails the release gate.",
     }
 }
 
@@ -1425,7 +1463,7 @@ fn binary_limit_argument() -> Result<u64, Box<dyn Error>> {
 fn validate_binary_limit(bytes: u64) -> Result<u64, String> {
     if bytes > BINARY_HARD_CEILING_BYTES {
         return Err(format!(
-            "--max-binary-bytes cannot exceed the project hard ceiling of {BINARY_HARD_CEILING_BYTES} bytes (10 MiB)"
+            "--max-binary-bytes cannot exceed the project hard ceiling of {BINARY_HARD_CEILING_BYTES} bytes (12 MiB)"
         ));
     }
     Ok(bytes)
@@ -1888,6 +1926,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pty_fixture_isolates_user_state_and_preserves_default_toolchain_paths() {
+        let parent_home = env::var_os("HOME");
+        let fixture = PtyFixture::create().unwrap();
+        let root = fixture.root.clone();
+        let mut command = CommandBuilder::new("quirl");
+        command.env_clear();
+        command.env("HOME", "/operator");
+        command.env("QUIRL_PROJECTS_DB", "/operator/projects.sqlite3");
+        command.env("QUIRL_HISTORY_DB", "/operator/history.sqlite3");
+        command.env("QUIRL_MODEL_PATH", "/operator/model");
+        command.env("QUIRL_TEST_CATALOG_GATE", "/operator/gate");
+        command.env("QUIRL_TEST_AI_BOOTSTRAP_DISABLED", "1");
+        fixture.configure_environment(&mut command);
+        assert_eq!(
+            command.get_env("CARGO_HOME"),
+            Some(Path::new("/operator/.cargo").as_os_str())
+        );
+        assert_eq!(
+            command.get_env("RUSTUP_HOME"),
+            Some(Path::new("/operator/.rustup").as_os_str())
+        );
+        for (key, relative) in [
+            ("HOME", "home"),
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_STATE_HOME", "state"),
+            ("XDG_RUNTIME_DIR", "runtime"),
+            ("QUIRL_PROJECTS_DB", "projects.sqlite3"),
+            ("QUIRL_HISTORY_DB", "history.sqlite3"),
+        ] {
+            assert_eq!(
+                command.get_env(key),
+                Some(root.join(relative).as_os_str()),
+                "{key}"
+            );
+        }
+        assert!(command.get_env("QUIRL_MODEL_PATH").is_none());
+        assert!(command.get_env("QUIRL_TEST_CATALOG_GATE").is_none());
+        assert!(
+            command
+                .get_env("QUIRL_TEST_AI_BOOTSTRAP_DISABLED")
+                .is_none()
+        );
+        assert_eq!(fs::read_dir(root.join("home")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&fixture.config_dir).unwrap().count(), 0);
+        assert_eq!(env::var_os("HOME"), parent_home);
+        fs::write(root.join("projects.sqlite3"), b"fixture state").unwrap();
+        drop(fixture);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn pty_fixture_preserves_explicit_toolchain_homes() {
+        let fixture = PtyFixture::create().unwrap();
+        let mut command = CommandBuilder::new("quirl");
+        command.env_clear();
+        command.env("HOME", "/operator");
+        command.env("CARGO_HOME", "/custom/cargo");
+        command.env("RUSTUP_HOME", "/custom/rustup");
+        fixture.configure_environment(&mut command);
+        assert_eq!(
+            command.get_env("CARGO_HOME"),
+            Some(Path::new("/custom/cargo").as_os_str())
+        );
+        assert_eq!(
+            command.get_env("RUSTUP_HOME"),
+            Some(Path::new("/custom/rustup").as_os_str())
+        );
+    }
+
+    #[test]
     fn nearest_rank_uses_sorted_sample_distribution() {
         let samples = (1..=100).map(Duration::from_millis).collect::<Vec<_>>();
         assert_eq!(nearest_rank(&samples, 50), Duration::from_millis(50));
@@ -1971,6 +2081,8 @@ mod tests {
 
     #[test]
     fn binary_size_policy_enforces_every_exact_boundary() {
+        // ADR 0034 fixes this externally reviewed policy in binary bytes.
+        assert_eq!(BINARY_HARD_CEILING_BYTES, 12_582_912);
         let ideal = binary_size_measurement(Some(BINARY_IDEAL_BYTES), BINARY_HARD_CEILING_BYTES);
         assert_eq!(ideal.policy_result, "within_ideal");
         assert!(ideal.warning.is_none());
@@ -2032,7 +2144,7 @@ mod tests {
         );
         let error = validate_binary_limit(BINARY_HARD_CEILING_BYTES + 1).unwrap_err();
         assert!(error.contains("cannot exceed"));
-        assert!(error.contains("10 MiB"));
+        assert!(error.contains("12 MiB"));
     }
 
     #[test]

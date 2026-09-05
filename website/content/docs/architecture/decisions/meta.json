@@ -23,6 +23,7 @@
     "0030-bounded-project-discovery",
     "0031-level-triggered-terminal-input",
     "0032-bounded-terminal-input",
-    "0033-bounded-simple-editor"
+    "0033-bounded-simple-editor",
+    "0034-release-binary-budget"
   ]
 }

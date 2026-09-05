@@ -59,7 +59,23 @@ rather than replace, real terminal checks on supported hardware.
 The workspace Cargo configuration omits unused full-text and spatial modules
 from bundled SQLite. Quirl's internal catalog, history, and intelligence stores
 use ordinary tables. Keep those build settings when reproducing release-size
-measurements; the binary's 10 MiB hard ceiling remains unchanged.
+measurements. The binary's 12 MiB hard ceiling is recorded in
+[ADR 0034](/docs/architecture/decisions/0034-release-binary-budget); historical measurements retain
+the ceiling used for their named artifact.
+
+The local-completion-discovery PTY fixture opts into a fixed five-second
+provider budget through `QUIRL_TEST_LOCAL_PROVIDER_PERSISTENCE`. This isolates
+its metadata-persistence assertions from host scheduling, including when the
+harness selects an optimized artifact. The ordinary provider budget remains
+400 ms, the fixture cannot extend the enclosing refresh deadline, and separate
+deadline and cancellation tests continue to prove child cleanup.
+
+The durable-discovery fixture opts into `QUIRL_TEST_CATALOG_PUBLICATIONS` in a
+private temporary directory. It waits for a bounded marker naming the exact
+published catalog fingerprint before submitting the next command. A visible
+database replacement alone does not prove the worker has notified the editor.
+This handshake tests adoption between editor turns without input retries or
+changing the normal session's refresh behavior.
 
 ## Layers
 

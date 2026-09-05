@@ -22,6 +22,7 @@ use nix::{
     },
     unistd::Pid,
 };
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     env,
@@ -107,6 +108,8 @@ struct SessionOptions {
     ai_bootstrap_fake: bool,
     catalog_force_timeout: bool,
     catalog_refresh_enabled: bool,
+    local_provider_persistence: bool,
+    catalog_publications: bool,
     fish_completion: Option<String>,
 }
 
@@ -116,6 +119,7 @@ struct Session {
     private: TempDirectory,
     catalog_gate: PathBuf,
     catalog_gate_reached: PathBuf,
+    catalog_publications: PathBuf,
 }
 
 impl Session {
@@ -243,6 +247,14 @@ return quirl.config {{
             ),
         ]);
         let catalog_gate = private.path.join("catalog-admission.gate");
+        let catalog_publications = private.path.join("catalog-publications");
+        if options.catalog_publications {
+            create_private_directory(&catalog_publications)?;
+            environment.insert(
+                OsString::from("QUIRL_TEST_CATALOG_PUBLICATIONS"),
+                catalog_publications.clone().into_os_string(),
+            );
+        }
         let catalog_gate_reached = PathBuf::from(format!("{}.reached", catalog_gate.display()));
         if options.catalog_gate {
             environment.insert(
@@ -275,6 +287,12 @@ return quirl.config {{
         if !options.catalog_refresh_enabled {
             environment.insert(
                 OsString::from("QUIRL_TEST_CATALOG_REFRESH_DISABLED"),
+                OsString::from("1"),
+            );
+        }
+        if options.local_provider_persistence {
+            environment.insert(
+                OsString::from("QUIRL_TEST_LOCAL_PROVIDER_PERSISTENCE"),
                 OsString::from("1"),
             );
         }
@@ -322,6 +340,7 @@ return quirl.config {{
             private,
             catalog_gate,
             catalog_gate_reached,
+            catalog_publications,
         })
     }
 }
@@ -1650,6 +1669,7 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), TaskError> {
     wait_for_file_contents(&mut warm, &catalog_path, b"changed-path-tool")?;
     wait_for_file_contents(&mut warm, &catalog_path, b"changed-declaration")?;
     wait_for_file_contents(&mut warm, &catalog_path, b"changed-declaration.help")?;
+    wait_for_catalog_publication(&mut warm, &catalog_path)?;
     execute_and_resume(&mut warm, "cd .")?;
     wait_for_command_information(
         &mut warm,
@@ -2706,6 +2726,10 @@ fn check_local_completion_discovery(binary: &Path) -> Result<(), TaskError> {
     // Failure model: provider code is untrusted and editor revisions can repeat
     // while one background generation is running. Fake shells make invocation,
     // framing, and persistence deterministic without host rc files or binaries.
+    // A production 400 ms attempt may correctly expire before these fake shells
+    // are scheduled on a busy host. This functional fixture explicitly admits
+    // five seconds per provider, still capped by the owning refresh deadline;
+    // timeout/cancellation tests keep their production and adversarial budgets.
     let fixtures = TempDirectory::new("quirl-local-completion")?;
     let binary_dir = fixtures.path.join("bin");
     let index_dir = fixtures.path.join("index");
@@ -2727,6 +2751,7 @@ fn check_local_completion_discovery(binary: &Path) -> Result<(), TaskError> {
             index_dir: Some(index_dir.clone()),
             catalog_refresh_enabled: true,
             fish_completion: Some("# dynamic provider fixture\n".to_owned()),
+            local_provider_persistence: true,
             rows: Some(20),
             columns: Some(200),
             ..SessionOptions::default()
@@ -2743,6 +2768,7 @@ fn check_local_completion_discovery(binary: &Path) -> Result<(), TaskError> {
             .windows(b"\"local_providers\":".len())
             .position(|window| window == b"\"local_providers\":")
             .and_then(|start| database.get(start..start.saturating_add(2_048).min(database.len())))
+            .and_then(|bytes| bytes.split(|byte| *byte == 0).next())
             .map(String::from_utf8_lossy);
         return Err(io::Error::other(format!(
             "{error}; provider calls={calls:?}; database_has_ghq={} database_has_fish={} provider_state={provider_state:?}; screen=\n{}",
@@ -3341,11 +3367,35 @@ fn discovery_session(
             index_dir: Some(index_dir.to_path_buf()),
             help_path: Some(help_path.to_path_buf()),
             catalog_refresh_enabled: true,
+            catalog_publications: true,
             rows: Some(18),
             columns: Some(400),
             ..SessionOptions::default()
         },
     )
+}
+
+fn wait_for_catalog_publication(session: &mut Session, catalog: &Path) -> Result<(), TaskError> {
+    // Atomic disk visibility precedes the worker's editor-notification flag.
+    // Wait for this exact snapshot's post-notification marker before asking
+    // the next editor turn to adopt it; never send an extra retry command.
+    let bytes = read_bounded_fixture(catalog, DISCOVERY_ARTIFACT_BYTES_MAX)?;
+    let fingerprint = format!("{:x}", Sha256::digest(&bytes));
+    let marker = session.catalog_publications.join(fingerprint);
+    let started = Instant::now();
+    while started.elapsed() < default_timeout() {
+        if fs::symlink_metadata(&marker)
+            .is_ok_and(|metadata| metadata.file_type().is_file() && metadata.len() == 0)
+        {
+            return Ok(());
+        }
+        session.pty.drain_for(Duration::from_millis(20))?;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "catalog snapshot became visible before its editor notification marker",
+    )
+    .into())
 }
 
 fn wait_for_command_information(

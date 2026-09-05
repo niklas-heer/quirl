@@ -81,6 +81,19 @@ pub(crate) fn acquire(
     kind: CoordinationKind,
     wait: CoordinationWait,
 ) -> Result<Option<CoordinationGuard>, ShellError> {
+    acquire_with_retry_wait(target, kind, wait, thread::sleep)
+}
+
+// Keep admission, retries, and ownership transfer together: every failed OS
+// lock attempt must release its process reservation before another attempt.
+// Inject only the delay so tests can count the exact retry budget without
+// treating an overscheduled CI thread as a coordination failure.
+fn acquire_with_retry_wait(
+    target: &Path,
+    kind: CoordinationKind,
+    wait: CoordinationWait,
+    mut retry_wait: impl FnMut(Duration),
+) -> Result<Option<CoordinationGuard>, ShellError> {
     let lock_path = lock_path(target, kind)?;
     let file = open_lock_file(&lock_path, kind)?;
     validate_lock_file(&lock_path, &file, kind)?;
@@ -115,7 +128,7 @@ pub(crate) fn acquire(
             }
         }
         if attempt.saturating_add(1) < attempts_max {
-            thread::sleep(EXPLICIT_LOCK_RETRY_DELAY);
+            retry_wait(EXPLICIT_LOCK_RETRY_DELAY);
         }
     }
 
@@ -266,7 +279,6 @@ mod tests {
         panic::{AssertUnwindSafe, catch_unwind},
         process::{Command, Stdio},
         sync::atomic::{AtomicU64, Ordering},
-        time::Instant,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -357,23 +369,49 @@ mod tests {
     fn explicit_contention_has_a_fixed_attempt_bound() {
         let directory = TestDirectory::new("explicit-bound");
         let target = directory.0.join("catalog.sqlite3");
-        let _guard = acquire(
+        let guard = acquire(
             &target,
             CoordinationKind::Catalog,
             CoordinationWait::Background,
         )
         .unwrap()
         .unwrap();
-        let started = Instant::now();
-        let error = acquire(
+        let mut waits = 0;
+        let error = acquire_with_retry_wait(
             &target,
             CoordinationKind::Catalog,
             CoordinationWait::Explicit,
+            |delay| {
+                assert_eq!(delay, Duration::from_millis(20));
+                waits += 1;
+            },
         )
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(waits, 100);
         assert!(error.details.context[0].contains("attempt limit: 101"));
+        // Failed contention must preserve the active owner's reservation.
+        assert!(
+            acquire_with_retry_wait(
+                &target,
+                CoordinationKind::Catalog,
+                CoordinationWait::Background,
+                |_| panic!("background acquisition must not wait"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        drop(guard);
+        assert!(
+            acquire_with_retry_wait(
+                &target,
+                CoordinationKind::Catalog,
+                CoordinationWait::Explicit,
+                |_| panic!("uncontended acquisition must not wait"),
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[cfg(unix)]

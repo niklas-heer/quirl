@@ -842,7 +842,7 @@ The parser boundary preserves compatibility without leaking it into the value ru
 | Keystroke to frame | ≤8 ms P95 |
 | First prompt paint | ≤21 ms P95; slow segments refresh later |
 | Stream memory | `O(window)` unless explicitly collected |
-| Release binary | ≤5 MiB ideal; >8 MiB emits a warning; >10 MiB fails the release gate. One MiB is exactly 1,048,576 bytes |
+| Release binary | ≤5 MiB ideal; >8 MiB emits a warning; >12 MiB fails the release gate. One MiB is exactly 1,048,576 bytes |
 
 These are targets, not current benchmark claims. Each release records cold/warm startup, completion/render latency, pipeline throughput, peak memory, and binary size on named hardware.
 
@@ -999,7 +999,7 @@ and accessible text output, per the release criterion in §10.
   fresh processes for cold-to-editable P50, keystroke-to-frame P95, and first
   prompt P95; production live-buffer retention proves O(window), and the exact
   stripped release binary is classified against the 5 MiB ideal, warns above
-  the 8 MiB soft cap, and fails strictly above the 10 MiB hard ceiling.
+  the 8 MiB soft cap, and fails strictly above the 12 MiB hard ceiling.
 - **Security and accessibility claims are adversarial.** Bounds, symlink and
   path containment, capability smuggling, cancellation, hostile C0/C1 terminal
   text, JSON semantic preservation, `NO_COLOR`, `TERM=dumb`, plain fallbacks,

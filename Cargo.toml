@@ -75,6 +75,8 @@ mlua-sys = { path = "vendor/mlua-sys" }
 crossterm = { path = "vendor/crossterm" }
 # Bound simple-editor input/undo and escape source controls at rendering.
 reedline = { path = "vendor/reedline" }
+# Read tokenizer unknown-token metadata directly without serializing its full graph.
+model2vec-rs = { path = "vendor/model2vec-rs" }
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }
@@ -170,7 +172,7 @@ debug = true
 opt-level = "z"
 lto = "fat"
 strip = "symbols"
-# mlua converts host-callback panics into Lua errors via unwinding. abort
-# would terminate the shell instead of producing a ShellError.
+# mlua catches host-callback panics at its Lua boundary and resumes them in
+# Rust. Retain unwinding so Rust cleanup and panic propagation can complete.
 panic = "unwind"
 codegen-units = 1

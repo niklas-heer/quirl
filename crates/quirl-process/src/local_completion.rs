@@ -1784,6 +1784,11 @@ compdef _qtool qtool
 "#,
         );
         let mut request = request(LocalCompletionProvider::Zsh, shell.clone());
+        // This checks nested candidates and startup-file isolation, not latency.
+        // The real compinit scans the installed shell's function roots, whose
+        // size and filesystem latency vary across CI images. Keep a finite
+        // fixture budget separate from the hanging-provider deadline oracle.
+        request.deadline = Duration::from_secs(10);
         request.command_path = vec!["qtool".to_owned(), "remote".to_owned()];
         request.arguments = vec!["a".to_owned()];
         request.completion_roots = zsh_function_roots(&shell);

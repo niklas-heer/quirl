@@ -6311,6 +6311,59 @@ mod tests {
     }
 
     #[test]
+    fn rust_callback_panic_unwinds_cleanup_and_preserves_the_restricted_vm() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        struct DropCount(Arc<AtomicU64>);
+        impl Drop for DropCount {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+
+        // Release profiles must retain panic=unwind: mlua catches a callback
+        // panic at its C boundary and resumes it at the Rust caller. Neither
+        // that path nor the caller's RAII cleanup may become process aborts.
+        // This is a host panic, not a promised ShellError conversion.
+        let runtime = LuaRuntime::new(LuaPolicy::script()).unwrap();
+        let callback_drops = Arc::new(AtomicU64::new(0));
+        let caller_drops = Arc::new(AtomicU64::new(0));
+        let callback_counter = Arc::clone(&callback_drops);
+        let callback = runtime
+            .lua
+            .create_function(move |_, ()| -> mlua::Result<()> {
+                let _cleanup = DropCount(Arc::clone(&callback_counter));
+                panic!("intentional Lua host callback panic");
+            })
+            .unwrap();
+        runtime
+            .lua
+            .globals()
+            .set("panic_fixture", callback)
+            .unwrap();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _cleanup = DropCount(Arc::clone(&caller_drops));
+            runtime.eval("return panic_fixture()")
+        }))
+        .expect_err("mlua must resume the host panic at the Rust caller");
+
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"intentional Lua host callback panic")
+        );
+        assert_eq!(callback_drops.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(caller_drops.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(runtime.eval("return 6 * 7").unwrap(), serde_json::json!(42));
+        assert_eq!(
+            runtime
+                .eval("return io == nil and os == nil and debug == nil and package == nil")
+                .unwrap(),
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
     fn instruction_budget_stops_runaway_code() {
         let runtime = LuaRuntime::new(LuaPolicy {
             instruction_limit: HOOK_GRANULARITY,

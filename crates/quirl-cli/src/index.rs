@@ -13,6 +13,7 @@ use quirl_core::{
     escape_terminal_controls, replace_file_atomically,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env,
@@ -58,6 +59,7 @@ const INDEX_DIAGNOSTIC_ORIGIN_BYTES_MAX: usize = 1024;
 const INDEX_DIAGNOSTIC_MESSAGE_BYTES_MAX: usize = 512;
 const DISCOVERY_STATE_VERSION: u32 = 3;
 const DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const DISCOVERY_CONTENTION_BACKOFF: Duration = Duration::from_millis(100);
 const DISCOVERY_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
 const DISCOVERY_DEADLINE: Duration = Duration::from_millis(750);
 const BACKGROUND_DISCOVERY_DEADLINE: Duration = Duration::from_secs(30);
@@ -92,6 +94,8 @@ pub(crate) trait CatalogRefreshObserver: Send + Sync {
     fn refresh_started(&self);
     fn refresh_published(&self);
     fn refresh_unchanged(&self);
+    /// The requested work remains pending while another catalog writer owns the lock.
+    fn refresh_contended(&self) {}
     fn refresh_failed(&self, error: &ShellError);
 }
 
@@ -858,7 +862,7 @@ fn initialize_interactive_catalog_with_deadline(
         &cancelled,
         None,
     ) {
-        Ok(refreshed) => Ok(refreshed),
+        Ok(outcome) => Ok(outcome.was_published()),
         Err(discovery_error) => ensure_builtin_database(&config.index_path).map_err(|error| {
             error.with_context(format!(
                 "catalog discovery failed before fallback publication: {}",
@@ -930,19 +934,30 @@ impl DiscoveryConfig {
     }
 }
 
+// A nonblocking lock miss is not a completed refresh. Keep the admitted work
+// owned here until it runs or the session is cancelled: requeueing could lose
+// it when newer requests have filled the bounded queue. At most one 64-path
+// batch is in flight in addition to the existing 64-path request queue. Each
+// contended turn performs one lock attempt, then waits at least 100 ms unless
+// cancelled; a long-lived competing writer cannot cause a busy retry loop.
 fn refresh_loop(worker: CatalogRefreshWorker) {
     let mut completed_generation = 0_u64;
+    let mut pending = None;
     loop {
-        let work = match wait_for_refresh_request(
-            completed_generation,
-            &worker.cancelled,
-            &worker.requested_generation,
-            &worker.wake,
-            &worker.local_probes,
-            worker.refresh_interval,
-        ) {
-            Ok(Some(work)) => work,
-            Ok(None) | Err(_) => return,
+        let work = if let Some(work) = pending.take() {
+            work
+        } else {
+            match wait_for_refresh_request(
+                completed_generation,
+                &worker.cancelled,
+                &worker.requested_generation,
+                &worker.wake,
+                &worker.local_probes,
+                worker.refresh_interval,
+            ) {
+                Ok(Some(work)) => work,
+                Ok(None) | Err(_) => return,
+            }
         };
         let current = if worker.reload_environment {
             DiscoveryConfig::from_environment().unwrap_or_else(|| worker.config.clone())
@@ -965,11 +980,26 @@ fn refresh_loop(worker: CatalogRefreshWorker) {
             ),
         };
         match result {
-            Ok(true) => {
-                worker.changed.store(true, Ordering::Release);
-                worker.observer.refresh_published();
+            Ok(RefreshOutcome::Contended) => {
+                worker.observer.refresh_contended();
+                pending = Some(work);
+                match wait_after_catalog_contention(&worker.cancelled, &worker.wake) {
+                    Ok(true) => continue,
+                    Ok(false) => return,
+                    Err(error) => {
+                        worker.observer.refresh_failed(&error);
+                        return;
+                    }
+                }
             }
-            Ok(false) => worker.observer.refresh_unchanged(),
+            Ok(RefreshOutcome::Published(fingerprint)) => {
+                notify_refresh_publication(&worker.changed, worker.observer.as_ref(), || {
+                    fingerprint
+                        .as_ref()
+                        .map_or(Ok(()), record_fixture_publication)
+                });
+            }
+            Ok(RefreshOutcome::Unchanged) => worker.observer.refresh_unchanged(),
             Err(error) => worker.observer.refresh_failed(&error),
         }
         if worker.cancelled.load(Ordering::Acquire) {
@@ -978,6 +1008,170 @@ fn refresh_loop(worker: CatalogRefreshWorker) {
         if let RefreshWork::Full { generation } = work {
             completed_generation = generation;
         }
+    }
+}
+
+fn wait_after_catalog_contention(
+    cancelled: &AtomicBool,
+    wake: &(Mutex<()>, Condvar),
+) -> Result<bool, ShellError> {
+    let guard = wake.0.lock().map_err(|_| {
+        ShellError::new(
+            ErrorCode::Io,
+            "the catalog contention wait lock was poisoned",
+        )
+        .with_help("Restart Quirl to create a fresh catalog worker")
+    })?;
+    // Ordinary requests and spurious wakeups must not shorten the backoff.
+    // Condvar tracks the original timeout across wakeups; cancel() changes the
+    // predicate under this same lock and wakes the owner immediately.
+    let (_guard, _) = wake
+        .1
+        .wait_timeout_while(guard, DISCOVERY_CONTENTION_BACKOFF, |()| {
+            !cancelled.load(Ordering::Acquire)
+        })
+        .map_err(|_| {
+            ShellError::new(
+                ErrorCode::Io,
+                "the catalog contention wait lock was poisoned",
+            )
+            .with_help("Restart Quirl to create a fresh catalog worker")
+        })?;
+    Ok(!cancelled.load(Ordering::Acquire))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshOutcome {
+    Published(Option<[u8; 32]>),
+    Unchanged,
+    Contended,
+}
+
+impl RefreshOutcome {
+    fn was_published(self) -> bool {
+        matches!(self, Self::Published(_))
+    }
+
+    fn published(bytes: &[u8]) -> Self {
+        // Hash the committed snapshot itself, never a later pathname read.
+        // Ordinary sessions pay neither this scan nor marker filesystem work.
+        Self::Published(
+            env::var_os("QUIRL_TEST_CATALOG_PUBLICATIONS").map(|_| Sha256::digest(bytes).into()),
+        )
+    }
+}
+
+fn notify_refresh_publication(
+    changed: &AtomicBool,
+    observer: &dyn CatalogRefreshObserver,
+    record_fixture: impl FnOnce() -> Result<(), ShellError>,
+) {
+    // Disk replacement precedes this function, but disk visibility alone is
+    // not an editor adoption notification. The fixture marker is deliberately
+    // last so its reader can safely request the next editor-turn boundary.
+    changed.store(true, Ordering::Release);
+    observer.refresh_published();
+    if let Err(error) = record_fixture() {
+        observer.refresh_failed(&error);
+    }
+}
+
+fn record_fixture_publication(fingerprint: &[u8; 32]) -> Result<(), ShellError> {
+    let Some(directory) = env::var_os("QUIRL_TEST_CATALOG_PUBLICATIONS") else {
+        return Ok(());
+    };
+    write_fixture_publication(Path::new(&directory), fingerprint)
+}
+
+fn write_fixture_publication(directory: &Path, fingerprint: &[u8; 32]) -> Result<(), ShellError> {
+    const MARKERS_MAX: usize = 64;
+    ensure_index_limit(
+        "fixture publication path bytes",
+        4096,
+        directory.as_os_str().as_encoded_bytes().len(),
+    )?;
+    let metadata = fs::symlink_metadata(directory).map_err(|error| {
+        index_io_error("inspect fixture publication directory", directory, error)
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "fixture publication path is not a real directory",
+        )
+        .with_help("Use a fresh private fixture directory without symlinks"));
+    }
+    #[cfg(unix)]
+    if metadata.mode() & 0o077 != 0 {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "fixture publication directory is not private",
+        )
+        .with_help("Restrict the fixture directory to owner-only access"));
+    }
+    let mut name = String::with_capacity(64);
+    for byte in fingerprint {
+        // Formatting into a String is infallible.
+        let _ = std::fmt::Write::write_fmt(&mut name, format_args!("{byte:02x}"));
+    }
+    let path = directory.join(name);
+    if fixture_publication_exists(&path)? {
+        return Ok(());
+    }
+    let mut count: usize = 0;
+    for entry in fs::read_dir(directory)
+        .map_err(|error| index_io_error("read fixture publication directory", directory, error))?
+        .take(MARKERS_MAX + 1)
+    {
+        entry
+            .map_err(|error| index_io_error("read fixture publication entry", directory, error))?;
+        count = count.saturating_add(1);
+        ensure_index_limit(
+            "fixture publication markers",
+            MARKERS_MAX,
+            count.saturating_add(1),
+        )?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    // Empty-file creation is the complete marker transaction. There is no
+    // content write that can fail after publishing a partially written token.
+    let _file = options
+        .open(&path)
+        .map_err(|error| index_io_error("create fixture publication marker", &path, error))?;
+    Ok(())
+}
+
+fn fixture_publication_exists(path: &Path) -> Result<bool, ShellError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(index_io_error(
+                "inspect fixture publication marker",
+                path,
+                error,
+            ));
+        }
+    };
+    let mut valid = metadata.file_type().is_file() && metadata.len() == 0;
+    #[cfg(unix)]
+    {
+        valid &= metadata.nlink() == 1 && metadata.mode().trailing_zeros() >= 6;
+    }
+    if valid {
+        Ok(true)
+    } else {
+        Err(ShellError::new(
+            ErrorCode::Validation,
+            "fixture publication marker has an unsafe collision",
+        )
+        .with_help(
+            "Use a fresh private publication directory containing only empty regular markers",
+        ))
     }
 }
 
@@ -1049,11 +1243,11 @@ fn refresh_catalog_cache(
     deadline: RefreshDeadline,
     cancelled: &AtomicBool,
     local_cancelled: Option<Arc<AtomicBool>>,
-) -> Result<bool, ShellError> {
+) -> Result<RefreshOutcome, ShellError> {
     let Some(_coordination) =
         acquire_catalog_coordination(&config.index_path, CoordinationWait::Background)?
     else {
-        return Ok(false);
+        return Ok(RefreshOutcome::Contended);
     };
     let mut budget = IndexBuildBudget::new(IndexBounds::PRODUCTION);
     budget.roots = config
@@ -1139,7 +1333,7 @@ fn refresh_catalog_cache(
         changed |= local_changed;
     }
     if !changed {
-        return Ok(false);
+        return Ok(RefreshOutcome::Unchanged);
     }
     ensure_refresh_active(deadline, cancelled, "before cache commit")?;
     write_index_bytes_atomically_unlocked(
@@ -1147,7 +1341,7 @@ fn refresh_catalog_cache(
         &encoded,
         intelligence::DATABASE_BYTES_MAX,
     )?;
-    Ok(true)
+    Ok(RefreshOutcome::published(&encoded))
 }
 
 fn discovery_cache_is_current(
@@ -1263,7 +1457,7 @@ fn refresh_local_completion_paths(
     command_paths: &[Vec<String>],
     deadline: RefreshDeadline,
     cancelled: Arc<AtomicBool>,
-) -> Result<bool, ShellError> {
+) -> Result<RefreshOutcome, ShellError> {
     if command_paths.len() > LOCAL_PROBE_QUEUE_MAX {
         return Err(index_limit_error(
             "local completion paths per worker turn",
@@ -1274,7 +1468,7 @@ fn refresh_local_completion_paths(
     let Some(_coordination) =
         acquire_catalog_coordination(&config.index_path, CoordinationWait::Background)?
     else {
-        return Ok(false);
+        return Ok(RefreshOutcome::Contended);
     };
     let bytes = read_index(&config.index_path)?;
     let (catalog, state_json) = intelligence::decode_database(&bytes, &config.index_path)?;
@@ -1306,7 +1500,7 @@ fn refresh_local_completion_paths(
         .map(|context| context.identity.clone())
         .collect::<Vec<_>>();
     if identities != state.local_providers {
-        return Ok(false);
+        return Ok(RefreshOutcome::Unchanged);
     }
     let paths = command_paths
         .iter()
@@ -1329,7 +1523,11 @@ fn refresh_local_completion_paths(
             intelligence::DATABASE_BYTES_MAX,
         )?;
     }
-    Ok(changed)
+    Ok(if changed {
+        RefreshOutcome::published(&updated)
+    } else {
+        RefreshOutcome::Unchanged
+    })
 }
 
 fn should_probe_local_path(catalog: &Catalog, command_path: &[String]) -> bool {
@@ -1525,13 +1723,7 @@ fn probe_local_completion_paths(
         let remaining = deadline
             .expires_at
             .saturating_duration_since(Instant::now());
-        let request_deadline = remaining.min(LOCAL_PROVIDER_DEADLINE);
-        #[cfg(test)]
-        let request_deadline = FIXTURE_PROVIDER_DEADLINE.with(|fixture| {
-            fixture
-                .get()
-                .map_or(request_deadline, |limit| remaining.min(limit))
-        });
+        let request_deadline = local_provider_deadline(remaining);
         if request_deadline.is_zero() {
             ensure_refresh_active(deadline, &cancelled, "before local completion spawn")?;
         }
@@ -1659,6 +1851,27 @@ fn probe_local_completion_paths(
         changed = true;
     }
     Ok((updated, changed))
+}
+
+fn local_provider_deadline(remaining: Duration) -> Duration {
+    // Persistence fixtures use actual subprocesses but assert metadata, not
+    // host scheduling latency. A fixed opt-in budget also supports checking a
+    // release artifact; it cannot extend the owning refresh deadline.
+    let persistence_fixture = env::var_os("QUIRL_TEST_LOCAL_PROVIDER_PERSISTENCE").is_some();
+    let deadline = admitted_local_provider_deadline(remaining, persistence_fixture);
+    #[cfg(test)]
+    let deadline = FIXTURE_PROVIDER_DEADLINE
+        .with(|fixture| fixture.get().map_or(deadline, |limit| remaining.min(limit)));
+    deadline
+}
+
+fn admitted_local_provider_deadline(remaining: Duration, persistence_fixture: bool) -> Duration {
+    let limit = if persistence_fixture {
+        Duration::from_secs(5)
+    } else {
+        LOCAL_PROVIDER_DEADLINE
+    };
+    remaining.min(limit)
 }
 
 fn local_negative_observation(
@@ -3811,11 +4024,119 @@ mod tests {
 
     static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
+    #[cfg(unix)]
+    #[test]
+    fn fixture_publication_marker_follows_editor_notification_and_preserves_it_on_error() {
+        let directory = temporary_directory();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let changed = AtomicBool::new(false);
+        let observer = TestRefreshObserver::default();
+        let snapshot = b"exact committed catalog bytes";
+        let fingerprint = Sha256::digest(snapshot).into();
+        let marker = directory.join(format!("{:x}", Sha256::digest(snapshot)));
+        assert!(!marker.exists());
+        notify_refresh_publication(&changed, &observer, || {
+            // A reader seeing the marker must be able to consume the pending
+            // publication at its very next editor-turn boundary.
+            assert!(changed.load(Ordering::Acquire));
+            assert_eq!(observer.published.load(Ordering::Acquire), 1);
+            write_fixture_publication(&directory, &fingerprint)
+        });
+        assert!(fs::read(&marker).unwrap().is_empty());
+        assert!(changed.swap(false, Ordering::AcqRel));
+        notify_refresh_publication(&changed, &observer, || {
+            Err(ShellError::new(ErrorCode::Io, "injected marker failure"))
+        });
+        assert!(changed.load(Ordering::Acquire));
+        assert_eq!(observer.failed.load(Ordering::Acquire), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_publication_markers_reject_collisions_links_and_the_first_excess_file() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let foreign = directory.join("foreign");
+        fs::write(&foreign, b"preserve").unwrap();
+        let markers = directory.join("markers");
+        fs::create_dir(&markers).unwrap();
+        fs::set_permissions(&markers, fs::Permissions::from_mode(0o700)).unwrap();
+        let zero_marker = markers.join("00".repeat(32));
+        symlink(&foreign, &zero_marker).unwrap();
+        assert!(write_fixture_publication(&markers, &[0; 32]).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"preserve");
+        fs::remove_file(&zero_marker).unwrap();
+        fs::write(&zero_marker, b"foreign bytes").unwrap();
+        assert!(write_fixture_publication(&markers, &[0; 32]).is_err());
+        assert_eq!(fs::read(&zero_marker).unwrap(), b"foreign bytes");
+        fs::remove_file(&zero_marker).unwrap();
+        let linked_directory = directory.join("linked");
+        symlink(&markers, &linked_directory).unwrap();
+        assert_eq!(
+            write_fixture_publication(&linked_directory, &[0; 32])
+                .unwrap_err()
+                .code,
+            ErrorCode::Validation
+        );
+        for number in 0_u8..64 {
+            write_fixture_publication(&markers, &[number; 32]).unwrap();
+        }
+        assert_eq!(fs::metadata(&zero_marker).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(
+            write_fixture_publication(&markers, &[64; 32])
+                .unwrap_err()
+                .code,
+            ErrorCode::ResourceLimit
+        );
+        assert_eq!(fs::read_dir(&markers).unwrap().count(), 64);
+        write_fixture_publication(&markers, &[0; 32]).unwrap();
+        assert_eq!(fs::read_dir(&markers).unwrap().count(), 64);
+        assert!(fs::read(&zero_marker).unwrap().is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn local_provider_persistence_budget_is_opt_in_and_cannot_extend_refresh() {
+        let normal_limit = Duration::from_millis(400);
+        let fixture_limit = Duration::from_secs(5);
+        for remaining in [Duration::ZERO, Duration::from_millis(399), normal_limit] {
+            assert_eq!(
+                admitted_local_provider_deadline(remaining, false),
+                remaining
+            );
+            assert_eq!(admitted_local_provider_deadline(remaining, true), remaining);
+        }
+        assert_eq!(
+            admitted_local_provider_deadline(Duration::from_millis(401), false),
+            normal_limit
+        );
+        assert_eq!(
+            admitted_local_provider_deadline(Duration::from_millis(401), true),
+            Duration::from_millis(401)
+        );
+        assert_eq!(
+            admitted_local_provider_deadline(fixture_limit, true),
+            fixture_limit
+        );
+        assert_eq!(
+            admitted_local_provider_deadline(Duration::MAX, true),
+            fixture_limit
+        );
+        assert_eq!(
+            admitted_local_provider_deadline(Duration::MAX, false),
+            normal_limit
+        );
+    }
+
     #[derive(Default)]
     struct TestRefreshObserver {
         started: AtomicUsize,
         published: AtomicUsize,
         unchanged: AtomicUsize,
+        contended: AtomicUsize,
         failed: AtomicUsize,
     }
 
@@ -3830,6 +4151,10 @@ mod tests {
 
         fn refresh_unchanged(&self) {
             self.unchanged.fetch_add(1, Ordering::Release);
+        }
+
+        fn refresh_contended(&self) {
+            self.contended.fetch_add(1, Ordering::Release);
         }
 
         fn refresh_failed(&self, _error: &ShellError) {
@@ -3885,13 +4210,17 @@ mod tests {
     }
 
     fn wait_for_observation(counter: &AtomicUsize) {
+        wait_for_observations(counter, 1);
+    }
+
+    fn wait_for_observations(counter: &AtomicUsize, count: usize) {
         // Wide enough to tolerate heavy parallel `cargo test --workspace`
         // contention (this genuinely flaked under load, not from a real
         // product bug): each fake provider is a trivial shell script, but a
         // busy machine can still delay scheduling it well past a couple of
         // seconds.
         let started_at = Instant::now();
-        while counter.load(Ordering::Acquire) == 0 {
+        while counter.load(Ordering::Acquire) < count {
             assert!(
                 started_at.elapsed() < Duration::from_secs(10),
                 "background catalog observation exceeded its test deadline"
@@ -3907,6 +4236,7 @@ mod tests {
             &AtomicBool::new(false),
             None,
         )
+        .map(RefreshOutcome::was_published)
     }
 
     struct ProviderPersistenceFixtureBudget(Option<Duration>);
@@ -3938,6 +4268,7 @@ mod tests {
             &cancelled,
             Some(Arc::clone(&cancelled)),
         )
+        .map(RefreshOutcome::was_published)
     }
 
     fn extend_negative_cache_backoff(config: &DiscoveryConfig, command: &str) {
@@ -4066,6 +4397,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
             )
             .unwrap()
+            .was_published()
         );
         let nested_catalog = load_catalog_at(&config.index_path);
         let nested = nested_catalog
@@ -4168,6 +4500,120 @@ mod tests {
         extend_negative_cache_backoff(&config, "ghq");
         assert!(!refresh_with_local(&config).unwrap());
         assert_eq!(fs::read(&marker).unwrap().len(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn contended_full_refresh_retains_its_generation_and_newer_requests() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        write_executable(&config.path_roots[0].join("demo"));
+        let guard = acquire_catalog_coordination(&config.index_path, CoordinationWait::Background)
+            .unwrap()
+            .unwrap();
+        let observer = Arc::new(TestRefreshObserver::default());
+        let worker = start_catalog_refresh_with_config(
+            config.clone(),
+            observer.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            false,
+        )
+        .unwrap();
+
+        // The real lock and observed miss establish contention without a sleep
+        // assumption. Generation two arrives while generation one is retained.
+        wait_for_observation(&observer.contended);
+        assert_eq!(observer.unchanged.load(Ordering::Acquire), 0);
+        assert!(!config.index_path.exists());
+        worker.request_refresh().unwrap();
+        drop(guard);
+        wait_for_observation(&observer.published);
+        wait_for_observation(&observer.unchanged);
+        assert!(load_catalog_at(&config.index_path).find("demo").is_some());
+        assert_eq!(observer.failed.load(Ordering::Acquire), 0);
+        drop(worker);
+        let guard = acquire_catalog_coordination(&config.index_path, CoordinationWait::Background)
+            .unwrap()
+            .unwrap();
+        drop(guard);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn contended_local_batch_survives_a_full_new_request_queue() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        write_executable(&config.path_roots[0].join("demo"));
+        let observer = Arc::new(TestRefreshObserver::default());
+        let worker = start_catalog_refresh_with_config(
+            config.clone(),
+            observer.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            false,
+        )
+        .unwrap();
+        wait_for_observation(&observer.published);
+        let guard = acquire_catalog_coordination(&config.index_path, CoordinationWait::Background)
+            .unwrap()
+            .unwrap();
+        worker.request_local_completion("demo ", 5).unwrap();
+        wait_for_observation(&observer.contended);
+        assert!(worker.local_probes.lock().unwrap().is_empty());
+        assert_eq!(observer.unchanged.load(Ordering::Acquire), 0);
+        for index in 0..LOCAL_PROBE_QUEUE_MAX {
+            let line = format!("demo child{index} ");
+            worker.request_local_completion(&line, line.len()).unwrap();
+        }
+        assert_eq!(
+            worker.local_probes.lock().unwrap().pending.len(),
+            LOCAL_PROBE_QUEUE_MAX
+        );
+        drop(guard);
+
+        // With no provider configured, each valid admitted batch completes as
+        // unchanged. Two completions prove the retained and new batches both
+        // ran, even though the queue had no space in which to reinsert work.
+        wait_for_observations(&observer.unchanged, 2);
+        assert!(worker.local_probes.lock().unwrap().is_empty());
+        assert_eq!(observer.failed.load(Ordering::Acquire), 0);
+        drop(worker);
+        let guard = acquire_catalog_coordination(&config.index_path, CoordinationWait::Background)
+            .unwrap()
+            .unwrap();
+        drop(guard);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cancellation_releases_contended_work_without_acquiring_the_catalog_lock() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        let guard = acquire_catalog_coordination(&config.index_path, CoordinationWait::Background)
+            .unwrap()
+            .unwrap();
+        let observer = Arc::new(TestRefreshObserver::default());
+        let worker = start_catalog_refresh_with_config(
+            config.clone(),
+            observer.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            false,
+        )
+        .unwrap();
+        wait_for_observation(&observer.contended);
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        let cleanup = thread::spawn(move || {
+            drop(worker);
+            sent.send(()).unwrap();
+        });
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        cleanup.join().unwrap();
+        assert_eq!(observer.published.load(Ordering::Acquire), 0);
+        assert_eq!(observer.unchanged.load(Ordering::Acquire), 0);
+        assert!(!config.index_path.exists());
+        drop(guard);
         fs::remove_dir_all(directory).unwrap();
     }
 

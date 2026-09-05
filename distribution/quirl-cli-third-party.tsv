@@ -117,7 +117,7 @@ miniz_oxide	0.9.1	linux,macos	MIT OR Zlib OR Apache-2.0	registry+https://github.
 mio	1.2.2	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/tokio-rs/mio
 mlua	0.12.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/mlua-rs/mlua
 mlua-sys	0.11.0	linux,macos	MIT	vendored+vendor/mlua-sys	https://github.com/mlua-rs/mlua
-model2vec-rs	0.2.1	linux,macos	LicenseRef-file:LICENSE	registry+https://github.com/rust-lang/crates.io-index	https://github.com/MinishLab/model2vec-rs
+model2vec-rs	0.2.1	linux,macos	LicenseRef-file:LICENSE	vendored+vendor/model2vec-rs	https://github.com/MinishLab/model2vec-rs
 monostate	0.1.18	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/monostate
 monostate-impl	0.1.18	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/monostate
 moxcms	0.8.1	linux,macos	BSD-3-Clause OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/awxkee/moxcms.git

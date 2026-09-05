@@ -3739,6 +3739,91 @@ mod tests {
         bytes
     }
 
+    fn metadata_fixture_model(model: &serde_json::Value) -> Result<StaticModel, String> {
+        let tokenizer = serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [], "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null, "decoder": null, "model": model,
+        });
+        StaticModel::from_bytes(
+            serde_json::to_vec(&tokenizer).unwrap(),
+            int8_safetensors(2, 2),
+            br#"{"normalize": false}"#,
+            Some(false),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn model_metadata_preserves_unknown_token_policy_for_all_tokenizer_models() {
+        // Row zero is [1, 2], row one [3, 4]. Named unknown tokens must be
+        // filtered, while Unigram's distinct unk_id policy keeps row zero.
+        for kind in ["WordPiece", "WordLevel", "BPE", "Unigram"] {
+            let model = if kind == "Unigram" {
+                serde_json::json!({"type": kind, "vocab": [["[UNK]", 0.0], ["x", -1.0]], "unk_id": 0, "byte_fallback": false})
+            } else {
+                serde_json::json!({
+                    "type": kind, "vocab": {"[UNK]": 0, "x": 1}, "unk_token": "[UNK]",
+                    "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "merges": []
+                })
+            };
+            let loaded = metadata_fixture_model(&model).unwrap();
+            let encoded = loaded.encode_with_args(
+                &["x".to_owned(), "?".to_owned(), String::new()],
+                Some(256),
+                1,
+            );
+            assert_eq!(encoded[0], vec![3.0, 4.0], "known token changed for {kind}");
+            let unknown = if kind == "Unigram" {
+                vec![1.0, 2.0]
+            } else {
+                vec![0.0, 0.0]
+            };
+            assert_eq!(
+                encoded[1], unknown,
+                "unknown-token policy changed for {kind}"
+            );
+            assert_eq!(encoded[2], vec![0.0, 0.0], "empty input changed for {kind}");
+        }
+    }
+
+    #[test]
+    fn model_metadata_distinguishes_empty_absent_and_missing_unknown_tokens() {
+        for kind in ["WordPiece", "WordLevel", "BPE"] {
+            let mut model = serde_json::json!({
+                "type": kind, "vocab": {"": 0, "x": 1}, "unk_token": "",
+                "continuing_subword_prefix": "##", "max_input_chars_per_word": 100, "merges": []
+            });
+            let loaded = metadata_fixture_model(&model).unwrap();
+            assert_eq!(
+                loaded.encode_with_args(&["?".to_owned()], Some(256), 1),
+                vec![vec![0.0, 0.0]]
+            );
+            model["unk_token"] = serde_json::json!("missing");
+            assert_eq!(
+                metadata_fixture_model(&model).unwrap_err(),
+                "unk_token 'missing' not found in vocabulary"
+            );
+            model["vocab"] = serde_json::json!({});
+            assert_eq!(
+                metadata_fixture_model(&model).unwrap_err(),
+                "unk_token 'missing' not found in vocabulary"
+            );
+        }
+        for model in [
+            serde_json::json!({"type": "BPE", "vocab": {}, "merges": []}),
+            serde_json::json!({"type": "BPE", "vocab": {"x": 0}, "merges": [], "unk_token": null}),
+            serde_json::json!({"type": "Unigram", "vocab": [["x", 0.0]], "unk_id": null, "byte_fallback": false}),
+        ] {
+            let loaded = metadata_fixture_model(&model).unwrap();
+            assert_eq!(
+                loaded.encode_with_args(&[String::new()], Some(256), 1),
+                vec![vec![0.0, 0.0]]
+            );
+        }
+    }
+
     #[test]
     fn database_round_trips_catalog_and_discovery_state() {
         let catalog = Catalog::builtin();

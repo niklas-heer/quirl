@@ -54,6 +54,18 @@ cargo xtask release package --target aarch64-apple-darwin --output target/releas
 cargo xtask release aggregate --input target/release-input --output target/release-aggregate
 ```
 
+Each native workflow job also builds the benchmark harness from the same clean
+candidate and runs the enforcing performance gate against the packaged binary's
+independently calculated SHA-256. A size or latency miss stops that package from
+reaching aggregation. The `performance-<target>` workflow artifact preserves the
+JSON report, including a failed budget, for seven days. These runner measurements
+supplement the named-terminal review in the release checklist.
+
+Measured PTY children use a private home, project database, and XDG directories.
+Project discovery remains enabled against that empty home; it cannot reuse a
+developer's project cache or scan personal repositories. The harness retains
+the real Cargo and Rustup locations for the normal toolchain prompt probes.
+
 Each native archive has exactly four top-level contracts: executable
 `bin/quirl`, Quirl's `LICENSE`, process-bridge `THIRD_PARTY_NOTICES.md`, and a
 deterministic target-specific `THIRD_PARTY_LICENSES.txt`. Packaging checks the

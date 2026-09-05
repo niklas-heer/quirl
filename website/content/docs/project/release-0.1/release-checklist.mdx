@@ -245,8 +245,8 @@ Use the direct command above to capture canonical JSON evidence.
   digest.
 - [ ] All enforced PTY latency, first-prompt, binary-size, and bounded-history
   budgets pass, or the release stops with the miss preserved in the record.
-- [ ] The exact release binary is at or below the 10 MiB hard ceiling
-  (10,485,760 bytes). At or below 5 MiB (5,242,880 bytes) is ideal; a binary
+- [ ] The exact release binary is at or below the 12 MiB hard ceiling
+  (12,582,912 bytes). At or below 5 MiB (5,242,880 bytes) is ideal; a binary
   above the 8 MiB soft cap (8,388,608 bytes) records a warning without weakening
   the hard gate. `--max-binary-bytes` may tighten but never raise the ceiling.
 - [ ] Rich-surface draw and edit latency are measured on the selected
@@ -338,12 +338,10 @@ Before publishing the capture:
   `release-assets` environment; no pull-request job or log receives them.
 - [ ] Draft release notes with supported platforms, native compatibility scope,
   reference-shell behavior, known residual risks, and upgrade/migration notes.
-  For 0.1, note that config schema v3 adds shared semantic themes on top of the
-  v2 rich-surface settings, while v4 changes the polished defaults to the
-  compact banner, automatic completion after one character, and the active
-  Rust toolchain prompt segment. Legacy unversioned v0 and explicit v1/v2/v3
-  config migrate deterministically to v4 defaults; no published config contract
-  is silently reinterpreted.
+  For 0.2, note that config schema v5 adds bounded project-discovery settings
+  to the existing rich-surface, theme, completion, and prompt contracts.
+  Legacy unversioned v0 and explicit v1/v2/v3/v4 configs migrate
+  deterministically to v5 defaults; unknown future versions fail closed.
 - [ ] Create the immutable version tag only after every required Linux/macOS
   gate above is signed off, using `cargo xtask release tag --expected-tag
   vVERSION --write` at A. Refuse rather than move a conflicting existing tag.

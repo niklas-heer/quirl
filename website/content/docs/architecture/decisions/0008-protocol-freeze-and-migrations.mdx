@@ -67,6 +67,11 @@ v0/v1/v2/v3 documents migrate deterministically to those v4 defaults; versions
 newer than v4 fail closed. The historical v2 and v3 descriptors remain pinned
 as migration evidence.
 
+ADR 0030 subsequently advances configuration to schema v5 for bounded project
+discovery. Legacy v0/v1/v2/v3/v4 configurations migrate to v5 defaults before
+validation; unknown future versions fail closed. The v4 descriptor remains
+pinned alongside the earlier descriptors as migration evidence.
+
 The executable plugin-I/O transition later supersedes that historical lock
 migration under ADR 0016's fail-closed rule. Plugin manifest v2 gives command
 I/O a closed Lua ABI-v1 interpretation, and lock v3 binds that identity. Lock

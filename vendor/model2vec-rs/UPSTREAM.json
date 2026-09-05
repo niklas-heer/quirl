@@ -1,0 +1,21 @@
+{
+  "crate": "model2vec-rs",
+  "version": "0.2.1",
+  "registry_checksum": "3cbb465c6997e85d6bcb0e9fabedb51cc8a0919d2a3de083157abe83dccbde54",
+  "original_files_sha256": {
+    ".cargo-ok": "afbf9d0f3560b0fd7795e81c42a0a79ee6b6fc67e064f77826aee642cad28d91",
+    ".cargo_vcs_info.json": "468c217c10b4a74319c6608e89e633ed08eb053bd169f658980b8406a5292220",
+    ".github/workflows/ci.yaml": "752bdd2fae0e89720e6d635d5910f557f89b2b4b899798f8c04546536f4a5102",
+    ".gitignore": "2e46d947038cd478922cde8b10c63b3d8af49bf263acd4cc609031a8687f5b2e",
+    "CITATION.cff": "85a07b439745ac8c9b2ee72d93e1f61345c8be08c39963d6e121fbc36aad286c",
+    "Cargo.lock": "532fcb618d0f5903346727e81958775d4244e360161d6f160aad6e2b5f69aa86",
+    "Cargo.toml": "6913b82d8877fd1d37df541c35fe4f801ff1dbf8f67616248dd4d7a04879f3d2",
+    "Cargo.toml.orig": "8de8597c72793aa2fb7d93851f9640c649474af884ceeda3fe375d03924145bd",
+    "LICENSE": "6869ad291a9df9866448579b7157bf337373a21ced5b4b315e68b2924aff2ab9",
+    "README.md": "66cd2b97dc2edfafcf6596699a02631933a8c34544444f71a27462eed705768f",
+    "rustfmt.toml": "e090969e99df9360705680cc0097cfaddae10c22dc2e01470592cf3b9787fd36",
+    "src/lib.rs": "8ff5b76caab0a57d255e8f1f0026ef51a1f6618344f85ef3728db8058c107982",
+    "src/main.rs": "2e6eeaa02813a0e94664d7fca34075c56cf55efa0e859b6d185378314b9e7f92",
+    "src/model.rs": "3cff1da658040ef867e60e1223f770afec237efb99c945bfa00c69a25a4b4ef9"
+  }
+}

@@ -874,8 +874,9 @@ remain separate release evidence. See [the testing strategy](/docs/contributing/
 Additions to `QuirlConfig` (Lua `config.lua`). The config schema fingerprint
 is frozen under ADR 0008. The interactive-surface fields shipped as config
 schema v2; theme selection and bounded custom palettes advanced v3, and the
-default active Rust toolchain segment advances v4 with a deterministic
-v0/v1/v2/v3-to-v4 migration:
+default active Rust toolchain segment advanced v4. Schema v5 adds project
+discovery with a deterministic v0/v1/v2/v3/v4-to-v5 migration. The existing
+interactive-surface fields remain:
 
 ```lua
 local config = quirl.config {
@@ -901,10 +902,12 @@ local config = quirl.config {
 ```
 
 ADR 0013 added bounded built-in and custom semantic themes as config schema v3.
-The current schema v4 changes only polished defaults: a compact banner,
+Schema v4 changes only polished defaults: a compact banner,
 automatic completion after one character, and `rust_version` in the right
-prompt. Unversioned v0 and explicit v1/v2/v3 documents migrate to v4 before
-validation, retaining the Tokyo Night theme default.
+prompt. Current schema v5 adds bounded project-discovery settings under
+[ADR 0030](/docs/architecture/decisions/0030-bounded-project-discovery). Unversioned v0 and
+explicit v1/v2/v3/v4 documents migrate to v5 before validation, retaining the
+Tokyo Night theme default.
 
 `ui.surface = "auto"` applies the §9 probe. Everything else in the frame
 derives from existing config (keymap, picker layout, prompt segments,

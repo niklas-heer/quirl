@@ -143,11 +143,11 @@ from immutable commit `168f9f2e2f2899f7910ca64831561c8885d9ef24`. The
 performance block below remains deliberately separate: it records an older
 measured artifact and is not retroactively attributed to the published binary.
 
-Config schema v4 includes 30 curated dark themes plus `ansi`, accepts bounded
+Config schema v5 includes 30 curated dark themes plus `ansi`, accepts bounded
 custom semantic palettes shared by both terminal surfaces, enables completion
 after one character by default, uses the compact welcome banner, and adds the
 active Rust toolchain to the default right prompt. Legacy unversioned and
-explicit v1/v2/v3 configurations migrate deterministically to v4. Tokyo Night
+explicit v1/v2/v3/v4 configurations migrate deterministically to v5. Tokyo Night
 is the default. `quirl config web` exposes the same validated palettes through
 a bounded, no-JavaScript preview gallery. See
 [ADR 0013](docs/decisions/0013-lua-config-themes.md) and
@@ -166,7 +166,7 @@ behavior, including the separate terminal transport limits.
 Important current limits:
 
 - A source checkout is not a supported release merely because its workspace
-  version says `0.1.0`; the immutable tag and release assets must identify the
+  version matches a release; the immutable tag and release assets must identify the
   same candidate, and the publication record must disclose its evidence scope.
 - Wasm packages validate but do not execute.
 - Package publishing is a local dry run, not a remote registry operation.

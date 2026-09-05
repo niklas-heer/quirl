@@ -43,7 +43,7 @@ lossy migration.
 | Catalog cache | 4 | 2 | v2/v3 facts are assigned explicit lower-confidence defaults, then current builtins merge |
 | Plugin lock | 3 | 3 | v1/v2 identities remain authenticated for diagnostics but fail closed; preserve the old file as `plugins.lock.json.legacy-v1`/`.legacy-v2`, then re-add after manifest-v2 review because an old lock cannot prove executable command I/O |
 | Recovery snapshot | 2 | 1 | Existing redacted output/errors are preserved; unavailable command/cwd/environment facts stay unavailable and replay is never inferred |
-| Lua config | 4 | legacy unversioned (v0) | Missing `schema_version` and explicit v1/v2/v3 documents migrate deterministically to v4 defaults before Rust validation; explicit unknown/future versions fail |
+| Lua config | 5 | legacy unversioned (v0) | Missing `schema_version` and explicit v1/v2/v3/v4 documents migrate deterministically to v5 defaults, including bounded project discovery, before Rust validation; explicit unknown/future versions fail |
 
 ## Deliberate 1.0 boundaries
 
