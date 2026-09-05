@@ -1,0 +1,65 @@
+# ADR 0035: Keep cold interactive startup free of project database loading
+
+- Status: accepted
+- Date: 2026-09-05
+- Applies to: interactive project cache admission and rich prompt context
+- Refines: [ADR 0030](0030-bounded-project-discovery.md)
+
+## Context
+
+The interactive constructor opened the project database, initialized its schema,
+and loaded its cached snapshot before entering the editor. Its existing worker
+then opened the same database again. Prompt Git and Rust probes already ran in
+the background, but the initial requests could launch processes before the first
+editable frame was flushed.
+
+These operations add filesystem work or CPU contention to startup. The exact
+`3ffe892` hosted Intel macOS candidate measured editable startup P50 at 28.18 ms
+and first paint P95 at 34.19 ms, exceeding the existing 25 ms and 21 ms limits.
+The measurements establish a missed target, not attribution to either operation.
+Fresh measurements must establish the effect of this change.
+
+## Decision
+
+The existing project worker owns initial database admission and cached snapshot
+loading. Construction returns a bounded empty snapshot with an explicit loading
+state. The worker publishes the admitted cache before beginning traversal;
+cached repositories can become usable while discovery continues. Database
+initialization errors retain their typed diagnostic through the existing
+snapshot result and UI error path.
+
+The first rich prompt displays its directory fallback before requesting Git and
+Rust context. Its existing context provider queues that initial request once,
+only after a successful frame flush, then reads cached context on later polls.
+A failed draw must not start the request. Later prompts and the simple editor
+retain their existing scheduling behavior.
+
+Project cache loading runs on the worker and may overlap first-frame rendering.
+Only the initial rich prompt's context request is ordered after that frame.
+Interactive history admission remains unchanged.
+
+## Failure model and invariants
+
+- One project worker retains ownership of its database and cleanup. Moving work
+  does not add threads, queues, connections, or filesystem retry loops.
+- Cached project rows, retained path bytes, targeted requests, SQLite lock waits,
+  and traversal retain their existing limits. Loading does not mean an empty
+  discovery result has been committed.
+- Cancellation is observed before admission, after loading, and before scanning.
+  Shutdown retains worker cleanup; no claim is made that an arbitrary filesystem
+  system call can be interrupted.
+- Initial cached rows cannot overwrite a newer foreground publication. A worker
+  initialization failure preserves those rows and remains observable until the
+  worker is restarted. Picker and refresh requests arriving during loading
+  remain coalesced work.
+- The prompt's initial request uses the existing bounded scheduler. Ordinary
+  input polls cannot enqueue it repeatedly or perform database or process I/O.
+- No release size or latency limit changes as part of this decision.
+
+## Validation
+
+Controlled worker gates prove construction returns before database admission,
+cached publication precedes traversal, requests survive loading, errors remain
+visible, and cancellation joins the worker. A controlled draw/provider sequence
+proves refresh follows a successful flush and does not run on draw failure.
+The canonical gates and fresh exact-artifact native measurements remain required.

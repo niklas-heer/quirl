@@ -125,6 +125,13 @@ keeps immediate closure assertions meaningful without retrying away leaks. The
 parent requires a successful exit and an explicit completion marker, and bounds
 helper runtime, captured output, and process-tree cleanup.
 
+Cold-start regressions use controlled worker gates to prove project database
+admission runs off the input thread and publishes cached repositories before
+discovery. Draw/provider ordering checks require the initial rich prompt context
+request to follow a successful flush, and reject enqueueing after a draw failure.
+These ordering checks complement the enforcing native latency measurements; see
+[ADR 0035](decisions/0035-cold-interactive-startup.md).
+
 ## Layers
 
 | Layer | What it proves | Typical evidence |

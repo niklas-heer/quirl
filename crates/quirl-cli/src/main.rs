@@ -2097,9 +2097,9 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
     let mut lua = None;
     let mut last_status = 0;
     let mut last_duration: Option<Duration> = None;
-    // The welcome text is the cold first paint. Start developer discovery only
-    // after it is visible, then let the rich editor adopt the complete result
-    // on a later bounded poll without requiring the user to submit a line.
+    // A banner is not an editable frame. Keep the prompt worker idle until the
+    // first rich frame is flushed; even nonblocking probe admission can contend
+    // with first paint by starting Git and rustc processes on another thread.
     let prompt_environment_generation = executor.environment_generation();
     let prompt_probe = Arc::new(RwLock::new(executor.developer_context_probe()));
     let worker_probe = Arc::clone(&prompt_probe);
@@ -2118,7 +2118,6 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             }
         },
     ));
-    let _ = prompt_scheduler.sample_current_dir();
     let mut prompt_context = (
         prompt_scheduler,
         prompt_probe,
@@ -2240,13 +2239,15 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                 *environment_generation = current_generation;
             }
             let prompt_directory = std::env::current_dir().unwrap_or_default();
-            let sample = scheduler.sample(&prompt_directory);
-            let cached_scheduler = Arc::clone(scheduler);
-            prompt = prompt
-                .with_native_context(sample.context)
-                .with_native_context_provider(move || {
-                    cached_scheduler.cached_context(&prompt_directory)
-                });
+            let defer_refresh = first_prompt && matches!(line_editor, SessionEditor::Rich(_));
+            if !defer_refresh {
+                prompt = prompt.with_native_context(scheduler.sample(&prompt_directory).context);
+            }
+            prompt = prompt.with_native_context_provider(native_prompt_provider(
+                Arc::clone(scheduler),
+                prompt_directory,
+                defer_refresh,
+            ));
         }
         if let Some(duration) = last_duration {
             prompt = prompt.with_duration(duration);
@@ -3240,10 +3241,14 @@ fn attach_project_refresh(
 }
 
 fn interactive_project_snapshot(snapshot: projects::ProjectSnapshot) -> InteractiveProjectSnapshot {
-    let scanning = snapshot.scan_state == projects::ProjectScanState::Scanning;
+    let scanning = matches!(
+        snapshot.scan_state,
+        projects::ProjectScanState::Loading | projects::ProjectScanState::Scanning
+    );
     let truncated = snapshot.scan_state == projects::ProjectScanState::Incomplete
         || snapshot.repositories.len() > PROJECT_ITEMS_MAX;
     let status = match snapshot.scan_state {
+        projects::ProjectScanState::Loading => Some("loading cached projects".to_owned()),
         projects::ProjectScanState::Cached if snapshot.last_complete_unix_ms.is_some() => {
             Some("cached project index; background refresh scheduled".to_owned())
         }
@@ -3276,6 +3281,25 @@ fn interactive_project_snapshot(snapshot: projects::ProjectSnapshot) -> Interact
         scanning,
         truncated,
         status,
+    }
+}
+
+// Failure model: starting background probes before the editable frame can steal
+// CPU and process-launch time from first paint. A cold rich prompt therefore
+// retains its directory-only fallback. Its first post-flush provider poll admits
+// exactly one refresh; all later event-loop polls are cache reads. The scheduler
+// continues to own its one pending path, coalescing, bounded probes and shutdown.
+fn native_prompt_provider(
+    scheduler: Arc<PromptContextScheduler>,
+    directory: PathBuf,
+    defer_refresh: bool,
+) -> impl Fn() -> Option<quirl_ui::NativePromptContext> + Send + Sync + 'static {
+    let refresh_pending = AtomicBool::new(defer_refresh);
+    move || {
+        if refresh_pending.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return Some(scheduler.sample(&directory).context);
+        }
+        scheduler.cached_context(&directory)
     }
 }
 
@@ -4187,6 +4211,58 @@ mod tests {
     static NEXT_DIFFERENTIAL_FIXTURE: AtomicUsize = AtomicUsize::new(0);
     const DEFAULT_DIFFERENTIAL_CASES: usize = 128;
     const DEFAULT_DIFFERENTIAL_SEED: u64 = 7_640_891_576_956_012_809;
+
+    #[test]
+    fn cold_native_prompt_provider_schedules_once_then_only_reads_the_cache() {
+        let (started, observed) = mpsc::sync_channel(2);
+        let scheduler = Arc::new(PromptContextScheduler::with_project_context_loader(
+            PROMPT_FIRST_PAINT_BUDGET,
+            move |_| {
+                started.send(()).unwrap();
+                NativeProjectContext {
+                    git_branch: Some("completed-branch".to_owned()),
+                    ..NativeProjectContext::default()
+                }
+            },
+        ));
+        let directory = PathBuf::from("/prompt-fixture");
+        let provider = native_prompt_provider(Arc::clone(&scheduler), directory.clone(), true);
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(provider().is_some());
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now().checked_add(Duration::from_secs(5)).unwrap();
+        // Cache publication, rather than a scheduling delay, acknowledges that
+        // the first refresh has finished before testing repeated provider polls.
+        while scheduler.cached_context(&directory).is_none() {
+            assert!(Instant::now() < deadline, "prompt cache was not published");
+            thread::yield_now();
+        }
+        for _ in 0..100 {
+            assert_eq!(
+                provider().unwrap().git_branch.as_deref(),
+                Some("completed-branch")
+            );
+        }
+        assert!(matches!(
+            observed.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        // A new explicit prompt sample must still admit its ordinary refresh.
+        // This would be coalesced if the provider had restarted active work.
+        assert!(scheduler.sample(&directory).timing.refresh_started);
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn already_scheduled_native_prompt_provider_never_enqueues_from_polling() {
+        let scheduler = Arc::new(PromptContextScheduler::default());
+        let provider = native_prompt_provider(scheduler, PathBuf::from("/prompt-fixture"), false);
+        assert!(provider().is_none());
+        assert!(provider().is_none());
+    }
 
     #[test]
     fn natural_command_is_codex_only() {

@@ -78,6 +78,7 @@ const documents = [
   ['docs/decisions/0032-bounded-terminal-input.md', 'architecture/decisions/0032-bounded-terminal-input.mdx'],
   ['docs/decisions/0033-bounded-simple-editor.md', 'architecture/decisions/0033-bounded-simple-editor.mdx'],
   ['docs/decisions/0034-release-binary-budget.md', 'architecture/decisions/0034-release-binary-budget.mdx'],
+  ['docs/decisions/0035-cold-interactive-startup.md', 'architecture/decisions/0035-cold-interactive-startup.mdx'],
 ];
 
 const pageBySource = new Map(documents);

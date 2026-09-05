@@ -37,11 +37,12 @@ generations, bounded recency/frequency observations, and a cheap repository
 activity timestamp. Foundation, picker, process, and UI crates remain unaware
 of SQLite.
 
-An interactive session reads one bounded cached snapshot during startup and
-makes it available to the project picker immediately. After the first visible
-paint it starts one session-owned worker. The worker performs bounded filesystem
-discovery independently of the input and render threads, publishes only complete
-SQLite transactions, wakes periodically, and accepts coalesced refresh hints.
+An interactive session starts one session-owned worker and exposes a loading
+snapshot while that worker admits the database and reads the bounded cache.
+It publishes cached repositories before starting filesystem discovery, as
+specified by [ADR 0035](/docs/architecture/decisions/0035-cold-interactive-startup). The worker performs
+bounded discovery independently of the input and render threads, publishes only
+complete SQLite transactions, wakes periodically, and accepts coalesced refresh hints.
 Startup, directory changes, project-picker use, successful or failed Git command
 completion, configuration changes, and an explicit refresh may all request work.
 Hints improve freshness but never replace periodic reconciliation.
@@ -85,7 +86,8 @@ Project discovery is a navigation provider, not a fourth grammar mode.
 
 ## Refresh and publication model
 
-- The cached snapshot is useful even when no worker can start.
+- Cached repositories become useful before a new discovery scan completes.
+  Worker startup or database admission failure remains an actionable diagnostic.
 - Full scans run at startup and on a bounded periodic interval. Targeted hints
   inspect a small set of directories and ancestors without promoting themselves
   to proof that an entire configured root is complete.

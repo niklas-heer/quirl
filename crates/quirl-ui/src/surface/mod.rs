@@ -1397,9 +1397,6 @@ impl RichSurface {
         let mut prompt_prepared = false;
 
         loop {
-            if prompt.poll_native_context() {
-                dirty = true;
-            }
             if dirty {
                 let (terminal_width, terminal_height) = crate::terminal_size().unwrap_or((80, 24));
                 if self.catalog.is_some() {
@@ -1451,22 +1448,29 @@ impl RichSurface {
                 let transcript_area =
                     model.transcript_area(Rect::new(0, 0, terminal_width, terminal_height));
                 let started = Instant::now();
-                self.visible_screen = self.terminal.draw(
-                    &model,
-                    self.explorer.as_ref(),
-                    prompt.mode,
-                    symbols,
-                    self.screen_selection,
-                    theme.selected(prompt.mode),
-                )?;
+                let mode = prompt.mode;
+                let ((visible_screen, draw_elapsed), context_changed) =
+                    draw_before_prompt_refresh(prompt, || {
+                        let screen = self.terminal.draw(
+                            &model,
+                            self.explorer.as_ref(),
+                            mode,
+                            symbols,
+                            self.screen_selection,
+                            theme.selected(mode),
+                        )?;
+                        Ok((screen, started.elapsed()))
+                    })?;
+                self.visible_screen = visible_screen;
                 self.transcript_area = transcript_area;
-                let draw_elapsed = started.elapsed();
                 // Ratatui flushes the backend before `draw` returns. Start the
                 // bounded catalog worker only after that first visible frame;
                 // subsequent input polling must not wait for discovery.
                 self.begin_catalog_admission()?;
                 self.record_draw(draw_elapsed);
-                dirty = self.copy_pending_screen_selection()?;
+                dirty = self.copy_pending_screen_selection()? || context_changed;
+            } else if prompt.poll_native_context() {
+                dirty = true;
             }
 
             if self.poll_catalog_admission()? {
@@ -3855,10 +3859,92 @@ fn timing_p95(samples: &VecDeque<Duration>) -> Option<Duration> {
     sorted.get(index).copied()
 }
 
+// A provider may admit bounded background work on its first invocation. Never
+// invoke it before a successful draw (including backend flush), or after a failed
+// draw. This keeps process launch contention behind the first editable frame;
+// subsequent idle-loop polling remains a nonblocking cache read.
+fn draw_before_prompt_refresh<T>(
+    prompt: &mut QuirlPrompt,
+    draw: impl FnOnce() -> Result<T, ShellError>,
+) -> Result<(T, bool), ShellError> {
+    let frame = draw()?;
+    Ok((frame, prompt.poll_native_context()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    struct PromptFlushWriter {
+        flushed: Arc<std::sync::atomic::AtomicBool>,
+        fail_flush: bool,
+    }
+
+    impl io::Write for PromptFlushWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                return Err(io::Error::other("injected first-frame flush failure"));
+            }
+            self.flushed.store(true, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn native_prompt_provider_waits_for_successful_terminal_frame_flush() {
+        for fail_flush in [false, true] {
+            let flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed_flush = Arc::clone(&flushed);
+            let observed_calls = Arc::clone(&calls);
+            let mut prompt =
+                QuirlPrompt::new(Mode::Command).with_native_context_provider(move || {
+                    assert!(observed_flush.load(AtomicOrdering::SeqCst));
+                    observed_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                    None
+                });
+            let mut terminal = Terminal::with_options(
+                CrosstermBackend::new(PromptFlushWriter {
+                    flushed: Arc::clone(&flushed),
+                    fail_flush,
+                }),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(Rect::new(0, 0, 12, 3)),
+                },
+            )
+            .unwrap();
+            assert!(!flushed.load(AtomicOrdering::SeqCst));
+            assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+            let result = draw_before_prompt_refresh(&mut prompt, || {
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(ratatui::widgets::Paragraph::new("> "), frame.area());
+                    })
+                    .map(|_| ())
+                    .map_err(terminal_error("draw the test prompt"))
+            });
+            if fail_flush {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .details
+                        .context
+                        .iter()
+                        .any(|line| line.contains("injected first-frame flush failure"))
+                );
+                assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+            } else {
+                assert!(!result.unwrap().1);
+                assert!(flushed.load(AtomicOrdering::SeqCst));
+                assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+            }
+        }
+    }
 
     struct CachedProjectProvider {
         snapshot: Option<InteractiveProjectSnapshot>,

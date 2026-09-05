@@ -93,6 +93,9 @@ which versions are published.
 - Interactive startup remains usable while command intelligence loads. Help,
   completion, resizing, retained output, history recovery, and secondary-text
   contrast now have focused user-session regressions.
+  The project worker now admits its database and publishes cached repositories
+  before scanning, with an explicit loading state in the picker. Initial Git
+  and Rust prompt probes start after the first rich frame is flushed.
 - Child-process cancellation, stopped jobs, pipeline cleanup, runtime protocol
   admission, SQLite history limits, atomic file writes, data parsing, extension
   boundaries, and plugin persistence reject invalid or excessive input earlier.

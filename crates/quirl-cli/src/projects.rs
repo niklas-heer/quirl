@@ -1,4 +1,15 @@
 //! Bounded Git-repository discovery and its rebuildable local cache.
+//!
+//! Startup returns a loading snapshot without opening SQLite on the caller.
+//! The existing single worker admits the database, publishes the bounded cached
+//! generation, then scans. Early refresh requests remain coalesced. Initial
+//! publication cannot replace a snapshot already updated by a foreground visit.
+//! An initialization error is retained once and reported through `snapshot`;
+//! neither failed loading nor cancellation removes cached data. Cancellation is
+//! checked around startup I/O and before traversal, and Drop joins the worker.
+//! SQLite retains its 250 ms busy timeout; filesystem syscalls are not assumed
+//! interruptible. Snapshots retain at most 16,384 rows and 16 MiB of path bytes,
+//! and the targeted request queue retains at most 64 paths.
 
 use crate::{
     bounded_file::{ReadFileOptions, read_optional_regular_file},
@@ -257,11 +268,16 @@ pub(crate) struct ProjectSnapshot {
     pub(crate) scan_state: ProjectScanState,
     /// Repositories ordered by effective activity, frequency, then path.
     pub(crate) repositories: Vec<ProjectRepository>,
+    // Keep the original typed initialization failure for the existing provider
+    // error boundary instead of making an unreadable cache look empty.
+    startup_error: Option<ShellError>,
 }
 
 /// Nonblocking discovery activity exposed to the interactive surface.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ProjectScanState {
+    /// The worker has not yet published the initial cached generation.
+    Loading,
     /// Cached results are loaded and no scan has run in this session yet.
     #[default]
     Cached,
@@ -373,19 +389,41 @@ impl RefreshRequests {
     }
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct ProjectStartupHooks {
+    before_open: Option<Box<dyn FnOnce() + Send>>,
+    after_cache: Option<Box<dyn FnOnce() + Send>>,
+}
+
 impl ProjectRefresh {
-    /// Load cached projects immediately and start startup discovery in the background.
+    /// Start one background worker that loads cached projects before discovery.
+    ///
+    /// Returns a loading snapshot without database I/O on the caller. Database
+    /// initialization failures are subsequently returned by `snapshot`.
     pub(crate) fn start(config: ProjectDiscoveryConfig) -> Result<Self, ShellError> {
         let path = default_database_path()?;
         Self::start_at(path, config)
     }
 
     fn start_at(path: PathBuf, config: ProjectDiscoveryConfig) -> Result<Self, ShellError> {
-        let database = ProjectDatabase::open(&path)?;
-        let initial_snapshot = database.snapshot()?;
-        drop(database);
+        Self::start_at_inner(
+            path,
+            config,
+            #[cfg(test)]
+            ProjectStartupHooks::default(),
+        )
+    }
 
-        let snapshot = Arc::new(RwLock::new(initial_snapshot));
+    fn start_at_inner(
+        path: PathBuf,
+        config: ProjectDiscoveryConfig,
+        #[cfg(test)] hooks: ProjectStartupHooks,
+    ) -> Result<Self, ShellError> {
+        let snapshot = Arc::new(RwLock::new(ProjectSnapshot {
+            scan_state: ProjectScanState::Loading,
+            ..ProjectSnapshot::default()
+        }));
         let changed = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
         let requests = Arc::new((
@@ -411,6 +449,8 @@ impl ProjectRefresh {
                     &worker_changed,
                     &worker_cancelled,
                     &worker_requests,
+                    #[cfg(test)]
+                    hooks,
                 );
             })
             .map_err(|error| {
@@ -430,13 +470,19 @@ impl ProjectRefresh {
     }
 
     /// Copy the latest bounded project generation without performing filesystem I/O.
+    ///
+    /// Returns the original initialization error if the worker could not load
+    /// the cache; a pending load instead returns an empty `Loading` snapshot.
     pub(crate) fn snapshot(&self) -> Result<ProjectSnapshot, ShellError> {
         self.snapshot
             .read()
-            .map(|snapshot| snapshot.clone())
             .map_err(|_| {
                 ShellError::new(ErrorCode::Io, "the project snapshot lock was poisoned")
                     .with_help("Restart Quirl to create a fresh project worker")
+            })
+            .and_then(|snapshot| match &snapshot.startup_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(snapshot.clone()),
             })
     }
 
@@ -506,11 +552,16 @@ impl ProjectRefresh {
         if !database.record_opened(path)? {
             return Ok(false);
         }
-        let next = database.snapshot()?;
+        let mut next = database.snapshot()?;
         let mut snapshot = self.snapshot.write().map_err(|_| {
             ShellError::new(ErrorCode::Io, "the project snapshot lock was poisoned")
                 .with_help("Restart Quirl to create a fresh project worker")
         })?;
+        // A successful foreground write does not restart a failed worker.
+        if let Some(error) = &snapshot.startup_error {
+            next.startup_error = Some(error.clone());
+            next.scan_state = ProjectScanState::Incomplete;
+        }
         *snapshot = next;
         self.changed.store(true, Ordering::Release);
         Ok(true)
@@ -773,6 +824,7 @@ impl ProjectDatabase {
                 ProjectScanState::Incomplete
             },
             repositories,
+            startup_error: None,
         })
     }
 
@@ -954,14 +1006,34 @@ fn project_worker(
     changed: &AtomicBool,
     cancelled: &AtomicBool,
     requests: &(Mutex<RefreshRequests>, Condvar),
+    #[cfg(test)] mut hooks: ProjectStartupHooks,
 ) {
-    let mut database = match ProjectDatabase::open(path) {
-        Ok(database) => database,
-        Err(_) => {
-            publish_scan_state(snapshot, changed, ProjectScanState::Incomplete);
+    #[cfg(test)]
+    if let Some(before_open) = hooks.before_open.take() {
+        before_open();
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return;
+    }
+    let loaded = ProjectDatabase::open(path)
+        .and_then(|database| database.snapshot().map(|cached| (database, cached)));
+    if cancelled.load(Ordering::Acquire) {
+        return;
+    }
+    let mut database = match loaded {
+        Ok((database, cached)) => {
+            publish_initial_snapshot(snapshot, changed, Ok(cached));
+            database
+        }
+        Err(error) => {
+            publish_initial_snapshot(snapshot, changed, Err(error));
             return;
         }
     };
+    #[cfg(test)]
+    if let Some(after_cache) = hooks.after_cache.take() {
+        after_cache();
+    }
     loop {
         if cancelled.load(Ordering::Acquire) {
             return;
@@ -988,7 +1060,7 @@ fn project_worker(
         let mut published = false;
         if full {
             // Full scans are the expensive cross-process operation. A losing
-            // interactive shell keeps its immediately loaded snapshot and lets
+            // interactive shell keeps its worker-loaded snapshot and lets
             // the lock owner publish the next complete generation.
             if let Ok(Some(_guard)) = coordination::acquire(
                 path,
@@ -1033,6 +1105,26 @@ fn project_worker(
         if published && let Ok(next) = database.snapshot() {
             publish_snapshot(snapshot, changed, next);
         }
+    }
+}
+
+fn publish_initial_snapshot(
+    snapshot: &RwLock<ProjectSnapshot>,
+    changed: &AtomicBool,
+    loaded: Result<ProjectSnapshot, ShellError>,
+) {
+    if let Ok(mut current) = snapshot.write() {
+        match loaded {
+            Ok(cached) if current.scan_state == ProjectScanState::Loading => *current = cached,
+            Ok(_) => return,
+            Err(error) => {
+                // A foreground visit can publish rows while startup is pending.
+                // Preserve them, but do not conceal that this worker has failed.
+                current.scan_state = ProjectScanState::Incomplete;
+                current.startup_error = Some(error);
+            }
+        }
+        changed.store(true, Ordering::Release);
     }
 }
 
@@ -2512,6 +2604,246 @@ mod tests {
         let removed = database.snapshot().unwrap();
         assert_eq!(removed.generation, 2);
         assert!(removed.repositories.is_empty());
+    }
+
+    // The gate owns release on assertion failure; the worker also has a broad
+    // watchdog so a broken test cannot leave an unbounded detached waiter.
+    struct StartupGate {
+        entered: std::sync::mpsc::Receiver<()>,
+        release: Option<std::sync::mpsc::SyncSender<()>>,
+    }
+
+    impl StartupGate {
+        fn new() -> (Self, Box<dyn FnOnce() + Send>) {
+            let (entered_sender, entered) = std::sync::mpsc::sync_channel(1);
+            let (release, receiver) = std::sync::mpsc::sync_channel(1);
+            let hook = Box::new(move || {
+                entered_sender.send(()).unwrap();
+                receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            (
+                Self {
+                    entered,
+                    release: Some(release),
+                },
+                hook,
+            )
+        }
+
+        fn wait(&self) {
+            self.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        fn release(&mut self) {
+            self.release.take().unwrap().send(()).unwrap();
+        }
+    }
+
+    impl Drop for StartupGate {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.try_send(());
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_constructor_returns_before_database_io_and_cancel_joins_without_opening() {
+        let temporary = TestDirectory::new("deferred-cancel");
+        let path = temporary.path().join("projects.sqlite3");
+        let config =
+            ProjectDiscoveryConfig::for_root(temporary.path().to_path_buf(), test_limits());
+        let (gate, hook) = StartupGate::new();
+        let refresh = ProjectRefresh::start_at_inner(
+            path.clone(),
+            config,
+            ProjectStartupHooks {
+                before_open: Some(hook),
+                ..ProjectStartupHooks::default()
+            },
+        )
+        .unwrap();
+        // Declare the release owner after the service so assertion unwinding
+        // releases the gate before the service joins its worker.
+        let mut gate = gate;
+        gate.wait();
+        assert!(!path.exists());
+        assert_eq!(
+            refresh.snapshot().unwrap().scan_state,
+            ProjectScanState::Loading
+        );
+        refresh.hint_picker_open().unwrap();
+        assert!(refresh.requests.0.lock().unwrap().full);
+        refresh.cancel();
+        gate.release();
+        drop(refresh);
+        assert!(
+            !path.exists(),
+            "cancelled startup must not create the database"
+        );
+    }
+
+    #[test]
+    fn startup_publishes_cached_rows_before_scan_and_preserves_early_picker_refresh() {
+        let temporary = TestDirectory::new("deferred-cache");
+        let path = temporary.path().join("projects.sqlite3");
+        let root = temporary.path().join("Code");
+        let old = root.join("old");
+        let new = root.join("new");
+        fs::create_dir_all(old.join(".git")).unwrap();
+        let config = ProjectDiscoveryConfig::for_root(root, test_limits());
+        let mut database = ProjectDatabase::open(&path).unwrap();
+        database
+            .persist_scan(&discover_repositories(&config, &AtomicBool::new(false)))
+            .unwrap();
+        drop(database);
+        fs::remove_dir_all(&old).unwrap();
+        fs::create_dir_all(new.join(".git")).unwrap();
+        let (gate, hook) = StartupGate::new();
+        let refresh = ProjectRefresh::start_at_inner(
+            path.clone(),
+            config,
+            ProjectStartupHooks {
+                after_cache: Some(hook),
+                ..ProjectStartupHooks::default()
+            },
+        )
+        .unwrap();
+        let mut gate = gate;
+        gate.wait();
+        let cached = refresh.snapshot().unwrap();
+        assert_eq!(cached.generation, 1);
+        assert_eq!(cached.scan_state, ProjectScanState::Cached);
+        assert_eq!(cached.repositories.len(), 1);
+        assert_eq!(cached.repositories[0].path, old);
+        assert!(refresh.take_changed());
+        refresh.hint_picker_open().unwrap();
+        gate.release();
+        let started = Instant::now();
+        let scanned = loop {
+            let snapshot = refresh.snapshot().unwrap();
+            if snapshot.scan_state == ProjectScanState::Complete {
+                break snapshot;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "scan state: {snapshot:?}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(scanned.generation, 2);
+        assert_eq!(scanned.repositories.len(), 1);
+        assert_eq!(scanned.repositories[0].path, new);
+        refresh.cancel();
+        drop(refresh);
+        assert_eq!(
+            ProjectDatabase::open(&path)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .generation,
+            2
+        );
+    }
+
+    #[test]
+    fn asynchronous_cache_failure_retains_typed_error_and_preserves_database_bytes() {
+        let temporary = TestDirectory::new("deferred-invalid");
+        let path = temporary.path().join("projects.sqlite3");
+        let invalid = b"not a SQLite database";
+        fs::write(&path, invalid).unwrap();
+        let config =
+            ProjectDiscoveryConfig::for_root(temporary.path().to_path_buf(), test_limits());
+        let refresh = ProjectRefresh::start_at(path.clone(), config).unwrap();
+        let started = Instant::now();
+        while !refresh.worker.as_ref().unwrap().is_finished() {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(refresh.take_changed());
+        let error = refresh.snapshot().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Io, "{error:?}");
+        assert!(!error.details.help.is_empty());
+        assert!(!error.details.context.is_empty());
+        assert_eq!(refresh.snapshot().unwrap_err().message, error.message);
+        assert_eq!(
+            refresh.snapshot.read().unwrap().scan_state,
+            ProjectScanState::Incomplete
+        );
+        drop(refresh);
+        assert_eq!(fs::read(path).unwrap(), invalid);
+    }
+
+    #[test]
+    fn startup_failure_after_a_foreground_visit_preserves_rows_and_reports_the_dead_worker() {
+        let temporary = TestDirectory::new("deferred-visit-failure");
+        let path = temporary.path().join("projects.sqlite3");
+        let repository = fs::canonicalize(temporary.path()).unwrap().join("project");
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        let config =
+            ProjectDiscoveryConfig::for_root(temporary.path().to_path_buf(), test_limits());
+        let (gate, hook) = StartupGate::new();
+        let refresh = ProjectRefresh::start_at_inner(
+            path.clone(),
+            config,
+            ProjectStartupHooks {
+                before_open: Some(hook),
+                ..ProjectStartupHooks::default()
+            },
+        )
+        .unwrap();
+        let mut gate = gate;
+        gate.wait();
+        assert!(refresh.record_opened_if_repository(&repository).unwrap());
+        assert_eq!(refresh.snapshot().unwrap().repositories[0].path, repository);
+        // Keep the admitted database intact while replacing its pathname with
+        // an invalid kind, modelling a startup open failure after the visit.
+        let saved = temporary.path().join("saved.sqlite3");
+        fs::rename(&path, &saved).unwrap();
+        fs::create_dir(&path).unwrap();
+        gate.release();
+        let started = Instant::now();
+        while !refresh.worker.as_ref().unwrap().is_finished() {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            thread::sleep(Duration::from_millis(1));
+        }
+        let error = refresh.snapshot().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation, "{error:?}");
+        let retained = refresh.snapshot.read().unwrap();
+        assert_eq!(retained.scan_state, ProjectScanState::Incomplete);
+        assert_eq!(retained.repositories.len(), 1);
+        assert_eq!(retained.repositories[0].path, repository);
+        drop(retained);
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&saved, &path).unwrap();
+        assert!(refresh.record_opened_if_repository(&repository).unwrap());
+        assert_eq!(refresh.snapshot().unwrap_err().message, error.message);
+        drop(refresh);
+        assert_eq!(
+            ProjectDatabase::open(&path)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .repositories[0]
+                .path,
+            repository
+        );
+    }
+
+    #[test]
+    fn initial_cache_publication_cannot_replace_an_early_foreground_update() {
+        let snapshot = RwLock::new(ProjectSnapshot {
+            generation: 7,
+            last_complete_unix_ms: Some(123),
+            ..ProjectSnapshot::default()
+        });
+        let changed = AtomicBool::new(false);
+        publish_initial_snapshot(&snapshot, &changed, Ok(ProjectSnapshot::default()));
+        let retained = snapshot.read().unwrap();
+        assert_eq!(retained.generation, 7);
+        assert_eq!(retained.last_complete_unix_ms, Some(123));
+        assert!(retained.startup_error.is_none());
+        assert!(!changed.load(Ordering::Acquire));
     }
 
     #[test]

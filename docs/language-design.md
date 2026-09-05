@@ -694,9 +694,10 @@ never overwritten by the form.
 
 > **No first-run wizard tax.** Quirl starts with a carefully chosen default theme, prompt, keymap, picker, and compatibility profile. Configuration helps explore and personalize a working product; it never assembles one.
 
-Project discovery follows the same rule. Quirl loads its last bounded repository
-snapshot immediately, then starts a cancellable background scan after first
-paint. On a new installation it infers likely project roots from repository
+Project discovery follows the same rule. Quirl's worker loads its last bounded
+repository snapshot while the editor remains usable, then starts a cancellable
+background scan. The project picker shows loading until that cache is admitted.
+On a new installation it infers likely project roots from repository
 clusters under the home directory, reports the result without blocking input,
 and keeps reconciling it periodically. Directory changes, project-picker use,
 Git commands, and configuration changes are coalesced refresh hints rather than

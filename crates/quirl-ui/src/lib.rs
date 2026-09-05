@@ -1947,9 +1947,11 @@ impl QuirlPrompt {
 
     /// Attach a nonblocking reader for completed background context refreshes.
     ///
-    /// Rich editing polls this reader at its existing bounded event-loop cadence;
-    /// the provider must return cached data and must not perform filesystem or
-    /// process work on the editor thread.
+    /// Rich editing first invokes this provider after a successful frame flush,
+    /// then polls at its existing bounded event-loop cadence. The provider may
+    /// enqueue one bounded background refresh on that first call; subsequent
+    /// calls must return cached data. It must not perform filesystem or process
+    /// work on the editor thread. The simple editor does not poll this provider.
     pub fn with_native_context_provider<F>(mut self, provider: F) -> Self
     where
         F: Fn() -> Option<NativePromptContext> + Send + Sync + 'static,
