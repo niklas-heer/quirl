@@ -1440,11 +1440,17 @@ fn execute_command_or_dialect_island(
 const FULL_SCREEN_PROGRAMS: &[&str] = &[
     "vim", "vi", "nvim", "view", "nvi", "emacs", "nano", "pico", "less", "more", "most", "man",
     "top", "htop", "btop", "gotop", "tmux", "screen", "watch", "mc", "ncdu", "fzf", "tig",
-    "lazygit", "k9s",
+    "lazygit", "k9s", "tokscale",
 ];
 
+/// Packages whose default UI requires inherited terminal descriptors even
+/// when invoked through a package launcher. Match package boundaries, not
+/// substrings: unrelated packages must retain ordinary captured output.
+const TERMINAL_PACKAGES: &[&str] = &["tokscale", "@tokscale/cli"];
+
 /// Return whether `source` is a single foreground external command whose
-/// executable is a known [`FULL_SCREEN_PROGRAMS`] entry.
+/// executable is a known [`FULL_SCREEN_PROGRAMS`] entry or a supported launcher
+/// invocation of a [`TERMINAL_PACKAGES`] entry.
 ///
 /// Deliberately conservative: multi-stage pipelines, boolean or sequential
 /// lists, background commands, and commands with redirects all return
@@ -1469,11 +1475,47 @@ fn needs_real_terminal(source: &str) -> bool {
     if !command.redirects.is_empty() {
         return false;
     }
-    let Some(executable) = command.words.first() else {
+    let Some((executable, arguments)) = command.words.split_first() else {
         return false;
     };
-    let name = executable.rsplit('/').next().unwrap_or(executable.as_str());
-    FULL_SCREEN_PROGRAMS.contains(&name)
+    let executable = executable.strip_prefix('^').unwrap_or(executable);
+    let name = executable.rsplit('/').next().unwrap_or(executable);
+    FULL_SCREEN_PROGRAMS.contains(&name) || terminal_package_invocation(name, arguments)
+}
+
+/// Inspect only documented, valueless launcher flags before the package.
+/// Unknown options can consume an argument, so guessing past one could mistake
+/// an option value for the executed package. Native parsing already bounds the
+/// source; this scan performs no expansion, package resolution, or filesystem I/O.
+fn terminal_package_invocation(launcher: &str, arguments: &[String]) -> bool {
+    if !matches!(launcher, "bunx" | "npx") {
+        return false;
+    }
+    let mut after_separator = false;
+    for argument in arguments {
+        if !after_separator {
+            if argument == "--" {
+                after_separator = true;
+                continue;
+            }
+            let valueless_flag = match launcher {
+                "bunx" => argument == "--bun",
+                "npx" => matches!(argument.as_str(), "--yes" | "-y" | "--no-install"),
+                _ => false,
+            };
+            if valueless_flag {
+                continue;
+            }
+        }
+        return TERMINAL_PACKAGES.iter().any(|package| {
+            argument == package
+                || argument
+                    .strip_prefix(package)
+                    .and_then(|suffix| suffix.strip_prefix('@'))
+                    .is_some_and(|version| !version.is_empty())
+        });
+    }
+    false
 }
 
 /// Return whether a parsed native command list directly invokes Git.
@@ -4304,6 +4346,51 @@ mod tests {
 
         // Invalid native syntax must not panic the heuristic.
         assert!(!needs_real_terminal("vim '"));
+    }
+
+    #[test]
+    fn terminal_packages_keep_tty_detection_through_supported_launchers() {
+        for source in [
+            "tokscale",
+            "^tokscale",
+            "bunx tokscale@latest",
+            "bunx --bun tokscale@4.15.1",
+            "bunx @tokscale/cli@latest",
+            "npx -y tokscale",
+            "npx --yes --no-install @tokscale/cli@4.15.1",
+            "npx -- tokscale@latest --light",
+            "/opt/homebrew/bin/bunx tokscale@latest",
+            "^/opt/homebrew/bin/bunx tokscale@latest",
+        ] {
+            assert!(needs_real_terminal(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn package_takeover_never_guesses_option_values_or_changes_command_graphs() {
+        for source in [
+            "bunx",
+            "bunx --bun",
+            "bunx --",
+            "bunx prettier file.ts",
+            "bunx tokscale-tools",
+            "bunx tokscale@",
+            "bunx @tokscale/cli-extra@latest",
+            "bunx --package tokscale something-else",
+            "npx --cache tokscale another-package",
+            "npx -c tokscale",
+            "echo bunx tokscale@latest",
+            "bunx tokscale@latest | cat",
+            "bunx tokscale@latest > report.txt",
+            "bunx tokscale@latest 2> errors.txt",
+            "bunx tokscale@latest < input.txt",
+            "bunx tokscale@latest &",
+            "true && bunx tokscale@latest",
+            "bunx tokscale@latest; echo done",
+            "bunx 'tokscale",
+        ] {
+            assert!(!needs_real_terminal(source), "{source}");
+        }
     }
 
     #[test]

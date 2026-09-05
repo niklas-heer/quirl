@@ -218,6 +218,17 @@ Embedded PTY input, VT parsing, child screen state, and replay remain future
 work under ADR 0022; this takeover delegates those responsibilities to the
 actual terminal.
 
+The post-0.2.0 source also recognizes `tokscale` directly and through
+`bunx tokscale@latest` or `npx tokscale@latest`, including pinned versions and
+the `@tokscale/cli` package. This preserves terminal detection, keyboard input,
+and alternate-screen rendering instead of triggering Tokscale's static report.
+Recognized launcher flags before the package are Bun's `--bun` and npx's
+`--yes`/`-y` and `--no-install`; `--` may delimit the package. Unknown launcher
+options are not skipped because their values could be mistaken for the package.
+Other packages retain captured output, and the same command-graph exclusions
+apply. Released 0.2.0 and earlier builds need `ui.surface = "simple"` for these
+wrapped TUI sessions until this fix is included in a release.
+
 ### 3.4 Transcript, scrolling, selection, and copy
 
 The transcript begins at the top and pushes the context/editor downward like a

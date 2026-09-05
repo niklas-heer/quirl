@@ -12,6 +12,14 @@ which versions are published.
 
 ## [Unreleased]
 
+### Fixed
+
+- Rich Normal mode gives Tokscale a real terminal when launched directly or
+  through `bunx`/`npx`, including versioned packages. Its interactive UI now
+  receives keyboard input instead of falling back to a static table. Other
+  package commands retain captured output; redirects, pipelines, and background
+  commands keep their existing routing.
+
 ## [0.2.0] - 2026-09-05
 
 ### Changed

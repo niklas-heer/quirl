@@ -71,6 +71,7 @@ const CHECK_NAMES: &[&str] = &[
     "streamed-progress-without-newline",
     "spinner-animates-during-silent-command",
     "full-screen-program-takeover",
+    "package-tui-terminal-takeover",
     "full-screen-program-spawn-failure-restores-terminal",
     "ctrl-l-forces-full-repaint",
     "local-completion-discovery",
@@ -507,7 +508,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 37] {
+fn checks() -> [CheckCase; 38] {
     [
         CheckCase {
             name: "rich-editing",
@@ -620,6 +621,10 @@ fn checks() -> [CheckCase; 37] {
         CheckCase {
             name: "full-screen-program-takeover",
             run: check_full_screen_program_takeover,
+        },
+        CheckCase {
+            name: "package-tui-terminal-takeover",
+            run: check_package_tui_terminal_takeover,
         },
         CheckCase {
             name: "full-screen-program-spawn-failure-restores-terminal",
@@ -2645,6 +2650,103 @@ fn check_full_screen_program_takeover(binary: &Path) -> Result<(), TaskError> {
         send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
         0,
         "full-screen program takeover",
+    )
+}
+
+fn check_package_tui_terminal_takeover(binary: &Path) -> Result<(), TaskError> {
+    // Failure model: a package launcher hides the TUI executable from the
+    // terminal classifier. Its child then sees piped stdout/stderr and silently
+    // selects a static report. These private, network-free fixtures require all
+    // three inherited terminal descriptors before entering an alternate screen.
+    // Each launch has the existing bounded PTY waits and Session cleanup; no
+    // package installation, timing sleeps, or extra Enter retries are involved.
+    let fixtures = TempDirectory::new("quirl-package-tui-takeover")?;
+    let binary_dir = fixtures.path.join("bin");
+    create_private_directory(&binary_dir)?;
+    write_executable(
+        &binary_dir.join("tokscale"),
+        "#!/bin/sh\n\
+         [ \"$#\" -eq 2 ] && [ \"$1\" = --fixture ] || exit 41\n\
+         if ! [ -t 0 ] || ! [ -t 1 ] || ! [ -t 2 ]; then\n\
+           printf 'PACKAGE_STATIC:%s\\n' \"$2\"; exit 42\n\
+         fi\n\
+         printf '\\033[?1049hPACKAGE_TUI:%s\\n' \"$2\"\n\
+         IFS= read -r answer || exit 43\n\
+         [ \"$answer\" = quit ] || exit 44\n\
+         printf 'PACKAGE_QUIT:%s\\n\\033[?1049l' \"$2\"\n",
+    )?;
+    for launcher in ["bunx", "npx"] {
+        write_executable(
+            &binary_dir.join(launcher),
+            "#!/bin/sh\n\
+             [ \"$1\" = tokscale@latest ] || exit 45\n\
+             shift\n\
+             exec \"${0%/*}/tokscale\" \"$@\"\n",
+        )?;
+    }
+    let mut session = Session::new(
+        binary,
+        SessionOptions {
+            path: Some(binary_dir),
+            ..SessionOptions::default()
+        },
+    )?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    for launcher in ["bunx", "npx", "tokscale"] {
+        let source = if launcher == "tokscale" {
+            "tokscale --fixture tokscale".to_owned()
+        } else {
+            format!("{launcher} tokscale@latest --fixture {launcher}")
+        };
+        check_package_tui_launch(&mut session, &source, launcher)?;
+    }
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "package TUI terminal takeover",
+    )
+}
+
+fn check_package_tui_launch(
+    session: &mut Session,
+    source: &str,
+    launcher: &str,
+) -> Result<(), TaskError> {
+    let output_start = session.pty.output().len();
+    session.pty.type_text(source)?;
+    session.pty.send(key::ENTER)?;
+    let ready = format!("PACKAGE_TUI:{launcher}");
+    let static_report = format!("PACKAGE_STATIC:{launcher}");
+    session
+        .pty
+        .wait_for_screen("package TUI terminal detection", |screen| {
+            let text = screen.text();
+            text.contains(&ready) || text.contains(&static_report)
+        })?;
+    if session.pty.screen().text().contains(&static_report) {
+        return Err(io::Error::other(format!(
+            "{launcher} TUI received a nonterminal descriptor and selected static output"
+        ))
+        .into());
+    }
+    session
+        .pty
+        .wait_for_since(b"\x1b[?1049h", output_start, default_timeout())?;
+    session.pty.type_text("quit")?;
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for_since(
+        format!("PACKAGE_QUIT:{launcher}").as_bytes(),
+        output_start,
+        default_timeout(),
+    )?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[?1049l", output_start, default_timeout())?;
+    wait_for_rich_input_since(session, output_start)?;
+    execute_and_resume_with_marker(
+        session,
+        &format!("/usr/bin/printf AFTER_PACKAGE_%s {launcher}"),
+        format!("AFTER_PACKAGE_{launcher}").as_bytes(),
     )
 }
 
