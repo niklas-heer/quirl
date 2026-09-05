@@ -38,8 +38,9 @@
 - Model loading reads unknown-token metadata directly instead of serializing
   the entire tokenizer, preserving inference across all four supported models
   while avoiding a temporary copy of the vocabulary and processing graph.
-- CI verifies coordination retry counts independently of scheduler delays and
-  gives the real Zsh completion fixture a separate bounded startup budget.
+- CI verifies coordination retries and asynchronous completion ordering
+  independently of scheduler delays, and gives the real Zsh completion fixture
+  a separate bounded startup budget.
   Release jobs now enforce size and latency budgets on every native artifact
   and preserve the measured results even when a budget fails.
 - Release performance sessions isolate project discovery and persisted state

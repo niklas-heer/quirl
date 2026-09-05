@@ -1433,8 +1433,75 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    struct SlowCompleter {
-        delay: Duration,
+    const COMPLETION_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    struct ControlledCompleter {
+        started: mpsc::SyncSender<String>,
+        release: mpsc::Receiver<()>,
+        stopped: mpsc::SyncSender<()>,
+    }
+
+    struct CompletionControl {
+        started: mpsc::Receiver<String>,
+        release: mpsc::SyncSender<()>,
+        stopped: mpsc::Receiver<()>,
+    }
+
+    impl CompletionControl {
+        fn new() -> (Self, ControlledCompleter) {
+            let (started_tx, started_rx) = mpsc::sync_channel(1);
+            let (release_tx, release_rx) = mpsc::sync_channel(1);
+            let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
+            (
+                Self {
+                    started: started_rx,
+                    release: release_tx,
+                    stopped: stopped_rx,
+                },
+                ControlledCompleter {
+                    started: started_tx,
+                    release: release_rx,
+                    stopped: stopped_tx,
+                },
+            )
+        }
+
+        fn wait_for_start(&self, expected_line: &str) {
+            assert_eq!(
+                self.started.recv_timeout(COMPLETION_TEST_TIMEOUT).unwrap(),
+                expected_line
+            );
+        }
+
+        fn finish(self, state: CompletionState) {
+            drop(state);
+            self.stopped.recv_timeout(COMPLETION_TEST_TIMEOUT).unwrap();
+        }
+    }
+
+    impl Drop for ControlledCompleter {
+        fn drop(&mut self) {
+            let _ = self.stopped.try_send(());
+        }
+    }
+
+    fn poll_completion_until(
+        state: &mut CompletionState,
+        line: &str,
+        ready: impl Fn(&CompletionState) -> bool,
+    ) {
+        let started = Instant::now();
+        while !ready(state) {
+            state.poll(line, line.len());
+            assert!(
+                started.elapsed() < COMPLETION_TEST_TIMEOUT,
+                "completion did not reach the expected state: catalog_ready={}, extension_ready={}, streaming={}",
+                state.catalog_ready,
+                state.extension_ready,
+                state.streaming,
+            );
+            thread::park_timeout(Duration::from_millis(1));
+        }
     }
 
     struct InvalidSpanCompleter;
@@ -1452,9 +1519,15 @@ mod tests {
         }
     }
 
-    impl ExtensionCompleter for SlowCompleter {
+    impl ExtensionCompleter for ControlledCompleter {
         fn complete(&mut self, line: &str, cursor: usize) -> Vec<ExtensionSuggestion> {
-            std::thread::sleep(self.delay);
+            // The test decides when each callback returns. A timeout or dropped
+            // controller also releases the worker if the test panics midway.
+            if self.started.try_send(line.to_owned()).is_err()
+                || self.release.recv_timeout(COMPLETION_TEST_TIMEOUT).is_err()
+            {
+                return Vec::new();
+            }
             vec![ExtensionSuggestion {
                 value: format!("plugin-{line}"),
                 display: format!("plugin-{line}"),
@@ -1463,27 +1536,6 @@ mod tests {
                 replace_start: 0,
                 replace_end: cursor,
             }]
-        }
-    }
-
-    struct GatedCompleter {
-        gate: Arc<(Mutex<bool>, Condvar)>,
-        started: mpsc::Sender<()>,
-        finished: mpsc::Sender<()>,
-    }
-
-    impl ExtensionCompleter for GatedCompleter {
-        fn complete(&mut self, _line: &str, _cursor: usize) -> Vec<ExtensionSuggestion> {
-            let _ = self.started.send(());
-            let (lock, ready) = &*self.gate;
-            let mut released = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            while !*released {
-                released = ready
-                    .wait(released)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-            }
-            let _ = self.finished.send(());
-            Vec::new()
         }
     }
 
@@ -1515,12 +1567,8 @@ mod tests {
         state.publish_catalog(Arc::new(Catalog::builtin()));
         state.resume_deferred().unwrap();
         assert!(state.deferred.is_none());
-        for _ in 0..100 {
-            if state.poll("git st", 6) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        poll_completion_until(&mut state, "git st", |state| !state.streaming);
+        assert!(state.catalog_ready);
         assert!(state.items.iter().any(|item| item.value == "git status"));
     }
 
@@ -1556,12 +1604,8 @@ mod tests {
         assert!(state.worker.is_none());
         state.request("git st", 6, Mode::Command).unwrap();
         assert!(state.worker.is_some());
-        for _ in 0..100 {
-            if state.poll("git st", 6) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
+        poll_completion_until(&mut state, "git st", |state| !state.streaming);
+        assert!(state.catalog_ready);
         assert!(state.items.iter().any(|item| item.value.contains("status")));
     }
 
@@ -1605,12 +1649,8 @@ mod tests {
         let mut state =
             CompletionState::new(Catalog::builtin(), Some(Box::new(InvalidSpanCompleter)));
         state.request("é", "é".len(), Mode::Command).unwrap();
-        let deadline = Instant::now() + Duration::from_millis(200);
-        while Instant::now() < deadline && state.streaming {
-            state.poll("é", "é".len());
-            std::thread::yield_now();
-        }
-        assert!(!state.streaming);
+        poll_completion_until(&mut state, "é", |state| !state.streaming);
+        assert!(state.extension_ready);
         assert!(state.items.iter().all(|item| item.source != "plugin"));
     }
 
@@ -1648,12 +1688,8 @@ mod tests {
     fn data_ls_uses_typed_contract_without_leaking_into_normal_completion() {
         let mut data = CompletionState::new(Catalog::builtin(), None);
         data.request("ls", 2, Mode::Data).unwrap();
-        for _ in 0..100 {
-            if data.poll("ls", 2) && !data.streaming {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        poll_completion_until(&mut data, "ls", |state| !state.streaming);
+        assert!(data.catalog_ready);
         let typed_ls = data.items.iter().find(|item| item.value == "ls").unwrap();
         assert_eq!(typed_ls.kind, CompletionKind::Command);
         assert!(typed_ls.summary.contains("typed"));
@@ -1663,12 +1699,8 @@ mod tests {
 
         let mut normal = CompletionState::new(Catalog::builtin(), None);
         normal.request("ls", 2, Mode::Command).unwrap();
-        for _ in 0..100 {
-            if normal.poll("ls", 2) && !normal.streaming {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        poll_completion_until(&mut normal, "ls", |state| !state.streaming);
+        assert!(normal.catalog_ready);
         assert!(
             normal
                 .items
@@ -1835,69 +1867,77 @@ mod tests {
 
     #[test]
     fn slow_extensions_merge_after_catalog_without_blocking_first_paint() {
-        let catalog = Catalog::builtin();
-        let mut state = CompletionState::new(
-            catalog,
-            Some(Box::new(SlowCompleter {
-                delay: Duration::from_millis(80),
-            })),
-        );
+        let (control, completer) = CompletionControl::new();
+        let mut state = CompletionState::new(Catalog::builtin(), Some(Box::new(completer)));
         state.request("git st", 6, Mode::Command).unwrap();
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_millis(60) && !state.poll("git st", 6) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(state.items.iter().any(|item| item.value.contains("status")));
-        assert!(state.streaming, "the slow provider should still be pending");
+        control.wait_for_start("git st");
+        poll_completion_until(&mut state, "git st", |state| state.catalog_ready);
 
-        let deadline = Instant::now() + Duration::from_millis(200);
-        while Instant::now() < deadline && !state.items.iter().any(|item| item.source == "plugin") {
-            state.poll("git st", 6);
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        assert!(state.items.iter().any(|item| item.value.contains("status")));
+        assert!(!state.items.iter().any(|item| item.source == "plugin"));
+        assert!(state.streaming, "the gated provider must still be pending");
+
+        control.release.send(()).unwrap();
+        poll_completion_until(&mut state, "git st", |state| !state.streaming);
         assert!(state.items.iter().any(|item| item.source == "plugin"));
-        assert!(!state.streaming);
+        control.finish(state);
     }
 
     #[test]
     fn cancelled_slow_extension_results_never_repaint_a_newer_query() {
-        let catalog = Catalog::builtin();
-        let mut state = CompletionState::new(
-            catalog,
-            Some(Box::new(SlowCompleter {
-                delay: Duration::from_millis(30),
-            })),
-        );
+        let (control, completer) = CompletionControl::new();
+        let mut state = CompletionState::new(Catalog::builtin(), Some(Box::new(completer)));
         state.request("old", 3, Mode::Command).unwrap();
-        std::thread::sleep(Duration::from_millis(5));
+        control.wait_for_start("old");
         state.cancel_for_edit();
         state.request("new", 3, Mode::Command).unwrap();
 
-        let deadline = Instant::now() + Duration::from_millis(150);
-        while Instant::now() < deadline && state.streaming {
-            state.poll("new", 3);
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        // Hold the old callback across cancellation and submission of its
+        // replacement. Starting the new callback proves the old one returned;
+        // hold the new result too, so a stale repaint cannot be hidden by it.
+        control.release.send(()).unwrap();
+        control.wait_for_start("new");
+        poll_completion_until(&mut state, "new", |state| state.catalog_ready);
+        assert!(!state.items.iter().any(|item| item.value == "plugin-old"));
+        assert!(!state.items.iter().any(|item| item.value == "plugin-new"));
+        assert!(state.streaming);
+        assert!(!state.extension_ready);
+
+        control.release.send(()).unwrap();
+        poll_completion_until(&mut state, "new", |state| !state.streaming);
         assert!(state.items.iter().any(|item| item.value == "plugin-new"));
         assert!(!state.items.iter().any(|item| item.value == "plugin-old"));
+        control.finish(state);
+    }
+
+    #[test]
+    fn completion_test_controller_unblocks_callback_during_unwind() {
+        let (control, completer) = CompletionControl::new();
+        let mut state = CompletionState::new(Catalog::builtin(), Some(Box::new(completer)));
+        state.request("old", 3, Mode::Command).unwrap();
+        control.wait_for_start("old");
+        let CompletionControl {
+            release, stopped, ..
+        } = control;
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _state = state;
+            let _release = release;
+            panic!("simulate a failed assertion while the callback is gated");
+        }));
+        assert!(unwind.is_err());
+        stopped.recv_timeout(COMPLETION_TEST_TIMEOUT).unwrap();
     }
 
     #[test]
     fn blocked_extension_shutdown_is_nonblocking_and_flood_keeps_one_pending_query() {
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let (started_tx, started_rx) = mpsc::channel();
-        let (finished_tx, finished_rx) = mpsc::channel();
-        let worker = ExtensionWorker::new(Box::new(GatedCompleter {
-            gate: Arc::clone(&gate),
-            started: started_tx,
-            finished: finished_tx,
-        }));
+        let (control, completer) = CompletionControl::new();
+        let worker = ExtensionWorker::new(Box::new(completer));
         worker.submit(ExtensionRequest {
             request_id: 1,
             line: "first".to_owned(),
             cursor: 5,
         });
-        assert!(started_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        control.wait_for_start("first");
 
         const REQUESTS: u64 = 10_000;
         for request_id in 2..=REQUESTS {
@@ -1924,10 +1964,11 @@ mod tests {
         });
         let drop_result = dropped_rx.recv_timeout(Duration::from_millis(250));
 
-        let (lock, ready) = &*gate;
-        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-        ready.notify_all();
-        assert!(finished_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        control.release.send(()).unwrap();
+        control
+            .stopped
+            .recv_timeout(COMPLETION_TEST_TIMEOUT)
+            .unwrap();
         dropper.join().unwrap();
         assert!(
             drop_result.is_ok(),

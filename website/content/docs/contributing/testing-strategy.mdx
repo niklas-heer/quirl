@@ -80,6 +80,12 @@ database replacement alone does not prove the worker has notified the editor.
 This handshake tests adoption between editor turns without input retries or
 changing the normal session's refresh behavior.
 
+Asynchronous completion regressions use explicit callback-start and release
+signals to place cancellation between old and new queries. The first-paint test
+holds the extension callback while checking catalog results. Wall time bounds
+the tests' waits; it does not establish callback ordering or stand in for the
+separate enforcing release-latency measurements.
+
 ## Layers
 
 | Layer | What it proves | Typical evidence |
