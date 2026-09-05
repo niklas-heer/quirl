@@ -89,8 +89,8 @@ The automated real-PTY harness is supporting evidence, not a human signoff.
   platform facts, and has a recorded byte length and cryptographic checksum for
   this exact candidate. This artifact is distinct from the mutable local
   intelligence cache and from `Catalog::builtin()` metadata.
-- [ ] The reviewed config descriptor is schema v4, its golden fingerprint
-  matches the candidate, and v0/v1/v2/v3-to-v4 migration tests pass.
+- [ ] The reviewed config descriptor is schema v5, its golden fingerprint
+  matches the candidate, and v0/v1/v2/v3/v4-to-v5 migration tests pass.
 - [ ] The supported compatibility boundary is unchanged: C0/C1-core is native
   on Linux/macOS; here-documents, process substitution, loops, functions,
   conditionals, and dialect control forms are explicit Bash/Zsh islands.

@@ -2477,11 +2477,11 @@ Options:
 - `--manifest` — Read a manifest other than ./plugin.toml
 - `--dry-run` — Require a network-free publication plan
 
-## `quirl pick [--source stdin|history|files|actions] [--query text] [--multi] [--limit count] [--root path] [--format text|json]`
+## `quirl pick [--source stdin|history|files|actions|projects] [--query text] [--multi] [--limit count] [--root path] [--refresh] [--format text|json]`
 
 Select typed values with Quirl's shared fuzzy engine
 
-The same deterministic exact/fuzzy/inverse query model ranks history, files, actions, jobs, completions, and data while returning the original value.
+The same deterministic exact/fuzzy/inverse query model ranks history, files, cached Git projects, actions, jobs, completions, and data while returning the original value. Cached projects prefer the newest bounded Git-metadata activity or Quirl open; an explicit refresh evaluates the active project roots and exclusions before scanning.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -2495,6 +2495,7 @@ Options:
 - `--root` — Set the file provider root
 - `--source` — Choose the typed provider
 - `--multi` — Return multiple selected values
+- `--refresh` — Refresh projects using the active config before selection
 
 ## `quirl plugin add <source> [--allow capability]... [--format text|json]`
 

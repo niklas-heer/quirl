@@ -23,6 +23,7 @@ mod package;
 mod pick;
 mod platform;
 mod plugin;
+mod projects;
 mod protocol;
 mod recovery;
 mod script;
@@ -55,7 +56,9 @@ use quirl_core::{
     escape_json_terminal_controls, escape_terminal_controls, reject_terminal_controls,
 };
 use quirl_data::{DataEnvelope, DataOutput, DataRenderFormat, DataRuntime};
-use quirl_lua::{LuaPolicy, MAX_LUA_SOURCE_BYTES, QuirlConfig, sdk_json, sdk_lua, sdk_markdown};
+use quirl_lua::{
+    LuaPolicy, MAX_LUA_SOURCE_BYTES, ProjectsConfig, QuirlConfig, sdk_json, sdk_lua, sdk_markdown,
+};
 use quirl_picker::{
     ItemKind, MAX_PICKER_ITEM_TEXT_BYTES, MAX_PICKER_ITEM_VALUE_BYTES, MAX_PICKER_ITEMS,
     MAX_PICKER_QUERY_BYTES, MAX_PICKER_REQUEST_BYTES, PICKER_PROTOCOL_VERSION, PickItem,
@@ -70,12 +73,13 @@ use quirl_ui::{
     CatalogLoader, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX, ExtensionCompleter,
     ExtensionSuggestion, InteractiveDataSnapshot, InteractiveEnvironmentSnapshot,
     InteractiveHistoryEntry, InteractiveJobAction, InteractiveJobSnapshot, InteractiveJobStatus,
-    InteractivePanelBatch, InteractivePanelProvider, InteractiveRuntimeSnapshot, InteractiveSignal,
-    MODE_TOGGLE_HOST_COMMAND, NativeProjectContext, PROMPT_FIRST_PAINT_BUDGET, PickerItem,
-    PickerItemKind, PickerMatch, PickerRanker, PromptContextScheduler, QuirlPrompt, RichSurface,
-    SurfaceKind, editor_with_extensions_config_history_and_picker, history_path, render_error,
-    select_surface, set_product_identity, terminal_supports_nerd_font, terminal_supports_unicode,
-    terminal_width,
+    InteractivePanelBatch, InteractivePanelProvider, InteractiveProjectEntry,
+    InteractiveProjectProvider, InteractiveProjectSnapshot, InteractiveRuntimeSnapshot,
+    InteractiveSignal, MODE_TOGGLE_HOST_COMMAND, NativeProjectContext, PROJECT_ITEMS_MAX,
+    PROMPT_FIRST_PAINT_BUDGET, PickerItem, PickerItemKind, PickerMatch, PickerRanker,
+    PromptContextScheduler, QuirlPrompt, RichSurface, SurfaceKind,
+    editor_with_extensions_config_history_and_picker, history_path, render_error, select_surface,
+    set_product_identity, terminal_supports_nerd_font, terminal_supports_unicode, terminal_width,
 };
 use recovery::RecoveryCommand;
 use script::ScriptLanguage;
@@ -486,7 +490,17 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
             }
             Ok(0)
         }
-        Some(Command::Pick { command }) => pick::execute(command, &load_composed_catalog()?),
+        Some(Command::Pick { command }) => {
+            let projects_config = command
+                .wants_project_refresh()
+                .then(config::load_discovered_projects)
+                .transpose()?;
+            let catalog = command
+                .wants_catalog()
+                .then(load_composed_catalog)
+                .transpose()?;
+            pick::execute(command, catalog.as_ref(), projects_config.as_ref())
+        }
         Some(Command::Events { command }) => platform::execute_events(command),
         Some(Command::View { command }) => platform::execute_view(command),
         Some(Command::Watch { command }) => platform::execute_watch(command),
@@ -1462,6 +1476,27 @@ fn needs_real_terminal(source: &str) -> bool {
     FULL_SCREEN_PROGRAMS.contains(&name)
 }
 
+/// Return whether a parsed native command list directly invokes Git.
+///
+/// This is only a cheap refresh hint after execution, not a security decision:
+/// aliases and wrappers may be missed, and the periodic full scan remains the
+/// source of eventual consistency.
+fn command_contains_git(source: &str) -> bool {
+    let Ok(list) = parse_command_list(source) else {
+        return false;
+    };
+    list.pipelines.iter().any(|pipeline| {
+        pipeline.commands.iter().any(|command| {
+            command.words.first().is_some_and(|executable| {
+                executable
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name == "git")
+            })
+        })
+    })
+}
+
 fn execute_command_or_dialect_island_with_extensions(
     executor: &mut NativeExecutor,
     source: &str,
@@ -2036,6 +2071,8 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         &history_path,
     )?;
     print_banner(&active_config);
+    let mut project_refresh = configured_project_refresh(&active_config.projects);
+    attach_project_refresh(&mut line_editor, project_refresh.as_ref());
     // The Codex-only preview deliberately leaves the legacy automatic local
     // model path disabled. Keeping ownership conditional avoids starting a
     // downloader or model worker while retaining explicit asset commands.
@@ -2092,6 +2129,9 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
         if !first_prompt {
             let current_directory = std::env::current_dir().unwrap_or_default();
             if current_directory != observed_directory {
+                if let Some(refresh) = &project_refresh {
+                    let _ = refresh.hint_directory(&current_directory);
+                }
                 let mut annotations = BTreeMap::new();
                 apply_observation_actions(
                     notify_extensions(
@@ -2137,6 +2177,11 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
             applied_revision = revision;
             if config != active_config {
                 sync_history(&mut line_editor, &history_path)?;
+                if config.projects != active_config.projects {
+                    attach_project_refresh(&mut line_editor, None);
+                    project_refresh.take();
+                    project_refresh = configured_project_refresh(&config.projects);
+                }
                 active_config = config;
                 let published_catalog = catalog.as_ref().ok_or_else(|| {
                     ShellError::new(
@@ -2152,6 +2197,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                     active_config.clone(),
                     &history_path,
                 )?;
+                attach_project_refresh(&mut line_editor, project_refresh.as_ref());
             }
         }
         if ai_bootstrap.take_catalog_changed() {
@@ -2168,6 +2214,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                     active_config.clone(),
                     &history_path,
                 )?;
+                attach_project_refresh(&mut line_editor, project_refresh.as_ref());
             }
             catalog = Some(refreshed_catalog);
             ai_bootstrap.request_reindex();
@@ -2416,6 +2463,11 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                             last_status,
                             Some(elapsed),
                         )?;
+                        if command_contains_git(command)
+                            && let Some(refresh) = &project_refresh
+                        {
+                            let _ = refresh.hint_git_command(&history_directory);
+                        }
                         transcript_result?;
                     }
                     InteractiveLine::Data(source) => {
@@ -2717,6 +2769,9 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         &error,
                         Duration::ZERO,
                     )?;
+                } else if let Some(refresh) = &project_refresh {
+                    let _ = refresh.record_opened_if_repository(&path);
+                    let _ = refresh.hint_directory(&path);
                 }
             }
             Ok(InteractiveSignal::CtrlC) => {
@@ -3123,6 +3178,104 @@ impl InteractivePanelProvider for CachedPanelAdapter {
         }
         self.observed_generation = Some(snapshot.generation);
         Ok(Some(snapshot))
+    }
+}
+
+struct CachedProjectAdapter {
+    refresh: Arc<projects::ProjectRefresh>,
+    initial_pending: bool,
+}
+
+impl CachedProjectAdapter {
+    fn new(refresh: Arc<projects::ProjectRefresh>) -> Self {
+        Self {
+            refresh,
+            initial_pending: true,
+        }
+    }
+}
+
+impl InteractiveProjectProvider for CachedProjectAdapter {
+    fn poll_cached(&mut self) -> Result<Option<InteractiveProjectSnapshot>, ShellError> {
+        if !self.initial_pending && !self.refresh.take_changed() {
+            return Ok(None);
+        }
+        self.initial_pending = false;
+        self.refresh
+            .snapshot()
+            .map(interactive_project_snapshot)
+            .map(Some)
+    }
+
+    fn picker_opened(&mut self) -> Result<(), ShellError> {
+        self.refresh.hint_picker_open()
+    }
+}
+
+fn configured_project_refresh(config: &ProjectsConfig) -> Option<Arc<projects::ProjectRefresh>> {
+    let result = projects::ProjectDiscoveryConfig::from_config(config)
+        .and_then(|config| config.map(projects::ProjectRefresh::start).transpose());
+    match result {
+        Ok(refresh) => refresh.map(Arc::new),
+        Err(error) => {
+            eprintln!("project discovery: {}", render_stderr_error(&error));
+            None
+        }
+    }
+}
+
+fn attach_project_refresh(
+    editor: &mut SessionEditor,
+    refresh: Option<&Arc<projects::ProjectRefresh>>,
+) {
+    let SessionEditor::Rich(editor) = editor else {
+        return;
+    };
+    match refresh {
+        Some(refresh) => {
+            editor.set_project_provider(Box::new(CachedProjectAdapter::new(Arc::clone(refresh))))
+        }
+        None => editor.clear_project_provider(),
+    }
+}
+
+fn interactive_project_snapshot(snapshot: projects::ProjectSnapshot) -> InteractiveProjectSnapshot {
+    let scanning = snapshot.scan_state == projects::ProjectScanState::Scanning;
+    let truncated = snapshot.scan_state == projects::ProjectScanState::Incomplete
+        || snapshot.repositories.len() > PROJECT_ITEMS_MAX;
+    let status = match snapshot.scan_state {
+        projects::ProjectScanState::Cached if snapshot.last_complete_unix_ms.is_some() => {
+            Some("cached project index; background refresh scheduled".to_owned())
+        }
+        projects::ProjectScanState::Cached => {
+            Some("discovering projects for the first time".to_owned())
+        }
+        projects::ProjectScanState::Scanning => {
+            Some("scanning configured project roots".to_owned())
+        }
+        projects::ProjectScanState::Complete => Some("project index is current".to_owned()),
+        projects::ProjectScanState::Incomplete => {
+            Some("project scan stopped at an I/O or resource boundary".to_owned())
+        }
+        projects::ProjectScanState::Deferred => {
+            Some("another Quirl session is refreshing projects".to_owned())
+        }
+    };
+    let projects = snapshot
+        .repositories
+        .into_iter()
+        .take(PROJECT_ITEMS_MAX)
+        .map(|repository| InteractiveProjectEntry {
+            path: repository.path,
+            name: repository.name.to_string_lossy().into_owned(),
+        })
+        .collect();
+    InteractiveProjectSnapshot {
+        generation: snapshot.generation,
+        projects,
+        scanning,
+        truncated,
+        status,
     }
 }
 
@@ -4075,6 +4228,16 @@ mod tests {
 
         // Invalid native syntax must not panic the heuristic.
         assert!(!needs_real_terminal("vim '"));
+    }
+
+    #[test]
+    fn git_refresh_hint_matches_direct_commands_in_native_lists() {
+        assert!(command_contains_git("git status"));
+        assert!(command_contains_git("printf ready; /usr/bin/git init"));
+        assert!(command_contains_git("printf x | git hash-object --stdin"));
+        assert!(!command_contains_git("printf git"));
+        assert!(!command_contains_git("lazygit"));
+        assert!(!command_contains_git("git '"));
     }
 
     #[test]

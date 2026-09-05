@@ -279,10 +279,10 @@ The fixed matrix also covers pasted control sequences, oversized paste
 rejection, fragmented committed Unicode and grapheme editing. Transport-level
 checks exceed pending-paste, escape-sequence, and terminal-reply queue limits,
 requiring resource diagnostics, no partial execution, and terminal restoration
-on both rich and simple surfaces. ADR 0031 records the dependency ingress patch.
+on both rich and simple surfaces. ADR 0032 records the dependency ingress patch.
 Both editors bound source to 64 KiB. The rich editor rejects the entire paste
 and preserves existing input; the simple editor fails closed on overflow and
-restores the terminal. ADR 0032 also bounds simple undo retention and Vi repeat
+restores the terminal. ADR 0033 also bounds simple undo retention and Vi repeat
 expansion, and requires displayed controls to remain inert. An actual idle
 unfinished-paste check waits for the 30-second admission deadline without
 sending another byte. A separate canonical zero-poll probe verifies immediate
@@ -293,7 +293,7 @@ The `vi-repeat-admission` PTY check sends rapid insertion and Escape in one writ
 and verifies exact post-edit source. It also rejects excessive decimal counts,
 multiplied counts, and overflowing prefixes before queued submission, proving
 terminal restoration and absence of command side effects. The simple editor
-bounds both raw collection and expanded actions as specified in ADR 0032.
+bounds both raw collection and expanded actions as specified in ADR 0033.
 
 Keyboard clipboard tests select Unicode output rows, issue copy commands, and
 verify exact single-line and multiline OSC 52 payloads. They do not access the

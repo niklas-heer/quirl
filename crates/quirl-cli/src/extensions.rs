@@ -3514,7 +3514,7 @@ quirl.completion.add_provider {{
 name = "managed"
 version = "0.1.0"
 entry = "plugin.lua"
-quirl = ">=0.1, <0.2"
+quirl = "=@QUIRL_VERSION@"
 api = "0.1.0"
 runtime = "trusted_lua"
 summary = "Managed prompt test"
@@ -3590,9 +3590,10 @@ output_type = "String"
 examples = ["managed text"]
 effects = ["read_filesystem"]
 error_codes = { "0" = "success" }
-"#;
-        fs::write(&manifest_path, manifest_source).unwrap();
-        let manifest = parse_plugin_manifest(manifest_source, "plugin.toml").unwrap();
+"#
+        .replace("@QUIRL_VERSION@", env!("CARGO_PKG_VERSION"));
+        fs::write(&manifest_path, &manifest_source).unwrap();
+        let manifest = parse_plugin_manifest(&manifest_source, "plugin.toml").unwrap();
         let source = format!("file:{}", manifest_path.display());
         let (locked, _) = resolve_plugin(
             &manifest,
@@ -3641,7 +3642,7 @@ error_codes = { "0" = "success" }
 name = "adapter"
 version = "0.1.0"
 entry = "adapter"
-quirl = ">=0.1, <0.2"
+quirl = "=@QUIRL_VERSION@"
 api = "0.1.0"
 runtime = "out_of_process"
 summary = "Managed adapter lifecycle test"
@@ -3655,9 +3656,10 @@ executable = "adapter"
 arguments = []
 callback_timeout_ms = 1000
 max_message_bytes = 65536
-"#;
-        fs::write(&manifest_path, manifest_source).unwrap();
-        let manifest = parse_plugin_manifest(manifest_source, "plugin.toml").unwrap();
+"#
+        .replace("@QUIRL_VERSION@", env!("CARGO_PKG_VERSION"));
+        fs::write(&manifest_path, &manifest_source).unwrap();
+        let manifest = parse_plugin_manifest(&manifest_source, "plugin.toml").unwrap();
         let source = format!("file:{}", manifest_path.display());
         let (locked, _) = resolve_plugin(
             &manifest,

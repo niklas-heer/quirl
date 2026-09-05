@@ -71,7 +71,7 @@ xshell = "0.2.7"
 # compatible. Keep this source-identical patch until upstream accepts
 # lua-src 551.x, then remove the patch and vendor/mlua-sys together.
 mlua-sys = { path = "vendor/mlua-sys" }
-# ADR 0031: bound Unix terminal input before events reach the editor.
+# ADR 0032: bound Unix terminal input before events reach the editor.
 crossterm = { path = "vendor/crossterm" }
 # Bound simple-editor input/undo and escape source controls at rendering.
 reedline = { path = "vendor/reedline" }

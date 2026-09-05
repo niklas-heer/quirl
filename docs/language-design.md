@@ -618,7 +618,8 @@ The input buffer is parsed continuously, understands command schemas and annotat
 fzf proves fuzzy selection is a terminal primitive. Quirl includes a native, typed picker in the line editor and exposes the same engine to commands, scripts, and plugins. Users should not have to install a finder and wire shell-specific bindings merely to search history or files.
 
 - **Typed selection:** displays labels, highlights, metadata, and previews but returns the original value. Picking a `Process`, `Path`, history entry, or plugin record never round-trips through lossy display text.
-- **Shared muscle memory:** `Ctrl-R` or `Up` opens fuzzy history, `Alt-Q` owns Quirl-internal chords (`f` files, `c` Miller-column directory explorer, `p` actions, `j` jobs, `r` results, `e` Environment Explorer), and `Shift-Tab` expands completion into the full picker. The directory explorer preserves unfinished input, previews syntax-highlighted source and bounded raster images, and commits `cd` only on Enter; the Environment Explorer remains read-only until an explicit copy or insert action. Conventional shell editing chords remain available.
+- **Shared muscle memory:** `Ctrl-R` or `Up` opens fuzzy history, `Alt-Q` owns Quirl-internal chords (`f` files, `g` Git projects, `c` Miller-column directory explorer, `p` actions, `j` jobs, `r` results, `e` Environment Explorer), and `Shift-Tab` expands completion into the full picker. The project picker reads a bounded local cache immediately while automatic discovery refreshes it off the input thread. Project and directory navigation preserve unfinished input and commit `cd` only on Enter; the Environment Explorer remains read-only until an explicit copy or insert action. Conventional shell editing chords remain available.
+- **Activity-aware projects:** with an empty query, Git projects are ordered by the newest of their last Quirl open and a bounded repository/Git-metadata activity observation, then by Quirl open count and stable path. A typed query keeps fuzzy relevance primary and uses that activity order as the deterministic tie-breaker. Selecting a project records its open time and increments its saturating open count; discovery never runs `git status` across the index merely to rank results.
 - **Interactive contract:** single/multi-select, exact/fuzzy/inverse terms, source switching, live reload, safe previews, named actions, cancellable/backpressured providers, and virtualized rendering.
 - **Script contract:** `pick` accepts byte lines or typed streams and emits selected values. `--query`, `--multi`, `--preview`, `--format`, and non-interactive fallback rules are testable.
 
@@ -635,9 +636,17 @@ git branch --format='%(refname:short)' | pick --query feature
 ```lua
 ---@type quirl.Config
 local config = quirl.config {
-  schema_version = 4,
+  schema_version = 5,
   editor = { keymap = "emacs", semantic_hints = true, banner = "compact" },
   picker = { layout = "adaptive", preview = true },
+  projects = {
+    discovery = "auto",
+    roots = { "~/Code", "/Volumes/company/projects" },
+    excludes = { "~/Code/archives" },
+    refresh_interval_seconds = 900,
+    max_depth = 8,
+    follow_symlinks = false,
+  },
   prompt = {
     symbols = "auto",
     left = { "directory", "git_branch", "git_state" },
@@ -655,6 +664,7 @@ return config
 | Round trip | A concrete-syntax-tree patcher changes only recognized literal arguments, preserving comments, layout, unknown plugin forms, and surrounding code. Writes are atomic and retain a recoverable prior version. |
 | Live synchronization | Browser reads refresh from the authoritative file and saves re-check it before writing. Unsaved browser changes use a three-way merge; conflicts show a diff instead of silently winning. No background watcher is claimed. |
 | Validation | Versioned schema supplies types, ranges, deprecations, platform support, examples, plugin settings. `quirl config check` parses/lints Lua, validates known annotations and returned config through Rust schema, and never activates invalid state. |
+| Project discovery | `projects.discovery` is `auto` or `disabled`. Automatic discovery scans the home directory plus `projects.roots`; roots do not replace home discovery. `projects.excludes` adds absolute or `~/`-relative subtrees to the built-in platform and cache exclusions. Roots are capped at 64, exclusions at 256, each path at 4,096 UTF-8 bytes, refresh at 60–86,400 seconds, and depth at 1–64. Symlink traversal is opt-in and remains bounded. Path lists are edited directly in Lua because configuration tools do not rewrite them as scalar literals. |
 | Prompt symbols | `auto` selects Nerd icons for Kitty, WezTerm, and Ghostty because those terminals document bundled symbol fallbacks; it otherwise chooses Unicode for a UTF-8 locale and ASCII as the final fallback. `plain`, `unicode`, and `nerd_font` remain explicit overrides, and `TERM=dumb` always wins with the plain profile. Live input uses `>` for plain and the solid `❯` for Unicode/Nerd. Thin Powerline chevrons are never used in path, right-prompt, continuation, or status-bar chrome; accepted transcript commands retain a solid `❯` semantic history marker. |
 | Preview | Theme, prompt, keymap, completion, picker, accessibility changes render against sample and live contexts before Apply. |
 | Dynamic values | UI shows evaluated value, source span, documentation, and marks code-controlled expressions; “Open in code” never silently replaces one. |
@@ -684,6 +694,24 @@ never overwritten by the form.
 
 > **No first-run wizard tax.** Quirl starts with a carefully chosen default theme, prompt, keymap, picker, and compatibility profile. Configuration helps explore and personalize a working product; it never assembles one.
 
+Project discovery follows the same rule. Quirl loads its last bounded repository
+snapshot immediately, then starts a cancellable background scan after first
+paint. On a new installation it infers likely project roots from repository
+clusters under the home directory, reports the result without blocking input,
+and keeps reconciling it periodically. Directory changes, project-picker use,
+Git commands, and configuration changes are coalesced refresh hints rather than
+exclusive sources of truth. Configured roots add locations outside the home
+directory; inferred roots and discovered repositories remain rebuildable state
+in a dedicated private SQLite cache. Automatic discovery excludes macOS
+`~/Library` and common Linux cache, Trash, application-data, package-cache, and
+build-output trees; configured exclusions add to those safety defaults. Set
+`projects.discovery = "disabled"` to stop startup and periodic discovery.
+Cold-index, warm-cache, warm-refresh, cancellation, and alternative-walker
+measurements are specified in the
+[project-discovery performance record](benchmarks/project-discovery.md); that
+record remains explicitly pending until reproducible release-build evidence is
+captured.
+
 ### Interaction and visual contracts
 
 - Incomplete input always yields a recoverable syntax tree, so highlighting, selection, indentation, and completion continue mid-command.
@@ -710,7 +738,7 @@ prompt:
 
 | Included | Default capability |
 | --- | --- |
-| Navigation | Smart `cd`, directory history, bookmarks, frecency, native typed picker |
+| Navigation | Smart `cd`, directory history, automatically discovered Git projects, bookmarks, frecency, native typed picker |
 | Discovery | Semantic completion, man/help indexing, fuzzy history/files/actions, previews, `which --explain` |
 | Data | JSON, YAML, TOML, CSV, SQLite, archive inspection, HTTP client |
 | Views | Tables, trees, diffs, logs, progress, charts, file previews |
@@ -745,7 +773,7 @@ Quirl takes Emacs and Neovim extensibility seriously. Trusted-language plugins u
 name = "kubernetes-workbench"
 version = "0.1.0"
 entry = "plugin.lua"
-quirl = ">=0.1, <0.2"
+quirl = ">=0.1, <0.3"
 
 [capabilities]
 request = [

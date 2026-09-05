@@ -392,7 +392,7 @@ from the same edge-triggered poll batch. Already-readable keyboard input then
 waits for an edge that need not arrive. Quirl selects Crossterm's existing
 level-triggered `use-dev-tty` backend, which rechecks unread input. This adds
 one dependency edge to an already locked package, no package version or
-product feature flag. ADR 0030 records the choice and its failure model.
+product feature flag. ADR 0031 records the choice and its failure model.
 
 Harness faults were retained and corrected too. Input echo is not command
 output, a query containing a filename is not a selected file, and seeing a
@@ -532,7 +532,7 @@ roll back the failing operation and exit with terminal restoration and a typed
 resource error before submission; rich paste rejection leaves editing active.
 
 Scoped vendored Crossterm and Reedline patches put limits at their owning
-boundaries. ADRs 0031 and 0032 record failure models, resource limits, cleanup,
+boundaries. ADRs 0032 and 0033 record failure models, resource limits, cleanup,
 provenance, and upstream-removal criteria. Pending escape input, bracketed paste,
 filtered terminal events, unfinished-input deadlines, Vi numeric expansion,
 and raw editor batches are bounded. Real tests found and corrected a blocking

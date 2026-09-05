@@ -1,6 +1,6 @@
 # Quirl's Crossterm 0.29 input patch
 
-See [ADR 0031](../../docs/decisions/0031-bounded-terminal-input.md) for the
+See [ADR 0032](../../docs/decisions/0032-bounded-terminal-input.md) for the
 failure model, bounds, selected feature path, and removal criteria.
 
 `UPSTREAM.json` records the crates.io archive checksum and original individual

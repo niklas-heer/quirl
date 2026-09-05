@@ -41,6 +41,7 @@ const documents = [
   ['docs/bash-zsh-source-study.md', 'research/bash-zsh-source-study.mdx'],
   ['docs/benchmarks/release-v1.0.md', 'project/release-0.1/performance-record.mdx'],
   ['docs/benchmarks/preview-v0.1.md', 'research/benchmarks/preview-v0.1.mdx'],
+  ['docs/benchmarks/project-discovery.md', 'research/benchmarks/project-discovery.mdx'],
   ['docs/benchmarks/embedded-language-selection.md', 'research/benchmarks/embedded-language-selection.mdx'],
   ['docs/benchmarks/steel-lua-fennel.md', 'research/benchmarks/steel-lua-fennel.mdx'],
   ['docs/decisions/0001-lua-extension-language.md', 'architecture/decisions/0001-lua-extension-language.mdx'],
@@ -70,10 +71,12 @@ const documents = [
   ['docs/decisions/0025-fine-tuned-command-retrieval-model.md', 'architecture/decisions/0025-fine-tuned-command-retrieval-model.mdx'],
   ['docs/decisions/0026-rust-native-releases-and-runtime-assets.md', 'architecture/decisions/0026-rust-native-releases-and-runtime-assets.mdx'],
   ['docs/decisions/0027-lua-5-5-1-runtime.md', 'architecture/decisions/0027-lua-5-5-1-runtime.mdx'],
+  ['docs/decisions/0028-bounded-miller-column-explorer.md', 'architecture/decisions/0028-bounded-miller-column-explorer.mdx'],
   ['docs/decisions/0029-codex-command-planner.md', 'architecture/decisions/0029-codex-command-planner.mdx'],
-  ['docs/decisions/0030-level-triggered-terminal-input.md', 'architecture/decisions/0030-level-triggered-terminal-input.mdx'],
-  ['docs/decisions/0031-bounded-terminal-input.md', 'architecture/decisions/0031-bounded-terminal-input.mdx'],
-  ['docs/decisions/0032-bounded-simple-editor.md', 'architecture/decisions/0032-bounded-simple-editor.mdx'],
+  ['docs/decisions/0030-bounded-project-discovery.md', 'architecture/decisions/0030-bounded-project-discovery.mdx'],
+  ['docs/decisions/0031-level-triggered-terminal-input.md', 'architecture/decisions/0031-level-triggered-terminal-input.mdx'],
+  ['docs/decisions/0032-bounded-terminal-input.md', 'architecture/decisions/0032-bounded-terminal-input.mdx'],
+  ['docs/decisions/0033-bounded-simple-editor.md', 'architecture/decisions/0033-bounded-simple-editor.mdx'],
 ];
 
 const pageBySource = new Map(documents);

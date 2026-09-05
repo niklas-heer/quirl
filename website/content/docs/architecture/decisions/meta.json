@@ -18,9 +18,11 @@
     "0014-external-history-provider-boundary",
     "0015-bounded-theme-preview-gallery",
     "0026-rust-native-releases-and-runtime-assets",
+    "0028-bounded-miller-column-explorer",
     "0029-codex-command-planner",
-    "0030-level-triggered-terminal-input",
-    "0031-bounded-terminal-input",
-    "0032-bounded-simple-editor"
+    "0030-bounded-project-discovery",
+    "0031-level-triggered-terminal-input",
+    "0032-bounded-terminal-input",
+    "0033-bounded-simple-editor"
   ]
 }

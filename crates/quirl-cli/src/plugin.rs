@@ -1650,13 +1650,14 @@ mod tests {
     }
 
     fn trusted_manifest(entry: &str) -> String {
+        let host_version = env!("CARGO_PKG_VERSION");
         format!(
             r#"schema_version = 2
 [plugin]
 name = "bounded"
 version = "0.1.0"
 entry = "{entry}"
-quirl = ">=0.1, <0.2"
+quirl = "={host_version}"
 api = "0.1.0"
 runtime = "trusted_lua"
 summary = "Bounded plugin"
@@ -1885,13 +1886,14 @@ summary = "Bounded plugin"
         let mut permissions = fs::metadata(&entry).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&entry, permissions).unwrap();
+        let host_version = env!("CARGO_PKG_VERSION");
         let source = format!(
             r#"schema_version = 2
 [plugin]
 name = "adapter"
 version = "0.1.0"
 entry = "adapter"
-quirl = ">=0.1, <0.2"
+quirl = "={host_version}"
 api = "0.1.0"
 runtime = "out_of_process"
 summary = "Isolation adapter contract"
@@ -2152,13 +2154,12 @@ quirl.plugin.command {
 "#,
         )
         .unwrap();
-        let manifest = parse_plugin_manifest(
-            r#"schema_version = 2
+        let manifest_source = r#"schema_version = 2
 [plugin]
 name = "trusted"
 version = "0.1.0"
 entry = "plugin.lua"
-quirl = ">=0.1, <0.2"
+quirl = "=@QUIRL_VERSION@"
 api = "0.1.0"
 runtime = "trusted_lua"
 summary = "Trusted bounded process plugin"
@@ -2176,10 +2177,9 @@ output_type = "String"
 examples = ["trusted run"]
 effects = ["spawn_process"]
 error_codes = { "resource_limit" = "bounded" }
-"#,
-            "plugin.toml",
-        )
-        .unwrap();
+"#
+        .replace("@QUIRL_VERSION@", env!("CARGO_PKG_VERSION"));
+        let manifest = parse_plugin_manifest(&manifest_source, "plugin.toml").unwrap();
         let result = validate_runtime(
             &manifest,
             &entry,

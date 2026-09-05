@@ -1464,24 +1464,30 @@ impl Catalog {
                 ),
                 command(
                     "quirl pick",
-                    "quirl pick [--source stdin|history|files|actions] [--query text] [--multi] [--limit count] [--root path] [--format text|json]",
+                    "quirl pick [--source stdin|history|files|actions|projects] [--query text] [--multi] [--limit count] [--root path] [--refresh] [--format text|json]",
                     "Select typed values with Quirl's shared fuzzy engine",
-                    "The same deterministic exact/fuzzy/inverse query model ranks history, files, actions, jobs, completions, and data while returning the original value.",
+                    "The same deterministic exact/fuzzy/inverse query model ranks history, files, cached Git projects, actions, jobs, completions, and data while returning the original value. Cached projects prefer the newest bounded Git-metadata activity or Quirl open; an explicit refresh evaluates the active project roots and exclusions before scanning.",
                     vec![
                         option(
                             &["--source"],
-                            Some("stdin|history|files|actions"),
+                            Some("stdin|history|files|actions|projects"),
                             "Choose the typed provider",
                         ),
                         option(&["--query"], Some("text"), "Set the initial fuzzy query"),
                         option(&["--multi"], None, "Return multiple selected values"),
                         option(&["--limit"], Some("count"), "Bound multi-selection output"),
                         option(&["--root"], Some("path"), "Set the file provider root"),
+                        option(
+                            &["--refresh"],
+                            None,
+                            "Refresh projects using the active config before selection",
+                        ),
                         option(&["--format"], Some("text|json"), "Choose stable output"),
                     ],
                     &[
                         "quirl pick --source history --query cargo",
                         "quirl pick --source files --query src",
+                        "quirl pick --source projects --query quirl",
                         "quirl pick --source actions --query index",
                     ],
                     &[Effect::ReadFilesystem],

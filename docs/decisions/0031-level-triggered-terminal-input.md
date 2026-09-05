@@ -1,4 +1,4 @@
-# ADR 0030: Keep queued terminal input observable across resize events
+# ADR 0031: Keep queued terminal input observable across resize events
 
 - Status: Accepted
 - Date: 2026-09-05

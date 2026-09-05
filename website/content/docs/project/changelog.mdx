@@ -31,6 +31,8 @@ which versions are published.
   validation, cancellation, and explicit review before shell execution.
 - A Miller-column directory explorer and an environment explorer in the rich
   terminal interface, plus native Quirl LSP completion and Neovim integration.
+- A project picker discovers Git repositories in the background, keeps a bounded
+  local cache, and jumps to a selected repository without blocking typing.
 - Replayable keyboard-session simulation with seeded workflows, styled terminal
   captures, resize and Unicode input, precise clipboard-protocol checks, and
   bounded sustained-session resource checks on macOS and Linux.
@@ -77,6 +79,9 @@ which versions are published.
   execution are not part of this release scope.
 - Lua extensions should be reviewed for Lua 5.5 language changes. The sandbox
   still exposes only the restricted SDK and standard libraries.
+- Configuration schema v5 adds project-discovery settings. Older configurations
+  retain their migration path; `quirl config migrate path/to/config.lua --dry-run`
+  previews the required source changes without rewriting the file.
 - Resource-limit failures never authorize execution of rejected input. Rich
   oversized paste preserves the edit; simple-editor input overflow exits the
   session after restoring terminal modes.

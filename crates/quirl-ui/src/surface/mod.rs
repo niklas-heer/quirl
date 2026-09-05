@@ -93,6 +93,60 @@ pub trait InteractiveIntentPlanner: Send {
     fn cancel(&mut self);
 }
 
+/// Maximum repository candidates retained by one rich-surface project snapshot.
+pub const PROJECT_ITEMS_MAX: usize = 4_096;
+/// Maximum encoded bytes retained for one repository path or display name.
+pub const PROJECT_FIELD_BYTES_MAX: usize = 4 * 1_024;
+/// Maximum encoded bytes retained across repository paths and display names.
+pub const PROJECT_RETAINED_BYTES_MAX: usize = 2 * 1_024 * 1_024;
+/// Maximum bytes retained for project-discovery status shown in the picker.
+pub const PROJECT_STATUS_BYTES_MAX: usize = 256;
+
+/// One repository candidate supplied by the product's project index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveProjectEntry {
+    /// Exact repository directory returned when the candidate is accepted.
+    pub path: PathBuf,
+    /// Short repository name used as the primary fuzzy-search field.
+    pub name: String,
+}
+
+/// Complete immutable generation supplied by the background project index.
+///
+/// The composition root may replace this snapshot between edit sessions. A
+/// running scan can publish cached candidates with `scanning` set; `status`
+/// then provides a bounded explanation in candidate preview details.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InteractiveProjectSnapshot {
+    /// Monotonic database or scanner generation represented by this snapshot.
+    pub generation: u64,
+    /// Repository directories available to the project picker.
+    pub projects: Vec<InteractiveProjectEntry>,
+    /// Whether a newer discovery generation is currently being assembled.
+    pub scanning: bool,
+    /// Whether discovery stopped at a configured resource bound.
+    pub truncated: bool,
+    /// Optional short discovery state suitable for terminal presentation.
+    pub status: Option<String>,
+}
+
+/// Nonblocking source of completed project-index snapshots.
+///
+/// Implementations may signal an owned background worker from
+/// [`Self::picker_opened`], but neither method may perform filesystem or
+/// database work, wait for a worker, or invoke user code on the render thread.
+pub trait InteractiveProjectProvider: Send {
+    /// Return a newer immutable snapshot already published in provider memory.
+    fn poll_cached(&mut self) -> Result<Option<InteractiveProjectSnapshot>, ShellError>;
+
+    /// Request a stale-index refresh immediately before the project picker opens.
+    ///
+    /// The default is a no-op for providers whose periodic refresh is sufficient.
+    fn picker_opened(&mut self) -> Result<(), ShellError> {
+        Ok(())
+    }
+}
+
 /// Bounded history metadata installed by the product's durable history store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractiveHistoryEntry {
@@ -412,6 +466,77 @@ fn legacy_history(path: &Path) -> Vec<InteractiveHistoryEntry> {
         .collect()
 }
 
+fn validate_project_snapshot(snapshot: &InteractiveProjectSnapshot) -> Result<(), ShellError> {
+    if snapshot.projects.len() > PROJECT_ITEMS_MAX {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "project snapshot exceeds its repository limit",
+        )
+        .with_context(format!(
+            "limit {PROJECT_ITEMS_MAX} repositories; observed {} repositories",
+            snapshot.projects.len()
+        ))
+        .with_help("Reduce configured discovery roots or tighten project scan limits"));
+    }
+    if snapshot
+        .status
+        .as_ref()
+        .is_some_and(|status| status.len() > PROJECT_STATUS_BYTES_MAX)
+    {
+        let observed = snapshot.status.as_ref().map_or(0, String::len);
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "project snapshot status exceeds its byte limit",
+        )
+        .with_context(format!(
+            "limit {PROJECT_STATUS_BYTES_MAX} bytes; observed {observed} bytes"
+        ))
+        .with_help("Publish a shorter project discovery status"));
+    }
+    let mut retained_bytes = 0_usize;
+    for project in &snapshot.projects {
+        if !project.path.is_absolute() || project.name.is_empty() {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "project snapshot contains an invalid repository identity",
+            )
+            .with_help("Publish absolute repository paths with non-empty display names"));
+        }
+        let path_bytes = project.path.as_os_str().as_encoded_bytes().len();
+        let name_bytes = project.name.len();
+        let field_bytes = path_bytes.max(name_bytes);
+        if field_bytes > PROJECT_FIELD_BYTES_MAX {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "project snapshot field exceeds its byte limit",
+            )
+            .with_context(format!(
+                "limit {PROJECT_FIELD_BYTES_MAX} bytes; observed {field_bytes} bytes"
+            ))
+            .with_help("Exclude the oversized repository path from project discovery"));
+        }
+        retained_bytes = retained_bytes
+            .saturating_add(path_bytes)
+            .saturating_add(name_bytes);
+        if retained_bytes > PROJECT_RETAINED_BYTES_MAX {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "project snapshot exceeds its retained-byte limit",
+            )
+            .with_context(format!(
+                "limit {PROJECT_RETAINED_BYTES_MAX} bytes; observed at least {retained_bytes} bytes"
+            ))
+            .with_help("Reduce configured discovery roots or tighten project scan limits"));
+        }
+    }
+    Ok(())
+}
+
+fn safe_project_text(value: &str, bytes_max: usize) -> String {
+    let escaped = quirl_core::escape_terminal_line(value);
+    crate::truncate_utf8_ref(&escaped, bytes_max).to_owned()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Result of one rich-surface input session after terminal ownership is released.
 pub enum InteractiveSignal {
@@ -471,6 +596,9 @@ pub struct RichSurface {
     keymap: String,
     history_path: PathBuf,
     history: Vec<InteractiveHistoryEntry>,
+    projects: InteractiveProjectSnapshot,
+    project_picker_active: bool,
+    project_provider: Option<Box<dyn InteractiveProjectProvider>>,
     terminal: SurfaceTerminal,
     draw_times: VecDeque<Duration>,
     input_analysis: InputAnalyzer,
@@ -569,6 +697,9 @@ impl RichSurface {
             keymap: config.editor.keymap.clone(),
             history_path,
             history,
+            projects: InteractiveProjectSnapshot::default(),
+            project_picker_active: false,
+            project_provider: None,
             terminal: SurfaceTerminal::default(),
             draw_times: VecDeque::with_capacity(TIMING_WINDOW),
             input_analysis,
@@ -645,6 +776,9 @@ impl RichSurface {
             keymap: config.editor.keymap.clone(),
             history_path,
             history,
+            projects: InteractiveProjectSnapshot::default(),
+            project_picker_active: false,
+            project_provider: None,
             terminal: SurfaceTerminal::default(),
             draw_times: VecDeque::with_capacity(TIMING_WINDOW),
             input_analysis: InputAnalyzer::unpublished(),
@@ -1059,6 +1193,98 @@ impl RichSurface {
         self.history = history;
     }
 
+    /// Replace the project picker with one complete, bounded index generation.
+    ///
+    /// This may be called between [`Self::read_line`] sessions; active sessions
+    /// should use [`Self::set_project_provider`]. An open picker is rebuilt as
+    /// one generation so ordinal identities cannot cross snapshots. Older
+    /// generations are ignored. Paths remain structured [`PathBuf`] values and
+    /// are never reconstructed from their terminal display representation.
+    pub fn install_project_snapshot(
+        &mut self,
+        snapshot: InteractiveProjectSnapshot,
+    ) -> Result<(), ShellError> {
+        let _ = self.admit_project_snapshot(snapshot)?;
+        Ok(())
+    }
+
+    fn admit_project_snapshot(
+        &mut self,
+        snapshot: InteractiveProjectSnapshot,
+    ) -> Result<bool, ShellError> {
+        if snapshot.generation < self.projects.generation || snapshot == self.projects {
+            return Ok(false);
+        }
+        validate_project_snapshot(&snapshot)?;
+        let active_query = self
+            .project_picker_active
+            .then(|| self.picker.query().unwrap_or_default().to_owned());
+        self.projects = snapshot;
+        if let Some(query) = active_query {
+            self.show_project_picker(&query);
+        }
+        Ok(true)
+    }
+
+    /// Attach a cache-only provider of asynchronously discovered projects.
+    ///
+    /// The provider is polled once per bounded rich-surface loop turn. It must
+    /// return immediately and leave filesystem and database work to an owned
+    /// background worker.
+    pub fn set_project_provider(&mut self, provider: Box<dyn InteractiveProjectProvider>) {
+        self.project_provider = Some(provider);
+    }
+
+    /// Remove project discovery state without rebuilding the rich surface.
+    ///
+    /// An active project picker is dismissed before its generation-local item
+    /// identities are discarded. Other pickers and editor state are unchanged.
+    pub fn clear_project_provider(&mut self) {
+        self.project_provider = None;
+        self.projects = InteractiveProjectSnapshot::default();
+        if self.project_picker_active {
+            self.dismiss_picker();
+        }
+    }
+
+    fn poll_project_provider(&mut self) -> bool {
+        let outcome = self
+            .project_provider
+            .as_mut()
+            .map(|provider| provider.poll_cached());
+        match outcome {
+            Some(Ok(Some(snapshot))) => match self.admit_project_snapshot(snapshot) {
+                Ok(changed) => changed,
+                Err(error) => self.set_project_provider_notice(&error.message),
+            },
+            Some(Err(error)) => self.set_project_provider_notice(&error.message),
+            Some(Ok(None)) | None => false,
+        }
+    }
+
+    fn request_project_refresh(&mut self) {
+        let outcome = self
+            .project_provider
+            .as_mut()
+            .map(|provider| provider.picker_opened());
+        if let Some(Err(error)) = outcome {
+            let _ = self.set_project_provider_notice(&error.message);
+        }
+    }
+
+    fn set_project_provider_notice(&mut self, message: &str) -> bool {
+        let notice = safe_project_text(message, PROJECT_STATUS_BYTES_MAX);
+        if self.projects.status.as_deref() == Some(&notice) {
+            return false;
+        }
+        self.projects.status = Some(notice);
+        if self.project_picker_active {
+            let query = self.picker.query().unwrap_or_default().to_owned();
+            self.show_project_picker(&query);
+        }
+        true
+    }
+
     /// Restore an editor buffer after a modal shell action completed between prompts.
     pub fn restore_input(&mut self, buffer: String, cursor: usize) -> Result<(), ShellError> {
         if buffer.len() > editor::MAX_EDITOR_BUFFER_BYTES {
@@ -1277,6 +1503,10 @@ impl RichSurface {
                 dirty = true;
                 continue;
             }
+            if self.poll_project_provider() {
+                dirty = true;
+                continue;
+            }
             if self.environment.poll() {
                 dirty = true;
                 continue;
@@ -1443,6 +1673,14 @@ impl RichSurface {
                                     self.dismiss_picker();
                                 } else if let Some(item) = self.completion.selected_item().cloned()
                                 {
+                                    if self.project_picker_active {
+                                        let buffer = editor.buffer().to_owned();
+                                        let cursor = editor.cursor();
+                                        let signal =
+                                            self.project_change_signal(&item, buffer, cursor)?;
+                                        self.dismiss_picker();
+                                        return Ok(signal);
+                                    }
                                     editor.replace(
                                         item.replace_start,
                                         item.replace_end,
@@ -1776,6 +2014,7 @@ impl RichSurface {
         self.completion.cancel_for_edit();
         self.deferred_catalog_picker = None;
         self.picker.dismiss();
+        self.project_picker_active = false;
         self.help_active = false;
         self.help_detail_scroll = 0;
     }
@@ -1885,6 +2124,7 @@ impl RichSurface {
             ("h", "History", "Search commands from every directory"),
             ("p", "Command palette", "Browse Quirl commands and help"),
             ("f", "Files", "Find a file in this directory"),
+            ("g", "Projects", "Jump to an indexed Git repository"),
             ("c", "Explorer", "Browse columns, preview, and jump"),
             ("j", "Jobs", "Inspect background jobs"),
             ("r", "Results", "Inspect recent typed data"),
@@ -1948,6 +2188,7 @@ impl RichSurface {
             KeyCode::Char('f') => {
                 self.open_picker(editor::PickerKind::Files, line, cursor, "files")
             }
+            KeyCode::Char('g') => self.open_project_picker(line.len()),
             KeyCode::Char('c') => {
                 self.open_directory_explorer()?;
             }
@@ -2335,9 +2576,11 @@ impl RichSurface {
         label: &'static str,
     ) {
         self.deferred_catalog_picker = None;
+        self.project_picker_active = false;
         self.help_active = false;
         self.help_detail_scroll = 0;
         let items = match kind {
+            editor::PickerKind::Projects => self.project_items(cursor),
             editor::PickerKind::Jobs => self.runtime.job_items(line.len()),
             editor::PickerKind::Data => self.runtime.data_items(line.len()),
             // Durable history is installed before the first prompt. Catalog
@@ -2360,6 +2603,7 @@ impl RichSurface {
             self.completion.show_picker_results(visible, label);
         } else if kind.bottom_anchored() {
             self.open_bottom_anchored_picker(items, label);
+            self.project_picker_active = kind == editor::PickerKind::Projects;
         } else {
             self.open_picker_items(items, label, false);
         }
@@ -2368,6 +2612,103 @@ impl RichSurface {
                 replace_end: line.len(),
             });
         }
+    }
+
+    fn open_project_picker(&mut self, _replace_end: usize) {
+        self.request_project_refresh();
+        self.show_project_picker("");
+    }
+
+    fn show_project_picker(&mut self, query: &str) {
+        // Catalog publication must not reinterpret this independent snapshot
+        // as the help or palette request that previously occupied the overlay.
+        self.deferred_catalog_picker = None;
+        let label = if self.projects.scanning {
+            "projects · scanning"
+        } else if self.projects.truncated {
+            "projects · partial"
+        } else {
+            "projects"
+        };
+        self.help_active = false;
+        self.help_detail_scroll = 0;
+        let items = self.project_items(0);
+        let visible = self
+            .picker
+            .open_bottom_anchored_with_query(items, label, query);
+        self.completion.show_picker_results(visible, label);
+        self.project_picker_active = true;
+    }
+
+    fn project_items(&self, replace_end: usize) -> Vec<completion::CompletionItem> {
+        self.projects
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(index, project)| {
+                let parent = project.path.parent().map_or_else(
+                    || "filesystem root".to_owned(),
+                    |parent| safe_project_text(&parent.to_string_lossy(), 2 * 1_024),
+                );
+                let mut detail = safe_project_text(&project.path.to_string_lossy(), 4 * 1_024);
+                if let Some(status) = self.projects.status.as_deref() {
+                    detail.push_str("\n\n");
+                    detail.push_str(&safe_project_text(status, PROJECT_STATUS_BYTES_MAX));
+                }
+                completion::CompletionItem {
+                    // This bounded ordinal is interpreted only while the
+                    // corresponding immutable snapshot remains installed.
+                    value: index.to_string(),
+                    display: safe_project_text(&project.name, 2 * 1_024),
+                    summary: parent,
+                    detail,
+                    replace_start: 0,
+                    replace_end,
+                    match_indices: Vec::new(),
+                    kind: completion::CompletionKind::Directory,
+                    source: "projects",
+                    trust: "local-index",
+                }
+            })
+            .collect()
+    }
+
+    fn project_path_for_item(
+        &self,
+        item: &completion::CompletionItem,
+    ) -> Result<PathBuf, ShellError> {
+        if item.source != "projects" {
+            return Err(ShellError::new(
+                ErrorCode::Validation,
+                "project picker accepted a candidate from another source",
+            )
+            .with_help("Close and reopen the project picker before selecting a repository"));
+        }
+        let index = item.value.parse::<usize>().ok();
+        index
+            .and_then(|index| self.projects.projects.get(index))
+            .map(|project| project.path.clone())
+            .ok_or_else(|| {
+                ShellError::new(
+                    ErrorCode::Validation,
+                    "project picker accepted a stale repository identity",
+                )
+                .with_help("Close and reopen the project picker to use the latest index")
+            })
+    }
+
+    fn project_change_signal(
+        &self,
+        item: &completion::CompletionItem,
+        buffer: String,
+        cursor: usize,
+    ) -> Result<InteractiveSignal, ShellError> {
+        let path = self.project_path_for_item(item)?;
+        Ok(InteractiveSignal::ChangeDirectory {
+            path,
+            buffer,
+            cursor,
+        })
     }
 
     fn handle_environment_key(
@@ -2427,6 +2768,7 @@ impl RichSurface {
         let visible = self
             .picker
             .open_with_query(items, "catalog help", false, &query);
+        self.project_picker_active = false;
         self.completion.show_picker_results(visible, "catalog help");
         self.help_active = true;
         self.help_detail_scroll = 0;
@@ -2446,6 +2788,7 @@ impl RichSurface {
         expanded: bool,
     ) {
         self.deferred_catalog_picker = None;
+        self.project_picker_active = false;
         self.help_active = false;
         self.help_detail_scroll = 0;
         let visible = self.picker.open(items, label, expanded);
@@ -2458,6 +2801,7 @@ impl RichSurface {
         label: &'static str,
     ) {
         self.deferred_catalog_picker = None;
+        self.project_picker_active = false;
         self.help_active = false;
         self.help_detail_scroll = 0;
         let visible = self.picker.open_bottom_anchored(items, label);
@@ -2479,6 +2823,7 @@ impl RichSurface {
         self.deferred_catalog_picker = None;
         self.picker.dismiss();
         self.completion.dismiss();
+        self.project_picker_active = false;
         self.help_active = false;
         self.help_detail_scroll = 0;
     }
@@ -3502,7 +3847,25 @@ fn timing_p95(samples: &VecDeque<Duration>) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    struct CachedProjectProvider {
+        snapshot: Option<InteractiveProjectSnapshot>,
+        poll_count: Arc<AtomicUsize>,
+        open_count: Arc<AtomicUsize>,
+    }
+
+    impl InteractiveProjectProvider for CachedProjectProvider {
+        fn poll_cached(&mut self) -> Result<Option<InteractiveProjectSnapshot>, ShellError> {
+            self.poll_count.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(self.snapshot.take())
+        }
+
+        fn picker_opened(&mut self) -> Result<(), ShellError> {
+            self.open_count.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(())
+        }
+    }
 
     struct ReadyIntentPlanner {
         update: Option<InteractiveIntentPlannerUpdate>,
@@ -3930,6 +4293,299 @@ mod tests {
         assert!(surface.environment.active());
         assert!(!surface.picker.active());
         assert_eq!(prompt.mode(), Mode::Command);
+    }
+
+    #[test]
+    fn alt_q_g_opens_projects_and_accepts_the_exact_path_without_losing_input() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let exact_path = {
+            use std::os::unix::ffi::OsStringExt;
+            PathBuf::from("/tmp/workspace").join(std::ffi::OsString::from_vec(vec![
+                b'a', b'l', b'p', b'h', b'a', b'-', 0x80,
+            ]))
+        };
+        #[cfg(not(unix))]
+        let exact_path = PathBuf::from("C:/workspace/alpha repo");
+        surface
+            .install_project_snapshot(InteractiveProjectSnapshot {
+                generation: 7,
+                projects: vec![InteractiveProjectEntry {
+                    path: exact_path.clone(),
+                    name: "alpha".to_owned(),
+                }],
+                scanning: true,
+                truncated: false,
+                status: Some("refreshing configured roots".to_owned()),
+            })
+            .unwrap();
+        let mut prompt = QuirlPrompt::with_config(Mode::Command, &config);
+        let unfinished = "git status --short";
+
+        surface.open_leader(unfinished.len());
+        assert!(
+            surface
+                .completion
+                .items
+                .iter()
+                .any(|item| item.value == "g" && item.display.contains("Projects"))
+        );
+        surface
+            .handle_leader_key(
+                KeyCode::Char('g'),
+                &mut prompt,
+                unfinished,
+                unfinished.len(),
+            )
+            .unwrap();
+
+        assert!(surface.picker.active());
+        assert!(surface.project_picker_active);
+        assert!(surface.picker.bottom_anchored());
+        assert_eq!(surface.completion.source_label, "projects · scanning");
+        let item = surface.completion.selected_item().unwrap().clone();
+        assert_eq!(item.kind, completion::CompletionKind::Directory);
+        assert_eq!(item.display, "alpha");
+        #[cfg(unix)]
+        assert_eq!(item.summary, "/tmp/workspace");
+        // The completion value is only a bounded generation-local identity;
+        // accepting it returns the structured path from the snapshot.
+        assert_ne!(item.value, exact_path.to_string_lossy());
+        assert_eq!(
+            surface
+                .project_change_signal(&item, unfinished.to_owned(), 3)
+                .unwrap(),
+            InteractiveSignal::ChangeDirectory {
+                path: exact_path,
+                buffer: unfinished.to_owned(),
+                cursor: 3,
+            }
+        );
+
+        surface.dismiss_picker();
+        assert!(!surface.project_picker_active);
+        assert!(!surface.picker.active());
+    }
+
+    #[test]
+    fn project_picker_searches_repository_name_and_parent_path() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface
+            .install_project_snapshot(InteractiveProjectSnapshot {
+                projects: vec![InteractiveProjectEntry {
+                    path: PathBuf::from("/tmp/company-work/quirl"),
+                    name: "quirl".to_owned(),
+                }],
+                ..InteractiveProjectSnapshot::default()
+            })
+            .unwrap();
+        surface.open_project_picker(0);
+
+        surface.update_picker_query(|picker| picker.insert_query("company"));
+        assert_eq!(surface.completion.items.len(), 1);
+        surface.update_picker_query(PickerOverlay::clear_query);
+        surface.update_picker_query(|picker| picker.insert_query("quirl"));
+        assert_eq!(surface.completion.items.len(), 1);
+    }
+
+    #[test]
+    fn project_snapshots_enforce_count_and_retained_field_bounds() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        let entry = InteractiveProjectEntry {
+            path: PathBuf::from("/tmp/project"),
+            name: "project".to_owned(),
+        };
+        surface
+            .install_project_snapshot(InteractiveProjectSnapshot {
+                projects: vec![entry.clone(); PROJECT_ITEMS_MAX],
+                ..InteractiveProjectSnapshot::default()
+            })
+            .unwrap();
+
+        let error = surface
+            .install_project_snapshot(InteractiveProjectSnapshot {
+                projects: vec![entry; PROJECT_ITEMS_MAX + 1],
+                ..InteractiveProjectSnapshot::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+
+        let error = surface
+            .install_project_snapshot(InteractiveProjectSnapshot {
+                projects: vec![InteractiveProjectEntry {
+                    path: PathBuf::from("/tmp/project"),
+                    name: "x".repeat(PROJECT_FIELD_BYTES_MAX + 1),
+                }],
+                ..InteractiveProjectSnapshot::default()
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn stale_project_generations_cannot_replace_newer_candidates() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface
+            .install_project_snapshot(InteractiveProjectSnapshot {
+                generation: 9,
+                projects: vec![InteractiveProjectEntry {
+                    path: PathBuf::from("/tmp/newer"),
+                    name: "newer".to_owned(),
+                }],
+                ..InteractiveProjectSnapshot::default()
+            })
+            .unwrap();
+        surface
+            .install_project_snapshot(InteractiveProjectSnapshot {
+                generation: 8,
+                projects: vec![InteractiveProjectEntry {
+                    path: PathBuf::from("/tmp/stale"),
+                    name: "stale".to_owned(),
+                }],
+                ..InteractiveProjectSnapshot::default()
+            })
+            .unwrap();
+
+        surface.open_project_picker(0);
+        let item = surface.completion.selected_item().unwrap();
+        assert_eq!(item.display, "newer");
+        assert_eq!(
+            surface.project_path_for_item(item).unwrap(),
+            Path::new("/tmp/newer")
+        );
+    }
+
+    #[test]
+    fn cached_provider_update_repaints_an_open_project_picker() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let open_count = Arc::new(AtomicUsize::new(0));
+        surface.set_project_provider(Box::new(CachedProjectProvider {
+            snapshot: Some(InteractiveProjectSnapshot {
+                generation: 1,
+                projects: vec![InteractiveProjectEntry {
+                    path: PathBuf::from("/tmp/background-project"),
+                    name: "background-project".to_owned(),
+                }],
+                ..InteractiveProjectSnapshot::default()
+            }),
+            poll_count: Arc::clone(&poll_count),
+            open_count: Arc::clone(&open_count),
+        }));
+
+        surface.open_project_picker(0);
+        assert!(surface.project_picker_active);
+        assert!(surface.completion.items.is_empty());
+        assert!(surface.poll_project_provider());
+
+        assert!(surface.project_picker_active);
+        assert_eq!(surface.completion.items.len(), 1);
+        assert_eq!(surface.completion.items[0].display, "background-project");
+        assert_eq!(poll_count.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(open_count.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn opening_projects_calls_only_the_nonblocking_refresh_hook() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let open_count = Arc::new(AtomicUsize::new(0));
+        surface.set_project_provider(Box::new(CachedProjectProvider {
+            snapshot: None,
+            poll_count: Arc::clone(&poll_count),
+            open_count: Arc::clone(&open_count),
+        }));
+
+        surface.open_project_picker(0);
+
+        assert_eq!(open_count.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(poll_count.load(AtomicOrdering::Relaxed), 0);
+        assert!(surface.project_picker_active);
+    }
+
+    #[test]
+    fn clearing_project_provider_discards_candidates_and_active_picker() {
+        let config = QuirlConfig::default();
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface
+            .install_project_snapshot(InteractiveProjectSnapshot {
+                generation: 4,
+                projects: vec![InteractiveProjectEntry {
+                    path: PathBuf::from("/tmp/project"),
+                    name: "project".to_owned(),
+                }],
+                ..InteractiveProjectSnapshot::default()
+            })
+            .unwrap();
+        surface.set_project_provider(Box::new(CachedProjectProvider {
+            snapshot: None,
+            poll_count: Arc::new(AtomicUsize::new(0)),
+            open_count: Arc::new(AtomicUsize::new(0)),
+        }));
+        surface.open_project_picker(0);
+
+        surface.clear_project_provider();
+
+        assert!(surface.project_provider.is_none());
+        assert_eq!(surface.projects, InteractiveProjectSnapshot::default());
+        assert!(!surface.project_picker_active);
+        assert!(!surface.picker.active());
+        assert!(!surface.completion.open);
     }
 
     #[test]
@@ -4517,6 +5173,65 @@ mod tests {
             await_catalog_admission(&mut surface).unwrap();
             assert!(!surface.help_active);
             assert_eq!(surface.picker.active(), replace);
+        }
+    }
+
+    #[test]
+    fn history_replaces_project_selection_before_accepting_a_command() {
+        let mut surface = cold_help_surface(Catalog::builtin());
+        surface.install_history_snapshot(vec![InteractiveHistoryEntry {
+            command_line: "printf history".to_owned(),
+            directory: None,
+            status: Some(0),
+            rank_bias: 0,
+        }]);
+        surface.open_project_picker(0);
+        assert!(surface.project_picker_active);
+
+        surface.open_picker(editor::PickerKind::History, "", 0, "history");
+
+        assert!(!surface.project_picker_active);
+        assert!(surface.picker.active());
+        assert_eq!(surface.picker.label(), "history");
+        let item = surface.completion.selected_item().unwrap();
+        assert_eq!(item.kind, completion::CompletionKind::History);
+        assert_eq!(item.value, "printf history");
+    }
+
+    #[test]
+    fn project_picker_replaces_deferred_help_and_palette_before_publication() {
+        for help in [true, false] {
+            let mut surface = cold_help_surface(Catalog::builtin());
+            if help {
+                surface.open_context_help("quirl data", 10);
+            } else {
+                surface.open_picker(editor::PickerKind::Palette, "", 0, "palette");
+            }
+            assert!(surface.deferred_catalog_picker.is_some());
+            let path = PathBuf::from("/tmp/project-fixture");
+            surface
+                .install_project_snapshot(InteractiveProjectSnapshot {
+                    generation: 1,
+                    projects: vec![InteractiveProjectEntry {
+                        path: path.clone(),
+                        name: "project-fixture".to_owned(),
+                    }],
+                    ..InteractiveProjectSnapshot::default()
+                })
+                .unwrap();
+            surface.open_project_picker(0);
+            surface.update_picker_query(|picker| picker.insert_query("fixture"));
+            assert!(surface.deferred_catalog_picker.is_none());
+
+            surface.begin_catalog_admission().unwrap();
+            await_catalog_admission(&mut surface).unwrap();
+
+            assert!(surface.project_picker_active);
+            assert!(!surface.help_active);
+            assert_eq!(surface.picker.query(), Some("fixture"));
+            assert_eq!(surface.picker.label(), "projects");
+            let item = surface.completion.selected_item().unwrap();
+            assert_eq!(surface.project_path_for_item(item).unwrap(), path);
         }
     }
 

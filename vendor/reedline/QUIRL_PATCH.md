@@ -15,7 +15,7 @@ Quirl owns these terminal/editor changes:
   insertions from the same batch.
 - Return typed input-limit errors through the edit-mode and engine boundaries.
 
-See [ADR 0032](../../docs/decisions/0032-bounded-simple-editor.md) for the failure
+See [ADR 0033](../../docs/decisions/0033-bounded-simple-editor.md) for the failure
 model, limits, cleanup contract, and upstream removal criteria. No new runtime
 dependencies or unsafe code are introduced. Consumer tests in `quirl-ui` exercise
 public buffer, editor, renderer, and edit-mode contracts. Real macOS/Linux PTY

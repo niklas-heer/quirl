@@ -26,6 +26,8 @@ pub(crate) enum CoordinationKind {
     Plugin,
     /// Coordinate catalog indexing, encoding, and atomic publication.
     Catalog,
+    /// Coordinate mutable project-index discovery and publication.
+    Project,
     /// Coordinate model validation, download, quarantine, and installation.
     #[cfg(test)]
     Model,
@@ -38,6 +40,7 @@ impl CoordinationKind {
         match self {
             Self::Plugin => "plugin-lockfile",
             Self::Catalog => "command-database",
+            Self::Project => "project-discovery",
             #[cfg(test)]
             Self::Model => "AI-model",
             Self::Asset => "runtime-asset",

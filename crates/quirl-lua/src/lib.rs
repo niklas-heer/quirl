@@ -119,6 +119,18 @@ pub const MAX_COMMAND_DETAILS_BYTES: usize = 16 * 1024;
 pub const MAX_COMMAND_TYPE_BYTES: usize = 256;
 /// Maximum number of custom palettes retained from one configuration.
 pub const MAX_CUSTOM_THEMES: usize = 32;
+/// Maximum configured project discovery roots retained from one configuration.
+pub const MAX_PROJECT_ROOTS: usize = 64;
+/// Maximum configured project discovery exclusions retained from one configuration.
+pub const MAX_PROJECT_EXCLUDES: usize = 256;
+/// Maximum UTF-8 byte length of one configured project path.
+pub const MAX_PROJECT_PATH_BYTES: usize = 4 * 1024;
+/// Minimum periodic project-index refresh interval, in seconds.
+pub const MIN_PROJECT_REFRESH_INTERVAL_SECONDS: u32 = 60;
+/// Maximum periodic project-index refresh interval, in seconds.
+pub const MAX_PROJECT_REFRESH_INTERVAL_SECONDS: u32 = 24 * 60 * 60;
+/// Maximum configured directory depth traversed during project discovery.
+pub const MAX_PROJECT_DISCOVERY_DEPTH: u16 = 64;
 /// Maximum UTF-8 byte length accepted for a selected or custom theme name.
 pub const MAX_THEME_NAME_BYTES: usize = 64;
 /// Number of popular named palettes shipped in addition to the `ansi` fallback.
@@ -126,7 +138,9 @@ pub const POPULAR_THEME_COUNT: usize = 30;
 /// Built-in palette selected by a default or migrated configuration.
 pub const DEFAULT_THEME_NAME: &str = "tokyo-night";
 /// Configuration schema version emitted after validation and migration.
-pub const CONFIG_SCHEMA_VERSION: u32 = 4;
+pub const CONFIG_SCHEMA_VERSION: u32 = 5;
+/// Configuration schema version preceding project discovery settings.
+pub const CONFIG_SCHEMA_VERSION_V4: u32 = 4;
 /// Historical configuration schema version retained for migration evidence.
 pub const CONFIG_SCHEMA_VERSION_V3: u32 = 3;
 /// Oldest configuration version accepted by the deterministic migration path.
@@ -137,11 +151,13 @@ pub const CONFIG_OLDEST_READABLE_VERSION: u32 = 0;
 pub const MAX_LUA_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 /// Historical v3 descriptor retained verbatim for compatibility review.
 pub const CONFIG_SCHEMA_DESCRIPTOR_V3: &str = "quirl.config@3{QuirlConfig{deny_unknown;schema_version:u32(default=3,legacy=0|1|2-migrates-to-3);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=full)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);theme:string(default=tokyo-night);themes:map<string,ThemeColors>(max=32,default={});statusline:StatuslineConfig(default)};ThemeColors{deny_unknown;accent_command:#RRGGBB;accent_data:#RRGGBB;context_primary:#RRGGBB;context_secondary:#RRGGBB;muted:#RRGGBB;border:#RRGGBB;status_background:#RRGGBB;error:#RRGGBB;warning:#RRGGBB;hint:#RRGGBB;string:#RRGGBB;operator:#RRGGBB;expansion:#RRGGBB;number:#RRGGBB};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=false);min_chars:u16(0..=4096,default=2)};builtins:ansi|ayu-dark|catppuccin-mocha|cobalt-2|dracula|everforest-dark-medium|github-dark|gotham|gruvbox-dark|horizon-dark|kanagawa-wave|material|monokai-dark|moonfly|night-owl|nord|oceanic-next|one-dark|one-half-black|oxocarbon-dark|palenight|papercolor-dark|rose-pine-moon|snazzy|solarized-dark|sonokai|srcery|synthwave|tokyo-night|tomorrow-night|zenburn;migration:unversioned-or-v1-or-v2-to-v3}";
+/// Historical v4 descriptor retained verbatim for compatibility review.
+pub const CONFIG_SCHEMA_DESCRIPTOR_V4: &str = "quirl.config@4{QuirlConfig{deny_unknown;schema_version:u32(default=4,legacy=0|1|2|3-migrates-to-4);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=compact)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=rust_version,jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);theme:string(default=tokyo-night);themes:map<string,ThemeColors>(max=32,default={});statusline:StatuslineConfig(default)};ThemeColors{deny_unknown;accent_command:#RRGGBB;accent_data:#RRGGBB;context_primary:#RRGGBB;context_secondary:#RRGGBB;muted:#RRGGBB;border:#RRGGBB;status_background:#RRGGBB;error:#RRGGBB;warning:#RRGGBB;hint:#RRGGBB;string:#RRGGBB;operator:#RRGGBB;expansion:#RRGGBB;number:#RRGGBB};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=true);min_chars:u16(0..=4096,default=1)};builtins:ansi|ayu-dark|catppuccin-mocha|cobalt-2|dracula|everforest-dark-medium|github-dark|gotham|gruvbox-dark|horizon-dark|kanagawa-wave|material|monokai-dark|moonfly|night-owl|nord|oceanic-next|one-dark|one-half-black|oxocarbon-dark|palenight|papercolor-dark|rose-pine-moon|snazzy|solarized-dark|sonokai|srcery|synthwave|tokyo-night|tomorrow-night|zenburn;migration:unversioned-or-v1-or-v2-or-v3-to-v4}";
 /// Canonical structural descriptor for the deny-unknown configuration contract.
 ///
 /// The descriptor includes defaults, value domains, and migration policy so its
 /// fingerprint changes whenever a reader-visible configuration rule changes.
-pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@4{QuirlConfig{deny_unknown;schema_version:u32(default=4,legacy=0|1|2|3-migrates-to-4);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=compact)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=rust_version,jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);theme:string(default=tokyo-night);themes:map<string,ThemeColors>(max=32,default={});statusline:StatuslineConfig(default)};ThemeColors{deny_unknown;accent_command:#RRGGBB;accent_data:#RRGGBB;context_primary:#RRGGBB;context_secondary:#RRGGBB;muted:#RRGGBB;border:#RRGGBB;status_background:#RRGGBB;error:#RRGGBB;warning:#RRGGBB;hint:#RRGGBB;string:#RRGGBB;operator:#RRGGBB;expansion:#RRGGBB;number:#RRGGBB};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=true);min_chars:u16(0..=4096,default=1)};builtins:ansi|ayu-dark|catppuccin-mocha|cobalt-2|dracula|everforest-dark-medium|github-dark|gotham|gruvbox-dark|horizon-dark|kanagawa-wave|material|monokai-dark|moonfly|night-owl|nord|oceanic-next|one-dark|one-half-black|oxocarbon-dark|palenight|papercolor-dark|rose-pine-moon|snazzy|solarized-dark|sonokai|srcery|synthwave|tokyo-night|tomorrow-night|zenburn;migration:unversioned-or-v1-or-v2-or-v3-to-v4}";
+pub const CONFIG_SCHEMA_DESCRIPTOR: &str = "quirl.config@5{QuirlConfig{deny_unknown;schema_version:u32(default=5,legacy=0|1|2|3|4-migrates-to-5);editor:EditorConfig(default);picker:PickerConfig(default);prompt:PromptConfig(default);ui:UiConfig(default);completion:CompletionConfig(default);projects:ProjectsConfig(default)};EditorConfig{deny_unknown;keymap:emacs|vim|helix(default=emacs);semantic_hints:bool(default=true);banner:full|compact|none(default=compact)};PickerConfig{deny_unknown;layout:adaptive|bottom|full(default=adaptive);preview:bool(default=true)};PromptConfig{deny_unknown;symbols:auto|plain|unicode|nerd_font(default=auto);left:array<string>(default=directory,git_branch,git_state);right:array<string>(default=rust_version,jobs,duration,status);transient:bool(default=true)};UiConfig{deny_unknown;surface:auto|rich|simple(default=auto);theme:string(default=tokyo-night);themes:map<string,ThemeColors>(max=32,default={});statusline:StatuslineConfig(default)};ThemeColors{deny_unknown;accent_command:#RRGGBB;accent_data:#RRGGBB;context_primary:#RRGGBB;context_secondary:#RRGGBB;muted:#RRGGBB;border:#RRGGBB;status_background:#RRGGBB;error:#RRGGBB;warning:#RRGGBB;hint:#RRGGBB;string:#RRGGBB;operator:#RRGGBB;expansion:#RRGGBB;number:#RRGGBB};StatuslineConfig{deny_unknown;hints:bool(default=true)};CompletionConfig{deny_unknown;auto:bool(default=true);min_chars:u16(0..=4096,default=1)};ProjectsConfig{deny_unknown;discovery:auto|disabled(default=auto);roots:array<string>(max=64,path_bytes=4096,absolute-or-home-relative,default=[]);excludes:array<string>(max=256,path_bytes=4096,absolute-or-home-relative,default=[]);refresh_interval_seconds:u32(60..=86400,default=900);max_depth:u16(1..=64,default=8);follow_symlinks:bool(default=false)};builtins:ansi|ayu-dark|catppuccin-mocha|cobalt-2|dracula|everforest-dark-medium|github-dark|gotham|gruvbox-dark|horizon-dark|kanagawa-wave|material|monokai-dark|moonfly|night-owl|nord|oceanic-next|one-dark|one-half-black|oxocarbon-dark|palenight|papercolor-dark|rose-pine-moon|snazzy|solarized-dark|sonokai|srcery|synthwave|tokyo-night|tomorrow-night|zenburn;migration:unversioned-or-v1-or-v2-or-v3-or-v4-to-v5}";
 
 /// Return the deterministic fingerprint of [`CONFIG_SCHEMA_DESCRIPTOR`].
 pub fn config_schema_hash() -> String {
@@ -428,7 +444,7 @@ impl Default for LuaPolicy {
 #[serde(deny_unknown_fields)]
 /// Validated top-level Quirl configuration returned across the Lua boundary.
 ///
-/// Unknown fields are rejected. Legacy versions zero through three are migrated
+/// Unknown fields are rejected. Legacy versions zero through four are migrated
 /// to the current schema only after Lua evaluation and typed deserialization
 /// succeed.
 pub struct QuirlConfig {
@@ -450,6 +466,9 @@ pub struct QuirlConfig {
     /// Automatic semantic-completion behavior.
     #[serde(default)]
     pub completion: CompletionConfig,
+    /// Automatic Git project discovery and periodic refresh policy.
+    #[serde(default)]
+    pub projects: ProjectsConfig,
 }
 
 impl Default for QuirlConfig {
@@ -461,6 +480,7 @@ impl Default for QuirlConfig {
             prompt: PromptConfig::default(),
             ui: UiConfig::default(),
             completion: CompletionConfig::default(),
+            projects: ProjectsConfig::default(),
         }
     }
 }
@@ -678,6 +698,43 @@ impl Default for CompletionConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+/// Policy for bounded, background Git project discovery.
+///
+/// Paths must be absolute or use `~` as the first component. The discovery
+/// owner expands home-relative paths before traversal and applies platform
+/// defaults in addition to the configured exclusions.
+pub struct ProjectsConfig {
+    /// Discovery policy: `auto` scans bounded inferred and configured roots;
+    /// `disabled` retains explicit configuration without starting scans.
+    pub discovery: String,
+    /// Additional absolute or home-relative roots included in project scans.
+    pub roots: Vec<String>,
+    /// Additional absolute or home-relative directory trees excluded from scans.
+    pub excludes: Vec<String>,
+    /// Periodic reconciliation interval in seconds, from 60 through 86,400.
+    pub refresh_interval_seconds: u32,
+    /// Maximum directory depth traversed below any discovery root, from 1 through 64.
+    pub max_depth: u16,
+    /// Whether discovery follows directory symlinks. Disabled by default to
+    /// avoid cycles and escaping configured filesystem boundaries.
+    pub follow_symlinks: bool,
+}
+
+impl Default for ProjectsConfig {
+    fn default() -> Self {
+        Self {
+            discovery: "auto".to_owned(),
+            roots: Vec::new(),
+            excludes: Vec::new(),
+            refresh_interval_seconds: 15 * 60,
+            max_depth: 8,
+            follow_symlinks: false,
+        }
+    }
+}
+
 impl QuirlConfig {
     /// Revalidate configuration received from persistence or a worker protocol.
     pub fn validate(&self, source: &str) -> Result<(), ShellError> {
@@ -729,6 +786,45 @@ impl QuirlConfig {
             return Err(validation_error(
                 source,
                 "completion.min_chars must be at most 4096",
+            ));
+        }
+        self.validate_projects(source)?;
+        Ok(())
+    }
+
+    fn validate_projects(&self, source: &str) -> Result<(), ShellError> {
+        if !matches!(self.projects.discovery.as_str(), "auto" | "disabled") {
+            return Err(validation_error(
+                source,
+                "projects.discovery must be `auto` or `disabled`",
+            ));
+        }
+        validate_project_paths(
+            source,
+            "projects.roots",
+            &self.projects.roots,
+            MAX_PROJECT_ROOTS,
+        )?;
+        validate_project_paths(
+            source,
+            "projects.excludes",
+            &self.projects.excludes,
+            MAX_PROJECT_EXCLUDES,
+        )?;
+        if !(MIN_PROJECT_REFRESH_INTERVAL_SECONDS..=MAX_PROJECT_REFRESH_INTERVAL_SECONDS)
+            .contains(&self.projects.refresh_interval_seconds)
+        {
+            return Err(validation_error(
+                source,
+                format!(
+                    "projects.refresh_interval_seconds must be from {MIN_PROJECT_REFRESH_INTERVAL_SECONDS} through {MAX_PROJECT_REFRESH_INTERVAL_SECONDS}"
+                ),
+            ));
+        }
+        if !(1..=MAX_PROJECT_DISCOVERY_DEPTH).contains(&self.projects.max_depth) {
+            return Err(validation_error(
+                source,
+                format!("projects.max_depth must be from 1 through {MAX_PROJECT_DISCOVERY_DEPTH}"),
             ));
         }
         Ok(())
@@ -807,6 +903,53 @@ fn validate_theme_name(source: &str, description: &str, name: &str) -> Result<()
             source,
             format!("{description} `{name}` must use lowercase ASCII letters, digits, or dash"),
         ));
+    }
+    Ok(())
+}
+
+fn validate_project_paths(
+    source: &str,
+    field: &str,
+    paths: &[String],
+    count_max: usize,
+) -> Result<(), ShellError> {
+    if paths.len() > count_max {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            format!("{field} exceeds its configured entry limit"),
+        )
+        .with_context(format!("entries: {}; limit: {count_max}", paths.len()))
+        .with_label(Some(source.to_owned()), 0, 0, "too many project paths")
+        .with_help("Remove unused project paths from this configuration"));
+    }
+    let mut unique = HashSet::with_capacity(paths.len());
+    for path in paths {
+        if path.len() > MAX_PROJECT_PATH_BYTES {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                format!("{field} path exceeds its byte limit"),
+            )
+            .with_context(format!(
+                "bytes: {}; limit: {MAX_PROJECT_PATH_BYTES}",
+                path.len()
+            ))
+            .with_label(Some(source.to_owned()), 0, 0, "project path is too long")
+            .with_help("Use a shorter absolute or home-relative project path"));
+        }
+        let is_home_relative = path == "~" || path.starts_with("~/");
+        let is_safe_text = !path.is_empty() && !path.bytes().any(|byte| byte.is_ascii_control());
+        if !is_safe_text || (!Path::new(path).is_absolute() && !is_home_relative) {
+            return Err(validation_error(
+                source,
+                format!("{field} entries must be non-empty absolute paths or start with `~/`"),
+            ));
+        }
+        if !unique.insert(path) {
+            return Err(validation_error(
+                source,
+                format!("{field} must not contain duplicate paths"),
+            ));
+        }
     }
     Ok(())
 }
@@ -3505,6 +3648,14 @@ pub fn sdk_lua() -> String {
         "Auto detects terminals with bundled Nerd symbols; nerd_font enables them explicitly elsewhere.",
     );
     output = output.replace(
+        "---@class quirl.Config\n---@field schema_version? integer",
+        "---@alias quirl.ProjectDiscovery 'auto'|'disabled'\n\n---@class quirl.ProjectsConfig\n---@field discovery? quirl.ProjectDiscovery Automatically discover Git projects or disable scanning.\n---@field roots? string[] Additional absolute or home-relative scan roots; at most 64.\n---@field excludes? string[] Additional absolute or home-relative exclusions; at most 256.\n---@field refresh_interval_seconds? integer Periodic refresh interval from 60 through 86400 seconds.\n---@field max_depth? integer Maximum scan depth from 1 through 64.\n---@field follow_symlinks? boolean Disabled by default to avoid cycles and boundary escapes.\n\n---@class quirl.Config\n---@field schema_version? integer",
+    );
+    output = output.replace(
+        "---@field completion? quirl.CompletionConfig",
+        "---@field completion? quirl.CompletionConfig\n---@field projects? quirl.ProjectsConfig",
+    );
+    output = output.replace(
         "---@field run fun(arguments: table): any",
         "---@field run fun(context: quirl.Context): quirl.RunnerResult",
     );
@@ -5643,7 +5794,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_configs_through_v3_migrate_to_v4_and_future_versions_fail() {
+    fn legacy_configs_through_v4_migrate_to_v5_and_future_versions_fail() {
         let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
         let legacy = runtime
             .lua
@@ -5667,12 +5818,16 @@ mod tests {
             let migrated = runtime.load_config_file(&path).unwrap();
             assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
             assert_eq!(migrated.ui.theme, DEFAULT_THEME_NAME);
+            assert_eq!(migrated.projects, ProjectsConfig::default());
             fs::remove_file(path).unwrap();
         }
 
         let future = runtime
             .lua
-            .load("return quirl.config { schema_version = 5 }")
+            .load(format!(
+                "return quirl.config {{ schema_version = {} }}",
+                CONFIG_SCHEMA_VERSION + 1
+            ))
             .eval::<Value>()
             .unwrap();
         let future = runtime.lua.from_value::<QuirlConfig>(future).unwrap();
@@ -5683,12 +5838,90 @@ mod tests {
     fn config_schema_descriptor_has_a_stable_identity() {
         assert_eq!(CONFIG_OLDEST_READABLE_VERSION, 0);
         assert_eq!(CONFIG_SCHEMA_VERSION_V3, 3);
+        assert_eq!(CONFIG_SCHEMA_VERSION_V4, 4);
         assert_eq!(
             quirl_core::schema_fingerprint(CONFIG_SCHEMA_DESCRIPTOR_V3),
             "fnv1a64:ecd91686169f6b26"
         );
-        assert!(CONFIG_SCHEMA_DESCRIPTOR.contains("migration:unversioned-or-v1-or-v2-or-v3-to-v4"));
-        assert_eq!(config_schema_hash(), "fnv1a64:b0ba5db7062a85c2");
+        assert_eq!(
+            quirl_core::schema_fingerprint(CONFIG_SCHEMA_DESCRIPTOR_V4),
+            "fnv1a64:b0ba5db7062a85c2"
+        );
+        assert!(
+            CONFIG_SCHEMA_DESCRIPTOR
+                .contains("migration:unversioned-or-v1-or-v2-or-v3-or-v4-to-v5")
+        );
+        assert_eq!(config_schema_hash(), "fnv1a64:0b0dbd3766c46215");
+    }
+
+    #[test]
+    fn project_discovery_defaults_are_bounded_and_safe() {
+        let projects = ProjectsConfig::default();
+
+        assert_eq!(projects.discovery, "auto");
+        assert!(projects.roots.is_empty());
+        assert!(projects.excludes.is_empty());
+        assert_eq!(projects.refresh_interval_seconds, 900);
+        assert_eq!(projects.max_depth, 8);
+        assert!(!projects.follow_symlinks);
+        QuirlConfig::default().validate("default.lua").unwrap();
+    }
+
+    #[test]
+    fn project_discovery_rejects_invalid_bounds_paths_and_list_counts() {
+        let mut config = QuirlConfig::default();
+        config.projects.refresh_interval_seconds = MIN_PROJECT_REFRESH_INTERVAL_SECONDS - 1;
+        assert!(
+            config
+                .validate("refresh.lua")
+                .unwrap_err()
+                .message
+                .contains("refresh")
+        );
+
+        config.projects.refresh_interval_seconds = MIN_PROJECT_REFRESH_INTERVAL_SECONDS;
+        config.projects.max_depth = 0;
+        assert!(
+            config
+                .validate("depth.lua")
+                .unwrap_err()
+                .message
+                .contains("max_depth")
+        );
+
+        config.projects.max_depth = 1;
+        config.projects.roots = vec!["relative/project".to_owned()];
+        assert!(
+            config
+                .validate("path.lua")
+                .unwrap_err()
+                .message
+                .contains("absolute")
+        );
+
+        config.projects.roots = vec!["~/project\nother".to_owned()];
+        assert!(
+            config
+                .validate("control.lua")
+                .unwrap_err()
+                .message
+                .contains("absolute")
+        );
+
+        config.projects.roots = (0..=MAX_PROJECT_ROOTS)
+            .map(|index| format!("~/project-{index}"))
+            .collect();
+        let error = config.validate("roots.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains(&format!("limit: {MAX_PROJECT_ROOTS}")));
+
+        config.projects.roots.clear();
+        config.projects.excludes = (0..=MAX_PROJECT_EXCLUDES)
+            .map(|index| format!("~/excluded-{index}"))
+            .collect();
+        let error = config.validate("excludes.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains(&format!("limit: {MAX_PROJECT_EXCLUDES}")));
     }
 
     #[test]

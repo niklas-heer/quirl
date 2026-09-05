@@ -46,6 +46,7 @@ pub enum PickerKind {
     History,
     Files,
     Directories,
+    Projects,
     Palette,
     Jobs,
     Data,
@@ -53,7 +54,7 @@ pub enum PickerKind {
 
 impl PickerKind {
     pub const fn bottom_anchored(self) -> bool {
-        matches!(self, Self::Palette)
+        matches!(self, Self::Palette | Self::Projects)
     }
 }
 
@@ -826,6 +827,7 @@ mod tests {
 
         assert_eq!(action, EditAction::KillToEnd);
         assert!(PickerKind::Palette.bottom_anchored());
+        assert!(PickerKind::Projects.bottom_anchored());
         assert!(!PickerKind::History.bottom_anchored());
     }
 

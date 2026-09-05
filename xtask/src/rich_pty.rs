@@ -640,9 +640,34 @@ fn enter_and_wait(
     command: &str,
     marker: &[u8],
 ) -> Result<Vec<u8>, TaskError> {
+    let start = session.pty.output().len();
     session.pty.type_text(command)?;
     session.pty.send(key::ENTER)?;
-    session.pty.wait_for(marker)
+    session.pty.wait_for_since(marker, start, default_timeout())
+}
+
+/// Cancel once and observe a completed redraw with empty input.
+/// Editing cancellation retains its terminal lease, unlike command execution;
+/// a fresh frame and cleared editor are the relevant readiness boundary.
+fn cancel_rich_and_resume(session: &mut Session) -> Result<(), TaskError> {
+    let start = session.pty.output().len();
+    session.pty.send(key::CTRL_C)?;
+    session
+        .pty
+        .wait_for_since(b"\x1b[?25h", start, default_timeout())?;
+    session
+        .pty
+        .wait_for_screen("completed empty editor after cancellation", |screen| {
+            screen.has_completed_frame()
+                && screen
+                    .lines()
+                    .iter()
+                    .any(|line| [">", "❯", "> D", "▦", "> AI", "✧"].contains(&line.trim()))
+                && ["NORMAL", "DATA", "AI"]
+                    .iter()
+                    .any(|mode| screen.bottom_line().contains(mode))
+        })?;
+    Ok(())
 }
 
 fn wait_for_rich_input_since(session: &mut Session, start: usize) -> Result<(), TaskError> {
@@ -664,7 +689,8 @@ fn execute_and_resume(session: &mut Session, command: &str) -> Result<(), TaskEr
         .pty
         .wait_for_screen("completed command in persistent viewport", |screen| {
             let text = screen.text();
-            text.contains(&command_record)
+            screen.has_completed_frame()
+                && text.contains(&command_record)
                 && text.contains("── exit ")
                 && screen.bottom_line().contains("NORMAL")
         })?;
@@ -689,10 +715,12 @@ fn execute_and_resume_with_marker(
     session.pty.wait_for_screen(
         &format!("command marker {marker:?} in persistent viewport"),
         |screen| {
-            screen.lines().iter().any(|line| {
-                let line = line.trim_start();
-                !line.starts_with(['❯', '>', '∙']) && line.contains(marker)
-            }) && screen.bottom_line().contains("NORMAL")
+            screen.has_completed_frame()
+                && screen.lines().iter().any(|line| {
+                    let line = line.trim_start();
+                    !line.starts_with(['❯', '>', '∙']) && line.contains(marker)
+                })
+                && screen.bottom_line().contains("NORMAL")
         },
     )?;
     session
@@ -776,8 +804,7 @@ fn check_discovery_preserves_command_intent(binary: &Path) -> Result<(), TaskErr
             screen.text().contains("git status [--short]")
                 && !screen.text().contains("history picker")
         })?;
-    session.pty.send(key::CTRL_C)?;
-    session.pty.wait_for(b"^C")?;
+    cancel_rich_and_resume(&mut session)?;
     session.pty.type_text("git status | quirl data")?;
     session.pty.send(b"\x1bOP")?;
     session
@@ -791,7 +818,7 @@ fn check_discovery_preserves_command_intent(binary: &Path) -> Result<(), TaskErr
     session
         .pty
         .wait_for_screen_text("git status | quirl data")?;
-    session.pty.send(key::CTRL_C)?;
+    cancel_rich_and_resume(&mut session)?;
     session.pty.drain_for(Duration::from_millis(100))?;
     pick_file_and_read(
         &mut session,
@@ -937,8 +964,7 @@ fn check_rich_editing(binary: &Path) -> Result<(), TaskError> {
     session.pty.wait_for(b"CTRLD_OK")?;
     wait_for_rich_input_since(&mut session, ctrl_d_start)?;
     session.pty.type_text("/usr/bin/printf SHOULD_NOT_RUN")?;
-    session.pty.send(key::CTRL_C)?;
-    session.pty.wait_for(b"^C")?;
+    cancel_rich_and_resume(&mut session)?;
     execute_and_resume_with_marker(&mut session, "/usr/bin/printf AFTER_CTRLC", b"AFTER_CTRLC")?;
     session.pty.send(key::ALT_Q)?;
     session.pty.send(b"d")?;
@@ -1771,8 +1797,7 @@ fn check_completion(binary: &Path) -> Result<(), TaskError> {
     session.pty.wait_for(b"git status [--short]")?;
     session.pty.send(key::ESCAPE)?;
     session.pty.drain_for(Duration::from_millis(200))?;
-    session.pty.send(key::CTRL_C)?;
-    session.pty.wait_for(b"^C")?;
+    cancel_rich_and_resume(&mut session)?;
     session.pty.type_text("git st")?;
     session.pty.send(b"\t")?;
     session.pty.wait_for(b"git status [--short]")?;
@@ -1796,8 +1821,7 @@ fn check_completion(binary: &Path) -> Result<(), TaskError> {
     session.pty.wait_for(b"zzzz-no-match")?;
     session.pty.send(key::ESCAPE)?;
     session.pty.drain_for(Duration::from_millis(100))?;
-    session.pty.send(key::CTRL_C)?;
-    session.pty.wait_for(b"^C")?;
+    cancel_rich_and_resume(&mut session)?;
     send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     Ok(())
 }
@@ -1826,6 +1850,7 @@ fn check_deferred_catalog_admission(binary: &Path) -> Result<(), TaskError> {
     {
         return Err(io::Error::other("catalog gate did not run inside owned raw mode").into());
     }
+    let queued_start = session.pty.output().len();
     session
         .pty
         .send(b"\x1b[200~/usr/bin/printf QUEUED_AFTER_ADMISSION\x1b[201~\r")?;
@@ -1846,11 +1871,11 @@ fn check_deferred_catalog_admission(binary: &Path) -> Result<(), TaskError> {
                 && text.contains("QUEUED_AFTER_ADMISSION")
                 && screen.bottom_line().contains("result kept in viewport")
         })?;
+    wait_for_rich_input_since(&mut session, queued_start)?;
     session.pty.type_text("git st")?;
     session.pty.send(b"\t")?;
     session.pty.wait_for(b"git status [--short]")?;
-    session.pty.send(key::CTRL_C)?;
-    session.pty.wait_for(b"^C")?;
+    cancel_rich_and_resume(&mut session)?;
     send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     Ok(())
 }
@@ -1909,7 +1934,7 @@ fn check_cold_context_help(binary: &Path) -> Result<(), TaskError> {
             screen.lines().iter().any(|line| line == &editor_line)
                 && !screen.text().contains("catalog help")
         })?;
-    session.pty.send(key::CTRL_C)?;
+    cancel_rich_and_resume(&mut session)?;
     session
         .pty
         .wait_for_screen("cold F1 cancellation restores empty input", |screen| {
@@ -1966,7 +1991,7 @@ fn check_cold_catalog_intents(binary: &Path) -> Result<(), TaskError> {
         } else {
             session.pty.wait_for_screen_text("git status [--short]")?;
         }
-        session.pty.send(key::CTRL_C)?;
+        cancel_rich_and_resume(&mut session)?;
         session
             .pty
             .wait_for_screen("cold intent cancellation restores input", |screen| {
@@ -2584,6 +2609,7 @@ fn check_full_screen_program_takeover(binary: &Path) -> Result<(), TaskError> {
         .wait_for_screen("rich viewport reacquired after takeover", |screen| {
             screen.bottom_line().contains("NORMAL")
         })?;
+    wait_for_rich_input_since(&mut session, output_start)?;
     execute_and_resume(&mut session, "/usr/bin/printf AFTER_%s TAKEOVER")?;
     ensure_status(
         send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
@@ -2614,6 +2640,7 @@ fn check_full_screen_program_spawn_failure_restores_terminal(
         },
     )?;
     session.pty.wait_for(STARTUP_MARKER)?;
+    let takeover_start = session.pty.output().len();
     session.pty.type_text("lazygit")?;
     session.pty.send(key::ENTER)?;
     session.pty.wait_for_screen(
@@ -2623,6 +2650,10 @@ fn check_full_screen_program_spawn_failure_restores_terminal(
             text.contains("could not start") && screen.bottom_line().contains("NORMAL")
         },
     )?;
+    // Error/footer painting can happen before the replacement editor acquires
+    // raw input. Sending here on visible text alone feeds cooked echo and can
+    // lose the only Enter; require this takeover's fresh terminal lease.
+    wait_for_rich_input_since(&mut session, takeover_start)?;
     execute_and_resume(&mut session, "/usr/bin/printf AFTER_SPAWN_FAILURE")?;
     ensure_status(
         send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
@@ -2791,7 +2822,7 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), TaskError> {
     session.pty.drain_for(Duration::from_millis(200))?;
     session.pty.send(b"\x1b[200~resize-safe\x1b[201~")?;
     session.pty.wait_for(b"resize-safe")?;
-    session.pty.send(key::CTRL_C)?;
+    cancel_rich_and_resume(&mut session)?;
     session
         .pty
         .wait_for_screen("tiny viewport cancellation status", |screen| {
@@ -2821,6 +2852,7 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), TaskError> {
         background_start,
         "rich background-command rejection",
     )?;
+    wait_for_rich_input_since(&mut session, background_start)?;
     session.pty.send(key::ALT_Q)?;
     session.pty.send(b"d")?;
     session
@@ -2832,14 +2864,15 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), TaskError> {
                 .any(|line| line.contains("DATA") && line.contains("Alt-Q Quirl"))
         })?;
     session.pty.type_text("[1,2]")?;
+    let result_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
+    wait_for_rich_input_since(&mut session, result_start)?;
     session.pty.send(key::ALT_Q)?;
     session.pty.send(b"r")?;
     session.pty.wait_for(b"cached typed result")?;
     session.pty.send(key::ESCAPE)?;
     session.pty.drain_for(Duration::from_millis(100))?;
-    session.pty.send(key::CTRL_C)?;
-    session.pty.wait_for(b"^C")?;
+    cancel_rich_and_resume(&mut session)?;
     let csv_path = session.private.path.join("stream.csv");
     let mut stream = BufWriter::new(File::create(&csv_path)?);
     writeln!(stream, "name")?;
@@ -2850,6 +2883,7 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), TaskError> {
     session
         .pty
         .type_text(&format!("open {}", shell_quote(&csv_path)))?;
+    let stream_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session.pty.wait_for_screen(
         "bounded large data output returned to rich editor",
@@ -2860,6 +2894,7 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), TaskError> {
                 && screen.bottom_line().contains("DATA")
         },
     )?;
+    wait_for_rich_input_since(&mut session, stream_start)?;
     session.pty.send(key::ALT_Q)?;
     session.pty.send(b"i")?;
     session
@@ -2883,6 +2918,7 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), TaskError> {
     session
         .pty
         .type_text("lua return quirl.process.run('/bin/sleep 30')")?;
+    let lua_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session
         .pty
@@ -2890,6 +2926,7 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), TaskError> {
             screen.text().contains("exceeded its deadline")
                 && screen.bottom_line().contains("NORMAL")
         })?;
+    wait_for_rich_input_since(&mut session, lua_start)?;
     execute_and_resume(
         &mut session,
         "/usr/bin/printf AFTER_%s DATA_CANCEL_RESTORED",
@@ -2938,15 +2975,16 @@ fn check_rich_review_regressions(binary: &Path) -> Result<(), TaskError> {
     session.pty.drain_for(Duration::from_millis(100))?;
     session.pty.send(key::ENTER)?;
     session.pty.type_text("atus")?;
+    let git_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session.pty.wait_for_screen_text("not a git repository")?;
+    wait_for_rich_input_since(&mut session, git_start)?;
     let long_line = format!("echo {}VIEWPORT-END", "x".repeat(180));
     session.pty.send(b"\x1b[200~")?;
     session.pty.type_text(&long_line)?;
     session.pty.send(b"\x1b[201~")?;
     session.pty.wait_for(b"VIEWPORT-END")?;
-    session.pty.send(key::CTRL_C)?;
-    session.pty.wait_for(b"^C")?;
+    cancel_rich_and_resume(&mut session)?;
     // The cancellation marker is emitted before the rich surface finishes
     // its replacement frame. Wait for that complete idle frame so Ctrl-D
     // cannot race the cancellation repaint and make this cleanup assertion
@@ -2977,8 +3015,7 @@ fn check_rich_review_regressions(binary: &Path) -> Result<(), TaskError> {
     ) {
         return Err(io::Error::other("semantic_hints=false rendered diagnostic").into());
     }
-    no_hints.pty.send(key::CTRL_C)?;
-    no_hints.pty.wait_for(b"^C")?;
+    cancel_rich_and_resume(&mut no_hints)?;
     send_ctrl_d_and_wait_for_exit(&mut no_hints.pty)?;
     Ok(())
 }
@@ -3199,6 +3236,7 @@ fn check_noninteractive_dialect_islands(binary: &Path) -> Result<(), TaskError> 
         b"ISLAND_STDIN_CLOSED",
     )?;
     session.pty.type_text("bash { sleep 30; }")?;
+    let island_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session.pty.drain_for(Duration::from_millis(200))?;
     session.pty.send(b"\x1a")?;
@@ -3206,6 +3244,7 @@ fn check_noninteractive_dialect_islands(binary: &Path) -> Result<(), TaskError> 
         "cancelled dialect island in persistent viewport",
         |screen| screen.text().contains("cancelled") && screen.bottom_line().contains("NORMAL"),
     )?;
+    wait_for_rich_input_since(&mut session, island_start)?;
     execute_and_resume_with_marker(
         &mut session,
         "/usr/bin/printf AFTER_%s ISLAND_CTRLZ",
@@ -3265,8 +3304,7 @@ fn check_no_color_preserves_semantic_hints(binary: &Path) -> Result<(), TaskErro
     wait_for_rich_input_since(&mut session, 0)?;
     session.pty.type_text("quirl describe --unknown")?;
     session.pty.wait_for_screen_text("unknown flag")?;
-    session.pty.send(key::CTRL_C)?;
-    session.pty.wait_for(b"^C")?;
+    cancel_rich_and_resume(&mut session)?;
     send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     Ok(())
 }
@@ -3354,7 +3392,7 @@ fn wait_for_mode_status(session: &mut Session, mode: &str) -> Result<(), TaskErr
         .pty
         .wait_for_screen(&format!("standard {mode} bottom status"), |screen| {
             let bottom = screen.bottom_line();
-            bottom.contains(mode) && bottom.contains("Tab complete")
+            screen.has_completed_frame() && bottom.contains(mode) && bottom.contains("Tab complete")
         })?;
     Ok(())
 }
@@ -3374,7 +3412,8 @@ fn clear_editor_in_mode(session: &mut Session, mode: &str) -> Result<(), TaskErr
         .pty
         .wait_for_screen("empty editor after clear", |screen| {
             let bottom = screen.bottom_line();
-            bottom.contains(mode)
+            screen.has_completed_frame()
+                && bottom.contains(mode)
                 && bottom.contains("Tab complete")
                 && screen
                     .lines()

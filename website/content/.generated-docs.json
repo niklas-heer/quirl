@@ -26,6 +26,7 @@
   "research/bash-zsh-source-study.mdx",
   "project/release-0.1/performance-record.mdx",
   "research/benchmarks/preview-v0.1.mdx",
+  "research/benchmarks/project-discovery.mdx",
   "research/benchmarks/embedded-language-selection.mdx",
   "research/benchmarks/steel-lua-fennel.mdx",
   "architecture/decisions/0001-lua-extension-language.mdx",
@@ -55,8 +56,10 @@
   "architecture/decisions/0025-fine-tuned-command-retrieval-model.mdx",
   "architecture/decisions/0026-rust-native-releases-and-runtime-assets.mdx",
   "architecture/decisions/0027-lua-5-5-1-runtime.mdx",
+  "architecture/decisions/0028-bounded-miller-column-explorer.mdx",
   "architecture/decisions/0029-codex-command-planner.mdx",
-  "architecture/decisions/0030-level-triggered-terminal-input.mdx",
-  "architecture/decisions/0031-bounded-terminal-input.mdx",
-  "architecture/decisions/0032-bounded-simple-editor.mdx"
+  "architecture/decisions/0030-bounded-project-discovery.mdx",
+  "architecture/decisions/0031-level-triggered-terminal-input.mdx",
+  "architecture/decisions/0032-bounded-terminal-input.mdx",
+  "architecture/decisions/0033-bounded-simple-editor.mdx"
 ]

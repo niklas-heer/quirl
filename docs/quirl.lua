@@ -101,6 +101,16 @@
 ---@field auto? boolean
 ---@field min_chars? integer
 
+---@alias quirl.ProjectDiscovery 'auto'|'disabled'
+
+---@class quirl.ProjectsConfig
+---@field discovery? quirl.ProjectDiscovery Automatically discover Git projects or disable scanning.
+---@field roots? string[] Additional absolute or home-relative scan roots; at most 64.
+---@field excludes? string[] Additional absolute or home-relative exclusions; at most 256.
+---@field refresh_interval_seconds? integer Periodic refresh interval from 60 through 86400 seconds.
+---@field max_depth? integer Maximum scan depth from 1 through 64.
+---@field follow_symlinks? boolean Disabled by default to avoid cycles and boundary escapes.
+
 ---@class quirl.Config
 ---@field schema_version? integer
 ---@field editor? quirl.EditorConfig
@@ -108,6 +118,7 @@
 ---@field prompt? quirl.PromptConfig
 ---@field ui? quirl.UiConfig
 ---@field completion? quirl.CompletionConfig
+---@field projects? quirl.ProjectsConfig
 
 ---@class quirl.PromptSegment
 ---@field name string

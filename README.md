@@ -90,7 +90,8 @@ network request is needed. Type `mode normal` to return to familiar commands.
 Press **Ctrl-D on an empty input line** to return to your previous shell.
 
 **Tab** opens completion, **F1** explains the command under your cursor, and
-**Ctrl-R** searches history. Current source builds also provide `help` as a starting point. The
+**Ctrl-R** searches history. Current source builds also provide `help` as a
+starting point and **Alt-Q**, then **g**, to jump among discovered Git projects. The
 [five-minute first session](website/content/docs/getting-started/first-session.mdx)
 shows expected output, mode shortcuts, and optional AI planning.
 
