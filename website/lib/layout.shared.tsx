@@ -9,7 +9,7 @@ export function baseOptions(): BaseLayoutProps {
         <span className="brand-lockup">
           <Image src="/logo.png" alt="" width={28} height={28} priority />
           <span>{appName}</span>
-          <span className="brand-status">v0.1.0</span>
+          <span className="brand-status">v0.2.0</span>
         </span>
       ),
     },

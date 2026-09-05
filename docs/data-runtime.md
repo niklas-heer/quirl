@@ -1,4 +1,4 @@
-# Data runtime in 0.1.0
+# Data runtime in 0.2.0
 
 ## Streaming failure model and invariants
 
@@ -204,7 +204,7 @@ inspection, HTTP, background task scheduling, or a
 fully streaming JSON/YAML/TOML parser. HTTP is not implied by `open`: a future
 HTTP adapter must expose explicit request, timeout, redirect, byte, and
 capability limits. Those remain design targets rather than silently available
-0.1.0 behavior.
+0.2.0 behavior.
 
 The rich interactive data branch also uses a shared `ExecutionRequest` with an
 inherited output target. It writes terminal-safe plain values one row at a time,

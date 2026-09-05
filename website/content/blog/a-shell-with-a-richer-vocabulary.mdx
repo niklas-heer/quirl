@@ -28,7 +28,7 @@ process, JSON, or Lua is explicit in the command you can read and save.
   poster="/quirl-demo-poster.png"
   width="1200"
   height="720"
-  aria-label="Earlier 0.1-era Quirl demo with historical local AI behavior and performance figures"
+  aria-label="Quirl v0.2.0 demo: native shell commands, typed data pipelines, local command search, explicit Bash compatibility, and sandboxed Lua"
   style={{ width: '100%', height: 'auto', borderRadius: '0.75rem', background: '#000' }}
 >
   <source src="/quirl-demo.webm" type="video/webm" />
@@ -36,11 +36,14 @@ process, JSON, or Lua is explicit in the command you can read and save.
   <a href="/quirl-demo.mp4">Watch the Quirl product tour.</a>
 </video>
 
-This is an earlier 0.1-era recording. Its local AI flow and performance card
-are historical; current source uses Codex proposals for review. Follow the
-[current first session](/docs/getting-started/first-session) for today's workflow,
-and consult the [historical artifact evidence](/docs/project/release-0.1/performance-record)
-for the scope of the recorded measurements.
+Recording refreshed using a local macOS ARM release-profile build of v0.2.0
+from commit `3958920`;
+the article retains its original publication date. The
+[recording provenance](/quirl-demo-provenance.json) identifies the exact binary
+and media. Follow the [first-session guide](/docs/getting-started/first-session)
+and consult the [release measurements](/docs/research/benchmarks/release-v0.2.0).
+Local command search returns candidates to review; Codex proposals use a
+separate authenticated workflow.
 
 ## Start where you already are
 
@@ -122,22 +125,29 @@ logic within the capabilities the host grants.
 
 ## Small enough to inspect, tested like a shell
 
-The performance card in the recording describes an earlier 0.1-era artifact.
-The [historical measurement record](/docs/project/release-0.1/performance-record)
-identifies the measured artifact and environment; those figures do not measure
-current source. The repository also exercises real-PTY journeys, guest-side
-Lua tests, and bounded differential cases against available Bash and Zsh references.
+The [v0.2.0 release measurements](/docs/research/benchmarks/release-v0.2.0)
+identify the measured binaries and environments. The earlier
+[0.1 measurement record](/docs/project/release-0.1/performance-record) remains
+historical evidence for its named artifact. The refreshed recording ends with
+product boundaries rather than a performance claim. The repository also
+exercises real-PTY journeys, guest-side Lua tests, and bounded differential
+cases against available Bash and Zsh references.
 
 Those numbers matter less as trophies than as constraints. A shell owns child
 processes, terminal modes, history, configuration, and user data. Fast is good;
 restoring the terminal and reaping every child on a failure path is mandatory.
 
 Quirl's pitch is therefore simple: familiar where it should be, explicit where
-it matters. Install the official release with:
+it matters. Install through Homebrew, then check the version:
 
 ```console
 brew install niklas-heer/tap/quirl
+quirl --version
 ```
+
+Homebrew provides v0.2.0. For an existing installation, follow the
+[upgrade instructions](/docs/getting-started/installation); verified native
+archives are also available there.
 
 Then run `quirl`, press <kbd>Ctrl-Space</kbd>, and give the same prompt a richer
 vocabulary.

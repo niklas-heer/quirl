@@ -1,11 +1,11 @@
 ---
 title: Status and platforms
-description: The honest support and release-identity boundary for Quirl's 0.1 Unix line.
+description: The honest support and release-identity boundary for Quirl's 0.2 Unix line.
 ---
 
 ## Release status
 
-Quirl's 0.1 line supports interactive Linux and macOS. A build is an official
+Quirl's 0.2 line supports interactive Linux and macOS. A build is an official
 release only when an immutable GitHub tag and release name its exact commit;
 untagged source checkouts are candidate or development builds even when their
 workspace version matches a release. Release gates are tracked in the
@@ -13,12 +13,17 @@ workspace version matches a release. Release gates are tracked in the
 evidence attribution appears below.
 
 The current supported release is
-[v0.1.0](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0), published on
-22 August 2026 from commit
-`168f9f2e2f2899f7910ca64831561c8885d9ef24`. Homebrew and the four native
-Linux/macOS archives all resolve to that immutable binary release. Compatible
+[v0.2.0](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0), from commit
+`39589209ff32a0ac61af984aa31e4879edb113dd`. Install through Homebrew or use the
+verified native archive for your Linux/macOS target. Check `quirl --version`
+before following the 0.2.0 walkthrough. Compatible
 completion knowledge may advance independently through the version-scoped
 website asset channel without changing the binary version.
+
+The [v0.2.0 native release measurements](/docs/research/benchmarks/release-v0.2.0)
+identify all four published executables, their hosted runner environments,
+and the passing latency and evidence gates. The 0.1 evidence block below
+remains historical.
 
 {/* BEGIN QUIRL RELEASE EVIDENCE STATUS */}
 > **Release evidence status — historical.** Artifact evidence for measured candidate `23fd5d36907fc816bdafd9aa3c2dcb3afb69feb5` and artifact `9a893a5f1a0b49d62712f331c88966113d910d94efa9651dc4feffe9fd55b637` is historical.

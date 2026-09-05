@@ -26,7 +26,7 @@ export default function HomePage() {
       <section className="hero">
         <div className="pill">
           <span className="dot" />
-          v0.1.0 · Linux and macOS
+          v0.2.0 · Linux and macOS
         </div>
         <p className="kicker">A well-stirred shell</p>
         <h1 className="glitch-h1">
@@ -59,24 +59,26 @@ export default function HomePage() {
           </a>
         </div>
         <p className="hero-note">
-          Available now · Homebrew or native release archive
+          Available now · Homebrew and verified native release archives
         </p>
       </section>
 
       <div className="demo-wrap">
         <div
           className="cassette demo-cassette"
-          aria-label="Earlier 0.1-era Quirl recording"
+          aria-label="Quirl v0.2.0 recording"
         >
           <div className="cassette-label">
-            <span>SIDE A — EARLIER 0.1-ERA DEMO</span>
+            <span>SIDE A — QUIRL v0.2.0</span>
             <CassetteReels />
           </div>
           <HeroDemo />
           <p id="demo-recording-context" style={{ padding: '1rem', margin: 0 }}>
-            This recording&apos;s local AI flow and performance card are historical.
-            Follow the <Link href="/docs/getting-started/first-session">current first session</Link>
-            {' '}and read the <Link href="/docs/project/release-0.1/performance-record">historical artifact evidence</Link>.
+            Recorded with a local macOS ARM release-profile build of v0.2.0 from commit <code>3958920</code>.
+            {' '}See the <a href="/quirl-demo-provenance.json">recording provenance</a>,
+            {' '}<Link href="/docs/getting-started/first-session">first-session guide</Link>,
+            {' '}and <Link href="/docs/research/benchmarks/release-v0.2.0">release measurements</Link>.
+            {' '}Search results are candidates to review.
           </p>
         </div>
       </div>
@@ -285,9 +287,9 @@ export default function HomePage() {
             <CassetteReels />
           </div>
           <div className="cassette-body">
-            <h2>The 0.1 release is here.</h2>
+            <h2>The 0.2 release is here.</h2>
             <p>
-              Quirl 0.1.0 is available for Linux and macOS through Homebrew
+              Quirl 0.2.0 is available for Linux and macOS through Homebrew
               and immutable native release archives. The docs separate
               current usage and runtime contracts from long-term direction
               and exact-artifact evidence.

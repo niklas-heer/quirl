@@ -23,9 +23,47 @@ This checklist uses two explicit revisions:
   rebuilds, or relabels A. Any code, manifest, generated-contract, dependency,
   or release-profile change requires a new candidate A and a fresh gate.
 
-## v0.1.0 publication record
+## v0.2.0 publication record
 
-Quirl 0.1.0 is published and supported:
+Quirl 0.2.0 was published on 5 September 2026:
+
+- The nondraft, immutable
+  [`v0.2.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0)
+  and tag identify candidate commit
+  `39589209ff32a0ac61af984aa31e4879edb113dd`. All 15 published asset digests and
+  byte counts matched the independently verified release bundle.
+- Candidate verification, all four native packages, downloadable assets,
+  aggregation, and publication succeeded in
+  [release run 33989045593](https://github.com/niklas-heer/quirl/actions/runs/33989045593).
+  All four exact native executables passed their enforcing performance gates:
+  101 successful automated PTY samples per target, 404 in total. The
+  [0.2.0 performance record](benchmarks/release-v0.2.0.md) links the unchanged
+  schema 8 reports, executable hashes, runner details, and measurement limits.
+- The composed release run is marked failed because its downstream Homebrew
+  PR job received an empty private-key input. The standalone
+  [Homebrew run 33990534633](https://github.com/niklas-heer/quirl/actions/runs/33990534633)
+  succeeded; [tap PR 7](https://github.com/niklas-heer/homebrew-tap/pull/7)
+  merged as `e6b2880dcac33f825dd36327331a560e62c84511`. Its four archive URLs
+  and hashes matched the published manifest. Recovery did not replace any
+  release asset or move the version tag.
+- The release-dispatched
+  [website asset run 33990164031](https://github.com/niklas-heer/quirl/actions/runs/33990164031)
+  admitted the version-scoped channel with the released binary and pushed
+  asset evidence commit `2981d379f046dbee6ebb56bf6291d27c4aa23616`.
+- The fresh [terminal recording](https://quirl.vercel.app/quirl-demo.mp4) and
+  [capture provenance](https://quirl.vercel.app/quirl-demo-provenance.json)
+  identify a clean local ARM64 macOS build of the same candidate using the
+  official release profile. Its binary digest differs from the hosted release
+  asset, so the recording is not attributed to the distributed executable.
+  VHS captured 71.2 seconds in a real PTY; the provenance records automated
+  checks and explicitly records no human or physical-terminal QA signoff.
+
+These published artifact and automated-evidence facts do not retroactively
+check every human-review item in the reusable procedure below.
+
+## Historical v0.1.0 publication record
+
+Quirl 0.1.0 was published with the following release record:
 
 - The immutable
   [`v0.1.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0)
@@ -43,15 +81,15 @@ Quirl 0.1.0 is published and supported:
 - The release operator completed human macOS, Linux, and remote PTY/SSH terminal
   review. The automated rich-PTY matrix remains supporting evidence rather than
   a substitute for that review.
-- The release ships the polished deterministic text demo and recording recipe.
-  No public real-terminal recording is currently linked from the project.
+- The release shipped the deterministic text demo and recording recipe.
+  At that release, no public real-terminal recording was linked from the project.
 - The performance record below measures an older artifact. It remains useful
   engineering history but is not presented as exact performance evidence for
   the published 0.1.0 binary.
 
 This publication record states what can be attributed to v0.1.0 without
 retroactively checking steps for which no durable per-item signoff was stored.
-The empty checklist below is the procedure for the next release.
+The empty checklist below remains the reusable procedure for a new candidate.
 
 ## Historical exact-candidate performance evidence
 
@@ -398,7 +436,7 @@ Before publishing the capture:
 ## Not release blockers
 
 The following work can improve Quirl later but is not silently attached to this
-Unix 0.1 gate:
+current Unix release gate:
 
 - native Windows terminal handoff, suspension semantics, and Windows hardware
   validation;
@@ -408,7 +446,7 @@ Unix 0.1 gate:
   signed transparency log;
 - exact emulation of Bash/Zsh option state or framework-sized startup files;
 - S3 or mirror-backed asset providers beyond the versioned GitHub Release
-  provider used for 0.1; and
+  assets and version-scoped website channels; and
 - removal of Reedline or replacement of the current simple-terminal fallback.
 
 These are explicit support boundaries. A future project may promote one only

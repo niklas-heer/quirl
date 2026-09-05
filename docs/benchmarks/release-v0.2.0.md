@@ -1,0 +1,71 @@
+# Quirl 0.2.0 native release evidence
+
+Recorded 2026-09-05 for the published [v0.2.0 release](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0). All four native artifacts passed the enforcing release benchmark with 101 successful PTY samples each. These are measurements of the exact published executables on the hosted runners below, not universal latency guarantees.
+
+## Release identity
+
+- Candidate and resolved tag commit: `39589209ff32a0ac61af984aa31e4879edb113dd`.
+- Native build and performance run: [33989045593](https://github.com/niklas-heer/quirl/actions/runs/33989045593).
+- GitHub release ID: `383365351`; published at `2026-09-05T20:27:24Z` as a nondraft, non-prerelease, immutable release.
+- [Release manifest](https://github.com/niklas-heer/quirl/releases/download/v0.2.0/release-manifest-v1.json) SHA-256: `3d36dca3e2a5de7dd7537bc03993e0a9254947d77a90ae972c62a79d45678aeb`.
+- All 15 published asset digests and byte counts matched the independently verified release bundle. Each packaged executable matched its native benchmark report.
+
+The binary and benchmark independently reported the same clean source revision. Artifact digest, profile, source identity, and harness identity checks passed on every target. This record reports native build and performance results; it does not imply that every downstream distribution job completed successfully.
+
+## Native results
+
+All values below are milliseconds except executable bytes. Limits were startup P50 ≤25 ms, first-prompt paint P95 ≤21 ms, and keystroke-to-frame P95 ≤8 ms. Each row completed 101 of 101 requested PTY samples with no recorded sample failure.
+
+| Target | Executable bytes | Startup P50 | First-prompt P95 | Keystroke P95 | Result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Linux ARM64 | 12,230,952 | 5.813032 | 3.810401 | 0.562713 | Pass |
+| Linux x86_64 | 14,251,864 | 8.771081 | 5.703123 | 0.652673 | Pass |
+| macOS ARM64 | 10,395,728 | 11.200625 | 12.819000 | 2.654500 | Pass |
+| macOS x86_64 | 12,562,680 | 18.476857 | 19.794755 | 1.164514 | Pass |
+
+Size follows [ADR 0036](../decisions/0036-advisory-release-binary-size.md): the project has no default executable-size ceiling. All four sizes exceeded the advisory 8 MiB threshold and retained warnings. Schema 8 records `hard_ceiling_bytes`, `enforced_limit_bytes`, and `hard_gate_passed` as `null`; measured bytes remain present and `release_gate_accepted` is `true`. No caller maximum was requested. Latency, identity, sample-completeness, stream-retention, and cleanup gates remained enforced.
+
+## Runners and toolchain
+
+| Target | GitHub runner label | CPU reported by harness | Logical CPUs | Operating system |
+| --- | --- | --- | ---: | --- |
+| Linux ARM64 | `ubuntu-24.04-arm` | unknown | 4 | Ubuntu 24.04.4 LTS |
+| Linux x86_64 | `ubuntu-24.04` | AMD EPYC 7763 64-Core Processor | 4 | Ubuntu 24.04.4 LTS |
+| macOS ARM64 | `macos-15` | Apple M1 (Virtual) | 3 | macOS 15.7.9 (24G830) |
+| macOS x86_64 | `macos-15-intel` | Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz | 4 | macOS 15.7.9 (24G830) |
+
+The Linux ARM64 CPU model was unavailable to the harness and is deliberately recorded as `unknown`. The exact hostnames, memory counts, and toolchain output remain in the JSON reports. macOS ARM64 used a virtual Apple M1.
+
+All builds used Rust 1.97.1 (`8bab26f4f`, 2026-07-14), LLVM 22.1.6, and Cargo 1.97.1 (`c980f4866`, 2026-06-30). The native official release profile used optimization `z` and `panic = "unwind"`; the canonical build retained fat LTO, one codegen unit, and stripped symbols.
+
+## Exact report files
+
+These are byte-for-byte copies of the schema 8 reports uploaded by the native jobs. SHA-256 values identify the JSON bytes, including whitespace; they are separate from executable and archive hashes.
+
+| Target and exact report | JSON SHA-256 | Native job |
+| --- | --- | --- |
+| [aarch64-unknown-linux-gnu](https://quirl.vercel.app/release-evidence/v0.2.0/aarch64-unknown-linux-gnu.json) | `5354888b3aa38eac919a3ec00dfa0a490314e3075effa5b4224a4419decdc488` | [101368742746](https://github.com/niklas-heer/quirl/actions/runs/33989045593/job/101368742746) |
+| [x86_64-unknown-linux-gnu](https://quirl.vercel.app/release-evidence/v0.2.0/x86_64-unknown-linux-gnu.json) | `f0aa18938343bbff8f6f9ec11f602cb0f7939b0e2c45f2e747644b249f7dc49b` | [101368742765](https://github.com/niklas-heer/quirl/actions/runs/33989045593/job/101368742765) |
+| [aarch64-apple-darwin](https://quirl.vercel.app/release-evidence/v0.2.0/aarch64-apple-darwin.json) | `0a1b849ae17866207313c4d35c835d281dd60113ce638355c83bbde3d33511b0` | [101368742836](https://github.com/niklas-heer/quirl/actions/runs/33989045593/job/101368742836) |
+| [x86_64-apple-darwin](https://quirl.vercel.app/release-evidence/v0.2.0/x86_64-apple-darwin.json) | `8190eaeff95a6d43f388168af79368eb72d61a08c72b3ac51ccf6eae235f9896` | [101368742763](https://github.com/niklas-heer/quirl/actions/runs/33989045593/job/101368742763) |
+
+## Published executable hashes
+
+Each digest below was checked against the actual `bin/quirl` bytes in its tar archive, then the published archive digest was checked against the release manifest and GitHub asset metadata.
+
+| Target | Executable SHA-256 |
+| --- | --- |
+| aarch64-unknown-linux-gnu | `2cf79675c003d8a93f56860a01b864542802d1ecd4f4510dc522130e86116f3f` |
+| x86_64-unknown-linux-gnu | `3c447fe42d8c75044a2705c96958ac0d35c2d9dd7b51c831b36ed645744ef8c4` |
+| aarch64-apple-darwin | `b9de01ca60a27c44cfb431b6b1d9262185438f0277240c4ac580e74609d32cb4` |
+| x86_64-apple-darwin | `e2572d818e9e6546bb8971b115d3d8929d8bcbb31996c305d5033cbc7b7794c0` |
+
+## Method and limitations
+
+The automated PTY harness creates a private initially empty home, configuration, history, catalog, project database, and XDG directories, shared across its samples. Each sample starts a fresh native process in a 120×40 terminal, answers terminal cursor-position queries, reconstructs the screen, checks the prompt and exact binary identity, then proves that the editor accepts input. Startup ends at the editable-marker frame; first-prompt paint and the final representative keystroke use their own recorded endpoints. Percentiles use nearest-rank selection.
+
+After the measurement endpoints, successful samples clear the measured input and request normal EOF exit within the original two-second sample deadline. Normal exit and bounded process cleanup finish before the next sample. Shutdown time is excluded from latency figures; failed samples retain forced cleanup and cannot produce a passing partial report. The native job logs retain all 101 ordered timing and shutdown observations per target.
+
+Hosted runners can vary with virtualization, scheduling, and background load. These observations do not isolate the cause of differences from earlier candidates, and the advisory size policy is not evidence of a latency improvement. The suite measures automated terminal interaction, not every physical terminal, visual accessibility scenario, OS clipboard, IME, or sustained human session. Separate contract, cancellation, terminal restoration, and long-session checks complement this evidence.
+
+Historical [0.1 release measurements](release-v1.0.md) and prior failed candidate reports retain their original artifacts, methodology, limits, and outcomes. No old report was rewritten to pass the current policy.

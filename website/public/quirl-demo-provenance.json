@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "quirl_version": "0.2.0",
+  "source_commit": "39589209ff32a0ac61af984aa31e4879edb113dd",
+  "target": "aarch64-apple-darwin",
+  "source_dirty": false,
+  "binary_bytes": 10412464,
+  "binary_sha256": "aa9cd3c60401069879fcf222bbbc8021b9232f1e9415f4a2279c6b1399c595dc",
+  "vhs_version": "0.11.0",
+  "recorded_recipe_sha256": "785bfeba958b4c4356c6c2642450e7fca83a986e31e7c613bc82f4784140ff2b",
+  "recipe_without_diagnostic_output_sha256": "5d5a4fcc69bee59f21ed0b18be6cb5031dae76cb03bafe4f203cd806836d10da",
+  "recipe_change": "Set CursorBlink false",
+  "diagnostic_recipe_addition": "Output raw-frames/",
+  "width": 1200,
+  "height": 720,
+  "duration_seconds": 71.2,
+  "media": {
+    "gif": {
+      "source_file": "assets/quirl-demo.gif",
+      "publication_file": "assets/quirl-demo.gif",
+      "bytes": 2976210,
+      "sha256": "028707925b716768cc854d672373b5e8a549ab0261d0f7b44d7c242663380b39"
+    },
+    "mp4": {
+      "source_file": "website/public/quirl-demo.mp4",
+      "publication_file": "website/public/quirl-demo.mp4",
+      "bytes": 1481827,
+      "sha256": "39b00afc07d08018742994f52fd26f53c66b54fea1e708b6a8b843b234a2c140"
+    },
+    "webm": {
+      "source_file": "website/public/quirl-demo.webm",
+      "publication_file": "website/public/quirl-demo.webm",
+      "bytes": 1583508,
+      "sha256": "4e1f68073478f5eb8fd4066d58b09d9f6a5916a129cd3db07dafab72249faee7"
+    },
+    "poster": {
+      "source_file": "poster.png",
+      "publication_file": "website/public/quirl-demo-poster.png",
+      "bytes": 107086,
+      "sha256": "bbf9098ae205026526d4ad7975cfcd3a03aa6d8a93c7d90dde14ad72d1280d85"
+    }
+  },
+  "frame_sequence": {
+    "pairs": 3558,
+    "first": 1,
+    "last": 3558,
+    "contiguous": true,
+    "matching_text_cursor_indices": true,
+    "raw_bytes": 371577192
+  },
+  "automated_review_seconds": [
+    2,
+    14,
+    43,
+    48,
+    67
+  ],
+  "physical_terminal_qa": false,
+  "human_qa": false,
+  "cause_caveat": "Previous fixed-position mark was not reproduced in the diagnostic or final take; this clean take does not prove CursorBlink caused or fixed it.",
+  "official_release_profile": true,
+  "artifact_origin": "local_release_profile_build",
+  "published_release_asset": false,
+  "artifact_scope": "Recorded executable built locally from the clean v0.2.0 source commit with the official release profile. Its digest differs from the hosted executable published in the GitHub release; hosted release measurements identify their own binaries."
+}

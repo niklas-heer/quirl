@@ -191,8 +191,23 @@ release asset escaped. Website channel manifests may advance independently, but
 only after their new content-addressed bytes exist; an existing payload URL is
 never overwritten.
 
-If the tap PR fails, the Quirl release remains valid. Regenerate the formula
-from its published manifest and retry with a new tap branch. If asset hosting is
+If the tap PR job fails after publication, the Quirl release remains valid.
+Preserve the failed job's logs and retry the standalone Homebrew workflow
+against the existing immutable tag:
+
+```sh
+gh workflow run homebrew.yml --repo niklas-heer/quirl --ref main -f tag=vVERSION
+```
+
+The workflow regenerates and checks the formula from the published manifest,
+then requires the normal protected `homebrew-tap` environment review before
+opening or updating its tap PR. Review that PR and the exact archive digests
+before merging; do not push directly to the tap default branch. This recovery
+does not rebuild or replace release artifacts or move the tag. The standalone
+path succeeded for v0.2.0 in
+[run 33990534633](https://github.com/niklas-heer/quirl/actions/runs/33990534633).
+
+If asset hosting is
 temporarily unavailable, existing installed assets and Quirl's degraded mode
 remain valid; do not repoint a published manifest to mutable replacement bytes.
 

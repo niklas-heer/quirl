@@ -6,8 +6,8 @@ description: Learn the shell, typed data runtime, Lua SDK, plugin platform, and 
 Quirl is a Rust shell that keeps your Bash and Zsh muscle memory working
 natively, adds an explicit typed data mode for structured pipelines, and
 standardizes configuration, scripts, prompts, completions, and trusted plugins
-on one sandboxed Lua 5.5.1 SDK. The supported `v0.1.0` artifacts retain their
-recorded Lua 5.4 runtime; 5.5.1 is currently unreleased source-tree behavior.
+on one sandboxed Lua 5.5.1 SDK. Quirl 0.2.0 includes this runtime; historical
+`v0.1.0` artifacts retain their recorded Lua 5.4 runtime.
 
 The native binary remains usable offline. Compatible completion knowledge is
 delivered separately through an exact-version website channel, so its immutable
@@ -20,20 +20,22 @@ binary release.
   muted
   playsInline
   poster="/quirl-demo-poster.png"
-  aria-label="Earlier 0.1-era Quirl demo with historical local AI behavior and performance figures"
+  aria-label="Quirl v0.2.0 demo: native shell commands, typed data pipelines, local command search, explicit Bash compatibility, and sandboxed Lua"
   style={{ width: '100%', borderRadius: '0.75rem' }}
 >
   <source src="/quirl-demo.webm" type="video/webm" />
   <source src="/quirl-demo.mp4" type="video/mp4" />
 </video>
 
-This earlier 0.1-era recording shows a historical local AI flow and performance
-card. Follow the [current first session](/docs/getting-started/first-session)
-for the current workflow; measurements apply only to their named artifacts.
+Recorded with a local macOS ARM release-profile build of v0.2.0 from commit `3958920`.
+The [recording provenance](/quirl-demo-provenance.json) identifies the exact
+binary and media. Follow the [first-session guide](/docs/getting-started/first-session)
+and consult the [release measurements](/docs/research/benchmarks/release-v0.2.0).
+Local command search returns candidates to review.
 
-<Callout type="warn" title="0.1 release identity">
+<Callout type="warn" title="0.2 release identity">
   The current supported release is
-  [v0.1.0](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0) for Linux
+  [v0.2.0](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0) for Linux
   and macOS. A build is official only when an immutable GitHub tag and release
   name its exact commit; other source checkouts are candidate or development
   builds. Windows is best-effort portability work. Historical benchmark
@@ -49,7 +51,7 @@ for the current workflow; measurements apply only to their named artifacts.
 ## Start here
 
 <Cards>
-  <Card title="Install Quirl" href="/docs/getting-started/installation" description="Install v0.1.0 with Homebrew or a verified native archive." />
+  <Card title="Install Quirl" href="/docs/getting-started/installation" description="Install v0.2.0 through Homebrew or a verified native archive." />
   <Card title="Your first session" href="/docs/getting-started/first-session" description="Move from familiar commands to typed data and back again." />
   <Card title="Understand the language" href="/docs/architecture/product-and-language-design" description="Read the complete product and language specification." />
   <Card title="Extend with Lua" href="/docs/extensions/lua-sdk" description="Use one bounded SDK for scripts, configuration, and plugins." />
