@@ -66,6 +66,11 @@ which versions are published.
   and preserve the measured results even when a budget fails.
 - Release performance sessions isolate project discovery and persisted state
   from the developer's home while retaining the default enabled behavior.
+  Each sample now shares one total deadline, terminal I/O is nonblocking, and
+  cleanup does not write to a terminal after its child exits. Failed samples
+  stop sampling and leave the evidence gate failed.
+  Failed measurements preserve the exact packaged executable for investigation
+  while continuing to block aggregation and publication.
 - Background catalog lock contention preserves queued refresh generations and
   local completion requests. A bounded, cancellable retry replaces the lost
   work and minute-long delay caused by treating contention as completion.

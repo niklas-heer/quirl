@@ -97,6 +97,14 @@ callback budget so protocol, snapshot, and output-limit assertions report their
 own failures. The dedicated runaway-adapter test retains its five-millisecond
 deadline and requires deadline-specific failure.
 
+Native release performance samples have one total PTY deadline (two seconds by
+default), shared by readiness, input, cursor replies, and frame stabilization.
+The harness uses nonblocking terminal I/O and performs no terminal writes during
+cleanup. It stops on the first failed sample, preserves the requested sample
+count, and fails the evidence gate rather than reporting the remaining samples
+as successful. Stage and sample progress go to stderr so a stalled runner can
+be diagnosed independently of the final JSON report.
+
 ## Layers
 
 | Layer | What it proves | Typical evidence |

@@ -83,6 +83,7 @@ jobs:
           ref: ${{ needs.check.outputs.candidate_commit }}
 
       - name: Build and package the native binary
+        id: package
         env:
           RELEASE_TARGET: ${{ matrix.target }}
         run: >-
@@ -117,6 +118,9 @@ jobs:
           retention-days: 7
 
       - name: Preserve the candidate package
+        # Failed measurements must remain inspectable against their exact
+        # executable. The failed job still blocks aggregation and publication.
+        if: ${{ always() && steps.package.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: package-${{ matrix.target }}

@@ -12,6 +12,9 @@ publish = false
 workspace = true
 
 [dependencies]
+filedescriptor = "0.8.3"
+nix = { workspace = true, features = ["poll"] }
+rustix = { version = "1.1.4", default-features = false, features = ["std", "process"] }
 mlua.workspace = true
 portable-pty = "0.9"
 quirl-catalog = { path = "../quirl-catalog" }

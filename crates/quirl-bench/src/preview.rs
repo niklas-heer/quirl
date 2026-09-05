@@ -1,4 +1,5 @@
-use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
+use filedescriptor::FileDescriptor;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use quirl_catalog::Catalog;
 use quirl_lua::QuirlConfig;
 use quirl_syntax::Mode;
@@ -6,6 +7,11 @@ use quirl_ui::{CatalogCompleter, LiveBuffer, LiveSample, QuirlPrompt};
 use reedline::{Completer, Prompt, PromptEditMode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::{
+    fd::{AsFd, AsRawFd},
+    unix::process::CommandExt,
+};
 use std::{
     env,
     error::Error,
@@ -14,8 +20,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, RecvTimeoutError},
-    thread::{self, JoinHandle},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -205,19 +210,168 @@ struct PtyMeasurementSpec {
     explanation: &'static str,
 }
 
-enum PtyEvent {
-    Data(Vec<u8>),
-    End,
-    Error(String),
+// Failure model: a child may stop reading, flood output, exit before its PTY
+// writer is dropped, or leave a descendant holding a pipe. No phase may renew
+// the sample deadline, and cleanup must never perform terminal writes. Retain
+// one 8 KiB I/O chunk, at most 4 KiB pending replies, and a fixed 120x40 screen;
+// scan at most 8 MiB and write at most 64 KiB per sample. A failure stops the
+// remaining samples, keeping the original requested count so it cannot pass.
+// WNOWAIT keeps the direct child PID reserved until the only group kill; only
+// then may try_wait reap it. This contains its group, not setsid escapees.
+const SAMPLE_OUTPUT_BYTES_MAX: usize = 8 * 1024 * 1024;
+const SAMPLE_INPUT_BYTES_MAX: usize = 64 * 1024;
+const PENDING_REPLY_BYTES_MAX: usize = 4096;
+const PROCESS_OUTPUT_BYTES_MAX: usize = 1024 * 1024;
+const PROCESS_TIMEOUT: Duration = Duration::from_secs(2);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy)]
+enum ProcessScope {
+    Group,
+    #[cfg(target_os = "macos")]
+    SystemProbe,
+}
+
+struct ProcessOwner {
+    scope: ProcessScope,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    group_signalled: bool,
+}
+
+impl ProcessOwner {
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        Self {
+            scope: ProcessScope::Group,
+            child: Some(child),
+            group_signalled: false,
+        }
+    }
+
+    fn process_id(&self) -> Result<u32, Box<dyn Error>> {
+        self.child
+            .as_ref()
+            .and_then(|child| child.process_id())
+            .ok_or_else(|| "owned child has no process ID".into())
+    }
+
+    fn standard_child_mut(&mut self) -> Result<&mut std::process::Child, Box<dyn Error>> {
+        self.child
+            .as_mut()
+            .and_then(|child| child.as_any_mut().downcast_mut::<std::process::Child>())
+            .ok_or_else(|| "metadata command is not an owned standard child".into())
+    }
+
+    #[cfg(unix)]
+    fn exited(&self) -> Result<bool, Box<dyn Error>> {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        let pid = Pid::from_raw(i32::try_from(self.process_id()?)?)
+            .ok_or("owned child has an invalid process ID")?;
+        // NOWAIT observes even an already-exited child without releasing its
+        // PID. This works even when the child exited before the first observation.
+        Ok(waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        )?
+        .is_some())
+    }
+
+    fn finish(&mut self) -> Result<portable_pty::ExitStatus, Box<dyn Error>> {
+        let deadline = Instant::now()
+            .checked_add(CLEANUP_TIMEOUT)
+            .ok_or("cleanup deadline overflow")?;
+        #[cfg(unix)]
+        let signal = {
+            use nix::{
+                errno::Errno,
+                sys::signal::{Signal, kill, killpg},
+                unistd::Pid,
+            };
+            let pid = Pid::from_raw(i32::try_from(self.process_id()?)?);
+            // No observer has reaped this child. Reserve the numeric identity
+            // until the one group signal; never address this group afterward.
+            let result = if self.group_signalled {
+                Ok(())
+            } else {
+                match self.scope {
+                    ProcessScope::Group => killpg(pid, Signal::SIGKILL),
+                    #[cfg(target_os = "macos")]
+                    ProcessScope::SystemProbe => Ok(()),
+                }
+            };
+            self.group_signalled = true;
+            let _ = kill(pid, Signal::SIGKILL);
+            match result {
+                Ok(()) | Err(Errno::ESRCH) => Ok(()),
+                Err(error) => Err(error),
+            }
+        };
+        #[cfg(target_os = "macos")]
+        let signal = if signal == Err(nix::errno::Errno::EPERM) {
+            let group = i32::try_from(self.process_id()?)?;
+            let absent = resolve_group_permission_error(
+                deadline,
+                || self.exited(),
+                || group_has_no_live_members(group, deadline),
+            )
+            .map_err(|error| format!("owned group termination: EPERM; {error}"))?;
+            if absent { Ok(()) } else { signal }
+        } else {
+            signal
+        };
+        loop {
+            let child = self.child.as_mut().ok_or("child was already reaped")?;
+            if let Some(status) = child.try_wait()? {
+                self.child.take();
+                #[cfg(unix)]
+                signal.map_err(|error| format!("owned group termination: {error}"))?;
+                return Ok(status);
+            }
+            remaining(deadline, "child cleanup")?;
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl Drop for ProcessOwner {
+    fn drop(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+        if let Err(error) = self.finish() {
+            eprintln!("performance: cleanup failed: {error}");
+        }
+        if let Some(mut child) = self.child.take() {
+            // A kernel-delayed SIGKILL must not lose its wait owner or block
+            // report publication. Failure stops sampling, so there is at most
+            // one such PTY reaper plus the fixed number of metadata probes.
+            // It retains only the child handle; it never signals the group again.
+            thread::spawn(move || {
+                if let Err(error) = child.wait() {
+                    eprintln!("performance: deferred child reaping failed: {error}");
+                }
+            });
+        }
+    }
 }
 
 struct PtySession {
-    child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn Write + Send>,
-    receiver: Receiver<PtyEvent>,
-    reader_thread: Option<JoinHandle<()>>,
+    // Field drop order also closes the terminal before killing/reaping on an
+    // unwinding path. Keep the unreaped child owner alive through that close.
+    master: FileDescriptor,
+    child: ProcessOwner,
     parser: vt100::Parser,
     query_tail: Vec<u8>,
+    pending_replies: Vec<u8>,
+    read_bytes: usize,
+    written_bytes: usize,
+}
+
+fn remaining(deadline: Instant, phase: &str) -> Result<Duration, Box<dyn Error>> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!("deadline expired during {phase}").into());
+    }
+    Ok(remaining)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -237,6 +391,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
+    eprintln!("performance: starting artifact identity checks");
     let source_quirl = quirl_binary()?;
     let expected_sha256 = expected_sha256_argument(enforce)?;
     let staged_quirl = StagedArtifact::copy_from(&source_quirl)?;
@@ -273,17 +428,23 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     let binary_limit = binary_limit_argument()?;
 
     let rich_status_identity = build_info.as_ref().map(rich_status_identity);
+    eprintln!(
+        "performance: starting {pty_samples} PTY samples, {pty_timeout_ms} ms total per sample"
+    );
     let pty = measure_pty(
         &quirl,
         pty_samples,
         Duration::from_millis(u64::try_from(pty_timeout_ms).unwrap_or(u64::MAX)),
         rich_status_identity.as_deref(),
     );
+    eprintln!("performance: PTY samples finished; starting CLI startup measurements");
     let cold = measure_cli_startup(&quirl, cold_samples)?;
+    eprintln!("performance: starting bounded in-process measurements");
     let edit = measure_headless_edit_frame(edit_samples)?;
     let prompt = measure_first_prompt(prompt_samples)?;
     let stream_window = measure_stream_window(stream_samples)?;
     let binary_size = measure_binary_size(&quirl, binary_limit);
+    eprintln!("performance: collecting bounded environment metadata");
     let mut environment = discover_environment(
         &quirl,
         build_info.as_ref(),
@@ -472,7 +633,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
         environment,
         methodology: Methodology {
             percentile_method: "nearest-rank over independently timed wall-clock samples",
-            pty_end_to_end: "The PTY suite uses a private initially empty home, configuration, history, catalog, project database, and XDG directories, shared across its samples; project discovery remains enabled. Explicit Rustup/Cargo homes preserve inherited toolchain lookup, and Quirl environment overrides/test hooks are cleared. Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with a short input marker, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
+            pty_end_to_end: "The PTY suite uses a private initially empty home, configuration, history, catalog, project database, and XDG directories, shared across its samples; project discovery remains enabled. Explicit Rustup/Cargo homes preserve inherited toolchain lookup, and Quirl environment overrides/test hooks are cleared. Each sample has one total deadline shared by all phases and uses nonblocking terminal I/O with bounded cleanup. The first failure stops sampling while retaining the originally requested count, so partial measurements cannot pass. Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with a short input marker, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
             cold_start: "Starts a new Quirl process for every sample and waits for `quirl --version` to exit. This measures process creation, dynamic loading, and CLI argument parsing, not cold-to-editable startup. OS filesystem caches are not flushed.",
             headless_edit_frame: "Calls Quirl's real CatalogCompleter and Prompt render methods, plus a benchmark-owned equivalent of the current semantic token classification, for `git commit --am`. No Reedline layout or terminal I/O occurs.",
             first_prompt: "Constructs a fresh configured QuirlPrompt and renders left, right, and indicator strings for every sample. Filesystem metadata may be served from OS cache. No terminal I/O occurs.",
@@ -495,6 +656,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
         release_gate_status: release_gate_status.to_owned(),
     };
 
+    eprintln!("performance: measurements complete; writing report");
     if env::args().any(|argument| argument == "--json") {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -539,13 +701,24 @@ fn measure_pty(
     let mut failures = Vec::new();
 
     for sample in 0..samples {
+        if sample % 10 == 0 {
+            eprintln!("performance: PTY sample {}/{samples}", sample + 1);
+        }
         match measure_pty_sample(path, &fixture, timeout, rich_status_identity) {
             Ok(measurement) => {
                 prompt_paint.push(measurement.prompt_paint);
                 cold_to_editable.push(measurement.cold_to_editable);
                 keystroke_to_frame.push(measurement.keystroke_to_frame);
             }
-            Err(error) => failures.push(format!("sample {}: {error}", sample + 1)),
+            Err(error) => {
+                let failure = format!(
+                    "sample {}: {error}; remaining samples were not run",
+                    sample + 1
+                );
+                eprintln!("performance: {failure}");
+                failures.push(failure);
+                break;
+            }
         }
     }
 
@@ -594,13 +767,16 @@ fn measure_pty_sample(
     rich_status_identity: Option<&str>,
 ) -> Result<PtySample, Box<dyn Error>> {
     let started = Instant::now();
+    let deadline = started
+        .checked_add(timeout)
+        .ok_or("sample deadline overflow")?;
     let mut session = PtySession::spawn(path, fixture)?;
     let result = (|| {
         // Readiness requires the command prompt, mode label, and the exact
         // binary identity in one modeled frame. Status notices may replace the
         // optional shortcut hints, so presentation copy is not a readiness
         // invariant.
-        session.wait_for_editable_command_frame(rich_status_identity, timeout)?;
+        session.wait_for_editable_command_frame(rich_status_identity, deadline)?;
         let prompt_paint = started.elapsed();
 
         // A short prefix of the representative edit establishes that the newly
@@ -608,10 +784,10 @@ fn measure_pty_sample(
         // endpoint; stabilization below is deliberately outside that timing.
         let marker = "qz";
         session.assert_absent(marker, "editable prompt marker")?;
-        session.send(marker.as_bytes())?;
-        session.wait_for_screen(marker, timeout, "editable prompt marker")?;
+        session.send(marker.as_bytes(), deadline)?;
+        session.wait_for_screen(marker, deadline, "editable prompt marker")?;
         let cold_to_editable = started.elapsed();
-        session.wait_for_stable_screen(marker, timeout, "editable prompt marker")?;
+        session.wait_for_stable_screen(marker, deadline, "editable prompt marker")?;
 
         // Advance only after each prefix is stable: viewport growth can issue
         // a cursor-position request, and a benchmark must not inject the next
@@ -621,13 +797,13 @@ fn measure_pty_sample(
         session.type_until_painted(
             &mut painted,
             &baseline[marker.len()..],
-            timeout,
+            deadline,
             "representative edit baseline",
         )?;
         let edit_started = Instant::now();
         session.assert_absent("qzbenchmarkload", "edited terminal frame")?;
-        session.send(b"d")?;
-        session.wait_for_screen("qzbenchmarkload", timeout, "edited terminal frame")?;
+        session.send(b"d", deadline)?;
+        session.wait_for_screen("qzbenchmarkload", deadline, "edited terminal frame")?;
 
         Ok(PtySample {
             prompt_paint,
@@ -635,8 +811,13 @@ fn measure_pty_sample(
             keystroke_to_frame: edit_started.elapsed(),
         })
     })();
-    session.finish();
-    result
+    let cleanup = session.finish();
+    match (result, cleanup) {
+        (Ok(sample), Ok(_)) => Ok(sample),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup: {cleanup}").into()),
+    }
 }
 
 struct PtyFixture {
@@ -740,61 +921,140 @@ impl PtySession {
         fixture.configure_environment(&mut command);
         command.cwd(env::current_dir()?);
 
-        let child = pair.slave.spawn_command(command)?;
-        let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
-        drop(pair.slave);
-        drop(pair.master);
-
-        // Retain at most 16 × 8 KiB chunks while the consumer models a frame.
-        // Backpressure stops a noisy candidate from growing the benchmark heap.
-        // finish drops the receiver so a blocked sender can always unwind.
-        let (sender, receiver) = mpsc::sync_channel(16);
-        let reader_thread = thread::spawn(move || {
-            let mut buffer = vec![0_u8; 8 * 1024];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => {
-                        let _ = sender.send(PtyEvent::End);
-                        break;
-                    }
-                    Ok(length) => {
-                        if sender
-                            .send(PtyEvent::Data(buffer[..length].to_vec()))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.send(PtyEvent::Error(error.to_string()));
-                        break;
-                    }
+        #[cfg(not(unix))]
+        return Err("bounded PTY performance measurement requires a native Unix target".into());
+        #[cfg(unix)]
+        {
+            // Dup while the master is owned. Avoid portable-pty's writer,
+            // whose Drop writes EOF and can block after the slave has exited.
+            struct MasterFd<'a>(&'a dyn portable_pty::MasterPty);
+            impl AsRawFd for MasterFd<'_> {
+                fn as_raw_fd(&self) -> std::os::fd::RawFd {
+                    self.0.as_raw_fd().unwrap_or(-1)
                 }
             }
-        });
-
-        Ok(Self {
-            child,
-            writer,
-            receiver,
-            reader_thread: Some(reader_thread),
-            parser: vt100::Parser::new(40, 120, 0),
-            query_tail: Vec::new(),
-        })
+            let mut master = FileDescriptor::dup(&MasterFd(pair.master.as_ref()))?;
+            master.set_non_blocking(true)?;
+            let child = ProcessOwner::new(pair.slave.spawn_command(command)?);
+            drop(pair);
+            Ok(Self {
+                child,
+                master,
+                parser: vt100::Parser::new(40, 120, 0),
+                query_tail: Vec::new(),
+                pending_replies: Vec::new(),
+                read_bytes: 0,
+                written_bytes: 0,
+            })
+        }
     }
 
-    fn send(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()?;
+    fn read_available(&mut self) -> Result<bool, Box<dyn Error>> {
+        let mut bytes = [0; 8192];
+        match self.master.read(&mut bytes) {
+            Ok(0) => Err("PTY ended before the requested frame".into()),
+            Ok(length) => {
+                self.read_bytes = self
+                    .read_bytes
+                    .checked_add(length)
+                    .ok_or("PTY byte count overflow")?;
+                if self.read_bytes > SAMPLE_OUTPUT_BYTES_MAX {
+                    return Err("PTY sample exceeded 8 MiB output limit".into());
+                }
+                let chunk = bytes.get(..length).ok_or("invalid PTY read length")?;
+                self.answer_cursor_queries(chunk)?;
+                self.parser.process(chunk);
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn poll(
+        &self,
+        deadline: Instant,
+        wake_at: Option<Instant>,
+        writing: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        #[cfg(unix)]
+        {
+            use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+            let events = if writing {
+                PollFlags::POLLIN | PollFlags::POLLOUT
+            } else {
+                PollFlags::POLLIN
+            };
+            let mut descriptors = [PollFd::new(self.master.as_fd(), events)];
+            // A quiet-period wakeup is not a request deadline. If it expired
+            // between the caller's check and here, poll once without waiting;
+            // only the original sample deadline can fail the request.
+            let budget = remaining(deadline, "PTY I/O")?;
+            let wait = wake_at.map_or(budget, |wake| {
+                budget.min(wake.saturating_duration_since(Instant::now()))
+            });
+            let timeout = PollTimeout::try_from(wait)?;
+            match poll(&mut descriptors, timeout) {
+                Ok(_) | Err(nix::errno::Errno::EINTR) => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        }
+        #[cfg(not(unix))]
+        Err("bounded PTY polling requires Unix".into())
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), Box<dyn Error>> {
+        let next = self
+            .written_bytes
+            .checked_add(bytes.len())
+            .ok_or("PTY input count overflow")?;
+        if next > SAMPLE_INPUT_BYTES_MAX {
+            return Err("PTY sample exceeded 64 KiB input limit".into());
+        }
+        self.written_bytes = next;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            remaining(deadline, "PTY input write")?;
+            match self
+                .master
+                .write(bytes.get(offset..).ok_or("invalid PTY write offset")?)
+            {
+                Ok(0) => return Err("PTY input write made no progress".into()),
+                Ok(count) => {
+                    offset = offset
+                        .checked_add(count)
+                        .ok_or("PTY write count overflow")?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.read_available()?;
+                    self.poll(deadline, None, true)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         Ok(())
+    }
+
+    fn flush_replies(&mut self, deadline: Instant) -> Result<(), Box<dyn Error>> {
+        while !self.pending_replies.is_empty() {
+            let replies = std::mem::take(&mut self.pending_replies);
+            self.write_bytes(&replies, deadline)?;
+        }
+        Ok(())
+    }
+
+    fn send(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), Box<dyn Error>> {
+        self.write_bytes(bytes, deadline)?;
+        self.flush_replies(deadline)
     }
 
     fn type_until_painted(
         &mut self,
         painted: &mut String,
         suffix: &str,
-        timeout: Duration,
+        deadline: Instant,
         phase: &str,
     ) -> Result<(), Box<dyn Error>> {
         if !suffix.is_ascii() {
@@ -802,118 +1062,50 @@ impl PtySession {
         }
         for byte in suffix.bytes() {
             painted.push(char::from(byte));
-            self.send(&[byte])?;
-            // The VT100 model intentionally trims trailing blank cells from
-            // `contents()`. The following visible byte acknowledges both the
-            // whitespace and itself without weakening the final prefix check.
+            self.send(&[byte], deadline)?;
             if !byte.is_ascii_whitespace() {
-                self.wait_for_stable_screen(painted, timeout, phase)?;
+                self.wait_for_stable_screen(painted, deadline, phase)?;
             }
         }
         Ok(())
     }
 
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "poll counts are bounded by the benchmark deadline"
-    )]
     fn wait_for_stable_screen(
         &mut self,
         marker: &str,
-        timeout: Duration,
+        deadline: Instant,
         phase: &str,
     ) -> Result<(), Box<dyn Error>> {
-        self.wait_for_screen(marker, timeout, phase)?;
-        let deadline = Instant::now() + timeout;
+        self.wait_for_screen(marker, deadline, phase)?;
         let quiet_period = Duration::from_millis(20);
+        let mut quiet_until = Instant::now()
+            .checked_add(quiet_period)
+            .ok_or("quiet deadline overflow")?;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(format!(
-                    "timed out after {:.0} ms waiting for stable {phase} `{marker}`; screen={:?}",
-                    millis(timeout),
-                    screen_tail(&self.parser.screen().contents())
-                )
-                .into());
+            remaining(deadline, phase)?;
+            if Instant::now() >= quiet_until {
+                return Ok(());
             }
-            match self.receiver.recv_timeout(remaining.min(quiet_period)) {
-                Ok(PtyEvent::Data(bytes)) => {
-                    self.answer_cursor_queries(&bytes)?;
-                    self.parser.process(&bytes);
-                    if !self.parser.screen().contents().contains(marker) {
-                        self.wait_for_screen(marker, remaining, phase)?;
-                    }
-                }
-                Ok(PtyEvent::End) => {
-                    return Err(format!("PTY ended while stabilizing {phase} `{marker}`").into());
-                }
-                Ok(PtyEvent::Error(error)) => {
-                    return Err(
-                        format!("PTY read failed while stabilizing {phase}: {error}").into(),
-                    );
-                }
-                Err(RecvTimeoutError::Timeout) => return Ok(()),
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(format!("PTY reader disconnected while stabilizing {phase}").into());
-                }
+            if self.read_available()? {
+                self.flush_replies(deadline)?;
+                self.wait_for_screen(marker, deadline, phase)?;
+                quiet_until = Instant::now()
+                    .checked_add(quiet_period)
+                    .ok_or("quiet deadline overflow")?;
+            } else {
+                self.poll(deadline, Some(quiet_until), false)?;
             }
         }
     }
 
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "poll counts are bounded by the benchmark deadline"
-    )]
     fn wait_for_editable_command_frame(
         &mut self,
-        rich_status_identity: Option<&str>,
-        timeout: Duration,
+        identity: Option<&str>,
+        deadline: Instant,
     ) -> Result<(), Box<dyn Error>> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let screen = self.parser.screen().contents();
-            if editable_command_frame(&screen, rich_status_identity) {
-                return Ok(());
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(format!(
-                    "timed out after {:.0} ms waiting for first editable command frame; screen={:?}",
-                    millis(timeout),
-                    screen_tail(&screen)
-                )
-                .into());
-            }
-            match self.receiver.recv_timeout(remaining) {
-                Ok(PtyEvent::Data(bytes)) => {
-                    self.answer_cursor_queries(&bytes)?;
-                    self.parser.process(&bytes);
-                }
-                Ok(PtyEvent::End) => {
-                    return Err("PTY ended while waiting for first editable command frame".into());
-                }
-                Ok(PtyEvent::Error(error)) => {
-                    return Err(format!(
-                        "PTY read failed while waiting for first editable command frame: {error}"
-                    )
-                    .into());
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(format!(
-                        "timed out after {:.0} ms waiting for first editable command frame; screen={:?}",
-                        millis(timeout),
-                        screen_tail(&self.parser.screen().contents())
-                    )
-                    .into());
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(
-                        "PTY reader disconnected while waiting for first editable command frame"
-                            .into(),
-                    );
-                }
-            }
-        }
+        self.wait_for_frame(deadline, "first editable command frame", |screen| {
+            editable_command_frame(screen, identity)
+        })
     }
 
     fn assert_absent(&self, marker: &str, phase: &str) -> Result<(), Box<dyn Error>> {
@@ -928,92 +1120,66 @@ impl PtySession {
         Ok(())
     }
 
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "poll counts are bounded by the benchmark deadline"
-    )]
     fn wait_for_screen(
         &mut self,
         marker: &str,
-        timeout: Duration,
+        deadline: Instant,
         phase: &str,
     ) -> Result<(), Box<dyn Error>> {
-        let deadline = Instant::now() + timeout;
+        self.wait_for_frame(deadline, phase, |screen| screen.contains(marker))
+    }
+
+    fn wait_for_frame(
+        &mut self,
+        deadline: Instant,
+        phase: &str,
+        ready: impl Fn(&str) -> bool,
+    ) -> Result<(), Box<dyn Error>> {
         loop {
-            let screen = self.parser.screen().contents();
-            if screen.contains(marker) {
+            remaining(deadline, phase).map_err(|error| {
+                format!(
+                    "{error}; screen={:?}",
+                    screen_tail(&self.parser.screen().contents())
+                )
+            })?;
+            if ready(&self.parser.screen().contents()) {
                 return Ok(());
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(format!(
-                    "timed out after {:.0} ms waiting for {phase} `{marker}`; screen={:?}",
-                    millis(timeout),
-                    screen_tail(&screen)
-                )
-                .into());
-            }
-            match self.receiver.recv_timeout(remaining) {
-                Ok(PtyEvent::Data(bytes)) => {
-                    self.answer_cursor_queries(&bytes)?;
-                    self.parser.process(&bytes);
-                }
-                Ok(PtyEvent::End) => {
-                    return Err(format!("PTY ended while waiting for {phase} `{marker}`").into());
-                }
-                Ok(PtyEvent::Error(error)) => {
-                    return Err(
-                        format!("PTY read failed while waiting for {phase}: {error}").into(),
-                    );
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(format!(
-                        "timed out after {:.0} ms waiting for {phase} `{marker}`; screen={:?}",
-                        millis(timeout),
-                        screen_tail(&self.parser.screen().contents())
-                    )
-                    .into());
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(format!("PTY reader disconnected while waiting for {phase}").into());
-                }
+            if self.read_available()? {
+                self.flush_replies(deadline)?;
+            } else {
+                self.poll(deadline, None, false)?;
             }
         }
     }
 
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "the cursor reply count is bounded by the captured PTY byte limit"
-    )]
     fn answer_cursor_queries(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
         let previous_length = self.query_tail.len();
         self.query_tail.extend_from_slice(bytes);
         let queries = cursor_query_count(&self.query_tail, previous_length);
-        for _ in 0..queries {
-            self.writer.write_all(b"\x1b[1;1R")?;
+        let added = queries.checked_mul(6).ok_or("PTY reply count overflow")?;
+        if self.pending_replies.len().saturating_add(added) > PENDING_REPLY_BYTES_MAX {
+            return Err("PTY sample exceeded 4 KiB pending cursor replies".into());
         }
-        if queries > 0 {
-            self.writer.flush()?;
+        for _ in 0..queries {
+            self.pending_replies.extend_from_slice(b"\x1b[1;1R");
         }
         let retained = self.query_tail.len().min(4);
-        self.query_tail.drain(..self.query_tail.len() - retained);
+        self.query_tail
+            .drain(..self.query_tail.len().saturating_sub(retained));
         Ok(())
     }
 
-    fn finish(mut self) {
-        let _ = self.writer.write_all(b"\x04");
-        let _ = self.writer.flush();
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-        drop(self.writer);
-        drop(self.receiver);
-        if let Some(handle) = self.reader_thread.take()
-            && handle.is_finished()
-        {
-            let _ = handle.join();
-        }
+    fn finish(self) -> Result<portable_pty::ExitStatus, Box<dyn Error>> {
+        let Self {
+            master, mut child, ..
+        } = self;
+        // Release the terminal before waiting for child cleanup, so the wait
+        // never retains an undrained master. The unreaped owner still reserves
+        // PID/group authority across close
+        // and its possible HUP. Closing performs no terminal write or flush.
+        drop(master);
+        child.finish()
     }
 }
 
@@ -1076,20 +1242,201 @@ fn measure_cli_startup(path: &Path, samples: usize) -> Result<Statistics, Box<dy
     for _ in 0..3 {
         run_version(path)?;
     }
-    timed(samples, || run_version(path))
+    let mut durations = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        durations.push(run_version(path)?);
+    }
+    statistics(durations).ok_or_else(|| "CLI startup requires at least one sample".into())
 }
 
-fn run_version(path: &Path) -> Result<(), Box<dyn Error>> {
-    let status = Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if !status.success() {
-        return Err(format!("{} --version exited with {status}", path.display()).into());
+fn run_version(path: &Path) -> Result<Duration, Box<dyn Error>> {
+    let output = bounded_command(Command::new(path).arg("--version"), PROCESS_TIMEOUT)?;
+    if !output.status.success() {
+        return Err(format!("{} --version exited with {}", path.display(), output.status).into());
     }
-    Ok(())
+    Ok(output.elapsed)
+}
+
+struct CommandCapture {
+    elapsed: Duration,
+    status: portable_pty::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[cfg(unix)]
+fn bounded_command(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<CommandCapture, Box<dyn Error>> {
+    bounded_command_in_scope(command, timeout, ProcessScope::Group)
+}
+
+#[cfg(unix)]
+fn bounded_command_in_scope(
+    command: &mut Command,
+    timeout: Duration,
+    scope: ProcessScope,
+) -> Result<CommandCapture, Box<dyn Error>> {
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(timeout)
+        .ok_or("process deadline overflow")?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut owner = ProcessOwner::new(Box::new(command.spawn()?));
+    owner.scope = scope;
+    capture_command(owner, started, deadline)
+}
+
+#[cfg(unix)]
+fn capture_command(
+    mut owner: ProcessOwner,
+    started: Instant,
+    deadline: Instant,
+) -> Result<CommandCapture, Box<dyn Error>> {
+    let stdout = owner
+        .standard_child_mut()?
+        .stdout
+        .take()
+        .ok_or("missing stdout")?;
+    let stderr = owner
+        .standard_child_mut()?
+        .stderr
+        .take()
+        .ok_or("missing stderr")?;
+    let mut pipes = [FileDescriptor::dup(&stdout)?, FileDescriptor::dup(&stderr)?];
+    drop((stdout, stderr));
+    for pipe in &mut pipes {
+        pipe.set_non_blocking(true)?;
+    }
+    let mut output = [Vec::new(), Vec::new()];
+    let mut ended = [false; 2];
+    loop {
+        remaining(deadline, "metadata or CLI subprocess")?;
+        let mut progress = false;
+        for ((pipe, bytes), eof) in pipes.iter_mut().zip(&mut output).zip(&mut ended) {
+            if *eof {
+                continue;
+            }
+            let mut buffer = [0; 8192];
+            match pipe.read(&mut buffer) {
+                Ok(0) => *eof = true,
+                Ok(length) => {
+                    if bytes.len().saturating_add(length) > PROCESS_OUTPUT_BYTES_MAX {
+                        return Err("subprocess output exceeded 1 MiB per stream".into());
+                    }
+                    bytes.extend_from_slice(
+                        buffer
+                            .get(..length)
+                            .ok_or("invalid subprocess read length")?,
+                    );
+                    progress = true;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if ended.iter().all(|eof| *eof) && owner.exited()? {
+            // Preserve the natural-exit measurement endpoint. Group cleanup
+            // and macOS zombie verification are outside startup latency.
+            let elapsed = started.elapsed();
+            let status = owner.finish()?;
+            let [stdout, stderr] = output;
+            return Ok(CommandCapture {
+                elapsed,
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if !progress {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_group_permission_error(
+    deadline: Instant,
+    mut observe_exit: impl FnMut() -> Result<bool, Box<dyn Error>>,
+    verify_group: impl FnOnce() -> Result<bool, Box<dyn Error>>,
+) -> Result<bool, Box<dyn Error>> {
+    // Closing a PTY may start HUP teardown before SIGKILL. Darwin can return
+    // group EPERM during that transition before WNOWAIT exposes the zombie.
+    // Wait within the original cleanup budget while retaining PID authority;
+    // only then can group verification distinguish an empty group from a
+    // genuine permission failure. Neither a pending exit nor a timeout passes.
+    loop {
+        remaining(deadline, "observing child exit before group verification")?;
+        if observe_exit()? {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    remaining(deadline, "process group verification")?;
+    verify_group()
+}
+
+#[cfg(target_os = "macos")]
+fn group_has_no_live_members(group: i32, deadline: Instant) -> Result<bool, Box<dyn Error>> {
+    // Darwin skips zombies when signalling a group and returns EPERM when it
+    // finds no signalable live member. EPERM also denotes genuine permission
+    // failure, so never suppress it solely because the direct child exited.
+    // Keep that child unreaped while a fixed OS probe scans at most 1 MiB for
+    // live members. With no live member, nothing can fork into this still-owned
+    // group. The fixed /bin/ps probe runs no guest code and owns only its child;
+    // direct cleanup avoids recursively probing an already-exited ps group.
+    let capture = bounded_command_in_scope(
+        Command::new("/bin/ps").args(["-axo", "pgid=,stat="]),
+        remaining(deadline, "process group verification")?,
+        ProcessScope::SystemProbe,
+    )?;
+    if !capture.status.success() {
+        return Err("cannot verify the exited macOS process group's cleanup".into());
+    }
+    no_live_group_rows(&capture.stdout, group)
+}
+
+#[cfg(target_os = "macos")]
+fn no_live_group_rows(output: &[u8], group: i32) -> Result<bool, Box<dyn Error>> {
+    if output.len() > PROCESS_OUTPUT_BYTES_MAX {
+        return Err("process group observation exceeded 1 MiB".into());
+    }
+    let text = std::str::from_utf8(output)?;
+    if text.trim().is_empty() {
+        return Err("process group observation returned no process rows".into());
+    }
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let observed = fields
+            .next()
+            .ok_or("missing process group")?
+            .parse::<i32>()?;
+        let status = fields.next().ok_or("missing process state")?;
+        if fields.next().is_some() {
+            return Err("unexpected process group observation fields".into());
+        }
+        if observed == group && !status.starts_with('Z') {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn bounded_command(
+    _command: &mut Command,
+    _timeout: Duration,
+) -> Result<CommandCapture, Box<dyn Error>> {
+    Err("bounded release subprocess probes require a native Unix target".into())
 }
 
 fn measure_headless_edit_frame(samples: usize) -> Result<Statistics, Box<dyn Error>> {
@@ -1700,15 +2047,16 @@ fn discover_environment(
 }
 
 fn source_dirty() -> Option<bool> {
-    let output = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=normal"])
-        .output()
-        .ok()?;
+    let output = bounded_command(
+        Command::new("git").args(["status", "--porcelain", "--untracked-files=normal"]),
+        PROCESS_TIMEOUT,
+    )
+    .ok()?;
     output.status.success().then_some(!output.stdout.is_empty())
 }
 
 fn quirl_build_info(quirl: &Path) -> Option<QuirlBuildInfo> {
-    let output = Command::new(quirl).arg("--build-info").output().ok()?;
+    let output = bounded_command(Command::new(quirl).arg("--build-info"), PROCESS_TIMEOUT).ok()?;
     if !output.status.success() || !output.stderr.is_empty() {
         return None;
     }
@@ -1839,7 +2187,7 @@ fn memory_bytes() -> Option<u64> {
 }
 
 fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(arguments).output().ok()?;
+    let output = bounded_command(Command::new(program).args(arguments), PROCESS_TIMEOUT).ok()?;
     output
         .status
         .success()
@@ -1924,6 +2272,271 @@ fn format_millis(value: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn fixture_script(fixture: &PtyFixture, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = fixture.root.join("child");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn assert_reaped(pid: u32) {
+        assert_eq!(
+            nix::sys::wait::waitpid(
+                nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap()),
+                Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+            ),
+            Err(nix::errno::Errno::ECHILD),
+            "the benchmark must retain and reap its direct child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_output_metadata_preserves_the_natural_exit_status() {
+        let capture = bounded_command(
+            Command::new("/bin/sh").args(["-c", "exit 42", "--build-info"]),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(capture.status.exit_code(), 42);
+        assert!(capture.stdout.is_empty());
+        assert!(capture.stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_pty_child_is_observed_before_first_registration_and_reaped_without_writes() {
+        let fixture = PtyFixture::create().unwrap();
+        let path = fixture_script(&fixture, "exit 42");
+        let session = PtySession::spawn(&path, &fixture).unwrap();
+        let pid = session.child.process_id().unwrap();
+        // Observe the zombie using a separate bounded OS query, not the owner's
+        // exit observer. In particular NOTE_EXIT must handle late registration.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let capture = bounded_command(
+                Command::new("/bin/ps").args(["-o", "stat=", "-p", &pid.to_string()]),
+                remaining(deadline, "waiting for fixture zombie").unwrap(),
+            )
+            .unwrap();
+            if String::from_utf8_lossy(&capture.stdout).contains('Z') {
+                break;
+            }
+            remaining(deadline, "waiting for fixture zombie").unwrap();
+        }
+        assert!(session.child.exited().unwrap());
+        let started = Instant::now();
+        let status = session.finish().unwrap();
+        assert_eq!(status.exit_code(), 42);
+        assert!(started.elapsed() < CLEANUP_TIMEOUT);
+        assert_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonreading_terminal_input_expires_and_reaps_the_child() {
+        let fixture = PtyFixture::create().unwrap();
+        let path = fixture_script(
+            &fixture,
+            "/bin/stty -echo -icanon; printf READY; exec /bin/sleep 30",
+        );
+        let mut session = PtySession::spawn(&path, &fixture).unwrap();
+        let pid = session.child.process_id().unwrap();
+        session
+            .wait_for_screen(
+                "READY",
+                Instant::now() + Duration::from_secs(5),
+                "fixture readiness",
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let error = session
+            .send(&vec![b'x'; SAMPLE_INPUT_BYTES_MAX], deadline)
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline expired"), "{error}");
+        session.finish().unwrap();
+        assert_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn later_sample_phases_cannot_renew_an_expired_deadline() {
+        let fixture = PtyFixture::create().unwrap();
+        let path = fixture_script(&fixture, "printf READY; exec /bin/sleep 30");
+        let mut session = PtySession::spawn(&path, &fixture).unwrap();
+        let pid = session.child.process_id().unwrap();
+        session
+            .wait_for_screen(
+                "READY",
+                Instant::now() + Duration::from_secs(5),
+                "fixture readiness",
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let first = session
+            .wait_for_screen("MISSING", deadline, "first phase")
+            .unwrap_err();
+        assert!(first.to_string().contains("deadline expired"));
+        // Even a marker already in the model cannot turn expiration into a
+        // success, and the next phase gets no fresh read/write allowance.
+        let next = session
+            .wait_for_screen("READY", deadline, "next phase")
+            .unwrap_err();
+        assert!(next.to_string().contains("deadline expired"));
+        assert!(session.send(b"x", deadline).is_err());
+        session.finish().unwrap();
+        assert_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_quiet_wakeup_does_not_expire_the_total_sample_deadline() {
+        let fixture = PtyFixture::create().unwrap();
+        let path = fixture_script(&fixture, "printf READY; exec /bin/sleep 30");
+        let mut session = PtySession::spawn(&path, &fixture).unwrap();
+        let pid = session.child.process_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        session
+            .wait_for_screen("READY", deadline, "fixture readiness")
+            .unwrap();
+        let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        session.poll(deadline, Some(expired), false).unwrap();
+        assert!(session.poll(expired, Some(expired), false).is_err());
+        session.finish().unwrap();
+        assert_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_pty_failure_stops_sampling_without_reducing_the_requested_count() {
+        let fixture = PtyFixture::create().unwrap();
+        let path = fixture_script(&fixture, "exit 42");
+        let measured = measure_pty(&path, 101, Duration::from_millis(100), None);
+        assert_eq!(measured.requested_samples, 101);
+        assert_eq!(measured.successful_samples, 0);
+        assert_eq!(measured.failures.len(), 1);
+        assert!(measured.prompt_paint.is_none());
+        assert!(measured.failures[0].contains("remaining samples were not run"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_deadline_reaps_a_nonresponsive_child() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Capture the owned PID at spawn rather than depending on guest code
+        // being scheduled before a deliberately short fault-test deadline.
+        let result = capture_command(
+            ProcessOwner::new(Box::new(child)),
+            Instant::now(),
+            Instant::now() + Duration::from_millis(50),
+        );
+        let error = match result {
+            Ok(_) => panic!("nonresponsive command succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("deadline expired"), "{error}");
+        assert_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_output_overflow_reaps_the_flooding_child() {
+        let child = Command::new("/usr/bin/yes")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let result = capture_command(
+            ProcessOwner::new(Box::new(child)),
+            Instant::now(),
+            Instant::now() + Duration::from_secs(5),
+        );
+        let error = match result {
+            Ok(_) => panic!("unbounded output was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exceeded 1 MiB"), "{error}");
+        assert_reaped(pid);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn group_permission_resolution_waits_for_observed_exit_before_verification() {
+        let observations = std::cell::Cell::new(0_u32);
+        let result = resolve_group_permission_error(
+            Instant::now() + Duration::from_secs(5),
+            || {
+                let count = observations.get().checked_add(1).unwrap();
+                observations.set(count);
+                Ok(count == 3)
+            },
+            || {
+                assert_eq!(observations.get(), 3);
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(result);
+        assert!(
+            !resolve_group_permission_error(
+                Instant::now() + Duration::from_secs(5),
+                || Ok(true),
+                || Ok(false),
+            )
+            .unwrap(),
+            "a live group must preserve the permission failure"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_exit_and_failed_group_verification_cannot_pass_cleanup() {
+        let verified = std::cell::Cell::new(false);
+        let result = resolve_group_permission_error(
+            Instant::now() + Duration::from_millis(10),
+            || Ok(false),
+            || {
+                verified.set(true);
+                Ok(true)
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("deadline expired"));
+        assert!(!verified.get());
+        let result = resolve_group_permission_error(
+            Instant::now() + Duration::from_secs(5),
+            || Ok(true),
+            || Err("verification unavailable".into()),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "verification unavailable");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn group_cleanup_observation_distinguishes_zombies_from_live_or_invalid_rows() {
+        assert!(no_live_group_rows(b"42 Z\n99 S\n", 42).unwrap());
+        assert!(!no_live_group_rows(b"42 Z\n42 S+\n", 42).unwrap());
+        assert!(!no_live_group_rows(b"42 T\n", 42).unwrap());
+        assert!(no_live_group_rows(b"99 R\n", 42).unwrap());
+        for invalid in [b"".as_slice(), b"42", b"broken R", b"42 Z extra"] {
+            assert!(no_live_group_rows(invalid, 42).is_err());
+        }
+        assert!(no_live_group_rows(&vec![b' '; PROCESS_OUTPUT_BYTES_MAX + 1], 42).is_err());
+    }
 
     #[test]
     fn pty_fixture_isolates_user_state_and_preserves_default_toolchain_paths() {

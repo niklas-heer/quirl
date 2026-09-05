@@ -65,6 +65,11 @@ independently calculated SHA-256. A size or latency miss stops that package from
 reaching aggregation. The `performance-<target>` workflow artifact preserves the
 JSON report, including a failed budget, for seven days. These runner measurements
 supplement the named-terminal review in the release checklist.
+If packaging succeeded, the separate `package-<target>` artifact is retained for
+one day even when measurement fails. It is diagnostic evidence, not an approved
+release: the failed job still blocks aggregation and publication. Compare the
+executable inside that archive with the report's binary digest when investigating
+a failure.
 
 Measured PTY children use a private home, project database, and XDG directories.
 Project discovery remains enabled against that empty home; it cannot reuse a
