@@ -3108,6 +3108,15 @@ impl SurfaceTerminal {
             "rich input requires the alternate screen"
         );
         terminal::enable_raw_mode().map_err(terminal_error("enable terminal raw mode"))?;
+        // Cooked execution permits the kernel to echo type-ahead directly into
+        // our viewport, outside ratatui's cached frame. Once raw mode owns input
+        // again, erase that external output and invalidate the cache before
+        // announcing readiness. This costs one bounded viewport repaint per
+        // execution handoff; ordinary keystrokes still use incremental diffs.
+        if let Err(error) = self.force_repaint() {
+            self.reset_best_effort();
+            return Err(error);
+        }
         if let Err(error) = execute!(
             io::stderr(),
             EnableBracketedPaste,

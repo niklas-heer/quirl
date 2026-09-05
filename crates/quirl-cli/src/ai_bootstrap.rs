@@ -1013,6 +1013,7 @@ struct ChannelReader {
     cancelled: Arc<AtomicBool>,
     current: io::Cursor<Vec<u8>>,
     finished: bool,
+    stalled: Option<mpsc::SyncSender<()>>,
 }
 
 #[cfg(test)]
@@ -1023,6 +1024,7 @@ impl ChannelReader {
             cancelled,
             current: io::Cursor::new(Vec::new()),
             finished: false,
+            stalled: None,
         }
     }
 }
@@ -1048,7 +1050,11 @@ impl Read for ChannelReader {
                 Ok(DownloadMessage::Data(chunk)) => self.current = io::Cursor::new(chunk),
                 Ok(DownloadMessage::End) => self.finished = true,
                 Ok(DownloadMessage::Error(error)) => return Err(io::Error::other(error)),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(stalled) = self.stalled.take() {
+                        let _ = stalled.try_send(());
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -1475,6 +1481,38 @@ mod tests {
         assert!(!generation_was_superseded_or_cancelled(&shared, 2));
     }
 
+    const DOWNLOAD_FIXTURE_WATCHDOG: Duration = Duration::from_secs(5);
+
+    struct StalledDownloadRead {
+        sender: Option<mpsc::SyncSender<DownloadMessage>>,
+        cancelled: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl StalledDownloadRead {
+        fn finish(&mut self) -> bool {
+            // Disconnect only during cleanup, after recording the read result.
+            // This also unblocks a broken cancellation path without faking a
+            // successful Interrupted result. Never join a still-running thread.
+            self.cancelled.store(true, Ordering::Release);
+            self.sender.take();
+            let Some(worker) = self.worker.take() else {
+                return true;
+            };
+            let started = Instant::now();
+            while !worker.is_finished() && started.elapsed() < DOWNLOAD_FIXTURE_WATCHDOG {
+                thread::park_timeout(Duration::from_millis(1));
+            }
+            worker.is_finished() && worker.join().is_ok()
+        }
+    }
+
+    impl Drop for StalledDownloadRead {
+        fn drop(&mut self) {
+            let _ = self.finish();
+        }
+    }
+
     #[test]
     fn stalled_https_channel_observes_cancellation_promptly() {
         let _covered_messages = (
@@ -1482,19 +1520,32 @@ mod tests {
             DownloadMessage::End,
             DownloadMessage::Error(String::new()),
         );
-        let (_sender, receiver) = mpsc::sync_channel(DOWNLOAD_CHANNEL_CHUNKS_MAX);
+        let (sender, receiver) = mpsc::sync_channel(DOWNLOAD_CHANNEL_CHUNKS_MAX);
+        let (stalled_tx, stalled_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = Arc::clone(&cancelled);
-        let canceller = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(20));
-            worker_cancelled.store(true, Ordering::Release);
-        });
-        let mut reader = ChannelReader::new(receiver, cancelled);
-        let started = Instant::now();
-        let error = reader.read(&mut [0_u8; 1]).unwrap_err();
-        canceller.join().unwrap();
+        let mut reader = ChannelReader::new(receiver, Arc::clone(&cancelled));
+        reader.stalled = Some(stalled_tx);
+        let mut task = StalledDownloadRead {
+            sender: Some(sender),
+            cancelled,
+            worker: Some(thread::spawn(move || {
+                let _ = result_tx.try_send(reader.read(&mut [0_u8; 1]));
+            })),
+        };
+
+        // This retained reader fixture must actually enter an uncancelled read
+        // and time out waiting for data before cancellation. Keep the stalled
+        // sender open until the result is recorded, so EOF cannot satisfy it.
+        // The watchdog bounds a broken test; it is not a latency measurement.
+        let stalled = stalled_rx.recv_timeout(DOWNLOAD_FIXTURE_WATCHDOG);
+        task.cancelled.store(true, Ordering::Release);
+        let result = result_rx.recv_timeout(DOWNLOAD_FIXTURE_WATCHDOG);
+        let joined = task.finish();
+        assert!(joined, "stalled reader did not exit during bounded cleanup");
+        assert!(stalled.is_ok(), "reader never observed the stalled channel");
+        let error = result.expect("reader ignored cancellation").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        assert!(started.elapsed() < Duration::from_millis(250));
     }
 
     #[cfg(unix)]

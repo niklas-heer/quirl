@@ -5,6 +5,7 @@ mod resize_input;
 mod soak_gallery;
 mod sustained;
 mod text_input;
+mod typeahead;
 mod usability;
 
 pub(crate) mod soak;
@@ -43,6 +44,7 @@ const DISCOVERY_DIRECTORY_ENTRIES_MAX: usize = 8;
 const DISCOVERY_FIXTURE_BYTES_MAX: usize = 4 * 1024;
 const CHECK_NAMES: &[&str] = &[
     "rich-editing",
+    "command-typeahead-redraw",
     "mode-switch-and-palette-screen",
     "automatic-command-intelligence",
     "codex-only-ai-mode",
@@ -505,11 +507,15 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 36] {
+fn checks() -> [CheckCase; 37] {
     [
         CheckCase {
             name: "rich-editing",
             run: check_rich_editing,
+        },
+        CheckCase {
+            name: "command-typeahead-redraw",
+            run: typeahead::check_command_typeahead_redraw,
         },
         CheckCase {
             name: "mode-switch-and-palette-screen",

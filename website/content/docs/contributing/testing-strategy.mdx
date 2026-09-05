@@ -97,17 +97,31 @@ callback budget so protocol, snapshot, and output-limit assertions report their
 own failures. The dedicated runaway-adapter test retains its five-millisecond
 deadline and requires deadline-specific failure.
 
+The retained download-channel fixture waits for an actual stalled read before
+cancelling it, and keeps the data sender open until it observes `Interrupted`.
+Its five-second watchdog bounds test failure and cleanup; it does not measure
+production HTTPS download latency or change the 25 ms cancellation poll.
+
 Native release performance samples have one total PTY deadline (two seconds by
-default), shared by readiness, input, cursor replies, and frame stabilization.
+default), shared by readiness, input, cursor replies, frame stabilization, and
+normal shutdown. After the latency endpoints, successful samples clear their
+input and request EOF, requiring exit status zero before starting the next
+sample against the shared fixture. Shutdown does not enter the latency metrics.
 The harness uses nonblocking terminal I/O and performs no terminal writes during
-cleanup. It stops on the first failed sample, preserves the requested sample
+forced cleanup. It stops on the first failed sample, preserves the requested sample
 count, and fails the evidence gate rather than reporting the remaining samples
 as successful. Stage and sample progress go to stderr so a stalled runner can
-be diagnosed independently of the final JSON report.
+be diagnosed independently of the final JSON report. Ordered timing and shutdown
+observations are limited to the first 101 successful samples.
 
 Terminal dimension queries use the platform API directly. An unavailable
 terminal retains the caller's conservative fallback or operating error; it must
 not start an external `tput` process, including during redirected prompt probes.
+
+The `command-typeahead-redraw` PTY regression holds a foreground command behind
+a private gate while sending the next input. It verifies the rendered spaces
+and the accepted input after control returns to the editor, covering kernel
+echo that bypasses the renderer's cached frame during cooked-mode execution.
 
 ## Layers
 

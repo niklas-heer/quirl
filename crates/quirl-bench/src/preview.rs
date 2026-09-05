@@ -198,6 +198,7 @@ struct PtySample {
     prompt_paint: Duration,
     cold_to_editable: Duration,
     keystroke_to_frame: Duration,
+    shutdown: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -212,7 +213,8 @@ struct PtyMeasurementSpec {
 
 // Failure model: a child may stop reading, flood output, exit before its PTY
 // writer is dropped, or leave a descendant holding a pipe. No phase may renew
-// the sample deadline, and cleanup must never perform terminal writes. Retain
+// the sample deadline. Successful samples request normal exit after timing;
+// forced cleanup must never perform terminal writes. Retain
 // one 8 KiB I/O chunk, at most 4 KiB pending replies, and a fixed 120x40 screen;
 // scan at most 8 MiB and write at most 64 KiB per sample. A failure stops the
 // remaining samples, keeping the original requested count so it cannot pass.
@@ -364,6 +366,12 @@ struct PtySession {
     pending_replies: Vec<u8>,
     read_bytes: usize,
     written_bytes: usize,
+}
+
+enum PtyRead {
+    Output,
+    Pending,
+    Closed,
 }
 
 fn remaining(deadline: Instant, phase: &str) -> Result<Duration, Box<dyn Error>> {
@@ -633,7 +641,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
         environment,
         methodology: Methodology {
             percentile_method: "nearest-rank over independently timed wall-clock samples",
-            pty_end_to_end: "The PTY suite uses a private initially empty home, configuration, history, catalog, project database, and XDG directories, shared across its samples; project discovery remains enabled. Explicit Rustup/Cargo homes preserve inherited toolchain lookup, and Quirl environment overrides/test hooks are cleared. Each sample has one total deadline shared by all phases and uses nonblocking terminal I/O with bounded cleanup. The first failure stops sampling while retaining the originally requested count, so partial measurements cannot pass. Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with a short input marker, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
+            pty_end_to_end: "The PTY suite uses a private initially empty home, configuration, history, catalog, project database, and XDG directories, shared across its samples; project discovery remains enabled. Explicit Rustup/Cargo homes preserve inherited toolchain lookup, and Quirl environment overrides/test hooks are cleared. Each sample has one total deadline shared by all phases and uses nonblocking terminal I/O with bounded cleanup. After all timing endpoints, successful samples clear the measured input and request EOF, requiring normal exit within that same deadline before cleanup; failed samples retain forced cleanup. Shutdown is excluded from latency measurements, and stderr retains ordered timing and shutdown observations for at most the first 101 successful samples. The first failure stops sampling while retaining the originally requested count, so partial measurements cannot pass. Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with a short input marker, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
             cold_start: "Starts a new Quirl process for every sample and waits for `quirl --version` to exit. This measures process creation, dynamic loading, and CLI argument parsing, not cold-to-editable startup. OS filesystem caches are not flushed.",
             headless_edit_frame: "Calls Quirl's real CatalogCompleter and Prompt render methods, plus a benchmark-owned equivalent of the current semantic token classification, for `git commit --am`. No Reedline layout or terminal I/O occurs.",
             first_prompt: "Constructs a fresh configured QuirlPrompt and renders left, right, and indicator strings for every sample. Filesystem metadata may be served from OS cache. No terminal I/O occurs.",
@@ -706,6 +714,20 @@ fn measure_pty(
         }
         match measure_pty_sample(path, &fixture, timeout, rich_status_identity) {
             Ok(measurement) => {
+                if sample < DEFAULT_RELEASE_PTY_SAMPLES {
+                    eprintln!(
+                        "performance: PTY sample {} completed: startup_ms={:.3} paint_ms={:.3} key_ms={:.3} shutdown_ms={:.3}",
+                        sample + 1,
+                        measurement.cold_to_editable.as_secs_f64() * 1000.0,
+                        measurement.prompt_paint.as_secs_f64() * 1000.0,
+                        measurement.keystroke_to_frame.as_secs_f64() * 1000.0,
+                        measurement.shutdown.as_secs_f64() * 1000.0,
+                    );
+                } else if sample == DEFAULT_RELEASE_PTY_SAMPLES {
+                    eprintln!(
+                        "performance: further PTY timing entries omitted after {DEFAULT_RELEASE_PTY_SAMPLES} samples"
+                    );
+                }
                 prompt_paint.push(measurement.prompt_paint);
                 cold_to_editable.push(measurement.cold_to_editable);
                 keystroke_to_frame.push(measurement.keystroke_to_frame);
@@ -809,11 +831,28 @@ fn measure_pty_sample(
             prompt_paint,
             cold_to_editable,
             keystroke_to_frame: edit_started.elapsed(),
+            shutdown: Duration::ZERO,
         })
     })();
+    // Normal shutdown is outside every measurement endpoint but shares the
+    // original sample deadline. Never turn successful samples into a crash
+    // loop against the fixture's shared persistence and background workers.
+    let shutdown_started = Instant::now();
+    let result = result.and_then(|sample| {
+        session.request_normal_exit(deadline)?;
+        Ok(sample)
+    });
     let cleanup = session.finish();
     match (result, cleanup) {
-        (Ok(sample), Ok(_)) => Ok(sample),
+        (Ok(mut sample), Ok(status)) if status.success() => {
+            sample.shutdown = shutdown_started.elapsed();
+            Ok(sample)
+        }
+        (Ok(_), Ok(status)) => Err(format!(
+            "normal shell exit failed with status {}",
+            status.exit_code()
+        )
+        .into()),
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(error)) => Err(error),
         (Err(error), Err(cleanup)) => Err(format!("{error}; cleanup: {cleanup}").into()),
@@ -950,9 +989,17 @@ impl PtySession {
     }
 
     fn read_available(&mut self) -> Result<bool, Box<dyn Error>> {
+        match self.read_terminal()? {
+            PtyRead::Output => Ok(true),
+            PtyRead::Pending => Ok(false),
+            PtyRead::Closed => Err("PTY ended before the requested frame".into()),
+        }
+    }
+
+    fn read_terminal(&mut self) -> Result<PtyRead, Box<dyn Error>> {
         let mut bytes = [0; 8192];
         match self.master.read(&mut bytes) {
-            Ok(0) => Err("PTY ended before the requested frame".into()),
+            Ok(0) => Ok(PtyRead::Closed),
             Ok(length) => {
                 self.read_bytes = self
                     .read_bytes
@@ -964,11 +1011,47 @@ impl PtySession {
                 let chunk = bytes.get(..length).ok_or("invalid PTY read length")?;
                 self.answer_cursor_queries(chunk)?;
                 self.parser.process(chunk);
-                Ok(true)
+                Ok(PtyRead::Output)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(PtyRead::Pending),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(PtyRead::Pending),
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(nix::libc::EIO) => Ok(PtyRead::Closed),
             Err(error) => Err(error.into()),
+        }
+    }
+
+    fn request_normal_exit(&mut self, deadline: Instant) -> Result<(), Box<dyn Error>> {
+        #[cfg(not(unix))]
+        return Err("bounded PTY shutdown requires Unix".into());
+        #[cfg(unix)]
+        {
+            if self.child.exited()? {
+                return Err("PTY child exited before normal shutdown was requested".into());
+            }
+            // The measured edit ends at the end of its one-line buffer.
+            // Ctrl-U clears it; Ctrl-D requests EOF without executing input.
+            self.send(b"\x15\x04", deadline)?;
+            let mut terminal_closed = false;
+            loop {
+                let budget = remaining(deadline, "normal shell exit")?;
+                if self.child.exited()? {
+                    // Observe without reaping: finish still needs the reserved
+                    // PID to clean up any remaining members of the same group.
+                    return Ok(());
+                }
+                if terminal_closed {
+                    // Terminal close can precede waitable exit. Only the OS
+                    // exit observation succeeds; the pause merely bounds polls.
+                    thread::sleep(budget.min(Duration::from_millis(1)));
+                    continue;
+                }
+                match self.read_terminal()? {
+                    PtyRead::Output => self.flush_replies(deadline)?,
+                    PtyRead::Pending => self.poll(deadline, None, false)?,
+                    PtyRead::Closed => terminal_closed = true,
+                }
+            }
         }
     }
 
@@ -2358,6 +2441,79 @@ mod tests {
             .send(&vec![b'x'; SAMPLE_INPUT_BYTES_MAX], deadline)
             .unwrap_err();
         assert!(error.to_string().contains("deadline expired"), "{error}");
+        session.finish().unwrap();
+        assert_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_shutdown_delivers_clear_and_eof_before_reaping_a_successful_exit() {
+        let fixture = PtyFixture::create().unwrap();
+        let path = fixture_script(
+            &fixture,
+            "/bin/stty raw -echo; printf READY; bytes=$(/bin/dd bs=1 count=2 2>/dev/null | /usr/bin/od -An -t x1 | /usr/bin/tr -d '[:space:]'); [ \"$bytes\" = 1504 ] || exit 23; exit 0",
+        );
+        let mut session = PtySession::spawn(&path, &fixture).unwrap();
+        let pid = session.child.process_id().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        session
+            .wait_for_screen("READY", deadline, "fixture readiness")
+            .unwrap();
+        session.request_normal_exit(deadline).unwrap();
+        assert!(session.child.exited().unwrap());
+        let status = session.finish().unwrap();
+        assert!(status.success());
+        assert_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_normal_shutdown_uses_the_original_deadline_and_force_reaps() {
+        let fixture = PtyFixture::create().unwrap();
+        let path = fixture_script(
+            &fixture,
+            "/bin/stty raw -echo; printf READY; exec /bin/sleep 30",
+        );
+        let mut session = PtySession::spawn(&path, &fixture).unwrap();
+        let pid = session.child.process_id().unwrap();
+        session
+            .wait_for_screen(
+                "READY",
+                Instant::now() + Duration::from_secs(5),
+                "fixture readiness",
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let error = session.request_normal_exit(deadline).unwrap_err();
+        assert!(error.to_string().contains("deadline expired"), "{error}");
+        assert!(remaining(deadline, "original sample deadline").is_err());
+        assert!(!session.child.exited().unwrap());
+        assert!(!session.finish().unwrap().success());
+        assert_reaped(pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_close_without_process_exit_cannot_pass_normal_shutdown() {
+        let fixture = PtyFixture::create().unwrap();
+        let path = fixture_script(
+            &fixture,
+            "/bin/stty raw -echo; printf READY; /bin/dd bs=1 count=2 >/dev/null 2>&1; exec </dev/null >/dev/null 2>&1; exec /bin/sleep 30",
+        );
+        let mut session = PtySession::spawn(&path, &fixture).unwrap();
+        let pid = session.child.process_id().unwrap();
+        session
+            .wait_for_screen(
+                "READY",
+                Instant::now() + Duration::from_secs(5),
+                "fixture readiness",
+            )
+            .unwrap();
+        let error = session
+            .request_normal_exit(Instant::now() + Duration::from_millis(100))
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline expired"), "{error}");
+        assert!(!session.child.exited().unwrap());
         session.finish().unwrap();
         assert_reaped(pid);
     }

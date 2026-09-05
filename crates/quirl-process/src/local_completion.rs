@@ -2111,29 +2111,55 @@ compdef _qtool qtool
         let pid_file = directory.path.join("descendant.pid");
         let shell = directory.executable(
             "descendant",
-            "#!/bin/sh\n/bin/sh -c 'printf %s \"$$\" > \"$PID_FILE\"; exec /bin/sleep 30' &\nwait\n",
+            "#!/bin/sh\n/bin/sh -c 'printf \"%s\\n\" \"$$\" > \"$PID_FILE\"; exec /bin/sleep 30' &\nwait\n",
         );
         let mut request = request(LocalCompletionProvider::Fish, shell);
-        request.deadline = Duration::from_secs(2);
+        // Cancellation is the oracle; process startup must not race a shorter
+        // provider deadline. The controller has its own bounded startup wait
+        // and always cancels, including when no complete PID is published.
+        request.deadline = Duration::from_secs(30);
         request.environment = vec![(
             "PID_FILE".to_owned(),
             pid_file.to_string_lossy().into_owned(),
         )];
         let cancelled = Arc::clone(&request.cancelled);
         let process = LocalCompletionProcess::new(1).unwrap();
-        let worker = thread::spawn(move || process.complete(request));
-        let startup = Instant::now();
-        while !pid_file.exists() && startup.elapsed() < Duration::from_secs(5) {
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert!(pid_file.exists(), "descendant did not publish its pid");
-        cancelled.store(true, Ordering::Relaxed);
-        let error = worker.join().unwrap().unwrap_err();
-        assert_eq!(error.code, ErrorCode::ResourceLimit);
-        let pid = fs::read_to_string(&pid_file)
-            .unwrap()
-            .parse::<i32>()
-            .unwrap();
+        let (outcome, descendant) = thread::scope(|scope| {
+            let controller = scope.spawn(|| {
+                let startup = Instant::now();
+                let descendant = loop {
+                    // File creation alone is not readiness: the writer may
+                    // still be publishing the PID. Require its final newline.
+                    let pid = fs::read_to_string(&pid_file)
+                        .ok()
+                        .and_then(|text| text.strip_suffix('\n')?.parse::<i32>().ok());
+                    if let Some(pid) = pid.filter(|pid| *pid > 0) {
+                        break Some((pid, kill(Pid::from_raw(pid), None)));
+                    }
+                    if startup.elapsed() >= Duration::from_secs(10) {
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                };
+                cancelled.store(true, Ordering::Relaxed);
+                descendant
+            });
+            // Keep assertions outside the scope so failures still cancel and
+            // join the controller and let the contained process finish cleanup.
+            let outcome = process.complete(request);
+            (outcome, controller.join().unwrap())
+        });
+        let (pid, alive) = descendant.unwrap_or_else(|| {
+            panic!("descendant did not publish a complete PID; provider result: {outcome:?}")
+        });
+        assert_eq!(
+            alive,
+            Ok(()),
+            "descendant must be alive before cancellation"
+        );
+        let error = outcome.unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit, "{error:?}");
+        assert!(error.message.contains("cancelled"), "{error:?}");
         let started = Instant::now();
         loop {
             match kill(Pid::from_raw(pid), None) {

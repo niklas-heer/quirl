@@ -50,11 +50,16 @@
   Each sample now shares one total deadline, terminal I/O is nonblocking, and
   cleanup does not write to a terminal after its child exits. Failed samples
   stop sampling and leave the evidence gate failed.
+  Successful samples now exit normally after their timing endpoints, within
+  the original deadline, before the next session reuses the fixture state.
   Failed measurements preserve the exact packaged executable for investigation
   while continuing to block aggregation and publication.
 - Terminal dimension queries use the native platform API directly. Redirected
   or unavailable terminals no longer trigger an external `tput` fallback during
   prompt rendering or surface selection.
+- The rich editor repaints when it regains input control after command execution,
+  removing kernel-echoed type-ahead that could leave stale characters in spaces.
+  Queued input remains intact and ordinary edits retain incremental rendering.
 - Contained subprocess groups terminate when their owner's keepalive pipe
   closes, including abrupt shell termination. Background probes and joined
   pipeline stages no longer depend on the parent reaching Rust cleanup.
