@@ -67,6 +67,10 @@ const LOCAL_PROBE_SEGMENT_BYTES_MAX: usize = 256;
 const LOCAL_INITIAL_PATHS_MAX: usize = 64;
 const LOCAL_PROVIDER_CONCURRENCY_MAX: usize = 2;
 const LOCAL_PROVIDER_DEADLINE: Duration = Duration::from_millis(400);
+#[cfg(test)]
+std::thread_local! {
+    static FIXTURE_PROVIDER_DEADLINE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
 const LOCAL_PROVIDER_OUTPUT_BYTES_MAX: usize = 256 * 1024;
 const LOCAL_PROVIDER_CANDIDATES_MAX: usize = 256;
 const LOCAL_PROVIDER_ROOTS_MAX: usize = 16;
@@ -1522,6 +1526,12 @@ fn probe_local_completion_paths(
             .expires_at
             .saturating_duration_since(Instant::now());
         let request_deadline = remaining.min(LOCAL_PROVIDER_DEADLINE);
+        #[cfg(test)]
+        let request_deadline = FIXTURE_PROVIDER_DEADLINE.with(|fixture| {
+            fixture
+                .get()
+                .map_or(request_deadline, |limit| remaining.min(limit))
+        });
         if request_deadline.is_zero() {
             ensure_refresh_active(deadline, &cancelled, "before local completion spawn")?;
         }
@@ -3899,6 +3909,27 @@ mod tests {
         )
     }
 
+    struct ProviderPersistenceFixtureBudget(Option<Duration>);
+
+    impl ProviderPersistenceFixtureBudget {
+        fn enter() -> Self {
+            // These fixtures assert persisted metadata and warm reuse, not
+            // latency. Under a concurrent build, the scheduler can consume the
+            // production 400 ms budget before a tiny shell fixture even starts.
+            // Scope the extra time to this test thread; process timeout and
+            // cancellation tests retain their real budgets.
+            Self(
+                FIXTURE_PROVIDER_DEADLINE.with(|limit| limit.replace(Some(Duration::from_secs(5)))),
+            )
+        }
+    }
+
+    impl Drop for ProviderPersistenceFixtureBudget {
+        fn drop(&mut self) {
+            FIXTURE_PROVIDER_DEADLINE.with(|limit| limit.set(self.0));
+        }
+    }
+
     fn refresh_with_local(config: &DiscoveryConfig) -> Result<bool, ShellError> {
         let cancelled = Arc::new(AtomicBool::new(false));
         refresh_catalog_cache(
@@ -3986,6 +4017,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fake_fish_and_zsh_providers_persist_nested_flags_and_descriptions() {
+        let _fixture_budget = ProviderPersistenceFixtureBudget::enter();
         let directory = temporary_directory();
         let mut config = discovery_config(&directory);
         let zsh = directory.join("zsh");
@@ -4053,6 +4085,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unavailable_provider_misses_are_warm_negative_cache_hits() {
+        let _fixture_budget = ProviderPersistenceFixtureBudget::enter();
         let directory = temporary_directory();
         let config = discovery_config(&directory);
         let binaries = &config.path_roots[0];
@@ -4076,6 +4109,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn malformed_provider_isolated_failure_publishes_base_and_warms_negative_cache() {
+        let _fixture_budget = ProviderPersistenceFixtureBudget::enter();
         let directory = temporary_directory();
         let config = discovery_config(&directory);
         let binaries = &config.path_roots[0];

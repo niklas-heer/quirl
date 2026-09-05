@@ -64,11 +64,17 @@ shell, unified-execution, app, browser, computer-use, and multi-agent features,
 requests `never` approvals and a read-only sandbox, removes shell-startup
 injection variables, and supplies exact base instructions plus a JSON output
 schema. Any streamed command, file, MCP, browser, collaboration, or other tool
-item fails the turn even if user Codex configuration exposes one. The complete
-app-server process tree is contained and reaped when the
+item fails the turn even if user Codex configuration exposes one. The owned
+app-server child and process group are terminated and reaped when the
 worker ends. Protocol lines, queued publications, events, aggregate turn bytes,
 input, catalog commands and arguments, temporary-name attempts, cancellation,
 and wall time have fixed limits.
+
+Protocol writes share the request's cancellation and deadline with response
+waits. A child that stops reading cannot hold the planner worker indefinitely;
+cancelled or partial writes discard the connection. Unix pipes use nonblocking
+I/O and explicit shutdown, so reader and writer cleanup does not depend on a
+detached descendant releasing an inherited descriptor.
 
 The long-lived local client uses app-server's supported newline-delimited JSON
 transport over the contained child's stdin and stdout. The documented

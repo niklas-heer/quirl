@@ -33,12 +33,19 @@ closed command I/O contract and portable components to the checked-in WIT world.
 New additions remain disabled until `plugin enable` repeats integrity and
 runtime-boundary checks.
 
-Mutations build and validate a complete candidate lock before writing and
-flushing a temporary file, syncing the state directory, and atomically
-replacing the current file. The previous lock is moved to
-`plugins.lock.json.bak`; failed replacement attempts restore it. A corrupt or
-incompatible lock is never silently overwritten. `remove` removes only the
-lock entry and never deletes source.
+Mutations serialize across processes before reading the lock and build a
+complete candidate within a 4 MiB serialization limit. The complete previous
+lock is published as `plugins.lock.json.bak` before atomically replacing the
+active file; the active name stays readable throughout. Unix transaction files
+start with private permissions before any contents are written. A corrupt or
+incompatible lock is never silently overwritten. `remove` removes only the lock
+entry and never deletes source.
+
+After an interrupted transaction, review the preserved temporary or recovery
+paths named in the diagnostic and move them aside before retrying. Quirl refuses
+new staging while those files remain and never deletes uncertain files
+automatically. Admission scans at most 1,024 state-directory entries, preventing
+repeated failures from accumulating more transaction files.
 `update --locked` verifies all local sources and rejects version, checksum,
 API, or permission changes.
 

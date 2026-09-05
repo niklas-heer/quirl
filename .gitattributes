@@ -1,0 +1,7 @@
+# Preserve vendored upstream bytes, including original CRLF line endings.
+# Upstream Markdown formatting is retained for provenance rather than restyled.
+vendor/crossterm/** -text whitespace=trailing-space,space-before-tab,cr-at-eol
+vendor/reedline/** -text whitespace=trailing-space,space-before-tab,cr-at-eol
+vendor/crossterm/README.md -whitespace
+vendor/reedline/.github/ISSUE_TEMPLATE/*.md -whitespace
+vendor/reedline/CONTRIBUTING.md -whitespace

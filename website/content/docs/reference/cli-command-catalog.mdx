@@ -1061,11 +1061,22 @@ Options:
 - `-n`, `--lines` — Print leading lines Print the selected number of lines from each input.
 - `files` — Files to read Files whose leading content is printed; omit them to read standard input.
 
-## `help [command]`
+## `help [command or search text]`
 
 Explore commands and their contracts
 
-Reads this same catalog used by completion and AI discovery.
+Run `quirl` with no command to open a shell in your current terminal.
+Type `help` to get started; `exit` or Ctrl-D returns to your previous shell.
+
+Normal: run familiar commands and byte pipelines.
+Data: type `mode data` for typed values; `mode normal` returns.
+AI: type `mode ai` to plan with an authenticated Codex CLI. Proposals need review and never run automatically.
+
+Tab completes; Ctrl-R searches history; Alt-Q opens modes and pickers.
+F1 explains the command at the cursor.
+
+Use `help <command>` for examples, or `help <words>` to search the catalog.
+Use `help all` to browse commands; refine a search when results are shortened.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -1079,7 +1090,7 @@ Options:
 
 List structured background job state
 
-Shows Quirl job ids, running/stopped/done state, and the original command.
+Shows Quirl job ids, running/stopped/done state, and the original command. On Unix, direct human output escapes command controls; captured or file-redirected output retains raw source. Job text is constructed incrementally within 1 MiB; captured text also obeys a tighter request capture budget. Human stop notifications show at most 256 source bytes plus a truncation marker; typed job metadata stays complete.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -1398,7 +1409,7 @@ Options:
 
 Switch the visible interactive grammar
 
-Normal mode carries bytes and process status. Data mode evaluates Quirl's native structured values and pipelines. AI mode asks an installed Codex CLI for a typed proposal from a bounded compact view of the complete admitted catalog, then inserts the validated command for review without executing it. It has no local suggestion or planner fallback.
+Normal mode carries bytes and process status. Unquoted newlines separate commands; newlines after a pipe or boolean connector continue that command, and backslash-newline joins physical lines. Quoted newlines stay literal. Data mode evaluates Quirl's native structured values and pipelines. AI mode asks an installed Codex CLI for a typed proposal from a bounded compact view of the complete admitted catalog, then inserts the validated command for review without executing it. It has no local suggestion or planner fallback.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -2061,7 +2072,7 @@ Options:
 
 Validate Lua configuration through Rust schemas
 
-Evaluates under config restrictions and preserves the active last-known-good value on failure.
+Evaluates under config restrictions, validates the returned Lua graph before allocating typed configuration, and preserves the active last-known-good value on failure. Returns are bounded to 256 KiB of retained strings, 4112 key/value nodes, and nesting depth 16; cyclic or repeated tables are rejected.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -2214,7 +2225,7 @@ Options:
 
 Evaluate a native structured-data pipeline
 
-Sources are `pwd`, `files [path]` (or `ls`), `open <path>`, JSON, or explicit `^external <command>`. Values stay typed through streams and transforms: filesystem rows retain Path, Size, and DateTime; tar retains Path and Size; TOML retains DateTime. JSON/YAML/TOML and bytes are explicit conversion boundaries, and `to json` documents its lossy domain encoding. The CLI injects a deadline-, cancellation-, and output-bounded external host; library runtimes fail closed without one. CSV/tar rows are pulled lazily and all adapters enforce byte, row, field, depth, node, retained-text, and materialization limits. `sort`, table output, envelopes, and collected convenience APIs intentionally materialize within those limits. Transforms include typed `where` comparisons with `and`/`or`, dotted `get`, `select`, `sort`, `take`, Option-producing `first`, and `length`. Task remains declarative state; HTTP is not an implicit source.
+Sources are `pwd`, `files [path]` (or `ls`), `open <path>`, JSON, or explicit `^external <command>`. Values stay typed through streams and transforms: filesystem rows retain Path, Size, and DateTime; tar retains Path and Size; TOML retains DateTime. JSON/YAML/TOML and bytes are explicit conversion boundaries, and `to json` documents its lossy domain encoding. The CLI injects a deadline-, cancellation-, and output-bounded external host; library runtimes fail closed without one. CSV/tar rows are pulled lazily and all adapters enforce byte, row, field, depth, node, retained-text, and materialization limits. `sort`, table output, envelopes, and collected convenience APIs intentionally materialize within those limits. Transforms include typed `where` comparisons with `and`/`or`, dotted `get`, `select`, `sort`, `take`, Option-producing `first`, and `length`. Numeric predicates and sorting compare retained decimal text exactly against signed and unsigned integers, without binary-float rounding; decimal exponents must fit a signed 64-bit integer. CSV columns remain strings: compare a boolean-looking cell with `where enabled == "true"`, without implicit type inference. `select` requires every requested field in each consumed row and preserves requested field order; a missing field reports the transform location and available fields. Task remains declarative state; HTTP is not an implicit source.
 
 - Input: `Nothing`
 - Output: `Value`
@@ -2317,7 +2328,7 @@ Options:
 
 Execute Quirl's native command graph
 
-Accepts complete Quirl source as exactly one outer-shell argument and passes it unchanged to extension planning. Without an explicit extension rewrite, the same source is parsed, diagnosed, and captured for bounded, redacted recovery. Quoting, empty arguments, byte pipes, redirects, boolean lists, and background jobs must be written inside that source operand; additional argv elements are rejected rather than joined into executable syntax.
+Accepts complete Quirl source as exactly one outer-shell argument and passes it unchanged to extension planning. Without an explicit extension rewrite, the same source is parsed, diagnosed, and captured for bounded, redacted recovery. Unquoted newlines separate commands; newlines after `|`, `&&`, or `||` continue the command, and backslash-newline joins physical lines. Quoted newlines remain literal. Quoting, empty arguments, byte pipes, redirects, boolean lists, and background jobs must be written inside that source operand; additional argv elements are rejected rather than joined into executable syntax.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -2398,7 +2409,7 @@ Options:
 
 Serve generated Lua and native Quirl (`.qrl`) editor intelligence
 
-Speaks a deterministic LSP subset over stdio, using the generated Lua HOST_API and semantic command catalog for diagnostics, completion, hover, signatures, and module docs without evaluating documents.
+Speaks a deterministic LSP subset over stdio, using the generated Lua HOST_API and semantic command catalog for diagnostics, completion, hover, signatures, and module docs without evaluating documents. Full-document changes require increasing integer versions and reject incremental ranges without replacing retained text.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -2489,7 +2500,7 @@ Options:
 
 Install a local plugin with explicit permission approval
 
-Reads the manifest and entry only from admitted regular files under their 256 KiB and 4 MiB limits. It validates the versioned runtime boundary, shows the permission diff, records SHA-256 source checksums, and atomically installs a disabled permission lock without implicit network access.
+Reads the manifest and entry only from admitted regular files under their 256 KiB and 4 MiB limits. It validates the versioned runtime boundary, shows the permission diff, records SHA-256 source checksums, and atomically installs a disabled permission lock without implicit network access. Plugin mutations serialize across processes; lock writes are capped at 4 MiB and stop when preserved transaction files need review.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -2520,7 +2531,7 @@ Options:
 
 Disable a plugin while retaining its permission lock
 
-Atomically changes only enabled state; source, checksums, versions, and granted capabilities remain locked for inspection and recovery.
+Atomically changes only enabled state; source, checksums, versions, and granted capabilities remain locked for inspection and recovery. Plugin mutations serialize across processes; lock writes are capped at 4 MiB and stop when preserved transaction files need review.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -2550,7 +2561,7 @@ Options:
 
 Enable a checksum-verified installed plugin
 
-Runs doctor and the declared non-executing or budgeted trusted boundary before atomically enabling the existing locked plugin.
+Runs doctor and the declared non-executing or budgeted trusted boundary before atomically enabling the existing locked plugin. Plugin mutations serialize across processes; lock writes are capped at 4 MiB and stop when preserved transaction files need review.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -2580,7 +2591,7 @@ Options:
 
 Remove an installed plugin lock without deleting source
 
-Atomically removes the named permission record; external source directories are never deleted by the plugin manager.
+Atomically removes the named permission record; external source directories are never deleted by the plugin manager. Plugin mutations serialize across processes; lock writes are capped at 4 MiB and stop when preserved transaction files need review.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -2595,7 +2606,7 @@ Options:
 
 Verify installed plugins without changing locked authority
 
-Re-resolves every local source and rejects any version, checksum, API, or permission change; platform v0.1 does not perform network updates.
+Re-resolves every local source and rejects any version, checksum, API, or permission change; platform v0.1 does not perform network updates. Plugin mutations serialize across processes; lock writes are capped at 4 MiB and stop when preserved transaction files need review.
 
 - Input: `Nothing`
 - Output: `Bytes`
@@ -2684,7 +2695,7 @@ Options:
 
 Serve explicitly granted source intelligence over MCP stdio
 
-Supports modern 2026-07-28 discovery and explicitly negotiated legacy clients. Each process exposes only the requested bounded catalog, completion, source-check, and source-format tools; it grants no filesystem, network, plugin, or command-execution authority.
+Supports modern 2026-07-28 discovery and explicitly negotiated legacy clients. Each process exposes only the requested bounded catalog, completion, source-check, and source-format tools; it grants no filesystem, network, plugin, or command-execution authority. Admission limits messages to 1 MiB, methods to 128 bytes, encoded parameters to 256 KiB, and JSON nesting to 32 containers before dispatch.
 
 - Input: `Nothing`
 - Output: `Bytes`

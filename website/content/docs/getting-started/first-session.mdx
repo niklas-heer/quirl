@@ -1,73 +1,142 @@
 ---
 title: Your first session
-description: Use Normal, Data, and AI modes, then discover the shared catalog and bounded Lua surface.
+description: Run a familiar command, filter typed data, and return to your usual shell in five minutes.
 ---
 
-## Begin in Normal mode
+> This guide follows the current source build. Homebrew currently installs
+> the published 0.1.0 release; build from source for the new `help` entry point
+> and Codex conversation workflow. The Normal and Data examples below also
+> illustrate the shared core workflow.
 
-Quirl starts where shell users expect: external commands, redirects, byte
-pipelines, boolean lists, and background jobs. The native grammar intentionally
-stays small; use an explicit Bash or Zsh island when you need behavior outside
-that frozen core. The default rich viewport streams bounded foreground output
-but rejects background pipelines before spawn; set `ui.surface = "simple"` for
-classic inherited-terminal background-job workflows.
+This walkthrough works from any directory, needs no sample files or account,
+and leaves your login shell unchanged. [Install Quirl](/docs/getting-started/installation),
+then run this from your current shell:
 
 ```sh
-ls -la | grep Cargo
+quirl
 ```
 
-## Switch to typed data
+Quirl starts in **Normal mode**. Enter the following commands one line at a
+time; the prompt tells you which mode is active.
 
-Press <kbd>Alt-Q</kbd>, then <kbd>d</kbd>, in an interactive session, or write an explicit `data`
-block in a native `.qrl` script. Data mode works with values rather than terminal
-text:
+## Run a familiar pipeline
 
 ```text
-open deployments.json | where status == "failed" | select service region
+printf '%s\n' hello | tr a-z A-Z
 ```
 
-The detailed semantics live in the [typed data runtime](/docs/guides/typed-data-runtime).
+You should see:
 
-Return to Normal mode with <kbd>Alt-Q</kbd>, then <kbd>n</kbd>. The leader menu
-keeps the active grammar visible: <kbd>n</kbd> selects byte-and-process commands,
-and <kbd>d</kbd> selects typed data. The textual forms are `mode normal`,
-`mode data`, and `mode ai`.
+```text
+HELLO
+```
 
-## Find a command in AI mode
+Normal mode runs familiar programs and byte pipelines. You can also use `pwd`,
+`cd`, and your usual external commands.
 
-Press <kbd>Alt-Q</kbd>, then <kbd>i</kbd>, and describe what you want in everyday
-language, then press <kbd>Enter</kbd>. Quirl asks an installed, authenticated
-Codex CLI to produce a typed proposal from the intent and a bounded compact
-projection of the complete admitted command catalog. The rich editor keeps one
-local Codex app-server connection and begins warming it with the first rich UI
-frame. While planning, a bordered activity card directly below the intent shows
-a high-contrast spinner, `CODEX`, the actual selected model, current phase, and
-elapsed time. Quirl prefers Luna when that model is available to the signed-in
-account. <kbd>Esc</kbd> or <kbd>Ctrl-C</kbd> cancels without losing the intent.
-Quirl validates the result and replaces the intent with a normally rendered
-command for review; it adds no fake command output and AI mode never executes
-it. Codex planning sends that bounded context to OpenAI and can reuse a ChatGPT
-subscription login. AI mode has no local suggestion or planner fallback.
+## Filter records in Data mode
 
-The completion database remains available to ordinary command completion and
-the explicit `quirl ai search` diagnostics, but AI-mode planning does not load
-or depend on Quirl's local model. Use `quirl assets status` to inspect readiness
-and `quirl ai status` to inspect database, model, and index state.
+Type this and press Enter:
 
-## Discover as you type
+```text
+mode data
+```
 
-- <kbd>Tab</kbd> opens semantic completion.
-- <kbd>Shift-Tab</kbd> expands completion into the picker.
-- <kbd>F1</kbd> opens contextual documentation from the same catalog.
-- <kbd>Ctrl-R</kbd> or <kbd>Up</kbd> opens cwd-aware history search.
-- <kbd>Alt-Q</kbd>, then <kbd>f</kbd>, opens the file picker.
-- <kbd>Alt-Q</kbd>, then <kbd>p</kbd>, opens catalog actions.
+Then paste the following pipeline. The two deployment records are included, so
+there is no file to create or download:
 
-The same leader also exposes history (<kbd>h</kbd>), directories
-(<kbd>c</kbd>), jobs (<kbd>j</kbd>), recent typed results (<kbd>r</kbd>), and
-retained output (<kbd>o</kbd>). Lua is not a hidden interactive grammar mode:
-use `lua <expression>` for a bounded one-off expression or `quirl run` for a
-script, configuration, or extension workflow.
+```text
+[{"service":"api","region":"eu","status":"failed"},{"service":"web","region":"us","status":"ok"}] | where status == "failed" | select service region
+```
 
-The catalog is also the source for generated help, documentation, and AI-facing
-metadata, so these surfaces do not drift into separate command lists.
+`where` keeps the failed deployment and `select` chooses the fields to show.
+Interactive streams print one record per line as results arrive:
+
+```text
+{"service":"api","region":"eu"}
+```
+
+When you have your own JSON or CSV file, replace the initial list with
+`open "your-file.json"` or `open "your-file.csv"`. Learn more in the
+[typed data guide](/docs/guides/typed-data-runtime).
+
+## Return to Normal mode and find help
+
+```text
+mode normal
+```
+
+You are ready to run ordinary commands again. Type `help` for an overview,
+then try `help mode` or `help quirl data` for a specific contract.
+
+- **Tab** opens completion; **Shift-Tab** expands it into the picker.
+- **F1** opens contextual command documentation.
+- **Ctrl-R** or **Up** searches your command history.
+- **Alt-Q**, then **f**, opens the file picker.
+
+**Alt-Q**, then **d** or **n**, also switches to Data or Normal mode. The
+textual `mode data` and `mode normal` commands work when your terminal does
+not pass the shortcut through.
+
+To leave Quirl, press **Ctrl-D on an empty input line**. You return to the shell
+that launched it. Press **Ctrl-C** first if you need to clear unfinished input.
+
+## Use typed data without entering Quirl
+
+From Bash, Zsh, or your existing shell, pass the entire pipeline as one quoted
+argument:
+
+```sh
+quirl data '[{"service":"api","region":"eu","status":"failed"},{"service":"web","region":"us","status":"ok"}] | where status == "failed" | select service region'
+```
+
+The standalone `quirl data` command defaults to a table and returns to your
+existing prompt:
+
+```text
+╭───┬─────────┬────────╮
+│ # │ service │ region │
+├───┼─────────┼────────┤
+│ 0 │ api     │ eu     │
+╰───┴─────────┴────────╯
+```
+
+Add `--format plain` to print the same record-per-line output as the interactive
+pipeline.
+
+## Optional: ask AI for a proposal
+
+AI planning requires an installed, authenticated Codex CLI. It sends your
+submitted intent and bounded command-catalog context to OpenAI; normal commands
+and Data mode do not need it.
+
+In Quirl, type `mode ai`, or press **Alt-Q**, then **i**. Describe a task such as
+“find the largest files in this directory” and press **Enter**. In the default
+rich editor, type a follow-up and press **Enter** to continue the conversation.
+When a proposal is ready, **Tab** or **Enter on empty input** transfers it to
+Normal mode for review. A separate Enter executes the reviewed command.
+**Esc** cancels planning or closes the conversation. There is no local planner
+fallback when Codex is unavailable.
+
+The local completion database serves ordinary completion and the separate
+`quirl ai search` tool. AI planning does not require Quirl's downloaded local
+model.
+
+## When familiar shell syntax needs Bash or Zsh
+
+Quirl's native grammar supports a focused set of quoting, redirects, byte
+pipelines, and command lists. For loops, functions, here-documents, and other
+shell-specific syntax, use an [explicit Bash or Zsh island](/docs/architecture/product-and-language-design).
+For example, in Normal mode:
+
+```text
+bash { for name in api web; do printf '%s\n' "$name"; done }
+```
+
+This prints `api` and `web` on separate lines.
+
+The default rich terminal surface rejects background pipelines before starting
+them. For classic background jobs with inherited terminal output, use
+`ui.surface = "simple"`; see [terminal behavior](/docs/architecture/interactive-surface).
+Lua is a separate scripting surface, not an interactive mode. For example,
+`quirl eval '1 + 2'` prints `3`.

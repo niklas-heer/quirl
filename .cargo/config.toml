@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --package xtask --"
+
+[env]
+# Internal catalog, history, and intelligence stores use ordinary SQLite tables.
+# Omit unused full-text and spatial modules from bundled SQLite to keep the CLI
+# within its release-size budget; retain the rest of SQLite's default behavior.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_RTREE"

@@ -46,11 +46,17 @@ description: "Canonical Quirl project documentation synced from docs/data-runtim
 `quirl data` evaluates native structured values and renders them explicitly:
 
 ```text
-quirl data 'open users.csv | where enabled == true | select name' --format table
+quirl data 'open users.csv | where enabled == "true" | select name' --format table
 quirl data 'open config.toml | get service.port' --format plain
 quirl data 'open users.json' --format json
 quirl data '^external printf "{\"ok\":true}" | from json'
 ```
+
+Interactive Data mode uses tables for already-materialized values such as
+single records. List sources, including inline JSON arrays, become streams
+and retain incremental plain-row output, preserving bounded memory and early
+failure behavior; `quirl data ... --format table` explicitly
+materializes a complete bounded table.
 
 Table output measures rendered Unicode cell widths and presents records in a
 compact rounded frame with padded cells and a header divider. Numeric, size,
@@ -98,6 +104,16 @@ implementation accident that produced `null`; write `null` explicitly. Bare
 paths containing whitespace also receive a migration diagnostic directing the
 author to quote the complete path.
 
+Numeric `where` predicates and `sort` compare retained decimal text exactly,
+including comparisons with signed and unsigned integers. Distinct values above
+2^53 remain distinct, trailing decimal zeros do not change equality, and a tiny
+nonzero decimal does not compare equal to zero through binary-float underflow.
+Decimal exponents must fit a signed 64-bit integer; a larger exponent produces
+`ResourceLimit`. Comparisons scan the bounded input digits with constant extra
+storage and never materialize the zeros implied by an exponent. This applies
+to the values retained by the runtime; comparison cannot recover precision
+already lost at a JSON, YAML, or TOML conversion boundary.
+
 `get`, `where`, and `sort` accept dotted cell paths that index into lists with
 a non-negative integer segment as well as into records by field name, for
 example `get items.0.name`. A path accepted by `get` or `where` may end with a
@@ -106,6 +122,12 @@ instead of failing when a field or index is absent, and `where b? == 1`
 treats an absent `b` as a non-match instead of erroring. Without the `?`
 marker, `get` and `where` fail closed on a field a row does not have, so a
 typo in a path is a diagnostic rather than a silently empty result.
+
+`select` requires every requested field in each consumed record. A missing
+field reports the transform's source range and a bounded list of available
+fields instead of silently omitting the column. Deferred stream failures keep
+that original location even when a later transform pulls the row. Empty inputs
+remain empty; projections preserve the requested field order.
 
 `Record` is an insertion-ordered mapping, not an alphabetized one: `select`
 emits fields in the order requested rather than sorted order, and table
@@ -145,7 +167,9 @@ script and watch consumers and therefore applies the same documented loss as
 JSON, YAML, TOML, and directory entries are validated then materialized because
 their current underlying parsers expose whole-document APIs.
 YAML anchors and aliases are rejected by a syntax-aware preflight before the
-whole-document parser can expand them. Leading UTF-8 BOMs are consumed as text
+whole-document parser can expand them. Quotes and block-style punctuation inside
+plain scalars do not hide later references; genuine quoted and block scalar
+text remains supported. Leading UTF-8 BOMs are consumed as text
 encoding markers, while malformed UTF-8 is a data encoding diagnostic with
 conversion guidance. CSV enforces record width while constructing both the
 header and each lazily pulled row, before retaining the first excess field.
@@ -156,7 +180,10 @@ field, 64 nesting-depth, 8 MiB retained-text, 16 MiB materialization, and
 evaluator entry points derive matching syntax byte, depth, and field limits
 before parsing. Resource-limit diagnostics report the configured limit and
 observed use when safe. CSV requires a single unique header row
-and does not support multiline quoted fields. Tar inspection lists headers
+and does not support multiline quoted fields. CSV columns remain strings,
+including boolean-looking and numeric-looking cells; compare text explicitly,
+for example `where enabled == "true"`. The adapter does not infer or coerce
+column types. Tar inspection lists headers
 only: it never extracts entries and intentionally supports only uncompressed POSIX `.tar`
 archives (not zip, gzip, bzip2, xz, or PAX/GNU extended-name semantics); each
 header checksum is verified before the entry is reported.

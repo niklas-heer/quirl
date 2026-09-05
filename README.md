@@ -64,24 +64,47 @@ into typed structures and validated before the rest of the shell can use them.
 
 ## Quick start
 
-Install the official Quirl 0.1.0 release from the Homebrew tap:
+Install the official Quirl 0.1.0 release, then start it inside your existing
+terminal:
 
 ```console
 brew install niklas-heer/tap/quirl
+quirl
 ```
 
-The formula installs the `quirl` binary plus its redistribution license files;
-its offline test never fetches the command model or completion database. Quirl
-acquires those separately in
-the background when available and remains usable in degraded mode while
-offline. Compatible completion knowledge can advance through Quirl's
-version-scoped website channel without forcing an otherwise empty binary
-release; every database generation has immutable, digest-named bytes and its
-own source identity. Native archives and checksums are also available from the
-immutable [`v0.1.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0).
-Build from source when contributing or testing current development work. The
-repository pins Rust 1.97.1 through `rust-toolchain.toml`; no system Lua
-installation is required.
+You start in **Normal mode**. Try a familiar byte pipeline:
+
+```text
+printf '%s\n' hello | tr a-z A-Z
+```
+
+It prints `HELLO`. Now type `mode data` and press Enter, then paste this
+self-contained pipeline:
+
+```text
+[{"service":"api","region":"eu","status":"failed"},{"service":"web","region":"us","status":"ok"}] | where status == "failed" | select service region
+```
+
+The result is one row: service `api`, region `eu`. No sample file, account, or
+network request is needed. Type `mode normal` to return to familiar commands.
+Press **Ctrl-D on an empty input line** to return to your previous shell.
+
+**Tab** opens completion, **F1** explains the command under your cursor, and
+**Ctrl-R** searches history. Current source builds also provide `help` as a starting point. The
+[five-minute first session](website/content/docs/getting-started/first-session.mdx)
+shows expected output, mode shortcuts, and optional AI planning.
+
+In current source builds, AI mode requires an installed, authenticated Codex CLI and sends your intent
+and bounded command-catalog context to OpenAI. It keeps proposals for review;
+nothing runs automatically. Normal commands and the example above work offline.
+
+See [installation](website/content/docs/getting-started/installation.mdx) for
+checksummed native archives, source builds, downloadable completion/model assets,
+and uninstall instructions. The supported release is the immutable
+[`v0.1.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.1.0).
+
+For development, the repository pins Rust 1.97.1; no system Lua installation is
+required:
 
 ```console
 git clone https://github.com/niklas-heer/quirl.git
@@ -89,45 +112,9 @@ cd quirl
 cargo run -p quirl-cli
 ```
 
-Run the deterministic text tour against the Homebrew-installed release to see
-Normal, Data, and AI modes, semantic completion, sandboxed Lua, and the shared
-command catalog:
-
-```console
-cargo xtask demo
-```
-
-![Quirl's deterministic text tour: typed-data filtering, semantic completion, sandboxed Lua evaluation, and generated documentation](assets/quirl-tour.svg)
-
-Inside an interactive session, <kbd>Tab</kbd> opens semantic completion,
-<kbd>Shift-Tab</kbd> expands it into the picker, <kbd>F1</kbd> opens contextual
-help, and <kbd>Ctrl-R</kbd> or <kbd>Up</kbd> searches cwd-aware history.
-<kbd>Alt-Q</kbd> opens Quirl's leader menu: then press <kbd>n</kbd>,
-<kbd>d</kbd>, or <kbd>i</kbd> for Normal, Data, or AI mode, or <kbd>f</kbd> for
-the file picker. <kbd>Alt-Q e</kbd> opens the full-screen Environment Explorer:
-developer-oriented categories lead into variables, and `PATH` drills into its
-ordered directories, executables, winning resolutions, and shadowed commands.
-Use <kbd>/</kbd> to filter, <kbd>w</kbd> to resolve a command across all of
-`PATH`, <kbd>y</kbd> to copy, or <kbd>i</kbd> to insert a safe reference for
-review. A bounded health scan starts immediately; Health reads `scanning…`,
-`clean`, or the final finding count instead of treating unchecked state as zero.
-Findings explain the concrete PATH entry and jump directly to it. AI mode sends
-the submitted intent and a bounded compact view
-of the complete admitted command catalog to an installed, authenticated Codex
-CLI. One open AI session is a bounded conversation: Enter follows up, Tab moves
-the current validated proposal into Normal mode for review, and an empty Enter
-does the same once a proposal is ready. Typing a follow-up before Enter keeps
-the conversation open. Proposals may be complete pipelines, command lists,
-redirects, or a syntax-checked chunk for Quirl's sandboxed Lua runtime; nothing
-runs automatically. The compact panel shows Codex, the selected model and
-reasoning effort, recent turns, and a visible activity indicator without
-reserving empty rows. There is no local-planner fallback. Codex can
-reuse the user's existing ChatGPT subscription login; the submitted context is
-sent to OpenAI.
-
-For requirements and a guided first session, see the website's
-[getting-started section](website/content/docs/getting-started/index.mdx).
-Release operators should use [the Rust-native release procedure](docs/releasing.md).
+After cloning, `cargo xtask demo` runs the deterministic text tour against the
+Homebrew-installed release. Release operators should use
+[the Rust-native release procedure](docs/releasing.md).
 
 ## Status
 
@@ -159,6 +146,16 @@ is the default. `quirl config web` exposes the same validated palettes through
 a bounded, no-JavaScript preview gallery. See
 [ADR 0013](docs/decisions/0013-lua-config-themes.md) and
 [ADR 0015](docs/decisions/0015-bounded-theme-preview-gallery.md).
+
+The current source supports `editor.keymap = "emacs"` (the default), `"vim"`,
+and `"helix"` in Lua configuration. Both terminal surfaces accept bracketed
+paste as editable text: pasted newlines require an explicit Enter to execute.
+Commands are limited to 64 KiB. Rich mode rejects an oversized edit with a
+status notice and preserves the previous input; simple mode exits with a
+resource diagnostic and restores the terminal. Excessive terminal input or an
+unfinished escape/paste sequence lasting 30 seconds also ends the session.
+See [the interactive surface](docs/tui-design.md) for editing and recovery
+behavior, including the separate terminal transport limits.
 
 Important current limits:
 
@@ -228,6 +225,21 @@ references and retain bounded reports and failure artifacts:
 ```console
 cargo xtask simulate --seed 123456789 --sessions 2048 --steps 12
 ```
+
+Keyboard-driven Unix PTY sessions exercise editing, pickers, help, typed data,
+and resizing, with replay traces and an offline screen gallery:
+
+```console
+cargo build -p quirl-cli
+cargo xtask session-soak --seed 2026090501 --sessions 100 --journeys 60
+```
+
+For a quick check, use `--sessions 4 --journeys 12`. The command above runs
+6,000 journeys: 100 modeled active hours at 60 journeys per hour, with think
+time removed. It does not establish 100 hours of continuous uptime. Each run
+keeps its executable hash, replay trace, measured counters, and an `index.html`
+gallery under `target/session-soak`. The styled SVGs model terminal cells and
+colors; they do not reproduce terminal fonts, IME behavior, or exact pixels.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and pull-request guidance,
 [AGENTS.md](AGENTS.md) for the engineering contract, and

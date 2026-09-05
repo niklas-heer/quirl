@@ -1,0 +1,68 @@
+# ADR 0030: Keep queued terminal input observable across resize events
+
+- Status: Accepted
+- Date: 2026-09-05
+- Decision owners: Quirl maintainers
+
+## Context and failure model
+
+A resize signal and readable keyboard input can arrive in one operating-system
+readiness batch. Crossterm 0.29's default Unix MIO backend returns immediately
+when it processes the signal token. If a terminal token follows it in that
+batch, those bytes remain unread. With edge-triggered readiness, another poll
+need not report bytes that were already readable. The user can see a resized
+prompt while their typed command or Enter appears to do nothing.
+
+The Linux canonical PTY gate reproduced this during the `resize-input` check:
+after `RESIZE_STOPPED_07` completed, shrinking the terminal and typing the next
+command left an empty editor until the bounded wait failed. A separate Linux
+run against the same binary reproduced the failure. Earlier macOS probes
+passed, so the regression is evidence of a scheduling-sensitive defect, not a
+claim that every resize loses input.
+
+## Decision
+
+Enable Crossterm's existing `use-dev-tty` dependency feature at the workspace
+source of truth. This selects its Unix backend built on level-triggered
+`filedescriptor::poll`. Returning one event leaves other unread sources ready
+for the next poll. No Quirl crate gains a feature flag, and no new dependency
+package or version is introduced: `filedescriptor` was already locked through
+other terminal dependencies.
+
+The CLI's normal/build release closure now includes the already locked
+`filedescriptor` 0.8.3 and its `thiserror` / `thiserror-impl` 1.0.69 dependencies.
+The release license inventory is regenerated from all four supported target
+graphs; choosing an existing backend does not exempt these packages from the
+CLI's redistribution checks.
+
+The owning behavior remains explicit:
+
+- `quirl-ui` still owns raw mode, terminal restoration, and 16 ms input polling;
+- Crossterm uses the same event parser and 1 KiB read buffer; that fixed read
+  size is not a claim that every parser state has bounded aggregate storage;
+- both backends select the same borrowed terminal stdin or owned `/dev/tty`
+  descriptor through `tty_fd`, preserving which input stream is consumed;
+- owned descriptors and Unix signal-pipe endpoints use RAII during setup;
+  the signal registration belongs to Crossterm's process-lifetime event source;
+- I/O failures still cross the existing terminal error mapping, and the PTY
+  test owner kills and reaps its child on every failed probe, including when
+  the child is stopped.
+
+This changes the dependency's readiness backend without introducing a local
+terminal parser, a retry keystroke, an artificial input delay, or a new thread.
+The application does not discard resize events or rely on their ordering
+relative to input.
+
+## Validation and future changes
+
+`resize-input` runs 32 cycles with a stopped child so resize and the sole Enter
+can queue together, then 32 immediate live cycles. Each cycle requires unique
+executed output and a fresh input-mode restoration sequence. It also sends the
+next command immediately after shrinking the terminal. No second Enter or
+sleep rescues unconsumed input. Unit tests reject command echoes and stale
+output as execution evidence, and prove that a stopped child is reaped on drop.
+
+Backend changes must rerun this check on Linux and macOS, plus the canonical
+PTY terminal-restoration checks. A passing scheduling-sensitive probe alone
+does not prove the absence of every terminal race; its value is preserving the
+observed failure boundary alongside the backend's readiness contract.

@@ -1,0 +1,66 @@
+# ADR 0031: Bound terminal input before editor admission
+
+- Status: Accepted
+- Date: 2026-09-05
+- Decision owners: Quirl maintainers
+
+## Failure model and invariants
+
+The editor's 64 KiB limit cannot bound input that its terminal dependency has
+not yet delivered. Crossterm 0.29 accumulates an unfinished escape or bracketed
+paste in a growing vector. Its Unix read loop can continue reading unfinished
+input beyond the caller's poll budget. Filtered terminal replies can also
+accumulate while a caller waits for an ordinary key.
+
+Input admission must reject excessive bytes before retaining them, yield to
+the caller's polling deadline, and expire an unfinished sequence even if no
+more bytes arrive. Rejected paste must never become an executable prefix or
+suffix. Terminal restoration and child ownership remain with the existing UI
+guards. Limit failures must retain their identity as `ShellError` with
+`ErrorCode::ResourceLimit` in both rich and simple surfaces.
+
+## Decision
+
+Retain a narrow, reviewed patch of Crossterm 0.29 in `vendor/crossterm`, selected
+by the workspace Cargo patch. It uses the level-triggered Unix backend chosen
+in ADR 0030. The pending buffer admits at most 4,096 raw bytes for an escape
+sequence, or 262,156 raw bytes for bracketed paste including its delimiters.
+The larger transport cap lets the editor reject a paste exceeding 64 KiB
+atomically while keeping the session usable. Crossing the transport cap or
+leaving a sequence unfinished for 30 seconds ends the session with an
+actionable resource diagnostic. This is an absolute sequence deadline, not an
+idle timer that an input stream can extend forever.
+
+Admission failure is sticky. Bytes already queued at the Unix terminal are
+flushed before returning the original error. This cannot suppress input a
+terminal sends in the future; it is not a protocol handshake. The polling
+loop checks its deadline after each 1 KiB read and drains signal notifications
+with one bounded read. A partial sequence limits blocking waits to its remaining
+deadline. Filtered event queues admit at most 1,024 events and 1 MiB of event
+storage plus owned paste text, checked before enqueueing.
+
+The pending vector can retain up to 512 KiB backing capacity because the paste
+cap crosses a power of two. UTF-8 replacement decoding can expand an admitted
+paste to at most three times its raw bytes. The event parser only consumes one
+1 KiB read when its prior events have drained; its event count is therefore
+bounded by that chunk. Queue byte admission covers decoded paste strings.
+These are transport bounds; the editor separately rejects input beyond its
+64 KiB command limit without changing the buffer, cursor, or undo history.
+
+## Ownership and maintenance
+
+The patch adds no dependency package or version and no Quirl feature flags.
+Original source hashes, the registry checksum, upstream manifest, and license
+are retained. `vendor/crossterm/QUIRL-PATCH.md` lists intentional deviations.
+The distribution inventory identifies Crossterm as vendored. The existing
+upstream unsafe platform code is retained; this patch adds no unsafe code.
+Windows remains outside the validated scope. The selected default Unix build
+uses Rustix for safe input flushing; the unused upstream `libc` feature path
+does not gain that flush behavior.
+
+The admission module uses only `std`. The canonical test task compiles its
+in-file tests directly with the pinned Rust compiler, avoiding unrelated
+upstream async/example test dependencies. PTY checks exercise the assembled
+library, error mapping, no-partial-execution behavior, and terminal cleanup.
+When upstream supplies equivalent bounds and polling behavior, revalidate all
+these tests and remove the patch as one change.

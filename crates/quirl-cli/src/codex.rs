@@ -15,6 +15,13 @@
 //! syntax-checked as restricted Lua before display. Codex never receives
 //! execution authority, and accepting a proposal only copies it into the
 //! normal editor for explicit review.
+//!
+//! An app server can stop reading its stdin at any time. Protocol writes share
+//! the request deadline and cancellation signal with response waits. A scoped
+//! writer owns each bounded payload while its supervisor can terminate the
+//! child on failure. Unix pipe writes are nonblocking, so cancellation also
+//! releases the writer when a descendant has retained a pipe descriptor. No
+//! partial request is retried or reused in a later conversation.
 
 use quirl_catalog::{ArgumentKind, Catalog};
 use quirl_contract::{
@@ -1372,6 +1379,7 @@ struct CodexAppServer {
     stdin: ChildStdin,
     events: Option<Receiver<Result<Vec<u8>, ShellError>>>,
     stdout_reader: Option<JoinHandle<()>>,
+    reader_shutdown: ExecutionCancellation,
     temporary: PlannerTemporary,
     request_id: u64,
     model: AppServerModel,
@@ -1424,14 +1432,18 @@ impl CodexAppServer {
             ShellError::new(ErrorCode::Io, "Codex app-server stdin is unavailable")
                 .with_help("Retry after restoring process pipe capacity")
         })?;
+        configure_protocol_pipe(&stdin)?;
         let stdout = child.child_mut().stdout.take().ok_or_else(|| {
             ShellError::new(ErrorCode::Io, "Codex app-server stdout is unavailable")
                 .with_help("Retry after restoring process pipe capacity")
         })?;
+        configure_protocol_pipe(&stdout)?;
+        let reader_shutdown = ExecutionCancellation::default();
+        let reader_cancellation = reader_shutdown.clone();
         let (event_sender, event_receiver) = mpsc::sync_channel(APP_SERVER_UPDATES_MAX);
         let stdout_reader = thread::Builder::new()
             .name("quirl-codex-app-server-stdout".to_owned())
-            .spawn(move || read_protocol_lines(stdout, event_sender))
+            .spawn(move || read_protocol_lines(stdout, event_sender, &reader_cancellation))
             .map_err(|error| {
                 ShellError::new(ErrorCode::Io, "cannot start the Codex protocol reader")
                     .with_context(error.to_string())
@@ -1442,6 +1454,7 @@ impl CodexAppServer {
             stdin,
             events: Some(event_receiver),
             stdout_reader: Some(stdout_reader),
+            reader_shutdown,
             temporary,
             request_id: 0,
             model: AppServerModel {
@@ -1461,9 +1474,11 @@ impl CodexAppServer {
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }),
+            deadline,
+            cancellation,
         )?;
         server.wait_response(initialize_id, deadline, cancellation)?;
-        server.send_notification("initialized", serde_json::json!({}))?;
+        server.send_notification("initialized", serde_json::json!({}), deadline, cancellation)?;
         server.model = server.discover_model(deadline, cancellation)?;
         Ok(server)
     }
@@ -1476,6 +1491,8 @@ impl CodexAppServer {
         let request_id = self.send_request(
             "model/list",
             serde_json::json!({"includeHidden": false, "limit": 100}),
+            deadline,
+            cancellation,
         )?;
         let result = self.wait_response(request_id, deadline, cancellation)?;
         let models = result
@@ -1625,6 +1642,8 @@ impl CodexAppServer {
                 "sandboxPolicy": {"type": "readOnly"},
                 "summary": "none"
             }),
+            deadline,
+            &job.cancellation,
         )?;
         let turn_result = self.wait_response(turn_request_id, deadline, &job.cancellation)?;
         let turn_id = value_string_path(&turn_result, &["turn", "id"])?;
@@ -1667,6 +1686,8 @@ impl CodexAppServer {
                 "sandbox": "read-only",
                 "serviceName": "quirl"
             }),
+            deadline,
+            &job.cancellation,
         )?;
         let result = self.wait_response(request_id, deadline, &job.cancellation)?;
         let thread_id = value_string_path(&result, &["thread", "id"])?;
@@ -1763,7 +1784,13 @@ impl CodexAppServer {
         }
     }
 
-    fn send_request(&mut self, method: &str, params: serde_json::Value) -> Result<u64, ShellError> {
+    fn send_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        deadline: Instant,
+        cancellation: &ExecutionCancellation,
+    ) -> Result<u64, ShellError> {
         self.request_id = self.request_id.checked_add(1).ok_or_else(|| {
             ShellError::new(
                 ErrorCode::ResourceLimit,
@@ -1772,7 +1799,11 @@ impl CodexAppServer {
             .with_help("Restart Quirl before submitting another request")
         })?;
         let id = self.request_id;
-        self.send_message(&serde_json::json!({"id": id, "method": method, "params": params}))?;
+        self.send_message(
+            &serde_json::json!({"id": id, "method": method, "params": params}),
+            deadline,
+            cancellation,
+        )?;
         Ok(id)
     }
 
@@ -1780,11 +1811,22 @@ impl CodexAppServer {
         &mut self,
         method: &str,
         params: serde_json::Value,
+        deadline: Instant,
+        cancellation: &ExecutionCancellation,
     ) -> Result<(), ShellError> {
-        self.send_message(&serde_json::json!({"method": method, "params": params}))
+        self.send_message(
+            &serde_json::json!({"method": method, "params": params}),
+            deadline,
+            cancellation,
+        )
     }
 
-    fn send_message(&mut self, message: &serde_json::Value) -> Result<(), ShellError> {
+    fn send_message(
+        &mut self,
+        message: &serde_json::Value,
+        deadline: Instant,
+        cancellation: &ExecutionCancellation,
+    ) -> Result<(), ShellError> {
         let mut writer = BoundedVecWriter::new(APP_SERVER_PROTOCOL_LINE_BYTES_MAX);
         let encode_result = serde_json::to_writer(&mut writer, message);
         if writer.overflowed {
@@ -1803,14 +1845,13 @@ impl CodexAppServer {
             .with_help("Report this app-server protocol defect")
         })?;
         writer.bytes.push(b'\n');
-        self.stdin
-            .write_all(&writer.bytes)
-            .and_then(|()| self.stdin.flush())
-            .map_err(|error| {
-                ShellError::new(ErrorCode::Io, "cannot write to the Codex app server")
-                    .with_context(error.to_string())
-                    .with_help("Restart Quirl and retry the request")
-            })
+        send_protocol_bytes(
+            &mut self.child,
+            &mut self.stdin,
+            &writer.bytes,
+            deadline,
+            cancellation,
+        )
     }
 
     fn wait_response(
@@ -1889,6 +1930,7 @@ impl CodexAppServer {
 
 impl Drop for CodexAppServer {
     fn drop(&mut self) {
+        self.reader_shutdown.cancel();
         self.events.take();
         let _ = self.child.terminate_and_reap();
         if let Some(reader) = self.stdout_reader.take() {
@@ -1897,12 +1939,134 @@ impl Drop for CodexAppServer {
     }
 }
 
-fn read_protocol_lines(mut stdout: impl Read, sender: SyncSender<Result<Vec<u8>, ShellError>>) {
+#[cfg(unix)]
+fn configure_protocol_pipe(descriptor: &impl std::os::fd::AsFd) -> Result<(), ShellError> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+    let flags = fcntl(descriptor, FcntlArg::F_GETFL)
+        .map(OFlag::from_bits_retain)
+        .map_err(protocol_write_io_error)?;
+    fcntl(descriptor, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+        .map_err(protocol_write_io_error)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_protocol_pipe<T>(_descriptor: &T) -> Result<(), ShellError> {
+    // Windows writer/reader release is provided by the contained Job Object
+    // termination before joins; anonymous pipes do not expose nonblocking mode.
+    Ok(())
+}
+
+fn send_protocol_bytes(
+    child: &mut ContainedChild,
+    stdin: &mut ChildStdin,
+    bytes: &[u8],
+    deadline: Instant,
+    cancellation: &ExecutionCancellation,
+) -> Result<(), ShellError> {
+    let started = Instant::now();
+    if cancellation.is_cancelled() || started >= deadline {
+        let error = protocol_write_budget_error(cancellation);
+        return Err(with_cleanup_context(error, child.terminate_and_reap()));
+    }
+    let stop_writer = ExecutionCancellation::default();
+    thread::scope(|scope| {
+        let writer = thread::Builder::new()
+            .name("quirl-codex-protocol-stdin".to_owned())
+            .spawn_scoped(scope, || write_protocol_bytes(stdin, bytes, &stop_writer))
+            .map_err(protocol_write_io_error)?;
+        loop {
+            if cancellation.is_cancelled() || Instant::now() >= deadline {
+                stop_writer.cancel();
+                let error = protocol_write_budget_error(cancellation).with_context(format!(
+                    "write budget: {} ms; observed: {} ms",
+                    deadline.saturating_duration_since(started).as_millis(),
+                    started.elapsed().as_millis(),
+                ));
+                let cleanup = child.terminate_and_reap();
+                let _ = writer.join();
+                return Err(with_cleanup_context(error, cleanup));
+            }
+            if writer.is_finished() {
+                return writer
+                    .join()
+                    .map_err(|_| protocol_error("Codex protocol writer panicked"))?
+                    .map_err(protocol_write_io_error);
+            }
+            thread::sleep(
+                APP_SERVER_RESPONSE_POLL.min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    })
+}
+
+fn protocol_write_budget_error(cancellation: &ExecutionCancellation) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        if cancellation.is_cancelled() {
+            "Codex protocol write was cancelled"
+        } else {
+            "Codex protocol write exceeded its deadline"
+        },
+    )
+    .with_help("Check the Codex installation and retry the request")
+}
+
+fn write_protocol_bytes(
+    stdin: &mut ChildStdin,
+    bytes: &[u8],
+    cancellation: &ExecutionCancellation,
+) -> std::io::Result<()> {
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        if cancellation.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "protocol write cancelled",
+            ));
+        }
+        match stdin.write(remaining) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(count) => {
+                remaining = remaining
+                    .get(count..)
+                    .ok_or_else(|| std::io::Error::other("invalid pipe write length"))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(APP_SERVER_RESPONSE_POLL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    stdin.flush()
+}
+
+fn protocol_write_io_error(error: impl std::fmt::Display) -> ShellError {
+    ShellError::new(ErrorCode::Io, "cannot write to the Codex app server")
+        .with_context(error.to_string())
+        .with_help("Restart Quirl and retry the request")
+}
+
+fn read_protocol_lines(
+    mut stdout: impl Read,
+    sender: SyncSender<Result<Vec<u8>, ShellError>>,
+    cancellation: &ExecutionCancellation,
+) {
     let mut buffer = [0_u8; 4096];
     let mut line = Vec::new();
     loop {
+        if cancellation.is_cancelled() {
+            return;
+        }
         let count = match stdout.read(&mut buffer) {
             Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(APP_SERVER_RESPONSE_POLL);
+                continue;
+            }
             Err(error) => {
                 let _ = sender.send(Err(ShellError::new(
                     ErrorCode::Io,
@@ -2208,6 +2372,133 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::Validation);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_write_deadline_and_cancellation_reap_a_nonreading_child() {
+        for cancel in [false, true] {
+            let mut command = Command::new("/bin/sleep");
+            command
+                .arg("2")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = ContainedChild::spawn(&mut command).unwrap();
+            let mut stdin = child.child_mut().stdin.take().unwrap();
+            configure_protocol_pipe(&stdin).unwrap();
+            let cancellation = ExecutionCancellation::default();
+            let cancel_worker = cancel.then(|| {
+                let cancellation = cancellation.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(40));
+                    cancellation.cancel();
+                })
+            });
+            let started = Instant::now();
+            let deadline = started + Duration::from_millis(if cancel { 1_000 } else { 40 });
+            // A payload larger than the pipe capacity forces the writer to
+            // wait; the fixture never reads its stdin and needs no network.
+            let error = send_protocol_bytes(
+                &mut child,
+                &mut stdin,
+                &vec![b'x'; APP_SERVER_PROTOCOL_LINE_BYTES_MAX],
+                deadline,
+                &cancellation,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(
+                error
+                    .message
+                    .contains(if cancel { "cancelled" } else { "deadline" })
+            );
+            assert!(started.elapsed() < Duration::from_millis(800));
+            assert!(child.try_wait().unwrap().is_some());
+            if let Some(worker) = cancel_worker {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_writes_preserve_framing_across_successive_requests() {
+        let mut command = Command::new("/bin/cat");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = ContainedChild::spawn(&mut command).unwrap();
+        let mut stdin = child.child_mut().stdin.take().unwrap();
+        let mut stdout = child.child_mut().stdout.take().unwrap();
+        configure_protocol_pipe(&stdin).unwrap();
+        let cancellation = ExecutionCancellation::default();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        for bytes in [b"first\n".as_slice(), b"second\n".as_slice()] {
+            send_protocol_bytes(&mut child, &mut stdin, bytes, deadline, &cancellation).unwrap();
+        }
+        let mut echoed = [0; 13];
+        stdout.read_exact(&mut echoed).unwrap();
+        assert_eq!(&echoed, b"first\nsecond\n");
+        child.terminate_and_reap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_write_rejects_an_expired_request_before_sending_bytes() {
+        let mut command = Command::new("/bin/cat");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = ContainedChild::spawn(&mut command).unwrap();
+        let mut stdin = child.child_mut().stdin.take().unwrap();
+        let mut stdout = child.child_mut().stdout.take().unwrap();
+        configure_protocol_pipe(&stdin).unwrap();
+        let error = send_protocol_bytes(
+            &mut child,
+            &mut stdin,
+            b"must not be sent",
+            Instant::now(),
+            &ExecutionCancellation::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(child.try_wait().unwrap().is_some());
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protocol_reader_shutdown_does_not_wait_for_a_retained_pipe_to_close() {
+        let mut command = Command::new("/bin/sleep");
+        command
+            .arg("2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = ContainedChild::spawn(&mut command).unwrap();
+        let stdout = child.child_mut().stdout.take().unwrap();
+        configure_protocol_pipe(&stdout).unwrap();
+        let cancellation = ExecutionCancellation::default();
+        let control = cancellation.clone();
+        let (sender, _events) = mpsc::sync_channel(1);
+        let (done, finished) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            read_protocol_lines(stdout, sender, &control);
+            done.send(()).unwrap();
+        });
+        // Keep the child and its write end alive while requesting reader
+        // shutdown, mirroring an inherited descriptor held by another process.
+        assert!(child.try_wait().unwrap().is_none());
+        cancellation.cancel();
+        finished.recv_timeout(Duration::from_millis(800)).unwrap();
+        reader.join().unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        child.terminate_and_reap().unwrap();
     }
 
     #[test]

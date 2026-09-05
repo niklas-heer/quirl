@@ -15,7 +15,7 @@ use std::{fmt, ops::Range, str::FromStr};
 /// the frozen 1.0 C1/C2 disposition.
 pub const COMPATIBILITY_MATRIX_JSON: &str = include_str!("../compatibility-v0.1.json");
 /// Current serialized version of the native command grammar.
-pub const GRAMMAR_PROTOCOL_VERSION: u32 = 2;
+pub const GRAMMAR_PROTOCOL_VERSION: u32 = 3;
 /// Schema version of the JSON evidence embedded in [`COMPATIBILITY_MATRIX_JSON`].
 pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 3;
 /// Canonical structural description used to fingerprint the command grammar.
@@ -23,7 +23,7 @@ pub const COMPATIBILITY_MATRIX_SCHEMA_VERSION: u32 = 3;
 /// Any change to serialized shapes, token semantics, supported expansions, or
 /// the referenced compatibility matrix must update this descriptor and the
 /// corresponding protocol version.
-pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@2{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or|sequence>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;word_ir:array<Word>;redirects:array<Redirect>};Word{deny_unknown;parts:nonempty-array<WordPart>};WordPart{deny_unknown;text:string;quoting:unquoted|single|double|escaped};Redirect{deny_unknown;fd:u8;kind:input|output|append|here_string|duplicate_input|duplicate_output;path:string;target:Word};tokens:word|pipe|and|or|semicolon|input|output|append|here_string|fd_duplicate|background;expansion:parameter|special|arithmetic|command|pathname;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema3}";
+pub const GRAMMAR_SCHEMA_DESCRIPTOR: &str = "quirl.command-grammar@3{CommandList{deny_unknown;pipelines:array<Pipeline>;connectors:array<and|or|sequence>;invariant:connectors.len+1=pipelines.len};Pipeline{deny_unknown;commands:array<SimpleCommand>;background:bool};SimpleCommand{deny_unknown;words:nonempty-array<string>;word_ir:array<Word>;redirects:array<Redirect>};Word{deny_unknown;parts:nonempty-array<WordPart>};WordPart{deny_unknown;text:string;quoting:unquoted|single|double|escaped};Redirect{deny_unknown;fd:u8;kind:input|output|append|here_string|duplicate_input|duplicate_output;path:string;target:Word};tokens:word|pipe|and|or|semicolon|newline|input|output|append|here_string|fd_duplicate|background;lines:unquoted-LF-sequences|leading-blank-trailing-LF-ignored|LF-after-pipe-and-or-continues|backslash-LF-removed|quoted-LF-literal|unquoted-CR-whitespace|backslash-CRLF-keeps-escaped-CR-then-separates;expansion:parameter|special|arithmetic|command|pathname;compatibility_matrix:quirl-syntax/compatibility-v0.1.json@schema3}";
 
 const MAX_COMMAND_SUBSTITUTION_DEPTH: usize = 64;
 
@@ -195,6 +195,7 @@ enum TokenKind {
     Or,
     Redirect { fd: u8, kind: RedirectKind },
     Semicolon,
+    Newline,
     Background,
 }
 
@@ -307,6 +308,7 @@ fn highlight_tokens(line: &str, tokens: &[Token]) -> Vec<HighlightSpan> {
             | TokenKind::And
             | TokenKind::Or
             | TokenKind::Semicolon
+            | TokenKind::Newline
             | TokenKind::Background => {
                 command_position = true;
                 HighlightKind::Operator
@@ -387,6 +389,11 @@ fn classify_word(raw: &str, word: &Word) -> HighlightKind {
 /// fragment so the process boundary can expand unquoted/double quoted parameters while keeping
 /// single quoted and escaped text literal.
 ///
+/// Unquoted line feeds separate commands. Leading, blank, and trailing lines
+/// are ignored; line feeds after `|`, `&&`, or `||` continue that operation.
+/// Quoted line feeds remain literal and backslash-line-feed pairs disappear.
+/// A carriage return outside quotes is whitespace, so CRLF input also separates
+/// commands; a backslash before CRLF escapes its CR rather than continuing LF.
 /// Empty or whitespace-only input succeeds with an empty [`CommandList`].
 /// Invalid quoting, unsupported C1 dialect forms, malformed control operators,
 /// or unsupported descriptor graphs return [`CommandSyntaxError`] with UTF-8
@@ -479,7 +486,7 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                     token,
                 )?);
             }
-            TokenKind::And | TokenKind::Or | TokenKind::Semicolon => {
+            TokenKind::And | TokenKind::Or | TokenKind::Semicolon | TokenKind::Newline => {
                 commands.push(finish_command(
                     &mut words,
                     &mut word_ir,
@@ -493,7 +500,7 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                 connectors.push(match token.kind {
                     TokenKind::And => ListConnector::And,
                     TokenKind::Or => ListConnector::Or,
-                    TokenKind::Semicolon => ListConnector::Sequence,
+                    TokenKind::Semicolon | TokenKind::Newline => ListConnector::Sequence,
                     _ => {
                         return Err(syntax_error(
                             token,
@@ -518,7 +525,7 @@ pub fn parse_command_list(input: &str) -> Result<CommandList, CommandSyntaxError
                     return Err(syntax_error(
                         next,
                         "background marker must end a command list",
-                        "Run the following command on a new line",
+                        "Submit the background command separately, then enter the next command",
                     ));
                 }
             }
@@ -597,7 +604,11 @@ fn reject_reserved_dialect_forms(tokens: &[Token]) -> Result<(), CommandSyntaxEr
         }
         match &token.kind {
             TokenKind::Redirect { .. } => redirect_target = true,
-            TokenKind::Pipe | TokenKind::And | TokenKind::Or | TokenKind::Semicolon => {
+            TokenKind::Pipe
+            | TokenKind::And
+            | TokenKind::Or
+            | TokenKind::Semicolon
+            | TokenKind::Newline => {
                 command_position = true;
             }
             TokenKind::Background => command_position = true,
@@ -844,7 +855,6 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
             continue;
         }
         if character == '\\' && quote != Some('\'') {
-            word_start.get_or_insert(index);
             let Some((_, escaped)) = characters.next() else {
                 return Err(CommandSyntaxError {
                     message: "command ends with an escape".to_owned(),
@@ -853,6 +863,12 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                     help: "Add the escaped character or remove the trailing backslash".to_owned(),
                 });
             };
+            // A continued physical line contributes no argument bytes. Do
+            // not start an empty word when the continuation stands alone.
+            if escaped == '\n' {
+                continue;
+            }
+            word_start.get_or_insert(index);
             append_fragment(
                 &mut parts,
                 &mut fragment,
@@ -933,6 +949,9 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
                 &mut word_start,
                 index,
             );
+            if character == '\n' {
+                push_line_separator(&mut tokens, index);
+            }
             continue;
         }
 
@@ -1106,7 +1125,31 @@ fn lex_command(input: &str) -> Result<Vec<Token>, CommandSyntaxError> {
         &mut word_start,
         input.len(),
     );
+    // A final physical line terminator completes the preceding command rather
+    // than asking for another one. Explicit trailing semicolons stay invalid.
+    if tokens
+        .last()
+        .is_some_and(|token| token.kind == TokenKind::Newline)
+    {
+        tokens.pop();
+    }
     Ok(tokens)
+}
+
+fn push_line_separator(tokens: &mut Vec<Token>, index: usize) {
+    // Blank lines and newlines following a continuation operator add no graph
+    // node. After a redirect, retain the delimiter so its missing operand is
+    // rejected before any command can execute.
+    if tokens
+        .last()
+        .is_some_and(|token| matches!(token.kind, TokenKind::Word(_) | TokenKind::Redirect { .. }))
+    {
+        tokens.push(Token {
+            kind: TokenKind::Newline,
+            start: index,
+            end: index.saturating_add(1),
+        });
+    }
 }
 
 fn open_command_substitution(
@@ -1454,6 +1497,71 @@ mod tests {
                     }]
                 },
             }]
+        );
+    }
+
+    #[test]
+    fn physical_lines_form_sequences_without_empty_commands() {
+        let graph = parse_command_list("\n \n printf one\n\n printf two\r\n").unwrap();
+        assert_eq!(graph.pipelines.len(), 2);
+        assert_eq!(graph.connectors, [ListConnector::Sequence]);
+        assert_eq!(graph.pipelines[0].commands[0].words, ["printf", "one"]);
+        assert_eq!(graph.pipelines[1].commands[0].words, ["printf", "two"]);
+        assert!(parse_command_list("\n\r\n\t").unwrap().pipelines.is_empty());
+    }
+
+    #[test]
+    fn physical_lines_after_boolean_and_pipe_operators_continue_commands() {
+        let graph = parse_command_list("printf a |\n\n cat &&\n true ||\n printf b\n").unwrap();
+        assert_eq!(graph.pipelines.len(), 3);
+        assert_eq!(graph.pipelines[0].commands.len(), 2);
+        assert_eq!(graph.connectors, [ListConnector::And, ListConnector::Or]);
+        for source in [
+            "printf a |\n",
+            "printf a &&\n",
+            "printf a ||\n",
+            "printf a;\n",
+        ] {
+            assert_eq!(
+                parse_command_list(source).unwrap_err().message,
+                "command list ends with a control operator"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_newlines_stay_literal_and_escaped_newlines_add_no_argument() {
+        let graph = parse_command_list("printf 'a\nb' \"c\nd\" e\\\nf \\\n tail").unwrap();
+        assert_eq!(graph.pipelines.len(), 1);
+        assert_eq!(
+            graph.pipelines[0].commands[0].words,
+            ["printf", "a\nb", "c\nd", "ef", "tail"]
+        );
+        assert!(parse_command_list("\\\n").unwrap().pipelines.is_empty());
+        let graph = parse_command_list("printf \"a\\\nb\" \"\\\n\"").unwrap();
+        assert_eq!(graph.pipelines[0].commands[0].words, ["printf", "ab", ""]);
+    }
+
+    #[test]
+    fn newlines_do_not_supply_redirect_operands_or_extend_background_lists() {
+        let source = "printf a >\n out";
+        let error = parse_command_list(source).unwrap_err();
+        assert_eq!(error.message, "redirection path must be a word");
+        assert_eq!(source.get(error.start..error.end), Some("\n"));
+        let error = parse_command_list("printf a &\nprintf b").unwrap_err();
+        assert_eq!(error.message, "background marker must end a command list");
+        assert!(parse_command_list("printf a &\n").unwrap().pipelines[0].background);
+    }
+
+    #[test]
+    fn carriage_returns_and_hash_words_keep_their_existing_quote_semantics() {
+        let graph =
+            parse_command_list("printf a\\\r\nprintf '#quoted' word#suffix #literal\n").unwrap();
+        assert_eq!(graph.pipelines.len(), 2);
+        assert_eq!(graph.pipelines[0].commands[0].words, ["printf", "a\r"]);
+        assert_eq!(
+            graph.pipelines[1].commands[0].words,
+            ["printf", "#quoted", "word#suffix", "#literal"]
         );
     }
 

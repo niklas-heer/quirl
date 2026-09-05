@@ -10,6 +10,14 @@
 //! chunks, and are hashed before publication. Compatibility is checked before
 //! network work and recorded again in the installed receipt.
 //!
+//! Format admission runs in an RAII staging directory before downloaded bytes
+//! enter their final generation. A valid digest does not make malformed format
+//! data publishable; repeated failures must leave neither a new generation nor
+//! a changed receipt. Staging cleanup never targets a final generation path.
+//! A bounded directory snapshot reserves generation capacity before downloading;
+//! failed or interrupted previous installs cannot make later attempts grow storage
+//! past the retained-generation limit. Capacity admission never deletes entries.
+//!
 //! Each asset is installed under its content hash. The `current.json` receipt
 //! is replaced only after the complete payload is durable, so a failed update
 //! cannot displace an older valid asset. A process-local plus OS file lock owns
@@ -60,6 +68,7 @@ const ASSET_BYTES_TOTAL_MAX: u64 = 2 * 1024 * 1024 * 1024;
 const COMPLETION_DATABASE_BYTES_MAX: u64 = 256 * 1024 * 1024;
 const COMMAND_MODEL_BYTES_MAX: u64 = 256 * 1024 * 1024;
 const ASSET_GENERATIONS_MAX: usize = 4;
+const ASSET_DIRECTORY_ENTRIES_MAX: usize = 64;
 const LOGICAL_NAME_BYTES_MAX: usize = 64;
 const FORMAT_BYTES_MAX: usize = 64;
 const URL_BYTES_MAX: usize = 2 * 1024;
@@ -893,6 +902,7 @@ fn install_one(
         return Ok(InstallOutcome::Current);
     }
     create_private_directory(&asset_root).map_err(AssetFailure::transient)?;
+    admit_generation_capacity(&asset_root, &asset.sha256).map_err(AssetFailure::permanent)?;
     let mut temporary = TemporaryDownload::create(&asset_root).map_err(AssetFailure::transient)?;
     let mut reader = if allow_file && asset.url.starts_with("file://") {
         FileDownloader
@@ -912,6 +922,20 @@ fn install_one(
         cancelled,
     )?;
     drop(temporary_file);
+    // The hash authenticates bytes, not their format. Validate while every
+    // output still belongs to staging so a failed admission cannot consume a
+    // retained generation or require deleting a pre-existing final path.
+    {
+        let staging = TemporaryDirectory::create(&asset_root, ".asset-admission")
+            .map_err(AssetFailure::transient)?;
+        admit_format_controlled(
+            staging.path(),
+            temporary.path(),
+            asset,
+            cancelled,
+            admission_started,
+        )?;
+    }
     let content_directory = asset_root.join(&asset.sha256);
     create_private_directory(&content_directory).map_err(AssetFailure::transient)?;
     admit_directory(&asset_root).map_err(AssetFailure::permanent)?;
@@ -1048,15 +1072,41 @@ fn admit_format_controlled(
     }
 }
 
-fn cleanup_generations(
-    asset_root: &Path,
-    current_hash: &str,
-    previous_hash: Option<&str>,
-) -> Result<(), ShellError> {
+fn admit_generation_capacity(asset_root: &Path, candidate_hash: &str) -> Result<(), ShellError> {
+    let generations = scan_generations(asset_root)?;
+    let already_retained = generations
+        .iter()
+        .any(|(name, _, _)| name == candidate_hash);
+    let prospective_count = generations
+        .len()
+        .saturating_add(usize::from(!already_retained));
+    if prospective_count > ASSET_GENERATIONS_MAX {
+        return Err(resource_limit(
+            "retained asset generations",
+            ASSET_GENERATIONS_MAX,
+            prospective_count,
+        ));
+    }
+    Ok(())
+}
+
+fn scan_generations(asset_root: &Path) -> Result<Vec<(String, PathBuf, fs::FileType)>, ShellError> {
     let entries =
         fs::read_dir(asset_root).map_err(|error| asset_io_error("list", asset_root, error))?;
     let mut generations = Vec::new();
-    for entry in entries.take(ASSET_GENERATIONS_MAX.saturating_add(1)) {
+    // Admission covers the complete bounded snapshot before any deletion.
+    // Receipts and unrelated entries cannot consume the generation scan slots.
+    for (index, entry) in entries
+        .take(ASSET_DIRECTORY_ENTRIES_MAX.saturating_add(1))
+        .enumerate()
+    {
+        if index == ASSET_DIRECTORY_ENTRIES_MAX {
+            return Err(resource_limit(
+                "asset directory entries",
+                ASSET_DIRECTORY_ENTRIES_MAX,
+                index.saturating_add(1),
+            ));
+        }
         let entry = entry.map_err(|error| asset_io_error("list", asset_root, error))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1076,6 +1126,15 @@ fn cleanup_generations(
             generations.len(),
         ));
     }
+    Ok(generations)
+}
+
+fn cleanup_generations(
+    asset_root: &Path,
+    current_hash: &str,
+    previous_hash: Option<&str>,
+) -> Result<(), ShellError> {
+    let generations = scan_generations(asset_root)?;
     for (name, path, file_type) in generations {
         if name == current_hash || previous_hash.is_some_and(|previous| previous == name) {
             continue;
@@ -3122,6 +3181,225 @@ mod tests {
         let receipt = read_receipt(&paths.data.join("completion-database/current.json")).unwrap();
         validate_installed_payload(&paths.data.join("completion-database"), &receipt.asset)
             .unwrap();
+    }
+
+    #[test]
+    fn invalid_asset_formats_leave_no_generation_and_preserve_the_current_asset() {
+        let directory = TestDirectory::new("format-admission-cleanup");
+        let paths = directory.paths();
+        create_private_directory(&paths.data).unwrap();
+        let current = entry("completion-database", TEST_NATIVE_DATABASE);
+        let downloader =
+            FakeDownloader::new([(current.url.clone(), TEST_NATIVE_DATABASE.to_vec())]);
+        install_one(
+            &paths,
+            "0.1.0",
+            &current,
+            &downloader,
+            false,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let asset_root = paths.data.join("completion-database");
+        let receipt_path = asset_root.join("current.json");
+        let original_receipt = fs::read(&receipt_path).unwrap();
+        let unrelated = asset_root.join("unrelated.txt");
+        fs::write(&unrelated, b"preserve this file").unwrap();
+
+        // Each small payload has the correct digest but an invalid database
+        // format. Repeated admission failures must not accumulate generations.
+        for version in 0..6 {
+            let bytes = format!("invalid database {version}").into_bytes();
+            let invalid = entry("completion-database", &bytes);
+            let downloader = FakeDownloader::new([(invalid.url.clone(), bytes)]);
+            let failure = install_one(
+                &paths,
+                "0.1.1",
+                &invalid,
+                &downloader,
+                false,
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap_err();
+            assert!(failure.permanent);
+            assert!(!asset_root.join(&invalid.sha256).exists());
+            assert_eq!(fs::read(&receipt_path).unwrap(), original_receipt);
+            assert_eq!(fs::read(&unrelated).unwrap(), b"preserve this file");
+            validate_installed_payload(&asset_root, &current).unwrap();
+            assert_eq!(fs::read_dir(&asset_root).unwrap().count(), 3);
+        }
+    }
+
+    #[test]
+    fn invalid_asset_admission_preserves_a_preexisting_hash_directory() {
+        let directory = TestDirectory::new("format-admission-preexisting");
+        let paths = directory.paths();
+        let bytes = b"invalid database";
+        let asset = entry("completion-database", bytes);
+        let content_directory = paths.data.join(&asset.logical_name).join(&asset.sha256);
+        create_private_directory(&content_directory).unwrap();
+        let existing = content_directory.join("unrelated.txt");
+        fs::write(&existing, b"do not remove an unowned generation").unwrap();
+        let downloader = FakeDownloader::new([(asset.url.clone(), bytes.to_vec())]);
+        assert!(
+            install_one(
+                &paths,
+                "0.1.0",
+                &asset,
+                &downloader,
+                false,
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(&existing).unwrap(),
+            b"do not remove an unowned generation"
+        );
+        assert_eq!(fs::read_dir(&content_directory).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn invalid_command_model_admission_cleans_staging_before_publication() {
+        let directory = TestDirectory::new("format-admission-model");
+        let paths = directory.paths();
+        let bytes = b"invalid model archive";
+        let asset = entry("command-model", bytes);
+        let downloader = FakeDownloader::new([(asset.url.clone(), bytes.to_vec())]);
+        assert!(
+            install_one(
+                &paths,
+                "0.1.0",
+                &asset,
+                &downloader,
+                false,
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .is_err()
+        );
+        let asset_root = paths.data.join(&asset.logical_name);
+        assert_eq!(fs::read_dir(asset_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_fifth_generation_is_rejected_before_downloading_or_changing_existing_files() {
+        let directory = TestDirectory::new("generation-capacity");
+        let paths = directory.paths();
+        let asset = entry("completion-database", TEST_NATIVE_DATABASE);
+        let asset_root = paths.data.join(&asset.logical_name);
+        create_private_directory(&asset_root).unwrap();
+        for index in 0..ASSET_GENERATIONS_MAX {
+            let hash = format!("{index:064x}");
+            create_private_directory(&asset_root.join(&hash)).unwrap();
+            fs::write(asset_root.join(&hash).join("payload"), hash).unwrap();
+        }
+        let receipt_path = asset_root.join("current.json");
+        fs::write(&receipt_path, b"preserve the prior receipt").unwrap();
+        let downloader = FakeDownloader::new([(asset.url.clone(), TEST_NATIVE_DATABASE.to_vec())]);
+        let failure = install_one(
+            &paths,
+            "0.1.0",
+            &asset,
+            &downloader,
+            false,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap_err();
+        assert_eq!(failure.error.code, ErrorCode::ResourceLimit);
+        assert_eq!(downloader.opens.load(Ordering::Relaxed), 0);
+        assert!(!asset_root.join(&asset.sha256).exists());
+        assert_eq!(
+            fs::read_dir(&asset_root).unwrap().count(),
+            ASSET_GENERATIONS_MAX + 1
+        );
+        assert_eq!(
+            fs::read(receipt_path).unwrap(),
+            b"preserve the prior receipt"
+        );
+        for index in 0..ASSET_GENERATIONS_MAX {
+            let hash = format!("{index:064x}");
+            assert_eq!(
+                fs::read(asset_root.join(&hash).join("payload")).unwrap(),
+                hash.as_bytes()
+            );
+        }
+        // Reusing an already retained identity consumes no additional slot.
+        admit_generation_capacity(&asset_root, &format!("{:064x}", 0)).unwrap();
+    }
+
+    #[test]
+    fn an_excessive_asset_directory_is_rejected_before_downloading() {
+        let directory = TestDirectory::new("generation-directory-capacity");
+        let paths = directory.paths();
+        let asset = entry("completion-database", TEST_NATIVE_DATABASE);
+        let asset_root = paths.data.join(&asset.logical_name);
+        create_private_directory(&asset_root).unwrap();
+        for index in 0..=ASSET_DIRECTORY_ENTRIES_MAX {
+            fs::write(asset_root.join(format!("unrelated-{index}")), b"preserve").unwrap();
+        }
+        let downloader = FakeDownloader::new([(asset.url.clone(), TEST_NATIVE_DATABASE.to_vec())]);
+        let failure = install_one(
+            &paths,
+            "0.1.0",
+            &asset,
+            &downloader,
+            false,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap_err();
+        assert_eq!(failure.error.code, ErrorCode::ResourceLimit);
+        assert_eq!(downloader.opens.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            fs::read_dir(&asset_root).unwrap().count(),
+            ASSET_DIRECTORY_ENTRIES_MAX + 1
+        );
+    }
+
+    #[test]
+    fn generation_cleanup_inspects_past_receipts_and_unrelated_entries() {
+        let directory = TestDirectory::new("generation-scan");
+        let root = directory.paths().data;
+        create_private_directory(&root).unwrap();
+        for index in 0..ASSET_DIRECTORY_ENTRIES_MAX - 3 {
+            fs::write(root.join(format!("unrelated-{index}")), b"preserve").unwrap();
+        }
+        let current = "a".repeat(64);
+        let previous = "b".repeat(64);
+        let stale = "c".repeat(64);
+        for name in [&current, &previous, &stale] {
+            create_private_directory(&root.join(name)).unwrap();
+            fs::write(root.join(name).join("payload"), name).unwrap();
+        }
+        cleanup_generations(&root, &current, Some(&previous)).unwrap();
+        assert!(root.join(&current).is_dir());
+        assert!(root.join(&previous).is_dir());
+        assert!(!root.join(&stale).exists());
+        for index in 0..ASSET_DIRECTORY_ENTRIES_MAX - 3 {
+            assert_eq!(
+                fs::read(root.join(format!("unrelated-{index}"))).unwrap(),
+                b"preserve"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_cleanup_rejects_excess_directory_entries_before_deleting() {
+        let directory = TestDirectory::new("generation-scan-bound");
+        let root = directory.paths().data;
+        create_private_directory(&root).unwrap();
+        let stale = root.join("c".repeat(64));
+        create_private_directory(&stale).unwrap();
+        fs::write(stale.join("payload"), b"preserve until admission succeeds").unwrap();
+        for index in 0..ASSET_DIRECTORY_ENTRIES_MAX {
+            fs::write(root.join(format!("unrelated-{index}")), b"preserve").unwrap();
+        }
+        let error = cleanup_generations(&root, &"a".repeat(64), None).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(stale.is_dir());
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            ASSET_DIRECTORY_ENTRIES_MAX + 1
+        );
     }
 
     #[test]

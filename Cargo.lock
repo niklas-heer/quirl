@@ -465,13 +465,12 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 [[package]]
 name = "crossterm"
 version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
 dependencies = [
  "bitflags 2.13.1",
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "filedescriptor",
  "mio",
  "parking_lot",
  "rustix",
@@ -2114,6 +2113,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "image",
+ "nix 0.30.1",
  "nu-ansi-term",
  "quirl-catalog",
  "quirl-core",
@@ -2343,8 +2343,6 @@ dependencies = [
 [[package]]
 name = "reedline"
 version = "0.49.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "826c1fc22a2b1f14c3f6a80fc3d56adfbfb913d07f170bce4246700de7adfd50"
 dependencies = [
  "chrono",
  "crossterm",
@@ -3769,6 +3767,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "color-eyre",
+ "crossterm",
  "nix 0.30.1",
  "quirl-catalog",
  "serde",

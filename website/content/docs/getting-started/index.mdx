@@ -1,16 +1,16 @@
 ---
 title: Getting started
-description: Install Quirl and learn its three interactive modes and bounded Lua extension surface.
+description: Try familiar commands and a complete typed-data workflow inside your existing terminal.
 ---
 
-Quirl is deliberately familiar at the prompt. Start with the commands you
-already know, opt into typed data when rows and records are the right model,
-use AI mode to discover or plan a command without executing it, and reach for
-Lua when you need general-purpose logic.
+Start Quirl inside your existing shell, run a familiar command, then try a
+self-contained typed-data pipeline. The [first session](/docs/getting-started/first-session)
+takes about five minutes, needs no account or sample files, and shows how to
+return to your previous shell.
 
 <Cards>
   <Card title="Install Quirl" href="/docs/getting-started/installation" description="Use Homebrew, a verified native archive, or the pinned source toolchain." />
-  <Card title="Try the core workflow" href="/docs/getting-started/first-session" description="Move between command bytes, typed values, AI discovery, and Lua." />
+  <Card title="Try the core workflow" href="/docs/getting-started/first-session" description="Run a command, filter two sample records, find help, and leave Quirl." />
   <Card title="Check project status" href="/docs/getting-started/status-and-platforms" description="See current platform support, release identity, and known limits." />
 </Cards>
 
@@ -20,9 +20,11 @@ Lua when you need general-purpose logic.
 | --- | --- | --- |
 | Normal mode | byte streams | familiar programs, redirects, jobs, Bash/Zsh islands |
 | Data mode | typed values | records, tables, filtering, selection, structured output |
-| AI mode | local command knowledge plus optional Codex planning | describe an intent, then insert a validated proposal for review |
-| Lua 5.5.1 | bounded logic | configuration, scripts, prompts, completion, plugins |
+| AI mode (optional) | proposals from an installed, authenticated Codex CLI | describe an intent, then move a validated proposal into Normal mode for review |
+| Lua scripting | bounded logic | configuration, scripts, prompts, completion, plugins |
 
-No mode silently pretends to be another. Native Quirl scripts make their
-grammar boundaries visible, and values crossing the Lua boundary are validated
-by Rust.
+Use `mode data` and `mode normal` to switch between typed values and familiar
+commands. Lua is a scripting surface rather than another interactive mode.
+The AI description here follows current source builds, not the published 0.1.0
+artifact. AI planning sends the submitted intent and bounded catalog context to OpenAI;
+it has no local planner fallback. Normal commands and Data mode work offline.

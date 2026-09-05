@@ -8,11 +8,19 @@
 //!   leave a generated child behind.
 //! - Interpreter probes and generated sessions share one RAII-owned temporary
 //!   root outside the workspace, which is removed on success and every error.
+//! - The Quirl executable is admitted through one regular-file handle and copied
+//!   once into that private root before any session. Copying retains a 64 KiB
+//!   buffer and scans at most 256 MiB plus one byte; the exact copied bytes are
+//!   SHA-256 hashed. Concurrent path replacement cannot switch later sessions,
+//!   and observed in-place source changes reject the snapshot before execution.
+//!   Partial snapshots remain under the root's RAII cleanup. Only a complete,
+//!   synchronized snapshot receives owner-only read/execute permissions.
 //! - Bash and Zsh must agree before their result can be treated as an oracle.
 //! - `summary.json` is installed atomically and last; its presence means every
 //!   trace and mismatch artifact needed by the scheduled reporter is durable.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     env,
     ffi::OsStr,
@@ -27,7 +35,13 @@ use std::{
 
 use crate::TaskError;
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
 const REPORT_SCHEMA_VERSION: u32 = 1;
+const SUMMARY_SCHEMA_VERSION: u32 = 2;
+const EXECUTABLE_BYTES_MAX: u64 = 256 * 1024 * 1024;
+const EXECUTABLE_COPY_BUFFER_BYTES: usize = 64 * 1024;
 const SESSION_SOURCE_BYTES_MAX: usize = 64 * 1024;
 const SESSION_OUTPUT_BYTES_MAX: usize = 64 * 1024;
 const SESSION_FILES_MAX: usize = 64;
@@ -127,6 +141,8 @@ struct PersistedSummary<'a> {
     reference_divergence_count: usize,
     first_mismatch_session: Option<usize>,
     quirl_executable: String,
+    quirl_snapshot_sha256: String,
+    quirl_snapshot_bytes: u64,
     bash: &'a InterpreterIdentity,
     zsh: &'a InterpreterIdentity,
     report: &'a str,
@@ -216,7 +232,11 @@ impl TemporaryRoot {
                 "quirl-simulation-{}-{seed}-{attempt}",
                 std::process::id()
             ));
-            match fs::create_dir(&path) {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(false);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(&path) {
                 Ok(()) => return Ok(Self { path }),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
@@ -233,6 +253,168 @@ impl Drop for TemporaryRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+#[derive(Debug)]
+struct ExecutableSnapshot {
+    source: PathBuf,
+    path: PathBuf,
+    sha256: String,
+    byte_size: u64,
+}
+
+/// An immutable executable copy and the private temporary directory that owns it.
+///
+/// Retain this guard until all children using [`Self::path`] have been reaped.
+/// Dropping it removes the snapshot and its directory on a best-effort basis.
+/// The original executable may be replaced after creation without changing the
+/// copied bytes or their recorded identity.
+pub(crate) struct PinnedExecutable {
+    snapshot: ExecutableSnapshot,
+    _temporary_root: TemporaryRoot,
+}
+
+impl PinnedExecutable {
+    /// Copy a regular executable into a newly reserved private directory.
+    ///
+    /// Admission scans at most 256 MiB plus one byte using a 64 KiB buffer and
+    /// hashes the copied bytes with SHA-256. On Unix, nonblocking, no-follow
+    /// admission rejects special files; the complete copy has mode 0500 and its
+    /// directory has mode 0700. Observed source mutation or any I/O failure
+    /// rejects the copy, and partial initialization drops the temporary root.
+    /// Directory reservation makes at most 64 attempts; `seed` distinguishes
+    /// deterministic runs and never controls executable contents.
+    pub(crate) fn create(source: &Path, seed: u64) -> io::Result<Self> {
+        let temporary_root = TemporaryRoot::create(seed)?;
+        let snapshot = snapshot_executable(source, &temporary_root.path, EXECUTABLE_BYTES_MAX)?;
+        Ok(Self {
+            snapshot,
+            _temporary_root: temporary_root,
+        })
+    }
+
+    /// Return the copied executable path used for every child in this run.
+    pub(crate) fn path(&self) -> &Path {
+        &self.snapshot.path
+    }
+
+    /// Return the canonical original path for provenance, never for execution.
+    pub(crate) fn source(&self) -> &Path {
+        &self.snapshot.source
+    }
+
+    /// Return the lowercase SHA-256 digest of the exact copied executable bytes.
+    pub(crate) fn sha256(&self) -> &str {
+        &self.snapshot.sha256
+    }
+
+    /// Return the number of copied executable bytes, bounded by 256 MiB.
+    pub(crate) fn byte_size(&self) -> u64 {
+        self.snapshot.byte_size
+    }
+}
+
+fn snapshot_executable(
+    source: &Path,
+    root: &Path,
+    bytes_max: u64,
+) -> io::Result<ExecutableSnapshot> {
+    let source = source.canonicalize()?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    let mut original = options.open(&source)?;
+    let before = original.metadata()?;
+    if !before.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "simulation executable is not a regular file",
+        ));
+    }
+    if before.len() > bytes_max {
+        return Err(executable_size_error(bytes_max, before.len()));
+    }
+    let path = root.join(if cfg!(windows) {
+        "quirl-snapshot.exe"
+    } else {
+        "quirl-snapshot"
+    });
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut snapshot = options.open(&path)?;
+    let (sha256, byte_size) = copy_executable_bytes(&mut original, &mut snapshot, bytes_max)?;
+    let after = original.metadata()?;
+    if byte_size != before.len() || executable_source_changed(&before, &after) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "simulation executable changed while being copied; finish the build and retry",
+        ));
+    }
+    snapshot.sync_all()?;
+    #[cfg(unix)]
+    snapshot.set_permissions(fs::Permissions::from_mode(0o500))?;
+    snapshot.sync_all()?;
+    Ok(ExecutableSnapshot {
+        source,
+        path,
+        sha256,
+        byte_size,
+    })
+}
+
+fn copy_executable_bytes(
+    source: &mut File,
+    output: &mut File,
+    bytes_max: u64,
+) -> io::Result<(String, u64)> {
+    let mut source = source.take(bytes_max.saturating_add(1));
+    let mut buffer = vec![0_u8; EXECUTABLE_COPY_BUFFER_BYTES];
+    let mut digest = Sha256::new();
+    let mut byte_size = 0_u64;
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        byte_size = byte_size.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        if byte_size > bytes_max {
+            return Err(executable_size_error(bytes_max, byte_size));
+        }
+        let chunk = buffer.get(..count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "executable read exceeded its copy buffer",
+            )
+        })?;
+        output.write_all(chunk)?;
+        digest.update(chunk);
+    }
+    Ok((format!("{:x}", digest.finalize()), byte_size))
+}
+
+fn executable_source_changed(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return true;
+    }
+    #[cfg(unix)]
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+    {
+        return true;
+    }
+    false
+}
+
+fn executable_size_error(limit: u64, observed: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("simulation executable exceeds its byte limit: limit {limit}; observed {observed}"),
+    )
 }
 
 #[derive(Debug)]
@@ -262,15 +444,7 @@ pub fn run(options: SimulationOptions) -> Result<SimulationResult, TaskError> {
     let temporary = TemporaryRoot::create(options.seed)?;
     let bash = interpreter_identity("bash", &search_path, &temporary.path)?;
     let zsh = interpreter_identity("zsh", &search_path, &temporary.path)?;
-    let quirl = options.quirl.canonicalize().map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "could not resolve built Quirl executable {}: {error}",
-                options.quirl.display()
-            ),
-        )
-    })?;
+    let quirl = snapshot_executable(&options.quirl, &temporary.path, EXECUTABLE_BYTES_MAX)?;
     let run_directory = create_run_directory(&options)?;
     let report_path = run_directory.join("report.jsonl");
     let report_file = OpenOptions::new()
@@ -283,7 +457,7 @@ pub fn run(options: SimulationOptions) -> Result<SimulationResult, TaskError> {
     let context = EvaluationContext {
         options: &options,
         temporary_root: &temporary.path,
-        quirl: &quirl,
+        quirl: &quirl.path,
         bash: &bash.executable,
         zsh: &zsh.executable,
         search_path: &search_path,
@@ -1039,7 +1213,7 @@ fn write_failure(run_directory: &Path, record: &SessionRecord) -> Result<(), Tas
 fn write_summary(
     options: &SimulationOptions,
     run_directory: &Path,
-    quirl: &Path,
+    quirl: &ExecutableSnapshot,
     bash: &InterpreterIdentity,
     zsh: &InterpreterIdentity,
     counts: &SimulationCounts,
@@ -1050,7 +1224,7 @@ fn write_summary(
         "mismatch"
     };
     let summary = PersistedSummary {
-        schema_version: REPORT_SCHEMA_VERSION,
+        schema_version: SUMMARY_SCHEMA_VERSION,
         result,
         seed: options.seed,
         sessions_generated: options.session_count,
@@ -1061,7 +1235,9 @@ fn write_summary(
         native_mismatch_count: counts.native_mismatches,
         reference_divergence_count: counts.reference_divergences,
         first_mismatch_session: counts.first_mismatch,
-        quirl_executable: quirl.display().to_string(),
+        quirl_executable: quirl.source.display().to_string(),
+        quirl_snapshot_sha256: quirl.sha256.clone(),
+        quirl_snapshot_bytes: quirl.byte_size,
         bash,
         zsh,
         report: "report.jsonl",
@@ -1162,6 +1338,165 @@ mod tests {
             .stderr(Stdio::piped())
             .process_group(0);
         command
+    }
+
+    #[test]
+    fn pinned_executable_owns_its_copy_and_preserves_original_on_drop() {
+        let parent = TemporaryRoot::create(test_seed()).unwrap();
+        let source = parent.path.join("built-quirl");
+        fs::write(&source, b"original executable bytes").unwrap();
+        let copied_path;
+        let copied_root;
+        {
+            let executable = PinnedExecutable::create(&source, test_seed()).unwrap();
+            copied_path = executable.path().to_path_buf();
+            copied_root = copied_path.parent().unwrap().to_path_buf();
+            fs::remove_file(&source).unwrap();
+            fs::write(&source, b"replacement executable bytes").unwrap();
+            assert_eq!(
+                fs::read(&copied_path).unwrap(),
+                b"original executable bytes"
+            );
+            assert_eq!(executable.source(), source.canonicalize().unwrap());
+            assert_eq!(executable.byte_size(), 25);
+            assert_eq!(
+                executable.sha256(),
+                format!("{:x}", Sha256::digest(b"original executable bytes"))
+            );
+        }
+        assert!(!copied_path.exists());
+        assert!(!copied_root.exists());
+        assert_eq!(fs::read(&source).unwrap(), b"replacement executable bytes");
+    }
+
+    #[test]
+    fn executable_snapshot_keeps_original_bytes_after_source_replacement() {
+        let parent = TemporaryRoot::create(test_seed()).unwrap();
+        let source = parent.path.join("built-quirl");
+        fs::write(&source, b"original executable bytes").unwrap();
+        let root = TemporaryRoot::create_in(&parent.path, test_seed()).unwrap();
+        let snapshot = snapshot_executable(&source, &root.path, 64).unwrap();
+        let replacement = parent.path.join("rebuilt-quirl");
+        fs::write(&replacement, b"replacement executable bytes").unwrap();
+        fs::rename(&replacement, &source).unwrap();
+        assert_eq!(
+            fs::read(&snapshot.path).unwrap(),
+            b"original executable bytes"
+        );
+        assert_eq!(snapshot.byte_size, 25);
+        assert_eq!(
+            snapshot.sha256,
+            format!("{:x}", Sha256::digest(b"original executable bytes"))
+        );
+        assert_eq!(snapshot.source, source.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn executable_snapshot_and_streaming_copy_enforce_exact_byte_limit() {
+        let parent = TemporaryRoot::create(test_seed()).unwrap();
+        let source = parent.path.join("built-quirl");
+        fs::write(&source, b"12345678").unwrap();
+        let root = TemporaryRoot::create_in(&parent.path, test_seed()).unwrap();
+        let snapshot = snapshot_executable(&source, &root.path, 8).unwrap();
+        assert_eq!(snapshot.byte_size, 8);
+        fs::write(&source, b"123456789").unwrap();
+        let rejected_root = TemporaryRoot::create_in(&parent.path, test_seed()).unwrap();
+        let error = snapshot_executable(&source, &rejected_root.path, 8).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("limit 8; observed 9"));
+        assert_eq!(fs::read_dir(&rejected_root.path).unwrap().count(), 0);
+        // Exercise the streaming guard independently of the metadata precheck,
+        // as when a regular file grows after admission.
+        let mut input = File::open(&source).unwrap();
+        let mut output = File::create(rejected_root.path.join("partial")).unwrap();
+        let error = copy_executable_bytes(&mut input, &mut output, 8).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(output.metadata().unwrap().len(), 0);
+        drop(output);
+        let rejected_path = rejected_root.path.clone();
+        drop(rejected_root);
+        assert!(!rejected_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_snapshot_rejects_fifo_without_waiting_for_a_writer() {
+        let parent = TemporaryRoot::create(test_seed()).unwrap();
+        let fifo = parent.path.join("fifo");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let error = snapshot_executable(&fifo, &parent.path, 8).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_snapshot_is_private_and_removed_with_its_temporary_root() {
+        let parent = TemporaryRoot::create(test_seed()).unwrap();
+        let source = parent.path.join("built-quirl");
+        fs::write(&source, b"private bytes").unwrap();
+        let snapshot_path;
+        let root_path;
+        {
+            let root = TemporaryRoot::create_in(&parent.path, test_seed()).unwrap();
+            root_path = root.path.clone();
+            assert_eq!(
+                fs::metadata(&root.path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let snapshot = snapshot_executable(&source, &root.path, 64).unwrap();
+            snapshot_path = snapshot.path.clone();
+            assert_eq!(
+                fs::metadata(&snapshot.path).unwrap().permissions().mode() & 0o777,
+                0o500
+            );
+        }
+        assert!(!snapshot_path.exists());
+        assert!(!root_path.exists());
+    }
+
+    #[test]
+    fn summary_records_snapshot_identity_without_changing_session_schema() {
+        let parent = TemporaryRoot::create(test_seed()).unwrap();
+        let source = parent.path.join("built-quirl");
+        fs::write(&source, b"executable").unwrap();
+        let snapshot = snapshot_executable(&source, &parent.path, 64).unwrap();
+        let interpreter = InterpreterIdentity {
+            executable: "/test/shell".to_owned(),
+            version: "test".to_owned(),
+        };
+        let options = SimulationOptions {
+            quirl: source,
+            seed: 1,
+            session_count: 1,
+            steps_max: 3,
+            only_session: None,
+            output_root: parent.path.clone(),
+        };
+        write_summary(
+            &options,
+            &parent.path,
+            &snapshot,
+            &interpreter,
+            &interpreter,
+            &SimulationCounts::default(),
+        )
+        .unwrap();
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(parent.path.join("summary.json")).unwrap()).unwrap();
+        assert_eq!(summary["schema_version"], 2);
+        assert_eq!(
+            summary["quirl_executable"],
+            snapshot.source.display().to_string()
+        );
+        assert_eq!(summary["quirl_snapshot_sha256"], snapshot.sha256);
+        assert_eq!(summary["quirl_snapshot_bytes"], 10);
+        assert_eq!(REPORT_SCHEMA_VERSION, 1);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Bounded Miller-column directory navigation for the rich surface.
 
-use crate::{SurfaceSymbols, theme::Theme};
+use crate::{SurfaceSymbols, file_read::open_regular_file, theme::Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use image::{DynamicImage, GenericImageView, ImageReader, Limits, RgbaImage};
 use quirl_core::{
@@ -700,7 +700,7 @@ fn load_file_preview(entry: &Entry) -> Preview {
     if is_supported_image_path(&entry.path) {
         return load_image_preview(entry);
     }
-    let file = match File::open(&entry.path) {
+    let file = match open_regular_file(&entry.path) {
         Ok(file) => file,
         Err(error) => return Preview::Error(format!("could not open preview: {error}")),
     };
@@ -1181,7 +1181,7 @@ fn load_image_preview(entry: &Entry) -> Preview {
             format_bytes(u64::try_from(IMAGE_ENCODED_BYTES_MAX).unwrap_or(u64::MAX))
         ));
     }
-    let file = match File::open(&entry.path) {
+    let file = match open_regular_file(&entry.path) {
         Ok(file) => file,
         Err(error) => return Preview::Error(format!("could not open image preview: {error}")),
     };
@@ -1801,6 +1801,36 @@ mod tests {
         };
         assert_eq!(lines.len(), PREVIEW_LINES_MAX);
         assert!(truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn previews_reject_files_replaced_with_fifos_after_directory_listing() {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let directory = TestDirectory::new("preview-replaced-fifo");
+        for name in ["input.txt", "input.png"] {
+            fs::write(directory.0.join(name), "original").unwrap();
+        }
+        let entries = list_directory(&directory.0, false, DirectorySort::Name).unwrap();
+        for entry in &entries {
+            fs::remove_file(&entry.path).unwrap();
+            mkfifo(&entry.path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        }
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let results = entries
+                .iter()
+                .map(|entry| matches!(load_preview(entry), Preview::Error(_)))
+                .collect::<Vec<_>>();
+            let _ = sender.send(results);
+        });
+        let rejected = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("preview admission must not wait on a replacement FIFO");
+        assert_eq!(rejected, vec![true, true]);
+        worker.join().unwrap();
     }
 
     #[test]

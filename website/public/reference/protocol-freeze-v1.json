@@ -7,9 +7,9 @@
     {"name":"agent.context","owner":"quirl-contract","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:df94421d02bc70bb","status":"frozen"},
     {"name":"agent.manifest","owner":"quirl-contract","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:913848cdbe3dcd66","status":"frozen"},
     {"name":"catalog","owner":"quirl-catalog","current_version":"4","oldest_readable":"2","compatibility":"migrated_range","schema_hash":"fnv1a64:d4bd0c9abee15fb1","status":"frozen"},
-    {"name":"command_grammar","owner":"quirl-syntax","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:177892e9b16cc4ab","status":"c1_core_unix_c2_runner"},
+    {"name":"command_grammar","owner":"quirl-syntax","current_version":"3","oldest_readable":"3","compatibility":"frozen_major","schema_hash":"fnv1a64:d1d66bbf9897a282","status":"c1_core_unix_c2_runner"},
     {"name":"common_abi","owner":"quirl-core","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:254f7565de75d691","status":"frozen"},
-    {"name":"compatibility_matrix","owner":"quirl-syntax","current_version":"3","oldest_readable":"3","compatibility":"frozen_major","schema_hash":"fnv1a64:b900f78fe1c20a64","status":"frozen_disposition"},
+    {"name":"compatibility_matrix","owner":"quirl-syntax","current_version":"3","oldest_readable":"3","compatibility":"frozen_major","schema_hash":"fnv1a64:dfbf5ced8a266d3c","status":"frozen_disposition"},
     {"name":"completion","owner":"quirl-catalog","current_version":"1","oldest_readable":"1","compatibility":"frozen_major","schema_hash":"fnv1a64:8293d43f3a269ccf","status":"versioned_async_frozen"},
     {"name":"config","owner":"quirl-lua","current_version":"4","oldest_readable":"0","compatibility":"migrated_range","schema_hash":"fnv1a64:b0ba5db7062a85c2","status":"v0_v1_v2_v3_migrate_to_v4"},
     {"name":"extension","owner":"quirl-core","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:bfddb053a448bfe8","status":"frozen"},
@@ -19,7 +19,7 @@
     {"name":"plugin_lock","owner":"quirl-plugin","current_version":"3","oldest_readable":"3","compatibility":"frozen_major","schema_hash":"fnv1a64:c2aef703ffa4e3a0","status":"v1_v2_fail_closed_readd_for_executable_io"},
     {"name":"plugin_manifest","owner":"quirl-plugin","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:cd9e015e537c31ea","status":"executable_io_v2"},
     {"name":"recovery","owner":"quirl-cli","current_version":"2","oldest_readable":"1","compatibility":"migrated_range","schema_hash":"fnv1a64:4afec9433ad12939","status":"v1_migrates_to_v2"},
-    {"name":"runner","owner":"quirl-process","current_version":"2","oldest_readable":"2","compatibility":"frozen_major","schema_hash":"fnv1a64:b6d406d9edbd6322","status":"bounded_capture_streaming_interactive"},
+    {"name":"runner","owner":"quirl-process","current_version":"3","oldest_readable":"3","compatibility":"frozen_major","schema_hash":"fnv1a64:0c298279a7c4646a","status":"bounded_capture_streaming_interactive"},
     {"name":"wasm_world","owner":"quirl-plugin","current_version":"0.1.0","oldest_readable":"0.1.0","compatibility":"frozen_major","schema_hash":"fnv1a64:81faa899f0811884","status":"nonexecuting_boundary"}
   ]
 }

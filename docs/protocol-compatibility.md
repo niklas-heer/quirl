@@ -17,12 +17,16 @@ Unknown fields and future versions are rejected at authoritative Rust
 boundaries. Descriptor hashes use named FNV-1a for deterministic identity, not
 security. Plugin file integrity continues to use SHA-256 and explicit grants.
 
-Runner protocol v2 binds command grammar v2 and the actual `ProcessBackend`
+Runner protocol v3 binds command grammar v3 and the actual `ProcessBackend`
 methods. It also freezes bounded job retention, wrap-safe non-colliding job
 IDs, and source-ordered input redirects. Runner v1 is retained as an exact
 historical descriptor and job-state fixture, but fails closed because its
 descriptor named grammar v1 and methods that did not match the public trait;
-there is no safe semantic migration from that false contract.
+there is no safe semantic migration from that false contract. Runner v2 also
+fails closed: its grammar flattened unquoted physical newlines into argument
+whitespace. Version 3 separates those command lines, preserves quoted newlines,
+and supports continuation after pipes/boolean connectors and backslash-LF.
+The serialized command graph and job-state shapes remain unchanged.
 
 Common ABI v2 describes the actual tagged `StructuredValue` variants and uses
 fixed-width `u64` diagnostic offsets on the wire. Extension protocol v2 uses a
@@ -44,7 +48,7 @@ lossy migration.
 ## Deliberate 1.0 boundaries
 
 The freeze manifest names limitations rather than hiding them. Native command
-grammar v2 records the quote-aware Linux/macOS C1-core executor and explicit C2
+grammar v3 records the quote-aware Linux/macOS C1-core executor and explicit C2
 dialect islands. Here-documents, process substitution, loops, functions,
 conditionals, and dialect control forms remain reference islands for 1.0,
 rather than an implied future native compatibility promise. Picker and

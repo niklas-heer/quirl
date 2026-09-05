@@ -1,0 +1,424 @@
+use nu_ansi_term::Style;
+use std::borrow::Cow;
+
+use crate::terminal_extensions::semantic_prompt::{PromptKind, SemanticPromptMarkers};
+use crate::Prompt;
+
+use super::utils::strip_ansi;
+
+/// A representation of a buffer with styling, used for doing syntax highlighting
+#[derive(Clone)]
+pub struct StyledText {
+    /// The component, styled parts of the text
+    pub buffer: Vec<(Style, String)>,
+}
+
+impl Default for StyledText {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StyledText {
+    /// Construct a new `StyledText`
+    pub const fn new() -> Self {
+        Self { buffer: vec![] }
+    }
+
+    /// Add a new styled string to the buffer
+    pub fn push(&mut self, styled_string: (Style, String)) {
+        self.buffer.push(styled_string);
+    }
+
+    /// Style range with the provided style
+    pub fn style_range(&mut self, from: usize, to: usize, new_style: Style) {
+        let (from, to) = if from > to { (to, from) } else { (from, to) };
+        let mut current_idx = 0;
+        let mut pair_idx = 0;
+        while pair_idx < self.buffer.len() {
+            let pair = &mut self.buffer[pair_idx];
+            let end_idx = current_idx + pair.1.len();
+            enum Position {
+                Before,
+                In,
+                After,
+            }
+            let start_position = if current_idx < from {
+                Position::Before
+            } else if current_idx >= to {
+                Position::After
+            } else {
+                Position::In
+            };
+            let end_position = if end_idx < from {
+                Position::Before
+            } else if end_idx > to {
+                Position::After
+            } else {
+                Position::In
+            };
+            match (start_position, end_position) {
+                (Position::Before, Position::After) => {
+                    let mut in_range = pair.1.split_off(from - current_idx);
+                    let after_range = in_range.split_off(to - from);
+                    let in_range = (new_style, in_range);
+                    let after_range = (pair.0, after_range);
+                    self.buffer.insert(pair_idx + 1, in_range);
+                    self.buffer.insert(pair_idx + 2, after_range);
+                    break;
+                }
+                (Position::Before, Position::In) => {
+                    let in_range = pair.1.split_off(from - current_idx);
+                    pair_idx += 1; // Additional increment for the split pair, since the new insertion is already correctly styled and can be skipped next iteration
+                    self.buffer.insert(pair_idx, (new_style, in_range));
+                }
+                (Position::In, Position::After) => {
+                    let after_range = pair.1.split_off(to - current_idx);
+                    let old_style = pair.0;
+                    pair.0 = new_style;
+                    if !after_range.is_empty() {
+                        self.buffer.insert(pair_idx + 1, (old_style, after_range));
+                    }
+                    break;
+                }
+                (Position::In, Position::In) => pair.0 = new_style,
+
+                (Position::After, _) => break,
+                _ => (),
+            }
+            current_idx = end_idx;
+            pair_idx += 1;
+        }
+    }
+
+    /// Render the styled string. We use the insertion point to render around so that
+    /// we can properly write out the styled string to the screen and find the correct
+    /// place to put the cursor. This assumes a logic that prints the first part of the
+    /// string, saves the cursor position, prints the second half, and then restores
+    /// the cursor position
+    ///
+    /// Also inserts the multiline continuation prompt with optional semantic markers
+    pub fn render_around_insertion_point(
+        &self,
+        insertion_point: usize,
+        prompt: &dyn Prompt,
+        use_ansi_coloring: bool,
+        semantic_markers: Option<&dyn SemanticPromptMarkers>,
+    ) -> (String, String) {
+        let mut current_idx = 0;
+        let mut left_string = String::new();
+        let mut right_string = String::new();
+
+        let multiline_prompt = prompt.render_prompt_multiline_indicator();
+        let prompt_style = Style::new().fg(prompt.get_prompt_multiline_color());
+
+        for pair in &self.buffer {
+            if current_idx >= insertion_point {
+                right_string.push_str(&render_as_string(
+                    pair,
+                    &prompt_style,
+                    &multiline_prompt,
+                    semantic_markers,
+                ));
+            } else if pair.1.len() + current_idx <= insertion_point {
+                left_string.push_str(&render_as_string(
+                    pair,
+                    &prompt_style,
+                    &multiline_prompt,
+                    semantic_markers,
+                ));
+            } else if pair.1.len() + current_idx > insertion_point {
+                let offset = insertion_point - current_idx;
+
+                let left_side = pair.1[..offset].to_string();
+                let right_side = pair.1[offset..].to_string();
+
+                left_string.push_str(&render_as_string(
+                    &(pair.0, left_side),
+                    &prompt_style,
+                    &multiline_prompt,
+                    semantic_markers,
+                ));
+                right_string.push_str(&render_as_string(
+                    &(pair.0, right_side),
+                    &prompt_style,
+                    &multiline_prompt,
+                    semantic_markers,
+                ));
+            }
+            current_idx += pair.1.len();
+        }
+
+        if use_ansi_coloring {
+            (left_string, right_string)
+        } else {
+            (strip_ansi(&left_string), strip_ansi(&right_string))
+        }
+    }
+
+    /// Apply the ANSI style formatting to the full string.
+    pub fn render_simple(&self) -> String {
+        self.buffer
+            .iter()
+            .map(|(style, text)| style.paint(escape_display_controls(text)).to_string())
+            .collect()
+    }
+
+    /// Get the unformatted text as a single continuous string.
+    pub fn raw_string(&self) -> String {
+        self.buffer.iter().map(|(_, str)| str.as_str()).collect()
+    }
+}
+
+fn render_as_string(
+    renderable: &(Style, String),
+    prompt_style: &Style,
+    multiline_prompt: &str,
+    semantic_markers: Option<&dyn SemanticPromptMarkers>,
+) -> String {
+    let mut rendered = String::new();
+
+    // Build the formatted multiline prompt with optional semantic markers
+    let formatted_multiline_prompt = if let Some(markers) = semantic_markers {
+        // Wrap multiline indicator with secondary prompt markers:
+        // \n + A;k=s + multiline_prompt + B
+        format!(
+            "\n{}{}{}",
+            markers.prompt_start(PromptKind::Secondary),
+            multiline_prompt,
+            markers.command_input_start()
+        )
+    } else {
+        format!("\n{multiline_prompt}")
+    };
+
+    for (line_number, line) in renderable.1.split('\n').enumerate() {
+        if line_number != 0 {
+            rendered.push_str(&prompt_style.paint(&formatted_multiline_prompt).to_string());
+        }
+        rendered.push_str(
+            &renderable
+                .0
+                .paint(escape_display_controls(line))
+                .to_string(),
+        );
+    }
+    rendered
+}
+
+/// Escape raw C0/C1 input before adding trusted styling, preserving line breaks.
+///
+/// Failure model: editor and history bytes can contain terminal instructions.
+/// Escaping after the raw insertion-point split keeps source offsets and command
+/// execution unchanged; layout then measures the same visible text that is sent
+/// to the terminal. Unchanged text borrows its input; escaped output grows by at
+/// most six bytes per input byte. Editor admission bounds the input separately.
+pub(crate) fn escape_display_controls(text: &str) -> Cow<'_, str> {
+    if !text
+        .chars()
+        .any(|character| character.is_control() && character != '\n')
+    {
+        return Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() && character != '\n' {
+            escaped.extend(character.escape_default());
+        } else {
+            escaped.push(character);
+        }
+    }
+    Cow::Owned(escaped)
+}
+
+#[cfg(test)]
+mod test {
+    use nu_ansi_term::{Color, Style};
+
+    use crate::StyledText;
+
+    #[test]
+    fn terminal_controls_are_display_text_without_changing_source_or_cursor_offsets() {
+        let source = "é\x1b]52;c;payload\x07\r\t\u{9b}Z";
+        let styled = StyledText {
+            buffer: vec![(Style::new(), source.to_owned())],
+        };
+        for cursor in source
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([source.len()])
+        {
+            let (before, after) = styled.render_around_insertion_point(
+                cursor,
+                &crate::DefaultPrompt::default(),
+                false,
+                None,
+            );
+            assert_eq!(before, super::escape_display_controls(&source[..cursor]));
+            assert_eq!(after, super::escape_display_controls(&source[cursor..]));
+            assert!(!before.contains('\x1b'));
+            assert!(!after.contains('\x1b'));
+        }
+        assert_eq!(styled.raw_string(), source);
+        assert_eq!(
+            styled.render_simple(),
+            super::escape_display_controls(source)
+        );
+    }
+
+    #[test]
+    fn display_escaping_keeps_unicode_and_newlines_and_bounds_control_expansion() {
+        let unchanged = "é👩‍💻\nnext";
+        assert!(matches!(
+            super::escape_display_controls(unchanged),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let controls = (0u8..=31).map(char::from).collect::<String>();
+        let escaped = super::escape_display_controls(&controls);
+        assert!(escaped.len() <= controls.len() * 6);
+        assert!(escaped
+            .chars()
+            .all(|character| !character.is_control() || character == '\n'));
+    }
+
+    fn get_styled_text_template() -> (super::StyledText, Style, Style) {
+        let before_style = Style::new().on(Color::Black);
+        let after_style = Style::new().on(Color::Red);
+        (
+            super::StyledText {
+                buffer: vec![
+                    (before_style, "aaa".into()),
+                    (before_style, "bbb".into()),
+                    (before_style, "ccc".into()),
+                ],
+            },
+            before_style,
+            after_style,
+        )
+    }
+    #[test]
+    fn style_range_partial_update_one_part() {
+        let (styled_text_template, before_style, after_style) = get_styled_text_template();
+        let mut styled_text = styled_text_template.clone();
+        styled_text.style_range(0, 1, after_style);
+        assert_eq!(styled_text.buffer[0], (after_style, "a".into()));
+        assert_eq!(styled_text.buffer[1], (before_style, "aa".into()));
+        assert_eq!(styled_text.buffer[2], (before_style, "bbb".into()));
+        assert_eq!(styled_text.buffer[3], (before_style, "ccc".into()));
+    }
+    #[test]
+    fn style_range_complete_update_one_part() {
+        let (styled_text_template, before_style, after_style) = get_styled_text_template();
+        let mut styled_text = styled_text_template.clone();
+        styled_text.style_range(0, 3, after_style);
+        assert_eq!(styled_text.buffer[0], (after_style, "aaa".into()));
+        assert_eq!(styled_text.buffer[1], (before_style, "bbb".into()));
+        assert_eq!(styled_text.buffer[2], (before_style, "ccc".into()));
+        assert_eq!(styled_text.buffer.len(), 3);
+    }
+    #[test]
+    fn style_range_update_over_boundary() {
+        let (styled_text_template, before_style, after_style) = get_styled_text_template();
+        let mut styled_text = styled_text_template;
+        styled_text.style_range(0, 5, after_style);
+        assert_eq!(styled_text.buffer[0], (after_style, "aaa".into()));
+        assert_eq!(styled_text.buffer[1], (after_style, "bb".into()));
+        assert_eq!(styled_text.buffer[2], (before_style, "b".into()));
+        assert_eq!(styled_text.buffer[3], (before_style, "ccc".into()));
+    }
+    #[test]
+    fn style_range_update_over_part() {
+        let (styled_text_template, before_style, after_style) = get_styled_text_template();
+        let mut styled_text = styled_text_template;
+        styled_text.style_range(1, 7, after_style);
+        assert_eq!(styled_text.buffer[0], (before_style, "a".into()));
+        assert_eq!(styled_text.buffer[1], (after_style, "aa".into()));
+        assert_eq!(styled_text.buffer[2], (after_style, "bbb".into()));
+        assert_eq!(styled_text.buffer[3], (after_style, "c".into()));
+        assert_eq!(styled_text.buffer[4], (before_style, "cc".into()));
+    }
+    #[test]
+    fn style_range_last_letter() {
+        let (_, before_style, after_style) = get_styled_text_template();
+        let mut styled_text = StyledText {
+            buffer: vec![(before_style, "asdf".into())],
+        };
+        styled_text.style_range(3, 4, after_style);
+        assert_eq!(styled_text.buffer[0], (before_style, "asd".into()));
+        assert_eq!(styled_text.buffer[1], (after_style, "f".into()));
+    }
+    #[test]
+    fn style_range_from_second_to_last() {
+        let (_, before_style, after_style) = get_styled_text_template();
+        let mut styled_text = StyledText {
+            buffer: vec![(before_style, "asdf".into())],
+        };
+        styled_text.style_range(2, 3, after_style);
+        assert_eq!(styled_text.buffer[0], (before_style, "as".into()));
+        assert_eq!(styled_text.buffer[1], (after_style, "d".into()));
+        assert_eq!(styled_text.buffer[2], (before_style, "f".into()));
+    }
+    #[test]
+    fn regression_style_range_cargo_run() {
+        let (_, before_style, after_style) = get_styled_text_template();
+        let mut styled_text = StyledText {
+            buffer: vec![
+                (before_style, "cargo".into()),
+                (before_style, " ".into()),
+                (before_style, "run".into()),
+            ],
+        };
+        styled_text.style_range(8, 7, after_style);
+        assert_eq!(styled_text.buffer[0], (before_style, "cargo".into()));
+        assert_eq!(styled_text.buffer[1], (before_style, " ".into()));
+        assert_eq!(styled_text.buffer[2], (before_style, "r".into()));
+        assert_eq!(styled_text.buffer[3], (after_style, "u".into()));
+        assert_eq!(styled_text.buffer[4], (before_style, "n".into()));
+    }
+
+    #[test]
+    fn test_render_multiline_without_semantic_markers() {
+        let style = Style::new();
+        let renderable = (style, "line1\nline2".to_string());
+        let prompt_style = Style::new();
+        let multiline_prompt = "::: ";
+
+        // Without semantic markers, just get newline + multiline prompt
+        let result = super::render_as_string(&renderable, &prompt_style, multiline_prompt, None);
+        assert!(result.contains("\n::: "));
+        assert!(!result.contains("\x1b]133;A;k=s"));
+    }
+
+    #[test]
+    fn test_render_multiline_with_semantic_markers() {
+        use crate::terminal_extensions::semantic_prompt::Osc133Markers;
+        let style = Style::new();
+        let renderable = (style, "line1\nline2".to_string());
+        let prompt_style = Style::new();
+        let multiline_prompt = "::: ";
+        let markers = Osc133Markers;
+
+        // With semantic markers, should wrap multiline prompt with A;k=s and B
+        let result =
+            super::render_as_string(&renderable, &prompt_style, multiline_prompt, Some(&markers));
+        // The result should contain the secondary prompt marker before ::: and B after
+        assert!(result.contains("\x1b]133;A;k=s\x1b\\"));
+        assert!(result.contains("\x1b]133;B\x1b\\"));
+    }
+
+    #[test]
+    fn test_render_single_line_no_markers_emitted() {
+        use crate::terminal_extensions::semantic_prompt::Osc133Markers;
+        let style = Style::new();
+        let renderable = (style, "single line".to_string());
+        let prompt_style = Style::new();
+        let multiline_prompt = "::: ";
+        let markers = Osc133Markers;
+
+        // Single line should not emit any markers
+        let result =
+            super::render_as_string(&renderable, &prompt_style, multiline_prompt, Some(&markers));
+        assert!(!result.contains("\x1b]133;A;k=s"));
+        assert!(!result.contains("\x1b]133;B"));
+    }
+}

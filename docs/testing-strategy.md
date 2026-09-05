@@ -10,7 +10,51 @@ cargo xtask check
 It checks Rust and Quirl formatting, denies every Clippy warning, rejects
 undocumented public Rust APIs, builds workspace Rustdoc with warnings denied,
 runs the full workspace, executes 128 deterministic generated C1 differential
-cases against each available reference shell, and runs guest-side Lua tests.
+cases against each available reference shell, runs the fixed real-PTY matrix
+and a seeded 12-journey keyboard session on Unix, and runs guest-side Lua tests.
+
+## Local Linux validation with Docker or Colima
+
+The pinned container image runs the same gate with Bash and Zsh installed.
+It supports native Linux ARM64 and x86-64 execution. Docker Desktop or a
+Docker-compatible Colima daemon is sufficient; Windows is outside this workflow.
+CI runs the canonical gate on both Ubuntu and macOS and verifies both reference
+shells are available.
+
+```sh
+docker build -f scripts/linux-check.Dockerfile -t quirl-linux-check:1.97.1 scripts
+QUIRL_GIT_COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir)
+docker run --rm --init --cpus 4 --memory 6g --pids-limit 1024 \
+  --mount "type=bind,source=$PWD,target=/workspace,readonly" \
+  --mount "type=bind,source=$QUIRL_GIT_COMMON_DIR,target=$QUIRL_GIT_COMMON_DIR,readonly" \
+  --mount type=volume,source=quirl-linux-cargo-1971,target=/home/quirl/.cargo \
+  --mount type=volume,source=quirl-linux-target-1971,target=/home/quirl/target \
+  quirl-linux-check:1.97.1
+```
+
+Run from the workspace root. The common Git directory mount also supports linked
+worktrees and preserves accurate build identity. Source and Git mounts are
+read-only. Tests run as an ordinary user so root privileges cannot hide
+permission failures. Linux artifacts and Cargo downloads stay in separate named
+volumes instead of overwriting macOS artifacts. The VM needs at least 6 GiB of
+memory; compilation and tests each use two concurrent workers. The container
+does not need privileged mode or access to the Docker socket.
+The `--init` flag is required: it reaps orphaned descendants as a normal Linux
+init process would. Running Cargo as PID 1 can leave killed descendants as
+zombies and invalidate lifecycle assertions.
+
+To run a larger simulation, append `cargo xtask simulate --seed 2026090401
+--sessions 2048 --steps 24 --output /home/quirl/target/simulations/linux` to the
+same `docker run` command after the image name. The explicit output path retains
+reports in the writable target volume instead of the read-only source mount. Keep the base image version
+and digest in `scripts/linux-check.Dockerfile` aligned with
+`rust-toolchain.toml` when upgrading Rust. Container PTY checks complement,
+rather than replace, real terminal checks on supported hardware.
+
+The workspace Cargo configuration omits unused full-text and spatial modules
+from bundled SQLite. Quirl's internal catalog, history, and intelligence stores
+use ordinary tables. Keep those build settings when reproducing release-size
+measurements; the binary's 10 MiB hard ceiling remains unchanged.
 
 ## Layers
 
@@ -134,7 +178,8 @@ status, exact output, or the bounded filesystem manifest, the result is
 The seed-specific directory under `target/simulations/` contains:
 
 - `summary.json`, including result counts, exact interpreter paths and
-  versions, and the first divergent session;
+  versions, the original Quirl path, its tested snapshot SHA-256 and byte size,
+  and the first divergent session;
 - `report.jsonl`, with every source, step list, outcome, filesystem manifest,
   deadline result, and classification;
 - `failures/session-N/`, with standalone `.sh` and `.qrl` replay sources plus
@@ -152,11 +197,126 @@ output to 64 KiB, the filesystem manifest to 64 files and 64 KiB at depth eight,
 and every interpreter to five seconds. Timeouts terminate the isolated process
 group before the result is recorded.
 
+Before the first session, the simulator copies Quirl from one admitted regular
+file handle into a private temporary directory. The copy uses a 64 KiB buffer,
+accepts at most 256 MiB of executable bytes, and hashes exactly what is copied.
+Observed in-place changes reject admission; later rebuilds cannot switch the
+binary between sessions. All sessions execute that owner-only snapshot, which
+is removed by the run's cleanup guard. Summary schema 2 adds snapshot identity;
+individual `report.jsonl` records retain schema 1.
+
 The daily GitHub Actions swarm chooses the explicit seed from the workflow run
 ID, installs both references, runs 2,048 sessions, and uploads the trace. It
 opens a public issue only when a completed `summary.json` proves a compatibility
 mismatch; checkout, installation, build, or runner failures fail the workflow
 without being mislabeled as shell defects.
+
+## Keyboard-driven user sessions
+
+The compatibility swarm compares shell execution. The session soak exercises
+the interactive product through real Unix PTYs, using the same isolated
+configuration and terminal model as the rich-terminal checks:
+
+```console
+cargo build -p quirl-cli
+cargo xtask session-soak --seed 2026090501
+cargo xtask session-soak --seed 2026090501 --sessions 100 --journeys 60
+```
+
+The short default runs four sessions with 12 journeys each. The explicit
+100-session invocation runs 6,000 journeys. At the explicitly assumed rate of 60 command journeys per
+hour, that is **100 modeled active hours** with think time removed. It is an
+action-coverage model, not a measured human usage rate or evidence of 100 hours
+of continuous uptime. Reports record actual elapsed time and input counts
+separately. A journey can contain several commands and navigation actions.
+
+The harness uses an immutable, hashed copy of the selected prebuilt binary.
+Pass `--binary /absolute/path/to/quirl` to test another build. Replaying a
+zero-based session requires the original seed and workload parameters, for
+example `--seed 2026090501 --sessions 100 --journeys 60 --session 17`.
+Keep the original executable when investigating a failure: rebuilding changes
+what a replay tests even when its input sequence is identical.
+
+The workload combines editing, completion, history, mode changes, typed data,
+help, invalid-input recovery, and terminal resizing. It records input actions
+and representative visible-screen checkpoints under `target/session-soak`.
+Open the run's `index.html` to browse its screen gallery and measured counters;
+`manifest.json` records replay inputs and `summary.json` records the outcome.
+Each session retains `actions.jsonl`, a summary, and bounded final screen/output
+evidence. A failed session also retains `failure.svg` when artifact writing
+succeeds. Logs record input before delivery; artifact or cleanup failures also
+fail the run. Reports use private, newly created directories and never replace
+an earlier run.
+
+Screens are escaped, bounded SVG **styled terminal-cell models** of the actual
+PTY output. They preserve ANSI, indexed, and truecolor foreground/background
+colors and common SGR styles using an explicit fixed palette. They make
+clipping, selection, stale overlays, wrapping, and misplaced cursors inspectable;
+they do not reproduce the user's terminal palette, font shaping, or exact pixels.
+Each cell admits at most 256 UTF-8 bytes; exceeding that bound fails the model
+and capture instead of silently publishing truncated evidence. Visual
+checkpoints wait for Ratatui's completed cursor-finalization sequence within the same bounded screen deadline, so a matching word halfway
+through a redraw cannot publish a partially painted gallery image. Failed
+checkpoints are not added to the gallery index. Inspect failure traces and
+images before attributing a failure to Quirl rather than the harness. Each run
+allows at most 1,000 sessions, 200 journeys per session, 180 seconds per session, two hours overall, and 20 failed
+sessions. Journals are capped at 1 MiB each and run artifacts at 256 MiB, with
+space reserved for summaries. Per-action screen waits are limited to eight
+seconds. The workload stops with failure when a bound prevents completion.
+
+The fixed rich-terminal matrix also reopens the same private profile to verify
+durable history and tests multiline bracketed paste against filesystem side
+effects. Pasting and selecting history must not execute a command; explicit
+submission must execute the intended commands exactly once. Session fixtures
+never use the developer's personal home, configuration, or history.
+
+The fixed matrix also covers pasted control sequences, oversized paste
+rejection, fragmented committed Unicode and grapheme editing. Transport-level
+checks exceed pending-paste, escape-sequence, and terminal-reply queue limits,
+requiring resource diagnostics, no partial execution, and terminal restoration
+on both rich and simple surfaces. ADR 0031 records the dependency ingress patch.
+Both editors bound source to 64 KiB. The rich editor rejects the entire paste
+and preserves existing input; the simple editor fails closed on overflow and
+restores the terminal. ADR 0032 also bounds simple undo retention and Vi repeat
+expansion, and requires displayed controls to remain inert. An actual idle
+unfinished-paste check waits for the 30-second admission deadline without
+sending another byte. A separate canonical zero-poll probe verifies immediate
+kernel and parser-queued events; it tests the harness's linked terminal library
+separately from the selected Quirl executable.
+
+The `vi-repeat-admission` PTY check sends rapid insertion and Escape in one write
+and verifies exact post-edit source. It also rejects excessive decimal counts,
+multiplied counts, and overflowing prefixes before queued submission, proving
+terminal restoration and absence of command side effects. The simple editor
+bounds both raw collection and expanded actions as specified in ADR 0032.
+
+Keyboard clipboard tests select Unicode output rows, issue copy commands, and
+verify exact single-line and multiline OSC 52 payloads. They do not access the
+operating-system clipboard. Fixed PTY checks pin one immutable binary for the
+whole matrix and print its SHA-256, so a concurrent rebuild cannot switch the
+product halfway through a run. Large PTY writes must drain output concurrently
+under the original send deadline: a real terminal continues reading while a
+shell paints, and a write-only harness can deadlock against the child's output
+buffer. Query replies, retained output, and screen parsing keep their existing
+bounds; backpressure must not be hidden by increasing timeouts.
+
+`sustained-session` keeps one shell alive across 128 output bursts (over 64 MiB),
+64 error/pipeline/editor-cancellation rounds, and four foreground interruptions.
+The first 32 MiB warms retained transcript capacity before measured churn.
+Linux samples descriptors, threads, resident memory, and direct children from
+bounded `/proc` reads at settled prompts. The warmed growth envelope is eight
+descriptors, eight threads, and 32 MiB RSS; successful exit must reap owned
+children. Other platforms verify responsiveness and child cleanup. A 120-second
+run admission limit plus bounded current operations prevents an indefinite
+regression hang. This checks accelerated retention after capacity wrap, not
+100-hour continuous uptime or proof of zero leaks.
+
+No finite generated workload emulates every terminal or usage pattern. Keep
+the focused process, job-control, sandbox, protocol, and release tests. Real
+terminal checks remain necessary for colors, fonts, IME input, clipboard
+integration, accessibility, terminal-specific key protocols, remote sessions,
+and real Codex authentication/network behavior. The accelerated soak does not
+replace actual long-duration memory, idle, suspend, or clock-change testing.
 
 ## Lifecycle simulation
 
@@ -190,8 +350,8 @@ Rust-owned driver reuses the workspace's existing `nix` and `unicode-width`
 dependencies and requires no separate scripting-language toolchain. Its small
 VT screen model answers cursor-position queries from modeled screen state, so
 assertions distinguish visible cells from stale bytes in the raw transcript.
-Each session limits retained output to 16 MiB, each read/write/wait to five
-seconds by default, the screen to 262,144 cells, and forced child cleanup to two
+Each session limits retained output to 16 MiB, each read/write/wait to 15
+seconds locally (100 seconds on GitHub Actions), the screen to 262,144 cells, and forced child cleanup to two
 seconds. Session teardown kills both the foreground process group and the PTY
 session group before reaping the leader.
 

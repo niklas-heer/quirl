@@ -26,7 +26,7 @@ editor line, a completion popup with a documentation pane, a diagnostics row,
 and a persistent bottom status bar. Ordinary foreground commands on the rich
 surface return bounded captured outcomes to that transcript without leaving
 the alternate screen. The normal screen is restored when the rich session
-suspends or exits, not between ordinary foreground commands.
+suspends, exits, or hands the real terminal to a supported full-screen command.
 
 What is **kept** from today's implementation:
 
@@ -74,9 +74,10 @@ Non-goals:
 
 - No embedded interactive terminal in the current stage. The rich surface
   captures ordinary noninteractive foreground commands; faithfully embedding `vim`,
-  `less`, `top`, REPLs, or another alternate-screen child requires the future
-  PTY/VT contract in ADR 0022. The simple surface remains the classic-terminal
-  compatibility path.
+  `less`, `top`, REPLs, or another alternate-screen child inside the transcript
+  requires the future PTY/VT contract in ADR 0022. Curated standalone full-screen
+  commands instead take over the real terminal (§3.3); arbitrary interactive
+  workflows remain on the simple surface.
 - No rich-surface background jobs in the current stage. They are rejected
   before spawn because their uncaptured asynchronous output could race and
   corrupt later frames. Use the simple surface for background-job workflows.
@@ -92,7 +93,7 @@ Non-goals:
 
 ### 3.1 Crate placement
 
-Per ADR 0002, all of this lives in `quirl-ui` (which may use catalog, core,
+Per ADR 0016, all of this lives in `quirl-ui` (which may use catalog, core,
 lua, syntax) with composition in `quirl-cli`. No new crate, no inverted edges.
 
 Workspace dependencies to add (root `Cargo.toml`):
@@ -201,11 +202,16 @@ uncaptured; accepting such a graph would let asynchronous bytes escape the
 transcript boundary and corrupt a later frame. Background job execution remains
 available on the simple surface.
 
-Interactive PTY applications are not sent through this contract as though
-captured text were a terminal. Embedded PTY input, VT parsing, child screen
-state, replay, and resize propagation remain future work under ADR 0022. The
-simple surface continues to use inherited streams and native terminal
-scrollback.
+A curated set of full-screen commands, including `vim`, `less`, `man`, and
+`top`, uses a separate whole-terminal takeover. Only a single foreground
+command without redirects, pipelines, or command-list connectors qualifies.
+Quirl releases its terminal guards, executes with inherited streams, then
+reacquires and repaints the rich viewport on success or failure. The child's
+screen contents are not captured into the transcript. Unlisted interactive
+programs and more complex interactive workflows should use the simple surface.
+Embedded PTY input, VT parsing, child screen state, and replay remain future
+work under ADR 0022; this takeover delegates those responsibilities to the
+actual terminal.
 
 ### 3.4 Transcript, scrolling, selection, and copy
 
@@ -310,18 +316,39 @@ reusing the revision-keyed syntax analysis. Every draw records a rolling P95
   future keymap-parity work.
 - **Paste safety**: bracketed paste inserts literally — newlines in pasted text
   never trigger execution; the frame shows `⇪ pasted 3 lines` in the status
-  bar until the next keystroke. Oversized paste truncates at a UTF-8 boundary
-  and reports the 64 KiB limit in the status bar.
+  bar until the next keystroke. Oversized paste is rejected as a whole before
+  changing the buffer, cursor, or undo history; the status bar reports observed
+  bytes, available capacity, and the 64 KiB limit. The simple surface also enables
+  bracketed paste, so pasted newlines require explicit submission. Terminal
+  transport admission is separately bounded as recorded in ADR 0031: unfinished
+  escape sequences admit 4,096 raw bytes; bracketed paste admits 262,156 raw
+  bytes including delimiters. Either crossing that limit or leaving a sequence
+  unfinished for 30 seconds ends the session with a resource diagnostic and
+  restores terminal state. These limits apply before editor admission. Pasted
+  control characters remain source text and are escaped for display; they
+  cannot issue terminal commands through the editor. In simple mode, exceeding
+  the 64 KiB editor bound also ends the session without submitting rejected
+  input; it does not provide rich mode's recoverable status notice.
 - **Keymaps**: `emacs` (default), `helix`, `vim` — the existing
   `editor.keymap` config values. The baseline centralizes bindings in
   `EditorState::apply_key`, but still uses explicit match branches. Data-driven
   `(mode, key) -> EditAction` tables and user remapping are future work. Helix
   and Vim modal states (`NOR`, `INS`, and Vim `VIS`) appear in the status bar.
-  Reedline may only be removed
-  once all three keymaps pass the shared keymap conformance test suite.
+  The simple surface uses Reedline's corresponding modes. Its Vi prefixes are
+  limited to 64 characters and checked numeric counts; expanded actions are
+  limited to 1,024 per processing batch, including dot replay. Rapid input is
+  applied in order under the current mode, so a later Escape cannot reinterpret
+  earlier insertion. Exceeding admission ends the simple session with a resource
+  diagnostic before rejected actions execute (ADR 0032). Reedline removal still
+  requires shared keymap conformance and accessibility evidence.
 - **History recall**: `Up`/`Down` prefix-aware cycling; `Ctrl-R` opens the
   history picker overlay. Inline autosuggestion (dim text after cursor) comes
   from the most recent matching history entry; `→` at end-of-line accepts it.
+
+The SQLite history database and existing journal/WAL sidecars are secured before
+initialization; Unix files use mode `0600`. Link aliases and special files are
+rejected. Readers enforce persisted command and directory byte limits before
+allocating text, with a 69 KiB SQLite row limit and an 8 MiB snapshot text budget.
 
 ```rust
 enum EditAction {
@@ -344,7 +371,7 @@ enum EditAction {
 | `Alt-Enter` | Force newline | |
 | `Alt-Q`, then a mnemonic | Quirl leader for modes, pickers, jobs, and results | collision-free internal command namespace |
 | `Ctrl-Space` | Command/data mode toggle compatibility alias | some terminals cannot distinguish this from NUL |
-| `Ctrl-R` or `Up` | Cwd-aware fuzzy history | conventional history entrypoint |
+| `Ctrl-R` or unselected `Up` | Cwd-aware fuzzy history | `Up` navigates within an explicitly selected completion menu |
 | `Alt-Q f/c/p/j/r/e` | Files / directory explorer / palette / jobs / results / Environment Explorer | Quirl leader namespace; both explorers preserve the edit buffer, while only the directory explorer can commit `cd` |
 | `Ctrl-G` / `Alt-D` | Active jobs / cached typed-data picker | snapshots only; selection inserts a revalidated command or data expression |
 | `Ctrl-C` | Clear line, dismiss popup; never exits | |
@@ -445,7 +472,9 @@ git che▌
   typing a flag prefix after a known command opens that command's options. This
   happens even when broad `completion.auto` fuzzy matching is disabled. An
   untouched informational popup leaves Enter bound to command execution; Tab
-  or arrow navigation converts it to a selectable completion menu.
+  or Down converts it to a selectable completion menu. Up and Down then navigate
+  within that menu; untouched automatic completion keeps Up bound to history.
+  Ctrl-R remains the explicit history entrypoint in either state.
 - Streaming: catalog and extension completion run on separate workers. Catalog
   results normally paint first; later extension results merge without moving a
   still-present selected value. `streaming…` shows while either source remains
@@ -520,6 +549,16 @@ honoring `picker.layout`:
 - `full`: terminal-height picker using the same full-screen frame and RAII
   lifecycle as ordinary editing.
 
+The file picker replaces the complete shell word under the cursor and preserves
+surrounding arguments and operators. It shares the ordinary completion path
+encoder: spaces, quotes, dollar signs, and other shell punctuation retain their
+literal filename meaning. Names beginning with `-` receive a `./` prefix so
+the selected file cannot become a program option. An unfinished quote is closed
+on selection, and
+filenames that cannot be represented as UTF-8 are omitted instead of inserting
+a different path. F1 searches the command segment at the cursor, including a
+later pipeline or command-list stage, without changing the edit buffer.
+
 `Alt-Q e` opens a dedicated full-screen Environment Explorer. Its source is the
 process executor's private, generation-tracked environment rather than the host
 process environment, so session exports and authorized extension updates appear
@@ -558,6 +597,13 @@ The picker engine, ranking, and typed-value return stay in `quirl-picker`;
 the surface uses it through the `PickerRanker` composition adapter. Source
 items are capped at 4 096 and 2 MiB retained data, queries at 1 024 bytes, and
 ranked visible results at 256; rendering virtualizes the current window.
+Interactive ranking has a 50 ms total budget, including request conversion and
+history bias. An invalid or expired request clears results instead of publishing
+partial or stale rankings. The engine checks cancellation between query terms
+and during Unicode preparation, so one large candidate cannot consume the entire
+turn unchecked. Query terms are prepared once, and empty queries skip Unicode
+search mapping. Word movement, deletion, and picker replacement ranges preserve
+complete UTF-8 whitespace characters.
 Job entries come from `NativeExecutor::jobs()` after its refresh/prune step and
 retain only stable IDs, status, command text, and state-valid `fg`/`bg`
 commands. Data entries come only from the bounded cache of successful typed
@@ -693,7 +739,7 @@ Decision made once at startup (and on `SIGWINCH` only for width tiers), in
 | --- | --- |
 | stderr not a TTY, `TERM=dumb`, terminal height < 5, or `ui.surface = "simple"` | **Simple surface**: current Reedline path — plain prompt and Reedline menus; completion also remains available through `quirl complete`; identical parser and catalog |
 | `NO_COLOR` | Rich layout, modifier-only theme (§7) |
-| width < 100 | Normal completion documentation pane hidden; the list and result count remain. A terminal-height full picker may show preview from width 72 when configured |
+| width < 72 | Normal completion documentation pane hidden; the list and result count remain. Picker previews require width 100, or width 72 in terminal-height full layout, and enabled preview config |
 | width < 60 | Status bar center dropped; context right side is dropped when it collides with the left side |
 
 Popup height is clamped to available rows, and terminals below eight rows move
@@ -702,8 +748,7 @@ negotiation remain planned refinements, not current capability claims.
 
 Hard rules carried over: every piece of information in the shipped frame has a
 linear text equivalent (diagnostics render through `render_error` on demand;
-standalone panel models require `plain_fallback`, although panels are not yet
-pinned into the frame); plugin-provided strings pass the existing
+pinned panel models require `plain_fallback`); plugin-provided strings pass the existing
 control-sequence escape filter before entering any buffer; no functionality is
 mouse-only or color-only; screen-reader users get a stable, minimally-redrawn
 simple surface rather than a chatty rich one.
@@ -719,7 +764,7 @@ Budgets (restating §12 as per-component obligations):
 | Keystroke → frame flushed | ≤8 ms P95 | event loop; one draw per batch |
 | Lex + resolve + style | ≤8 ms P95 | §6 cache |
 | First prompt paint | ≤21 ms P95 | context row paints with cached/stale segments; scheduler fills in |
-| Cold start → editable | ≤25 ms P50 | rich catalog admission follows the first flush and completes before input polling; `$PATH` warmup remains lazy |
+| Cold start → editable | ≤25 ms P50 | rich catalog construction starts on a worker after the first flush; input stays responsive and `$PATH` warmup remains lazy |
 | Completion: local results visible | ≤8 ms | catalog worker publishes independently; extensions merge later |
 | Memory | 16 MiB/50,000-line transcript; 1 MiB selection/copy; virtualized popup/picker; 64 KiB editor; bounded undo/history | |
 
@@ -781,8 +826,9 @@ In-crate `#[cfg(test)]` modules, behavior-sentence names, run by `cargo xtask ch
 - **Execution separation**: rich ordinary foreground commands select the 1
   MiB-per-stream streaming capture path and commit status only after drain. Rich mode
   rejects a background pipeline before spawn. Simple mode inherits streams and
-  retains background-job compatibility. PTY-only applications are not
-  presented as supported rich captures.
+  retains background-job compatibility. Curated full-screen takeover checks
+  require real-terminal handoff and rich-frame restoration on success and spawn
+  failure; they do not claim embedded PTY emulation.
 
 Sandbox/budget claims need adversarial proof per AGENTS.md; any new Lua-facing
 surface (status items) gets deny-unknown-fields structs at the boundary.
@@ -791,11 +837,14 @@ Current evidence includes styled TestBackend checks for rest/data/diagnostic/
 completion/picker/compact/adversarial frames; shared keymap and Shift-Tab
 conformance; stale/cancelled asynchronous completion tests; 4 KiB highlighting;
 and explicit editor, completion, picker, PATH, undo, and history bounds. The
-full permutation implied above (especially every degradation row, `NO_COLOR`,
-plain symbols, persistent-session lifecycle, and named terminal snapshots)
-remains release-evidence work. `cargo xtask rich-pty` must cover deletion,
-wrapping, Alt-Q leader repaint, completion, repeated captured execution,
-transcript scrolling/copy, and Ctrl-D on a real Unix PTY.
+fixed `cargo xtask rich-pty` matrix covers deletion, wrapping, Alt-Q leader
+repaint, completion, repeated captured execution, transcript scrolling/copy,
+Ctrl-D, takeover restoration, and semantic hints with `NO_COLOR` on real Unix
+PTYs. It also checks paste, committed Unicode, Vi repetition, and terminal-input
+limits. The seeded session soak adds replayable navigation and colored SVG cell
+models. These checks do not establish every degradation permutation, native
+font/IME/clipboard behavior, or named-terminal accessibility support; those
+remain separate release evidence. See [the testing strategy](testing-strategy.md).
 
 ---
 
@@ -949,10 +998,13 @@ The integration maintains these invariants:
 - **Post-flush catalog admission.** Extension discovery, active configuration,
   theme, keymap, runtime activation, terminal guards, cursor negotiation, and
   the initial empty-editor frame remain eager. Rich mode then invokes one
-  bounded catalog loader synchronously after the first successful flush and
-  before event polling. It publishes one immutable `Arc<Catalog>` generation to
-  analysis, completion, picker/help, and the REPL only after every consumer is
-  ready. Input arriving meanwhile remains queued by the terminal. Loader
+  bounded catalog loader on one worker after the first successful flush and
+  continues polling input. The surface thread publishes one immutable
+  `Arc<Catalog>` generation to analysis and completion before exposing it to
+  picker/help and the REPL. Typing, ordinary command execution, builtin help,
+  filesystem pickers, and history remain usable while discovery runs. Explicit
+  completion resumes against the current input after publication; an open
+  palette/help overlay refreshes without overwriting an edited query. Loader
   failure preserves the catalog error while the existing drop guards restore
   cooked mode, cursor visibility and shape, bracketed paste, and the alternate
   screen. Simple/degraded mode keeps eager catalog construction.
@@ -992,3 +1044,21 @@ text. All optional regions are virtualized; offscreen rows stay within the
 declared snapshot bounds and are never rebuilt from Lua during a frame.
 The session transcript separately retains at most 16 MiB and 50,000 logical
 lines, and one selection/copy operation retains at most 1 MiB of plain text.
+
+### Interactive help and first success
+
+Textual `help` opens a compact getting-started overview from `Catalog::builtin()`.
+It works before background command discovery finishes. Exact command names and
+`quirl`-qualified shorthand open the corresponding contract; partial names and
+search words list up to 12 choices, and ambiguous aliases never select an
+arbitrary command. Help scans up to 4,096 admitted commands, accepts 256-byte
+queries, and retains at most 64 KiB of wrapped, terminal-safe text. Large results
+show a refinement hint. Help output belongs to the rich transcript, so repainting
+and returning to the prompt preserve it; the simple surface prints the same text.
+
+Already-materialized Data-mode values, such as a single record, use the same
+bounded table renderer as `quirl data`. List sources, including inline JSON
+arrays, become streams and keep incremental plain-row output so inspection
+does not force a whole stream into memory. Use `quirl data ... --format table`
+for an explicitly collected table. Both paths retain the original typed
+values for the results picker; presentation never changes their data contract.

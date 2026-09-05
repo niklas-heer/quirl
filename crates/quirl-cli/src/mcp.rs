@@ -4,6 +4,12 @@
 //! access. Its check and format tools work only on bounded source supplied in a
 //! JSON-RPC request, so an MCP client cannot obtain ambient execution rights by
 //! discovering a tool.
+//!
+//! Admission precedes dispatch: malformed envelopes and excessive method,
+//! parameter, or nesting sizes must not mutate negotiation state. Only a valid
+//! request without an ID is a notification; an explicit null ID still receives
+//! a response. The 1 MiB frame bounds parse allocation, and depth inspection
+//! stops at the declared limit without recursive traversal.
 
 use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::{Subcommand, ValueEnum};
@@ -23,6 +29,7 @@ const MAX_TOOL_INPUT_BYTES: usize = 256 * 1024;
 const MAX_DEPTH: usize = 32;
 // Correlation IDs are not payloads, so validate their encoded size before cloning or reflection.
 const MAX_REQUEST_ID_BYTES: usize = 128;
+const MAX_METHOD_BYTES: usize = 128;
 
 #[derive(Debug, Subcommand)]
 pub enum ServeCommand {
@@ -140,7 +147,14 @@ impl McpServer {
                 ));
             }
         };
-        if json_depth(&value) > MAX_DEPTH {
+        if !value.is_object() {
+            return Some(Response::error(
+                Value::Null,
+                -32600,
+                "invalid JSON-RPC request",
+            ));
+        }
+        if !json_depth_is_bounded(&value) {
             return Some(Response::error(
                 request_id(&value),
                 -32600,
@@ -148,17 +162,36 @@ impl McpServer {
             ));
         }
         let id = request_id(&value);
-        let notification = value.get("id").is_none_or(Value::is_null);
+        let notification = value.get("id").is_none();
         let request: Request = match serde_json::from_value(value) {
             Ok(request) => request,
             Err(_) => {
-                return (!notification)
-                    .then(|| Response::error(id, -32600, "invalid JSON-RPC request"));
+                return Some(Response::error(id, -32600, "invalid JSON-RPC request"));
             }
         };
         if request.jsonrpc != "2.0" || !valid_id(&request.id) {
-            return (!notification)
-                .then(|| Response::error(id, -32600, "invalid JSON-RPC request"));
+            return Some(Response::error(id, -32600, "invalid JSON-RPC request"));
+        }
+        if !request.params.is_object() && !request.params.is_array() {
+            return Some(Response::error(
+                id,
+                -32600,
+                "JSON-RPC params must be structured",
+            ));
+        }
+        if request.method.len() > MAX_METHOD_BYTES {
+            return Some(Response::error(
+                id,
+                -32600,
+                "method exceeds the MCP byte limit",
+            ));
+        }
+        if serialized_size(&request.params) > MAX_TOOL_INPUT_BYTES {
+            return Some(Response::error(
+                id,
+                -32600,
+                "params exceed the MCP byte limit",
+            ));
         }
 
         let result = match request.method.as_str() {
@@ -504,7 +537,7 @@ fn response_meta(era: Option<ProtocolEra>) -> Option<Value> {
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, RpcError> {
-    if json_depth(&value) > MAX_DEPTH || serialized_size(&value) > MAX_TOOL_INPUT_BYTES {
+    if !json_depth_is_bounded(&value) || serialized_size(&value) > MAX_TOOL_INPUT_BYTES {
         return Err(RpcError::new(
             -32602,
             "tool input exceeds the configured limit",
@@ -619,22 +652,22 @@ fn serialized_response_size(response: &Response) -> usize {
     serde_json::to_vec(response).map_or(usize::MAX, |bytes| bytes.len())
 }
 
-fn json_depth(value: &Value) -> usize {
-    match value {
-        Value::Array(values) => values
-            .iter()
-            .map(json_depth)
-            .max()
-            .unwrap_or_default()
-            .saturating_add(1),
-        Value::Object(values) => values
-            .values()
-            .map(json_depth)
-            .max()
-            .unwrap_or_default()
-            .saturating_add(1),
-        _ => 0,
+fn json_depth_is_bounded(value: &Value) -> bool {
+    let mut pending = vec![(value, 0_usize)];
+    while let Some((value, depth)) = pending.pop() {
+        let child_depth = depth.saturating_add(1);
+        if (value.is_array() || value.is_object()) && child_depth > MAX_DEPTH {
+            return false;
+        }
+        match value {
+            Value::Array(values) => pending.extend(values.iter().map(|value| (value, child_depth))),
+            Value::Object(values) => {
+                pending.extend(values.values().map(|value| (value, child_depth)))
+            }
+            _ => {}
+        }
     }
+    true
 }
 
 fn read_message(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, ShellError> {
@@ -917,6 +950,121 @@ mod tests {
             responses[1]["result"]["protocolVersion"],
             LEGACY_PROTOCOL_VERSIONS[2]
         );
+    }
+
+    #[test]
+    fn null_request_ids_receive_responses_but_notifications_do_not() {
+        let mut server = initialized_server(vec![McpCapability::Catalog]);
+        let response = server
+            .handle_bytes(br#"{"jsonrpc":"2.0","id":null,"method":"tools/list","params":{}}"#)
+            .unwrap();
+        assert_eq!(response.id, Value::Null);
+        assert!(response.result.is_some());
+        assert!(
+            server
+                .handle_bytes(br#"{"jsonrpc":"2.0","method":"tools/list","params":{}}"#,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn invalid_idless_envelopes_receive_errors_without_mutating_the_session() {
+        let mut server = McpServer::new(vec![McpCapability::Catalog], Catalog::builtin());
+        for input in [
+            "null",
+            "[]",
+            "{}",
+            r#"{"jsonrpc":"1.0","method":"initialize"}"#,
+            r#"["2.0",null,"initialize",{"protocolVersion":"2025-11-25"}]"#,
+            r#"{"jsonrpc":"2.0","method":"tools/list","params":null}"#,
+        ] {
+            let response = server.handle_bytes(input.as_bytes()).unwrap();
+            assert_eq!(response.id, Value::Null);
+            assert_eq!(response.error.unwrap().code, -32600);
+            assert_eq!(server.era, None);
+        }
+    }
+
+    #[test]
+    fn declared_method_and_params_limits_are_enforced_before_dispatch() {
+        let mut server = initialized_server(vec![McpCapability::Catalog]);
+        for (length, code) in [(128, -32601), (129, -32600)] {
+            let response = server
+                .handle_bytes(request(2, &"m".repeat(length), json!({})).as_bytes())
+                .unwrap();
+            assert_eq!(response.error.unwrap().code, code);
+        }
+        let empty_params = json!({"protocolVersion": LEGACY_PROTOCOL_VERSIONS[2], "capabilities": {"padding": ""}});
+        let overhead = serialized_size(&empty_params);
+        for (size, accepted) in [
+            (MAX_TOOL_INPUT_BYTES, true),
+            (MAX_TOOL_INPUT_BYTES + 1, false),
+        ] {
+            let mut server = McpServer::new(vec![McpCapability::Catalog], Catalog::builtin());
+            let mut params = empty_params.clone();
+            params["capabilities"]["padding"] = json!("x".repeat(size - overhead));
+            assert_eq!(serialized_size(&params), size);
+            let response = server
+                .handle_bytes(request(1, "initialize", params).as_bytes())
+                .unwrap();
+            if accepted {
+                assert!(response.error.is_none());
+                assert!(server.era.is_some());
+            } else {
+                assert_eq!(response.error.unwrap().code, -32600);
+                assert_eq!(server.era, None);
+            }
+        }
+    }
+
+    #[test]
+    fn nesting_limit_accepts_the_boundary_and_rejects_the_next_container() {
+        let mut value = Value::Null;
+        for _ in 0..MAX_DEPTH {
+            value = json!([value]);
+        }
+        assert!(json_depth_is_bounded(&value));
+        value = json!([value]);
+        assert!(!json_depth_is_bounded(&value));
+        let mut server = McpServer::new(vec![McpCapability::Catalog], Catalog::builtin());
+        let response = server
+            .handle_bytes(request(1, "initialize", value).as_bytes())
+            .unwrap();
+        assert_eq!(response.error.unwrap().code, -32600);
+        assert!(server.era.is_none());
+    }
+
+    #[test]
+    fn modern_metadata_counts_toward_the_parameter_budget_before_negotiation() {
+        let mut empty_params = modern_params(json!({}));
+        empty_params["_meta"]["io.modelcontextprotocol"]["clientInfo"]["name"] = json!("");
+        let overhead = serialized_size(&empty_params);
+        for (size, accepted) in [
+            (MAX_TOOL_INPUT_BYTES, true),
+            (MAX_TOOL_INPUT_BYTES + 1, false),
+        ] {
+            let mut server = McpServer::new(vec![McpCapability::Catalog], Catalog::builtin());
+            let mut params = empty_params.clone();
+            params["_meta"]["io.modelcontextprotocol"]["clientInfo"]["name"] =
+                json!("x".repeat(size - overhead));
+            assert_eq!(serialized_size(&params), size);
+            let response = server
+                .handle_bytes(request(1, "server/discover", params).as_bytes())
+                .unwrap();
+            if accepted {
+                assert!(response.error.is_none());
+                assert_eq!(server.era, Some(ProtocolEra::Modern));
+            } else {
+                assert_eq!(response.error.unwrap().code, -32600);
+                assert!(server.era.is_none());
+                let recovered = server
+                    .handle_bytes(
+                        request(2, "server/discover", modern_params(json!({}))).as_bytes(),
+                    )
+                    .unwrap();
+                assert!(recovered.error.is_none());
+            }
+        }
     }
 
     #[test]

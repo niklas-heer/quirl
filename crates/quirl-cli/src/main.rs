@@ -11,6 +11,7 @@ mod config;
 mod coordination;
 mod extension_scheduler;
 mod extensions;
+mod help;
 mod history;
 mod index;
 mod intelligence;
@@ -44,7 +45,7 @@ use package::PackageCommand;
 use pick::PickCommand;
 use platform::{EventsCommand, ViewCommand, WatchCommand};
 use plugin::PluginCommand;
-use quirl_catalog::{Catalog, CommandSpec, Completion, Effect as CatalogEffect};
+use quirl_catalog::{Catalog, Completion, Effect as CatalogEffect};
 use quirl_contract::{CommandPlanner, CommandPlanningRequest, CommandProposal};
 use quirl_core::{
     CommandOutcome, ErrorCode, ExecutionCancellation, ExecutionCleanupState, ExecutionEffect,
@@ -55,7 +56,11 @@ use quirl_core::{
 };
 use quirl_data::{DataEnvelope, DataOutput, DataRenderFormat, DataRuntime};
 use quirl_lua::{LuaPolicy, MAX_LUA_SOURCE_BYTES, QuirlConfig, sdk_json, sdk_lua, sdk_markdown};
-use quirl_picker::{ItemKind, MAX_PICKER_ITEMS, PickItem, Picker};
+use quirl_picker::{
+    ItemKind, MAX_PICKER_ITEM_TEXT_BYTES, MAX_PICKER_ITEM_VALUE_BYTES, MAX_PICKER_ITEMS,
+    MAX_PICKER_QUERY_BYTES, MAX_PICKER_REQUEST_BYTES, PICKER_PROTOCOL_VERSION, PickItem,
+    PickerOutcome, PickerRequest, execute_request as execute_picker_request,
+};
 use quirl_process::{
     DEFAULT_CAPTURE_BYTES, JobStatus, NativeExecutor, ObservedActivity, OutputObserver,
     change_directory, sandboxed_process_host,
@@ -86,7 +91,7 @@ use std::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Debug, Parser)]
-#[command(name = "quirl", version, about = "Everything you need, mixed in")]
+#[command(name = "quirl", version, about = "Everything you need, mixed in", after_help = quirl_catalog::INTERACTIVE_START_HELP)]
 struct Cli {
     /// Emit machine-readable metadata for release tooling.
     #[arg(long, hide = true)]
@@ -1863,13 +1868,21 @@ fn render_interactive_data_output(
         bytes = bytes.saturating_add(write_interactive_data_bytes(b"some(\n", cancelled, writer)?);
     }
     bytes = bytes.saturating_add(match output {
-        DataOutput::Value(value) => write_interactive_data_value(&value, cancelled, writer, stage),
+        // Finite values already own their bounded rows, so use the same table
+        // presentation as `quirl data`. Streams keep incremental row rendering.
+        DataOutput::Value(value) => {
+            write_interactive_data_value(&value, DataRenderFormat::Table, cancelled, writer, stage)
+        }
         DataOutput::Stream(mut stream) => {
             let mut stream_bytes = 0_u64;
             let mut pulls = 0_usize;
             while let Some(value) = stream.next(cancelled)? {
                 stream_bytes = stream_bytes.saturating_add(write_interactive_data_value(
-                    &value, cancelled, writer, stage,
+                    &value,
+                    DataRenderFormat::Plain,
+                    cancelled,
+                    writer,
+                    stage,
                 )?);
                 pulls = pulls.saturating_add(1);
                 if pulls == INTERACTIVE_DATA_PULLS_PER_TURN_MAX {
@@ -1914,6 +1927,7 @@ fn interactive_data_option_depth_error(observed: usize) -> ShellError {
 
 fn write_interactive_data_value(
     value: &StructuredValue,
+    format: DataRenderFormat,
     cancelled: &AtomicBool,
     writer: &mut impl Write,
     stage: &mut InteractiveDataStage,
@@ -1925,13 +1939,10 @@ fn write_interactive_data_value(
         )
         .with_help("Retry the expression after the cancellation is clear"));
     }
-    let rendered = DataEnvelope::value(value.clone()).render(DataRenderFormat::Plain)?;
-    writer
-        .write_all(rendered.as_bytes())
-        .map_err(data_output_write_error)?;
-    writer.flush().map_err(data_output_write_error)?;
+    let rendered = DataEnvelope::value(value.clone()).render(format)?;
+    let bytes = write_interactive_data_bytes(rendered.as_bytes(), cancelled, writer)?;
     stage.observe(value)?;
-    Ok(u64::try_from(rendered.len()).unwrap_or(u64::MAX))
+    Ok(bytes)
 }
 
 fn write_interactive_data_bytes(
@@ -2247,14 +2258,35 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         print_mode_feedback(mode, &active_config);
                     }
                     InteractiveLine::Help(topic) => {
-                        let published_catalog = catalog.as_deref().ok_or_else(|| {
-                            ShellError::new(
-                                ErrorCode::Io,
-                                "interactive catalog publication is incomplete",
-                            )
-                            .with_help("Restart Quirl before requesting help again")
-                        })?;
-                        print_help(published_catalog, topic);
+                        // Help must work even when a fast first submission beats
+                        // background command discovery. Builtins need no I/O.
+                        let published_catalog = catalog
+                            .clone()
+                            .unwrap_or_else(|| Arc::new(Catalog::builtin()));
+                        match help::render(
+                            &published_catalog,
+                            topic,
+                            terminal_width().unwrap_or(80),
+                        ) {
+                            Ok(rendered) => {
+                                last_status = 0;
+                                line_editor.emit_output(
+                                    &buffer,
+                                    rendered.as_bytes(),
+                                    &[],
+                                    0,
+                                    Duration::ZERO,
+                                )?;
+                            }
+                            Err(error) => {
+                                last_status = 1;
+                                line_editor.append_command_error(
+                                    &buffer,
+                                    &error,
+                                    Duration::ZERO,
+                                )?;
+                            }
+                        }
                     }
                     InteractiveLine::Command(command) => {
                         let started = Instant::now();
@@ -3114,11 +3146,7 @@ impl SessionEditor {
                     }
                     _ => InteractiveSignal::CtrlC,
                 })
-                .map_err(|error| {
-                    ShellError::new(ErrorCode::Io, "the interactive editor failed")
-                        .with_context(error.to_string())
-                        .with_help("Retry with ui.surface = \"simple\"")
-                }),
+                .map_err(quirl_ui::editor_read_error),
         }
     }
 
@@ -3417,21 +3445,39 @@ impl ExtensionCompleter for LocalAwareCompletionAdapter {
     }
 }
 
+const INTERACTIVE_PICKER_DEADLINE: Duration = Duration::from_millis(50);
+
 impl PickerRanker for SharedPickerRanker {
     fn rank(&self, items: &[PickerItem], query: &str, limit: usize) -> Vec<PickerMatch> {
-        let shared = items
-            .iter()
-            .take(MAX_PICKER_ITEMS)
-            .map(|item| PickItem {
-                id: item.id.clone(),
-                kind: shared_picker_kind(item.kind),
-                label: item.label.clone(),
-                description: item.description.clone(),
-                preview: item.preview.clone(),
-                value: serde_json::Value::String(item.value.clone()),
-            })
-            .collect::<Vec<_>>();
-        let mut ranked = Picker.rank(&shared, query);
+        let started = Instant::now();
+        let Some(deadline) = started.checked_add(INTERACTIVE_PICKER_DEADLINE) else {
+            return Vec::new();
+        };
+        self.rank_until(items, query, limit, deadline)
+    }
+}
+
+impl SharedPickerRanker {
+    fn rank_until(
+        &self,
+        items: &[PickerItem],
+        query: &str,
+        limit: usize,
+        deadline: Instant,
+    ) -> Vec<PickerMatch> {
+        // Ranking executes on the editor thread. Rejected or expired work yields
+        // an empty result; never publish partial ranks from an abandoned query.
+        let Some(request) = interactive_picker_request(items, query, deadline) else {
+            return Vec::new();
+        };
+        let PickerOutcome::Ready {
+            matches: mut ranked,
+        } = execute_picker_request(&request, || Instant::now() >= deadline).outcome
+        else {
+            return Vec::new();
+        };
+        // Keep the complete bounded result until applying directory history bias,
+        // so a short UI limit cannot discard the best locally ranked candidate.
         ranked.sort_by(|left, right| {
             let left_score = left
                 .score
@@ -3443,6 +3489,9 @@ impl PickerRanker for SharedPickerRanker {
                 .cmp(&left_score)
                 .then_with(|| left.index.cmp(&right.index))
         });
+        if Instant::now() >= deadline {
+            return Vec::new();
+        }
         ranked
             .into_iter()
             .take(limit.min(MAX_PICKER_ITEMS))
@@ -3452,6 +3501,62 @@ impl PickerRanker for SharedPickerRanker {
             })
             .collect()
     }
+}
+
+fn interactive_picker_request(
+    items: &[PickerItem],
+    query: &str,
+    deadline: Instant,
+) -> Option<PickerRequest> {
+    if query.len() > MAX_PICKER_QUERY_BYTES || Instant::now() >= deadline {
+        return None;
+    }
+    let mut shared = Vec::with_capacity(items.len().min(MAX_PICKER_ITEMS));
+    let mut retained_bytes = query.len();
+    for item in items.iter().take(MAX_PICKER_ITEMS) {
+        // Reject raw oversize before cloning; the canonical validator below then
+        // charges JSON escaping, framing and all protocol-specific bounds.
+        let text_bytes = item
+            .id
+            .len()
+            .saturating_add(item.label.len())
+            .saturating_add(item.description.len())
+            .saturating_add(item.preview.as_ref().map_or(0, String::len));
+        retained_bytes = retained_bytes
+            .saturating_add(text_bytes)
+            .saturating_add(item.value.len());
+        if text_bytes > MAX_PICKER_ITEM_TEXT_BYTES
+            || item.value.len() > MAX_PICKER_ITEM_VALUE_BYTES
+            || retained_bytes > MAX_PICKER_REQUEST_BYTES
+            || Instant::now() >= deadline
+        {
+            return None;
+        }
+        shared.push(PickItem {
+            id: item.id.clone(),
+            kind: shared_picker_kind(item.kind),
+            label: item.label.clone(),
+            description: item.description.clone(),
+            preview: item.preview.clone(),
+            value: serde_json::Value::String(item.value.clone()),
+        });
+    }
+    let mut request = PickerRequest {
+        protocol_version: PICKER_PROTOCOL_VERSION,
+        request_id: 1,
+        query: query.to_owned(),
+        items: shared,
+        limit: MAX_PICKER_ITEMS,
+        deadline_ms: u64::try_from(INTERACTIVE_PICKER_DEADLINE.as_millis()).ok()?,
+    };
+    request.validate().ok()?;
+    request.deadline_ms = u64::try_from(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis(),
+    )
+    .ok()?;
+    (request.deadline_ms > 0).then_some(request)
 }
 
 const fn shared_picker_kind(kind: PickerItemKind) -> ItemKind {
@@ -3808,21 +3913,6 @@ fn run_stdin() -> Result<i32, ShellError> {
     Ok(outcome.status_code())
 }
 
-fn print_help(catalog: &Catalog, topic: Option<&str>) {
-    if let Some(topic) = topic {
-        if let Some(command) = catalog.find(topic) {
-            print_command_help(command);
-        } else {
-            println!(
-                "No exact catalog entry for `{}`. Press Tab to explore related commands.",
-                escape_terminal_controls(topic)
-            );
-        }
-    } else {
-        print_catalog(catalog);
-    }
-}
-
 fn print_catalog(catalog: &Catalog) {
     println!("Quirl commands\n");
     for command in &catalog.commands {
@@ -3835,31 +3925,6 @@ fn print_catalog(catalog: &Catalog) {
     println!(
         "\nTab opens the IDE completion menu; `quirl catalog --format json` is the AI interface."
     );
-}
-
-fn print_command_help(command: &CommandSpec) {
-    println!(
-        "{}\n  {}\n\n{}",
-        escape_terminal_controls(&command.signature),
-        escape_terminal_controls(&command.summary),
-        escape_terminal_controls(&command.details)
-    );
-    if !command.options.is_empty() {
-        println!("\nOptions:");
-        for option in &command.options {
-            println!(
-                "  {:<20} {}",
-                escape_terminal_controls(&option.names.join(", ")),
-                escape_terminal_controls(&option.documentation)
-            );
-        }
-    }
-    if !command.examples.is_empty() {
-        println!("\nExamples:");
-        for example in &command.examples {
-            println!("  {}", escape_terminal_controls(example));
-        }
-    }
 }
 
 fn print_json_value(value: serde_json::Value) {
@@ -4036,6 +4101,57 @@ mod tests {
         };
         let matches = SharedPickerRanker.rank(&[item("remote", 0), item("local", 4_000)], "git", 2);
         assert_eq!(matches[0].index, 1);
+    }
+
+    #[test]
+    fn shared_picker_rejects_expired_or_oversized_work_without_partial_results() {
+        let item = PickerItem {
+            id: "item".to_owned(),
+            kind: PickerItemKind::History,
+            label: "git status".to_owned(),
+            description: String::new(),
+            preview: None,
+            value: "git status".to_owned(),
+            rank_bias: 0,
+        };
+        assert!(
+            SharedPickerRanker
+                .rank_until(std::slice::from_ref(&item), "git", 1, Instant::now())
+                .is_empty()
+        );
+        assert!(
+            SharedPickerRanker
+                .rank(
+                    std::slice::from_ref(&item),
+                    &"a".repeat(MAX_PICKER_QUERY_BYTES + 1),
+                    1
+                )
+                .is_empty()
+        );
+        let mut oversized = item.clone();
+        oversized.label = "x".repeat(MAX_PICKER_ITEM_TEXT_BYTES + 1);
+        assert!(
+            SharedPickerRanker
+                .rank(&[item, oversized], "git", 2)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shared_picker_applies_history_bias_before_the_result_limit() {
+        let item = |id: &str, rank_bias| PickerItem {
+            id: id.to_owned(),
+            kind: PickerItemKind::History,
+            label: "git status".to_owned(),
+            description: String::new(),
+            preview: None,
+            value: id.to_owned(),
+            rank_bias,
+        };
+        let results =
+            SharedPickerRanker.rank(&[item("a-remote", 0), item("z-local", 4_000)], "git", 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].index, 1);
     }
 
     struct DifferentialGenerator {
@@ -5452,6 +5568,22 @@ mod tests {
         .unwrap();
         let reference = reference_outcome("bash", "printf value; printf warning >&2; exit 7;");
         assert_same_outcome("bash interactive island", &native, &reference);
+    }
+
+    #[test]
+    fn finite_interactive_data_uses_tables_without_changing_retained_values() {
+        let source = r#"{"service":"api","status":"failed"} | select service"#;
+        let output = DataRuntime::new().eval_output(source).unwrap();
+        let mut rendered = Vec::new();
+        let mut stage = InteractiveDataCache::default().stage();
+        render_interactive_data_output(output, &AtomicBool::new(false), &mut rendered, &mut stage)
+            .unwrap();
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(text.contains("service"));
+        assert!(text.contains("api"));
+        assert!(text.contains('│'));
+        assert!(!text.contains(r#"{"service""#));
+        assert_eq!(stage.items.len(), 1);
     }
 
     #[test]

@@ -19,7 +19,7 @@ mod value_boundary;
 use indexmap::{IndexMap, IndexSet};
 use quirl_core::{
     DirectoryOptions, Entry, EntryKind, ErrorCode, ProcessHost, ProcessRequest, ShellError,
-    StructuredValue, directory_entries_with_options,
+    StructuredValue, directory_entries_with_options, escape_terminal_line,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -745,7 +745,8 @@ impl DataRuntime {
         validate_data_output(&output, self.limits)?;
         for transform in &expression.transforms {
             check_cancelled(cancelled)?;
-            output = apply_output_transform(output, transform, self.limits, cancelled)?;
+            output = apply_output_transform(output, transform, self.limits, cancelled)
+                .map_err(|error| transform_error(error, &transform.span))?;
             validate_data_output(&output, self.limits)?;
         }
         Ok(output)
@@ -1212,9 +1213,10 @@ fn apply_output_transform(
                 .iter()
                 .map(|field| field.value.clone())
                 .collect::<Vec<_>>();
-            Ok(DataOutput::Stream(
-                stream.map(move |row| select_fields(row, &fields, "select")),
-            ))
+            let span = transform.span.clone();
+            Ok(DataOutput::Stream(stream.map(move |row| {
+                select_fields(row, &fields, "select").map_err(|error| transform_error(error, &span))
+            })))
         }
         DataTransform::Get { path } => {
             let field = path.value.clone();
@@ -1532,11 +1534,19 @@ fn control_error_usage(error: &ShellError, limits: DataLimits) -> Result<ValueUs
 /// Reject YAML graph references before `serde_yaml_ng` can replay an anchored
 /// event subtree into an amplified materialized value. The scan recognizes
 /// reference indicators only in YAML syntax, excluding quoted scalars,
-/// comments, and indented block-scalar contents.
+/// comments, and indented block-scalar contents. Plain-scalar punctuation cannot
+/// open a shielding quote or block state, including on continuation lines.
+///
+/// Keep these coupled lexical transitions together: a false quote transition
+/// could hide a later graph reference before the deserializer's allocations.
+/// The admitted file-byte bound caps this linear scan, which retains only state.
 fn reject_yaml_references(contents: &str, path: &Path) -> Result<(), ShellError> {
     let mut block_parent_indent = None;
     let mut single_quoted = false;
     let mut double_quoted = false;
+    let mut plain_scalar_indent = None;
+    let mut plain_scalar_is_root = false;
+    let mut flow_depth = 0_usize;
     let mut offset = 0_usize;
     for line in contents.split_inclusive('\n') {
         let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
@@ -1554,6 +1564,13 @@ fn reject_yaml_references(contents: &str, path: &Path) -> Result<(), ShellError>
         }
 
         let bytes = line_without_newline.as_bytes();
+        let document_boundary = matches!(line_without_newline.trim(), "---" | "...");
+        let continues_plain_scalar = !document_boundary
+            && plain_scalar_indent.is_some_and(|parent_indent| {
+                flow_depth > 0 || indentation > parent_indent || plain_scalar_is_root
+            });
+        let mut plain_scalar = continues_plain_scalar;
+        let mut structured_line = continues_plain_scalar && !plain_scalar_is_root;
         let mut escaped = false;
         let mut index = 0_usize;
         while index < bytes.len() {
@@ -1583,11 +1600,14 @@ fn reject_yaml_references(contents: &str, path: &Path) -> Result<(), ShellError>
                 continue;
             }
             match byte {
-                b'"' => double_quoted = true,
-                b'\'' => single_quoted = true,
+                // Quotes only delimit a scalar at its start. An apostrophe or
+                // quote inside plain text must not hide later reference tokens.
+                b'"' if !plain_scalar => double_quoted = true,
+                b'\'' if !plain_scalar => single_quoted = true,
                 b'#' if yaml_indicator_boundary(bytes.get(index.wrapping_sub(1)).copied()) => break,
                 b'|' | b'>'
-                    if yaml_indicator_boundary(bytes.get(index.wrapping_sub(1)).copied()) =>
+                    if !plain_scalar
+                        && yaml_indicator_boundary(bytes.get(index.wrapping_sub(1)).copied()) =>
                 {
                     block_parent_indent = Some(indentation);
                     break;
@@ -1612,9 +1632,57 @@ fn reject_yaml_references(contents: &str, path: &Path) -> Result<(), ShellError>
                         "Expand the referenced value explicitly before opening the YAML document",
                     ));
                 }
-                _ => {}
+                b':' if bytes.get(index.saturating_add(1)).is_none_or(|next| {
+                    next.is_ascii_whitespace()
+                        || matches!(next, b'[' | b']' | b'{' | b'}' | b',')
+                        || (flow_depth > 0 && matches!(next, b'\'' | b'"'))
+                }) =>
+                {
+                    plain_scalar = false;
+                    structured_line = true;
+                }
+                b'-' | b'?'
+                    if !plain_scalar
+                        && bytes
+                            .get(index.saturating_add(1))
+                            .is_none_or(u8::is_ascii_whitespace) =>
+                {
+                    structured_line = true;
+                }
+                b'!' if !plain_scalar => {
+                    // A tag decorates the following scalar; its spelling does
+                    // not turn that scalar into plain text.
+                    while bytes.get(index.saturating_add(1)).is_some_and(|next| {
+                        !next.is_ascii_whitespace() && !matches!(next, b',' | b']' | b'}')
+                    }) {
+                        index = index.saturating_add(1);
+                    }
+                }
+                b'[' | b'{' if !plain_scalar || flow_depth > 0 => {
+                    flow_depth = flow_depth.saturating_add(1);
+                    plain_scalar = false;
+                }
+                b']' | b'}' | b',' if flow_depth > 0 => {
+                    if byte != b',' {
+                        flow_depth = flow_depth.saturating_sub(1);
+                    }
+                    plain_scalar = false;
+                }
+                byte if byte.is_ascii_whitespace() => {}
+                _ => plain_scalar = true,
             }
             index = index.saturating_add(1);
+        }
+        if document_boundary {
+            plain_scalar_indent = None;
+            plain_scalar_is_root = false;
+        } else if !line_without_newline.trim().is_empty() {
+            plain_scalar_indent = plain_scalar.then_some(
+                plain_scalar_indent
+                    .filter(|_| continues_plain_scalar)
+                    .unwrap_or(indentation),
+            );
+            plain_scalar_is_root = plain_scalar && !structured_line && flow_depth == 0;
         }
         offset = offset.saturating_add(line.len());
     }
@@ -3435,15 +3503,128 @@ fn i64_u64_order(left: i64, right: u64) -> Ordering {
     u64::try_from(left).map_or(Ordering::Less, |left| left.cmp(&right))
 }
 
+// Failure model: binary rounding can equate distinct decimal and integer values,
+// making predicates incorrect and the sort comparator inconsistent. Compare
+// borrowed decimal digits instead. Each comparison scans at most the admitted
+// text lengths, retains constant state, and never expands an exponent into zeros.
+// A signed 64-bit exponent is the explicit arithmetic boundary; malformed text
+// and exponents outside that range fail before comparison.
+struct DecimalParts<'a> {
+    mantissa: &'a str,
+    negative: bool,
+    leading_zeros: usize,
+    significant_digits: usize,
+    decimal_position: i128,
+}
+
+impl<'a> DecimalParts<'a> {
+    fn parse(source: &'a str, stage: &str) -> Result<Self, ShellError> {
+        let negative = source.starts_with('-');
+        let unsigned = source.strip_prefix('-').unwrap_or(source);
+        let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+            Some((mantissa, exponent)) => (mantissa, parse_decimal_exponent(exponent, stage)?),
+            None => (unsigned, 0),
+        };
+        let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        if integer.is_empty()
+            || !integer.bytes().all(|byte| byte.is_ascii_digit())
+            || (integer.starts_with('0') && integer.len() > 1)
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+            || (mantissa.contains('.') && fraction.is_empty())
+        {
+            return Err(data_error(stage, "decimal is not a finite JSON number"));
+        }
+        let leading_zeros = mantissa
+            .bytes()
+            .filter(|byte| *byte != b'.')
+            .take_while(|byte| *byte == b'0')
+            .count();
+        let significant_digits = integer
+            .len()
+            .saturating_add(fraction.len())
+            .saturating_sub(leading_zeros);
+        let integer_digits = i64::try_from(integer.len()).map_err(|_| {
+            resource_limit_error(
+                "decimal digits",
+                i64::MAX.try_into().unwrap_or(usize::MAX),
+                integer.len(),
+                "Use a shorter decimal value",
+            )
+        })?;
+        let leading = i64::try_from(leading_zeros).map_err(|_| {
+            resource_limit_error(
+                "decimal digits",
+                i64::MAX.try_into().unwrap_or(usize::MAX),
+                leading_zeros,
+                "Use a shorter decimal value",
+            )
+        })?;
+        Ok(Self {
+            mantissa,
+            negative: negative && significant_digits > 0,
+            leading_zeros,
+            significant_digits,
+            decimal_position: i128::from(exponent)
+                .saturating_add(i128::from(integer_digits))
+                .saturating_sub(i128::from(leading)),
+        })
+    }
+
+    fn digits(&self) -> impl Iterator<Item = u8> + '_ {
+        self.mantissa
+            .bytes()
+            .filter(|byte| *byte != b'.')
+            .skip(self.leading_zeros)
+    }
+
+    fn magnitude_order(&self, other: &Self) -> Ordering {
+        match (self.significant_digits == 0, other.significant_digits == 0) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            (false, false) => {}
+        }
+        let position = self.decimal_position.cmp(&other.decimal_position);
+        if position != Ordering::Equal {
+            return position;
+        }
+        let digits = self.significant_digits.max(other.significant_digits);
+        self.digits()
+            .chain(std::iter::repeat(b'0'))
+            .take(digits)
+            .cmp(other.digits().chain(std::iter::repeat(b'0')).take(digits))
+    }
+}
+
+fn parse_decimal_exponent(exponent: &str, stage: &str) -> Result<i64, ShellError> {
+    let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(data_error(stage, "decimal exponent is not an integer"));
+    }
+    exponent.parse::<i64>().map_err(|_| {
+        ShellError::new(
+            ErrorCode::ResourceLimit,
+            "decimal exponent exceeds its signed 64-bit limit",
+        )
+        .with_context(format!(
+            "exponent digits: {}; supported range: {}..={}",
+            digits.len(),
+            i64::MIN,
+            i64::MAX
+        ))
+        .with_help("Use a decimal exponent within the supported range")
+    })
+}
+
 fn decimal_order(left: &str, right: &str, stage: &str) -> Result<Ordering, ShellError> {
-    let left = left
-        .parse::<f64>()
-        .map_err(|_| data_error(stage, "left decimal cannot be ordered"))?;
-    let right = right
-        .parse::<f64>()
-        .map_err(|_| data_error(stage, "right decimal cannot be ordered"))?;
-    left.partial_cmp(&right)
-        .ok_or_else(|| data_error(stage, "non-finite decimals cannot be ordered"))
+    let left = DecimalParts::parse(left, stage)?;
+    let right = DecimalParts::parse(right, stage)?;
+    match (left.negative, right.negative) {
+        (true, false) => Ok(Ordering::Less),
+        (false, true) => Ok(Ordering::Greater),
+        (true, true) => Ok(left.magnitude_order(&right).reverse()),
+        (false, false) => Ok(left.magnitude_order(&right)),
+    }
 }
 
 fn decimal_integer_order(left: &str, right: i64, stage: &str) -> Result<Ordering, ShellError> {
@@ -3560,8 +3741,17 @@ fn select_fields(
     fn select(
         object: IndexMap<String, DataValue>,
         fields: &[String],
-    ) -> IndexMap<String, DataValue> {
-        fields
+        stage: &str,
+    ) -> Result<IndexMap<String, DataValue>, ShellError> {
+        // Validate the complete projection before cloning any selected values.
+        // A typo must not turn a record into a successful empty projection.
+        for field in fields {
+            if !object.contains_key(field) {
+                return Err(data_error(stage, format!("record has no field `{field}`"))
+                    .with_help(available_fields_hint(&object)));
+            }
+        }
+        Ok(fields
             .iter()
             .filter_map(|field| {
                 object
@@ -3569,15 +3759,15 @@ fn select_fields(
                     .cloned()
                     .map(|value| (field.clone(), value))
             })
-            .collect()
+            .collect())
     }
 
     match value {
-        DataValue::Record(object) => Ok(DataValue::Record(select(object, fields))),
+        DataValue::Record(object) => select(object, fields, stage).map(DataValue::Record),
         DataValue::List(values) => values
             .into_iter()
             .map(|value| match value {
-                DataValue::Record(object) => Ok(DataValue::Record(select(object, fields))),
+                DataValue::Record(object) => select(object, fields, stage).map(DataValue::Record),
                 _ => Err(data_error(stage, "select expects record rows")),
             })
             .collect::<Result<Vec<_>, _>>()
@@ -3586,6 +3776,43 @@ fn select_fields(
             stage,
             "select expects a record or list of records",
         )),
+    }
+}
+
+/// Diagnostic work is independent of record width and key length: inspect at
+/// most eight keys and 64 Unicode scalars per key, then escape that excerpt.
+fn available_fields_hint(object: &IndexMap<String, DataValue>) -> String {
+    let mut hint = String::from("Available fields: ");
+    if object.is_empty() {
+        hint.push_str("none (this record is empty)");
+        return hint;
+    }
+    for (index, key) in object.keys().take(8).enumerate() {
+        if index != 0 {
+            hint.push_str(", ");
+        }
+        let excerpt: String = key.chars().take(64).collect();
+        hint.push('`');
+        hint.push_str(&escape_terminal_line(&excerpt));
+        if excerpt.len() < key.len() {
+            hint.push('…');
+        }
+        hint.push('`');
+    }
+    if object.len() > 8 {
+        hint.push_str(", …");
+    }
+    hint.push_str(". Choose fields present in every consumed row");
+    hint
+}
+
+/// Preserve an upstream diagnostic's location when a later consumer forces a
+/// lazy pull; only failures without a location acquire this transform's span.
+fn transform_error(error: ShellError, span: &std::ops::Range<usize>) -> ShellError {
+    if error.details.labels.is_empty() {
+        error.with_label(None, span.start, span.end, "data transform failed here")
+    } else {
+        error
     }
 }
 
@@ -3897,6 +4124,133 @@ mod tests {
             runtime.eval_typed("[1,2,3] | length").unwrap(),
             DataValue::UInt(3)
         );
+    }
+
+    #[test]
+    fn decimal_predicates_and_sorts_preserve_exact_numeric_order() {
+        let runtime = DataRuntime::new();
+        for source in [
+            r#"[{"value":9007199254740993}] | where value == 9007199254740992.0"#,
+            r#"[{"value":18446744073709551615}] | where value == 18446744073709551614.0"#,
+            r#"[{"value":0.10000000000000001}] | where value == 0.1"#,
+            r#"[{"value":1e-999}] | where value == 0"#,
+        ] {
+            assert_eq!(
+                runtime.eval_typed(source).unwrap(),
+                DataValue::List(Vec::new()),
+                "{source}"
+            );
+        }
+        let sorted = runtime
+            .eval_typed(
+                r#"[{"value":9007199254740993,"name":"last"},
+                {"value":9007199254740992.0,"name":"middle"},
+                {"value":9007199254740991,"name":"first"}]
+                | sort value | select name"#,
+            )
+            .unwrap();
+        assert_eq!(
+            sorted,
+            typed(serde_json::json!([
+                {"name":"first"}, {"name":"middle"}, {"name":"last"}
+            ]))
+        );
+    }
+
+    #[test]
+    fn decimal_comparison_handles_signs_padding_and_bounded_extreme_exponents() {
+        for (left, right, expected) in [
+            ("0", "-0.000e99", Ordering::Equal),
+            ("1", "1.000e+0", Ordering::Equal),
+            ("0.00120", "12e-4", Ordering::Equal),
+            ("-0.00120", "-12e-4", Ordering::Equal),
+            ("-1.1", "-1.01", Ordering::Less),
+            ("1e-999", "0", Ordering::Greater),
+            ("-1e-999", "0", Ordering::Less),
+            (
+                "1e9223372036854775807",
+                "9e9223372036854775806",
+                Ordering::Greater,
+            ),
+            (
+                "1e-9223372036854775808",
+                "1e-9223372036854775807",
+                Ordering::Less,
+            ),
+            (
+                "10e9223372036854775807",
+                "1e9223372036854775807",
+                Ordering::Greater,
+            ),
+        ] {
+            assert_eq!(
+                decimal_order(left, right, "test").unwrap(),
+                expected,
+                "{left}, {right}"
+            );
+            assert_eq!(
+                decimal_order(right, left, "test").unwrap(),
+                expected.reverse()
+            );
+        }
+        for invalid in [
+            "", "-", "+1", "01", "1.", ".1", "1e", "1e+", "NaN", "inf", "-inf", "1.0.0", "1e1e1",
+        ] {
+            assert_eq!(
+                decimal_order(invalid, "0", "test").unwrap_err().code,
+                ErrorCode::Data,
+                "{invalid}"
+            );
+        }
+        for excessive in ["1e9223372036854775808", "1e-9223372036854775809"] {
+            let error = decimal_order(excessive, "0", "test").unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert!(!error.details.help.is_empty());
+        }
+    }
+
+    #[test]
+    fn seeded_decimal_comparison_matches_an_exact_scaled_integer_oracle() {
+        fn sample(state: &mut u64) -> (i64, u32) {
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mantissa = i64::from_le_bytes(state.to_le_bytes());
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (mantissa, u32::try_from(*state % 10).unwrap())
+        }
+        // i64 coefficients scaled by at most 10^9 fit in i128. This oracle
+        // is independent of digit normalization and exercises fixed replayable
+        // mixed-sign, fractional, and integer/decimal comparisons.
+        let seed = 0x7175_6972_6c64_6563_u64;
+        let mut state = seed;
+        for case in 0..1024 {
+            let (left, left_scale) = sample(&mut state);
+            let (right, right_scale) = sample(&mut state);
+            let scale = left_scale.max(right_scale);
+            let left_exact = i128::from(left) * 10_i128.pow(scale - left_scale);
+            let right_exact = i128::from(right) * 10_i128.pow(scale - right_scale);
+            let expected = left_exact.cmp(&right_exact);
+            let left_text = format!("{left}e-{left_scale}");
+            let right_text = format!("{right}.00e-{right_scale}");
+            assert_eq!(
+                decimal_order(&left_text, &right_text, "seeded").unwrap(),
+                expected,
+                "seed: {seed}; case: {case}; left: {left_text}; right: {right_text}"
+            );
+            assert_eq!(
+                decimal_order(&right_text, &left_text, "seeded").unwrap(),
+                expected.reverse()
+            );
+            let integer_expected =
+                i128::from(left).cmp(&(i128::from(right) * 10_i128.pow(left_scale)));
+            assert_eq!(
+                decimal_integer_order(&left_text, right, "seeded").unwrap(),
+                integer_expected
+            );
+            assert_eq!(
+                decimal_order(&left_text, &left_text, "seeded").unwrap(),
+                Ordering::Equal
+            );
+        }
     }
 
     #[test]
@@ -4316,6 +4670,68 @@ mod tests {
     }
 
     #[test]
+    fn yaml_plain_scalar_quotes_cannot_hide_following_references() {
+        // Small aliases prove admission rejects references before the YAML
+        // deserializer can materialize them, regardless of earlier plain text.
+        for plain_text in [
+            "text: isn't\n",
+            "text: an\"example\n",
+            "text: say 'hello\n",
+            "text: say \"hello\n",
+            "text: first line\n  'plain continuation\n",
+            "text: first line\n  \"plain continuation\n",
+            "text: a | symbol\n",
+            "text: a > symbol\n",
+            "text: [say 'hello, other]\n",
+            "text: [say \"hello, other]\n",
+        ] {
+            let source = format!("{plain_text}base: &base [one]\ncopy: *base\n");
+            let error = reject_yaml_references(&source, Path::new("plain.yaml")).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Data, "{plain_text:?}");
+            assert!(error.message.contains("anchor"), "{plain_text:?}");
+            let alias_source = format!("{plain_text}copy: *missing\n");
+            let error = reject_yaml_references(&alias_source, Path::new("plain.yaml")).unwrap_err();
+            assert!(error.message.contains("alias"), "{plain_text:?}");
+        }
+
+        for plain_text in ["isn't", "an\"example", "say 'hello", "say \"hello"] {
+            let file = temporary_file(
+                "yaml",
+                &format!("text: {plain_text}\nbase: &base [one]\ncopy: *base\n"),
+            );
+            let error = DataRuntime::new()
+                .eval_typed(&format!("open {}", file.path().display()))
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::Data);
+            assert!(error.message.contains("anchor"));
+        }
+    }
+
+    #[test]
+    fn yaml_reference_guard_preserves_quoted_and_block_scalar_text() {
+        for source in [
+            "text: 'isn''t &anchor *alias'\n",
+            "text: \"escaped \\\"quote &anchor *alias\"\n",
+            "text: 'first line\n  &anchor *alias'\n",
+            "text: \"first line\n  &anchor *alias\"\n",
+            "[\"&anchor *alias\", '&anchor *alias']\n",
+            "{\"text\":\"&anchor *alias\"}\n",
+            "text: |\n  &anchor *alias\n",
+            "text: >\n  &anchor *alias\n",
+            "text: isn't\nnext: '&anchor *alias'\n",
+            "text: !!str '&anchor *alias'\n",
+            "text: !!str |\n  &anchor *alias\n",
+            "-\n  '&anchor *alias'\n",
+        ] {
+            reject_yaml_references(source, Path::new("quoted.yaml")).unwrap();
+            let file = temporary_file("yaml", source);
+            DataRuntime::new()
+                .eval_typed(&format!("open {}", file.path().display()))
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn pull_pipeline_stops_before_later_invalid_csv_rows() {
         let csv = temporary_file("csv", "name,kind\napi,service\nbroken\n");
         let output = DataRuntime::new()
@@ -4533,6 +4949,130 @@ mod tests {
             render_stream_with_limit(vec![row], DataRenderFormat::Table, single_row.len() - 1)
                 .unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
+    }
+
+    #[test]
+    fn missing_selected_fields_fail_with_available_names_and_the_original_span() {
+        for input in [r#"{"name":"Ada"}"#, r#"[{"name":"Ada"},{"other":1}]"#] {
+            for projection in ["naem", "name naem"] {
+                let source = format!("{input} | select {projection}");
+                let error = DataRuntime::new().eval_typed(&source).unwrap_err();
+                assert_eq!(error.code, ErrorCode::Data);
+                assert!(error.message.contains("`naem`"));
+                assert!(
+                    error
+                        .details
+                        .help
+                        .iter()
+                        .any(|help| help.contains("Available fields: `name`"))
+                );
+                let [label] = error.details.labels.as_slice() else {
+                    panic!("expected the failed projection's location");
+                };
+                assert_eq!(
+                    source.get(label.start..label.end),
+                    Some(format!("select {projection}").as_str())
+                );
+            }
+        }
+        assert_eq!(
+            DataRuntime::new().eval_typed("[] | select absent").unwrap(),
+            DataValue::List(vec![])
+        );
+        // A later heterogeneous row cannot turn a collected projection into
+        // a successful partial result.
+        assert!(
+            DataRuntime::new()
+                .eval_typed(r#"[{"name":"Ada"},{}] | select name"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn deferred_select_errors_keep_the_projection_location_and_allow_recovery() {
+        let csv = temporary_file("csv", "name,enabled\nAda,true\nBen,false\n");
+        let runtime = DataRuntime::new();
+        let source = format!("open {} | select naem | length", csv.path().display());
+        let error = runtime.eval_typed(&source).unwrap_err();
+        let [label] = error.details.labels.as_slice() else {
+            panic!("expected the lazy projection's location");
+        };
+        assert_eq!(source.get(label.start..label.end), Some("select naem"));
+        assert!(
+            error
+                .details
+                .help
+                .iter()
+                .any(|help| help.contains("`name`, `enabled`"))
+        );
+
+        let source = format!("open {} | select name | take 1", csv.path().display());
+        let rows = runtime.eval_typed(&source).unwrap();
+        std::assert_matches!(rows, DataValue::List(rows) if rows.len() == 1);
+        // Reopening after the failed pull succeeds; no failed projection state
+        // leaks into the next evaluation.
+        let source = format!(
+            "open {} | where enabled == \"true\" | select name",
+            csv.path().display()
+        );
+        let rows = runtime.eval_typed(&source).unwrap();
+        std::assert_matches!(rows, DataValue::List(rows) if rows.len() == 1);
+    }
+
+    #[test]
+    fn a_late_projection_failure_releases_the_lazy_reader_without_a_collected_result() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(Arc::clone(&dropped));
+        let mut rows = vec![
+            DataValue::Record(IndexMap::from([("name".to_owned(), DataValue::Int(1))])),
+            DataValue::Record(IndexMap::new()),
+        ]
+        .into_iter();
+        let stream = DataStream::from_pull(
+            move |_| {
+                let _keep_reader_alive = &probe;
+                Ok(rows.next())
+            },
+            DataLimits::DEFAULT,
+        );
+        let expression =
+            syntax::parse_data_expression("[] | select name", DataSyntaxLimits::DEFAULT).unwrap();
+        let output = apply_output_transform(
+            DataOutput::Stream(stream),
+            &expression.transforms[0],
+            DataLimits::DEFAULT,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let error = output.into_envelope(&AtomicBool::new(false)).unwrap_err();
+        assert!(error.message.contains("`name`"));
+        assert!(
+            error
+                .details
+                .help
+                .iter()
+                .any(|help| help.contains("record is empty"))
+        );
+        assert!(dropped.load(AtomicOrdering::Relaxed));
+    }
+
+    #[test]
+    fn available_field_hints_bound_and_escape_untrusted_names() {
+        let object = (0..9)
+            .map(|index| {
+                (
+                    format!("{index}\n{}", "界".repeat(1000)),
+                    DataValue::Nothing,
+                )
+            })
+            .collect::<IndexMap<_, _>>();
+        let hint = available_fields_hint(&object);
+        assert!(!hint.contains('\n'));
+        assert!(hint.contains("0\\n"));
+        assert!(!hint.contains("8\\n"));
+        assert!(hint.contains(", …"));
+        assert!(hint.len() < 8 * 64 * 6 + 100);
+        assert!(available_fields_hint(&IndexMap::new()).contains("record is empty"));
     }
 
     #[test]

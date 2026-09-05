@@ -318,9 +318,11 @@ impl PickerWorker {
     /// Invalidate `cancellation.request_id` if it is still current.
     pub fn cancel(&self, cancellation: PickerCancellation) -> Result<(), ShellError> {
         cancellation.validate()?;
+        // Zero is never a submitted ID; it invalidates even u64::MAX without
+        // aliasing a future request or saturating back to the cancelled request.
         let _ = self.latest_request_id.compare_exchange(
             cancellation.request_id,
-            cancellation.request_id.saturating_add(1),
+            0,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
@@ -367,7 +369,7 @@ impl Default for PickerWorker {
 
 impl Drop for PickerWorker {
     fn drop(&mut self) {
-        self.latest_request_id.fetch_add(1, Ordering::AcqRel);
+        self.latest_request_id.store(0, Ordering::Release);
         let (lock, ready) = &*self.queue;
         let mut state = lock_recover(lock);
         state.shutdown = true;
@@ -434,7 +436,9 @@ fn unavailable_picker_worker() -> ShellError {
 
 /// Execute a request synchronously for hosts that already own a worker.
 ///
-/// The cancellation probe is checked between items. Callers must first use
+/// The cancellation probe is checked between items and terms, and every 256
+/// graphemes while preparing searchable text. Deadline expiry after sorting
+/// discards the complete result instead of publishing it late. Callers must first use
 /// [`PickerRequest::validate`]; this function assumes its size, depth, limit,
 /// and deadline invariants already hold.
 pub fn execute_request(
@@ -443,11 +447,7 @@ pub fn execute_request(
 ) -> PickerResponse {
     let started = Instant::now();
     let deadline = Duration::from_millis(request.deadline_ms);
-    let terms = request
-        .query
-        .split_whitespace()
-        .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>();
+    let terms = prepare_terms(&request.query);
     let mut matches = Vec::new();
     for (index, item) in request.items.iter().enumerate() {
         if cancelled() {
@@ -456,7 +456,21 @@ pub fn execute_request(
         if started.elapsed() >= deadline {
             return picker_response(request.request_id, PickerOutcome::DeadlineExceeded);
         }
-        if let Some((score, match_indices)) = rank_item(item, &terms) {
+        let mut interrupted = None;
+        let ranked = rank_item(item, &terms, &mut || {
+            interrupted = if cancelled() {
+                Some(PickerOutcome::Cancelled)
+            } else if started.elapsed() >= deadline {
+                Some(PickerOutcome::DeadlineExceeded)
+            } else {
+                None
+            };
+            interrupted.is_none()
+        });
+        if let Some(outcome) = interrupted {
+            return picker_response(request.request_id, outcome);
+        }
+        if let Some((score, match_indices)) = ranked {
             matches.push(PickMatch {
                 index,
                 score,
@@ -470,23 +484,33 @@ pub fn execute_request(
     if started.elapsed() >= deadline {
         return picker_response(request.request_id, PickerOutcome::DeadlineExceeded);
     }
+    sort_matches(&request.items, &mut matches);
+    if cancelled() {
+        return picker_response(request.request_id, PickerOutcome::Cancelled);
+    }
+    if started.elapsed() >= deadline {
+        return picker_response(request.request_id, PickerOutcome::DeadlineExceeded);
+    }
+    matches.truncate(request.limit);
+    picker_response(request.request_id, PickerOutcome::Ready { matches })
+}
+
+fn sort_matches(items: &[PickItem], matches: &mut [PickMatch]) {
     matches.sort_by(|left, right| {
         right
             .score
             .cmp(&left.score)
             .then_with(|| {
-                let left_label = request.items.get(left.index).map(|item| &item.label);
-                let right_label = request.items.get(right.index).map(|item| &item.label);
+                let left_label = items.get(left.index).map(|item| &item.label);
+                let right_label = items.get(right.index).map(|item| &item.label);
                 left_label.cmp(&right_label)
             })
             .then_with(|| {
-                let left_id = request.items.get(left.index).map(|item| &item.id);
-                let right_id = request.items.get(right.index).map(|item| &item.id);
+                let left_id = items.get(left.index).map(|item| &item.id);
+                let right_id = items.get(right.index).map(|item| &item.id);
                 left_id.cmp(&right_id)
             })
     });
-    matches.truncate(request.limit);
-    picker_response(request.request_id, PickerOutcome::Ready { matches })
 }
 
 fn picker_response(request_id: u64, outcome: PickerOutcome) -> PickerResponse {
@@ -571,40 +595,29 @@ pub struct Picker;
 
 impl Picker {
     /// Rank items deterministically. Space-separated terms are ANDed, a leading `'`
-    /// requests an exact substring, and `!` excludes matching items.
+    /// requests an exact substring, and `!` excludes matching items. Contiguous
+    /// primary-label matches rank ahead of description matches; label prefixes
+    /// rank ahead of interior substrings. Description length does not reduce
+    /// these primary-match scores. Empty queries retain zero scores for callers
+    /// that apply explicit domain preferences, such as local-history bias.
     ///
     /// This synchronous helper does not apply [`PickerRequest`] resource bounds
     /// or cancellation; use it only with inputs already bounded by the caller.
     pub fn rank(&self, items: &[PickItem], query: &str) -> Vec<PickMatch> {
-        let terms = query
-            .split_whitespace()
-            .filter(|term| !term.is_empty())
-            .collect::<Vec<_>>();
+        let terms = prepare_terms(query);
         let mut matches = items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| rank_item(item, &terms).map(|rank| (index, rank)))
+            .filter_map(|(index, item)| {
+                rank_item(item, &terms, &mut || true).map(|rank| (index, rank))
+            })
             .map(|(index, (score, match_indices))| PickMatch {
                 index,
                 score,
                 match_indices,
             })
             .collect::<Vec<_>>();
-        matches.sort_by(|left, right| {
-            right
-                .score
-                .cmp(&left.score)
-                .then_with(|| {
-                    let left_label = items.get(left.index).map(|item| &item.label);
-                    let right_label = items.get(right.index).map(|item| &item.label);
-                    left_label.cmp(&right_label)
-                })
-                .then_with(|| {
-                    let left_id = items.get(left.index).map(|item| &item.id);
-                    let right_id = items.get(right.index).map(|item| &item.id);
-                    left_id.cmp(&right_id)
-                })
-        });
+        sort_matches(items, &mut matches);
         matches
     }
 
@@ -625,40 +638,79 @@ impl Picker {
     }
 }
 
-fn rank_item(item: &PickItem, terms: &[&str]) -> Option<(i32, Vec<usize>)> {
-    let label_graphemes = item.label.graphemes(true).count();
+struct QueryTerm {
+    inverse: bool,
+    exact: bool,
+    value: String,
+}
+
+fn prepare_terms(query: &str) -> Vec<QueryTerm> {
+    query
+        .split_whitespace()
+        .filter_map(|raw_term| {
+            let (inverse, term) = raw_term
+                .strip_prefix('!')
+                .map_or((false, raw_term), |term| (true, term));
+            let (exact, term) = term
+                .strip_prefix('\'')
+                .map_or((false, term), |term| (true, term));
+            (!term.is_empty()).then(|| QueryTerm {
+                inverse,
+                exact,
+                value: term.to_lowercase(),
+            })
+        })
+        .collect()
+}
+
+fn rank_item(
+    item: &PickItem,
+    terms: &[QueryTerm],
+    continue_ranking: &mut impl FnMut() -> bool,
+) -> Option<(i32, Vec<usize>)> {
+    // Opening an empty picker needs no Unicode mapping or candidate copies.
+    if terms.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    let label_graphemes = if item.label.is_ascii() {
+        item.label.len().saturating_sub(
+            item.label
+                .as_bytes()
+                .windows(2)
+                .filter(|pair| *pair == b"\r\n")
+                .count(),
+        )
+    } else {
+        item.label.graphemes(true).count()
+    };
     let searchable = if item.description.is_empty() {
         item.label.clone()
     } else {
         format!("{} {}", item.label, item.description)
     };
-    let searchable = FoldedText::new(&searchable);
+    let searchable = FoldedText::new(&searchable, continue_ranking)?;
     let mut score: i32 = 0;
     let mut primary_indices = Vec::new();
-    for raw_term in terms {
-        let (inverse, term) = raw_term
-            .strip_prefix('!')
-            .map_or((false, *raw_term), |term| (true, term));
-        let (exact, term) = term
-            .strip_prefix('\'')
-            .map_or((false, term), |term| (true, term));
-        if term.is_empty() {
-            continue;
+    for term in terms {
+        if !continue_ranking() {
+            return None;
         }
-        let term = term.to_lowercase();
-        let matched = if exact {
-            searchable.value.find(&term).map(|start| {
+        let primary = primary_substring_match(term, &searchable, label_graphemes);
+        let matched = if primary.is_some() {
+            primary
+        } else if term.exact {
+            searchable.value.find(&term.value).map(|start| {
                 (
                     20_000_i32.saturating_sub(
                         i32::try_from(searchable.grapheme_at(start)).unwrap_or(i32::MAX),
                     ),
-                    searchable.indices_for(start, start.saturating_add(term.len())),
+                    searchable.indices_for(start, start.saturating_add(term.value.len())),
                 )
             })
         } else {
-            fuzzy_match(&term, &searchable)
+            fuzzy_match(&term.value, &searchable)
         };
-        if inverse {
+        if term.inverse {
             if matched.is_some() {
                 return None;
             }
@@ -673,6 +725,34 @@ fn rank_item(item: &PickItem, terms: &[&str]) -> Option<(i32, Vec<usize>)> {
     Some((score, primary_indices))
 }
 
+/// Contiguous names must not lose to scattered letters in short descriptions.
+/// Reuse the folded candidate and its byte mapping; no second candidate copy
+/// or Unicode fold is needed. Penalties stay below the gap between score tiers.
+fn primary_substring_match(
+    term: &QueryTerm,
+    candidate: &FoldedText,
+    label_graphemes: usize,
+) -> Option<(i32, Vec<usize>)> {
+    let start = candidate.value.find(&term.value)?;
+    let end = start.saturating_add(term.value.len());
+    if candidate.grapheme_at(end.saturating_sub(1)) >= label_graphemes {
+        return None;
+    }
+    let prefix = start == 0;
+    let base: i32 = match (term.exact, prefix) {
+        (true, true) => 40_000,
+        (true, false) => 30_000,
+        (false, true) => 10_000,
+        (false, false) => 5_000,
+    };
+    let offset = i32::try_from(candidate.grapheme_at(start).min(1_000)).unwrap_or(1_000);
+    let length = i32::try_from(label_graphemes.min(1_000)).unwrap_or(1_000);
+    Some((
+        base.saturating_sub(offset).saturating_sub(length),
+        candidate.indices_for(start, end),
+    ))
+}
+
 struct FoldedText {
     value: String,
     grapheme_by_byte: Vec<usize>,
@@ -680,21 +760,57 @@ struct FoldedText {
 }
 
 impl FoldedText {
-    fn new(value: &str) -> Self {
-        let mut folded = String::new();
-        let mut grapheme_by_byte = Vec::new();
+    fn new(value: &str, continue_ranking: &mut impl FnMut() -> bool) -> Option<Self> {
+        if value.is_ascii() {
+            return Self::ascii(value, continue_ranking);
+        }
+        let mut folded = String::with_capacity(value.len());
+        let mut grapheme_by_byte = Vec::with_capacity(value.len());
         let mut grapheme_count = 0;
         for (index, grapheme) in value.graphemes(true).enumerate() {
-            let lowercase = grapheme.to_lowercase();
-            folded.push_str(&lowercase);
-            grapheme_by_byte.extend(std::iter::repeat_n(index, lowercase.len()));
+            if index.is_multiple_of(256) && !continue_ranking() {
+                return None;
+            }
+            // Lowercase each scalar without allocating one String per grapheme.
+            // Expansions keep all resulting bytes mapped to the original grapheme.
+            for character in grapheme.chars().flat_map(char::to_lowercase) {
+                folded.push(character);
+                grapheme_by_byte.extend(std::iter::repeat_n(index, character.len_utf8()));
+            }
             grapheme_count = index.saturating_add(1);
         }
-        Self {
+        Some(Self {
             value: folded,
             grapheme_by_byte,
             grapheme_count,
+        })
+    }
+
+    fn ascii(value: &str, continue_ranking: &mut impl FnMut() -> bool) -> Option<Self> {
+        let mut grapheme_by_byte = Vec::with_capacity(value.len());
+        let mut grapheme_count = 0_usize;
+        let mut previous_carriage_return = false;
+        for (offset, byte) in value.bytes().enumerate() {
+            if offset.is_multiple_of(256) && !continue_ranking() {
+                return None;
+            }
+            // CRLF is the only multi-byte grapheme in ASCII. Keep its two
+            // bytes attached to one index, matching Unicode segmentation.
+            let index = if byte == b'\n' && previous_carriage_return {
+                grapheme_count.saturating_sub(1)
+            } else {
+                let index = grapheme_count;
+                grapheme_count = grapheme_count.saturating_add(1);
+                index
+            };
+            grapheme_by_byte.push(index);
+            previous_carriage_return = byte == b'\r';
         }
+        Some(Self {
+            value: value.to_ascii_lowercase(),
+            grapheme_by_byte,
+            grapheme_count,
+        })
     }
 
     fn grapheme_at(&self, byte_index: usize) -> usize {
@@ -812,6 +928,56 @@ mod tests {
     }
 
     #[test]
+    fn command_name_substrings_outrank_fuzzy_description_matches() {
+        let mut cd = item("cd", ItemKind::Action, "cd");
+        cd.description = "Change the shell working directory".to_owned();
+        let mut doctor = item("doctor", ItemKind::Action, "quirl config doctor");
+        doctor.description = "Diagnose configuration schema and editability".to_owned();
+        let ranked = Picker.rank(&[cd, doctor], "doctor");
+        assert_eq!(ranked[0].index, 1);
+        assert_eq!(ranked[0].match_indices, [13, 14, 15, 16, 17, 18]);
+        assert_eq!(ranked[1].index, 0);
+        assert!(ranked[1].match_indices.is_empty());
+    }
+
+    #[test]
+    fn primary_substrings_rank_before_description_exact_matches_without_losing_exclusions() {
+        let mut described = item("description", ItemKind::Action, "a");
+        described.description = "doctor".to_owned();
+        let mut primary = item("primary", ItemKind::Action, "quirl config doctor");
+        primary.description = "detailed documentation ".repeat(400);
+        let prefix = item("prefix", ItemKind::Action, "doctor");
+        let items = [described, primary, prefix];
+        for query in ["doctor", "'doctor"] {
+            let ranked = Picker.rank(&items, query);
+            assert_eq!(
+                ranked
+                    .iter()
+                    .map(|matched| matched.index)
+                    .collect::<Vec<_>>(),
+                [2, 1, 0]
+            );
+        }
+        assert!(Picker.rank(&items, "!doctor").is_empty());
+        let ranked = Picker.rank(&items, "doctor !documentation");
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|matched| matched.index)
+                .collect::<Vec<_>>(),
+            [2, 0]
+        );
+        // Empty queries still delegate preference to deterministic ties and
+        // the caller's explicit history bias; descriptions add no score.
+        assert!(
+            Picker
+                .rank(&items, "")
+                .iter()
+                .all(|matched| matched.score == 0)
+        );
+    }
+
+    #[test]
     fn description_matches_do_not_claim_indices_in_the_display_label() {
         let mut described = item("1", ItemKind::File, "alpha");
         described.description = "unique description".to_owned();
@@ -905,6 +1071,65 @@ mod tests {
         });
         assert_eq!(response.request_id, 5);
         assert_eq!(response.outcome, PickerOutcome::Cancelled);
+    }
+
+    #[test]
+    fn ascii_fast_path_preserves_crlf_and_control_grapheme_indices() {
+        let value = "A\r\nB\n\r\tC";
+        let folded = FoldedText::new(value, &mut || true).unwrap();
+        assert_eq!(folded.value, value.to_lowercase());
+        assert_eq!(folded.grapheme_count, value.graphemes(true).count());
+        for (index, (offset, grapheme)) in value.grapheme_indices(true).enumerate() {
+            for byte in offset..offset + grapheme.len() {
+                assert_eq!(folded.grapheme_at(byte), index);
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_is_observed_inside_one_large_multiterm_item() {
+        let mut request = request(1, vec![item("large", ItemKind::File, &"a".repeat(16_000))]);
+        request.query = "!z ".repeat(1365);
+        request.validate().unwrap();
+        let mut probes = 0;
+        let response = execute_request(&request, || {
+            probes += 1;
+            probes > 3
+        });
+        assert_eq!(response.outcome, PickerOutcome::Cancelled);
+        assert_eq!(probes, 4);
+    }
+
+    #[test]
+    fn one_large_multiterm_item_cannot_monopolize_a_short_deadline() {
+        let mut request = request(1, vec![item("large", ItemKind::File, &"a".repeat(16_000))]);
+        request.query = "!z ".repeat(1365);
+        request.deadline_ms = 1;
+        request.validate().unwrap();
+        let started = Instant::now();
+        let response = execute_request(&request, || false);
+        assert_eq!(response.outcome, PickerOutcome::DeadlineExceeded);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn maximum_request_id_can_be_cancelled_without_becoming_current_again() {
+        let mut worker = PickerWorker::new();
+        worker
+            .submit(request(
+                u64::MAX,
+                vec![item("last", ItemKind::File, "last")],
+            ))
+            .unwrap();
+        worker
+            .cancel(PickerCancellation {
+                protocol_version: PICKER_PROTOCOL_VERSION,
+                request_id: u64::MAX,
+            })
+            .unwrap();
+        assert_eq!(worker.latest_request_id.load(Ordering::Acquire), 0);
+        assert!(worker.try_recv_latest().is_none());
+        assert!(worker.submit(request(u64::MAX, Vec::new())).is_err());
     }
 
     #[test]

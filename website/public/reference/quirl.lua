@@ -156,7 +156,7 @@ quirl = {}
 ---@return string
 function quirl.cwd() end
 
----Run a command through the composed bounded native process host.
+---Run a command through the composed bounded native process host. Deadline-controlled Unix calls reject FIFO redirections and bound final pipe draining; use native pipes or regular files.
 ---@param command string
 ---@return quirl.ProcessResult
 function quirl.process.run(command) end

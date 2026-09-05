@@ -4,6 +4,10 @@
 //! The server deliberately consumes the same generated host API and command
 //! catalog as the CLI. It speaks the LSP JSON-RPC subset over standard
 //! `Content-Length` framing and never evaluates document text.
+//!
+//! Full document synchronization is transactional: invalid, incremental, or
+//! stale changes preserve the previous text, version, and retained-byte count.
+//! Validation and diagnostics finish before a replacement becomes visible.
 
 #![cfg_attr(
     test,
@@ -249,7 +253,7 @@ impl LanguageService {
             retained_bytes_after_replace(self.retained_document_bytes, old_bytes, candidate_bytes)?;
         let document = Document {
             language_id: language_id.to_owned(),
-            version: item.get("version").and_then(Value::as_i64).unwrap_or(0),
+            version: document_version(item)?,
             text: text.to_owned(),
         };
         let diagnostics = diagnostics(uri, &document, self.native_analyzer)?;
@@ -267,7 +271,7 @@ impl LanguageService {
         let item = field(params, "textDocument")?;
         let uri = string_field(item, "uri")?;
         validate_byte_limit("document URI", uri.len(), MAX_URI_BYTES)?;
-        let version = item.get("version").and_then(Value::as_i64).unwrap_or(0);
+        let version = document_version(item)?;
         let changes = params
             .get("contentChanges")
             .and_then(Value::as_array)
@@ -278,9 +282,16 @@ impl LanguageService {
             ));
         }
         validate_count_limit("content change count", changes.len(), MAX_CONTENT_CHANGES)?;
-        let text = changes
-            .last()
-            .and_then(|change| change.get("text"))
+        let change = changes.last().ok_or_else(|| {
+            invalid_params("didChange requires one full contentChanges text value")
+        })?;
+        if change.get("range").is_some() || change.get("rangeLength").is_some() {
+            return Err(invalid_params(
+                "didChange requires full document text without range or rangeLength",
+            ));
+        }
+        let text = change
+            .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_params("didChange requires a full contentChanges text value"))?;
         validate_byte_limit("document text", text.len(), MAX_DOCUMENT_BYTES)?;
@@ -288,6 +299,11 @@ impl LanguageService {
             .documents
             .get(uri)
             .ok_or_else(|| invalid_params("didChange refers to a document that is not open"))?;
+        if version <= previous.version {
+            return Err(invalid_params(
+                "didChange version must increase beyond the open document version",
+            ));
+        }
         let old_bytes = retained_bytes(uri, &previous.language_id, &previous.text)?;
         let candidate_bytes = retained_bytes(uri, &previous.language_id, text)?;
         let next_retained_bytes =
@@ -1243,6 +1259,12 @@ fn document_uri(params: &Value) -> Result<&str, ShellError> {
     let uri = string_field(field(params, "textDocument")?, "uri")?;
     validate_byte_limit("document URI", uri.len(), MAX_URI_BYTES)?;
     Ok(uri)
+}
+
+fn document_version(item: &Value) -> Result<i64, ShellError> {
+    item.get("version")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| invalid_params("document version must be an integer"))
 }
 
 fn invalid_params(message: &str) -> ShellError {
@@ -2205,6 +2227,50 @@ mod tests {
             .unwrap();
         assert_eq!(service.documents[uri].version, 4);
         assert_eq!(service.documents[uri].text, "echo new");
+        assert_accounting(&service);
+    }
+
+    #[test]
+    fn incremental_and_stale_changes_preserve_the_last_full_document() {
+        let mut service = LanguageService::default();
+        let uri = "file:///atomic-change.qrl";
+        service
+            .did_open(&open_params(uri, "quirl", 2, "echo original"))
+            .unwrap();
+        let before_bytes = service.retained_document_bytes;
+        for params in [
+            change_params(
+                uri,
+                3,
+                vec![json!({"text": "replacement", "range": {
+                    "start": {"line": 0, "character": 5}, "end": {"line": 0, "character": 13}
+                }})],
+            ),
+            change_params(
+                uri,
+                3,
+                vec![json!({"text": "replacement", "rangeLength": 8})],
+            ),
+            change_params(uri, 2, vec![json!({"text": "duplicate"})]),
+            change_params(uri, 1, vec![json!({"text": "stale"})]),
+            json!({"textDocument": {"uri": uri}, "contentChanges": [{"text": "unversioned"}]}),
+        ] {
+            let error = service.did_change(&params).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+            assert!(!error.details.help.is_empty());
+            assert_eq!(service.documents[uri].text, "echo original");
+            assert_eq!(service.documents[uri].version, 2);
+            assert_eq!(service.retained_document_bytes, before_bytes);
+        }
+        service
+            .did_change(&change_params(
+                uri,
+                4,
+                vec![json!({"text": "echo recovered"})],
+            ))
+            .unwrap();
+        assert_eq!(service.documents[uri].text, "echo recovered");
+        assert_eq!(service.documents[uri].version, 4);
         assert_accounting(&service);
     }
 

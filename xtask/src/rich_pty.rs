@@ -1,5 +1,15 @@
 //! End-to-end rich-terminal checks driven by the Rust PTY harness.
 
+mod clipboard;
+mod resize_input;
+mod soak_gallery;
+mod sustained;
+mod text_input;
+mod usability;
+
+pub(crate) mod soak;
+pub(crate) mod zero_poll;
+
 use crate::{
     TaskError,
     pty::{PtySession, SpawnOptions, VirtualScreen, default_timeout, key},
@@ -8,10 +18,9 @@ use nix::{
     errno::Errno,
     sys::{
         signal::{Signal, kill},
-        stat::Mode,
         termios::LocalFlags,
     },
-    unistd::{Pid, mkfifo},
+    unistd::Pid,
 };
 use std::{
     collections::BTreeMap,
@@ -42,7 +51,19 @@ const CHECK_NAMES: &[&str] = &[
     "completion",
     "interactive-runtime",
     "cwd-history",
+    "restart-history",
+    "multiline-paste-admission",
+    "paste-control-isolation",
+    "oversized-paste-admission",
+    "unicode-committed-text",
+    "keyboard-clipboard-protocol",
+    "terminal-input-limits",
+    "vi-repeat-admission",
+    "sustained-session",
+    "resize-input",
     "retained-output-cycles",
+    "first-session-help-and-data",
+    "discovery-preserves-command-intent",
     "external-command-compatibility",
     "streamed-progress-without-newline",
     "spinner-animates-during-silent-command",
@@ -72,6 +93,7 @@ struct SessionOptions {
     surface: Option<&'static str>,
     shell: Option<PathBuf>,
     symbols: Option<&'static str>,
+    keymap: Option<&'static str>,
     semantic_hints: Option<bool>,
     no_color: bool,
     catalog_gate: bool,
@@ -90,6 +112,7 @@ struct SessionOptions {
 
 struct Session {
     pty: PtySession,
+    spawn: SpawnOptions,
     private: TempDirectory,
     catalog_gate: PathBuf,
     catalog_gate_reached: PathBuf,
@@ -106,6 +129,7 @@ impl Session {
         create_private_directory(&temporary_dir)?;
         let semantic_hints = options.semantic_hints.unwrap_or(true);
         let symbols = options.symbols.unwrap_or("plain");
+        let keymap = options.keymap.unwrap_or("emacs");
         let surface = options.surface.unwrap_or("rich");
         fs::write(
             config_dir.join("config.lua"),
@@ -113,7 +137,7 @@ impl Session {
                 r#"---@type quirl.Config
 return quirl.config {{
   schema_version = 3,
-  editor = {{ keymap = "emacs", semantic_hints = {semantic_hints}, banner = "none" }},
+  editor = {{ keymap = "{keymap}", semantic_hints = {semantic_hints}, banner = "none" }},
   picker = {{ layout = "adaptive", preview = true }},
   prompt = {{
     symbols = "{symbols}",
@@ -291,9 +315,10 @@ return quirl.config {{
         spawn.rows = options.rows.unwrap_or(30);
         spawn.columns = options.columns.unwrap_or(120);
         spawn.stderr_path = options.redirect_stderr.then(|| private.path.join("stderr"));
-        let pty = PtySession::spawn(spawn)?;
+        let pty = PtySession::spawn(spawn.clone())?;
         Ok(Self {
             pty,
+            spawn,
             private,
             catalog_gate,
             catalog_gate_reached,
@@ -441,6 +466,16 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
         }
     }
 
+    // All fixed checks execute one admitted snapshot even if another worker
+    // rebuilds the source binary while this suite is running.
+    let pinned = crate::simulation::PinnedExecutable::create(binary, 0x5054_5943_4845_434b)?;
+    println!(
+        "rich PTY binary: sha256={} bytes={} source={}",
+        pinned.sha256(),
+        pinned.byte_size(),
+        pinned.source().display()
+    );
+    let binary = pinned.path();
     for check in checks() {
         if !selected.is_empty() && !selected.iter().any(|name| name == check.name) {
             continue;
@@ -451,7 +486,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 24] {
+fn checks() -> [CheckCase; 36] {
     [
         CheckCase {
             name: "rich-editing",
@@ -494,8 +529,56 @@ fn checks() -> [CheckCase; 24] {
             run: check_cwd_history,
         },
         CheckCase {
+            name: "restart-history",
+            run: usability::check_restart_history,
+        },
+        CheckCase {
+            name: "multiline-paste-admission",
+            run: usability::check_multiline_paste_admission,
+        },
+        CheckCase {
+            name: "paste-control-isolation",
+            run: text_input::check_paste_control_isolation,
+        },
+        CheckCase {
+            name: "oversized-paste-admission",
+            run: text_input::check_oversized_paste_admission,
+        },
+        CheckCase {
+            name: "unicode-committed-text",
+            run: text_input::check_unicode_committed_text,
+        },
+        CheckCase {
+            name: "keyboard-clipboard-protocol",
+            run: clipboard::check_clipboard_protocol,
+        },
+        CheckCase {
+            name: "terminal-input-limits",
+            run: text_input::check_terminal_input_limits,
+        },
+        CheckCase {
+            name: "vi-repeat-admission",
+            run: text_input::check_vi_repeat_admission,
+        },
+        CheckCase {
+            name: "sustained-session",
+            run: sustained::check_sustained_session,
+        },
+        CheckCase {
+            name: "resize-input",
+            run: resize_input::check_resize_input,
+        },
+        CheckCase {
             name: "retained-output-cycles",
             run: check_retained_output_cycles,
+        },
+        CheckCase {
+            name: "first-session-help-and-data",
+            run: check_first_session_help_and_data,
+        },
+        CheckCase {
+            name: "discovery-preserves-command-intent",
+            run: check_discovery_preserves_command_intent,
         },
         CheckCase {
             name: "external-command-compatibility",
@@ -563,6 +646,9 @@ fn enter_and_wait(
 }
 
 fn wait_for_rich_input_since(session: &mut Session, start: usize) -> Result<(), TaskError> {
+    // A rendered output/footer can precede the next editor's terminal lease.
+    // Require its fresh mouse-mode enable before sending more input; screen
+    // echo or an earlier prompt must not make a command look completed.
     session
         .pty
         .wait_for_since(b"\x1b[?1000h", start, default_timeout())?;
@@ -582,6 +668,7 @@ fn execute_and_resume(session: &mut Session, command: &str) -> Result<(), TaskEr
                 && text.contains("── exit ")
                 && screen.bottom_line().contains("NORMAL")
         })?;
+    wait_for_rich_input_since(session, output_start)?;
     ensure_alternate_screen_unchanged(session, output_start, "completed command")
 }
 
@@ -601,7 +688,12 @@ fn execute_and_resume_with_marker(
     })?;
     session.pty.wait_for_screen(
         &format!("command marker {marker:?} in persistent viewport"),
-        |screen| screen.text().contains(marker) && screen.bottom_line().contains("NORMAL"),
+        |screen| {
+            screen.lines().iter().any(|line| {
+                let line = line.trim_start();
+                !line.starts_with(['❯', '>', '∙']) && line.contains(marker)
+            }) && screen.bottom_line().contains("NORMAL")
+        },
     )?;
     session
         .pty
@@ -662,6 +754,163 @@ fn wait_for_terminal_owner(session: &mut Session) -> Result<(), TaskError> {
     Ok(())
 }
 
+fn check_discovery_preserves_command_intent(binary: &Path) -> Result<(), TaskError> {
+    let mut session = Session::new(binary, SessionOptions::default())?;
+    fs::write(
+        session.private.path.join("quarterly report;$notes.txt"),
+        b"PICKED_EXACT_FILE\n",
+    )?;
+    fs::write(
+        session.private.path.join("-n"),
+        b"PICKED_OPTION_LIKE_FILE\n",
+    )?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    session.pty.type_text("git st")?;
+    session.pty.send(b"\t")?;
+    session.pty.wait_for_screen_text("git status [--short]")?;
+    session.pty.send(b"\x1b[B\x1b[A")?;
+    session.pty.drain_for(Duration::from_millis(100))?;
+    session
+        .pty
+        .wait_for_screen("Up stays in explicit completion", |screen| {
+            screen.text().contains("git status [--short]")
+                && !screen.text().contains("history picker")
+        })?;
+    session.pty.send(key::CTRL_C)?;
+    session.pty.wait_for(b"^C")?;
+    session.pty.type_text("git status | quirl data")?;
+    session.pty.send(b"\x1bOP")?;
+    session
+        .pty
+        .wait_for_screen("help follows the pipeline stage at the cursor", |screen| {
+            let text = screen.text();
+            text.contains("> quirl data") && text.contains("Sources are")
+        })?;
+    session.pty.send(key::ESCAPE)?;
+    session.pty.drain_for(Duration::from_millis(100))?;
+    session
+        .pty
+        .wait_for_screen_text("git status | quirl data")?;
+    session.pty.send(key::CTRL_C)?;
+    session.pty.drain_for(Duration::from_millis(100))?;
+    pick_file_and_read(
+        &mut session,
+        "quarterly",
+        "quarterly report;$notes.txt",
+        r"> cat quarterly\ report\;\$notes.txt",
+        "PICKED_EXACT_FILE",
+    )?;
+    pick_file_and_read(
+        &mut session,
+        "-n",
+        "-n",
+        "> cat ./-n",
+        "PICKED_OPTION_LIKE_FILE",
+    )?;
+    let cleanup_start = session.pty.output().len();
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "command discovery",
+    )?;
+    ensure_terminal_restored(&session, cleanup_start, "command discovery")
+}
+
+fn pick_file_and_read(
+    session: &mut Session,
+    query: &str,
+    filename: &str,
+    expected_editor: &str,
+    marker: &str,
+) -> Result<(), TaskError> {
+    session.pty.type_text("cat ")?;
+    session.pty.send(key::ALT_Q)?;
+    session.pty.send(b"f")?;
+    session.pty.wait_for_screen_text("picker")?;
+    session.pty.type_text(query)?;
+    session.pty.wait_for_screen_text(filename)?;
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("picked file inserted into editor", |screen| {
+            screen
+                .lines()
+                .iter()
+                .any(|line| line.trim() == expected_editor)
+                && !screen.text().contains("picker")
+        })?;
+    let execution_start = session.pty.output().len();
+    session.pty.send(key::ENTER)?;
+    session.pty.wait_for_screen_text(marker)?;
+    wait_for_rich_input_since(session, execution_start)?;
+    Ok(())
+}
+
+fn check_first_session_help_and_data(binary: &Path) -> Result<(), TaskError> {
+    let mut session = Session::new(
+        binary,
+        SessionOptions {
+            rows: Some(40),
+            ..SessionOptions::default()
+        },
+    )?;
+    session.pty.wait_for(STARTUP_MARKER)?;
+    execute_and_resume_with_marker(
+        &mut session,
+        &format!("help {}", "x".repeat(257)),
+        b"help topic is too long",
+    )?;
+    execute_and_resume_with_marker(
+        &mut session,
+        "help mode",
+        b"Switch the visible interactive grammar",
+    )?;
+    // Repainting must recover help from retained state, not stale terminal bytes.
+    session.pty.send(key::CTRL_L)?;
+    session
+        .pty
+        .wait_for_screen_text("Switch the visible interactive grammar")?;
+    execute_and_resume_with_marker(&mut session, "help", b"Getting started with Quirl")?;
+    session.pty.type_text("mode data")?;
+    let data_mode_start = session.pty.output().len();
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("textual Data-mode entry", |screen| {
+            screen.bottom_line().contains("DATA")
+        })?;
+    wait_for_rich_input_since(&mut session, data_mode_start)?;
+    session.pty.type_text(r#"[{"service":"api","status":"failed"},{"service":"web","status":"healthy"}] | where status == "failed" | select service"#)?;
+    let result_start = session.pty.output().len();
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("first typed result", |screen| {
+            let text = screen.text();
+            screen.bottom_line().contains("DATA")
+                && text
+                    .lines()
+                    .any(|line| line.trim().starts_with(r#"{"service":"api"}"#))
+        })?;
+    wait_for_rich_input_since(&mut session, result_start)?;
+    session.pty.type_text("mode normal")?;
+    let normal_mode_start = session.pty.output().len();
+    session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("textual Normal-mode return", |screen| {
+            screen.bottom_line().contains("NORMAL")
+        })?;
+    wait_for_rich_input_since(&mut session, normal_mode_start)?;
+    let cleanup_start = session.pty.output().len();
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "first session",
+    )?;
+    ensure_terminal_restored(&session, cleanup_start, "first session")
+}
+
 fn check_rich_editing(binary: &Path) -> Result<(), TaskError> {
     let mut session = Session::new(binary, SessionOptions::default())?;
     session.pty.wait_for(STARTUP_MARKER)?;
@@ -673,8 +922,6 @@ fn check_rich_editing(binary: &Path) -> Result<(), TaskError> {
     session.pty.type_text("/usr/bin/printf DELETE_XOK")?;
     session.pty.send(b"\x1b[D\x1b[D\x1b[D\x1b[3~")?;
     let delete_start = session.pty.output().len();
-    session.pty.send(key::ENTER)?;
-    session.pty.drain_for(Duration::from_millis(100))?;
     session.pty.send(key::ENTER)?;
     session.pty.wait_for_screen_text("DELETE_OK")?;
     wait_for_rich_input_since(&mut session, delete_start)?;
@@ -725,24 +972,35 @@ fn check_rich_editing(binary: &Path) -> Result<(), TaskError> {
         })?;
     session.pty.type_text("/usr/bin/printf 'MULTI_ONE")?;
     session.pty.send(key::ENTER)?;
-    session.pty.drain_for(Duration::from_millis(200))?;
+    session
+        .pty
+        .wait_for_screen("incomplete quote continues editing", |screen| {
+            screen.text().contains("MULTI_ONE")
+                && screen.lines().iter().any(|line| line.trim() == ".")
+        })?;
     session.pty.type_text("_TWO'")?;
+    let multiline_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session
         .pty
         .wait_for_screen("captured multiline output", |screen| {
-            let text = screen.text();
-            text.contains("MULTI_ONE") && text.contains("_TWO")
+            screen.lines().iter().any(|line| line.trim() == "MULTI_ONE")
+                && screen.lines().iter().any(|line| line.trim() == "_TWO")
         })?;
+    wait_for_rich_input_since(&mut session, multiline_start)?;
     execute_and_resume_with_marker(
         &mut session,
         "/bin/sh -c 'printf STDOUT_OK; printf STDERR_OK >&2'",
         b"STDERR_OK",
     )?;
-    if !contains(session.pty.output(), b"STDOUT_OK") {
-        return Err(
-            io::Error::other("interactive command stdout was not handed back to the PTY").into(),
-        );
+    if !session.pty.screen().lines().iter().any(|line| {
+        let line = line.trim_start();
+        !line.starts_with(['❯', '>', '∙', '.']) && line.contains("STDOUT_OK")
+    }) {
+        return Err(screen_error(
+            "interactive command stdout was not handed back to the PTY",
+            session.pty.screen(),
+        ));
     }
     ensure_status(
         send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
@@ -885,6 +1143,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), TaskError> 
             columns: Some(120),
             path: Some(binary_dir),
             index_dir: Some(index_dir.clone()),
+            catalog_refresh_enabled: true,
             ..SessionOptions::default()
         },
     )?;
@@ -924,7 +1183,14 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), TaskError> 
                     == 1
         })?;
 
-    wait_for_command_information(&mut session, "ls", &["Enter run"])?;
+    // This check exercises discovered commands, so admit its isolated PATH
+    // catalog explicitly instead of relying on time spent resizing the frame.
+    wait_for_file_contents(
+        &mut session,
+        &index_dir.join("catalog.sqlite3"),
+        b"fixture-tool",
+    )?;
+    wait_for_command_information(&mut session, "ls", &["Enter run", "source:"])?;
     let normal_ls_information = session.pty.screen().text();
     if normal_ls_information.contains("List a directory as typed entries in Data mode")
         || normal_ls_information.contains("source: quirl · built-in")
@@ -1132,8 +1398,9 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), TaskError> 
         .pty
         .child_pid()
         .ok_or_else(|| io::Error::other("Quirl exited before foreground handoff"))?;
+    let handoff_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
-    session.pty.drain_for(Duration::from_millis(100))?;
+    session.pty.wait_for_screen_text("HANDOFF_STARTED")?;
     if session.pty.foreground_group()? == quirl_process {
         return Err(
             io::Error::other("foreground command did not receive terminal ownership").into(),
@@ -1147,6 +1414,7 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), TaskError> 
                 && text.contains("HANDOFF_DONE")
                 && screen.bottom_line().contains("NORMAL")
         })?;
+    wait_for_rich_input_since(&mut session, handoff_start)?;
     if session.pty.foreground_group()? != quirl_process {
         return Err(
             io::Error::other("Quirl did not recover terminal ownership after handoff").into(),
@@ -1419,6 +1687,7 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), TaskError> {
         &degraded.private.path.join("FALLBACK_BUILTIN_VISIBLE"),
         "visible to fallback ls\n",
     )?;
+    let fallback_start = degraded.pty.output().len();
     degraded.pty.send(key::ENTER)?;
     degraded.pty.wait_for(b"FALLBACK_BUILTIN_VISIBLE")?;
     degraded
@@ -1426,6 +1695,7 @@ fn check_durable_command_discovery(binary: &Path) -> Result<(), TaskError> {
         .wait_for_screen("corrupt-cache fallback returned", |screen| {
             screen.bottom_line().contains("DATA")
         })?;
+    wait_for_rich_input_since(&mut degraded, fallback_start)?;
     let cleanup_start = degraded.pty.output().len();
     ensure_status(
         send_ctrl_d_and_wait_for_exit(&mut degraded.pty)?,
@@ -1458,6 +1728,15 @@ fn check_completion(binary: &Path) -> Result<(), TaskError> {
             text.contains("path-target/") && !text.contains("path-target.txt")
         })?;
     session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("accepted directory completion", |screen| {
+            screen
+                .lines()
+                .iter()
+                .any(|line| line.starts_with("> cd ") && line.ends_with("/path-target/"))
+        })?;
+    let cd_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session
         .pty
@@ -1468,13 +1747,24 @@ fn check_completion(binary: &Path) -> Result<(), TaskError> {
                 && text.contains("── exit 0")
                 && !text.contains("(no output)")
         })?;
+    wait_for_rich_input_since(&mut session, cd_start)?;
 
     session.pty.type_text("cat no")?;
     session.pty.send(b"\t")?;
     session.pty.wait_for_screen_text("notes.txt")?;
     session.pty.send(key::ENTER)?;
+    session
+        .pty
+        .wait_for_screen("accepted file completion", |screen| {
+            screen
+                .lines()
+                .iter()
+                .any(|line| line.trim() == "> cat notes.txt")
+        })?;
+    let cat_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session.pty.wait_for_screen_text("PATH_FILE_OK")?;
+    wait_for_rich_input_since(&mut session, cat_start)?;
 
     session.pty.type_text("git st")?;
     session.pty.send(b"\t")?;
@@ -1487,9 +1777,18 @@ fn check_completion(binary: &Path) -> Result<(), TaskError> {
     session.pty.send(b"\t")?;
     session.pty.wait_for(b"git status [--short]")?;
     session.pty.send(key::ENTER)?;
-    session.pty.drain_for(Duration::from_millis(200))?;
+    session
+        .pty
+        .wait_for_screen("accepted git completion", |screen| {
+            screen
+                .lines()
+                .iter()
+                .any(|line| line.trim() == "> git status")
+        })?;
+    let git_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session.pty.wait_for_screen_text("not a git repository")?;
+    wait_for_rich_input_since(&mut session, git_start)?;
     session.pty.type_text("git")?;
     session.pty.send(b"\x1b[Z")?;
     session.pty.wait_for_screen_text("picker")?;
@@ -1504,6 +1803,8 @@ fn check_completion(binary: &Path) -> Result<(), TaskError> {
 }
 
 fn check_deferred_catalog_admission(binary: &Path) -> Result<(), TaskError> {
+    check_cold_context_help(binary)?;
+    check_cold_catalog_intents(binary)?;
     let mut session = Session::new(
         binary,
         SessionOptions {
@@ -1551,6 +1852,137 @@ fn check_deferred_catalog_admission(binary: &Path) -> Result<(), TaskError> {
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"^C")?;
     send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
+    Ok(())
+}
+
+fn check_cold_context_help(binary: &Path) -> Result<(), TaskError> {
+    // Failure model: F1 before catalog publication used to disappear silently.
+    // Hold the real admission worker until builtin context help is visible,
+    // then prove publication preserves both that context and the original input.
+    // Every failure still drops the owning Session and restores/reaps its PTY.
+    let mut session = Session::new(
+        binary,
+        SessionOptions {
+            catalog_gate: true,
+            ..SessionOptions::default()
+        },
+    )?;
+    let reached = session.catalog_gate_reached.clone();
+    wait_for_file(&mut session, reached)?;
+    let command = "git status | quirl data COLD_F1_PRESERVED";
+    let editor_line = format!("> {command}");
+    session.pty.type_text(command)?;
+    session
+        .pty
+        .wait_for_screen("cold F1 input is complete", |screen| {
+            screen.lines().iter().any(|line| line == &editor_line)
+        })?;
+    session.pty.send(b"\x1bOP")?;
+    let context_help = |screen: &VirtualScreen| {
+        let text = screen.text();
+        text.contains("catalog help")
+            && screen.lines().iter().any(|line| {
+                line.split('│')
+                    .nth(1)
+                    .is_some_and(|cell| cell.trim() == "> quirl data")
+                    && line
+                        .split('│')
+                        .nth(3)
+                        .is_some_and(|cell| cell.trim() == "quirl data")
+            })
+            && text.contains("Sources are")
+    };
+    session.pty.wait_for_screen(
+        "cold F1 builtin context help before publication",
+        context_help,
+    )?;
+    fs::write(&session.catalog_gate, b"release\n")?;
+    let published = PathBuf::from(format!("{}.published", session.catalog_gate.display()));
+    wait_for_file(&mut session, published)?;
+    session
+        .pty
+        .wait_for_screen("cold F1 context survives catalog publication", context_help)?;
+    session.pty.send(key::ESCAPE)?;
+    session
+        .pty
+        .wait_for_screen("cold F1 preserves original editor", |screen| {
+            screen.lines().iter().any(|line| line == &editor_line)
+                && !screen.text().contains("catalog help")
+        })?;
+    session.pty.send(key::CTRL_C)?;
+    session
+        .pty
+        .wait_for_screen("cold F1 cancellation restores empty input", |screen| {
+            screen.lines().iter().any(|line| line.trim() == ">")
+                && screen.text().contains("interactive input cancelled")
+                && screen.bottom_line().contains("NORMAL")
+        })?;
+    execute_and_resume_with_marker(
+        &mut session,
+        "/usr/bin/printf COLD_F1_RECOVERED",
+        b"COLD_F1_RECOVERED",
+    )?;
+    let cleanup_start = session.pty.output().len();
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "cold F1 help",
+    )?;
+    ensure_terminal_restored(&session, cleanup_start, "cold F1 help")
+}
+
+fn check_cold_catalog_intents(binary: &Path) -> Result<(), TaskError> {
+    for palette in [false, true] {
+        let mut session = Session::new(
+            binary,
+            SessionOptions {
+                catalog_gate: true,
+                ..SessionOptions::default()
+            },
+        )?;
+        let reached = session.catalog_gate_reached.clone();
+        wait_for_file(&mut session, reached)?;
+        if palette {
+            session
+                .pty
+                .type_text("/usr/bin/printf COLD_PALETTE_PRESERVED")?;
+            session.pty.send(key::ALT_Q)?;
+            session.pty.send(b"p")?;
+            session.pty.wait_for_screen_text("picker")?;
+            session.pty.type_text("doctor")?;
+            session.pty.wait_for_screen_text("doctor")?;
+        } else {
+            session.pty.type_text("git st")?;
+            session.pty.send(key::TAB)?;
+            session.pty.wait_for_screen_text("loading catalog")?;
+        }
+        fs::write(&session.catalog_gate, b"release\n")?;
+        let published = PathBuf::from(format!("{}.published", session.catalog_gate.display()));
+        wait_for_file(&mut session, published)?;
+        if palette {
+            session.pty.wait_for_screen_text("quirl config doctor")?;
+            session.pty.send(key::ESCAPE)?;
+            session.pty.wait_for_screen_text("COLD_PALETTE_PRESERVED")?;
+        } else {
+            session.pty.wait_for_screen_text("git status [--short]")?;
+        }
+        session.pty.send(key::CTRL_C)?;
+        session
+            .pty
+            .wait_for_screen("cold intent cancellation restores input", |screen| {
+                screen.text().contains("interactive input cancelled")
+                    && screen.bottom_line().contains("NORMAL")
+            })?;
+        execute_and_resume_with_marker(
+            &mut session,
+            "/usr/bin/printf COLD_INTENT_RECOVERED",
+            b"COLD_INTENT_RECOVERED",
+        )?;
+        let start = session.pty.output().len();
+        session.pty.send(key::CTRL_D)?;
+        ensure_status(session.pty.wait_exit()?, 0, "cold catalog intent")?;
+        ensure_terminal_restored(&session, start, "cold catalog intent")?;
+    }
     Ok(())
 }
 
@@ -1680,6 +2112,7 @@ fn execute_cwd_history_command(session: &mut Session, command: &str) -> Result<(
                 && text.contains("── exit ")
                 && screen.bottom_line().contains("NORMAL")
         })?;
+    wait_for_rich_input_since(session, output_start)?;
     ensure_alternate_screen_unchanged(session, output_start, "cwd-history command")
 }
 
@@ -1711,6 +2144,7 @@ fn check_retained_output_cycles(binary: &Path) -> Result<(), TaskError> {
                     && screen.bottom_line().contains("NORMAL")
             },
         )?;
+        wait_for_rich_input_since(&mut session, output_start)?;
         let emitted = &session.pty.output()[output_start..];
         if contains(emitted, ALTERNATE_SCREEN_LEAVE) || contains(emitted, ALTERNATE_SCREEN_ENTER) {
             return Err(io::Error::other(format!(
@@ -1976,6 +2410,7 @@ complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Prin
     if !finished.is_file() {
         return Err(io::Error::other("GHQ fixture did not reach process completion").into());
     }
+    wait_for_rich_input_since(&mut session, output_start)?;
     ensure_alternate_screen_unchanged(&session, output_start, "streamed GHQ fixture")?;
     ensure_status(
         send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
@@ -2000,13 +2435,16 @@ fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), TaskErro
     let mut session = Session::new(binary, SessionOptions::default())?;
     session.pty.wait_for(STARTUP_MARKER)?;
     let output_start = session.pty.output().len();
-    let command = "/bin/sh -c 'printf start\\n >&2; printf 33%%\\r >&2; sleep 1; printf 66%%\\r >&2; sleep 1; printf 100%%done\\n >&2'";
+    // Quote printf formats inside the fixture shell too: unquoted backslashes
+    // are consumed by that shell and would print literal `r` instead of CR.
+    let command = r#"/bin/sh -c 'printf "start\n" >&2; printf "33%%\r" >&2; sleep 1; printf "66%%\r" >&2; sleep 1; printf "100%%done\n" >&2'"#;
     session.pty.type_text(command)?;
     session.pty.send(key::ENTER)?;
     session
         .pty
         .wait_for_screen("first progress frame live", |screen| {
-            screen.text().contains("33%") && screen.bottom_line().contains("running")
+            screen.lines().iter().any(|line| line.trim() == "33%")
+                && screen.bottom_line().contains("running")
         })?;
     if session.pty.screen().text().contains("100%done") {
         return Err(io::Error::other(
@@ -2017,7 +2455,8 @@ fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), TaskErro
     session
         .pty
         .wait_for_screen("second progress frame live", |screen| {
-            screen.text().contains("66%") && screen.bottom_line().contains("running")
+            screen.lines().iter().any(|line| line.trim() == "66%")
+                && screen.bottom_line().contains("running")
         })?;
     session.pty.wait_for_screen(
         "progress fixture completed inside persistent viewport",
@@ -2028,6 +2467,7 @@ fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), TaskErro
                 && screen.bottom_line().contains("NORMAL")
         },
     )?;
+    wait_for_rich_input_since(&mut session, output_start)?;
     if contains(&session.pty.output()[output_start..], b"\\u{1b}") {
         return Err(screen_error(
             "streamed carriage-return progress leaked a literal escape sequence",
@@ -2054,6 +2494,7 @@ fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), Tas
     let mut session = Session::new(binary, SessionOptions::default())?;
     session.pty.wait_for(STARTUP_MARKER)?;
     session.pty.type_text("/bin/sleep 2")?;
+    let execution_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session
         .pty
@@ -2078,6 +2519,7 @@ fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), Tas
         "silent command completed inside persistent viewport",
         |screen| screen.text().contains("── exit 0") && screen.bottom_line().contains("NORMAL"),
     )?;
+    wait_for_rich_input_since(&mut session, execution_start)?;
     ensure_status(
         send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
         0,
@@ -2266,11 +2708,15 @@ fn check_local_completion_discovery(binary: &Path) -> Result<(), TaskError> {
         let calls = fs::read_to_string(&calls).unwrap_or_else(|_| "<no calls>".to_owned());
         let database =
             read_bounded_fixture(&catalog_path, DISCOVERY_ARTIFACT_BYTES_MAX).unwrap_or_default();
+        let provider_state = database
+            .windows(b"\"local_providers\":".len())
+            .position(|window| window == b"\"local_providers\":")
+            .and_then(|start| database.get(start..start.saturating_add(2_048).min(database.len())))
+            .map(String::from_utf8_lossy);
         return Err(io::Error::other(format!(
-            "{error}; provider calls={calls:?}; database_has_ghq={} database_has_fish={} database_has_provider_identity={}; screen=\n{}",
+            "{error}; provider calls={calls:?}; database_has_ghq={} database_has_fish={} provider_state={provider_state:?}; screen=\n{}",
             contains(&database, b"ghq"),
             contains(&database, b"ghq.fish"),
-            contains(&database, b"local_providers"),
             session.pty.screen().text()
         ))
         .into());
@@ -2452,27 +2898,11 @@ fn check_interactive_runtime(binary: &Path) -> Result<(), TaskError> {
     Ok(())
 }
 
-/// Send Ctrl-D and wait for the child to exit, retrying the keystroke once
-/// if the child is still alive after a short probe.
-///
-/// Reedline's Ctrl-D exits only an empty editor and otherwise falls back to
-/// a plain edit action; landing right after a command finishes, on an
-/// editor buffer that has not fully settled yet, it can take that fallback
-/// path instead, leaving the shell alive and waiting for more input rather
-/// than hung. On real CI this produced a `wait_exit` timeout that was
-/// consistent, not occasional, and that a longer deadline alone never
-/// fixed -- confirmed by a process/thread-state snapshot showing the child
-/// idling normally in its terminal read loop, not stuck or busy.
+/// Send exactly one EOF after the caller has observed an empty, ready editor.
+/// Retrying would hide a missing readiness oracle or a dropped input event.
 fn send_ctrl_d_and_wait_for_exit(pty: &mut PtySession) -> Result<i32, TaskError> {
-    const EXIT_PROBE: Duration = Duration::from_millis(500);
     pty.send(key::CTRL_D)?;
-    match pty.wait_exit_within(EXIT_PROBE) {
-        Ok(status) => Ok(status),
-        Err(_) => {
-            pty.send(key::CTRL_D)?;
-            pty.wait_exit()
-        }
-    }
+    pty.wait_exit()
 }
 
 #[allow(
@@ -2589,6 +3019,33 @@ fn check_suspend_resume(binary: &Path) -> Result<(), TaskError> {
     Ok(())
 }
 
+fn construction_group_from_output(output: &[u8]) -> io::Result<Pid> {
+    let marker = b"owned pipeline process group: ";
+    let start = output
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+        .ok_or_else(|| io::Error::other("construction failure omitted its owned process group"))?;
+    let tail = output
+        .get(start.saturating_add(marker.len())..)
+        .unwrap_or_default();
+    let end = tail
+        .iter()
+        .take(11)
+        .position(|byte| matches!(byte, b'\r' | b'\n'))
+        .ok_or_else(|| {
+            io::Error::other("construction process group line is incomplete or too long")
+        })?;
+    let digits = tail.get(..end).unwrap_or_default();
+    let process_group = std::str::from_utf8(digits)
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|process_group| *process_group > 1)
+        .ok_or_else(|| {
+            io::Error::other("construction failure reported an invalid process group")
+        })?;
+    Ok(Pid::from_raw(process_group))
+}
+
 #[allow(
     clippy::arithmetic_side_effects,
     reason = "job counts and process identifiers are bounded by the fixed PTY scenario"
@@ -2629,25 +3086,29 @@ fn check_native_job_control(binary: &Path) -> Result<(), TaskError> {
     )?;
     let pid_path = session.private.path.join("construction.pid");
     let mut construction_cleanup = ObservedProcessGroupCleanup::new(pid_path.clone());
-    let gate_path = session.private.path.join("construction.gate");
-    mkfifo(&gate_path, Mode::S_IRUSR | Mode::S_IWUSR)?;
-    let script = format!(
-        "printf %s $$ > {}; printf x > {}; sleep 30",
-        shell_quote(&pid_path),
-        shell_quote(&gate_path)
-    );
-    let construction = format!(
-        "/bin/sh -c {} | /bin/cat < {} > /definitely/missing/quirl-construction-output",
-        shell_quote_text(&script),
-        shell_quote(&gate_path)
-    );
-    session.pty.type_text(&construction)?;
+    // The executor reports its verified owned group before construction unwinds.
+    // This proves partial child ownership without requiring the guest to publish
+    // its PID before the next stage's redirection fails.
+    session
+        .pty
+        .type_text("/bin/sleep 30 | /bin/cat > /definitely/missing/quirl-construction-output")?;
     session.pty.send(key::ENTER)?;
     session.pty.wait_for(b"cannot write redirected output")?;
+    let group_deadline = Instant::now() + default_timeout();
+    let observed_group = loop {
+        match construction_group_from_output(session.pty.output()) {
+            Ok(group) => break group,
+            Err(error) if Instant::now() >= group_deadline => return Err(error.into()),
+            Err(_) => {
+                session.pty.drain_for(Duration::from_millis(20))?;
+            }
+        }
+    };
+    fs::write(&pid_path, observed_group.as_raw().to_string())?;
     wait_for_terminal_owner(&mut session)?;
     let observed_child = construction_cleanup.observed_pid()?;
     match kill(observed_child, None) {
-        Err(Errno::ESRCH) => construction_cleanup.disarm(),
+        Err(Errno::ESRCH) => {}
         Err(error) => return Err(error.into()),
         Ok(()) => {
             return Err(io::Error::other(format!(
@@ -2655,6 +3116,15 @@ fn check_native_job_control(binary: &Path) -> Result<(), TaskError> {
                 observed_child.as_raw()
             ))
             .into());
+        }
+    }
+    match nix::sys::signal::killpg(observed_child, None) {
+        Err(Errno::ESRCH) => construction_cleanup.disarm(),
+        Err(error) => return Err(error.into()),
+        Ok(()) => {
+            return Err(
+                io::Error::other("partial construction leaked its owned process group").into(),
+            );
         }
     }
     execute_simple_with_marker(
@@ -2788,9 +3258,13 @@ fn check_no_color_preserves_semantic_hints(binary: &Path) -> Result<(), TaskErro
             ..SessionOptions::default()
         },
     )?;
-    session.pty.wait_for(STARTUP_MARKER)?;
+    // A renderer may position across unchanged blank cells instead of writing
+    // spaces. Visible labels must be checked in the terminal model, not as a
+    // contiguous raw byte substring whose encoding changes with text styles.
+    wait_for_standard_status(&mut session)?;
+    wait_for_rich_input_since(&mut session, 0)?;
     session.pty.type_text("quirl describe --unknown")?;
-    session.pty.wait_for(b"unknown flag")?;
+    session.pty.wait_for_screen_text("unknown flag")?;
     session.pty.send(key::CTRL_C)?;
     session.pty.wait_for(b"^C")?;
     send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
@@ -2846,7 +3320,16 @@ fn wait_for_command_information(
         &format!("automatic information for {command:?}"),
         |screen| {
             let text = screen.text();
-            markers.iter().all(|marker| text.contains(marker))
+            // Provenance can arrive after the menu and footer. Inspect a
+            // completed frame for the current edit before making negative
+            // assertions about which command owns the visible documentation.
+            screen.has_completed_frame()
+                && screen.lines().iter().any(|line| {
+                    ["> ", "❯ ", "> D ", "▦ "]
+                        .iter()
+                        .any(|prefix| line.starts_with(&format!("{prefix}{command}")))
+                })
+                && markers.iter().all(|marker| text.contains(marker))
         },
     )?;
     Ok(())
@@ -2882,7 +3365,23 @@ fn clear_editor(session: &mut Session) -> Result<(), TaskError> {
 
 fn clear_editor_in_mode(session: &mut Session, mode: &str) -> Result<(), TaskError> {
     session.pty.send(key::CTRL_U)?;
-    wait_for_mode_status(session, mode)
+    let prompts = match mode {
+        "DATA" => ["> D", "▦"],
+        "AI" => ["> AI", "✧"],
+        _ => [">", "❯"],
+    };
+    session
+        .pty
+        .wait_for_screen("empty editor after clear", |screen| {
+            let bottom = screen.bottom_line();
+            bottom.contains(mode)
+                && bottom.contains("Tab complete")
+                && screen
+                    .lines()
+                    .iter()
+                    .any(|line| prompts.contains(&line.trim()))
+        })?;
+    Ok(())
 }
 
 #[allow(
@@ -3048,6 +3547,22 @@ mod tests {
         process::{Command, Stdio},
         thread,
     };
+
+    #[test]
+    fn construction_group_requires_a_complete_safe_identifier() {
+        assert_eq!(
+            construction_group_from_output(b"owned pipeline process group: 1234\r\n").unwrap(),
+            Pid::from_raw(1234)
+        );
+        for value in ["1234", "0\n", "1\n", "-12\n", "2147483648\n", "12oops\n"] {
+            assert!(
+                construction_group_from_output(
+                    format!("owned pipeline process group: {value}").as_bytes()
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn temporary_session_directory_is_private() {

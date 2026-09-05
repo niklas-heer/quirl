@@ -290,6 +290,15 @@ impl Drop for ExtensionWorker {
     }
 }
 
+/// One request retained while catalog admission owns the only producer.
+/// Input is admitted before copying and never exceeds the completion query cap.
+struct DeferredCompletion {
+    line: String,
+    cursor: usize,
+    mode: Mode,
+    automatic: bool,
+}
+
 pub struct CompletionState {
     worker: Option<CompletionWorker>,
     catalog: Option<Arc<Catalog>>,
@@ -311,6 +320,7 @@ pub struct CompletionState {
     catalog_position_delta: usize,
     data_ls_alias_request: bool,
     explicit_quirl_request: bool,
+    deferred: Option<DeferredCompletion>,
 }
 
 impl CompletionState {
@@ -339,6 +349,7 @@ impl CompletionState {
             catalog_position_delta: 0,
             data_ls_alias_request: false,
             explicit_quirl_request: false,
+            deferred: None,
         }
     }
 
@@ -364,6 +375,7 @@ impl CompletionState {
             catalog_position_delta: 0,
             data_ls_alias_request: false,
             explicit_quirl_request: false,
+            deferred: None,
         }
     }
 
@@ -383,6 +395,22 @@ impl CompletionState {
         self.cancel_for_edit();
         self.worker = None;
         self.catalog = Some(catalog);
+    }
+
+    /// Resume the latest still-live request after every surface consumer has
+    /// received the catalog. Editing and dismissal remove the retained intent.
+    pub fn resume_deferred(&mut self) -> Result<(), ShellError> {
+        if self.catalog.is_some()
+            && let Some(request) = self.deferred.take()
+        {
+            self.request_with_presentation(
+                &request.line,
+                request.cursor,
+                request.mode,
+                request.automatic,
+            )?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -416,6 +444,23 @@ impl CompletionState {
                 "completion limited to {} query bytes; editing remains available",
                 quirl_catalog::MAX_COMPLETION_QUERY_BYTES
             ));
+            return Ok(());
+        }
+        if self.catalog.is_none() {
+            // Discovery may be slow or fail independently of this keystroke.
+            // Retain one bounded latest intent; no worker or filesystem scan is
+            // needed until the catalog is published at a surface safe point.
+            self.cancel_for_edit();
+            self.deferred = Some(DeferredCompletion {
+                line: line.to_owned(),
+                cursor: clamped_utf8_cursor(line, cursor),
+                mode,
+                automatic,
+            });
+            self.open = true;
+            self.streaming = true;
+            self.automatic = automatic;
+            self.source_label = "loading catalog";
             return Ok(());
         }
         self.start_workers()?;
@@ -619,6 +664,7 @@ impl CompletionState {
     }
 
     pub fn dismiss(&mut self) {
+        self.deferred = None;
         self.items.clear();
         self.filesystem_pending.clear();
         self.selected = 0;
@@ -638,6 +684,7 @@ impl CompletionState {
     }
 
     pub fn show_picker_results(&mut self, items: Vec<CompletionItem>, source_label: &'static str) {
+        self.deferred = None;
         self.items = bounded_items(items);
         self.selected = 0;
         // A picker with no matches must stay visible so its query remains
@@ -817,7 +864,7 @@ fn filesystem_completion_context(
     })
 }
 
-fn clamped_utf8_cursor(line: &str, cursor: usize) -> usize {
+pub(super) fn clamped_utf8_cursor(line: &str, cursor: usize) -> usize {
     let mut cursor = cursor.min(line.len());
     while cursor > 0 && !line.is_char_boundary(cursor) {
         cursor = cursor.saturating_sub(1);
@@ -826,6 +873,26 @@ fn clamped_utf8_cursor(line: &str, cursor: usize) -> usize {
 }
 
 fn shell_segment_start(input: &str) -> usize {
+    shell_separator_indices(input)
+        .last()
+        .map_or(0, |index| index.saturating_add(1))
+}
+
+/// Locates the command under the cursor without treating quoted operators as
+/// boundaries. The caller supplies the editor's bounded source string.
+pub(super) fn shell_segment_range(line: &str, cursor: usize) -> std::ops::Range<usize> {
+    let cursor = clamped_utf8_cursor(line, cursor);
+    let mut start = 0;
+    for index in shell_separator_indices(line) {
+        if index >= cursor {
+            return start..index;
+        }
+        start = index.saturating_add(1);
+    }
+    start..line.len()
+}
+
+fn shell_separator_indices(input: &str) -> impl Iterator<Item = usize> + '_ {
     #[derive(Clone, Copy)]
     enum Quote {
         None,
@@ -834,11 +901,10 @@ fn shell_segment_start(input: &str) -> usize {
     }
     let mut quote = Quote::None;
     let mut escaped = false;
-    let mut start = 0;
-    for (index, character) in input.char_indices() {
+    input.char_indices().filter_map(move |(index, character)| {
         if escaped {
             escaped = false;
-            continue;
+            return None;
         }
         match quote {
             Quote::Single if character == '\'' => quote = Quote::None,
@@ -850,12 +916,62 @@ fn shell_segment_start(input: &str) -> usize {
             Quote::None if character == '\'' => quote = Quote::Single,
             Quote::None if character == '"' => quote = Quote::Double,
             Quote::None if matches!(character, '|' | '&' | ';' | '\n') => {
-                start = index.saturating_add(character.len_utf8());
+                return Some(index);
             }
             Quote::None => {}
         }
+        None
+    })
+}
+
+/// A file picker returns a complete path, so replace its entire shell word and
+/// retain everything outside that word, including later arguments and operators.
+/// Bounded scans of the editor line prevent whitespace inside quotes from
+/// corrupting the replacement span. The existing completion encoder owns quoting.
+pub(super) struct FilePickerReplacement {
+    pub range: std::ops::Range<usize>,
+    style: PathWordStyle,
+}
+
+impl FilePickerReplacement {
+    pub fn at_cursor(line: &str, cursor: usize) -> Self {
+        let cursor = clamped_utf8_cursor(line, cursor);
+        let segment = shell_segment_range(line, cursor);
+        let word = shell_words(line.get(segment.clone()).unwrap_or_default(), segment.start)
+            .into_iter()
+            .find(|word| {
+                word.start <= cursor && cursor <= word.start.saturating_add(word.raw.len())
+            });
+        let Some(word) = word else {
+            return Self {
+                range: cursor..cursor,
+                style: PathWordStyle::Unquoted,
+            };
+        };
+        let style = match path_word_style(word.raw) {
+            PathWordStyle::SingleQuoted { .. } => PathWordStyle::SingleQuoted { closed: true },
+            PathWordStyle::DoubleQuoted { .. } => PathWordStyle::DoubleQuoted { closed: true },
+            PathWordStyle::Unquoted => PathWordStyle::Unquoted,
+        };
+        Self {
+            range: word.start..word.start.saturating_add(word.raw.len()),
+            style,
+        }
     }
-    start
+
+    pub fn encode(&self, path: &str) -> String {
+        // Shell quoting does not stop a program from interpreting `-name` as
+        // an option. An explicit relative path preserves the picked file.
+        if path.starts_with('-') {
+            return encode_shell_path(&format!("./{path}"), self.style);
+        }
+        // Picker names are literal directory entries. Ordinary completion can
+        // instead carry an intentional `~/` prefix, which must keep expanding.
+        if matches!(self.style, PathWordStyle::Unquoted) && path.starts_with('~') {
+            return encode_shell_path(path, PathWordStyle::SingleQuoted { closed: true });
+        }
+        encode_shell_path(path, self.style)
+    }
 }
 
 #[allow(
@@ -1022,12 +1138,18 @@ fn path_scan_parts(value: &str) -> Option<(PathBuf, String, String)> {
 fn encode_shell_path(path: &str, style: PathWordStyle) -> String {
     match style {
         PathWordStyle::Unquoted => {
+            // Backslash-newline is shell continuation, not a literal filename
+            // character. A quoted word preserves the selected path's identity.
+            if path.contains(['\n', '\r']) {
+                return encode_shell_path(path, PathWordStyle::SingleQuoted { closed: true });
+            }
             let mut escaped = String::with_capacity(path.len());
             for character in path.chars() {
                 if character.is_whitespace()
                     || matches!(
                         character,
                         '\\' | '\''
+                            | '#'
                             | '"'
                             | '$'
                             | '`'
@@ -1377,6 +1499,53 @@ mod tests {
     }
 
     #[test]
+    fn cold_completion_replays_only_the_latest_admitted_request() {
+        let mut state = CompletionState::unpublished(None);
+        state.request("quirl doc", 9, Mode::Command).unwrap();
+        state.request("git st", 6, Mode::Command).unwrap();
+        assert!(state.worker.is_none());
+        assert!(state.streaming);
+        assert_eq!(state.deferred.as_ref().unwrap().line, "git st");
+        state.resume_deferred().unwrap();
+        assert!(state.deferred.is_some());
+        state.publish_catalog(Arc::new(Catalog::builtin()));
+        state.resume_deferred().unwrap();
+        assert!(state.deferred.is_none());
+        for _ in 0..100 {
+            if state.poll("git st", 6) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(state.items.iter().any(|item| item.value == "git status"));
+    }
+
+    #[test]
+    fn cold_completion_is_invalidated_by_edit_dismissal_and_query_overflow() {
+        for dismiss_only in [false, true] {
+            let mut state = CompletionState::unpublished(None);
+            state.request("git st", 6, Mode::Command).unwrap();
+            if dismiss_only {
+                state.dismiss();
+            } else {
+                state.cancel_for_edit();
+            }
+            state.publish_catalog(Arc::new(Catalog::builtin()));
+            state.resume_deferred().unwrap();
+            assert!(state.worker.is_none());
+            assert!(!state.open);
+        }
+        let mut state = CompletionState::unpublished(None);
+        let exact = "x".repeat(quirl_catalog::MAX_COMPLETION_QUERY_BYTES);
+        state.request(&exact, exact.len(), Mode::Command).unwrap();
+        assert_eq!(state.deferred.as_ref().unwrap().line.len(), exact.len());
+        let over = format!("{exact}x");
+        state.request(&over, over.len(), Mode::Command).unwrap();
+        assert!(state.deferred.is_none());
+        assert!(state.resource_notice().is_some());
+    }
+
+    #[test]
     fn catalog_completion_uses_the_frozen_worker_envelope() {
         let catalog = Catalog::builtin();
         let mut state = CompletionState::new(catalog, None);
@@ -1519,6 +1688,24 @@ mod tests {
 
         state.next();
         assert!(state.accepts_enter());
+    }
+
+    #[test]
+    fn completion_preserves_home_prefixes_while_picker_names_remain_literal() {
+        assert_eq!(
+            encode_shell_path("~/notes", PathWordStyle::Unquoted),
+            "~/notes"
+        );
+        let replacement = FilePickerReplacement::at_cursor("cat ", 4);
+        let inserted = replacement.encode("~/");
+        let parsed = quirl_syntax::parse_command_list(&format!("cat {inserted}")).unwrap();
+        let word = &parsed.pipelines[0].commands[0].word_ir[1];
+        assert_eq!(word.text(), "~/");
+        assert!(
+            word.parts
+                .iter()
+                .all(|part| part.quoting == quirl_syntax::Quoting::Single)
+        );
     }
 
     #[test]

@@ -28,12 +28,25 @@ plan, then verify the clean candidate:
 
 ```console
 cargo xtask release prepare --write
+npm ci --prefix website
+npm --prefix website run sync:docs
+npm --prefix website run sync:reference
 cargo xtask check
-cargo xtask release verify
+cargo xtask website-check
 ```
 
 Preparation writes the reviewable canonical notes to `RELEASE_NOTES.md` and
-updates the local workspace package versions in `Cargo.lock`. After the release
+updates the local workspace package versions in `Cargo.lock`. The compiled
+website references embed the workspace version, so refresh both reference pages
+as well as the source mirrors. Review and commit the preparation with
+`chore(release): prepare next version`, then run `cargo xtask release verify`
+against the clean candidate. The preparation workflow performs these same
+generation and validation steps before opening its pull request.
+
+Website documentation follows the current source tree. Keep installation and
+download labels on the latest published version until the new GitHub Release
+exists, and identify source-only features in first-session instructions. A
+prepared changelog entry is not evidence of publication. After the release
 PR is merged, preview the exact tag operation with `cargo xtask release tag
 --expected-tag vVERSION`; publication adds `--write` to create and non-force
 push that exact lightweight tag.

@@ -708,7 +708,10 @@ impl PtySession {
         drop(pair.slave);
         drop(pair.master);
 
-        let (sender, receiver) = mpsc::channel();
+        // Retain at most 16 × 8 KiB chunks while the consumer models a frame.
+        // Backpressure stops a noisy candidate from growing the benchmark heap.
+        // finish drops the receiver so a blocked sender can always unwind.
+        let (sender, receiver) = mpsc::sync_channel(16);
         let reader_thread = thread::spawn(move || {
             let mut buffer = vec![0_u8; 8 * 1024];
             loop {
@@ -967,6 +970,7 @@ impl PtySession {
         }
         let _ = self.child.wait();
         drop(self.writer);
+        drop(self.receiver);
         if let Some(handle) = self.reader_thread.take()
             && handle.is_finished()
         {

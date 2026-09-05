@@ -436,6 +436,19 @@ pub enum InteractiveSignal {
     Suspend,
 }
 
+/// Latest picker intent awaiting catalog admission. Help retains at most one
+/// editor-sized source and one bounded picker query; dismissal drops both.
+enum DeferredCatalogPicker {
+    Palette {
+        replace_end: usize,
+    },
+    Help {
+        line: String,
+        cursor: usize,
+        initial_query: String,
+    },
+}
+
 /// Stateful full-screen terminal editor with completion, pickers, history, and diagnostics.
 ///
 /// The surface owns raw mode, bracketed paste, cursor shape, and its ratatui
@@ -449,6 +462,7 @@ pub struct RichSurface {
     catalog_admission: Option<CatalogAdmission>,
     completion: CompletionState,
     picker: PickerOverlay,
+    deferred_catalog_picker: Option<DeferredCatalogPicker>,
     explorer: Option<DirectoryExplorer>,
     pending_input: Option<(String, usize)>,
     picker_layout: PickerLayout,
@@ -543,6 +557,7 @@ impl RichSurface {
         Ok(Self {
             completion: CompletionState::new(Arc::clone(&catalog), extension_completer),
             picker: PickerOverlay::new(picker_ranker),
+            deferred_catalog_picker: None,
             explorer: None,
             pending_input: None,
             picker_layout: PickerLayout::from_config(&config.picker.layout),
@@ -621,6 +636,7 @@ impl RichSurface {
             catalog_admission: None,
             completion: CompletionState::unpublished(extension_completer),
             picker: PickerOverlay::new(picker_ranker),
+            deferred_catalog_picker: None,
             explorer: None,
             pending_input: None,
             picker_layout: PickerLayout::from_config(&config.picker.layout),
@@ -989,6 +1005,35 @@ impl RichSurface {
         self.input_analysis.publish_catalog(Arc::clone(&catalog));
         self.catalog = Some(catalog);
         self.runtime.catalog_admitted();
+        self.completion.resume_deferred()?;
+        if let Some(deferred) = self.deferred_catalog_picker.take()
+            && self.picker.active()
+            && let Some(catalog) = self.catalog.as_deref()
+        {
+            let visible = match deferred {
+                DeferredCatalogPicker::Palette { replace_end } => self
+                    .picker
+                    .replace_items(overlay::palette_items(catalog, replace_end)),
+                DeferredCatalogPicker::Help {
+                    line,
+                    cursor,
+                    initial_query,
+                } => {
+                    let items = overlay::palette_items(catalog, line.len());
+                    // Upgrade the original cursor context when discovery adds
+                    // a longer command contract. An edited query takes priority.
+                    if self.picker.query() == Some(initial_query.as_str()) {
+                        let query = contextual_help_query(catalog, &line, cursor);
+                        self.picker
+                            .open_with_query(items, "catalog help", false, &query)
+                    } else {
+                        self.picker.replace_items(items)
+                    }
+                }
+            };
+            self.completion
+                .show_picker_results(visible, self.picker.label());
+        }
         #[cfg(debug_assertions)]
         catalog_admission_published_test_hook()?;
         Ok(true)
@@ -1199,6 +1244,7 @@ impl RichSurface {
             }
 
             if self.poll_catalog_admission()? {
+                self.refresh_completion_after_catalog(&editor, prompt.mode)?;
                 dirty = true;
                 continue;
             }
@@ -1460,17 +1506,11 @@ impl RichSurface {
                     }
                     if self.completion.open && !self.picker.active() {
                         match key.code {
-                            KeyCode::Up if prompt.mode == Mode::Natural => {
-                                self.completion.previous();
-                                continue;
-                            }
                             KeyCode::Up => {
-                                self.completion.dismiss();
-                                self.open_picker(
-                                    editor::PickerKind::History,
+                                self.handle_completion_up(
+                                    prompt.mode,
                                     editor.buffer(),
                                     editor.cursor(),
-                                    "history",
                                 );
                                 continue;
                             }
@@ -1734,6 +1774,7 @@ impl RichSurface {
         }
         self.expand_completion_pending = false;
         self.completion.cancel_for_edit();
+        self.deferred_catalog_picker = None;
         self.picker.dismiss();
         self.help_active = false;
         self.help_detail_scroll = 0;
@@ -2255,6 +2296,37 @@ impl RichSurface {
         self.refresh_completion_after_text(editor.buffer(), editor.cursor(), mode)
     }
 
+    fn refresh_completion_after_catalog(
+        &mut self,
+        editor: &EditorState,
+        mode: Mode,
+    ) -> Result<(), ShellError> {
+        // Typing can precede publication without creating a request. Reapply
+        // the normal automatic policy to the current buffer exactly once at
+        // admission, while preserving explicit completion and every overlay.
+        if mode == Mode::Natural
+            || self.completion.open
+            || self.picker.active()
+            || self.leader_active
+            || self.environment.active()
+            || self.explorer.is_some()
+        {
+            return Ok(());
+        }
+        self.refresh_completion_after_edit(editor, mode)
+    }
+
+    fn handle_completion_up(&mut self, mode: Mode, line: &str, cursor: usize) {
+        if mode == Mode::Natural || !self.completion.automatic {
+            self.completion.previous();
+        } else {
+            // Informational popups do not capture normal history recall. Once
+            // the user chooses completion navigation, both arrows stay there.
+            self.completion.dismiss();
+            self.open_picker(editor::PickerKind::History, line, cursor, "history");
+        }
+    }
+
     fn open_picker(
         &mut self,
         kind: editor::PickerKind,
@@ -2262,14 +2334,26 @@ impl RichSurface {
         cursor: usize,
         label: &'static str,
     ) {
+        self.deferred_catalog_picker = None;
         self.help_active = false;
         self.help_detail_scroll = 0;
         let items = match kind {
             editor::PickerKind::Jobs => self.runtime.job_items(line.len()),
             editor::PickerKind::Data => self.runtime.data_items(line.len()),
-            _ => self.catalog.as_deref().map_or_else(Vec::new, |catalog| {
-                overlay::items(kind, catalog, &self.history, line, cursor)
-            }),
+            // Durable history is installed before the first prompt. Catalog
+            // admission may still be pending or unavailable, but must not hide
+            // that independent snapshot or make recall depend on discovery I/O.
+            editor::PickerKind::History => overlay::history_items(&self.history, line.len()),
+            // Files and directories depend on the current filesystem, not on
+            // imported command metadata. A cold catalog must not hide paths.
+            editor::PickerKind::Files | editor::PickerKind::Directories => {
+                overlay::filesystem_items(kind, line, cursor)
+            }
+            editor::PickerKind::Palette => {
+                self.catalog.as_deref().map_or_else(Vec::new, |catalog| {
+                    overlay::items(kind, catalog, &self.history, line, cursor)
+                })
+            }
         };
         if kind == editor::PickerKind::History {
             let visible = self.picker.open_with_query(items, label, true, line);
@@ -2278,6 +2362,11 @@ impl RichSurface {
             self.open_bottom_anchored_picker(items, label);
         } else {
             self.open_picker_items(items, label, false);
+        }
+        if kind == editor::PickerKind::Palette && self.catalog.is_none() {
+            self.deferred_catalog_picker = Some(DeferredCatalogPicker::Palette {
+                replace_end: line.len(),
+            });
         }
     }
 
@@ -2311,8 +2400,21 @@ impl RichSurface {
     }
 
     fn open_context_help(&mut self, line: &str, cursor: usize) {
-        let Some(catalog) = self.catalog.as_deref() else {
+        self.deferred_catalog_picker = None;
+        if line.len() > editor::MAX_EDITOR_BUFFER_BYTES {
+            self.dismiss_picker();
             return;
+        }
+        // Builtin help is available at first paint without discovery I/O. Keep
+        // one admitted context so imported contracts can upgrade it later; all
+        // normal picker dismissal/replacement paths invalidate this intent.
+        let fallback;
+        let catalog = match self.catalog.as_deref() {
+            Some(catalog) => catalog,
+            None => {
+                fallback = Catalog::builtin();
+                &fallback
+            }
         };
         let query = contextual_help_query(catalog, line, cursor);
         let items = overlay::items(
@@ -2328,6 +2430,13 @@ impl RichSurface {
         self.completion.show_picker_results(visible, "catalog help");
         self.help_active = true;
         self.help_detail_scroll = 0;
+        if self.catalog.is_none() {
+            self.deferred_catalog_picker = Some(DeferredCatalogPicker::Help {
+                line: line.to_owned(),
+                cursor,
+                initial_query: query,
+            });
+        }
     }
 
     fn open_picker_items(
@@ -2336,6 +2445,7 @@ impl RichSurface {
         label: &'static str,
         expanded: bool,
     ) {
+        self.deferred_catalog_picker = None;
         self.help_active = false;
         self.help_detail_scroll = 0;
         let visible = self.picker.open(items, label, expanded);
@@ -2347,6 +2457,7 @@ impl RichSurface {
         items: Vec<completion::CompletionItem>,
         label: &'static str,
     ) {
+        self.deferred_catalog_picker = None;
         self.help_active = false;
         self.help_detail_scroll = 0;
         let visible = self.picker.open_bottom_anchored(items, label);
@@ -2365,6 +2476,7 @@ impl RichSurface {
     }
 
     fn dismiss_picker(&mut self) {
+        self.deferred_catalog_picker = None;
         self.picker.dismiss();
         self.completion.dismiss();
         self.help_active = false;
@@ -3272,6 +3384,11 @@ fn history_error(path: &Path) -> impl Fn(io::Error) -> ShellError + '_ {
 
 fn terminal_error(action: &'static str) -> impl Fn(io::Error) -> ShellError {
     move |error| {
+        if event::is_input_limit_error(&error) {
+            return ShellError::new(ErrorCode::ResourceLimit, "terminal input exceeded its resource limit")
+                .with_context(error.to_string())
+                .with_help("Restart the session and paste at most 64 KiB at a time; ensure the terminal finishes bracketed paste sequences");
+        }
         ShellError::new(ErrorCode::Io, format!("could not {action}"))
             .with_context(error.to_string())
             .with_help(
@@ -3766,6 +3883,11 @@ mod tests {
             surface.expand_completion_pending = true;
             surface.completion.open = true;
             surface.help_active = true;
+            surface.deferred_catalog_picker = Some(DeferredCatalogPicker::Help {
+                line: buffer.clone(),
+                cursor,
+                initial_query: "printf".to_owned(),
+            });
 
             surface.toggle_grammar_mode(&mut prompt);
 
@@ -3776,6 +3898,7 @@ mod tests {
             assert!(!surface.expand_completion_pending);
             assert!(!surface.completion.open);
             assert!(!surface.help_active);
+            assert!(surface.deferred_catalog_picker.is_none());
         }
     }
 
@@ -4246,6 +4369,367 @@ mod tests {
         assert!(surface.picker.active());
         assert!(surface.picker.bottom_anchored());
         assert!(!surface.picker.expanded());
+    }
+
+    #[test]
+    fn explicit_completion_up_returns_to_the_previous_choice_without_opening_history() {
+        let catalog = Arc::new(Catalog::builtin());
+        let mut surface = RichSurface::new(
+            Arc::clone(&catalog),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        let line = "git st";
+        let choices = overlay::items(editor::PickerKind::Palette, &catalog, &[], line, line.len())
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        assert_eq!(choices.len(), 2);
+        surface.completion.open_manual(choices.clone(), "catalog");
+        surface.completion.next();
+        assert_eq!(surface.completion.selected, 1);
+
+        surface.handle_completion_up(Mode::Command, line, line.len());
+
+        assert!(!surface.picker.active());
+        assert_eq!(surface.completion.selected, 0);
+        assert_eq!(surface.completion.items, choices);
+        assert!(surface.completion.accepts_enter());
+        surface.handle_completion_up(Mode::Command, line, line.len());
+        assert_eq!(surface.completion.selected, 1);
+    }
+
+    #[test]
+    fn automatic_completion_keeps_history_recall_until_the_user_navigates() {
+        let catalog = Arc::new(Catalog::builtin());
+        let mut surface = RichSurface::new(
+            Arc::clone(&catalog),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        let line = "git st";
+        surface.install_history_snapshot(vec![InteractiveHistoryEntry {
+            command_line: "git status --short".to_owned(),
+            directory: None,
+            status: Some(0),
+            rank_bias: 0,
+        }]);
+        let choices = overlay::items(editor::PickerKind::Palette, &catalog, &[], line, line.len())
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        surface.completion.open_manual(choices.clone(), "catalog");
+        surface.completion.automatic = true;
+        assert!(!surface.completion.accepts_enter());
+
+        surface.handle_completion_up(Mode::Command, line, line.len());
+
+        assert!(surface.picker.active());
+        assert_eq!(surface.picker.query(), Some(line));
+        assert_eq!(
+            surface.completion.selected_item().unwrap().value,
+            "git status --short"
+        );
+
+        surface.dismiss_picker();
+        surface.completion.open_manual(choices, "catalog");
+        surface.completion.automatic = true;
+        surface.completion.next();
+        surface.handle_completion_up(Mode::Command, line, line.len());
+        assert!(!surface.picker.active());
+        assert_eq!(surface.completion.selected, 0);
+        assert!(surface.completion.accepts_enter());
+    }
+
+    #[test]
+    fn cold_context_help_is_immediate_and_keeps_the_latest_cursor_context() {
+        let mut surface = cold_help_surface(Catalog::builtin());
+        let line = "git status | quirl data pending";
+        surface.open_context_help(line, "git status".len());
+        assert_eq!(surface.picker.query(), Some("git status"));
+        surface.open_context_help(line, line.len());
+        assert!(surface.published_catalog().is_none());
+        assert!(surface.help_active);
+        assert_eq!(surface.picker.query(), Some("quirl data"));
+        assert!(
+            surface
+                .completion
+                .items
+                .iter()
+                .any(|item| item.value == "quirl data")
+        );
+        surface.begin_catalog_admission().unwrap();
+        await_catalog_admission(&mut surface).unwrap();
+        assert!(surface.help_active);
+        assert_eq!(surface.picker.query(), Some("quirl data"));
+        assert!(surface.deferred_catalog_picker.is_none());
+    }
+
+    #[test]
+    fn cold_help_upgrades_imported_context_without_overwriting_an_edited_query() {
+        let mut catalog = Catalog::builtin();
+        let mut imported = catalog.commands[0].clone();
+        imported.path = "fixture deploy".to_owned();
+        catalog.merge([imported]);
+        for edited in [false, true] {
+            let mut surface = cold_help_surface(catalog.clone());
+            surface.open_context_help("fixture deploy pending", 22);
+            if edited {
+                surface.update_picker_query(PickerOverlay::clear_query);
+                surface.update_picker_query(|picker| picker.insert_query("doctor"));
+            }
+            surface.begin_catalog_admission().unwrap();
+            await_catalog_admission(&mut surface).unwrap();
+            let expected = if edited { "doctor" } else { "fixture deploy" };
+            assert_eq!(surface.picker.query(), Some(expected));
+            let expected_path = if edited {
+                "quirl config doctor"
+            } else {
+                "fixture deploy"
+            };
+            assert!(
+                surface
+                    .completion
+                    .items
+                    .iter()
+                    .any(|item| item.value == expected_path)
+            );
+        }
+    }
+
+    #[test]
+    fn dismissed_or_replaced_cold_help_is_not_reopened_by_publication() {
+        for replace in [false, true] {
+            let mut surface = cold_help_surface(Catalog::builtin());
+            surface.open_context_help("quirl data", 10);
+            if replace {
+                surface.open_picker(editor::PickerKind::History, "", 0, "history");
+            } else {
+                surface.dismiss_picker();
+            }
+            surface.begin_catalog_admission().unwrap();
+            await_catalog_admission(&mut surface).unwrap();
+            assert!(!surface.help_active);
+            assert_eq!(surface.picker.active(), replace);
+        }
+    }
+
+    #[test]
+    fn cold_help_context_copy_respects_the_editor_byte_limit() {
+        let mut surface = cold_help_surface(Catalog::builtin());
+        let exact = "x".repeat(editor::MAX_EDITOR_BUFFER_BYTES);
+        surface.open_context_help(&exact, exact.len());
+        let Some(DeferredCatalogPicker::Help {
+            line,
+            initial_query,
+            ..
+        }) = &surface.deferred_catalog_picker
+        else {
+            panic!("exact-size help context was not retained");
+        };
+        assert_eq!(line.len(), editor::MAX_EDITOR_BUFFER_BYTES);
+        assert!(initial_query.len() <= crate::PICKER_QUERY_BYTES_MAX);
+        let over = format!("{exact}x");
+        surface.open_context_help(&over, over.len());
+        assert!(surface.deferred_catalog_picker.is_none());
+        assert!(!surface.picker.active());
+    }
+
+    fn cold_help_surface(catalog: Catalog) -> RichSurface {
+        RichSurface::new_deferred(
+            Box::new(move || Ok(Arc::new(catalog))),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_arrival_refreshes_current_automatic_information_without_retyping() {
+        let mut config = QuirlConfig::default();
+        config.completion.auto = false;
+        let mut catalog = Catalog::builtin();
+        catalog.merge_report(quirl_catalog::import_fish(
+            "complete -c ls -s a -l all -d 'Show all entries'",
+            "ls.fish",
+        ));
+        let mut surface = RichSurface::new_deferred(
+            Box::new(move || Ok(Arc::new(catalog))),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &config,
+            PathBuf::new(),
+        )
+        .unwrap();
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("ls");
+        surface
+            .refresh_completion_after_edit(&editor, Mode::Command)
+            .unwrap();
+        assert!(!surface.completion.open);
+        surface.begin_catalog_admission().unwrap();
+        await_catalog_admission(&mut surface).unwrap();
+        surface
+            .refresh_completion_after_catalog(&editor, Mode::Command)
+            .unwrap();
+        assert!(surface.completion.open);
+        assert!(surface.completion.automatic);
+
+        surface.completion.cancel_for_edit();
+        editor.clear();
+        editor.insert_paste("unknown-prefix");
+        surface
+            .refresh_completion_after_catalog(&editor, Mode::Command)
+            .unwrap();
+        assert!(!surface.completion.open);
+        surface
+            .completion
+            .request("git st", 6, Mode::Command)
+            .unwrap();
+        surface
+            .refresh_completion_after_catalog(&editor, Mode::Command)
+            .unwrap();
+        assert!(surface.completion.open);
+        assert!(!surface.completion.automatic);
+    }
+
+    #[test]
+    fn cold_file_and_directory_pickers_do_not_depend_on_catalog_admission() {
+        let mut surface = RichSurface::new_deferred(
+            Box::new(|| {
+                Err(
+                    ShellError::new(ErrorCode::Io, "catalog remains unavailable")
+                        .with_help("Filesystem pickers do not need command discovery"),
+                )
+            }),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface.open_picker(editor::PickerKind::Files, "cat ", 4, "files");
+        assert!(surface.published_catalog().is_none());
+        assert!(surface.picker.active());
+        // Cargo test runs in this crate, whose manifest is a stable local file.
+        let manifest = surface
+            .completion
+            .items
+            .iter()
+            .find(|item| item.display == "Cargo.toml")
+            .unwrap();
+        assert_eq!(manifest.source, "filesystem");
+        assert_eq!(manifest.replace_start, 4);
+        assert_eq!(manifest.replace_end, 4);
+
+        surface.open_picker(editor::PickerKind::Directories, "cd ", 3, "directories");
+        assert!(surface.published_catalog().is_none());
+        assert!(!surface.completion.items.is_empty());
+        assert!(
+            surface
+                .completion
+                .items
+                .iter()
+                .all(|item| item.summary == "directory")
+        );
+        let oversized = "x".repeat(editor::MAX_EDITOR_BUFFER_BYTES + 1);
+        surface.open_picker(
+            editor::PickerKind::Files,
+            &oversized,
+            oversized.len(),
+            "files",
+        );
+        assert!(surface.completion.items.is_empty());
+    }
+
+    #[test]
+    fn cold_palette_keeps_query_and_replacement_when_catalog_arrives() {
+        let mut surface = RichSurface::new_deferred(
+            Box::new(|| Ok(Arc::new(Catalog::builtin()))),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface.open_picker(editor::PickerKind::Palette, "replace me", 10, "picker");
+        surface.update_picker_query(|picker| picker.insert_query("doctor"));
+        assert!(surface.completion.items.is_empty());
+        let bottom_anchored = surface.picker.bottom_anchored();
+        surface.begin_catalog_admission().unwrap();
+        await_catalog_admission(&mut surface).unwrap();
+        assert_eq!(surface.picker.query(), Some("doctor"));
+        assert_eq!(surface.picker.bottom_anchored(), bottom_anchored);
+        let selected = surface
+            .completion
+            .items
+            .iter()
+            .find(|item| item.value == "quirl config doctor")
+            .unwrap();
+        assert_eq!(selected.replace_end, 10);
+    }
+
+    #[test]
+    fn dismissed_cold_palette_is_not_reopened_by_catalog_publication() {
+        let mut surface = RichSurface::new_deferred(
+            Box::new(|| Ok(Arc::new(Catalog::builtin()))),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface.open_picker(editor::PickerKind::Palette, "", 0, "picker");
+        surface.update_picker_query(|picker| picker.insert_query("doctor"));
+        surface.dismiss_picker();
+        surface.begin_catalog_admission().unwrap();
+        await_catalog_admission(&mut surface).unwrap();
+        assert!(!surface.picker.active());
+        assert!(!surface.completion.open);
+    }
+
+    #[test]
+    fn deferred_catalog_does_not_hide_installed_history() {
+        let mut surface = RichSurface::new_deferred(
+            Box::new(|| {
+                Err(
+                    ShellError::new(ErrorCode::Io, "catalog remains unavailable")
+                        .with_help("History recall does not need this loader"),
+                )
+            }),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        assert!(surface.published_catalog().is_none());
+        surface.open_picker(editor::PickerKind::History, "", 0, "history");
+        assert!(surface.completion.items.is_empty());
+        surface.install_history_snapshot(vec![InteractiveHistoryEntry {
+            command_line: "printf REOPENED_HISTORY".to_owned(),
+            directory: Some("/saved/project".to_owned()),
+            status: Some(0),
+            rank_bias: 4_000,
+        }]);
+        surface.open_picker(editor::PickerKind::History, "REOPENED", 8, "history");
+        assert!(surface.published_catalog().is_none());
+        assert!(surface.picker.active());
+        let selected = surface.completion.selected_item().unwrap();
+        assert_eq!(selected.value, "printf REOPENED_HISTORY");
+        assert_eq!(selected.replace_end, 8);
+        assert_eq!(selected.source, "history-local");
+
+        surface.open_picker(editor::PickerKind::History, "missing", 7, "history");
+        assert!(surface.completion.items.is_empty());
     }
 
     #[test]

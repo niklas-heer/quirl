@@ -8,6 +8,7 @@
     )
 )]
 
+mod file_read;
 mod panel;
 mod surface;
 mod theme;
@@ -329,6 +330,8 @@ pub trait PickerRanker: Send + Sync {
     /// Every returned index must refer to `items`; match positions are character,
     /// not byte, offsets into the corresponding label. Implementations run on UI
     /// paths and must keep work bounded by the supplied slice and result limit.
+    /// A host may return no matches when admission or its ranking deadline fails;
+    /// callers must not treat an empty result as proof that no input item matches.
     fn rank(&self, items: &[PickerItem], query: &str, limit: usize) -> Vec<PickerMatch>;
 }
 
@@ -532,6 +535,23 @@ pub fn editor(catalog: Catalog) -> Reedline {
     editor_with_config(catalog, QuirlConfig::default())
 }
 
+/// Map a simple-editor read failure to the shell's operating error boundary.
+///
+/// Typed terminal-input and editor admission failures retain [`ErrorCode::ResourceLimit`]
+/// and their configured limit context; other Reedline failures remain I/O
+/// errors. This mapping performs no I/O. Reedline's read guard restores terminal
+/// modes before returning the error; the caller must stop the failed session.
+pub fn editor_read_error(error: io::Error) -> ShellError {
+    if crossterm::event::is_input_limit_error(&error) || reedline::is_input_limit_error(&error) {
+        return ShellError::new(ErrorCode::ResourceLimit, "terminal input exceeded its resource limit")
+            .with_context(error.to_string())
+            .with_help("Restart the session with a smaller paste or Vi repeat: keep the input buffer within 64 KiB and repeats within 1,024 actions; ensure the terminal finishes bracketed paste sequences");
+    }
+    ShellError::new(ErrorCode::Io, "the interactive editor failed")
+        .with_context(error.to_string())
+        .with_help("Restart the session after checking that its terminal and history path remain accessible")
+}
+
 /// Create a default Reedline editor with optional extension completions.
 ///
 /// Extension callbacks execute through the completion boundary and must return
@@ -664,6 +684,9 @@ fn configured_editor(
         false,
     ));
     let mut line_editor = Reedline::create()
+        // A terminal paste must populate the buffer without submitting each
+        // complete line. Reedline disables this terminal protocol by default.
+        .use_bracketed_paste(true)
         .with_completer(completer)
         .with_menu(ReedlineMenu::EngineCompleter(completion_menu))
         .with_menu(ReedlineMenu::EngineCompleter(help_menu))
@@ -892,6 +915,10 @@ impl EditMode for QuirlEditMode {
 
     fn edit_mode(&self) -> PromptEditMode {
         self.inner.edit_mode()
+    }
+
+    fn take_input_error(&mut self) -> Option<io::Error> {
+        self.inner.take_input_error()
     }
 }
 
@@ -1432,12 +1459,17 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 const MAX_PROMPT_WORKTREE_ENTRIES: usize = 4_096;
+const MAX_PROMPT_GIT_FILE_BYTES: usize = 8 * 1024;
+const MAX_PROMPT_ANCESTORS: usize = 128;
 
 fn load_prompt_context(cwd: PathBuf, previous: Option<PromptCacheEntry>) -> PromptCacheEntry {
-    let git_dir = cwd.ancestors().find_map(resolve_git_dir);
+    let git_dir = cwd
+        .ancestors()
+        .take(MAX_PROMPT_ANCESTORS)
+        .find_map(resolve_git_dir);
     let head = git_dir
         .as_ref()
-        .and_then(|git_dir| fs::read_to_string(git_dir.join("HEAD")).ok())
+        .and_then(|git_dir| read_prompt_git_file(&git_dir.join("HEAD")).ok())
         .map(|head| head.trim().to_owned());
     let worktree = scan_worktree(&cwd);
     let dependencies = PromptDependencies {
@@ -2130,13 +2162,51 @@ fn resolve_git_dir(directory: &Path) -> Option<PathBuf> {
     if marker.is_dir() {
         return Some(marker);
     }
-    let contents = fs::read_to_string(marker).ok()?;
+    let contents = read_prompt_git_file(&marker).ok()?;
     let path = contents.trim().strip_prefix("gitdir:")?.trim();
+    if path.is_empty() {
+        return None;
+    }
     let path = PathBuf::from(path);
     Some(if path.is_absolute() {
         path
     } else {
         directory.join(path)
+    })
+}
+
+fn read_prompt_git_file(path: &Path) -> Result<String, ShellError> {
+    // Metadata is only an early rejection. A limit-plus-one read also catches
+    // growth after admission, without retaining an unbounded branch or gitdir.
+    let io_error = |error: io::Error| {
+        ShellError::new(ErrorCode::Io, "could not read prompt Git metadata")
+            .with_context(error.to_string())
+            .with_help("Use readable regular Git metadata files")
+    };
+    let limit = u64::try_from(MAX_PROMPT_GIT_FILE_BYTES).unwrap_or(u64::MAX);
+    let check_limit = |observed: u64| {
+        if observed > limit {
+            Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "prompt Git metadata exceeds its byte limit",
+            )
+            .with_context(format!("limit: {limit}; observed: {observed}"))
+            .with_help("Use Git metadata no larger than 8 KiB"))
+        } else {
+            Ok(())
+        }
+    };
+    let file = file_read::open_regular_file(path).map_err(io_error)?;
+    check_limit(file.metadata().map_err(io_error)?.len())?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    check_limit(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
+    String::from_utf8(bytes).map_err(|error| {
+        ShellError::new(ErrorCode::Validation, "prompt Git metadata is not UTF-8")
+            .with_context(error.to_string())
+            .with_help("Use UTF-8 Git metadata for prompt context")
     })
 }
 
@@ -3014,6 +3084,8 @@ const HISTORY_READ_LIMITS: HistoryReadLimits = HistoryReadLimits {
 /// 50,000 entries or 8 MiB, skips invalid UTF-8 and oversized records, and
 /// decodes Reedline-compatible multiline escapes. A missing file is an empty
 /// history; other filesystem failures return [`ErrorCode::Io`].
+/// Non-regular files are rejected before reading; Unix FIFO admission never
+/// waits for a writer. Symlinks to regular history files remain supported.
 pub fn read_history(path: &Path) -> Result<Vec<String>, ShellError> {
     read_history_with_limits(path, HISTORY_READ_LIMITS)
 }
@@ -3022,7 +3094,7 @@ fn read_history_with_limits(
     path: &Path,
     limits: HistoryReadLimits,
 ) -> Result<Vec<String>, ShellError> {
-    let mut file = match File::open(path) {
+    let mut file = match file_read::open_regular_file(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(history_read_error(path, error)),
@@ -3328,12 +3400,254 @@ pub fn render_error(error: &ShellError, color: bool) -> String {
     rendered.trim_end().to_owned()
 }
 
+// Exercise the dependency's owning admission implementation with its actual
+// public event types, without exposing a production-only testing API.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../vendor/reedline/src/input_limits.rs"]
+mod reedline_input_limits_contract;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use quirl_core::ErrorCode;
     use quirl_lua::{EditorConfig, PickerConfig, PromptConfig};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn simple_editor_error_mapping_does_not_trust_resource_limit_text() {
+        let error = editor_read_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "terminal input pending sequence limit 4096 bytes, observed 4097 bytes",
+        ));
+        assert_eq!(error.code, ErrorCode::Io);
+        assert!(render_error(&error, false).contains("terminal input pending sequence"));
+        assert!(!render_error(&error, false).contains("Retry with ui.surface"));
+        let error = editor_read_error(io::Error::other("history unavailable"));
+        assert_eq!(error.code, ErrorCode::Io);
+        assert!(render_error(&error, false).contains("history unavailable"));
+    }
+
+    #[test]
+    fn simple_styled_input_escapes_controls_after_splitting_at_the_source_cursor() {
+        let source = "é\x1b]52;c;payload\x07\r\t\u{9b}Z";
+        let styled = StyledText {
+            buffer: vec![(Style::new(), source.to_owned())],
+        };
+        for color in [false, true] {
+            let (before, after) = styled.render_around_insertion_point(
+                "é".len(),
+                &reedline::DefaultPrompt::default(),
+                color,
+                None,
+            );
+            assert_eq!(before, "é");
+            assert_eq!(after, "\\u{1b}]52;c;payload\\u{7}\\r\\t\\u{9b}Z");
+            assert_eq!(styled.raw_string(), source);
+            assert_eq!(styled.render_simple(), format!("{before}{after}"));
+        }
+    }
+
+    #[test]
+    fn simple_history_hint_escapes_display_but_acceptance_keeps_original_bytes() {
+        use reedline::Hinter;
+        let suffix = "\x1b]52;c;payload\x07";
+        let mut history = FileBackedHistory::new(2).unwrap();
+        history
+            .save(HistoryItem::from_command_line(format!("echo {suffix}")))
+            .unwrap();
+        for color in [false, true] {
+            let mut hinter = DefaultHinter::default();
+            let display = hinter.handle("echo ", 5, &history, color, "");
+            assert!(!display.contains("\x1b]52;"));
+            assert!(display.contains("\\u{1b}]52;c;payload\\u{7}"));
+            assert_eq!(hinter.complete_hint(), suffix);
+        }
+    }
+
+    #[test]
+    fn simple_line_buffer_admits_exact_bytes_and_rejects_the_next_character() {
+        let mut buffer = reedline::LineBuffer::new();
+        let exact = "x".repeat(MAX_HISTORY_ENTRY_BYTES);
+        buffer.set_buffer(exact.clone());
+        assert_eq!(buffer.get_buffer(), exact);
+        let cursor = buffer.insertion_point();
+        buffer.insert_char('é');
+        assert_eq!(buffer.get_buffer(), exact);
+        assert_eq!(buffer.insertion_point(), cursor);
+    }
+
+    #[test]
+    fn rejected_simple_replacement_cannot_install_its_projected_cursor_offset() {
+        let mut buffer = reedline::LineBuffer::from("é safe");
+        let cursor = buffer.insertion_point();
+        buffer.replace_range(0.."é".len(), &"x".repeat(MAX_HISTORY_ENTRY_BYTES));
+        buffer.set_insertion_point(MAX_HISTORY_ENTRY_BYTES.saturating_add(4));
+        assert_eq!(buffer.get_buffer(), "é safe");
+        assert_eq!(buffer.insertion_point(), cursor);
+        assert!(buffer.is_valid());
+    }
+
+    #[test]
+    fn rejected_simple_selection_replacement_restores_source_and_skips_later_edits() {
+        let mut editor = Reedline::create();
+        editor.run_edit_commands(&[EditCommand::InsertString("é safe".to_owned())]);
+        editor.run_edit_commands(&[EditCommand::SelectAll]);
+        let cursor = editor.current_insertion_point();
+        editor.run_edit_commands(&[
+            EditCommand::InsertString("x".repeat(MAX_HISTORY_ENTRY_BYTES.saturating_add(1))),
+            EditCommand::InsertChar('!'),
+        ]);
+        assert_eq!(editor.current_buffer_contents(), "é safe");
+        assert_eq!(editor.current_insertion_point(), cursor);
+        let error = editor
+            .read_line(&reedline::DefaultPrompt::default())
+            .unwrap_err();
+        assert!(reedline::is_input_limit_error(&error));
+        assert_eq!(editor_read_error(error).code, ErrorCode::ResourceLimit);
+        editor.run_edit_commands(&[EditCommand::Undo]);
+        assert_eq!(editor.current_buffer_contents(), "");
+    }
+
+    #[test]
+    fn simple_editor_callback_rolls_back_overflow_and_projected_cursor_as_one_edit() {
+        let mut editor = reedline::Editor::default();
+        editor.edit_buffer(
+            |buffer| buffer.set_buffer("é safe".to_owned()),
+            reedline::UndoBehavior::CreateUndoPoint,
+        );
+        let cursor = editor.line_buffer().insertion_point();
+        editor.edit_buffer(
+            |buffer| {
+                buffer.replace_range(0.."é".len(), &"x".repeat(MAX_HISTORY_ENTRY_BYTES));
+                buffer.set_insertion_point(MAX_HISTORY_ENTRY_BYTES.saturating_add(4));
+            },
+            reedline::UndoBehavior::CreateUndoPoint,
+        );
+        assert_eq!(editor.get_buffer(), "é safe");
+        assert_eq!(editor.line_buffer().insertion_point(), cursor);
+    }
+
+    #[test]
+    fn full_simple_buffer_can_swap_unequal_words_without_false_growth_rejection() {
+        let word = "x".repeat(MAX_HISTORY_ENTRY_BYTES - 2);
+        let mut buffer = reedline::LineBuffer::from(format!("a {word}").as_str());
+        buffer.set_insertion_point(0);
+        buffer.swap_words();
+        assert_eq!(buffer.get_buffer(), format!("{word} a"));
+        assert!(buffer.is_valid());
+    }
+
+    #[test]
+    fn full_simple_buffer_can_swap_unequal_utf8_graphemes_without_false_growth_rejection() {
+        let tail = "x".repeat(MAX_HISTORY_ENTRY_BYTES - "éa".len());
+        let mut buffer = reedline::LineBuffer::from(format!("éa{tail}").as_str());
+        buffer.set_insertion_point("é".len());
+        buffer.swap_graphemes();
+        assert_eq!(buffer.get_buffer(), format!("aé{tail}"));
+        assert!(buffer.is_valid());
+    }
+
+    #[test]
+    fn simple_undo_retains_only_its_bounded_recent_states() {
+        let mut editor = Reedline::create();
+        for _ in 0..256 {
+            editor.run_edit_commands(&[EditCommand::InsertString("x".to_owned())]);
+        }
+        assert_eq!(editor.current_buffer_contents().len(), 256);
+        for _ in 0..200 {
+            editor.run_edit_commands(&[EditCommand::Undo]);
+        }
+        assert_eq!(editor.current_buffer_contents().len(), 129);
+    }
+
+    #[test]
+    fn simple_action_batches_admit_exactly_their_limit_without_charging_failed_events() {
+        use reedline_input_limits_contract::{InputActionBudget, is_input_limit_error};
+
+        let edits =
+            |count| ReedlineEvent::Edit(vec![EditCommand::MoveRight { select: false }; count]);
+        let mut budget = InputActionBudget::default();
+        budget.admit(&edits(600)).unwrap();
+        budget.admit(&edits(424)).unwrap();
+        let error = budget.admit(&edits(1)).unwrap_err();
+        assert!(is_input_limit_error(&error));
+        assert!(error.to_string().contains("1024"));
+        assert!(error.to_string().contains("1025"));
+        budget.admit(&ReedlineEvent::None).unwrap();
+
+        let mut budget = InputActionBudget::default();
+        budget.admit(&edits(600)).unwrap();
+        assert!(is_input_limit_error(
+            &budget.admit(&edits(500)).unwrap_err()
+        ));
+        budget.admit(&edits(424)).unwrap();
+    }
+
+    #[test]
+    fn vi_repeats_admit_the_exact_action_bound_through_the_quirl_wrapper() {
+        for wrapped in [false, true] {
+            for count in [3, 1_024] {
+                let mut mode = vi_normal_mode(wrapped);
+                let event = vi_keys(mode.as_mut(), &format!("{count}w"));
+                let ReedlineEvent::Multiple(events) = event else {
+                    panic!("valid Vi repeat did not produce its bounded actions");
+                };
+                assert_eq!(events.len(), count);
+                assert!(events.iter().all(
+                    |event| matches!(event, ReedlineEvent::Edit(commands) if commands.len() == 1)
+                ));
+                assert!(mode.take_input_error().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn excessive_vi_counts_and_products_fail_before_action_expansion() {
+        for wrapped in [false, true] {
+            for source in ["1025w", "32d33w", "184467440737095516160w"] {
+                let mut mode = vi_normal_mode(wrapped);
+                assert_eq!(vi_keys(mode.as_mut(), source), ReedlineEvent::None);
+                let error = mode.take_input_error().unwrap();
+                assert!(reedline::is_input_limit_error(&error));
+                assert_eq!(editor_read_error(error).code, ErrorCode::ResourceLimit);
+            }
+        }
+    }
+
+    #[test]
+    fn vi_dot_repeat_counts_the_saved_primitive_actions() {
+        for wrapped in [false, true] {
+            let mut mode = vi_normal_mode(wrapped);
+            assert!(matches!(
+                vi_keys(mode.as_mut(), "600x"),
+                ReedlineEvent::Multiple(_)
+            ));
+            assert!(mode.take_input_error().is_none());
+            assert_eq!(vi_keys(mode.as_mut(), "2."), ReedlineEvent::None);
+            let error = mode.take_input_error().unwrap();
+            assert!(reedline::is_input_limit_error(&error));
+            assert!(error.to_string().contains("1024"));
+        }
+    }
+
+    fn vi_normal_mode(wrapped: bool) -> Box<dyn EditMode> {
+        let mut mode: Box<dyn EditMode> = if wrapped {
+            configured_edit_mode("vim")
+        } else {
+            Box::<Vi>::default()
+        };
+        parsed_key(mode.as_mut(), KeyCode::Esc, KeyModifiers::NONE);
+        mode
+    }
+
+    fn vi_keys(mode: &mut dyn EditMode, source: &str) -> ReedlineEvent {
+        let mut result = ReedlineEvent::None;
+        for character in source.chars() {
+            result = parsed_key(mode, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        result
+    }
 
     struct ExampleExtension;
 
@@ -5005,6 +5319,71 @@ mod tests {
             .unwrap()
             .as_nanos();
         env::temp_dir().join(format!("quirl-ui-{label}-{}-{unique}", std::process::id()))
+    }
+
+    #[test]
+    fn prompt_git_metadata_accepts_exact_limit_and_rejects_excess_or_invalid_text() {
+        let path = test_history_path("prompt-git-bounds");
+        fs::write(&path, "x".repeat(MAX_PROMPT_GIT_FILE_BYTES)).unwrap();
+        assert_eq!(
+            read_prompt_git_file(&path).unwrap().len(),
+            MAX_PROMPT_GIT_FILE_BYTES
+        );
+        fs::write(&path, "x".repeat(MAX_PROMPT_GIT_FILE_BYTES + 1)).unwrap();
+        let error = read_prompt_git_file(&path).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(error.details.context[0].contains("limit: 8192; observed: 8193"));
+        assert!(!error.details.help.is_empty());
+        fs::write(&path, [0xff]).unwrap();
+        assert_eq!(
+            read_prompt_git_file(&path).unwrap_err().code,
+            ErrorCode::Validation
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn git_directory_markers_require_a_nonempty_bounded_target() {
+        let directory = test_history_path("prompt-gitdir");
+        fs::create_dir(&directory).unwrap();
+        let marker = directory.join(".git");
+        fs::write(&marker, "gitdir: metadata\n").unwrap();
+        assert_eq!(
+            resolve_git_dir(&directory),
+            Some(directory.join("metadata"))
+        );
+        fs::write(&marker, "gitdir: \n").unwrap();
+        assert!(resolve_git_dir(&directory).is_none());
+        fs::write(
+            &marker,
+            format!("gitdir: {}", "x".repeat(MAX_PROMPT_GIT_FILE_BYTES)),
+        )
+        .unwrap();
+        assert!(resolve_git_dir(&directory).is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_and_prompt_readers_reject_fifos_without_waiting_for_a_writer() {
+        use nix::{sys::stat::Mode, unistd::mkfifo};
+
+        let path = test_history_path("reader-fifo");
+        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let worker_path = path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = sender.send((
+                read_history(&worker_path),
+                read_prompt_git_file(&worker_path),
+            ));
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(1));
+        fs::remove_file(path).unwrap();
+        let (history, prompt) = result.expect("UI file readers must not wait on a FIFO");
+        assert!(history.is_err());
+        assert!(prompt.is_err());
+        worker.join().unwrap();
     }
 
     #[test]

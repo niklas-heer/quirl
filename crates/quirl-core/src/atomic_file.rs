@@ -4,10 +4,14 @@
 //!
 //! - Temporary creation can collide or fail. Candidates use bounded retries,
 //!   same-directory names, and create-new semantics, so an existing entry is
-//!   never truncated. A guard removes a candidate on every returned failure.
+//!   never truncated. Returned failures preserve candidates for explicit review
+//!   rather than risking deletion of a concurrently replaced directory entry.
 //! - A write can stop after any byte, flushing or syncing can fail, and copying
-//!   permissions can fail. The target is untouched until the complete candidate
-//!   contents and intended permissions have both been synchronized.
+//!   permissions can fail. Unix candidates start with private `0600` permissions
+//!   before any content is written, so preserved partial writes do not expose
+//!   private source bytes through the process umask. Intended final permissions
+//!   are applied only after the complete contents are synchronized. The target
+//!   is untouched until both contents and permissions have been synchronized.
 //! - Replacement can succeed before the parent-directory sync fails. A verified
 //!   hard link retains the original inode before replacement. A failure after
 //!   replacement preserves both the complete replacement and recoverable
@@ -46,7 +50,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 #[cfg(unix)]
 use nix::{
@@ -753,11 +757,11 @@ fn create_candidate(path: &Path) -> Result<(PathBuf, File), ShellError> {
     for _ in 0..TEMPORARY_NAME_ATTEMPTS_MAX {
         let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let candidate = temporary_path(path, sequence)?;
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
             Ok(file) => return Ok((candidate, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
@@ -923,6 +927,53 @@ mod tests {
         assert_eq!(fs::read(&source).unwrap(), b"new source\n");
         assert!(fs::metadata(&source).unwrap().permissions().readonly());
         assert_only_source_remains(&directory.0, &source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_write_failure_preserves_candidate_with_private_permissions() {
+        let directory = TestDirectory::new("private-partial-write");
+        // A caller may keep a private file in a traversable directory. Candidate
+        // privacy must hold before target permissions are copied, even when a
+        // partial write fails and leaves the candidate for explicit recovery.
+        fs::set_permissions(&directory.0, Permissions::from_mode(0o755)).unwrap();
+        let source = directory.0.join("private.lua");
+        fs::write(&source, b"original private contents").unwrap();
+        fs::set_permissions(&source, Permissions::from_mode(0o600)).unwrap();
+        let replacement = b"replacement private contents";
+        let mut candidate = None;
+        let error = replace_file_atomically_with_hook(
+            &source,
+            b"original private contents",
+            replacement,
+            options(),
+            |stage| {
+                if stage == TransactionStage::PartialWrite {
+                    candidate = fs::read_dir(&directory.0)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .find(|path| path != &source);
+                    return Err(io::Error::other("injected partial-write failure"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Io);
+        let candidate = candidate.unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"original private contents");
+        assert_eq!(
+            fs::read(&candidate).unwrap(),
+            replacement[..replacement.len().div_ceil(2)]
+        );
+        assert_eq!(
+            fs::metadata(&candidate).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(error.details.context.iter().any(|context| {
+            context.contains("failure cleanup preserved temporary")
+                && context.contains(&candidate.display().to_string())
+        }));
     }
 
     #[test]

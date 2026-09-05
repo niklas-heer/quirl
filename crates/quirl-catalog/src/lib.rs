@@ -16,6 +16,8 @@ use std::{
 
 /// Schema version emitted by [`Catalog`] serialization and by built-in catalogs.
 pub const CATALOG_SCHEMA_VERSION: u32 = 4;
+/// Shared launch guidance for CLI help and the interactive discovery overview.
+pub const INTERACTIVE_START_HELP: &str = "Run `quirl` with no command to open a shell in your current terminal.\nType `help` to get started; `exit` or Ctrl-D returns to your previous shell.";
 /// Oldest catalog schema version that [`Catalog::from_json`] can migrate.
 pub const CATALOG_OLDEST_READABLE_VERSION: u32 = 2;
 /// Wire version for asynchronous completion request and response envelopes.
@@ -556,11 +558,19 @@ impl Catalog {
             commands: vec![
                 command(
                     "help",
-                    "help [command]",
+                    "help [command or search text]",
                     "Explore commands and their contracts",
-                    "Reads this same catalog used by completion and AI discovery.",
+                    &format!(
+                        "{INTERACTIVE_START_HELP}\n\nNormal: run familiar commands and byte pipelines.\nData: type `mode data` for typed values; `mode normal` returns.\nAI: type `mode ai` to plan with an authenticated Codex CLI. Proposals need review and never run automatically.\n\nTab completes; Ctrl-R searches history; Alt-Q opens modes and pickers.\nF1 explains the command at the cursor.\n\nUse `help <command>` for examples, or `help <words>` to search the catalog.\nUse `help all` to browse commands; refine a search when results are shortened."
+                    ),
                     vec![],
-                    &["help git commit"],
+                    &[
+                        "help mode",
+                        "help data",
+                        "help git",
+                        "help config",
+                        "help all",
+                    ],
                     &[],
                     Provenance::Builtin,
                 ),
@@ -568,7 +578,7 @@ impl Catalog {
                     "mode",
                     "mode <normal|data|ai|toggle>",
                     "Switch the visible interactive grammar",
-                    "Normal mode carries bytes and process status. Data mode evaluates Quirl's native structured values and pipelines. AI mode asks an installed Codex CLI for a typed proposal from a bounded compact view of the complete admitted catalog, then inserts the validated command for review without executing it. It has no local suggestion or planner fallback.",
+                    "Normal mode carries bytes and process status. Unquoted newlines separate commands; newlines after a pipe or boolean connector continue that command, and backslash-newline joins physical lines. Quoted newlines stay literal. Data mode evaluates Quirl's native structured values and pipelines. AI mode asks an installed Codex CLI for a typed proposal from a bounded compact view of the complete admitted catalog, then inserts the validated command for review without executing it. It has no local suggestion or planner fallback.",
                     vec![],
                     &["mode data", "mode ai", "mode normal", "mode toggle"],
                     &[],
@@ -578,7 +588,7 @@ impl Catalog {
                     "quirl data",
                     "quirl data <source> [| transform ...] [--format table|plain|json]",
                     "Evaluate a native structured-data pipeline",
-                    "Sources are `pwd`, `files [path]` (or `ls`), `open <path>`, JSON, or explicit `^external <command>`. Values stay typed through streams and transforms: filesystem rows retain Path, Size, and DateTime; tar retains Path and Size; TOML retains DateTime. JSON/YAML/TOML and bytes are explicit conversion boundaries, and `to json` documents its lossy domain encoding. The CLI injects a deadline-, cancellation-, and output-bounded external host; library runtimes fail closed without one. CSV/tar rows are pulled lazily and all adapters enforce byte, row, field, depth, node, retained-text, and materialization limits. `sort`, table output, envelopes, and collected convenience APIs intentionally materialize within those limits. Transforms include typed `where` comparisons with `and`/`or`, dotted `get`, `select`, `sort`, `take`, Option-producing `first`, and `length`. Task remains declarative state; HTTP is not an implicit source.",
+                    "Sources are `pwd`, `files [path]` (or `ls`), `open <path>`, JSON, or explicit `^external <command>`. Values stay typed through streams and transforms: filesystem rows retain Path, Size, and DateTime; tar retains Path and Size; TOML retains DateTime. JSON/YAML/TOML and bytes are explicit conversion boundaries, and `to json` documents its lossy domain encoding. The CLI injects a deadline-, cancellation-, and output-bounded external host; library runtimes fail closed without one. CSV/tar rows are pulled lazily and all adapters enforce byte, row, field, depth, node, retained-text, and materialization limits. `sort`, table output, envelopes, and collected convenience APIs intentionally materialize within those limits. Transforms include typed `where` comparisons with `and`/`or`, dotted `get`, `select`, `sort`, `take`, Option-producing `first`, and `length`. Numeric predicates and sorting compare retained decimal text exactly against signed and unsigned integers, without binary-float rounding; decimal exponents must fit a signed 64-bit integer. CSV columns remain strings: compare a boolean-looking cell with `where enabled == \"true\"`, without implicit type inference. `select` requires every requested field in each consumed row and preserves requested field order; a missing field reports the transform location and available fields. Task remains declarative state; HTTP is not an implicit source.",
                     vec![option_with_static_values(
                         &["--format"],
                         "table|plain|json",
@@ -763,7 +773,7 @@ impl Catalog {
                     "quirl config check",
                     "quirl config check <file> [--format text|json]",
                     "Validate Lua configuration through Rust schemas",
-                    "Evaluates under config restrictions and preserves the active last-known-good value on failure.",
+                    "Evaluates under config restrictions, validates the returned Lua graph before allocating typed configuration, and preserves the active last-known-good value on failure. Returns are bounded to 256 KiB of retained strings, 4112 key/value nodes, and nesting depth 16; cyclic or repeated tables are rejected.",
                     vec![option(
                         &["--format"],
                         Some("text|json"),
@@ -914,7 +924,7 @@ impl Catalog {
                     "quirl plugin add",
                     "quirl plugin add <source> [--allow capability]... [--format text|json]",
                     "Install a local plugin with explicit permission approval",
-                    "Reads the manifest and entry only from admitted regular files under their 256 KiB and 4 MiB limits. It validates the versioned runtime boundary, shows the permission diff, records SHA-256 source checksums, and atomically installs a disabled permission lock without implicit network access.",
+                    "Reads the manifest and entry only from admitted regular files under their 256 KiB and 4 MiB limits. It validates the versioned runtime boundary, shows the permission diff, records SHA-256 source checksums, and atomically installs a disabled permission lock without implicit network access. Plugin mutations serialize across processes; lock writes are capped at 4 MiB and stop when preserved transaction files need review.",
                     vec![
                         repeatable_option(
                             &["--allow"],
@@ -951,7 +961,7 @@ impl Catalog {
                     "quirl plugin enable",
                     "quirl plugin enable <name> [--format text|json]",
                     "Enable a checksum-verified installed plugin",
-                    "Runs doctor and the declared non-executing or budgeted trusted boundary before atomically enabling the existing locked plugin.",
+                    "Runs doctor and the declared non-executing or budgeted trusted boundary before atomically enabling the existing locked plugin. Plugin mutations serialize across processes; lock writes are capped at 4 MiB and stop when preserved transaction files need review.",
                     vec![option(
                         &["--format"],
                         Some("text|json"),
@@ -965,7 +975,7 @@ impl Catalog {
                     "quirl plugin disable",
                     "quirl plugin disable <name> [--format text|json]",
                     "Disable a plugin while retaining its permission lock",
-                    "Atomically changes only enabled state; source, checksums, versions, and granted capabilities remain locked for inspection and recovery.",
+                    "Atomically changes only enabled state; source, checksums, versions, and granted capabilities remain locked for inspection and recovery. Plugin mutations serialize across processes; lock writes are capped at 4 MiB and stop when preserved transaction files need review.",
                     vec![option(
                         &["--format"],
                         Some("text|json"),
@@ -993,7 +1003,7 @@ impl Catalog {
                     "quirl plugin update",
                     "quirl plugin update --locked [--format text|json]",
                     "Verify installed plugins without changing locked authority",
-                    "Re-resolves every local source and rejects any version, checksum, API, or permission change; platform v0.1 does not perform network updates.",
+                    "Re-resolves every local source and rejects any version, checksum, API, or permission change; platform v0.1 does not perform network updates. Plugin mutations serialize across processes; lock writes are capped at 4 MiB and stop when preserved transaction files need review.",
                     vec![
                         option(
                             &["--locked"],
@@ -1014,7 +1024,7 @@ impl Catalog {
                     "quirl plugin remove",
                     "quirl plugin remove <name> [--format text|json]",
                     "Remove an installed plugin lock without deleting source",
-                    "Atomically removes the named permission record; external source directories are never deleted by the plugin manager.",
+                    "Atomically removes the named permission record; external source directories are never deleted by the plugin manager. Plugin mutations serialize across processes; lock writes are capped at 4 MiB and stop when preserved transaction files need review.",
                     vec![option(
                         &["--format"],
                         Some("text|json"),
@@ -1343,7 +1353,7 @@ impl Catalog {
                     "quirl lsp",
                     "quirl lsp",
                     "Serve generated Lua and native Quirl (`.qrl`) editor intelligence",
-                    "Speaks a deterministic LSP subset over stdio, using the generated Lua HOST_API and semantic command catalog for diagnostics, completion, hover, signatures, and module docs without evaluating documents.",
+                    "Speaks a deterministic LSP subset over stdio, using the generated Lua HOST_API and semantic command catalog for diagnostics, completion, hover, signatures, and module docs without evaluating documents. Full-document changes require increasing integer versions and reject incremental ranges without replacing retained text.",
                     vec![],
                     &["quirl lsp"],
                     &[],
@@ -1353,7 +1363,7 @@ impl Catalog {
                     "quirl serve mcp",
                     "quirl serve mcp --capabilities catalog|complete|check|format",
                     "Serve explicitly granted source intelligence over MCP stdio",
-                    "Supports modern 2026-07-28 discovery and explicitly negotiated legacy clients. Each process exposes only the requested bounded catalog, completion, source-check, and source-format tools; it grants no filesystem, network, plugin, or command-execution authority.",
+                    "Supports modern 2026-07-28 discovery and explicitly negotiated legacy clients. Each process exposes only the requested bounded catalog, completion, source-check, and source-format tools; it grants no filesystem, network, plugin, or command-execution authority. Admission limits messages to 1 MiB, methods to 128 bytes, encoded parameters to 256 KiB, and JSON nesting to 32 containers before dispatch.",
                     vec![required_repeatable_option_with_static_values(
                         &["--capabilities"],
                         "catalog|complete|check|format",
@@ -1392,7 +1402,7 @@ impl Catalog {
                     "quirl exec",
                     "quirl exec <source> [--format text|json]",
                     "Execute Quirl's native command graph",
-                    "Accepts complete Quirl source as exactly one outer-shell argument and passes it unchanged to extension planning. Without an explicit extension rewrite, the same source is parsed, diagnosed, and captured for bounded, redacted recovery. Quoting, empty arguments, byte pipes, redirects, boolean lists, and background jobs must be written inside that source operand; additional argv elements are rejected rather than joined into executable syntax.",
+                    "Accepts complete Quirl source as exactly one outer-shell argument and passes it unchanged to extension planning. Without an explicit extension rewrite, the same source is parsed, diagnosed, and captured for bounded, redacted recovery. Unquoted newlines separate commands; newlines after `|`, `&&`, or `||` continue the command, and backslash-newline joins physical lines. Quoted newlines remain literal. Quoting, empty arguments, byte pipes, redirects, boolean lists, and background jobs must be written inside that source operand; additional argv elements are rejected rather than joined into executable syntax.",
                     vec![option(
                         &["--format"],
                         Some("text|json"),
@@ -1587,7 +1597,7 @@ impl Catalog {
                     "jobs",
                     "jobs",
                     "List structured background job state",
-                    "Shows Quirl job ids, running/stopped/done state, and the original command.",
+                    "Shows Quirl job ids, running/stopped/done state, and the original command. On Unix, direct human output escapes command controls; captured or file-redirected output retains raw source. Job text is constructed incrementally within 1 MiB; captured text also obeys a tighter request capture budget. Human stop notifications show at most 256 source bytes plus a truncation marker; typed job metadata stays complete.",
                     vec![],
                     &["jobs"],
                     &[],

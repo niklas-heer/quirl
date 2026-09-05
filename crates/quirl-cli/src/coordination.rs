@@ -22,6 +22,8 @@ static HELD_LOCK_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 pub(crate) enum CoordinationKind {
+    /// Coordinate plugin lockfile read-modify-write transactions.
+    Plugin,
     /// Coordinate catalog indexing, encoding, and atomic publication.
     Catalog,
     /// Coordinate model validation, download, quarantine, and installation.
@@ -34,6 +36,7 @@ pub(crate) enum CoordinationKind {
 impl CoordinationKind {
     fn label(self) -> &'static str {
         match self {
+            Self::Plugin => "plugin-lockfile",
             Self::Catalog => "command-database",
             #[cfg(test)]
             Self::Model => "AI-model",

@@ -1,6 +1,9 @@
 use super::{
-    completion::{CompletionItem, CompletionKind},
-    editor::PickerKind,
+    completion::{
+        CompletionItem, CompletionKind, FilePickerReplacement, clamped_utf8_cursor,
+        shell_segment_range,
+    },
+    editor::{MAX_EDITOR_BUFFER_BYTES, PickerKind, after_last_whitespace},
 };
 use crate::{
     InteractiveHistoryEntry, PICKER_QUERY_BYTES_MAX, PICKER_RANKING_TEXT_BYTES_MAX, PickerItem,
@@ -168,9 +171,7 @@ impl PickerOverlay {
             return None;
         }
         let trimmed = self.query.trim_end_matches(char::is_whitespace);
-        let start = trimmed
-            .rfind(char::is_whitespace)
-            .map_or(0, |index| index.saturating_add(1));
+        let start = after_last_whitespace(trimmed);
         self.query.truncate(start);
         Some(self.ranked_items())
     }
@@ -182,6 +183,16 @@ impl PickerOverlay {
         self.active = false;
         self.expanded = false;
         self.bottom_anchored = false;
+    }
+
+    /// Replace a pending palette's source while preserving its bounded query
+    /// and presentation. Admission must not discard typing performed meanwhile.
+    pub fn replace_items(&mut self, items: Vec<CompletionItem>) -> Vec<CompletionItem> {
+        let query = self.query.clone();
+        let bottom_anchored = self.bottom_anchored;
+        let visible = self.open_with_query(items, self.label, self.expanded, &query);
+        self.bottom_anchored = bottom_anchored;
+        visible
     }
 
     fn ranked_items(&self) -> Vec<CompletionItem> {
@@ -198,7 +209,12 @@ impl PickerOverlay {
 }
 
 pub fn contextual_help_query(catalog: &Catalog, line: &str, cursor: usize) -> String {
-    let prefix = line.get(..cursor.min(line.len())).unwrap_or(line).trim();
+    if line.len() > MAX_EDITOR_BUFFER_BYTES {
+        return String::new();
+    }
+    let cursor = clamped_utf8_cursor(line, cursor);
+    let segment = shell_segment_range(line, cursor);
+    let prefix = line.get(segment.start..cursor).unwrap_or_default().trim();
     if prefix.is_empty() {
         return String::new();
     }
@@ -232,65 +248,84 @@ pub fn items(
     cursor: usize,
 ) -> Vec<CompletionItem> {
     match kind {
-        PickerKind::History => history
-            .iter()
-            .rev()
-            .take(OVERLAY_ITEMS_MAX)
-            .map(|entry| CompletionItem {
-                value: entry.command_line.clone(),
-                display: entry.command_line.clone(),
-                summary: entry.directory.as_ref().map_or_else(
-                    || "history".to_owned(),
-                    |directory| format!("history · {directory}"),
-                ),
-                detail: entry.status.map_or_else(
-                    || "Previously accepted command".to_owned(),
-                    |status| format!("Previously accepted command · status {status}"),
-                ),
-                replace_start: 0,
-                replace_end: line.len(),
-                match_indices: Vec::new(),
-                kind: CompletionKind::History,
-                source: if entry.rank_bias > 0 {
-                    "history-local"
-                } else {
-                    "history"
-                },
-                trust: "session",
-            })
-            .collect(),
-        PickerKind::Palette => catalog
-            .commands
-            .iter()
-            .take(OVERLAY_ITEMS_MAX)
-            .map(|command| CompletionItem {
-                value: command.path.clone(),
-                display: command.path.clone(),
-                summary: command.summary.clone(),
-                detail: format!("{}\n\n{}", command.signature, command.details),
-                replace_start: 0,
-                replace_end: line.len(),
-                match_indices: Vec::new(),
-                kind: CompletionKind::Command,
-                source: "catalog",
-                trust: "validated",
-            })
-            .collect(),
-        PickerKind::Files | PickerKind::Directories => {
-            let start = line[..cursor.min(line.len())]
-                .rfind(char::is_whitespace)
-                .map_or(0, |index| index.saturating_add(1));
-            directory_items(kind, Path::new("."), start, cursor)
-        }
+        PickerKind::History => history_items(history, line.len()),
+        PickerKind::Palette => palette_items(catalog, line.len()),
+        PickerKind::Files | PickerKind::Directories => filesystem_items(kind, line, cursor),
         PickerKind::Jobs | PickerKind::Data => Vec::new(),
     }
+}
+
+/// Scan at most 4,096 entries for a file or directory picker without command
+/// discovery. Oversized editor input is rejected before building replacements;
+/// paths retain the same literal-name quoting and option-prefix protection.
+pub(super) fn filesystem_items(kind: PickerKind, line: &str, cursor: usize) -> Vec<CompletionItem> {
+    if line.len() > MAX_EDITOR_BUFFER_BYTES {
+        return Vec::new();
+    }
+    let replacement = FilePickerReplacement::at_cursor(line, cursor);
+    directory_items(kind, Path::new("."), &replacement)
+}
+
+/// Build at most 4,096 palette choices for the admitted catalog generation.
+pub(super) fn palette_items(catalog: &Catalog, replace_end: usize) -> Vec<CompletionItem> {
+    catalog
+        .commands
+        .iter()
+        .take(OVERLAY_ITEMS_MAX)
+        .map(|command| CompletionItem {
+            value: command.path.clone(),
+            display: command.path.clone(),
+            summary: command.summary.clone(),
+            detail: format!("{}\n\n{}", command.signature, command.details),
+            replace_start: 0,
+            replace_end,
+            match_indices: Vec::new(),
+            kind: CompletionKind::Command,
+            source: "catalog",
+            trust: "validated",
+        })
+        .collect()
+}
+
+/// Build at most 4,096 history choices without requiring command discovery.
+/// The caller supplies the bounded history snapshot and editor replacement size.
+pub(super) fn history_items(
+    history: &[InteractiveHistoryEntry],
+    replace_end: usize,
+) -> Vec<CompletionItem> {
+    history
+        .iter()
+        .rev()
+        .take(OVERLAY_ITEMS_MAX)
+        .map(|entry| CompletionItem {
+            value: entry.command_line.clone(),
+            display: entry.command_line.clone(),
+            summary: entry.directory.as_ref().map_or_else(
+                || "history".to_owned(),
+                |directory| format!("history · {directory}"),
+            ),
+            detail: entry.status.map_or_else(
+                || "Previously accepted command".to_owned(),
+                |status| format!("Previously accepted command · status {status}"),
+            ),
+            replace_start: 0,
+            replace_end,
+            match_indices: Vec::new(),
+            kind: CompletionKind::History,
+            source: if entry.rank_bias > 0 {
+                "history-local"
+            } else {
+                "history"
+            },
+            trust: "session",
+        })
+        .collect()
 }
 
 fn directory_items(
     kind: PickerKind,
     directory: &Path,
-    replace_start: usize,
-    replace_end: usize,
+    replacement: &FilePickerReplacement,
 ) -> Vec<CompletionItem> {
     let mut entries = fs::read_dir(directory)
         .ok()
@@ -300,27 +335,28 @@ fn directory_items(
         .filter_map(Result::ok)
         .filter(|entry| kind != PickerKind::Directories || entry.path().is_dir())
         .take(OVERLAY_ITEMS_MAX)
-        .map(|entry| {
+        .filter_map(|entry| {
             let path = entry.path();
-            let mut value = entry.file_name().to_string_lossy().into_owned();
+            // Display repair must never select a different filesystem object.
+            let mut display = entry.file_name().to_str()?.to_owned();
             if path.is_dir() {
-                value.push('/');
+                display.push('/');
             }
-            CompletionItem {
-                value: value.clone(),
-                display: value,
+            Some(CompletionItem {
+                value: replacement.encode(&display),
+                display,
                 summary: if path.is_dir() { "directory" } else { "file" }.to_owned(),
                 detail: path.display().to_string(),
-                replace_start,
-                replace_end,
+                replace_start: replacement.range.start,
+                replace_end: replacement.range.end,
                 match_indices: Vec::new(),
                 kind: CompletionKind::Path,
                 source: "filesystem",
                 trust: "local",
-            }
+            })
         })
         .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.value.cmp(&right.value));
+    entries.sort_by(|left, right| left.display.cmp(&right.display));
     entries
 }
 
@@ -376,6 +412,44 @@ mod tests {
             kind: CompletionKind::Command,
             source: "test",
             trust: "validated",
+        }
+    }
+
+    #[test]
+    fn deleting_picker_words_preserves_multibyte_whitespace() {
+        for separator in [" ", "\u{00a0}", "\u{2003}", "\u{3000}"] {
+            let mut overlay = PickerOverlay::new(Arc::new(StablePickerRanker));
+            overlay.open_with_query(
+                Vec::new(),
+                "history",
+                false,
+                &format!("one{separator}two{separator}"),
+            );
+            assert!(overlay.kill_query_word().is_some());
+            assert_eq!(overlay.query(), Some(format!("one{separator}").as_str()));
+            assert!(overlay.kill_query_word().is_some());
+            assert_eq!(overlay.query(), Some(""));
+        }
+    }
+
+    #[test]
+    fn file_picker_replacement_starts_after_the_complete_unicode_separator() {
+        let line = "cat\u{3000}fi";
+        let results = items(
+            PickerKind::Files,
+            &Catalog::builtin(),
+            &[],
+            line,
+            line.len(),
+        );
+        assert!(
+            !results.is_empty(),
+            "the crate fixture directory contains Cargo.toml"
+        );
+        for result in results {
+            assert_eq!(result.replace_start, "cat\u{3000}".len());
+            assert!(line.is_char_boundary(result.replace_start));
+            assert_eq!(result.replace_end, line.len());
         }
     }
 
@@ -443,5 +517,144 @@ mod tests {
             contextual_help_query(&catalog, "git status --short", 18),
             "git status"
         );
+    }
+
+    #[test]
+    fn contextual_help_follows_the_cursor_across_command_boundaries() {
+        let catalog = Catalog::builtin();
+        for separator in [" | ", " && ", " || ", "; ", "\n"] {
+            let line = format!("git status{separator}quirl doctor");
+            assert_eq!(
+                contextual_help_query(&catalog, &line, line.len()),
+                "quirl doctor"
+            );
+            assert_eq!(
+                contextual_help_query(&catalog, &line, "git status".len()),
+                "git status"
+            );
+            let empty_segment = format!("git status{separator}");
+            assert_eq!(
+                contextual_help_query(&catalog, &empty_segment, empty_segment.len()),
+                ""
+            );
+        }
+        for argument in ["'x | y'", "\"x && y\"", "x\\;y", "'x\ny'"] {
+            let line = format!("git status {argument}");
+            assert_eq!(
+                contextual_help_query(&catalog, &line, line.len()),
+                "git status"
+            );
+        }
+    }
+
+    #[test]
+    fn file_picker_preserves_selected_paths_and_surrounding_command_text() {
+        use super::super::editor::EditorState;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "quirl-file-picker-{}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        )));
+        fs::create_dir(&fixture.0).unwrap();
+        let names = [
+            "quarterly report.txt",
+            "it's here.txt",
+            "$notes",
+            "star*file",
+            "semi;colon",
+            "#notes",
+            "~notes",
+            "line\nbreak",
+            "carriage\rreturn",
+            "日本語.txt",
+            "-n",
+            "-two words",
+            "-$notes",
+        ];
+        for name in names {
+            fs::write(fixture.0.join(name), b"selected contents").unwrap();
+        }
+        // Linux permits byte filenames that macOS filesystems reject at creation.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            fs::write(
+                fixture
+                    .0
+                    .join(std::ffi::OsString::from_vec(vec![b'x', 0xff])),
+                b"unrepresentable",
+            )
+            .unwrap();
+        }
+        // A file choice replaces the whole current word, even when the cursor
+        // is inside a quoted word. Arguments and operators outside it survive.
+        for marked in [
+            "cat ▌ keep | cat",
+            "cat ol▌d.txt keep | cat",
+            "cat 'old na▌me' keep | cat",
+            "cat \"old na▌me\" keep | cat",
+            "cat 'unfinished ▌",
+            "cat \"unfinished ▌",
+        ] {
+            let cursor = marked.find('▌').unwrap();
+            let line = marked.replace('▌', "");
+            let replacement = FilePickerReplacement::at_cursor(&line, cursor);
+            let results = directory_items(PickerKind::Files, &fixture.0, &replacement);
+            assert_eq!(
+                results.len(),
+                names.len(),
+                "non-UTF-8 names must not acquire a lossy identity"
+            );
+            for item in results {
+                let mut editor = EditorState::new("emacs", Vec::new());
+                editor.restore(line.clone(), cursor);
+                editor.replace(item.replace_start, item.replace_end, &item.value);
+                let parsed = quirl_syntax::parse_command_list(editor.buffer()).unwrap();
+                assert_eq!(parsed.pipelines.len(), 1);
+                let command = &parsed.pipelines[0].commands[0];
+                assert_eq!(command.words[0], "cat");
+                let expected_argument = if item.display.starts_with('-') {
+                    format!("./{}", item.display)
+                } else {
+                    item.display.clone()
+                };
+                assert_eq!(
+                    command.words[1], expected_argument,
+                    "{marked}: {}",
+                    item.value
+                );
+                assert!(!command.words[1].starts_with('-'));
+                assert_eq!(
+                    fs::canonicalize(fixture.0.join(&command.words[1])).unwrap(),
+                    fs::canonicalize(fixture.0.join(&item.display)).unwrap(),
+                    "the inserted argument must still name the selected file"
+                );
+                let expected_words = if marked.ends_with("keep | cat") { 3 } else { 2 };
+                assert_eq!(command.words.len(), expected_words);
+                if expected_words == 3 {
+                    assert_eq!(command.words[2], "keep");
+                    assert_eq!(parsed.pipelines[0].commands[1].words, ["cat"]);
+                }
+                for part in &command.word_ir[1].parts {
+                    if part.text.contains(['$', '`']) {
+                        assert!(matches!(
+                            part.quoting,
+                            quirl_syntax::Quoting::Single | quirl_syntax::Quoting::Escaped
+                        ));
+                    }
+                    if part.text.contains(['*', '~']) {
+                        assert_ne!(part.quoting, quirl_syntax::Quoting::Unquoted);
+                    }
+                }
+            }
+        }
     }
 }

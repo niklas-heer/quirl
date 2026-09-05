@@ -4326,7 +4326,9 @@ max_message_bytes = 65536
 
         assert_eq!(
             host.reload_if_changed(),
-            ExtensionReloadState::Reloaded { revision: 1 }
+            ExtensionReloadState::Reloaded { revision: 1 },
+            "adapter activation diagnostics: {:?}",
+            host.take_errors()
         );
         for _ in 0..4 {
             assert_eq!(host.reload_if_changed(), ExtensionReloadState::Unchanged);

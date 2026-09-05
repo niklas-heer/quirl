@@ -20,6 +20,30 @@ or x86_64. It installs `quirl` plus its redistribution license files; its
 bounded offline test does not download the completion database or command
 model.
 
+## Start and leave a session
+
+After installation, check the binary and start Quirl from your existing terminal:
+
+```sh
+quirl --version
+quirl
+```
+
+You start in Normal mode. Follow [your first session](/docs/getting-started/first-session)
+for a complete command-and-data example. Press **Ctrl-D on an empty input line**
+to leave Quirl and return to your previous shell; **Ctrl-C** clears unfinished
+input. Trying Quirl this way does not change your login shell.
+
+To remove the Homebrew installation, leave Quirl and run this in your previous
+shell:
+
+```sh
+brew uninstall quirl
+```
+
+Your Quirl configuration, history, and downloaded data are stored separately
+from the installed binary.
+
 ## Direct release archive
 
 Download the package for your operating system and architecture from the
@@ -51,14 +75,15 @@ cd quirl
 cargo run -p quirl-cli
 ```
 
-For a guided, text-only tour of the major surfaces, first install the official
-release with Homebrew. The tour deliberately uses that release rather than a
-binary compiled from the checkout:
+For contributors who have cloned the repository and installed the Homebrew
+release, this optional text-only tour runs against that installed release:
 
 ```sh
-brew install niklas-heer/tap/quirl
 cargo xtask demo
 ```
+
+The [first-session walkthrough](/docs/getting-started/first-session) works with
+just the installed binary and does not require a checkout or Rust.
 
 ![Quirl's narrated deterministic tour: Normal, Data, and AI modes, semantic completion, sandboxed Lua, and the shared command catalog](/quirl-tour.svg)
 

@@ -59,7 +59,11 @@ diagnostic set after every open or full-text change.
 The service retains at most 128 open documents and 16 MiB of aggregate
 document state. Each URI is limited to 8 KiB, each language identifier to 64
 bytes, and each document body to 1 MiB. `didChange` accepts exactly one
-full-document replacement, matching the advertised full-sync mode. Duplicate
+full-document replacement without `range` or `rangeLength`, matching the
+advertised full-sync mode. Opens and changes require an integer document
+version; changes must advance beyond the retained version, though gaps are
+allowed. Incremental, stale, duplicate-version, and unversioned changes leave
+the previous document intact. Duplicate
 `didOpen` notifications atomically replace the existing document; a rejected
 open or change preserves the prior text, version, and accounting. Close,
 shutdown, and exit release retained state. These are UTF-8 byte limits, and

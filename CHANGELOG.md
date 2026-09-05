@@ -4,9 +4,11 @@ Notable user-visible changes to Quirl are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Content under `[Unreleased]` remains candidate work. A versioned entry is cut
-only after its exact commit and artifacts pass the
-[release checklist](docs/release-checklist.md).
+Content under `[Unreleased]` remains candidate work. Release preparation moves
+it into a versioned entry for review; publication follows only after the exact
+candidate and artifacts pass the [release checklist](docs/release-checklist.md).
+The [GitHub Releases](https://github.com/niklas-heer/quirl/releases) page records
+which versions are published.
 
 ## [Unreleased]
 
@@ -20,6 +22,13 @@ only after its exact commit and artifacts pass the
 
 ### Added
 
+- Conversational Codex command assistance with typed plans, executable-plan
+  validation, cancellation, and explicit review before shell execution.
+- A Miller-column directory explorer and an environment explorer in the rich
+  terminal interface, plus native Quirl LSP completion and Neovim integration.
+- Replayable keyboard-session simulation with seeded workflows, styled terminal
+  captures, resize and Unicode input, precise clipboard-protocol checks, and
+  bounded sustained-session resource checks on macOS and Linux.
 - A recorded VHS terminal demo and an asciinema/`asg` text-tour SVG, embedded
   in the README and website to show semantic completion, native pipelines,
   typed data, and Lua in action. `scripts/record-tour.sh` reproduces the tour
@@ -33,6 +42,20 @@ only after its exact commit and artifacts pass the
 
 ### Fixed
 
+- Rich paste rejects oversized edits atomically. The simple fallback preserves
+  pasted newlines until submission, renders pasted terminal controls safely,
+  bounds source and undo retention, and restores the terminal on input failure.
+- Rapid Vi typing followed by Escape preserves source order. Numeric repeats,
+  terminal escape/paste accumulation, input queues and editor batches now have
+  explicit resource bounds; incomplete terminal sequences expire when idle.
+- Interactive startup remains usable while command intelligence loads. Help,
+  completion, resizing, retained output, history recovery, and secondary-text
+  contrast now have focused user-session regressions.
+- Child-process cancellation, stopped jobs, pipeline cleanup, runtime protocol
+  admission, SQLite history limits, atomic file writes, data parsing, extension
+  boundaries, and plugin persistence reject invalid or excessive input earlier.
+- The PTY harness handles bidirectional backpressure without extending deadlines
+  and checks visible labels in reconstructed screens instead of raw byte layout.
 - The homepage demo now exposes playback controls when autoplay or reduced
   motion leaves it paused, reserves its aspect ratio, and shares a stable
   content rail with centered hero copy. The decorative headline treatment no
@@ -42,6 +65,18 @@ only after its exact commit and artifacts pass the
   builds; it now matches either build identity. The closing beat now ends on
   a successful `bash { ... }` dialect island instead of the native-mode
   process-substitution error.
+
+### Upgrade notes
+
+- Linux and macOS remain the supported interactive platforms. Windows and Wasm
+  execution are not part of this release scope.
+- Lua extensions should be reviewed for Lua 5.5 language changes. The sandbox
+  still exposes only the restricted SDK and standard libraries.
+- Resource-limit failures never authorize execution of rejected input. Rich
+  oversized paste preserves the edit; simple-editor input overflow exits the
+  session after restoring terminal modes.
+- Accelerated session tests and styled terminal captures are supporting evidence,
+  not a claim of continuous 100-hour uptime or native IME/clipboard compatibility.
 
 ## [0.1.0] - 2026-08-22
 

@@ -132,25 +132,12 @@ impl FrameModel<'_> {
             );
         }
         let information_requested = self.completion.open || self.runtime.focused_panel().is_some();
-        let information_area = if layout.information.height >= 3 || !information_requested {
-            layout.information
-        } else {
-            // Once a session reaches the bottom row there is no space below the
-            // live prompt. Reuse a bounded tail slice of scrollback as an
-            // overlay so opening completion never moves the prompt.
-            let height = if self.picker_layout == PickerLayout::Full {
-                layout.transcript.height
-            } else {
-                layout.transcript.height.min(12)
-            };
-            Rect::new(
-                layout.transcript.x,
-                layout.transcript.bottom().saturating_sub(height),
-                layout.transcript.width,
-                height,
-            )
-        };
-        if information_requested && layout.information.height < 3 {
+        let information_area = information_area(
+            &layout,
+            information_requested,
+            self.picker_layout == PickerLayout::Full,
+        );
+        if information_area != layout.information {
             frame.render_widget(Clear, information_area);
         }
         self.render_information(frame, information_area);
@@ -954,6 +941,31 @@ struct FrameLayout {
     diagnostic: Option<Rect>,
     information: Rect,
     status: Rect,
+}
+
+/// Prefer enough rows to read documentation, borrowing transcript rows without
+/// moving the editor. Border/source rows alone are not a usable help panel.
+fn information_area(layout: &FrameLayout, requested: bool, full: bool) -> Rect {
+    // Borders, source metadata, and a wrapped usage example can consume eight
+    // rows before the first explanatory paragraph becomes visible.
+    const READABLE_ROWS_MIN: u16 = 12;
+    if !requested || layout.information.height >= READABLE_ROWS_MIN {
+        return layout.information;
+    }
+    let height = if full {
+        layout.transcript.height
+    } else {
+        layout.transcript.height.min(READABLE_ROWS_MIN)
+    };
+    if height <= layout.information.height {
+        return layout.information;
+    }
+    Rect::new(
+        layout.transcript.x,
+        layout.transcript.bottom().saturating_sub(height),
+        layout.transcript.width,
+        height,
+    )
 }
 
 fn frame_layout(
@@ -2365,6 +2377,42 @@ mod tests {
                 .modifier
                 .contains(Modifier::REVERSED)
         );
+    }
+
+    #[test]
+    fn help_uses_readable_transcript_space_when_only_header_rows_remain() {
+        let layout = frame_layout(Rect::new(0, 0, 120, 40), 1, false, 0, 33, true);
+        assert_eq!(layout.information.height, 4);
+        let area = information_area(&layout, true, false);
+        assert_eq!(area.height, 12);
+        assert!(area.bottom() <= layout.input.y);
+        assert_eq!(information_area(&layout, false, false), layout.information);
+
+        let short = frame_layout(Rect::new(0, 0, 60, 8), 1, false, 0, 2, true);
+        assert_eq!(information_area(&short, true, false), short.information);
+        let roomy = frame_layout(Rect::new(0, 0, 120, 40), 1, false, 0, 0, true);
+        assert_eq!(information_area(&roomy, true, false), roomy.information);
+    }
+
+    #[test]
+    fn help_keeps_explanatory_text_visible_at_intermediate_pane_heights() {
+        for rows in 4_u16..12 {
+            let layout = frame_layout(
+                Rect::new(0, 0, 120, 40),
+                1,
+                false,
+                0,
+                usize::from(37 - rows),
+                true,
+            );
+            assert_eq!(layout.information.height, rows);
+            let area = information_area(&layout, true, false);
+            assert_eq!(area.height, 12);
+            assert!(area.bottom() <= layout.input.y);
+        }
+        let layout = frame_layout(Rect::new(0, 0, 120, 40), 1, false, 0, 25, true);
+        assert_eq!(layout.information.height, 12);
+        assert_eq!(information_area(&layout, true, false), layout.information);
     }
 
     #[test]

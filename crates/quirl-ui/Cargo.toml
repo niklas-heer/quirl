@@ -26,3 +26,8 @@ serde_json.workspace = true
 syntect.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Reuse workspace platform constants for nonblocking regular-file admission;
+# opening first with std::fs::File can hang on a substituted FIFO.
+nix.workspace = true

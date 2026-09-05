@@ -1,9 +1,29 @@
+//! Plugin management and durable lockfile publication.
+//!
+//! # Persistence failure model and resource bounds
+//!
+//! Concurrent commands may update the same lock. Mutations hold the bounded
+//! process/OS coordination lock across reading, validation and publication.
+//! Lock serialization and reads stop at 4 MiB. Each mutation enforces a 1024-entry
+//! state-directory limit and refuses to stage more data while a previous lock
+//! transaction temporary or recovery name remains. Existing lock and backup files
+//! are replaced with core's verified atomic transaction, so the active name
+//! stays readable while its complete predecessor is saved as the backup.
+//!
+//! Temporary creation may collide with a file or symlink; 64 create-new attempts
+//! never truncate an existing entry. Initial publication uses a synchronized
+//! private temporary and a no-replace hard link. Returned failures preserve
+//! transaction names with diagnostic context, because portable Rust cannot
+//! condition cleanup on identity. Successful unlink assumes a cooperative
+//! containing namespace, matching core's atomic replacement contract.
+
 use crate::bounded_file::{ReadFileOptions, read_optional_regular_file, read_regular_file};
+use crate::coordination::{self, CoordinationGuard, CoordinationKind, CoordinationWait};
 use crate::lua_worker::LuaWorkerRuntime as LuaRuntime;
 use clap::{Subcommand, ValueEnum};
 use quirl_core::{
-    ContributionKind, ErrorCode, ShellError, escape_json_terminal_controls,
-    escape_terminal_controls,
+    AtomicReplaceOptions, ContributionKind, ErrorCode, ShellError, escape_json_terminal_controls,
+    escape_terminal_controls, replace_file_atomically,
 };
 use quirl_lua::{CommandRegistration, LuaPolicy};
 use quirl_plugin::{
@@ -21,19 +41,22 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 const MANIFEST_FILE: &str = "plugin.toml";
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LOCK_BYTES: usize = 4 * 1024 * 1024;
+const LOCK_TEMPORARY_ATTEMPTS_MAX: usize = 64;
+const LOCK_DIRECTORY_ENTRIES_MAX: usize = 1024;
+static LOCK_TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Subcommand)]
 pub enum PluginCommand {
@@ -148,6 +171,16 @@ pub fn wants_json(command: &PluginCommand) -> bool {
 
 pub fn execute(command: PluginCommand) -> Result<i32, ShellError> {
     let root = plugin_root()?;
+    let _coordination = match &command {
+        PluginCommand::Add { .. }
+        | PluginCommand::Enable { .. }
+        | PluginCommand::Disable { .. }
+        | PluginCommand::Update { .. }
+        | PluginCommand::Remove { .. } => Some(acquire_plugin_lock(&root)?),
+        PluginCommand::Check { .. }
+        | PluginCommand::Permissions { .. }
+        | PluginCommand::Doctor { .. } => None,
+    };
     match command {
         PluginCommand::Check { file, format } => check_legacy(&file, format),
         PluginCommand::Add {
@@ -1100,98 +1133,304 @@ fn load_lock(root: &Path) -> Result<PluginLockfile, ShellError> {
         .map_err(|error| error.with_context(format!("lockfile: {}", path.display())))
 }
 
+fn create_plugin_state_directory(root: &Path) -> Result<(), ShellError> {
+    const DEPTH_MAX: usize = 64;
+    let depth = root.components().take(DEPTH_MAX.saturating_add(1)).count();
+    if depth > DEPTH_MAX {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "plugin state path exceeds its depth limit",
+        )
+        .with_context(format!("limit: {DEPTH_MAX}; observed: at least {depth}"))
+        .with_help("Choose a shorter QUIRL_PLUGIN_HOME path"));
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(root).map_err(|error| {
+        io_error(
+            "cannot create plugin state directory",
+            error,
+            "Choose a private writable QUIRL_PLUGIN_HOME",
+        )
+    })?;
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
+        io_error(
+            "cannot inspect plugin state directory",
+            error,
+            "Choose a private writable QUIRL_PLUGIN_HOME",
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            "plugin state must be a real directory",
+        )
+        .with_help("Replace the plugin state symlink or special file with a private directory"));
+    }
+    Ok(())
+}
+
+fn acquire_plugin_lock(root: &Path) -> Result<CoordinationGuard, ShellError> {
+    create_plugin_state_directory(root)?;
+    coordination::acquire(
+        &root.join(PLUGIN_LOCK_FILE),
+        CoordinationKind::Plugin,
+        CoordinationWait::Explicit,
+    )?
+    .ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::ResourceLimit,
+            "plugin lockfile coordination remained busy",
+        )
+        .with_help("Wait for the other plugin command to finish and retry")
+    })
+}
+
+// Mutation callers hold acquire_plugin_lock across their read-modify-write.
 fn save_lock(root: &Path, lock: &PluginLockfile) -> Result<(), ShellError> {
+    save_lock_with_hook(root, lock, || Ok(()))
+}
+
+fn save_lock_with_hook(
+    root: &Path,
+    lock: &PluginLockfile,
+    after_backup: impl FnOnce() -> io::Result<()>,
+) -> Result<(), ShellError> {
     lock.validate()?;
-    fs::create_dir_all(root).map_err(|error| {
+    let mut writer = LockBytesWriter {
+        bytes: Vec::new(),
+        exceeded: false,
+    };
+    serde_json::to_writer_pretty(&mut writer, lock).map_err(|error| {
+        if writer.exceeded {
+            return lock_bytes_limit_error(MAX_LOCK_BYTES.saturating_add(1));
+        }
         io_error(
-            format!("cannot create plugin state directory {}", root.display()),
-            error,
-            "Choose a writable QUIRL_PLUGIN_HOME",
+            "cannot serialize plugin lockfile",
+            io::Error::other(error),
+            "Report this as a plugin platform schema defect",
         )
     })?;
+    create_plugin_state_directory(root)?;
+    ensure_lock_transactions_clear(root)?;
     let path = root.join(PLUGIN_LOCK_FILE);
-    let temporary = root.join(format!(".{PLUGIN_LOCK_FILE}.tmp-{}", std::process::id()));
     let backup = root.join(format!("{PLUGIN_LOCK_FILE}.bak"));
-    let bytes = serde_json::to_vec_pretty(lock).map_err(|error| {
-        ShellError::new(ErrorCode::Io, "cannot serialize plugin lockfile")
-            .with_context(error.to_string())
-            .with_help("Report this as a plugin platform schema defect")
-    })?;
-    let mut temporary_file = fs::File::create(&temporary).map_err(|error| {
+    let expected = read_optional_regular_file(plugin_read_options(
+        &path,
+        MAX_LOCK_BYTES,
+        "plugin lockfile",
+        "Restore a valid regular plugin lockfile before retrying",
+    ))?;
+    if let Some(previous) = expected {
+        PluginLockfile::from_json(&previous)?;
+        publish_lock_bytes(&backup, &previous)?;
+        after_backup().map_err(|error| {
+            io_error(
+                "plugin lock update stopped after saving backup",
+                error,
+                "The previous lock remains active; retry the update",
+            )
+        })?;
+        replace_file_atomically(
+            &path,
+            &previous,
+            &writer.bytes,
+            AtomicReplaceOptions {
+                bytes_max: MAX_LOCK_BYTES,
+            },
+        )
+    } else {
+        publish_lock_bytes(&path, &writer.bytes)
+    }
+}
+
+fn ensure_lock_transactions_clear(root: &Path) -> Result<(), ShellError> {
+    let entries = fs::read_dir(root).map_err(|error| {
         io_error(
-            format!("cannot create temporary lockfile {}", temporary.display()),
+            "cannot inspect plugin lock transactions",
             error,
-            "Check available space and directory permissions",
+            "Repair the plugin state directory",
         )
     })?;
-    temporary_file.write_all(&bytes).map_err(|error| {
+    let prefixes = [
+        format!(".{PLUGIN_LOCK_FILE}.tmp-"),
+        format!(".{PLUGIN_LOCK_FILE}.bak.tmp-"),
+        format!(".{PLUGIN_LOCK_FILE}.quirl-format-"),
+        format!(".{PLUGIN_LOCK_FILE}.bak.quirl-format-"),
+    ];
+    for (index, entry) in entries.enumerate() {
+        if index >= LOCK_DIRECTORY_ENTRIES_MAX {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "plugin state directory exceeds its entry limit",
+            )
+            .with_context(format!(
+                "limit: {LOCK_DIRECTORY_ENTRIES_MAX}; observed: at least {}",
+                index.saturating_add(1)
+            ))
+            .with_help("Move unrelated files out of the plugin state directory and retry"));
+        }
+        let entry = entry.map_err(|error| {
+            io_error(
+                "cannot inspect plugin lock transaction entry",
+                error,
+                "Repair the plugin state directory",
+            )
+        })?;
+        let name = entry.file_name();
+        if prefixes
+            .iter()
+            .any(|prefix| name.to_string_lossy().starts_with(prefix))
+        {
+            return Err(ShellError::new(ErrorCode::ResourceLimit, "plugin lock has an unfinished transaction")
+                .with_context(format!("pending transaction limit: 0; observed: at least 1; preserved: {}", entry.path().display()))
+                .with_help("Review and move preserved lock transaction files aside before retrying; keep the active lock and backup"));
+        }
+    }
+    Ok(())
+}
+
+struct LockBytesWriter {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+impl Write for LockBytesWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > MAX_LOCK_BYTES {
+            self.exceeded = true;
+            return Err(io::Error::other("plugin lockfile byte limit exceeded"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn lock_bytes_limit_error(observed: usize) -> ShellError {
+    ShellError::new(
+        ErrorCode::ResourceLimit,
+        "plugin lockfile exceeds its byte limit",
+    )
+    .with_context(format!("limit: {MAX_LOCK_BYTES}; observed: {observed}"))
+    .with_help("Remove unused plugin records before retrying")
+}
+
+fn publish_lock_bytes(path: &Path, bytes: &[u8]) -> Result<(), ShellError> {
+    publish_lock_bytes_with_hook(path, bytes, || Ok(()))
+}
+
+fn publish_lock_bytes_with_hook(
+    path: &Path,
+    bytes: &[u8],
+    before_publish: impl FnOnce() -> io::Result<()>,
+) -> Result<(), ShellError> {
+    let previous = read_optional_regular_file(plugin_read_options(
+        path,
+        MAX_LOCK_BYTES,
+        "plugin lockfile document",
+        "Use a regular plugin lock or backup without links",
+    ))?;
+    if let Some(previous) = previous {
+        return replace_file_atomically(
+            path,
+            &previous,
+            bytes,
+            AtomicReplaceOptions {
+                bytes_max: MAX_LOCK_BYTES,
+            },
+        );
+    }
+    let (temporary, mut file) = create_lock_temporary(path)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        validate_lock_temporary(&temporary, &file, 1)?;
+        before_publish()?;
+        // The final name is never overwritten when another entry appears.
+        fs::hard_link(&temporary, path)?;
+        validate_lock_temporary(path, &file, 2)?;
+        validate_lock_temporary(&temporary, &file, 2)?;
+        fs::remove_file(&temporary)?;
+        Ok::<(), io::Error>(())
+    })();
+    result.map_err(|error| {
         io_error(
-            format!("cannot write temporary lockfile {}", temporary.display()),
+            format!("cannot publish plugin lock document {}", path.display()),
             error,
-            "Check available space and directory permissions",
+            "Review preserved transaction files before retrying",
         )
+        .with_context(format!(
+            "preserved transaction temporary: {}",
+            temporary.display()
+        ))
     })?;
-    temporary_file.sync_all().map_err(|error| {
-        io_error(
-            format!("cannot sync temporary lockfile {}", temporary.display()),
-            error,
-            "Check the plugin state filesystem",
+    sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+fn validate_lock_temporary(path: &Path, file: &fs::File, links_expected: u64) -> io::Result<()> {
+    let named = fs::symlink_metadata(path)?;
+    let opened = file.metadata()?;
+    if !named.file_type().is_file() || !opened.file_type().is_file() {
+        return Err(io::Error::other(
+            "plugin lock temporary is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    if named.dev() != opened.dev()
+        || named.ino() != opened.ino()
+        || opened.nlink() != links_expected
+    {
+        return Err(io::Error::other(
+            "plugin lock temporary changed during publication",
+        ));
+    }
+    #[cfg(not(unix))]
+    let _ = links_expected;
+    Ok(())
+}
+
+fn create_lock_temporary(path: &Path) -> Result<(PathBuf, fs::File), ShellError> {
+    let name = path.file_name().ok_or_else(|| {
+        ShellError::new(
+            ErrorCode::InvalidArgument,
+            "plugin lock path has no file name",
         )
+        .with_help("Use a nested plugin state directory")
     })?;
-    drop(temporary_file);
-    let replaced = path.exists();
-    if replaced {
-        match fs::remove_file(&backup) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    for _ in 0..LOCK_TEMPORARY_ATTEMPTS_MAX {
+        let sequence = LOCK_TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = std::ffi::OsString::from(".");
+        temporary_name.push(name);
+        temporary_name.push(format!(".tmp-{}-{sequence}", std::process::id()));
+        let temporary = path.with_file_name(temporary_name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&temporary) {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(io_error(
-                    format!("cannot replace stale lockfile backup {}", backup.display()),
+                    "cannot create private plugin lock temporary",
                     error,
-                    "Repair the plugin state directory before retrying",
+                    "Check available disk space and directory permissions",
                 ));
             }
         }
-        fs::rename(&path, &backup).map_err(|error| {
-            io_error(
-                format!("cannot preserve lockfile backup {}", backup.display()),
-                error,
-                "The current lock remains active; repair the state directory",
-            )
-        })?;
-        if let Err(error) = sync_directory(root) {
-            let rollback = fs::rename(&backup, &path)
-                .map(|()| "previous lock restored".to_owned())
-                .unwrap_or_else(|rollback_error| {
-                    format!(
-                        "rollback failed: {rollback_error}; backup remains at {}",
-                        backup.display()
-                    )
-                });
-            return Err(error.with_context(rollback));
-        }
     }
-    if let Err(error) = fs::rename(&temporary, &path) {
-        let rollback = if replaced {
-            fs::rename(&backup, &path)
-                .map(|()| "previous lock restored".to_owned())
-                .unwrap_or_else(|rollback_error| {
-                    format!(
-                        "rollback failed: {rollback_error}; backup remains at {}",
-                        backup.display()
-                    )
-                })
-        } else {
-            "no previous lock existed".to_owned()
-        };
-        return Err(io_error(
-            format!("cannot atomically install lockfile {}", path.display()),
-            error,
-            "Retry after repairing the state directory",
-        )
-        .with_context(rollback));
-    }
-    sync_directory(root)
+    Err(ShellError::new(
+        ErrorCode::ResourceLimit,
+        "plugin lock temporary creation exhausted its attempt limit",
+    )
+    .with_context(format!("limit: {LOCK_TEMPORARY_ATTEMPTS_MAX}"))
+    .with_help("Remove stale plugin lock temporary entries before retrying"))
 }
 
 #[cfg(unix)]
@@ -1423,6 +1662,174 @@ runtime = "trusted_lua"
 summary = "Bounded plugin"
 "#
         )
+    }
+
+    fn test_locked_plugin(name: &str) -> quirl_plugin::LockedPlugin {
+        let source = trusted_manifest("plugin.lua")
+            .replace("name = \"bounded\"", &format!("name = \"{name}\""));
+        let manifest = parse_plugin_manifest(&source, "test.toml").unwrap();
+        resolve_plugin(
+            &manifest,
+            source.as_bytes(),
+            b"return {}",
+            "file:test.toml",
+            &[],
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap()
+        .0
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictable_lock_temporary_symlink_never_truncates_external_file() {
+        use std::os::unix::fs::symlink;
+        let directory = test_package_directory("temporary-link");
+        fs::create_dir_all(&directory).unwrap();
+        let external = directory.join("external-data");
+        fs::write(&external, b"preserve user data").unwrap();
+        let legacy_temporary =
+            directory.join(format!(".{PLUGIN_LOCK_FILE}.tmp-{}", std::process::id()));
+        let lock = PluginLockfile::empty();
+        save_lock(&directory, &lock).unwrap();
+        symlink(&external, &legacy_temporary).unwrap();
+        for _ in 0..3 {
+            let error = save_lock(&directory, &lock).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
+        }
+        assert_eq!(fs::read(&external).unwrap(), b"preserve user data");
+        assert!(
+            legacy_temporary
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(load_lock(&directory).unwrap(), lock);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_first_publication_preserves_foreign_entry_and_blocks_further_staging() {
+        let directory = test_package_directory("failed-first-save");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(PLUGIN_LOCK_FILE);
+        let lock = PluginLockfile::empty();
+        let bytes = serde_json::to_vec(&lock).unwrap();
+        let error =
+            publish_lock_bytes_with_hook(&path, &bytes, || fs::write(&path, b"concurrent entry"))
+                .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Io);
+        assert_eq!(fs::read(&path).unwrap(), b"concurrent entry");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        for _ in 0..3 {
+            let error = save_lock(&directory, &lock).unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"concurrent entry");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn transaction_admission_accepts_entry_limit_and_rejects_one_more() {
+        let directory = test_package_directory("transaction-entry-limit");
+        fs::create_dir_all(&directory).unwrap();
+        for index in 0..LOCK_DIRECTORY_ENTRIES_MAX {
+            fs::write(directory.join(format!("unrelated-{index}")), b"").unwrap();
+        }
+        ensure_lock_transactions_clear(&directory).unwrap();
+        fs::write(directory.join("one-more"), b"").unwrap();
+        let error = ensure_lock_transactions_clear(&directory).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn interrupted_save_keeps_previous_lock_readable_and_preserves_backup() {
+        let directory = test_package_directory("interrupted-save");
+        let previous = PluginLockfile::empty();
+        save_lock(&directory, &previous).unwrap();
+        let candidate = previous.install(test_locked_plugin("new-plugin")).unwrap();
+        let error = save_lock_with_hook(&directory, &candidate, || {
+            assert_eq!(load_lock(&directory).unwrap(), previous);
+            Err(io::Error::other("injected failure after backup"))
+        })
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Io);
+        assert_eq!(load_lock(&directory).unwrap(), previous);
+        let backup = read_bounded(
+            &directory.join(format!("{PLUGIN_LOCK_FILE}.bak")),
+            MAX_LOCK_BYTES,
+            "backup",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(PluginLockfile::from_json(&backup).unwrap(), previous);
+        save_lock(&directory, &candidate).unwrap();
+        assert_eq!(load_lock(&directory).unwrap(), candidate);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirected_backup_is_rejected_without_changing_active_lock_or_target() {
+        use std::os::unix::fs::symlink;
+        let directory = test_package_directory("backup-link");
+        let previous = PluginLockfile::empty();
+        save_lock(&directory, &previous).unwrap();
+        let external = directory.join("external-data");
+        fs::write(&external, b"preserved backup target").unwrap();
+        symlink(&external, directory.join(format!("{PLUGIN_LOCK_FILE}.bak"))).unwrap();
+        let candidate = previous.install(test_locked_plugin("new-plugin")).unwrap();
+        assert!(save_lock(&directory, &candidate).is_err());
+        assert_eq!(fs::read(&external).unwrap(), b"preserved backup target");
+        assert_eq!(load_lock(&directory).unwrap(), previous);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn oversized_serialization_preserves_previous_lock_and_creates_no_backup() {
+        let directory = test_package_directory("oversized-lock");
+        let previous = PluginLockfile::empty();
+        save_lock(&directory, &previous).unwrap();
+        let mut plugin = test_locked_plugin("large-plugin");
+        plugin.source = "x".repeat(MAX_LOCK_BYTES + 1);
+        let candidate = previous.install(plugin).unwrap();
+        let error = save_lock(&directory, &candidate).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_eq!(load_lock(&directory).unwrap(), previous);
+        assert!(!directory.join(format!("{PLUGIN_LOCK_FILE}.bak")).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_plugin_mutations_preserve_both_installed_entries() {
+        let directory = test_package_directory("concurrent-save");
+        fs::create_dir_all(&directory).unwrap();
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let threads = ["first-plugin", "second-plugin"].map(|name| {
+            let directory = directory.clone();
+            let ready = Arc::clone(&ready);
+            thread::spawn(move || {
+                ready.wait();
+                let _guard = acquire_plugin_lock(&directory).unwrap();
+                let candidate = load_lock(&directory)
+                    .unwrap()
+                    .install(test_locked_plugin(name))
+                    .unwrap();
+                save_lock(&directory, &candidate).unwrap();
+            })
+        });
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let lock = load_lock(&directory).unwrap();
+        assert_eq!(lock.plugins.len(), 2);
+        assert_eq!(lock.plugins[0].name, "first-plugin");
+        assert_eq!(lock.plugins[1].name, "second-plugin");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

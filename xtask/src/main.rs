@@ -86,6 +86,18 @@ enum Task {
     },
     /// Build all public Rust API documentation with warnings denied.
     Docs,
+    /// Internal standalone test of xtask's linked terminal-input dependency.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    ZeroPollCheck,
+    /// Internal PTY child for the canonical nonblocking terminal-input probe.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    ZeroPollProbe {
+        /// Private gate created only after the parent queues the test input.
+        #[arg(long)]
+        gate: PathBuf,
+    },
     /// Run bounded real-terminal checks through the Rust PTY harness.
     #[cfg(unix)]
     RichPty {
@@ -95,6 +107,28 @@ enum Task {
         /// Run only this named check; repeat to select multiple checks.
         #[arg(long)]
         check: Vec<String>,
+    },
+    /// Exercise replayable keyboard-driven user journeys in isolated real PTYs.
+    #[cfg(unix)]
+    SessionSoak {
+        /// Prebuilt Quirl binary; the harness tests an immutable private copy.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// Recorded deterministic seed, independent of the wall clock.
+        #[arg(long, default_value_t = 2_026_090_501)]
+        seed: u64,
+        /// Number of isolated sessions, between 1 and 1000.
+        #[arg(long, default_value_t = 4)]
+        sessions: usize,
+        /// Command journeys per session, between 1 and 200.
+        #[arg(long, default_value_t = 12)]
+        journeys: usize,
+        /// Replay only this zero-based session from the original workload.
+        #[arg(long)]
+        session: Option<usize>,
+        /// Parent directory for private traces, screen images, and the summary.
+        #[arg(long, default_value = "target/session-soak")]
+        output: PathBuf,
     },
     /// Check website mirrors, lint, types, and a production build without rewriting sources.
     WebsiteCheck,
@@ -163,6 +197,10 @@ fn execute(cli: Cli) -> Result<(), TaskError> {
         Task::Check { seed, cases } => task_check(&root, seed, cases),
         Task::Docs => task_docs(&root),
         #[cfg(unix)]
+        Task::ZeroPollCheck => rich_pty::zero_poll::check(),
+        #[cfg(unix)]
+        Task::ZeroPollProbe { gate } => rich_pty::zero_poll::run_probe(&gate),
+        #[cfg(unix)]
         Task::RichPty { binary, check } => {
             let binary = if binary.is_absolute() {
                 binary
@@ -170,6 +208,39 @@ fn execute(cli: Cli) -> Result<(), TaskError> {
                 root.join(binary)
             };
             rich_pty::run(&root, &binary, &check)
+        }
+        #[cfg(unix)]
+        Task::SessionSoak {
+            binary,
+            seed,
+            sessions,
+            journeys,
+            session,
+            output,
+        } => {
+            let binary = binary.unwrap_or_else(|| debug_quirl_binary(&root));
+            let binary = resolve_workspace_path(&root, binary);
+            let summary = rich_pty::soak::run(
+                &binary,
+                rich_pty::soak::SoakOptions {
+                    seed,
+                    sessions,
+                    journeys_per_session: journeys,
+                    only_session: session,
+                    output: resolve_workspace_path(&root, output),
+                },
+            )?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            if summary.failure_count > 0
+                || summary.stopped_reason.is_some()
+                || summary.sessions_completed != summary.sessions_requested
+            {
+                return Err(io::Error::other(
+                    "session soak failed or stopped early; inspect the recorded traces",
+                )
+                .into());
+            }
+            Ok(())
         }
         Task::WebsiteCheck => task_website_check(&root),
         Task::Simulate {
@@ -185,6 +256,15 @@ fn execute(cli: Cli) -> Result<(), TaskError> {
         Task::DemoRecord { expected_sha256 } => task_demo_record(&root, &expected_sha256),
         Task::ReleasePreview => task_release_preview(&root),
         Task::ReleaseGate { expected_sha256 } => task_release_gate(&root, &expected_sha256),
+    }
+}
+
+#[cfg(unix)]
+fn resolve_workspace_path(root: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
     }
 }
 
@@ -210,6 +290,8 @@ fn task_lint(root: &Path) -> Result<(), TaskError> {
 
 fn task_test(root: &Path, seed: u64, cases: usize) -> Result<(), TaskError> {
     let sh = workspace_shell(root)?;
+    #[cfg(unix)]
+    let session_seed = seed;
     let seed = seed.to_string();
     let cases = cases.to_string();
     cmd!(sh, "cargo test --workspace")
@@ -218,11 +300,44 @@ fn task_test(root: &Path, seed: u64, cases: usize) -> Result<(), TaskError> {
         .run()?;
     #[cfg(unix)]
     {
+        // Exercise the patched dependency's std-only admission unit directly,
+        // avoiding unrelated upstream async/example test dependencies.
+        let patch_tests = debug_quirl_binary(root).with_file_name("terminal-input-buffer-tests");
+        cmd!(sh, "rustc --edition=2021 --test vendor/crossterm/src/event/source/unix/input_buffer.rs -o {patch_tests}").run()?;
+        cmd!(sh, "{patch_tests}").run()?;
+        // Compile the actual queue/filter code against inert platform fixtures;
+        // PTY checks below separately exercise the assembled terminal backend.
+        let reader_tests = debug_quirl_binary(root).with_file_name("terminal-input-reader-tests");
+        let tty_feature = r#"feature="use-dev-tty""#;
+        let paste_feature = r#"feature="bracketed-paste""#;
+        cmd!(sh, "rustc --edition=2021 --test vendor/crossterm/src/event/quirl_read_tests.rs --cfg {tty_feature} --cfg {paste_feature} -o {reader_tests}").run()?;
+        cmd!(sh, "{reader_tests}").run()?;
+        // This PTY verifies xtask's linked dependency; it is deliberately not
+        // counted as a check of the separately selected Quirl product binary.
+        rich_pty::zero_poll::check()?;
         cmd!(sh, "cargo build -p quirl-cli")
             .env("QUIRL_TEST_SEED", &seed)
             .env("QUIRL_TEST_CASES", &cases)
             .run()?;
-        rich_pty::run(root, &debug_quirl_binary(root), &[])?;
+        let binary = debug_quirl_binary(root);
+        rich_pty::run(root, &binary, &[])?;
+        let summary = rich_pty::soak::run(
+            &binary,
+            rich_pty::soak::SoakOptions {
+                seed: session_seed,
+                sessions: 1,
+                journeys_per_session: 12,
+                only_session: None,
+                output: binary.parent().unwrap_or(root).join("session-soak-check"),
+            },
+        )?;
+        if summary.failure_count > 0 || summary.sessions_completed != 1 {
+            return Err(io::Error::other(format!(
+                "keyboard session smoke failed; inspect {}",
+                summary.report_directory.display()
+            ))
+            .into());
+        }
     }
     cmd!(sh, "cargo run -p quirl-cli -- test examples/lua_tests.lua")
         .env("QUIRL_TEST_SEED", &seed)

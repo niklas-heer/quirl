@@ -2,6 +2,7 @@ use super::{completion::CompletionState, editor::EditorState};
 use crate::{SurfaceSymbols, theme::Theme};
 use quirl_syntax::Mode;
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 pub struct StatusBarModel<'a> {
@@ -79,9 +80,9 @@ impl StatusBarModel<'_> {
             "Enter send · Esc close".to_owned()
         } else if self.completion.open && self.completion.automatic {
             if unicode {
-                "↑↓ select · Tab choose · Enter run · Esc close".to_owned()
+                "↑ history · ↓/Tab choose · Enter run · Esc close".to_owned()
             } else {
-                "up/down select | Tab choose | Enter run | Esc close".to_owned()
+                "up history | down/Tab choose | Enter run | Esc close".to_owned()
             }
         } else if self.completion.open {
             if unicode {
@@ -100,7 +101,25 @@ impl StatusBarModel<'_> {
                 SurfaceSymbols::Plain => format!("quirl {}", super::product_identity()),
             }
         };
-        let left_text = left.join(separator);
+        let left_text = fit_columns(&left.join(separator), usize::from(self.width));
+        let right_columns = usize::from(self.width)
+            .saturating_sub(UnicodeWidthStr::width(left_text.as_str()))
+            .saturating_sub(1);
+        // Keep the dismissal key discoverable when a narrow window cannot fit
+        // the full interaction legend. Fit every region by terminal columns,
+        // preserving whole graphemes so wide notices cannot push hints offscreen.
+        let right = if UnicodeWidthStr::width(right.as_str()) > right_columns {
+            let compact = if self.mode == Mode::Natural && self.assistant_busy {
+                "Esc cancel"
+            } else if self.completion.open || self.mode == Mode::Natural {
+                "Esc close"
+            } else {
+                &right
+            };
+            fit_columns(compact, right_columns)
+        } else {
+            right
+        };
         let fixed = UnicodeWidthStr::width(left_text.as_str())
             .saturating_add(UnicodeWidthStr::width(right.as_str()))
             .saturating_add(UnicodeWidthStr::width(separator).saturating_mul(2));
@@ -108,7 +127,7 @@ impl StatusBarModel<'_> {
         let center = if self.width < 60 {
             String::new()
         } else {
-            center.chars().take(available).collect()
+            fit_columns(&center, available)
         };
         let mut spans = vec![Span::styled(left_text, theme.accent(self.mode))];
         if !center.is_empty() {
@@ -127,5 +146,62 @@ impl StatusBarModel<'_> {
             spans.push(Span::styled(right, theme.dim()));
         }
         Line::from(spans).style(theme.status())
+    }
+}
+
+fn fit_columns(text: &str, columns: usize) -> String {
+    let mut occupied = 0_usize;
+    text.graphemes(true)
+        .take_while(|grapheme| {
+            occupied = occupied.saturating_add(UnicodeWidthStr::width(*grapheme));
+            occupied <= columns
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quirl_catalog::Catalog;
+
+    #[test]
+    fn column_clipping_preserves_combining_and_joined_graphemes() {
+        assert_eq!(fit_columns("e\u{301}界👨‍👩‍👧‍👦z", 5), "e\u{301}界👨‍👩‍👧‍👦");
+        assert_eq!(fit_columns("界z", 1), "");
+        assert_eq!(fit_columns("abc", 0), "");
+    }
+
+    #[test]
+    fn status_content_fits_narrow_windows_and_wide_character_notices() {
+        let editor = EditorState::new("emacs", Vec::new());
+        let mut completion = CompletionState::new(Catalog::builtin(), None);
+        for open in [false, true] {
+            completion.open = open;
+            for width in [16, 32, 40, 60, 80, 120] {
+                let line = StatusBarModel {
+                    editor: &editor,
+                    completion: &completion,
+                    mode: Mode::Command,
+                    width,
+                    hints: true,
+                    notice: Some("界面提示界面提示界面提示界面提示界面提示界面提示界面提示"),
+                    timings: None,
+                    symbols: SurfaceSymbols::Unicode,
+                    assistant_busy: false,
+                    assistant_has_proposal: false,
+                }
+                .line(Theme::new(false));
+                assert!(
+                    line.width() <= usize::from(width),
+                    "width={width}; open={open}; line={line}"
+                );
+                if open && width >= 32 {
+                    assert!(
+                        line.to_string().contains("Esc close"),
+                        "width={width}; line={line}"
+                    );
+                }
+            }
+        }
     }
 }

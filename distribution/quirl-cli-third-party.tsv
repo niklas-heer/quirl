@@ -40,7 +40,7 @@ crc32fast	1.5.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-l
 crossbeam-deque	0.8.7	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/crossbeam-rs/crossbeam
 crossbeam-epoch	0.9.20	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/crossbeam-rs/crossbeam
 crossbeam-utils	0.8.22	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/crossbeam-rs/crossbeam
-crossterm	0.29.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/crossterm-rs/crossterm
+crossterm	0.29.0	linux,macos	MIT	vendored+vendor/crossterm	https://github.com/crossterm-rs/crossterm
 crypto-common	0.1.7	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/RustCrypto/traits
 darling	0.20.11	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/TedDriggs/darling
 darling	0.24.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/TedDriggs/darling
@@ -65,6 +65,7 @@ fallible-iterator	0.3.0	linux,macos	MIT/Apache-2.0	registry+https://github.com/r
 fallible-streaming-iterator	0.1.9	linux,macos	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/sfackler/fallible-streaming-iterator
 fd-lock	4.0.4	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/yoshuawuyts/fd-lock
 fdeflate	0.3.7	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/image-rs/fdeflate
+filedescriptor	0.8.3	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/wezterm/wezterm
 find-msvc-tools	0.1.11	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-lang/cc-rs
 flate2	1.1.10	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-lang/flate2-rs
 fnv	1.0.7	linux,macos	Apache-2.0 / MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/servo/rust-fnv
@@ -157,7 +158,7 @@ rawpointer	0.2.1	linux,macos	MIT/Apache-2.0	registry+https://github.com/rust-lan
 rayon	1.12.0	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rayon-rs/rayon
 rayon-cond	0.4.0	linux,macos	Apache-2.0/MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/cuviper/rayon-cond
 rayon-core	1.13.0	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rayon-rs/rayon
-reedline	0.49.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/nushell/reedline
+reedline	0.49.0	linux,macos	MIT	vendored+vendor/reedline	https://github.com/nushell/reedline
 regex	1.13.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-lang/regex
 regex-automata	0.4.18	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-lang/regex
 regex-syntax	0.8.11	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-lang/regex
@@ -203,7 +204,9 @@ syn	2.0.119	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/
 syn	3.0.3	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/syn
 syntect	5.3.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/trishume/syntect
 textwrap	0.16.2	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/mgeisler/textwrap
+thiserror	1.0.69	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/thiserror
 thiserror	2.0.20	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/thiserror
+thiserror-impl	1.0.69	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/thiserror
 thiserror-impl	2.0.20	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/thiserror
 tokenizers	0.21.4	linux,macos	Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/huggingface/tokenizers
 toml	0.9.12+spec-1.1.0	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/toml-rs/toml

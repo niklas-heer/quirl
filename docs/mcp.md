@@ -25,7 +25,12 @@ For existing clients, Quirl also accepts legacy `initialize` negotiation for
 connection selects exactly one era; modern metadata and legacy negotiation
 cannot be mixed.
 
-Messages, nested JSON, tool input, and tool output are bounded. Oversized tool
+Messages and responses are limited to 1 MiB, methods to 128 UTF-8 bytes, and
+encoded parameters to 256 KiB. Requests allow at most 32 nested containers.
+Admission rejects invalid envelopes and exceeded limits before changing the
+connection's negotiation state. An explicit null request ID receives a
+response; a valid request without an ID is a notification and receives none.
+Malformed ID-less envelopes still receive an invalid-request error. Oversized tool
 results return a JSON-RPC error while the stdio connection remains usable.
 
 MCP intentionally exposes the compiled builtin catalog only. It does not read

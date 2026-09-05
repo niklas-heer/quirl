@@ -88,7 +88,7 @@ impl Palette {
         accent_data: Rgb::new(187, 154, 247),
         context_primary: Rgb::new(125, 207, 255),
         context_secondary: Rgb::new(187, 154, 247),
-        muted: Rgb::new(86, 95, 137),
+        muted: Rgb::new(154, 165, 206),
         border: Rgb::new(65, 72, 104),
         status_background: Rgb::new(36, 40, 59),
         error: Rgb::new(247, 118, 142),
@@ -174,8 +174,9 @@ impl Theme {
     }
 
     pub(crate) fn dim(self) -> RatatuiStyle {
+        // The palette already distinguishes secondary text. Applying terminal
+        // dimming again makes help sources and dismissal hints hard to read.
         self.ratatui_foreground(self.palette.muted)
-            .add_modifier(Modifier::DIM)
     }
 
     pub(crate) fn border(self) -> RatatuiStyle {

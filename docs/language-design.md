@@ -325,6 +325,18 @@ Quirl targets the copy-and-paste surface first. Full Bash and Zsh are separate e
 | C3 · Source state | Deliberately partial | Import cwd, exported env, aliases when representable | State-diff protocol; reject traps and opaque functions |
 | C4 · Exact emulation | No promise | Every option, trap, framework, obscure expansion | Run the requested `bash` or `zsh` |
 
+In current development source, Normal-mode input separates commands at unquoted
+line feeds, including multiline paste. Blank lines and a final line feed add no
+empty command. A line feed after `|`, `&&`, or `||` continues that operation;
+backslash followed by a line feed continues a word without adding a character.
+Quoted line feeds stay literal. Outside quotes, CR is whitespace, so ordinary
+CRLF also separates commands; backslash-CRLF retains the escaped CR and still
+separates at LF. Explicit trailing semicolons and unfinished operators remain
+errors, and `&` must still end the complete list. Native `#` comments are not
+part of this lexer; use a Bash/Zsh island for comment-bearing shell snippets.
+The command grammar and native runner advertise protocol version 3 for these
+line semantics; this does not change the immutable `v0.1.0` release.
+
 ```sh
 # Ordinary input: native, fast, familiar
 cargo test --workspace && echo 'tests passed'

@@ -27,6 +27,21 @@
       "stdout": "done"
     },
     {
+      "id": "physical_line_sequence",
+      "source": "printf A\nprintf B\n",
+      "stdout": "AB"
+    },
+    {
+      "id": "physical_line_operator_continuation",
+      "source": "printf A |\n tr A B &&\n printf C ||\n printf D",
+      "stdout": "BC"
+    },
+    {
+      "id": "physical_line_quoting_and_escape",
+      "source": "printf '%s' 'a\nb' \"c\nd\" e\\\nf",
+      "stdout": "a\nbc\ndef"
+    },
+    {
       "id": "output_redirect",
       "source": "printf redirected > /dev/null && printf done",
       "stdout": "done"
@@ -65,8 +80,8 @@
     },
     {
       "id": "lists_and_boolean_connectors", "level": "C1", "implementation": "native",
-      "forms": ["left && right", "left || right", "first; second"],
-      "limitations": "Newlines are handled by the script reader; a trailing connector remains a recoverable syntax error."
+      "forms": ["left && right", "left || right", "first; second", "first\nsecond", "producer |\nconsumer", "command continued\\\nargument"],
+      "limitations": "Unquoted LF separates command lists; leading, blank, and trailing LF are ignored. LF after |, &&, or || continues the operator, and backslash-LF is removed. Quoted LF stays literal. CR outside quotes is whitespace; backslash-CRLF retains an escaped CR and separates at LF. Explicit trailing connectors remain recoverable syntax errors; # comments are not part of this native lexer."
     },
     {
       "id": "export_assignment", "level": "C1", "implementation": "native",

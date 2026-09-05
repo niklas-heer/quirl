@@ -1096,7 +1096,18 @@ fn parse_transform(
             return Err(usage_error(
                 span,
                 format!("invalid arguments for `{known}`"),
-                "Check the focused data transform syntax in `help data`",
+                match known {
+                    "get" => "Use `get <field.path>` (append `?` for an optional path)",
+                    "select" => "Use `select <field> [<field> ...]`",
+                    "sort" => "Use `sort <field.path> [asc|desc]`",
+                    "take" => "Use `take <count>` with a non-negative integer",
+                    "from" => "Use `from json` to parse a JSON string value",
+                    "to" => "Use `to json` to serialize a typed value",
+                    "length" => "Use `length` without arguments",
+                    "first" => "Use `first` without arguments",
+                    "lines" => "Use `lines` without arguments",
+                    _ => "Check the data transform syntax in `help data`",
+                },
             ));
         }
         _ => {
@@ -1105,7 +1116,10 @@ fn parse_transform(
                 Some(suggestion) => {
                     format!("Did you mean `{suggestion}`? Otherwise {default_help}")
                 }
-                None => format!("Use {default_help}"),
+                None => format!(
+                    "Use {}",
+                    default_help.strip_prefix("use ").unwrap_or(default_help)
+                ),
             };
             return Err(syntax_error(
                 format!("unknown data transform `{command}`"),
@@ -2117,6 +2131,29 @@ mod tests {
 
         let error = parse("[{\"a\":1}] | zzzzzzzzzz").unwrap_err();
         assert!(!error.help.contains("Did you mean"));
+    }
+
+    #[test]
+    fn malformed_transform_arguments_offer_the_exact_recovery_syntax() {
+        for (stage, usage) in [
+            ("get", "get <field.path>"),
+            ("select", "select <field>"),
+            ("sort", "sort <field.path> [asc|desc]"),
+            ("take", "take <count>"),
+            ("from", "from json"),
+            ("to", "to json"),
+            ("length extra", "length` without arguments"),
+            ("first extra", "first` without arguments"),
+            ("lines extra", "lines` without arguments"),
+        ] {
+            let source = format!("[] | {stage}");
+            let error = parse(&source).unwrap_err();
+            assert!(error.help.contains(usage), "{stage}: {}", error.help);
+            assert_eq!(source.get(error.start..error.end), Some(stage));
+        }
+        let error = parse("[] | help").unwrap_err();
+        assert!(error.help.starts_with("Use `get`"));
+        assert!(!error.help.contains("Use use"));
     }
 
     #[test]

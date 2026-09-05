@@ -30,7 +30,12 @@ clap = { version = "4.5", features = ["derive"] }
 # Rich reports are limited to the developer-only xtask binary. Product errors
 # continue to use the serialized quirl_core::ShellError contract.
 color-eyre = { version = "=0.6.5", default-features = false, features = ["track-caller"] }
-crossterm = "0.29"
+# The Unix MIO backend can discard readable keyboard readiness when it returns
+# SIGWINCH from the same edge-triggered poll batch, stranding queued input.
+# Use the existing level-triggered backend so unread bytes remain observable.
+# It retains the same parser, 1 KiB read buffer, raw-mode owner, and polling;
+# filedescriptor is already present through the terminal dependency graph.
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
 getrandom = "0.3"
 # Explorer image previews admit only four common raster formats and disable
 # encoders, parallelism, and high-cost formats such as AVIF, EXR, and TIFF.
@@ -66,6 +71,10 @@ xshell = "0.2.7"
 # compatible. Keep this source-identical patch until upstream accepts
 # lua-src 551.x, then remove the patch and vendor/mlua-sys together.
 mlua-sys = { path = "vendor/mlua-sys" }
+# ADR 0031: bound Unix terminal input before events reach the editor.
+crossterm = { path = "vendor/crossterm" }
+# Bound simple-editor input/undo and escape source controls at rendering.
+reedline = { path = "vendor/reedline" }
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }

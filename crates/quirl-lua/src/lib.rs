@@ -1199,7 +1199,7 @@ const BUILTIN_THEMES: &[BuiltinTheme] = &[
         "#bb9af7",
         "#7dcfff",
         "#bb9af7",
-        "#565f89",
+        "#9aa5ce",
         "#414868",
         "#24283b",
         "#f7768e",
@@ -1559,7 +1559,7 @@ pub const HOST_API: &[HostApiSpec] = &[
     },
     HostApiSpec {
         path: "quirl.process.run",
-        summary: "Run a command through the composed bounded native process host.",
+        summary: "Run a command through the composed bounded native process host. Deadline-controlled Unix calls reject FIFO redirections and bound final pipe draining; use native pipes or regular files.",
         parameters: COMMAND_PARAMETER,
         returns: "quirl.ProcessResult",
         capability: Some("process.spawn"),
@@ -1980,6 +1980,21 @@ impl LuaRuntime {
     }
 
     /// Evaluate an immutable configuration source snapshot and validate its schema.
+    ///
+    /// Before typed deserialization, the returned value must fit the shared Lua
+    /// return limits: 256 KiB of retained string bytes, 4112 key/value nodes,
+    /// nesting depth 16, and positive integer keys no greater than 4096. Cycles,
+    /// repeated tables, and unsupported Lua values are rejected. Limit violations
+    /// return [`ErrorCode::ResourceLimit`] before Rust allocates configuration
+    /// strings or collections.
+    ///
+    /// # Failure model and invariants
+    ///
+    /// A small source may construct a deep table or repeat one Lua string many
+    /// times, expanding into separate Rust allocations outside the VM budget.
+    /// The bounded iterative shape walk counts each retained string occurrence
+    /// before decoding. Only a fully admitted, migrated, validated configuration
+    /// is returned, so callers can preserve their active configuration on failure.
     pub fn load_config_source(
         &self,
         source: &str,
@@ -1995,6 +2010,8 @@ impl LuaRuntime {
             .set_name(source_name)
             .eval::<Value>()
             .map_err(|error| lua_error(error, Some(path), source.len()))?;
+        validate_lua_return_shape(&value)
+            .map_err(|error| error.with_context(format!("configuration source: {source_name}")))?;
         let mut config = self.lua.from_value::<QuirlConfig>(value).map_err(|error| {
             validation_error(
                 &path.display().to_string(),
@@ -5532,6 +5549,82 @@ mod tests {
         assert_eq!(config.editor.keymap, "helix");
         assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(config.prompt.symbols, "auto");
+    }
+
+    #[test]
+    fn config_return_checks_retained_bytes_before_deserializing_repeated_strings() {
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        // The shared guard counts the prompt and left keys as retained strings.
+        let key_bytes = "prompt".len() + "left".len();
+        let payload_bytes = MAX_LUA_RETURN_RETAINED_BYTES - key_bytes;
+        let source =
+            format!("return {{ prompt = {{ left = {{ string.rep('x', {payload_bytes}) }} }} }}");
+        let config = runtime
+            .load_config_source(&source, "exact-limit.lua")
+            .unwrap();
+        assert_eq!(config.prompt.left[0].len(), payload_bytes);
+        let excessive = format!(
+            "return {{ prompt = {{ left = {{ string.rep('x', {}) }} }} }}",
+            payload_bytes + 1
+        );
+        let error = runtime
+            .load_config_source(&excessive, "over-limit.lua")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("retained bytes"))
+        );
+
+        let repeated = "local piece = string.rep('x', 1024); local left = {}; for i = 1, 257 do left[i] = piece end; return { prompt = { left = left } }";
+        let error = runtime
+            .load_config_source(repeated, "repeated-string.lua")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        assert_eq!(
+            runtime
+                .load_config_source("return {}", "valid-after-error.lua")
+                .unwrap(),
+            QuirlConfig::default()
+        );
+    }
+
+    #[test]
+    fn config_return_checks_nodes_depth_and_cycles_before_typed_decoding() {
+        let runtime = LuaRuntime::new(LuaPolicy::config()).unwrap();
+        // Root, prompt and left contribute five nodes; each entry adds key/value.
+        let entries_max = (MAX_LUA_RETURN_NODES - 5) / 2;
+        let source = format!(
+            "local left = {{}}; for i = 1, {entries_max} do left[i] = 'x' end; return {{ prompt = {{ left = left }} }}"
+        );
+        let config = runtime
+            .load_config_source(&source, "exact-nodes.lua")
+            .unwrap();
+        assert_eq!(config.prompt.left.len(), entries_max);
+        let excessive = format!(
+            "local left = {{}}; for i = 1, {} do left[i] = 'x' end; return {{ prompt = {{ left = left }} }}",
+            entries_max + 1
+        );
+        let error = runtime
+            .load_config_source(&excessive, "over-nodes.lua")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        let deep = format!(
+            "local value = {{}}; for i = 1, {MAX_LUA_RETURN_DEPTH} do value = {{ value }} end; return value"
+        );
+        let error = runtime.load_config_source(&deep, "deep.lua").unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResourceLimit);
+        let error = runtime
+            .load_config_source(
+                "local value = {}; value.prompt = value; return value",
+                "cycle.lua",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Validation);
+        assert!(error.message.contains("cyclic or repeated table"));
     }
 
     #[test]

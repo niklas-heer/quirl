@@ -1,5 +1,27 @@
 # Manual PTY job-control check
 
+Host-controlled native execution applies its cancellation and deadline to
+redirection admission, `fg`, and final stream draining. Unix FIFO file
+redirections are rejected in these bounded requests; use a native pipeline or
+regular file instead. `/dev/null` remains supported. Trusted-local convenience
+execution retains ordinary FIFO rendezvous through its Rust API. The Quirl
+interactive prompt also uses host-controlled execution; to use a FIFO there,
+put its redirection inside an explicitly invoked external shell, for example
+`sh -c 'cat < /path/to/fifo'`.
+
+After direct children finish, capture drains are limited to 100 ms and the
+remaining request deadline. Detached descendants must close or redirect inherited
+streams: process-group signals do not reach a descendant that has created a new
+session. Pipe readers and writers shut down without waiting indefinitely for
+such descriptors to close.
+
+Unix job listings are built incrementally within 1 MiB. Captured text also obeys
+a tighter request capture budget; direct terminal and file output keep their own
+1 MiB bound. Direct human output escapes command controls, and stop
+notifications show at most 256 source bytes with a visible truncation marker.
+Captured and file-redirected listings retain raw command source; typed job
+metadata retains the complete command.
+
 ## Failure model and invariants
 
 The native executor treats pipeline construction as a transaction and terminal

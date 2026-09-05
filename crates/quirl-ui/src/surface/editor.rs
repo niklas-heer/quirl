@@ -416,22 +416,24 @@ impl EditorState {
         self.pasted_lines = None;
         self.resource_notice = None;
         let available = MAX_EDITOR_BUFFER_BYTES.saturating_sub(self.buffer.len());
-        let insert_bytes = char_boundary_at_or_before(text, available.min(text.len()));
-        if insert_bytes == 0 {
-            if !text.is_empty() {
-                self.set_buffer_limit_notice("paste");
-            }
+        // Pasted source is one admission transaction: truncating it can turn a
+        // reviewed command into a different executable prefix. Reject before
+        // recording undo or mutating the buffer, cursor, or revision.
+        if text.len() > available {
+            self.resource_notice = Some(format!(
+                "paste rejected: {} bytes exceed {available} available editor bytes (limit {MAX_EDITOR_BUFFER_BYTES})",
+                text.len()
+            ));
+            return;
+        }
+        if text.is_empty() {
             return;
         }
         self.record_edit();
-        self.buffer.insert_str(self.cursor, &text[..insert_bytes]);
-        self.cursor = self.cursor.saturating_add(insert_bytes);
+        self.buffer.insert_str(self.cursor, text);
+        self.cursor = self.cursor.saturating_add(text.len());
         self.revision = self.revision.saturating_add(1);
-        if insert_bytes < text.len() {
-            self.set_buffer_limit_notice("paste");
-        } else {
-            self.pasted_lines = Some(text.lines().count().max(1));
-        }
+        self.pasted_lines = Some(text.lines().count().max(1));
     }
 
     pub fn accept_suggestion(&mut self) -> bool {
@@ -571,17 +573,6 @@ impl EditorState {
     }
 }
 
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "the decrement is guarded by index being nonzero"
-)]
-fn char_boundary_at_or_before(value: &str, mut index: usize) -> usize {
-    while index > 0 && !value.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
-}
-
 fn push_undo_state(
     stack: &mut VecDeque<(String, usize)>,
     retained_bytes: &mut usize,
@@ -669,9 +660,19 @@ fn line_end(value: &str, cursor: usize) -> usize {
 fn word_left(value: &str, cursor: usize) -> usize {
     let prefix = &value[..cursor.min(value.len())];
     let trimmed = prefix.trim_end_matches(char::is_whitespace);
-    trimmed
-        .rfind(char::is_whitespace)
-        .map_or(0, |index| index.saturating_add(1))
+    after_last_whitespace(trimmed)
+}
+
+// Whitespace may occupy multiple UTF-8 bytes; every editor and picker range
+// must begin after the complete scalar, never one byte after its start.
+pub(super) fn after_last_whitespace(value: &str) -> usize {
+    value
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| {
+            index.saturating_add(character.len_utf8())
+        })
 }
 
 #[allow(
@@ -692,6 +693,28 @@ fn word_right(value: &str, cursor: usize) -> usize {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
+
+    #[test]
+    fn word_motion_and_deletion_keep_unicode_whitespace_boundaries() {
+        for separator in [" ", "\t", "\u{00a0}", "\u{2003}", "\u{3000}"] {
+            let prefix = format!("echo{separator}");
+            let original = format!("{prefix}value{separator}");
+            let mut editor = EditorState::new("emacs", Vec::new());
+            editor.insert_paste(&original);
+            editor.apply(EditAction::MoveWordLeft);
+            assert_eq!(editor.cursor(), prefix.len());
+            assert!(editor.buffer().is_char_boundary(editor.cursor()));
+            assert!(editor.apply(EditAction::Insert('x')));
+            assert_eq!(editor.buffer(), format!("{prefix}xvalue{separator}"));
+
+            let mut editor = EditorState::new("emacs", Vec::new());
+            editor.insert_paste(&original);
+            assert!(editor.apply(EditAction::KillWord));
+            assert_eq!(editor.buffer(), prefix);
+            assert!(editor.apply(EditAction::Yank));
+            assert_eq!(editor.buffer(), original);
+        }
+    }
 
     #[test]
     fn deletion_and_motion_follow_grapheme_boundaries() {
@@ -836,13 +859,35 @@ mod tests {
     }
 
     #[test]
-    fn oversized_paste_is_utf8_safe_and_reports_the_editor_limit() {
+    fn oversized_paste_is_rejected_atomically_and_reports_the_editor_limit() {
         let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("echo safe");
+        editor.apply(EditAction::MoveLeft);
+        let cursor = editor.cursor();
+        let revision = editor.revision();
         let input = format!("{}💥", "a".repeat(MAX_EDITOR_BUFFER_BYTES));
         editor.insert_paste(&input);
+        assert_eq!(editor.buffer(), "echo safe");
+        assert_eq!(editor.cursor(), cursor);
+        assert_eq!(editor.revision(), revision);
+        assert!(editor.resource_notice().unwrap().contains("paste rejected"));
+        assert!(editor.apply(EditAction::Undo));
+        assert_eq!(editor.buffer(), "");
+    }
+
+    #[test]
+    fn paste_admits_the_exact_remaining_byte_limit_and_rejects_one_more() {
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("é");
+        let input = "x".repeat(MAX_EDITOR_BUFFER_BYTES - "é".len());
+        editor.insert_paste(&format!("{input}x"));
+        assert_eq!(editor.buffer(), "é");
+        editor.insert_paste(&input);
         assert_eq!(editor.buffer().len(), MAX_EDITOR_BUFFER_BYTES);
-        assert!(editor.buffer().is_char_boundary(editor.buffer().len()));
-        assert!(editor.resource_notice().unwrap().contains("paste limited"));
+        assert!(editor.resource_notice().is_none());
+        editor.insert_paste("x");
+        assert_eq!(editor.buffer().len(), MAX_EDITOR_BUFFER_BYTES);
+        assert!(editor.resource_notice().unwrap().contains("paste rejected"));
     }
 
     #[test]

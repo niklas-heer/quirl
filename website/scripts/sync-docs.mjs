@@ -71,6 +71,9 @@ const documents = [
   ['docs/decisions/0026-rust-native-releases-and-runtime-assets.md', 'architecture/decisions/0026-rust-native-releases-and-runtime-assets.mdx'],
   ['docs/decisions/0027-lua-5-5-1-runtime.md', 'architecture/decisions/0027-lua-5-5-1-runtime.mdx'],
   ['docs/decisions/0029-codex-command-planner.md', 'architecture/decisions/0029-codex-command-planner.mdx'],
+  ['docs/decisions/0030-level-triggered-terminal-input.md', 'architecture/decisions/0030-level-triggered-terminal-input.mdx'],
+  ['docs/decisions/0031-bounded-terminal-input.md', 'architecture/decisions/0031-bounded-terminal-input.mdx'],
+  ['docs/decisions/0032-bounded-simple-editor.md', 'architecture/decisions/0032-bounded-simple-editor.mdx'],
 ];
 
 const pageBySource = new Map(documents);

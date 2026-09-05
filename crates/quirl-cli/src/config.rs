@@ -386,7 +386,7 @@ fn migrate(file: &Path, dry_run: bool, format: ConfigOutputFormat) -> Result<i32
             ErrorCode::InvalidArgument,
             "configuration migration is preview-only",
         )
-        .with_help("Pass `--dry-run`; Quirl 0.1.0 never rewrites configuration during migration"));
+        .with_help("Pass `--dry-run`; configuration migration only previews changes and never rewrites the file"));
     }
     let source = read_config_source(file)?;
     let (source_schema_version, candidate) = migration_candidate(&source)?;
