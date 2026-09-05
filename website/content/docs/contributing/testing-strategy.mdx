@@ -59,9 +59,12 @@ rather than replace, real terminal checks on supported hardware.
 The workspace Cargo configuration omits unused full-text and spatial modules
 from bundled SQLite. Quirl's internal catalog, history, and intelligence stores
 use ordinary tables. Keep those build settings when reproducing release-size
-measurements. The binary's 12 MiB hard ceiling is recorded in
-[ADR 0034](/docs/architecture/decisions/0034-release-binary-budget); historical measurements retain
-the ceiling used for their named artifact.
+measurements. [ADR 0036](/docs/architecture/decisions/0036-advisory-release-binary-size)
+makes executable size advisory by default: retain exact byte counts and the
+warning above 8 MiB, and investigate growth without a clear user benefit.
+An explicit `--max-binary-bytes` still enforces the caller's requested maximum.
+Missing measurement or identity evidence remains a failure. Historical reports
+retain their original limits; all latency and cleanup gates remain unchanged.
 
 The local-completion-discovery PTY fixture opts into a fixed five-second
 provider budget through `QUIRL_TEST_LOCAL_PROVIDER_PERSISTENCE`. This isolates

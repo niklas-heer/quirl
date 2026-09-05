@@ -102,10 +102,11 @@
 
 ### Upgrade notes
 
-- The reviewed native-executable hard ceiling is now 12 MiB, preserving all
-  current features and Rust panic cleanup. The 8 MiB warning remains; every
-  native release job enforces the cap and existing latency budgets against its
-  exact artifact. See ADR 0034 for the measurements and decision.
+- Release binary size is advisory by default, prioritizing shell usability
+  and retaining all features. Exact byte counts, independent digests, and the
+  warning above 8 MiB remain; growth without a clear user benefit warrants
+  review. An explicit `--max-binary-bytes` still enforces a caller maximum.
+  Every latency, identity, and cleanup gate remains unchanged. See ADR 0036.
 - Linux and macOS remain the supported interactive platforms. Windows and Wasm
   execution are not part of this release scope.
 - Lua extensions should be reviewed for Lua 5.5 language changes. The sandbox

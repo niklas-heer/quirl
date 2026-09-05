@@ -243,12 +243,14 @@ Use the direct command above to capture canonical JSON evidence.
   `quirl` and `quirl-bench`, their matching source identity, the artifact
   profile, panic strategy, operating system, architecture, and independent
   digest.
-- [ ] All enforced PTY latency, first-prompt, binary-size, and bounded-history
+- [ ] All enforced PTY latency, first-prompt, explicit caller size, and bounded-history
   budgets pass, or the release stops with the miss preserved in the record.
-- [ ] The exact release binary is at or below the 12 MiB hard ceiling
-  (12,582,912 bytes). At or below 5 MiB (5,242,880 bytes) is ideal; a binary
-  above the 8 MiB soft cap (8,388,608 bytes) records a warning without weakening
-  the hard gate. `--max-binary-bytes` may tighten but never raise the ceiling.
+- [ ] The exact release binary's byte size and independent digest are recorded.
+  At or below 5 MiB (5,242,880 bytes) is ideal; above 8 MiB (8,388,608 bytes)
+  records an advisory warning. Investigate growth without a clear user benefit.
+  There is no default project size ceiling; an explicit `--max-binary-bytes`
+  remains enforceable. Missing size or identity evidence still blocks release.
+  See [ADR 0036](/docs/architecture/decisions/0036-advisory-release-binary-size).
 - [ ] Rich-surface draw and edit latency are measured on the selected
   candidate; `QUIRL_UI_TIMINGS=1` is diagnostic evidence, not a substitute for
   the enforcing PTY harness.

@@ -32,13 +32,19 @@ const DEFAULT_RELEASE_PTY_SAMPLES: usize = 101;
 const DEFAULT_PTY_TIMEOUT_MS: usize = 2_000;
 const DEFAULT_STREAM_SAMPLES: usize = 100_000;
 const MINIMUM_ACCEPTED_PTY_SAMPLES: usize = 20;
-// Binary-size policy uses binary mebibytes: one MiB is exactly 1,048,576 bytes.
-// The ideal and soft cap are advisory; the hard ceiling is an enforcing gate.
+// Binary-size telemetry uses binary mebibytes: one MiB is 1,048,576 bytes.
+// Both tiers are advisory; the project imposes no executable-size ceiling.
 const BINARY_IDEAL_BYTES: u64 = 5 * 1024 * 1024;
 const BINARY_SOFT_CAP_BYTES: u64 = 8 * 1024 * 1024;
-const BINARY_HARD_CEILING_BYTES: u64 = 12 * 1024 * 1024;
 const _: () = assert!(BINARY_IDEAL_BYTES < BINARY_SOFT_CAP_BYTES);
-const _: () = assert!(BINARY_SOFT_CAP_BYTES < BINARY_HARD_CEILING_BYTES);
+const BINARY_SIZE_POLICY_EXPLANATION: &str = "Binary units are MiB (1 MiB = 1,048,576 bytes). At or below 5 MiB is ideal; more than 8 MiB emits an advisory warning. The project imposes no executable-size ceiling on any architecture. Only an explicit --max-binary-bytes value enforces a caller-selected limit.";
+
+// Failure model: removing a footprint cap must not admit absent measurements,
+// mismatched artifacts, or failed latency/sample evidence. Exact bytes remain
+// mandatory, alongside the existing staged digest and native identity checks.
+// An optional caller limit is distinct from the advisory policy and must still
+// reject oversized artifacts. Null report fields represent absent limits;
+// neither an architecture default nor u64::MAX stands in for "unlimited".
 const COLD_START_TARGET_MS: f64 = 25.0;
 const EDIT_FRAME_TARGET_MS: f64 = 8.0;
 const FIRST_PROMPT_TARGET_MS: f64 = 21.0;
@@ -137,12 +143,12 @@ struct BinarySizeMeasurement {
     bytes: Option<u64>,
     ideal_bytes: u64,
     soft_cap_bytes: u64,
-    hard_ceiling_bytes: u64,
-    enforced_limit_bytes: u64,
+    hard_ceiling_bytes: Option<u64>,
+    enforced_limit_bytes: Option<u64>,
     policy_result: &'static str,
     target_result: &'static str,
     measurement_valid: bool,
-    hard_gate_passed: bool,
+    hard_gate_passed: Option<bool>,
     release_gate_accepted: bool,
     warning: Option<String>,
     explanation: &'static str,
@@ -452,6 +458,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     let prompt = measure_first_prompt(prompt_samples)?;
     let stream_window = measure_stream_window(stream_samples)?;
     let binary_size = measure_binary_size(&quirl, binary_limit);
+    eprintln!("performance: {}", binary_size_notice(&binary_size));
     eprintln!("performance: collecting bounded environment metadata");
     let mut environment = discover_environment(
         &quirl,
@@ -635,7 +642,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
     };
 
     let report = PreviewReport {
-        schema_version: 7,
+        schema_version: 8,
         suite: "quirl_1.0_release_performance",
         measured_at_utc: measured_at_utc(),
         environment,
@@ -646,7 +653,7 @@ pub fn run(enforce: bool) -> Result<(), Box<dyn Error>> {
             headless_edit_frame: "Calls Quirl's real CatalogCompleter and Prompt render methods, plus a benchmark-owned equivalent of the current semantic token classification, for `git commit --am`. No Reedline layout or terminal I/O occurs.",
             first_prompt: "Constructs a fresh configured QuirlPrompt and renders left, right, and indicator strings for every sample. Filesystem metadata may be served from OS cache. No terminal I/O occurs.",
             stream_window: "Pushes a fixed-size typed sample sequence through Quirl's production LiveBuffer at capacities 1, 16, and 256, then verifies retained and dropped counts and records serialized snapshot bytes. This proves retention is bounded by window size for bounded records; it is not a producer-backpressure or allocator-RSS measurement.",
-            binary_size: "Copies the executable passed with `--quirl` into a private read-only staging directory, verifies its SHA-256 when enforcing the release gate, then measures that exact staged executable. Binary units are MiB (1 MiB = 1,048,576 bytes): 5 MiB is ideal, more than 8 MiB warns, and more than 12 MiB fails the hard gate. `--max-binary-bytes` may impose a stricter hard limit but cannot relax the 12 MiB project ceiling.",
+            binary_size: "Copies the executable passed with `--quirl` into a private read-only staging directory, verifies its SHA-256 when enforcing the release gate, then measures that exact staged executable. Exact byte counts remain required evidence. Binary units are MiB (1 MiB = 1,048,576 bytes): 5 MiB is ideal and more than 8 MiB warns. There is no project-enforced size ceiling on any architecture. Only an explicit `--max-binary-bytes` value enforces a caller-selected maximum; size policy does not relax artifact identity, latency, or sample gates.",
             limitations: vec![
                 "A completed frame means the expected screen state was reconstructed from the PTY byte stream; physical terminal-emulator scheduling, GPU composition, and monitor scanout are not measured.",
                 "The UI highlighter is private; the edit proxy reproduces its command/option/quote classification but not StyledText allocation or rendering.",
@@ -1609,31 +1616,35 @@ fn measure_stream_window(samples: usize) -> Result<StreamWindowMeasurement, Box<
     })
 }
 
-fn measure_binary_size(path: &Path, limit_bytes: u64) -> BinarySizeMeasurement {
+fn measure_binary_size(path: &Path, limit_bytes: Option<u64>) -> BinarySizeMeasurement {
     let bytes = fs::metadata(path).ok().map(|metadata| metadata.len());
     binary_size_measurement(bytes, limit_bytes)
 }
 
-fn binary_size_measurement(bytes: Option<u64>, enforced_limit_bytes: u64) -> BinarySizeMeasurement {
+fn binary_size_measurement(
+    bytes: Option<u64>,
+    enforced_limit_bytes: Option<u64>,
+) -> BinarySizeMeasurement {
     let measurement_valid = bytes.is_some();
-    let target_result = match bytes {
-        Some(bytes) if bytes <= enforced_limit_bytes => "measured_within_target",
-        Some(_) => "measured_miss",
-        None => "invalid_or_incomplete_measurement",
+    let target_result = match (bytes, enforced_limit_bytes) {
+        (Some(bytes), Some(limit)) if bytes <= limit => "measured_within_target",
+        (Some(_), Some(_)) => "measured_miss",
+        (Some(_), None) => "measured_advisory",
+        (None, _) => "invalid_or_incomplete_measurement",
     };
     let policy_result = match bytes {
         Some(bytes) if bytes <= BINARY_IDEAL_BYTES => "within_ideal",
         Some(bytes) if bytes <= BINARY_SOFT_CAP_BYTES => "within_soft_cap",
-        Some(bytes) if bytes <= BINARY_HARD_CEILING_BYTES => "soft_cap_warning",
-        Some(_) => "hard_ceiling_exceeded",
+        Some(_) => "soft_cap_warning",
         None => "invalid_or_incomplete_measurement",
     };
-    let hard_gate_passed = bytes.is_some_and(|bytes| bytes <= enforced_limit_bytes);
+    let hard_gate_passed =
+        enforced_limit_bytes.map(|limit| bytes.is_some_and(|bytes| bytes <= limit));
     let warning = bytes
         .filter(|bytes| *bytes > BINARY_SOFT_CAP_BYTES)
         .map(|bytes| {
             format!(
-                "release binary is {bytes} bytes, above the {BINARY_SOFT_CAP_BYTES}-byte soft cap; the hard ceiling is {BINARY_HARD_CEILING_BYTES} bytes"
+                "release binary is {bytes} bytes, above the {BINARY_SOFT_CAP_BYTES}-byte advisory threshold; the project imposes no executable-size ceiling"
             )
         });
     BinarySizeMeasurement {
@@ -1641,27 +1652,39 @@ fn binary_size_measurement(bytes: Option<u64>, enforced_limit_bytes: u64) -> Bin
         bytes,
         ideal_bytes: BINARY_IDEAL_BYTES,
         soft_cap_bytes: BINARY_SOFT_CAP_BYTES,
-        hard_ceiling_bytes: BINARY_HARD_CEILING_BYTES,
+        hard_ceiling_bytes: None,
         enforced_limit_bytes,
         policy_result,
         target_result,
         measurement_valid,
         hard_gate_passed,
-        release_gate_accepted: hard_gate_passed,
+        release_gate_accepted: measurement_valid && hard_gate_passed.unwrap_or(true),
         warning,
-        explanation: "Binary units are MiB (1 MiB = 1,048,576 bytes). At or below 5 MiB is ideal; more than 8 MiB emits a warning; more than 12 MiB fails the release gate.",
+        explanation: BINARY_SIZE_POLICY_EXPLANATION,
     }
+}
+
+fn binary_size_notice(measurement: &BinarySizeMeasurement) -> String {
+    let Some(bytes) = measurement.bytes else {
+        return "staged executable size unavailable; release evidence is incomplete".to_owned();
+    };
+    let mut notice = measurement.warning.clone().unwrap_or_else(|| {
+        format!("staged executable is {bytes} bytes; no project-enforced size ceiling")
+    });
+    if let Some(limit) = measurement.enforced_limit_bytes {
+        notice.push_str(&format!("; explicit caller limit: {limit} bytes"));
+    }
+    notice
 }
 
 fn binary_size_gate_failure(measurement: &BinarySizeMeasurement) -> Option<String> {
     if !measurement.measurement_valid {
         return Some("release binary size could not be measured".to_owned());
     }
-    (!measurement.hard_gate_passed).then(|| {
-        format!(
-            "release binary exceeds the enforced {}-byte hard limit (project hard ceiling: {} bytes)",
-            measurement.enforced_limit_bytes, measurement.hard_ceiling_bytes
-        )
+    measurement.enforced_limit_bytes.and_then(|limit| {
+        (measurement.hard_gate_passed == Some(false)).then(|| {
+            format!("release binary exceeds the explicit caller-selected {limit}-byte size limit")
+        })
     })
 }
 
@@ -1872,31 +1895,35 @@ fn default_pty_samples(enforce: bool) -> usize {
     }
 }
 
-fn byte_argument(name: &str, default: u64) -> Result<u64, Box<dyn Error>> {
-    let Some(value) = argument_value(name) else {
-        return Ok(default);
+fn binary_limit_argument() -> Result<Option<u64>, Box<dyn Error>> {
+    binary_limit_from_arguments(env::args().skip(2)).map_err(Into::into)
+}
+
+fn binary_limit_from_arguments(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Option<u64>, String> {
+    while let Some(argument) = arguments.next() {
+        if argument == "--max-binary-bytes" {
+            let value = arguments
+                .next()
+                .ok_or_else(|| "--max-binary-bytes requires a byte count".to_owned())?;
+            return parse_binary_limit(Some(&value));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_binary_limit(value: Option<&str>) -> Result<Option<u64>, String> {
+    let Some(value) = value else {
+        return Ok(None);
     };
     let bytes = value
         .parse::<u64>()
-        .map_err(|error| format!("invalid {name} value `{value}`: {error}"))?;
+        .map_err(|error| format!("invalid --max-binary-bytes value `{value}`: {error}"))?;
     if bytes == 0 {
-        return Err(format!("{name} must be greater than zero").into());
+        return Err("--max-binary-bytes must be greater than zero".to_owned());
     }
-    Ok(bytes)
-}
-
-fn binary_limit_argument() -> Result<u64, Box<dyn Error>> {
-    let bytes = byte_argument("--max-binary-bytes", BINARY_HARD_CEILING_BYTES)?;
-    Ok(validate_binary_limit(bytes)?)
-}
-
-fn validate_binary_limit(bytes: u64) -> Result<u64, String> {
-    if bytes > BINARY_HARD_CEILING_BYTES {
-        return Err(format!(
-            "--max-binary-bytes cannot exceed the project hard ceiling of {BINARY_HARD_CEILING_BYTES} bytes (12 MiB)"
-        ));
-    }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 struct StagedArtifact {
@@ -2838,82 +2865,133 @@ mod tests {
     }
 
     #[test]
-    fn missing_release_binary_never_accepts_size_evidence() {
-        let evidence = measure_binary_size(
-            Path::new("/definitely/missing/quirl-release-binary"),
-            BINARY_HARD_CEILING_BYTES,
-        );
-        assert_eq!(evidence.target_result, "invalid_or_incomplete_measurement");
-        assert!(!evidence.measurement_valid);
-        assert!(!evidence.release_gate_accepted);
+    fn default_size_policy_has_no_project_or_architecture_ceiling() {
+        assert_eq!(parse_binary_limit(None), Ok(None));
+        // Exercise beyond both superseded architecture caps and the largest
+        // representable measurement without constructing a giant fixture file.
+        for bytes in [12_582_913, 14_680_065, u64::MAX] {
+            let evidence = binary_size_measurement(Some(bytes), None);
+            assert_eq!(evidence.bytes, Some(bytes));
+            assert_eq!(evidence.policy_result, "soft_cap_warning");
+            assert_eq!(evidence.target_result, "measured_advisory");
+            assert_eq!(evidence.hard_ceiling_bytes, None);
+            assert_eq!(evidence.enforced_limit_bytes, None);
+            assert_eq!(evidence.hard_gate_passed, None);
+            assert!(evidence.warning.is_some());
+            assert!(evidence.measurement_valid);
+            assert!(evidence.release_gate_accepted);
+            assert!(binary_size_gate_failure(&evidence).is_none());
+        }
     }
 
     #[test]
-    fn binary_size_policy_enforces_every_exact_boundary() {
-        // ADR 0034 fixes this externally reviewed policy in binary bytes.
-        assert_eq!(BINARY_HARD_CEILING_BYTES, 12_582_912);
-        let ideal = binary_size_measurement(Some(BINARY_IDEAL_BYTES), BINARY_HARD_CEILING_BYTES);
-        assert_eq!(ideal.policy_result, "within_ideal");
-        assert!(ideal.warning.is_none());
-        assert!(ideal.hard_gate_passed);
-
-        let above_ideal =
-            binary_size_measurement(Some(BINARY_IDEAL_BYTES + 1), BINARY_HARD_CEILING_BYTES);
-        assert_eq!(above_ideal.policy_result, "within_soft_cap");
-        assert!(above_ideal.warning.is_none());
-        assert!(above_ideal.hard_gate_passed);
-
-        let soft_cap =
-            binary_size_measurement(Some(BINARY_SOFT_CAP_BYTES), BINARY_HARD_CEILING_BYTES);
-        assert_eq!(soft_cap.policy_result, "within_soft_cap");
-        assert!(soft_cap.warning.is_none());
-
-        let warning =
-            binary_size_measurement(Some(BINARY_SOFT_CAP_BYTES + 1), BINARY_HARD_CEILING_BYTES);
-        assert_eq!(warning.policy_result, "soft_cap_warning");
-        assert!(warning.warning.is_some());
-        assert!(warning.hard_gate_passed);
-        assert!(warning.release_gate_accepted);
-        assert!(binary_size_gate_failure(&warning).is_none());
-
-        let hard_ceiling =
-            binary_size_measurement(Some(BINARY_HARD_CEILING_BYTES), BINARY_HARD_CEILING_BYTES);
-        assert_eq!(hard_ceiling.policy_result, "soft_cap_warning");
-        assert!(hard_ceiling.hard_gate_passed);
-
-        let rejected = binary_size_measurement(
-            Some(BINARY_HARD_CEILING_BYTES + 1),
-            BINARY_HARD_CEILING_BYTES,
-        );
-        assert_eq!(rejected.policy_result, "hard_ceiling_exceeded");
-        assert_eq!(rejected.target_result, "measured_miss");
-        assert!(!rejected.hard_gate_passed);
-        assert!(!rejected.release_gate_accepted);
-        assert!(
-            binary_size_gate_failure(&rejected)
-                .is_some_and(|failure| failure.contains("hard limit"))
-        );
-    }
-
-    #[test]
-    fn stricter_binary_limit_cannot_be_reported_as_a_gate_pass() {
-        let stricter_limit = BINARY_IDEAL_BYTES;
-        let evidence = binary_size_measurement(Some(stricter_limit + 1), stricter_limit);
-        assert_eq!(evidence.policy_result, "within_soft_cap");
-        assert_eq!(evidence.target_result, "measured_miss");
-        assert!(!evidence.hard_gate_passed);
-        assert!(!evidence.release_gate_accepted);
-    }
-
-    #[test]
-    fn binary_limit_override_can_only_tighten_the_hard_ceiling() {
+    fn absent_binary_limits_are_explicit_nulls_in_serialized_evidence() {
+        let evidence = serde_json::to_value(binary_size_measurement(Some(u64::MAX), None)).unwrap();
+        assert!(evidence.get("hard_ceiling_bytes").unwrap().is_null());
+        assert!(evidence.get("enforced_limit_bytes").unwrap().is_null());
+        assert!(evidence.get("hard_gate_passed").unwrap().is_null());
+        let limited = serde_json::to_value(binary_size_measurement(Some(42), Some(42))).unwrap();
+        assert!(limited.get("hard_ceiling_bytes").unwrap().is_null());
         assert_eq!(
-            validate_binary_limit(BINARY_HARD_CEILING_BYTES),
-            Ok(BINARY_HARD_CEILING_BYTES)
+            limited.get("enforced_limit_bytes").unwrap().as_u64(),
+            Some(42)
         );
-        let error = validate_binary_limit(BINARY_HARD_CEILING_BYTES + 1).unwrap_err();
-        assert!(error.contains("cannot exceed"));
-        assert!(error.contains("12 MiB"));
+        assert_eq!(
+            limited.get("hard_gate_passed").unwrap().as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn missing_release_binary_never_accepts_size_evidence() {
+        for limit in [None, Some(BINARY_IDEAL_BYTES)] {
+            let evidence =
+                measure_binary_size(Path::new("/definitely/missing/quirl-release-binary"), limit);
+            assert_eq!(evidence.target_result, "invalid_or_incomplete_measurement");
+            assert!(!evidence.measurement_valid);
+            assert!(!evidence.release_gate_accepted);
+            assert!(binary_size_gate_failure(&evidence).is_some());
+        }
+    }
+
+    #[test]
+    fn advisory_size_tiers_preserve_every_exact_boundary() {
+        for (bytes, expected, warns) in [
+            (BINARY_IDEAL_BYTES, "within_ideal", false),
+            (BINARY_IDEAL_BYTES + 1, "within_soft_cap", false),
+            (BINARY_SOFT_CAP_BYTES, "within_soft_cap", false),
+            (BINARY_SOFT_CAP_BYTES + 1, "soft_cap_warning", true),
+        ] {
+            let evidence = binary_size_measurement(Some(bytes), None);
+            assert_eq!(evidence.policy_result, expected);
+            assert_eq!(evidence.warning.is_some(), warns);
+            assert!(evidence.release_gate_accepted);
+            assert!(binary_size_gate_failure(&evidence).is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_caller_size_limit_passes_exactly_and_rejects_the_next_byte() {
+        for limit in [BINARY_IDEAL_BYTES, 100 * 1024 * 1024] {
+            let exact = binary_size_measurement(Some(limit), Some(limit));
+            assert_eq!(exact.hard_gate_passed, Some(true));
+            assert!(exact.release_gate_accepted);
+            let rejected = binary_size_measurement(Some(limit + 1), Some(limit));
+            assert_eq!(rejected.hard_gate_passed, Some(false));
+            assert_eq!(rejected.target_result, "measured_miss");
+            assert!(!rejected.release_gate_accepted);
+            assert!(
+                binary_size_gate_failure(&rejected)
+                    .unwrap()
+                    .contains(&limit.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn caller_size_limit_is_optional_positive_and_has_no_hidden_project_maximum() {
+        assert_eq!(parse_binary_limit(None), Ok(None));
+        assert_eq!(parse_binary_limit(Some("1")), Ok(Some(1)));
+        assert_eq!(
+            parse_binary_limit(Some(&u64::MAX.to_string())),
+            Ok(Some(u64::MAX))
+        );
+        for invalid in ["", "0", "-1", "many", "18446744073709551616"] {
+            assert!(parse_binary_limit(Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn size_notice_keeps_default_advisory_and_explicit_limits_visible() {
+        let large = binary_size_notice(&binary_size_measurement(Some(100_000_000), None));
+        assert!(large.contains("100000000 bytes"));
+        assert!(large.contains("advisory"));
+        assert!(large.contains("no executable-size ceiling"));
+        let explicit = binary_size_notice(&binary_size_measurement(Some(42), Some(40)));
+        assert!(explicit.contains("explicit caller limit: 40 bytes"));
+        assert!(binary_size_notice(&binary_size_measurement(None, None)).contains("incomplete"));
+    }
+
+    #[test]
+    fn explicitly_requested_size_limit_cannot_disappear_when_its_value_is_missing() {
+        for arguments in [
+            vec!["--max-binary-bytes"],
+            vec!["--max-binary-bytes", "--json"],
+        ] {
+            assert!(binary_limit_from_arguments(arguments.into_iter().map(str::to_owned)).is_err());
+        }
+        assert_eq!(
+            binary_limit_from_arguments(std::iter::once("--json".to_owned())),
+            Ok(None)
+        );
+        assert_eq!(
+            binary_limit_from_arguments(
+                ["--max-binary-bytes", "42", "--json"]
+                    .into_iter()
+                    .map(str::to_owned)
+            ),
+            Ok(Some(42))
+        );
     }
 
     #[test]
@@ -3009,6 +3087,16 @@ mod tests {
         };
         assert!(!build_info_contract_is_current(&dirty_official_release));
 
+        let opposite_architecture = if env::consts::ARCH == "aarch64" {
+            "x86_64"
+        } else {
+            "aarch64"
+        };
+        let mismatched_architecture = QuirlBuildInfo {
+            architecture: opposite_architecture.to_owned(),
+            ..matching.clone()
+        };
+        assert!(!build_info_matches_benchmark(&mismatched_architecture));
         let mismatched = QuirlBuildInfo {
             build_profile: "other".to_owned(),
             ..matching

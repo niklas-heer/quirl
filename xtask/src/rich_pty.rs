@@ -1457,15 +1457,19 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), TaskError> 
             io::Error::other("foreground command did not receive terminal ownership").into(),
         );
     }
+    wait_for_rich_input_since(&mut session, handoff_start)?;
+    // Readiness follows viewport clearing but can precede a complete repaint.
+    // Inspect this handoff's final layout only after the fresh input lease,
+    // rather than inspecting partial cells left by the marker reader's drain.
     session
         .pty
         .wait_for_screen("captured foreground command completion", |screen| {
             let text = screen.text();
-            text.contains("HANDOFF_STARTED")
+            screen.has_completed_frame()
+                && text.contains("HANDOFF_STARTED")
                 && text.contains("HANDOFF_DONE")
                 && screen.bottom_line().contains("NORMAL")
         })?;
-    wait_for_rich_input_since(&mut session, handoff_start)?;
     if session.pty.foreground_group()? != quirl_process {
         return Err(
             io::Error::other("Quirl did not recover terminal ownership after handoff").into(),

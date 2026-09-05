@@ -25,6 +25,7 @@
     "0032-bounded-terminal-input",
     "0033-bounded-simple-editor",
     "0034-release-binary-budget",
-    "0035-cold-interactive-startup"
+    "0035-cold-interactive-startup",
+    "0036-advisory-release-binary-size"
   ]
 }

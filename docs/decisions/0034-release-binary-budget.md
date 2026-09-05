@@ -4,6 +4,9 @@
 - Date: 2026-09-05
 - Decision owners: Quirl maintainers
 - Supersedes in part: the 10 MiB binary ceiling in the language design and ADR 0025
+- Superseded in part by: [ADR 0036](0036-advisory-release-binary-size.md),
+  which makes executable size advisory by default; the measurements below
+  retain the policy used at the time.
 
 ## Context
 

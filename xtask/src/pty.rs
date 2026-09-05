@@ -185,6 +185,12 @@ impl VirtualScreen {
 
     pub(super) fn resize(&mut self, rows: usize, columns: usize) -> io::Result<()> {
         validate_screen_size(rows, columns)?;
+        // The kernel need not emit a resize event when geometry is unchanged.
+        // Preserve the visible frame and parser/cursor state in that case;
+        // otherwise a valid screen can remain falsely incomplete forever.
+        if self.rows == rows && self.columns == columns {
+            return Ok(());
+        }
         self.frame_complete = false;
         self.frame_finalization = FrameFinalization::None;
         let mut resized = blank_cells(rows, columns, CellStyle::default());
@@ -2031,6 +2037,49 @@ mod tests {
         assert!(!screen.has_completed_frame());
         screen.feed(b"\x1b[0m\x1b[?25h\x1b[4;3H");
         assert!(screen.has_completed_frame());
+    }
+
+    #[test]
+    fn input_readiness_during_handoff_does_not_complete_the_new_frame() {
+        let mut screen = VirtualScreen::new(4, 80, 0).unwrap();
+        screen.feed(b"HANDOFF_DONE\x1b[4;1HNORMAL\x1b[0m\x1b[?25h\x1b[3;3H");
+        assert!(screen.has_completed_frame());
+        // resume_input clears the completed execution view before announcing
+        // mouse readiness. The next read_line draw can span many PTY reads.
+        screen.feed(b"\x1b[1;1H\x1b[J\x1b[?1000h");
+        assert!(!screen.has_completed_frame());
+        assert!(screen.bottom_line().is_empty());
+        screen.feed(b"partial JSON row");
+        assert!(!screen.has_completed_frame());
+        screen.feed(b"\x1b[4;1HNORMAL");
+        assert!(!screen.has_completed_frame());
+        screen.feed(b"\x1b[0m\x1b[?25h\x1b[3;");
+        assert!(!screen.has_completed_frame());
+        screen.feed(b"3H");
+        assert!(screen.has_completed_frame());
+        assert_eq!(screen.bottom_line(), "NORMAL");
+    }
+
+    #[test]
+    fn unchanged_resize_preserves_frame_and_terminal_state() {
+        let mut screen = VirtualScreen::new(4, 8, 0).unwrap();
+        screen.feed(b"\x1b[2;4rabcdefgh\x1b[0m\x1b[?25h\x1b[2;8H");
+        assert!(screen.has_completed_frame());
+        let before = format!("{screen:?}");
+        screen.resize(4, 8).unwrap();
+        assert_eq!(format!("{screen:?}"), before);
+        assert!(screen.has_completed_frame());
+        // Pending wrap and an incomplete escape also survive a no-op resize.
+        screen.feed(b"x\x1b[");
+        assert!(screen.wrap_pending);
+        let before = format!("{screen:?}");
+        screen.resize(4, 8).unwrap();
+        assert_eq!(format!("{screen:?}"), before);
+        screen.feed(b"0m\x1b[?25h\x1b[2;8H");
+        assert!(screen.has_completed_frame());
+        screen.resize(5, 8).unwrap();
+        assert!(!screen.has_completed_frame());
+        assert_eq!(screen.rows, 5);
     }
 
     #[test]
