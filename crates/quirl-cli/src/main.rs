@@ -1449,8 +1449,8 @@ const FULL_SCREEN_PROGRAMS: &[&str] = &[
 const TERMINAL_PACKAGES: &[&str] = &["tokscale", "@tokscale/cli"];
 
 /// Return whether `source` is a single foreground external command whose
-/// executable is a known [`FULL_SCREEN_PROGRAMS`] entry or a supported launcher
-/// invocation of a [`TERMINAL_PACKAGES`] entry.
+/// executable is a known [`FULL_SCREEN_PROGRAMS`] entry, an interactive tdx
+/// invocation, or a supported launcher invocation of a [`TERMINAL_PACKAGES`] entry.
 ///
 /// Deliberately conservative: multi-stage pipelines, boolean or sequential
 /// lists, background commands, and commands with redirects all return
@@ -1480,7 +1480,67 @@ fn needs_real_terminal(source: &str) -> bool {
     };
     let executable = executable.strip_prefix('^').unwrap_or(executable);
     let name = executable.rsplit('/').next().unwrap_or(executable);
-    FULL_SCREEN_PROGRAMS.contains(&name) || terminal_package_invocation(name, arguments)
+    FULL_SCREEN_PROGRAMS.contains(&name)
+        || (name == "tdx" && terminal_tdx_invocation(arguments))
+        || terminal_package_invocation(name, arguments)
+}
+
+/// Recognize tdx's interactive entrypoints without executing or expanding args.
+///
+/// Its default, file, last-file, and numbered-recent-file views need terminal
+/// ownership. Scriptable commands and unknown options retain captured output.
+/// Scan the already bounded native argv once with constant additional memory;
+/// option values must never be mistaken for commands or interactive flags.
+fn terminal_tdx_invocation(arguments: &[String]) -> bool {
+    let mut arguments = arguments.iter().map(String::as_str);
+    let mut literal = false;
+    let mut file_selected = false;
+    let mut command = None;
+    let mut selection = None;
+    while let Some(argument) = arguments.next() {
+        if !literal && argument.starts_with('-') {
+            let (flag, inline) = argument
+                .split_once('=')
+                .map_or((argument, None), |(flag, value)| (flag, Some(value)));
+            match flag {
+                "--" if inline.is_none() => literal = true,
+                "-r" | "--read-only" | "--show-headings" if inline.is_none() => {}
+                "-f" | "--file" => {
+                    let Some(value) = inline.or_else(|| arguments.next()) else {
+                        return false;
+                    };
+                    if value.is_empty() || file_selected {
+                        return false;
+                    }
+                    file_selected = true;
+                }
+                "-m" | "--max-visible" => {
+                    let Some(value) = inline.or_else(|| arguments.next()) else {
+                        return false;
+                    };
+                    if !value.parse::<i64>().is_ok_and(|value| value >= 0) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            continue;
+        }
+        if command.is_none() && !file_selected && argument.ends_with(".md") {
+            file_selected = true;
+        } else if command.is_none() {
+            command = Some(argument);
+        } else if selection.is_none() {
+            selection = Some(argument);
+        } else {
+            return false;
+        }
+    }
+    match (command, selection) {
+        (None | Some("last"), None) => true,
+        (Some("recent"), Some(index)) => index.parse::<i64>().is_ok_and(|index| index > 0),
+        _ => false,
+    }
 }
 
 /// Inspect only documented, valueless launcher flags before the package.
@@ -4371,6 +4431,64 @@ mod tests {
 
         // Invalid native syntax must not panic the heuristic.
         assert!(!needs_real_terminal("vim '"));
+    }
+
+    #[test]
+    fn tdx_interactive_views_receive_the_terminal_without_capturing_script_commands() {
+        for source in [
+            "tdx",
+            "^tdx",
+            "/opt/homebrew/bin/tdx",
+            "tdx todo.md",
+            "tdx 'my tasks.md' --read-only",
+            "tdx -r --show-headings -m 10",
+            "tdx --file tasks",
+            "tdx --file=list",
+            "tdx --max-visible=0 todo.md",
+            "tdx -- todo.md",
+            "tdx last",
+            "tdx recent 2",
+            "tdx -f todo.md recent 1",
+        ] {
+            assert!(needs_real_terminal(source), "{source}");
+        }
+        for source in [
+            "tdx list",
+            "tdx todo.md list --json",
+            "tdx --file tasks list",
+            "tdx add 'last'",
+            "tdx toggle 1",
+            "tdx edit 1 'recent'",
+            "tdx delete 1",
+            "tdx recent",
+            "tdx recent clear",
+            "tdx recent 0",
+            "tdx recent invalid",
+            "tdx help",
+            "tdx --help",
+            "tdx --version",
+            "tdx --debug-config",
+            "tdx --file",
+            "tdx --file=",
+            "tdx one.md --file two.md",
+            "tdx --max-visible -1",
+            "tdx --read-only=true",
+            "tdx --json",
+            "tdx --unknown last",
+            "tdx -- --read-only",
+            "tdx last --help",
+            "tdx | cat",
+            "tdx > out.txt",
+            "tdx 2> errors.txt",
+            "tdx < in.txt",
+            "tdx &",
+            "true && tdx",
+            "tdx; echo done",
+            "echo tdx",
+            "tdx-other",
+        ] {
+            assert!(!needs_real_terminal(source), "{source}");
+        }
     }
 
     #[test]

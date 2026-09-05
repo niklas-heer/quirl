@@ -718,7 +718,6 @@ fn wait_for_rich_input_since(session: &mut Session, start: usize) -> Result<(), 
 fn execute_and_resume(session: &mut Session, command: &str) -> Result<(), TaskError> {
     let output_start = session.pty.output().len();
     session.pty.type_text(command)?;
-    dismiss_directory_navigation_for_execution(session, command)?;
     session.pty.send(key::ENTER)?;
     let command_record = format!("❯ {command}");
     session
@@ -741,9 +740,9 @@ fn dismiss_directory_navigation_for_execution(
     if !command.starts_with("cd ") {
         return Ok(());
     }
-    // These callers request execution of an already chosen directory. Enter
-    // otherwise accepts the automatic candidate and begins browsing children.
-    // The navigation journey separately exercises that intentional edit path.
+    // The cwd-history caller first observes an explicit Tab-opened popup.
+    // Only that visible open-to-closed transition proves Escape was consumed;
+    // an unrelated redraw cannot synchronize Escape for bare `cd .` safe points.
     let editor_line = format!("> {command}");
     session
         .pty
@@ -2890,8 +2889,8 @@ fn check_full_screen_program_takeover(binary: &Path) -> Result<(), TaskError> {
 }
 
 fn check_package_tui_terminal_takeover(binary: &Path) -> Result<(), TaskError> {
-    // Failure model: a package launcher hides the TUI executable from the
-    // terminal classifier. Its child then sees piped stdout/stderr and silently
+    // Failure model: a package launcher or unrecognized direct TUI such as tdx
+    // bypasses the terminal classifier. Its child sees piped stdout/stderr and silently
     // selects a static report. These private, network-free fixtures require all
     // three inherited terminal descriptors before entering an alternate screen.
     // Each launch has the existing bounded PTY waits and Session cleanup; no
@@ -2920,6 +2919,15 @@ fn check_package_tui_terminal_takeover(binary: &Path) -> Result<(), TaskError> {
              exec \"${0%/*}/tokscale\" \"$@\"\n",
         )?;
     }
+    write_executable(
+        &binary_dir.join("tdx"),
+        "#!/bin/sh\n\
+         if [ \"$#\" -eq 1 ] && [ \"$1\" = list ]; then\n\
+           if [ -t 1 ] || [ -t 2 ]; then exit 46; fi\n\
+           printf 'TDX_LIST_CAPTURED\\n'; exit 0\n\
+         fi\n\
+         exec \"${0%/*}/tokscale\" --fixture tdx\n",
+    )?;
     let mut session = Session::new(
         binary,
         SessionOptions {
@@ -2928,19 +2936,22 @@ fn check_package_tui_terminal_takeover(binary: &Path) -> Result<(), TaskError> {
         },
     )?;
     session.pty.wait_for(STARTUP_MARKER)?;
-    for launcher in ["bunx", "npx", "tokscale"] {
-        let source = if launcher == "tokscale" {
-            "tokscale --fixture tokscale".to_owned()
-        } else {
-            format!("{launcher} tokscale@latest --fixture {launcher}")
+    for launcher in ["bunx", "npx", "tokscale", "tdx"] {
+        let source = match launcher {
+            "tdx" => "tdx".to_owned(),
+            "tokscale" => "tokscale --fixture tokscale".to_owned(),
+            _ => format!("{launcher} tokscale@latest --fixture {launcher}"),
         };
         check_package_tui_launch(&mut session, &source, launcher)?;
     }
+    execute_and_resume_with_marker(&mut session, "tdx list", b"TDX_LIST_CAPTURED")?;
+    let cleanup_start = session.pty.output().len();
     ensure_status(
         send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
         0,
         "package TUI terminal takeover",
-    )
+    )?;
+    ensure_terminal_restored(&session, cleanup_start, "package TUI terminal takeover")
 }
 
 fn check_package_tui_launch(

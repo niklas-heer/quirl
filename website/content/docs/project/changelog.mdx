@@ -19,6 +19,9 @@ which versions are published.
 
 ### Fixed
 
+- Rich Normal mode hands tdx's interactive views the real terminal, preserving
+  screen redraws and input instead of appending each frame to captured output.
+  Scriptable tdx commands such as `list` keep ordinary transcript output.
 - Native Unix commands expand unquoted `~` and `~/` from the session home,
   including `cd` arguments and redirection paths, while preserving quoted and
   escaped literal tildes and enforcing the existing expansion limit.

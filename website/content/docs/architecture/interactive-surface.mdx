@@ -223,6 +223,12 @@ The post-0.2.0 source also recognizes `tokscale` directly and through
 `bunx tokscale@latest` or `npx tokscale@latest`, including pinned versions and
 the `@tokscale/cli` package. This preserves terminal detection, keyboard input,
 and alternate-screen rendering instead of triggering Tokscale's static report.
+
+The same handoff supports `tdx`, its positional Markdown file or `--file`
+selection, `last`, and numbered `recent` views, including their read-only and
+display options. Its scriptable commands (`list`, `add`, `toggle`, `edit`,
+`delete`, and unnumbered `recent`) retain captured transcript output. Unknown
+options remain captured rather than guessing their argument meanings.
 Recognized launcher flags before the package are Bun's `--bun` and npx's
 `--yes`/`-y` and `--no-install`; `--` may delimit the package. Unknown launcher
 options are not skipped because their values could be mistaken for the package.
