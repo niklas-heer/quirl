@@ -86,6 +86,17 @@ holds the extension callback while checking catalog results. Wall time bounds
 the tests' waits; it does not establish callback ordering or stand in for the
 separate enforcing release-latency measurements.
 
+The trusted-plugin registration fixture uses an explicit five-second Lua wall
+budget for its real isolated syntax check, registration, and process calls.
+Memory and instruction limits remain the production defaults, and both metadata
+mismatches and incorrect process grants must fail. Production callers retain
+the 100 ms config policy; dedicated deadline and cancellation tests continue
+to verify worker termination and cleanup.
+Isolated-adapter functional fixtures likewise use an explicit five-second
+callback budget so protocol, snapshot, and output-limit assertions report their
+own failures. The dedicated runaway-adapter test retains its five-millisecond
+deadline and requires deadline-specific failure.
+
 ## Layers
 
 | Layer | What it proves | Typical evidence |

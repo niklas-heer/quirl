@@ -908,7 +908,18 @@ impl LuaWorkerRuntime {
     }
 
     pub(crate) fn check_source(source: &str, source_name: &str) -> Result<(), ShellError> {
-        let runtime = Self::new(LuaPolicy::config())?;
+        Self::check_source_with_policy(source, source_name, LuaPolicy::config())
+    }
+
+    /// Check source syntax in an isolated worker under an explicit admitted policy.
+    /// This preserves source diagnostics and applies the policy's wall deadline to
+    /// the check RPC; ordinary callers retain [`Self::check_source`]'s config policy.
+    pub(crate) fn check_source_with_policy(
+        source: &str,
+        source_name: &str,
+        policy: LuaPolicy,
+    ) -> Result<(), ShellError> {
+        let runtime = Self::new(policy)?;
         runtime.call(Operation::Check {
             source: source.to_owned(),
             source_name: source_name.to_owned(),

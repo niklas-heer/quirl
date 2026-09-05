@@ -414,7 +414,13 @@ fn read_source_package(source: &str) -> Result<SourcePackage, ShellError> {
 /// place that maps `process.spawn` grants onto `LuaPolicy::allow_process`, so
 /// activation and validation cannot drift apart.
 pub(crate) fn trusted_lua_runtime(grants: &[String]) -> Result<LuaRuntime, ShellError> {
-    let mut policy = LuaPolicy::config();
+    trusted_lua_runtime_with_policy(grants, LuaPolicy::config())
+}
+
+fn trusted_lua_runtime_with_policy(
+    grants: &[String],
+    mut policy: LuaPolicy,
+) -> Result<LuaRuntime, ShellError> {
     policy.allow_process = grants
         .iter()
         .any(|grant| grant == "process.spawn" || grant.starts_with("process.spawn:"));
@@ -435,6 +441,28 @@ fn validate_runtime(
     entry_bytes: &[u8],
     grants: &[String],
     require_runnable: bool,
+) -> Result<(), ShellError> {
+    validate_runtime_with_lua_policy(
+        manifest,
+        entry_path,
+        entry_bytes,
+        grants,
+        require_runnable,
+        LuaPolicy::config(),
+    )
+}
+
+// Functional fixtures can exercise real isolated validation without treating
+// the production 100 ms wall budget as a scheduler guarantee. The caller's
+// policy still crosses the worker's bounded policy admission unchanged; grants
+// remain the sole authority for enabling process calls.
+fn validate_runtime_with_lua_policy(
+    manifest: &PluginManifest,
+    entry_path: &Path,
+    entry_bytes: &[u8],
+    grants: &[String],
+    require_runnable: bool,
+    lua_policy: LuaPolicy,
 ) -> Result<(), ShellError> {
     validate_plugin_manifest(manifest, entry_bytes, env!("CARGO_PKG_VERSION"))?;
     match manifest.plugin.runtime {
@@ -468,8 +496,8 @@ fn validate_runtime(
         .with_help("Encode the locked plugin entry as UTF-8")
     })?;
     let source_name = entry_path.display().to_string();
-    LuaRuntime::check_source(entry_source, &source_name)?;
-    let runtime = trusted_lua_runtime(grants)?;
+    LuaRuntime::check_source_with_policy(entry_source, &source_name, lua_policy)?;
+    let runtime = trusted_lua_runtime_with_policy(grants, lua_policy)?;
     let registrations = runtime.load_plugin_source(entry_source, &source_name)?;
     let registered_commands = registrations
         .commands
@@ -1872,6 +1900,15 @@ summary = "Bounded plugin"
         fs::remove_dir_all(directory).unwrap();
     }
 
+    // These fixtures assert protocol, relocation, permission, and output-limit
+    // behavior. Their real child processes need scheduling headroom on loaded
+    // hosts; the dedicated 5 ms deadline fixture below keeps its own budget.
+    #[cfg(unix)]
+    const ADAPTER_FUNCTIONAL_TIMEOUT_MS: u64 = 5_000;
+    #[cfg(unix)]
+    const _: () =
+        assert!(ADAPTER_FUNCTIONAL_TIMEOUT_MS <= quirl_plugin::MAX_ADAPTER_CALLBACK_TIMEOUT_MS);
+
     #[cfg(unix)]
     fn write_isolated_adapter(
         directory: &Path,
@@ -1922,7 +1959,7 @@ max_message_bytes = {max_bytes}
         let manifest = write_isolated_adapter(
             &directory,
             "#!/bin/sh\nread request\nprintf '%s\\n' '{\"protocol\":\"quirl.plugin.v1\",\"schema_version\":1,\"api_version\":\"0.1.0\",\"operation\":\"initialize\",\"status\":\"ready\"}'\n",
-            1_000,
+            ADAPTER_FUNCTIONAL_TIMEOUT_MS,
             65_536,
         );
         let entry = directory.join("adapter");
@@ -1948,7 +1985,7 @@ max_message_bytes = {max_bytes}
         let manifest = write_isolated_adapter(
             &directory,
             "#!/bin/sh\nread request\nprintf '%s\\n' '{\"protocol\":\"quirl.plugin.v1\",\"schema_version\":1,\"api_version\":\"0.1.0\",\"operation\":\"initialize\",\"status\":\"ready\"}'\n",
-            1_000,
+            ADAPTER_FUNCTIONAL_TIMEOUT_MS,
             65_536,
         );
         let entry = directory.join("adapter");
@@ -1993,8 +2030,8 @@ max_message_bytes = {max_bytes}
         fs::create_dir_all(&directory).unwrap();
         let manifest = write_isolated_adapter(
             &directory,
-            "#!/bin/sh\ntest -f \"$(dirname \"$0\")/sidecar\" || exit 42\n",
-            1_000,
+            "#!/bin/sh\nread request || exit 43\ntest -f \"${0%/*}/sidecar\" || exit 42\n",
+            ADAPTER_FUNCTIONAL_TIMEOUT_MS,
             65_536,
         );
         fs::write(
@@ -2013,7 +2050,15 @@ max_message_bytes = {max_bytes}
             true,
         )
         .unwrap_err();
-        assert_eq!(error.code, ErrorCode::Validation);
+        assert_eq!(error.code, ErrorCode::Validation, "{error:?}");
+        assert!(
+            error
+                .details
+                .context
+                .iter()
+                .any(|context| context == "exit status: 42"),
+            "{error:?}"
+        );
         assert!(
             error
                 .details
@@ -2032,7 +2077,7 @@ max_message_bytes = {max_bytes}
         let manifest = write_isolated_adapter(
             &directory,
             "#!/bin/sh\nread request\nprintf '%s\\n' '{\"protocol\":\"quirl.plugin.v1\",\"schema_version\":1,\"api_version\":\"0.1.0\",\"operation\":\"initialize\",\"status\":\"ready\",\"forged\":true}'\n",
-            1_000,
+            ADAPTER_FUNCTIONAL_TIMEOUT_MS,
             65_536,
         );
         let entry = directory.join("adapter");
@@ -2100,7 +2145,7 @@ max_message_bytes = {max_bytes}
         let output = write_isolated_adapter(
             &directory,
             "#!/bin/sh\nread request\nprintf '%s' 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\nprintf '%s' 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' >&2\n",
-            1_000,
+            ADAPTER_FUNCTIONAL_TIMEOUT_MS,
             512,
         );
         let output_bytes = fs::read(&entry).unwrap();
@@ -2139,6 +2184,13 @@ max_message_bytes = {max_bytes}
     #[cfg(unix)]
     #[test]
     fn trusted_plugin_requires_full_registration_parity_and_bounded_process_grants() {
+        // This tests registration parity and process authority, not latency.
+        // Keep production memory/instruction limits, but allow bounded scheduling
+        // time for isolated Lua and its real sandboxed process round trip.
+        let fixture_policy = LuaPolicy {
+            wall_time: Duration::from_secs(5),
+            ..LuaPolicy::config()
+        };
         let directory = test_package_directory("trusted-process");
         fs::create_dir_all(&directory).unwrap();
         let entry = directory.join("plugin.lua");
@@ -2180,7 +2232,7 @@ error_codes = { "resource_limit" = "bounded" }
 "#
         .replace("@QUIRL_VERSION@", env!("CARGO_PKG_VERSION"));
         let manifest = parse_plugin_manifest(&manifest_source, "plugin.toml").unwrap();
-        let result = validate_runtime(
+        let result = validate_runtime_with_lua_policy(
             &manifest,
             &entry,
             &fs::read(&entry).unwrap(),
@@ -2189,12 +2241,13 @@ error_codes = { "resource_limit" = "bounded" }
                 "process.spawn:printf".to_owned(),
             ],
             true,
+            fixture_policy,
         );
         assert!(result.is_ok(), "{result:?}");
         let mismatched_entry = fs::read_to_string(&entry)
             .unwrap()
             .replace("input_type = \"Nothing\"", "input_type = \"String\"");
-        let mismatch = validate_runtime(
+        let mismatch = validate_runtime_with_lua_policy(
             &manifest,
             &entry,
             mismatched_entry.as_bytes(),
@@ -2203,11 +2256,32 @@ error_codes = { "resource_limit" = "bounded" }
                 "process.spawn:printf".to_owned(),
             ],
             true,
+            fixture_policy,
         )
         .unwrap_err();
         assert_eq!(mismatch.code, ErrorCode::Validation);
         assert!(mismatch.message.contains("registration differs"));
         assert!(mismatch.details.context[0].contains("Nothing -> String"));
+        let denied = validate_runtime_with_lua_policy(
+            &manifest,
+            &entry,
+            &fs::read(&entry).unwrap(),
+            &[
+                "commands.register".to_owned(),
+                "process.spawn:other".to_owned(),
+            ],
+            true,
+            fixture_policy,
+        )
+        .unwrap_err();
+        assert_eq!(denied.code, ErrorCode::Lua);
+        assert!(
+            denied
+                .details
+                .context
+                .iter()
+                .any(|context| context.contains("capability denied"))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
