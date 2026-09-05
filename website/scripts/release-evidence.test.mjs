@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 import {
   evidenceSourcePath,
   parseEvidenceMetadata,
+  projectionPaths,
   renderProjection,
   repositoryGit,
+  synchronizeProjectionFiles,
   validateAttribution,
   validateProjection,
   validateRecordIdentity,
@@ -241,6 +243,67 @@ test('record_identity_rejects_visible_artifact_time_and_platform_mismatches', ()
       ),
     /platform scope field must occur exactly once/,
   );
+});
+
+function withProjectionFixture(notes, check) {
+  const root = mkdtempSync(join(tmpdir(), 'quirl-version-evidence-'));
+  const metadata = parseEvidenceMetadata(header());
+  try {
+    for (const path of projectionPaths) {
+      const absolute = join(root, path);
+      mkdirSync(dirname(absolute), { recursive: true });
+      writeFileSync(absolute, path === 'RELEASE_NOTES.md'
+        ? notes : renderProjection(metadata, path.endsWith('.mdx') ? 'mdx' : 'markdown'));
+    }
+    const record = join(root, evidenceSourcePath);
+    mkdirSync(dirname(record), { recursive: true });
+    writeFileSync(record, '# 0.1.0 exact-candidate performance record\n');
+    check(root, metadata);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('new_candidate_notes_remain_byte_exact_while_historical_projections_are_checked', () => {
+  const notes = '# Quirl 0.2.0\n\n### Fixed\n\n- New candidate changes.\n';
+  withProjectionFixture(notes, (root, metadata) => {
+    for (const checkMode of [false, true]) {
+      synchronizeProjectionFiles(root, metadata, checkMode);
+      assert.equal(readFileSync(join(root, 'RELEASE_NOTES.md'), 'utf8'), notes);
+    }
+    writeFileSync(join(root, 'README.md'), renderProjection(metadata).replace('historical', 'current'));
+    assert.throws(() => synchronizeProjectionFiles(root, metadata, true), /projections are stale: README/);
+    synchronizeProjectionFiles(root, metadata, false);
+    assert.equal(readFileSync(join(root, 'RELEASE_NOTES.md'), 'utf8'), notes);
+    validateProjection(readFileSync(join(root, 'README.md'), 'utf8'), metadata, 'README.md');
+  });
+});
+
+test('matching_version_notes_still_require_and_validate_the_record_projection', () => {
+  withProjectionFixture('# Quirl 0.1.0\n', (root, metadata) => {
+    assert.throws(() => synchronizeProjectionFiles(root, metadata, true), /projection is missing from RELEASE_NOTES/);
+    writeFileSync(join(root, 'RELEASE_NOTES.md'), `# Quirl 0.1.0\n${renderProjection(metadata)}`);
+    assert.doesNotThrow(() => synchronizeProjectionFiles(root, metadata, true));
+  });
+});
+
+test('another_version_cannot_carry_the_historical_notes_projection', () => {
+  const metadata = parseEvidenceMetadata(header());
+  const notes = `# Quirl 0.2.0\n${renderProjection(metadata)}`;
+  withProjectionFixture(notes, (root, metadata) => {
+    for (const checkMode of [false, true]) {
+      assert.throws(() => synchronizeProjectionFiles(root, metadata, checkMode), /0\.2\.0 must not contain the 0\.1\.0 evidence/);
+      assert.equal(readFileSync(join(root, 'RELEASE_NOTES.md'), 'utf8'), notes);
+    }
+  });
+});
+
+test('missing_or_ambiguous_notes_identity_does_not_disable_evidence_checks', () => {
+  for (const notes of ['# Unversioned release\n', '# Quirl 0.2.0\n# Quirl 0.1.0\n']) {
+    withProjectionFixture(notes, (root, metadata) => {
+      assert.throws(() => synchronizeProjectionFiles(root, metadata, true), /release notes version field must occur exactly once/);
+    });
+  }
 });
 
 function runGitOrThrow(cwd, arguments_) {

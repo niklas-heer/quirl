@@ -98,6 +98,10 @@ The website's canonical Markdown mirrors are produced only by
 `website/scripts/sync-docs.mjs`; composed builtin catalog and Lua reference
 pages are produced only by `website/scripts/sync-generated-reference.mjs`.
 The external native `QCNC` SQLite artifact is not a website authoring source.
+The compiled references use an isolated product profile: personal plugins,
+configuration, and downloaded assets must not change their contents. A user's
+`quirl doc` can include installed command metadata; the website publishes the
+portable builtin contract and Lua SDK.
 Never repair a generated MDX page directly. Run the appropriate sync command,
 review the canonical source and generated diff, then run both syncs a second
 time to prove byte idempotence.
@@ -107,8 +111,11 @@ Release evidence status has an additional semantic source of truth: the strict
 `docs/benchmarks/release-v1.0.md`. The shared website parser accepts only the
 closed `historical`/`current` states, exact commit and digest shapes, a UTC
 measurement timestamp, and a bounded platform scope. `sync-docs.mjs` derives
-the marked README, changelog, release notes, language-design, checklist, audit,
-and website status regions from that header. The release-attribution check also
+the marked README, changelog, language-design, checklist, audit, and website
+status regions from that header. Release notes receive a projection only when
+they describe the same version as the evidence record. Preparing a new version
+must preserve its deterministic notes without borrowing an older artifact's
+evidence. The release-attribution check also
 verifies
 named Git objects and, for current evidence, the evidence-only direct child of
 the measured candidate. A byte-fresh mirror cannot therefore override or

@@ -31,6 +31,11 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.repository.default_branch }}
 
+      - name: Install Linux reference shells
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zsh
+
       - name: Verify the release state
         env:
           EXPECTED_TAG: ${{ inputs.tag }}
@@ -45,6 +50,9 @@ jobs:
         run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Run the canonical quality gate
+        # Match CI's bounded concurrency for process and terminal deadlines.
+        env:
+          RUST_TEST_THREADS: "2"
         run: cargo xtask check
 
   package:
