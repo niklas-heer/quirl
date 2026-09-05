@@ -92,18 +92,16 @@ Sleep 1500ms
 Enter
 Sleep 4s
 
-# AI mode searches local knowledge, then inserts a suggestion for review.
+# Local command search is a CLI tool, separate from authenticated Codex planning.
 Hide
 Ctrl+L
-Ctrl+Space
-Wait+Screen /AI/
-Show
-Type "copy a directory while preserving permissions"
-Sleep 6s
+Type "mode normal"
 Enter
 Wait+Screen /NORMAL/
-Sleep 3s
-Ctrl+U
+Show
+Type `quirl ai search "copy a directory while preserving permissions" --limit 3`
+Enter
+Sleep 6s
 
 # Full Bash compatibility stays explicit and visible.
 Hide
@@ -117,16 +115,16 @@ Enter
 Sleep 3s
 
 # Lua is the small, resource-bounded extension surface.
-Type `lua return { answer = 6 * 7, sandboxed = true }`
+Type `lua return { answer = 6 * 7, runtime = _VERSION, sandboxed = true }`
 Enter
 Sleep 3s
 
-# Finish on proof, not promises.
+# End with stable product boundaries; measurements belong to exact artifacts.
 Hide
 Ctrl+L
 Type "./tour proof"
 Enter
-Wait+Screen /RELEASE PROOF/
+Wait+Screen /EXPLICIT BOUNDARIES/
 Show
 Sleep 6s
 

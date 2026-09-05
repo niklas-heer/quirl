@@ -66,13 +66,18 @@ export default function HomePage() {
       <div className="demo-wrap">
         <div
           className="cassette demo-cassette"
-          aria-label="Recorded Quirl session"
+          aria-label="Earlier 0.1-era Quirl recording"
         >
           <div className="cassette-label">
-            <span>SIDE A — 69 SECOND PRODUCT TOUR</span>
+            <span>SIDE A — EARLIER 0.1-ERA DEMO</span>
             <CassetteReels />
           </div>
           <HeroDemo />
+          <p id="demo-recording-context" style={{ padding: '1rem', margin: 0 }}>
+            This recording&apos;s local AI flow and performance card are historical.
+            Follow the <Link href="/docs/getting-started/first-session">current first session</Link>
+            {' '}and read the <Link href="/docs/project/release-0.1/performance-record">historical artifact evidence</Link>.
+          </p>
         </div>
       </div>
 

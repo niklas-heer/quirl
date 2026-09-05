@@ -46,6 +46,9 @@
   boundaries, and plugin persistence reject invalid or excessive input earlier.
 - The PTY harness handles bidirectional backpressure without extending deadlines
   and checks visible labels in reconstructed screens instead of raw byte layout.
+- Demo recipes report the actual Lua runtime and distinguish local command
+  search from authenticated Codex planning. Earlier embedded recordings and
+  their performance cards are explicitly labeled as historical.
 - The homepage demo now exposes playback controls when autoplay or reduced
   motion leaves it paused, reserves its aspect ratio, and shares a stable
   content rail with centered hero copy. The decorative headline treatment no

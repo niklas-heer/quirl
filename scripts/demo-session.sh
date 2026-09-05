@@ -118,7 +118,8 @@ if [ "$demo_symbols" = nerd_font ]; then
     '}' >"$demo_config/config.lua"
 fi
 
-demo_path=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin
+# Nested `quirl` commands in the recording must use the same candidate binary.
+demo_path=$demo_bin_dir:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin
 demo_term=${TERM:-xterm-256color}
 cd "$demo_workspace"
 

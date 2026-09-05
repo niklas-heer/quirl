@@ -34,10 +34,10 @@ case $card in
     printf '\n'
     printf '    %s%sQ U I R L%s\n' "$bold" "$magenta" "$reset"
     printf '    %sA WELL-STIRRED SHELL%s\n\n' "$white" "$reset"
-    printf '    %sBASH MUSCLE MEMORY%s   %s→%s   %sTYPED DATA%s   %s→%s   %sLOCAL INTENT%s\n\n' \
+    printf '    %sBASH MUSCLE MEMORY%s   %s→%s   %sTYPED DATA%s   %s→%s   %sBOUNDED LUA%s\n\n' \
       "$magenta" "$reset" "$muted" "$reset" "$cyan" "$reset" \
       "$muted" "$reset" "$green" "$reset"
-    printf '    %sOne fast Rust binary. Three explicit modes. No mystery grammar.%s\n\n' \
+    printf '    %sNative commands. Typed pipelines. Explicit extension boundaries.%s\n\n' \
       "$dim" "$reset"
     rule
     ;;
@@ -59,14 +59,12 @@ case $card in
     printf '\n'
     rule
     printf '\n'
-    printf '    %s%sRELEASE PROOF%s   %smeasured on the 0.1 release artifact%s\n\n' \
-      "$bold" "$green" "$reset" "$dim" "$reset"
-    printf '    %s4.46 MiB%s release artifact     %s19.2 ms%s first-prompt P95\n' \
-      "$magenta" "$reset" "$cyan" "$reset"
-    printf '    %s1,100+%s Rust tests             %s11%s real-PTY journeys\n' \
-      "$yellow" "$reset" "$green" "$reset"
-    printf '    %sLua 5.4%s, resource bounded     %sAI suggests%s — you decide\n\n' \
-      "$cyan" "$reset" "$magenta" "$reset"
+    printf '    %s%sEXPLICIT BOUNDARIES%s\n\n' "$bold" "$green" "$reset"
+    printf '    %sNative commands%s and byte pipelines\n' "$magenta" "$reset"
+    printf '    %sTyped records%s through open, where, sort, and select\n' "$cyan" "$reset"
+    printf '    %sBounded Lua%s for scripts and extensions\n' "$yellow" "$reset"
+    printf '    %sCodex planning%s requires authentication and command review\n\n' \
+      "$green" "$reset"
     printf '    %sFamiliar where it should be. Explicit where it matters.%s\n\n' \
       "$white" "$reset"
     rule

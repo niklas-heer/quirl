@@ -99,7 +99,7 @@ explain() {
 
 printf '%sQuirl %s a well-stirred shell%s\n' \
   "$demo_magenta" "$demo_dash" "$demo_reset"
-printf 'The three prompt modes make bytes, typed values, and intent visibly different.\n'
+printf 'Native commands, typed data, and bounded extensions share one shell.\n'
 
 explain 'NORMAL MODE — run familiar programs; Quirl owns pipes and process status.'
 run_demo exec "printf 'api ready\\nworker degraded\\n' | grep degraded && printf 'pipeline status: healthy\\n'"
@@ -110,11 +110,11 @@ run_demo complete 'git commit --am'
 explain 'DATA MODE — filter and sort real typed fields before rendering a table.'
 run_demo data '[{"service":"api","region":"eu","latency_ms":18},{"service":"worker","region":"us","latency_ms":91},{"service":"jobs","region":"eu","latency_ms":54}] | where latency_ms > 50 | sort latency_ms desc | select service region latency_ms'
 
-explain 'AI MODE — describe the goal; local results are suggested, never auto-executed.'
+explain 'LOCAL COMMAND SEARCH — retrieve suggestions without executing them; AI mode separately uses Codex.'
 run_ai_demo ai search 'show git branch status' --limit 3
 
 explain 'LUA SDK — bounded extension logic for scripts and config, not a hidden mode.'
-run_demo eval 'return { answer = 6 * 7, runtime = "sandboxed Lua 5.4" }'
+run_demo eval 'return { answer = 6 * 7, runtime = _VERSION }'
 run_demo check hello.lua
 
 explain 'ONE CATALOG — the interactive UI, CLI, docs, and agents share one contract.'

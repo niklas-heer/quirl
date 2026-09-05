@@ -17,12 +17,17 @@
 
 <div align="center">
   <a href="https://quirl.vercel.app/">
-    <img src="assets/quirl-demo.gif?raw=1" width="1200" alt="A narrated Quirl terminal session: a native pipeline and semantic completion in Normal mode; typed JSON flowing through open, where, sort, and select in Data mode; local AI suggestions; an explicit Bash island; sandboxed Lua; and measured release proof">
+    <img src="assets/quirl-demo.gif?raw=1" width="1200" alt="Earlier 0.1-era Quirl demo: shell commands, typed data, historical local AI suggestions, Bash compatibility, Lua, and a historical performance card">
   </a>
   <br>
   <a href="https://quirl.vercel.app/quirl-demo.mp4">Watch the MP4</a>
   ·
   <a href="https://quirl.vercel.app/blog/a-shell-with-a-richer-vocabulary">Read the feature tour</a>
+  <p>
+    Earlier 0.1-era recording; its local AI flow and performance card are historical.
+    See the <a href="https://quirl.vercel.app/docs/getting-started/first-session">current first session</a>
+    and <a href="https://quirl.vercel.app/docs/project/release-0.1/performance-record">historical artifact evidence</a>.
+  </p>
 </div>
 
 > [!IMPORTANT]

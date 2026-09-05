@@ -38,7 +38,8 @@ export function HeroDemo() {
       playsInline
       width={1200}
       height={720}
-      aria-label="Recorded Quirl terminal session: a native pipeline and semantic completion, typed JSON transformed with open, where, sort, and select, local AI suggestions, explicit Bash compatibility, sandboxed Lua, and measured release proof"
+      aria-label="Earlier 0.1-era Quirl demo: shell commands, typed data, historical local AI suggestions, Bash compatibility, Lua, and a historical performance card"
+      aria-describedby="demo-recording-context"
     >
       <source src="/quirl-demo.webm" type="video/webm" />
       <source src="/quirl-demo.mp4" type="video/mp4" />

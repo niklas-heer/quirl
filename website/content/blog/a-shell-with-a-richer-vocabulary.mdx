@@ -1,6 +1,6 @@
 ---
 title: A Shell With a Richer Vocabulary
-description: See how Quirl moves from familiar commands to typed JSON, local AI suggestions, explicit Bash compatibility, and bounded Lua—without hiding the boundaries.
+description: See how Quirl moves from familiar commands to typed JSON, reviewed Codex proposals, explicit Bash compatibility, and bounded Lua—without hiding the boundaries.
 date: 2026-08-24
 ---
 
@@ -28,13 +28,19 @@ process, JSON, or Lua is explicit in the command you can read and save.
   poster="/quirl-demo-poster.png"
   width="1200"
   height="720"
-  aria-label="Quirl product tour showing Normal, Data, and AI modes, explicit Bash compatibility, sandboxed Lua, and release measurements"
+  aria-label="Earlier 0.1-era Quirl demo with historical local AI behavior and performance figures"
   style={{ width: '100%', height: 'auto', borderRadius: '0.75rem', background: '#000' }}
 >
   <source src="/quirl-demo.webm" type="video/webm" />
   <source src="/quirl-demo.mp4" type="video/mp4" />
   <a href="/quirl-demo.mp4">Watch the Quirl product tour.</a>
 </video>
+
+This is an earlier 0.1-era recording. Its local AI flow and performance card
+are historical; current source uses Codex proposals for review. Follow the
+[current first session](/docs/getting-started/first-session) for today's workflow,
+and consult the [historical artifact evidence](/docs/project/release-0.1/performance-record)
+for the scope of the recorded measurements.
 
 ## Start where you already are
 
@@ -99,12 +105,14 @@ part of the product contract, not a temporary safety prompt.
 
 ## Extend one small boundary
 
-Lua 5.4 is Quirl's single extension language for configuration, scripts,
+Current source uses Lua 5.5.1 as Quirl's single extension language for configuration, scripts,
 prompts, completion providers, and trusted plugins:
 
 ```lua
 return { answer = 6 * 7, sandboxed = true }
 ```
+
+The published `v0.1.0` artifacts retain their recorded Lua 5.4 runtime.
 
 Every VM runs with a memory limit, instruction budget, wall deadline, and
 cancellation. The standard library is restricted, and values are converted
@@ -114,10 +122,11 @@ logic within the capabilities the host grants.
 
 ## Small enough to inspect, tested like a shell
 
-The measured 0.1 release artifact is 4.46 MiB and reached the first prompt in
-19.2 ms P95 in its recorded release environment. The current repository has
-more than 1,100 Rust tests, plus real-PTY journeys, guest-side Lua tests, and
-bounded differential cases against available Bash and Zsh references.
+The performance card in the recording describes an earlier 0.1-era artifact.
+The [historical measurement record](/docs/project/release-0.1/performance-record)
+identifies the measured artifact and environment; those figures do not measure
+current source. The repository also exercises real-PTY journeys, guest-side
+Lua tests, and bounded differential cases against available Bash and Zsh references.
 
 Those numbers matter less as trophies than as constraints. A shell owns child
 processes, terminal modes, history, configuration, and user data. Fast is good;
