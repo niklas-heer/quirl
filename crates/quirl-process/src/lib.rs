@@ -4906,6 +4906,10 @@ mod platform {
 
         #[test]
         fn capture_shutdown_is_bounded_and_closes_the_owned_descriptor() {
+            run_pipe_task_descriptor_fixture("shutdown");
+        }
+
+        fn assert_capture_shutdown_closes_descriptor() {
             // The retained writer models a detached descendant outside the killed group.
             let (reader, mut writer) = pipe().unwrap();
             let task = spawn_reader_observed(reader, 1024, None).unwrap();
@@ -4922,6 +4926,55 @@ mod platform {
 
         #[test]
         fn dropping_pipe_tasks_interrupts_pending_io_and_closes_descriptors() {
+            run_pipe_task_descriptor_fixture("drop");
+        }
+
+        fn run_pipe_task_descriptor_fixture(mode: &str) {
+            // Drop joins the worker and closes its owned descriptor. BrokenPipe
+            // and EOF also require that no other process holds an inherited
+            // endpoint: concurrent test subprocesses can retain CLOEXEC pipes
+            // between fork and exec. Isolate that process-global oracle without
+            // adding retries that could conceal a leaked task-owned descriptor.
+            let mut executor = NativeExecutor::default();
+            executor
+                .set_environment_variable(
+                    "QUIRL_PIPE_TASK_TEST_BINARY".to_owned(),
+                    env::current_exe().unwrap().to_str().unwrap().to_owned(),
+                )
+                .unwrap();
+            executor
+                .set_environment_variable(
+                    "QUIRL_PIPE_TASK_DESCRIPTOR_HELPER".to_owned(),
+                    mode.to_owned(),
+                )
+                .unwrap();
+            let mut request = bounded_request(
+                "\"$QUIRL_PIPE_TASK_TEST_BINARY\" --exact platform::tests::pipe_task_descriptor_cleanup_helper --nocapture --test-threads=1".to_owned(),
+                Duration::from_secs(5),
+            );
+            request.max_output_bytes = 64 * 1024;
+            let result = executor.execute_capture_request(request).unwrap();
+            assert_eq!(result.status, 0, "{result:?}");
+            assert!(
+                result
+                    .stdout
+                    .as_deref()
+                    .is_some_and(|output| { output.contains("pipe descriptor closure verified") }),
+                "descriptor fixture did not complete: {result:?}"
+            );
+        }
+
+        #[test]
+        fn pipe_task_descriptor_cleanup_helper() {
+            match env::var("QUIRL_PIPE_TASK_DESCRIPTOR_HELPER").as_deref() {
+                Ok("shutdown") => assert_capture_shutdown_closes_descriptor(),
+                Ok("drop") => assert_dropping_pipe_tasks_closes_descriptors(),
+                _ => return,
+            }
+            println!("pipe descriptor closure verified");
+        }
+
+        fn assert_dropping_pipe_tasks_closes_descriptors() {
             let (reader, mut writer) = pipe().unwrap();
             let task = spawn_reader_observed(reader, 1024, None).unwrap();
             drop(task);

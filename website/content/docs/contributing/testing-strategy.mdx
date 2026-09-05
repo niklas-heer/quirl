@@ -123,6 +123,13 @@ a private gate while sending the next input. It verifies the rendered spaces
 and the accepted input after control returns to the editor, covering kernel
 echo that bypasses the renderer's cached frame during cooked-mode execution.
 
+Pipe-task descriptor assertions run in isolated, bounded helper processes.
+`BrokenPipe` and EOF require every copy of an endpoint to close; unrelated tests
+can briefly inherit close-on-exec descriptors between fork and exec. Isolation
+keeps immediate closure assertions meaningful without retrying away leaks. The
+parent requires a successful exit and an explicit completion marker, and bounds
+helper runtime, captured output, and process-tree cleanup.
+
 ## Layers
 
 | Layer | What it proves | Typical evidence |
