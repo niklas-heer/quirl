@@ -36,3 +36,6 @@
   next edit or explicit completion request.
 - Completion and documentation panels reserve space below the editor, scrolling
   older transcript lines upward instead of covering recent command output.
+- Plain shell startup skips constructing the command-line option tree. Invocations
+  with arguments retain full validation, and redirected stdin keeps its existing
+  execution behavior.

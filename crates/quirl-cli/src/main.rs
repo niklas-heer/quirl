@@ -98,7 +98,7 @@ use std::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Default, Parser)]
 #[command(name = "quirl", version, about = "Everything you need, mixed in", after_help = quirl_catalog::INTERACTIVE_START_HELP)]
 struct Cli {
     /// Emit machine-readable metadata for release tooling.
@@ -331,7 +331,14 @@ fn main() -> ExitCode {
             Err(_) => ExitCode::FAILURE,
         };
     }
-    let cli = Cli::parse();
+    // An empty invocation has no switches to validate. Keep command-tree
+    // construction out of shell startup; every supplied argument still goes
+    // through Clap, and `run` retains interactive versus stdin selection.
+    let cli = if std::env::args_os().nth(1).is_none() {
+        Cli::default()
+    } else {
+        Cli::parse()
+    };
     if cli.build_info {
         print_json_value(serde_json::json!({
             "schema_version": 3,
@@ -4310,6 +4317,14 @@ mod tests {
     static NEXT_DIFFERENTIAL_FIXTURE: AtomicUsize = AtomicUsize::new(0);
     const DEFAULT_DIFFERENTIAL_CASES: usize = 128;
     const DEFAULT_DIFFERENTIAL_SEED: u64 = 7_640_891_576_956_012_809;
+
+    #[test]
+    fn empty_invocation_defaults_match_the_full_argument_parser() {
+        // Compare every field so a future global option cannot silently give
+        // plain shell startup a different default from Clap's contract.
+        let parsed = Cli::try_parse_from(["quirl"]).unwrap();
+        assert_eq!(format!("{:?}", Cli::default()), format!("{parsed:?}"));
+    }
 
     #[test]
     fn cold_native_prompt_provider_schedules_once_then_only_reads_the_cache() {
