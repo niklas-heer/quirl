@@ -35,6 +35,7 @@ impl Journey {
             .ok_or_else(|| io::Error::other("clone journey deadline overflow"))?;
         let mut session = Session::new(binary, SessionOptions::default())?;
         session.pty.wait_for(STARTUP_MARKER)?;
+        wait_for_rich_input_until(&mut session, 0, deadline)?;
         let remotes = session.private.path.join("remotes");
         fs::create_dir(&remotes)?;
         for repository in repositories {
@@ -59,7 +60,7 @@ impl Journey {
 
     fn run(&mut self, command: &str) -> Result<(), TaskError> {
         let start = self.submit(command)?;
-        self.wait_input(start)
+        self.wait_command_result(start)
     }
 
     fn submit(&mut self, command: &str) -> Result<usize, TaskError> {
@@ -90,17 +91,41 @@ impl Journey {
         Ok(start)
     }
 
-    fn select(&mut self, start: usize, down_count: usize) -> Result<(), TaskError> {
+    fn select(&mut self, down_count: usize) -> Result<(), TaskError> {
         for _ in 0..down_count {
             self.session.pty.send(b"\x1b[B")?;
         }
+        // The modal acquired its own raw lease before this choice. It cannot
+        // acknowledge execution; require a lease acquired after selection.
+        let start = self.session.pty.output().len();
         self.session.pty.send(key::ENTER)?;
-        self.wait_input(start)
+        self.wait_command_result(start)
     }
 
     fn wait_input(&mut self, start: usize) -> Result<(), TaskError> {
         let deadline = self.step_deadline()?;
         wait_for_rich_input_until(&mut self.session, start, deadline)
+    }
+
+    fn wait_command_result(&mut self, start: usize) -> Result<(), TaskError> {
+        let deadline = self.step_deadline()?;
+        wait_for_rich_input_until(&mut self.session, start, deadline)?;
+        loop {
+            let screen = self.session.pty.screen();
+            if screen.has_completed_frame() && newest_command_has_result(&screen.lines()) {
+                // Completion can be painted while execution still owns cooked
+                // input. Recheck the lease after that result before typing.
+                return wait_for_rich_input_until(&mut self.session, start, deadline);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(format!(
+                    "managed-clone command did not complete before the step deadline; screen: {}",
+                    screen.text()
+                ))
+                .into());
+            }
+            self.session.pty.drain_for(Duration::from_millis(16))?;
+        }
     }
 
     fn step_deadline(&self) -> Result<Instant, TaskError> {
@@ -160,7 +185,7 @@ impl Journey {
     }
 
     fn assert_checkout(&self, path: &Path) -> Result<(), TaskError> {
-        let config = read_bounded_fixture(&path.join(".git/config"), FIXTURE_BYTES_MAX)?;
+        let config = self.read_fixture(&path.join(".git/config"))?;
         if !path.join(".git/HEAD").is_file()
             || !config
                 .windows(REMOTE_PREFIX.len())
@@ -176,13 +201,24 @@ impl Journey {
     }
 
     fn assert_file(&self, relative: &str, expected_prefix: &[u8]) -> Result<(), TaskError> {
-        let actual = read_bounded_fixture(&self.path(relative), FIXTURE_BYTES_MAX)?;
+        let actual = self.read_fixture(&self.path(relative))?;
         if !actual.starts_with(expected_prefix) {
             return Err(
                 io::Error::other(format!("clone fixture {relative} differed: {actual:?}")).into(),
             );
         }
         Ok(())
+    }
+
+    fn read_fixture(&self, path: &Path) -> Result<Vec<u8>, TaskError> {
+        read_bounded_fixture(path, FIXTURE_BYTES_MAX).map_err(|error| {
+            io::Error::other(format!(
+                "cannot read managed-clone fixture {}: {error}; screen: {}",
+                path.display(),
+                self.session.pty.screen().text()
+            ))
+            .into()
+        })
     }
 
     fn snapshot(&self, label: &str) -> Result<(), TaskError> {
@@ -215,10 +251,7 @@ impl Journey {
     }
 
     fn assert_policy(&self, expected: &str) -> Result<(), TaskError> {
-        let bytes = read_bounded_fixture(
-            &self.path("state/quirl/clone-policy.json"),
-            FIXTURE_BYTES_MAX,
-        )?;
+        let bytes = self.read_fixture(&self.path("state/quirl/clone-policy.json"))?;
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;
         if value.get("policy").and_then(serde_json::Value::as_str) != Some(expected) {
             return Err(
@@ -258,8 +291,8 @@ pub(super) fn check_project_clone_default(binary: &Path) -> Result<(), TaskError
             return Err(io::Error::other("cancelled clone changed files or preference").into());
         }
     }
-    let start = journey.suggest("original")?;
-    journey.select(start, 0)?;
+    journey.suggest("original")?;
+    journey.select(0)?;
     journey.assert_checkout(&journey.path("original"))?;
     journey.assert_policy("off")?;
     journey.run(&format!("git clone {REMOTE_PREFIX}subsequent"))?;
@@ -349,9 +382,9 @@ exec {git} "$@"
 /// Clone once, immediately navigate with retained typing, and reuse without Git mutation.
 pub(super) fn check_project_clone_navigation(binary: &Path) -> Result<(), TaskError> {
     let mut journey = Journey::new(binary, &["once", "ordinary", "conflict"])?;
-    let start = journey.suggest("once")?;
+    journey.suggest("once")?;
     journey.snapshot("clone-chooser")?;
-    journey.select(start, 1)?;
+    journey.select(1)?;
     let checkout = journey.managed("once");
     journey.assert_checkout(&checkout)?;
     journey.assert_policy("off")?;
@@ -417,8 +450,8 @@ pub(super) fn check_project_clone_always(binary: &Path) -> Result<(), TaskError>
             "first", "second", "explicit", "options", "compound", "redirect",
         ],
     )?;
-    let start = journey.suggest("first")?;
-    journey.select(start, 2)?;
+    journey.suggest("first")?;
+    journey.select(2)?;
     journey.assert_checkout(&journey.managed("first"))?;
     journey.assert_policy("managed")?;
     journey.run(&format!("git clone {REMOTE_PREFIX}second"))?;
@@ -444,4 +477,73 @@ pub(super) fn check_project_clone_always(binary: &Path) -> Result<(), TaskError>
     }
     journey.assert_policy("managed")?;
     journey.finish("managed clone remembered preference and bypasses", 0)
+}
+
+// A raw lease can belong to a modal or child, not a finished shell command.
+// Require the newest transcript command's result and an empty editor as well.
+// Inspect at most the already bounded screen; command wrapping and managed
+// source rewriting do not affect the command/result boundary markers.
+fn newest_command_has_result(lines: &[String]) -> bool {
+    let Some(command) = lines.iter().rposition(|line| line.starts_with("❯ ")) else {
+        return false;
+    };
+    let following = lines.iter().skip(command.saturating_add(1));
+    following.clone().any(|line| line.starts_with("── exit "))
+        && following.clone().any(|line| line.trim() == ">")
+        && !following
+            .clone()
+            .any(|line| line.starts_with("> ") && !line.trim_end().eq(">"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::newest_command_has_result;
+
+    fn result_ready(lines: &[&str]) -> bool {
+        newest_command_has_result(&lines.iter().map(ToString::to_string).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn clone_result_oracle_requires_the_newest_command_to_finish() {
+        assert!(!result_ready(&["── exit 0 · 1ms ──", ">"]));
+        assert!(result_ready(&[
+            "❯ git clone first",
+            "── exit 0 · 1ms ──",
+            ">"
+        ]));
+        assert!(!result_ready(&[
+            "❯ git clone first",
+            "── exit 0 · 1ms ──",
+            "❯ git clone second",
+            ">"
+        ]));
+        assert!(!result_ready(&[
+            "❯ git clone first",
+            "── exit 0 · 1ms ──",
+            "❯ git clone first",
+            ">"
+        ]));
+        assert!(!result_ready(&[
+            "❯ git clone first",
+            "── exit 0 · 1ms ──",
+            "> git clone second"
+        ]));
+    }
+
+    #[test]
+    fn clone_result_oracle_accepts_wrapped_managed_commands_and_failure_results() {
+        assert!(result_ready(&[
+            "❯ 'git' 'clone' '--' 'https://clone.example/team/first'",
+            "'/private/managed/clone.example/team/first'",
+            "Cloning into the chosen directory...",
+            "── exit 0 · 1ms ──",
+            ">"
+        ]));
+        assert!(result_ready(&[
+            "❯ quirl projects clone conflict",
+            "error: destination already exists",
+            "── exit 1 · 1ms ──",
+            ">"
+        ]));
+    }
 }
