@@ -326,6 +326,10 @@ pub struct CompletionState {
     data_ls_alias_request: bool,
     explicit_quirl_request: bool,
     deferred: Option<DeferredCompletion>,
+    // Publication is asynchronous: invalidating a worker is insufficient if
+    // the surface creates another automatic request for the same input. Keep
+    // dismissal intent until an edit or a new explicit request supersedes it.
+    dismissed: bool,
 }
 
 impl CompletionState {
@@ -356,6 +360,7 @@ impl CompletionState {
             data_ls_alias_request: false,
             explicit_quirl_request: false,
             deferred: None,
+            dismissed: false,
         }
     }
 
@@ -383,6 +388,7 @@ impl CompletionState {
             data_ls_alias_request: false,
             explicit_quirl_request: false,
             deferred: None,
+            dismissed: false,
         }
     }
 
@@ -399,7 +405,9 @@ impl CompletionState {
     }
 
     pub fn replace_catalog(&mut self, catalog: Arc<Catalog>) {
+        let dismissed = self.dismissed;
         self.cancel_for_edit();
+        self.dismissed = dismissed;
         self.worker = None;
         self.catalog = Some(catalog);
     }
@@ -445,6 +453,7 @@ impl CompletionState {
         mode: Mode,
         automatic: bool,
     ) -> Result<(), ShellError> {
+        self.dismissed = false;
         if line.len() > quirl_catalog::MAX_COMPLETION_QUERY_BYTES {
             self.cancel_for_edit();
             self.resource_notice = Some(format!(
@@ -539,6 +548,13 @@ impl CompletionState {
     pub fn cancel_for_edit(&mut self) {
         self.resource_notice = None;
         self.dismiss();
+        self.dismissed = false;
+    }
+
+    /// Whether publication must preserve dismissal for the unchanged input.
+    /// Editing or requesting completion again starts a new input intent.
+    pub(super) const fn was_dismissed(&self) -> bool {
+        self.dismissed
     }
 
     fn cancel_workers(&mut self) {
@@ -697,6 +713,7 @@ impl CompletionState {
     }
 
     pub fn dismiss(&mut self) {
+        self.dismissed = true;
         // Escape must also invalidate in-flight and already published results:
         // otherwise a late provider can reopen the menu and steal the next Enter.
         self.cancel_workers();

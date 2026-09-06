@@ -74,6 +74,9 @@ pub(super) mod key {
     pub const CTRL_L: &[u8] = b"\x0c";
     pub const CTRL_U: &[u8] = b"\x15";
     pub const ESCAPE: &[u8] = b"\x1b";
+    // CSI-u terminates Escape explicitly, so an immediately following Enter
+    // remains a separate key rather than the legacy Alt+Enter encoding.
+    pub const ESCAPE_THEN_ENTER: &[u8] = b"\x1b[27u\r";
     pub const ENTER: &[u8] = b"\r";
     pub const TAB: &[u8] = b"\t";
 }

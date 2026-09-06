@@ -1926,11 +1926,7 @@ fn check_directory_navigation(binary: &Path) -> Result<(), TaskError> {
     wait_navigation_completion(&mut session, "> cd ~/Projects/alpha/", "nested/")?;
     session.pty.send(key::ENTER)?;
     wait_navigation_completion(&mut session, "> cd ~/Projects/alpha/nested/", "leaf/")?;
-    session.pty.send(key::ESCAPE)?;
-    wait_for_standard_status(&mut session)?;
-    let cd_start = session.pty.output().len();
-    session.pty.send(key::ENTER)?;
-    wait_for_rich_input_since(&mut session, cd_start)?;
+    execute_accepted_directory_and_resume(&mut session)?;
     check_navigation_file_acceptance(&mut session)?;
 
     check_navigation_pwd(&mut session, &nested)?;
@@ -1986,12 +1982,19 @@ fn check_navigation_changed_home(session: &mut Session) -> Result<(), TaskError>
                     .iter()
                     .any(|line| line.trim() == "> cd ~/HOME_UPDATED_CHILD/")
         })?;
-    session.pty.send(key::ESCAPE)?;
-    wait_for_standard_status(session)?;
-    let execution_start = session.pty.output().len();
-    session.pty.send(key::ENTER)?;
-    wait_for_rich_input_since(session, execution_start)?;
+    execute_accepted_directory_and_resume(session)?;
     check_navigation_pwd(session, &child)
+}
+
+fn execute_accepted_directory_and_resume(session: &mut Session) -> Result<(), TaskError> {
+    // An empty directory may already show the standard footer, so it cannot
+    // acknowledge Escape. Adjacent legacy Escape/Enter bytes instead mean
+    // Alt+Enter and insert a newline. Send an explicitly terminated Escape
+    // followed by Enter in one ordered batch, then require a fresh input lease.
+    // The caller separately verifies the accepted path and resulting cwd.
+    let execution_start = session.pty.output().len();
+    session.pty.send(key::ESCAPE_THEN_ENTER)?;
+    wait_for_rich_input_since(session, execution_start)
 }
 
 fn check_navigation_pwd(session: &mut Session, expected: &Path) -> Result<(), TaskError> {

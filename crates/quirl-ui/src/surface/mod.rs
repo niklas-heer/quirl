@@ -2664,8 +2664,10 @@ impl RichSurface {
     ) -> Result<(), ShellError> {
         // Typing can precede publication without creating a request. Reapply
         // the normal automatic policy to the current buffer exactly once at
-        // admission, while preserving explicit completion and every overlay.
+        // admission, while preserving explicit completion, prior dismissal,
+        // and every overlay. Background publication is not a new user edit.
         if mode == Mode::Natural
+            || self.completion.was_dismissed()
             || self.completion.open
             || self.picker.active()
             || self.leader_active
@@ -5611,6 +5613,45 @@ mod tests {
             .unwrap();
         assert!(surface.completion.open);
         assert!(!surface.completion.automatic);
+    }
+
+    #[test]
+    fn catalog_publication_cannot_reopen_completion_dismissed_for_the_current_edit() {
+        let mut surface = cold_help_surface(Catalog::builtin());
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("cd /tmp");
+        surface
+            .completion
+            .request(editor.buffer(), editor.cursor(), Mode::Command)
+            .unwrap();
+        assert!(surface.completion.open);
+        assert!(surface.published_catalog().is_none());
+
+        // The loading popup is already visible when Escape is consumed. A
+        // subsequent catalog publication must not turn the next Enter back
+        // into completion acceptance for this unchanged command.
+        surface.dismiss_picker();
+        surface.begin_catalog_admission().unwrap();
+        await_catalog_admission(&mut surface).unwrap();
+        surface
+            .refresh_completion_after_catalog(&editor, Mode::Command)
+            .unwrap();
+        assert!(!surface.completion.open);
+        assert!(!surface.completion.accepts_enter());
+
+        // Explicit Tab remains an independent request even without an edit.
+        surface
+            .completion
+            .request(editor.buffer(), editor.cursor(), Mode::Command)
+            .unwrap();
+        assert!(surface.completion.open);
+        surface.dismiss_picker();
+        editor.insert_paste("/");
+        surface
+            .refresh_completion_after_edit(&editor, Mode::Command)
+            .unwrap();
+        assert!(surface.completion.open);
+        assert!(surface.completion.automatic);
     }
 
     #[test]

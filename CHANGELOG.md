@@ -46,6 +46,8 @@ which versions are published.
   directory selection. Escape then Enter executes the selected directory;
   already complete filenames still execute on the first Enter. Home-directory
   candidates follow the session's current `HOME` value.
+  Background catalog loading preserves an Escape-dismissed popup until the
+  next edit or explicit completion request.
 - Completion and documentation panels reserve space below the editor, scrolling
   older transcript lines upward instead of covering recent command output.
 
