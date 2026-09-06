@@ -28,7 +28,20 @@ This checklist uses two explicit revisions:
   rebuilds, or relabels A. Any code, manifest, generated-contract, dependency,
   or release-profile change requires a new candidate A and a fresh gate.
 
-## v0.2.0 publication record
+## v0.3.0 publication record
+
+Quirl 0.3.0 was published on 6 September 2026:
+
+- The nondraft, non-prerelease, immutable [v0.3.0 GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.3.0) and tag identify candidate commit `dfb43e54320d166ebe195bb5a0255b8aacbb11e5`. Publication was verified at `2026-09-06T19:34:54Z` (release ID `383694213`). All 15 published asset digests and byte counts, plus the exact release body, matched the reviewed bundle.
+- Candidate verification, canonical quality gate, all four native packages, downloadable assets, aggregation, publication, and protected Homebrew job succeeded in [release run 34054071682](https://github.com/niklas-heer/quirl/actions/runs/34054071682), attempt 1. Each exact native executable passed 101 successful automated PTY samples, 404 in total. The [0.3.0 performance record](/docs/research/benchmarks/release-v0.3.0) links unchanged reports, executable hashes, runner details, limits, and preserved older failed candidates.
+- The release manifest SHA-256 is `583a36d0d4ae5ae85e336d71695480bee2624778a41f7f52ff7bdd3ec2820329`; reviewed release notes SHA-256 is `3d62a1cb5830c2fb69ef103ae8a984815e42d548fade13585a23ceba0202a379`. Exact archive members matched the measured executable bytes on all four targets. Size remained advisory; latency, identity, completeness, retention, and cleanup gates were enforced.
+- [Homebrew tap PR 8](https://github.com/niklas-heer/homebrew-tap/pull/8) merged as `57a937fe2b674dd29e7475522889f3bc77c88711`. The formula on tap `main` matched the audited four published archive URLs and hashes.
+- The release-dispatched [website asset run 34055349465](https://github.com/niklas-heer/quirl/actions/runs/34055349465) passed from the released candidate and pushed asset evidence commit `cffebda4b43ad57f18dd3c1e63260ef381c059af`. The live version-scoped manifest matched the committed channel.
+- The fresh [terminal recording](https://quirl.vercel.app/quirl-demo.mp4) and [capture provenance](https://quirl.vercel.app/quirl-demo-provenance.json) identify the exact published macOS ARM64 executable, SHA-256 `30a6edce509a6220cfb4c505fe0192598d56174336a8720ffd0e2042be1c53d8`. VHS captured 71.12 seconds in an isolated real PTY with key input. The provenance records exact package/report/runtime-asset and media identities, automated assertions and sampled visual inspection, and explicitly records no human or physical-terminal QA signoff.
+
+Earlier failed candidates remain documented with their original outcomes. Passing this candidate does not retroactively pass them or establish infrastructure-only causes. These verified artifact and automated-evidence facts do not check the reusable human-review boxes below.
+
+## Historical v0.2.0 publication record
 
 Quirl 0.2.0 was published on 5 September 2026:
 
@@ -55,8 +68,8 @@ Quirl 0.2.0 was published on 5 September 2026:
   [website asset run 33990164031](https://github.com/niklas-heer/quirl/actions/runs/33990164031)
   admitted the version-scoped channel with the released binary and pushed
   asset evidence commit `2981d379f046dbee6ebb56bf6291d27c4aa23616`.
-- The fresh [terminal recording](https://quirl.vercel.app/quirl-demo.mp4) and
-  [capture provenance](https://quirl.vercel.app/quirl-demo-provenance.json)
+- The recording prepared for 0.2.0 and its
+  [historical capture provenance](https://github.com/niklas-heer/quirl/blob/cffebda4b43ad57f18dd3c1e63260ef381c059af/website/public/quirl-demo-provenance.json)
   identify a clean local ARM64 macOS build of the same candidate using the
   official release profile. Its binary digest differs from the hosted release
   asset, so the recording is not attributed to the distributed executable.
@@ -216,10 +229,18 @@ font or a Nerd Font was used. A glyph difference must never change behavior.
 - [ ] `ui.surface = "simple"`, `TERM=dumb`, a non-TTY stderr, and terminal
   height below five rows select the Reedline fallback rather than attempting
   the Ratatui frame.
-- [ ] A foreground command receives the terminal and returns it cleanly.
-- [ ] The rich frame releases raw mode, bracketed paste, viewport, and cursor
-  state before foreground execution and `Ctrl-Z`, then reconstructs cleanly.
-- [ ] `command &`, `jobs`, `fg`, `Ctrl-Z`, and `bg` show coherent job state.
+- [ ] A rich foreground native command receives an embedded PTY with working
+  input, resize, redraw, and alternate-screen behavior; Quirl retains the
+  physical terminal and restores its transcript after completion.
+- [ ] During execution and output drain, transcript and execution status remain
+  visible without an editable next prompt. The input prompt returns only after
+  the command finishes and the editor resumes.
+- [ ] Shell suspend/resume releases and reconstructs the physical terminal's
+  raw mode, bracketed paste, viewport, and cursor state cleanly.
+- [ ] On the simple surface, `command &`, `jobs`, `fg`, `Ctrl-Z`, and `bg` show
+  coherent job state. Rich background jobs and stopped foreground sessions
+  fail with the documented actionable limitation; they are not claimed as
+  supported embedded job control.
 - [ ] `&&`, `||`, redirects, here-strings, bounded command substitution, and
   pathname expansion execute through the native C1-core graph.
 - [ ] Unsupported process substitution and compound control syntax produce an

@@ -40,6 +40,8 @@ const documents = [
   ['docs/adoption-plan.md', 'project/adoption-plan.mdx'],
   ['docs/bash-zsh-source-study.md', 'research/bash-zsh-source-study.mdx'],
   ['docs/benchmarks/release-v1.0.md', 'project/release-0.1/performance-record.mdx'],
+  ['docs/benchmarks/README.md', 'research/benchmarks/index.mdx'],
+  ['docs/benchmarks/release-v0.3.0.md', 'research/benchmarks/release-v0.3.0.mdx'],
   ['docs/benchmarks/release-v0.2.0.md', 'research/benchmarks/release-v0.2.0.mdx'],
   ['docs/benchmarks/preview-v0.1.md', 'research/benchmarks/preview-v0.1.mdx'],
   ['docs/benchmarks/project-discovery.md', 'research/benchmarks/project-discovery.mdx'],

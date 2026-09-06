@@ -1,0 +1,222 @@
+{
+  "schema_version": 8,
+  "suite": "quirl_1.0_release_performance",
+  "measured_at_utc": "2026-09-06T13:50:11Z",
+  "environment": {
+    "hostname": "iad01-dz253-5e3f85b4-3338-4a6c-a052-5dcfa8656131-86D4FD91115F.local",
+    "operating_system": "macOS 15.7.9 (24G830)",
+    "architecture": "x86_64",
+    "cpu": "Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz",
+    "logical_cpus": 4,
+    "memory_bytes": 15032385536,
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: x86_64-apple-darwin\nrelease: 1.97.1\nLLVM version: 22.1.6",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "source_commit": "bee307192d55c7d69058410b09f5be76b322c9bc",
+    "source_dirty": false,
+    "artifact_digest_verified": true,
+    "artifact_profile_verified": true,
+    "artifact_source_verified": true,
+    "harness_source_verified": true,
+    "build_profile": "release",
+    "optimization_level": "z",
+    "panic_strategy": "unwind",
+    "quirl_binary": "/var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/quirl-release-artifact-14728-1788702569330690000-0/quirl-staged",
+    "quirl_binary_bytes": 12846656,
+    "quirl_binary_sha256": "5829789a05ec1e7455fc6eb68dffe652335c1e22a32c9285accdd4cc8a449959",
+    "quirl_version": "quirl 0.3.0"
+  },
+  "methodology": {
+    "percentile_method": "nearest-rank over independently timed wall-clock samples",
+    "pty_end_to_end": "The PTY suite uses a private initially empty home, configuration, history, catalog, project database, and XDG directories, shared across its samples; project discovery remains enabled. Explicit Rustup/Cargo homes preserve inherited toolchain lookup, and Quirl environment overrides/test hooks are cleared. Each sample has one total deadline shared by all phases and uses nonblocking terminal I/O with bounded cleanup. After all timing endpoints, successful samples clear the measured input and request EOF, requiring normal exit within that same deadline before cleanup; failed samples retain forced cleanup. Shutdown is excluded from latency measurements, and stderr retains ordered timing and shutdown observations for at most the first 101 successful samples. The first failure stops sampling while retaining the originally requested count, so partial measurements cannot pass. Each sample opens a fresh 120x40 pseudo-terminal, starts the release Quirl process, answers terminal cursor-position requests, and feeds output into a VT100 terminal model. It records process start to the first prompt frame, validates editability with a short input marker, then records a final representative keystroke until the expected edited buffer is present in the terminal frame. `release` defaults to 101 independent PTY samples for a steadier nearest-rank P95; `preview` retains 31, and `--pty-samples` overrides either mode.",
+    "cold_start": "Starts a new Quirl process for every sample and waits for `quirl --version` to exit. This measures process creation, dynamic loading, and CLI argument parsing, not cold-to-editable startup. OS filesystem caches are not flushed.",
+    "headless_edit_frame": "Calls Quirl's real CatalogCompleter and Prompt render methods, plus a benchmark-owned equivalent of the current semantic token classification, for `git commit --am`. No Reedline layout or terminal I/O occurs.",
+    "first_prompt": "Constructs a fresh configured QuirlPrompt and renders left, right, and indicator strings for every sample. Filesystem metadata may be served from OS cache. No terminal I/O occurs.",
+    "stream_window": "Pushes a fixed-size typed sample sequence through Quirl's production LiveBuffer at capacities 1, 16, and 256, then verifies retained and dropped counts and records serialized snapshot bytes. This proves retention is bounded by window size for bounded records; it is not a producer-backpressure or allocator-RSS measurement.",
+    "binary_size": "Copies the executable passed with `--quirl` into a private read-only staging directory, verifies its SHA-256 when enforcing the release gate, then measures that exact staged executable. Exact byte counts remain required evidence. Binary units are MiB (1 MiB = 1,048,576 bytes): 5 MiB is ideal and more than 8 MiB warns. There is no project-enforced size ceiling on any architecture. Only an explicit `--max-binary-bytes` value enforces a caller-selected maximum; size policy does not relax artifact identity, latency, or sample gates.",
+    "limitations": [
+      "A completed frame means the expected screen state was reconstructed from the PTY byte stream; physical terminal-emulator scheduling, GPU composition, and monitor scanout are not measured.",
+      "The UI highlighter is private; the edit proxy reproduces its command/option/quote classification but not StyledText allocation or rendering.",
+      "The benchmark does not control CPU frequency, other machine load, thermal state, or OS filesystem caches.",
+      "Results from debug builds are emitted but are not suitable for release decisions; run with `cargo run --release`."
+    ]
+  },
+  "measurements": [
+    {
+      "id": "pty_cold_to_editable",
+      "label": "process start to first prompt accepting and painting a short input marker",
+      "samples": 101,
+      "successful_samples": 101,
+      "failures": [],
+      "includes_terminal_io": true,
+      "min_ms": 16.52062,
+      "p50_ms": 23.266478,
+      "p95_ms": 35.612373000000005,
+      "max_ms": 57.445857000000004,
+      "target": {
+        "specification_target": "cold start to editable prompt P50 <=25 ms",
+        "measured_percentile": "P50",
+        "limit_ms": 25.0,
+        "target_result": "measured_within_target",
+        "measurement_valid": true,
+        "release_gate_accepted": true,
+        "explanation": "A PTY terminal model observed the prompt and a short input marker rendered in the editable buffer."
+      }
+    },
+    {
+      "id": "pty_keystroke_to_frame",
+      "label": "injected final keystroke to corresponding terminal frame",
+      "samples": 101,
+      "successful_samples": 101,
+      "failures": [],
+      "includes_terminal_io": true,
+      "min_ms": 0.7237800000000001,
+      "p50_ms": 1.067382,
+      "p95_ms": 2.0690399999999998,
+      "max_ms": 6.469641,
+      "target": {
+        "specification_target": "keystroke to frame P95 <=8 ms",
+        "measured_percentile": "P95",
+        "limit_ms": 8.0,
+        "target_result": "measured_within_target",
+        "measurement_valid": true,
+        "release_gate_accepted": true,
+        "explanation": "The timer starts immediately before the final byte and ends when the PTY terminal model contains the complete expected edited buffer."
+      }
+    },
+    {
+      "id": "pty_first_prompt_paint",
+      "label": "process start to first rendered prompt frame",
+      "samples": 101,
+      "successful_samples": 101,
+      "failures": [],
+      "includes_terminal_io": true,
+      "min_ms": 14.330406,
+      "p50_ms": 19.137442,
+      "p95_ms": 28.309796000000002,
+      "max_ms": 53.825313,
+      "target": {
+        "specification_target": "first prompt paint P95 <=21 ms",
+        "measured_percentile": "P95",
+        "limit_ms": 21.0,
+        "target_result": "measured_miss",
+        "measurement_valid": true,
+        "release_gate_accepted": true,
+        "explanation": "A VT100 terminal model observed Quirl's command prompt indicator; physical monitor scanout is outside this software benchmark."
+      }
+    },
+    {
+      "id": "cli_process_startup_to_version_exit",
+      "label": "fresh CLI subprocess to `quirl --version` exit",
+      "samples": 31,
+      "successful_samples": 31,
+      "failures": [],
+      "includes_terminal_io": false,
+      "min_ms": 10.94359,
+      "p50_ms": 15.795791,
+      "p95_ms": 18.244551,
+      "max_ms": 18.778245,
+      "target": {
+        "specification_target": "cold start to editable prompt P50 <=25 ms",
+        "measured_percentile": "P50",
+        "limit_ms": 25.0,
+        "target_result": "inconclusive_lower_bound_within_target",
+        "measurement_valid": true,
+        "release_gate_accepted": false,
+        "explanation": "This subprocess lower bound excludes interactive editor and prompt initialization, so a result below the target cannot pass the release gate."
+      }
+    },
+    {
+      "id": "headless_edit_cpu_proxy",
+      "label": "completion + semantic-highlight proxy + prompt render",
+      "samples": 2000,
+      "successful_samples": 2000,
+      "failures": [],
+      "includes_terminal_io": false,
+      "min_ms": 0.065719,
+      "p50_ms": 0.07933899999999999,
+      "p95_ms": 0.273982,
+      "max_ms": 3.347231,
+      "target": {
+        "specification_target": "keystroke to frame P95 <=8 ms",
+        "measured_percentile": "P95",
+        "limit_ms": 8.0,
+        "target_result": "proxy_within_target",
+        "measurement_valid": true,
+        "release_gate_accepted": false,
+        "explanation": "Headless CPU proxy excludes Reedline layout, terminal writes, terminal synchronization, and display latency."
+      }
+    },
+    {
+      "id": "first_prompt_construct_and_render_cpu",
+      "label": "fresh prompt construction and string rendering",
+      "samples": 500,
+      "successful_samples": 500,
+      "failures": [],
+      "includes_terminal_io": false,
+      "min_ms": 0.042025,
+      "p50_ms": 0.043566999999999995,
+      "p95_ms": 0.069194,
+      "max_ms": 0.11382,
+      "target": {
+        "specification_target": "first prompt paint P95 <=21 ms",
+        "measured_percentile": "P95",
+        "limit_ms": 21.0,
+        "target_result": "proxy_within_target",
+        "measurement_valid": true,
+        "release_gate_accepted": false,
+        "explanation": "Measures prompt construction and render methods only; it does not measure terminal paint or time to an editable input loop."
+      }
+    }
+  ],
+  "stream_window": {
+    "id": "live_stream_window_retention",
+    "input_samples_per_capacity": 100000,
+    "capacities": [
+      {
+        "capacity": 1,
+        "retained_samples": 1,
+        "dropped_samples": 99999,
+        "serialized_snapshot_bytes": 109
+      },
+      {
+        "capacity": 16,
+        "retained_samples": 16,
+        "dropped_samples": 99984,
+        "serialized_snapshot_bytes": 845
+      },
+      {
+        "capacity": 256,
+        "retained_samples": 256,
+        "dropped_samples": 99744,
+        "serialized_snapshot_bytes": 12606
+      }
+    ],
+    "invariant_valid": true,
+    "release_gate_accepted": true,
+    "explanation": "Production LiveBuffer retention equals min(input, capacity) and dropped counts equal input minus capacity at every supported boundary tested."
+  },
+  "binary_size": {
+    "id": "release_binary_size",
+    "bytes": 12846656,
+    "ideal_bytes": 5242880,
+    "soft_cap_bytes": 8388608,
+    "hard_ceiling_bytes": null,
+    "enforced_limit_bytes": null,
+    "policy_result": "soft_cap_warning",
+    "target_result": "measured_advisory",
+    "measurement_valid": true,
+    "hard_gate_passed": null,
+    "release_gate_accepted": true,
+    "warning": "release binary is 12846656 bytes, above the 8388608-byte advisory threshold; the project imposes no executable-size ceiling",
+    "explanation": "Binary units are MiB (1 MiB = 1,048,576 bytes). At or below 5 MiB is ideal; more than 8 MiB emits an advisory warning. The project imposes no executable-size ceiling on any architecture. Only an explicit --max-binary-bytes value enforces a caller-selected limit."
+  },
+  "evidence_gate_passed": true,
+  "performance_gate_passed": false,
+  "warnings": [
+    "release binary is 12846656 bytes, above the 8388608-byte advisory threshold; the project imposes no executable-size ceiling"
+  ],
+  "gate_failures": [
+    "pty_first_prompt_paint: measured_miss"
+  ],
+  "release_gate_status": "failed_one_or_more_release_budgets"
+}

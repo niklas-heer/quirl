@@ -26,7 +26,7 @@ export default function HomePage() {
       <section className="hero">
         <div className="pill">
           <span className="dot" />
-          v0.2.0 · Linux and macOS
+          v0.3.0 · Linux and macOS
         </div>
         <p className="kicker">A well-stirred shell</p>
         <h1 className="glitch-h1">
@@ -66,18 +66,18 @@ export default function HomePage() {
       <div className="demo-wrap">
         <div
           className="cassette demo-cassette"
-          aria-label="Quirl v0.2.0 recording"
+          aria-label="Quirl v0.3.0 recording"
         >
           <div className="cassette-label">
-            <span>SIDE A — QUIRL v0.2.0</span>
+            <span>SIDE A — QUIRL v0.3.0</span>
             <CassetteReels />
           </div>
           <HeroDemo />
           <p id="demo-recording-context" style={{ padding: '1rem', margin: 0 }}>
-            Recorded with a local macOS ARM release-profile build of v0.2.0 from commit <code>3958920</code>.
+            Recorded with the published macOS ARM release package for v0.3.0 from commit <code>dfb43e5</code>.
             {' '}See the <a href="/quirl-demo-provenance.json">recording provenance</a>,
             {' '}<Link href="/docs/getting-started/first-session">first-session guide</Link>,
-            {' '}and <Link href="/docs/research/benchmarks/release-v0.2.0">release measurements</Link>.
+            {' '}and <Link href="/docs/research/benchmarks/release-v0.3.0">release measurements</Link>.
             {' '}Search results are candidates to review.
           </p>
         </div>
@@ -287,9 +287,9 @@ export default function HomePage() {
             <CassetteReels />
           </div>
           <div className="cassette-body">
-            <h2>The 0.2 release is here.</h2>
+            <h2>The 0.3 release is here.</h2>
             <p>
-              Quirl 0.2.0 is available for Linux and macOS through Homebrew
+              Quirl 0.3.0 is available for Linux and macOS through Homebrew
               and immutable native release archives. The docs separate
               current usage and runtime contracts from long-term direction
               and exact-artifact evidence.

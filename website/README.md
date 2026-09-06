@@ -2,7 +2,7 @@
 
 The Quirl landing page and complete documentation site are built with Next.js
 and [Fumadocs](https://www.fumadocs.dev/). Public copy describes the supported
-0.2.0 release while keeping untagged source work, historical evidence, and
+0.3.0 release while keeping untagged source work, historical evidence, and
 future product direction clearly separated. The documentation mirror is
 designed for frequent updates.
 

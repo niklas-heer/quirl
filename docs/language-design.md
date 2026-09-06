@@ -1,6 +1,6 @@
 # Quirl language and product design
 
-**Product direction with an evidence-bounded current contract · Quirl 0.2.0**
+**Product direction with an evidence-bounded current contract · Quirl 0.3.0**
 
 > **The development environment in your terminal.** Your shell should feel as smart as your editor.
 
@@ -9,17 +9,25 @@ performance, and a well-tooled Lua extension language with an IDE-grade editing
 experience. Completion, diagnostics, documentation, prompt context, and
 interactive views are one product—not a pile of plugins.
 
-## Current 0.2 release contract
+## Current 0.3 release contract
 
-This is the implemented contract for the 0.2 release line. The supported
+This is the implemented contract for the 0.3 release line. The supported
 artifact is the immutable
-[`v0.2.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0);
+[`v0.3.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.3.0);
 untagged source remains candidate or development work:
 
 - On Linux and macOS, the native C1-core includes byte pipelines, redirects,
   boolean lists, bounded expansion/substitution, jobs, and explicit Bash/Zsh
   islands for unsupported control syntax. Windows remains best-effort process
   portability rather than a supported interactive target.
+- Rich Normal mode gives foreground native programs an embedded terminal,
+  including terminal detection, redraws, key input, resize, and local terminal
+  queries. The [foreground terminal contract](tui-design.md#33-foreground-terminal-execution)
+  defines the bounds and unsupported extensions.
+- Projects can organize clones as `~/Projects/host/owner/repository`, respect
+  GHQ roots, reuse matching checkouts, and open completed clones while preserving
+  unfinished input. Plain `git clone URL` keeps its original behavior unless the
+  user opts in through the [managed cloning offer](decisions/0039-managed-project-cloning.md).
 - Data mode is a focused, bounded runtime rather than a general type system. It
   supports the sources, bridges, transforms, materialization points, limits,
   and exclusions documented in [the data runtime](data-runtime.md); bytes and
@@ -38,8 +46,8 @@ untagged source remains candidate or development work:
   separate immutable SQLite artifact; neither replaces the CLI-owned mutable
   intelligence cache.
 
-The implemented product line is **0.2.x**. Version 0.2.0 names immutable commit
-`39589209ff32a0ac61af984aa31e4879edb113dd`. The historical 0.1.0 release names
+The implemented product line is **0.3.x**. Version 0.3.0 names immutable commit
+`dfb43e54320d166ebe195bb5a0255b8aacbb11e5`. The historical 0.1.0 release names
 commit `168f9f2e2f2899f7910ca64831561c8885d9ef24`. A source checkout is not a
 supported release merely because its workspace version matches one. In
 this document, “1.0” is either a historical/accepted scope label from an ADR or
@@ -326,7 +334,7 @@ Quirl targets the copy-and-paste surface first. Full Bash and Zsh are separate e
 | C3 · Source state | Deliberately partial | Import cwd, exported env, aliases when representable | State-diff protocol; reject traps and opaque functions |
 | C4 · Exact emulation | No promise | Every option, trap, framework, obscure expansion | Run the requested `bash` or `zsh` |
 
-In current development source, Normal-mode input separates commands at unquoted
+Normal-mode input separates commands at unquoted
 line feeds, including multiline paste. Blank lines and a final line feed add no
 empty command. A line feed after `|`, `&&`, or `||` continues that operation;
 backslash followed by a line feed continues a word without adding a character.
@@ -487,7 +495,7 @@ Quirl needs one canonical general-purpose language for scripts, configuration, c
 
 > **Accepted: Lua.** Rust remains Quirl’s implementation language; Lua is the sole first-class language for configuration, scripts, and trusted plugins. The selection evidence measured Lua 5.4; the production source tree now pins Lua 5.5.1 under [ADR 0027](decisions/0027-lua-5-5-1-runtime.md). Familiarity, a small runtime, longevity, and the mature `mlua` bridge outweigh Luau’s stronger analyzer for this extension-only role. Read the [decision report](embedded-language-decision.md) and [ADR 0001](decisions/0001-lua-extension-language.md).
 
-The first Lua slice embedded restricted Lua 5.4. The current source tree embeds restricted Lua 5.5.1; generates LuaLS/JSON/Markdown SDK views; validates configuration with Rust schemas; atomically reloads config and plugins at safe prompt boundaries; and applies keymap, prompt, picker, and extension settings to the editor. The rejected prototype runtime and all executable/dependency paths are removed.
+The first Lua slice embedded restricted Lua 5.4. The current release embeds restricted Lua 5.5.1; generates LuaLS/JSON/Markdown SDK views; validates configuration with Rust schemas; atomically reloads config and plugins at safe prompt boundaries; and applies keymap, prompt, picker, and extension settings to the editor. The rejected prototype runtime and all executable/dependency paths are removed.
 
 Quirl generates LuaLS-compatible annotations, completion metadata, docs, and AI schemas from Rust host definitions. `quirl check` parses, lints, resolves modules and capabilities, and validates known schemas without execution. Rust validates every host value before mutation, but Quirl does not promise sound static typing for arbitrary Lua.
 
@@ -894,7 +902,7 @@ evidence required for that decision; they are not a current task list:
 - **C1 core with evidence.** On Unix, the quote-aware command IR supports
   lists, standard-descriptor redirects, here-strings, bounded command
   substitution, parameter/arithmetic expansion, and pathname expansion.
-  Post-0.2.0 Unix source also expands leading unquoted `~` and `~/` from the
+  Quirl 0.3.0 on Unix also expands leading unquoted `~` and `~/` from the
   session `HOME`, retaining its bytes literally within the existing expansion
   budget. Quoted or escaped tildes and named-user forms remain literal; a missing
   or invalid home produces an actionable error. The

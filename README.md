@@ -10,32 +10,32 @@
 
   [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
   [![Rust](https://img.shields.io/badge/rust-1.97.1%2B-orange.svg)](rust-toolchain.toml)
-  [![Status](https://img.shields.io/badge/status-0.2_Unix_line-blue.svg)](#status)
+  [![Status](https://img.shields.io/badge/status-0.3_Unix_line-blue.svg)](#status)
 </div>
 
 ---
 
 <div align="center">
   <a href="https://quirl.vercel.app/">
-    <img src="assets/quirl-demo.gif?raw=1" width="1200" alt="Quirl v0.2.0 demo: native shell commands, typed data pipelines, local command search, explicit Bash compatibility, and sandboxed Lua">
+    <img src="assets/quirl-demo.gif?raw=1" width="1200" alt="Quirl v0.3.0 demo: native shell commands, typed data pipelines, local command search, explicit Bash compatibility, and sandboxed Lua">
   </a>
   <br>
   <a href="https://quirl.vercel.app/quirl-demo.mp4">Watch the MP4</a>
   ·
   <a href="https://quirl.vercel.app/blog/a-shell-with-a-richer-vocabulary">Read the feature tour</a>
   <p>
-    Recorded with a local macOS ARM release-profile build of v0.2.0 from commit <code>3958920</code>.
+    Recorded with the published macOS ARM release package for v0.3.0 from commit <code>dfb43e5</code>.
     See the <a href="https://quirl.vercel.app/quirl-demo-provenance.json">recording provenance</a>,
     <a href="https://quirl.vercel.app/docs/getting-started/first-session">first-session guide</a>,
-    and <a href="https://quirl.vercel.app/docs/research/benchmarks/release-v0.2.0">release measurements</a>.
+    and <a href="https://quirl.vercel.app/docs/research/benchmarks/release-v0.3.0">release measurements</a>.
     Search results are candidates to review.
   </p>
 </div>
 
 > [!IMPORTANT]
-> Quirl's **0.2 Unix line** supports interactive Linux and macOS. Treat a build
-> as the official `0.2.0` release only when it comes from the immutable
-> [`v0.2.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0);
+> Quirl's **0.3 Unix line** supports interactive Linux and macOS. Treat a build
+> as the official `0.3.0` release only when it comes from the immutable
+> [`v0.3.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.3.0);
 > other source checkouts are candidate or development builds. Windows is
 > best-effort, contract-tested portability work.
 
@@ -71,8 +71,8 @@ into typed structures and validated before the rest of the shell can use them.
 
 ## Quick start
 
-Quirl 0.2.0 is available through Homebrew or a
-[verified native release archive](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0).
+Quirl 0.3.0 is available through Homebrew or a
+[verified native release archive](https://github.com/niklas-heer/quirl/releases/tag/v0.3.0).
 Install it, check the version, then start it inside your existing terminal:
 
 ```console
@@ -99,21 +99,21 @@ network request is needed. Type `mode normal` to return to familiar commands.
 Press **Ctrl-D on an empty input line** to return to your previous shell.
 
 **Tab** opens completion, **F1** explains the command under your cursor, and
-**Ctrl-R** searches history. Quirl 0.2.0 also provides `help` as a
+**Ctrl-R** searches history. Quirl 0.3.0 also provides `help` as a
 starting point and **Alt-Q**, then **g**, to jump among discovered Git projects. The
 [five-minute first session](website/content/docs/getting-started/first-session.mdx)
 shows expected output, mode shortcuts, and optional AI planning.
 
-In Quirl 0.2.0, AI mode requires an installed, authenticated Codex CLI and sends your intent
+In Quirl 0.3.0, AI mode requires an installed, authenticated Codex CLI and sends your intent
 and bounded command-catalog context to OpenAI. It keeps proposals for review;
 nothing runs automatically. Normal commands and the example above work offline.
 
 See [installation](website/content/docs/getting-started/installation.mdx) for
 checksummed native archives, source builds, downloadable completion/model assets,
 and uninstall instructions. The supported release is the immutable
-[`v0.2.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0).
+[`v0.3.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.3.0).
 
-Current development builds also organize new checkouts with **Projects**:
+Quirl 0.3.0 organizes new checkouts with **Projects**:
 
 ```console
 quirl projects clone https://github.com/niklas-heer/quirl.git
@@ -129,8 +129,8 @@ are reused without pulling, and completed clones appear in **Alt-Q g**. Use
 **Alt-Q u** to open the latest cloned project while retaining unfinished input.
 `quirl projects policy ask` restores the one-time offer, `managed` explicitly
 opts in for future eligible clones, and `off` disables suggestions. With no
-argument, `quirl projects policy` prints the saved setting. These additions are
-unreleased; see the [managed cloning design](docs/decisions/0039-managed-project-cloning.md).
+argument, `quirl projects policy` prints the saved setting. See the
+[managed cloning design](docs/decisions/0039-managed-project-cloning.md).
 
 For development, the repository pins Rust 1.97.1; no system Lua installation is
 required:
@@ -147,7 +147,7 @@ Homebrew-installed release. Release operators should use
 
 ## Status
 
-Quirl 0.2.0 has native C1-core command
+Quirl 0.3.0 has native C1-core command
 execution on Linux and macOS; a bounded, focused typed-data runtime; a
 restricted Lua 5.5.1 runner and SDK; permission-locked trusted-Lua plugin command
 dispatch; a semantic catalog and language service; and rich/simple terminal
@@ -157,13 +157,13 @@ and artifacts named by an immutable release. The runtime contracts live in
 `Catalog::builtin()` and `HOST_API`; the generated references and website are
 projections, not competing specifications.
 
-Quirl 0.2.0 embeds Lua 5.5.1. Historical `v0.1.0` artifacts retain their
+Quirl 0.3.0 embeds Lua 5.5.1. Historical `v0.1.0` artifacts retain their
 recorded Lua 5.4 runtime.
 
 The supported release is
-[`v0.2.0`](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0), published
-from immutable commit `39589209ff32a0ac61af984aa31e4879edb113dd`.
-[Native v0.2.0 release measurements](docs/benchmarks/release-v0.2.0.md) identify
+[`v0.3.0`](https://github.com/niklas-heer/quirl/releases/tag/v0.3.0), published
+from immutable commit `dfb43e54320d166ebe195bb5a0255b8aacbb11e5`.
+[Native v0.3.0 release measurements](docs/benchmarks/release-v0.3.0.md) identify
 all four published executables and their hosted environments. The historical
 performance block below records an older measured artifact and is not
 retroactively attributed to the published binaries.
@@ -178,7 +178,7 @@ a bounded, no-JavaScript preview gallery. See
 [ADR 0013](docs/decisions/0013-lua-config-themes.md) and
 [ADR 0015](docs/decisions/0015-bounded-theme-preview-gallery.md).
 
-Quirl 0.2.0 supports `editor.keymap = "emacs"` (the default), `"vim"`,
+Quirl 0.3.0 supports `editor.keymap = "emacs"` (the default), `"vim"`,
 and `"helix"` in Lua configuration. Both terminal surfaces accept bracketed
 paste as editable text: pasted newlines require an explicit Enter to execute.
 Commands are limited to 64 KiB. Rich mode rejects an oversized edit with a
@@ -188,7 +188,7 @@ unfinished escape/paste sequence lasting 30 seconds also ends the session.
 See [the interactive surface](docs/tui-design.md) for editing and recovery
 behavior, including the separate terminal transport limits.
 
-Unreleased Unix source builds give native foreground programs an embedded PTY,
+Quirl 0.3.0 on Unix gives native foreground programs an embedded PTY,
 including wrappers and newly installed TUIs. Screen redraws, keyboard input,
 local terminal queries, resize, and Ctrl-C use the same path without an app list.
 Unused type-ahead returns as editable prompt text. See

@@ -1,4 +1,11 @@
 {
   "title": "Benchmark archive",
-  "pages": ["release-v0.2.0", "preview-v0.1", "embedded-language-selection", "steel-lua-fennel"]
+  "pages": [
+    "index",
+    "release-v0.3.0",
+    "release-v0.2.0",
+    "preview-v0.1",
+    "embedded-language-selection",
+    "steel-lua-fennel"
+  ]
 }

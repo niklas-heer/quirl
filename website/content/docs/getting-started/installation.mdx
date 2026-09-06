@@ -1,12 +1,12 @@
 ---
 title: Install Quirl
-description: Install a native Quirl release or build the 0.2 line with the pinned toolchain.
+description: Install a native Quirl release or build the 0.3 line with the pinned toolchain.
 ---
 
-<Callout type="info" title="Quirl 0.2.0 is available">
+<Callout type="info" title="Quirl 0.3.0 is available">
   Install through Homebrew or download a SHA-256-pinned
   native archive from the immutable
-  [v0.2.0 GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0).
+  [v0.3.0 GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.3.0).
 </Callout>
 
 ## Homebrew
@@ -16,7 +16,7 @@ brew install niklas-heer/tap/quirl
 quirl --version
 ```
 
-The tap provides Quirl 0.2.0. Confirm `quirl 0.2.0` before following the
+The tap provides Quirl 0.3.0. Confirm `quirl 0.3.0` before following the
 current walkthrough. To upgrade an existing Homebrew installation:
 
 ```sh
@@ -57,7 +57,7 @@ from the installed binary.
 ## Direct release archive
 
 Download the package for your operating system and architecture from the
-[v0.2.0 GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0),
+[v0.3.0 GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.3.0),
 verify it against `SHA256SUMS`, and compare the entry in
 `release-manifest-v1.json` before putting `quirl` on `PATH`. Never use an asset
 from a mutable branch URL as a release binary.
@@ -74,7 +74,7 @@ require Git, Rust, Python, or a system Lua installation.
 - Rustup. The repository pins Rust 1.97.1 with `clippy` and `rustfmt`.
 - Python 3 only for the Unix PTY quality gate.
 
-You do not need a system Lua installation. Quirl 0.2.0 embeds vendored Lua
+You do not need a system Lua installation. Quirl 0.3.0 embeds vendored Lua
 5.5.1. Historical `v0.1.0` artifacts retain Lua 5.4.
 
 ## Build and run
@@ -98,7 +98,7 @@ just the installed binary and does not require a checkout or Rust.
 ![Historical 0.1-era Quirl text tour showing its earlier modes, local AI workflow, and Lua 5.4 runtime](/quirl-tour.svg)
 
 This preserved text tour documents an earlier 0.1-era build, including its
-local AI workflow and Lua 5.4 runtime. For v0.2.0, follow the
+local AI workflow and Lua 5.4 runtime. For v0.3.0, follow the
 [first-session guide](/docs/getting-started/first-session) or watch the
 [current recording](/docs).
 

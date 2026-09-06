@@ -1,65 +1,79 @@
 {
   "schema_version": 1,
-  "quirl_version": "0.2.0",
-  "source_commit": "39589209ff32a0ac61af984aa31e4879edb113dd",
+  "quirl_version": "0.3.0",
+  "source_commit": "dfb43e54320d166ebe195bb5a0255b8aacbb11e5",
   "target": "aarch64-apple-darwin",
   "source_dirty": false,
-  "binary_bytes": 10412464,
-  "binary_sha256": "aa9cd3c60401069879fcf222bbbc8021b9232f1e9415f4a2279c6b1399c595dc",
+  "binary_bytes": 10612336,
+  "binary_sha256": "30a6edce509a6220cfb4c505fe0192598d56174336a8720ffd0e2042be1c53d8",
   "vhs_version": "0.11.0",
-  "recorded_recipe_sha256": "785bfeba958b4c4356c6c2642450e7fca83a986e31e7c613bc82f4784140ff2b",
-  "recipe_without_diagnostic_output_sha256": "5d5a4fcc69bee59f21ed0b18be6cb5031dae76cb03bafe4f203cd806836d10da",
-  "recipe_change": "Set CursorBlink false",
-  "diagnostic_recipe_addition": "Output raw-frames/",
+  "recorded_recipe_sha256": "5d5a4fcc69bee59f21ed0b18be6cb5031dae76cb03bafe4f203cd806836d10da",
+  "recipe_change": "None; recorded an identical private copy of the checked-in scripts/demo.tape.",
+  "recording_support_sha256": {
+    "scripts/record-demo.sh": "a0ee10e45fabd90fe3d6a8d68ba8da5596a5b637d1b9304cb263588b5f154003",
+    "scripts/demo-session.sh": "02ba027e6cc4af8acc5c9e9890ac1547d09674ae577c34f6cc2bf1de562188f1",
+    "scripts/demo-card.sh": "29478b57402f1b7eb48519bf14f424e6c8f4c1fa91bcd29abc199f07e9a03d41"
+  },
   "width": 1200,
   "height": 720,
-  "duration_seconds": 71.2,
+  "duration_seconds": 71.12,
   "media": {
     "gif": {
       "source_file": "assets/quirl-demo.gif",
       "publication_file": "assets/quirl-demo.gif",
-      "bytes": 2976210,
-      "sha256": "028707925b716768cc854d672373b5e8a549ab0261d0f7b44d7c242663380b39"
+      "bytes": 3908939,
+      "sha256": "f188ccb05853eda56b38aeebd2fcb1e789b48eef922b29a657723ec806779945"
     },
     "mp4": {
       "source_file": "website/public/quirl-demo.mp4",
       "publication_file": "website/public/quirl-demo.mp4",
-      "bytes": 1481827,
-      "sha256": "39b00afc07d08018742994f52fd26f53c66b54fea1e708b6a8b843b234a2c140"
+      "bytes": 1797568,
+      "sha256": "451e49a54083ac5f57dbf12a64bef180a83cde24442ed674417e2e0cbb7c6d90"
     },
     "webm": {
       "source_file": "website/public/quirl-demo.webm",
       "publication_file": "website/public/quirl-demo.webm",
-      "bytes": 1583508,
-      "sha256": "4e1f68073478f5eb8fd4066d58b09d9f6a5916a129cd3db07dafab72249faee7"
+      "bytes": 1854592,
+      "sha256": "ebfd791ca435007c4027bfcaa2235968213488b7ee17447267390d7ee6aeea38"
     },
     "poster": {
-      "source_file": "poster.png",
+      "source_file": "website/public/quirl-demo-poster.png",
       "publication_file": "website/public/quirl-demo-poster.png",
-      "bytes": 107086,
-      "sha256": "bbf9098ae205026526d4ad7975cfcd3a03aa6d8a93c7d90dde14ad72d1280d85"
+      "bytes": 107132,
+      "sha256": "040fcf4caeb2951f9055e874ec479ee04dabe8a1ea68a05ebdd4170c7c610994"
     }
   },
-  "frame_sequence": {
-    "pairs": 3558,
-    "first": 1,
-    "last": 3558,
-    "contiguous": true,
-    "matching_text_cursor_indices": true,
-    "raw_bytes": 371577192
-  },
-  "automated_review_seconds": [
+  "sampled_review_frame_count": 36,
+  "sampled_review_interval_seconds": 2,
+  "full_size_review_seconds": [
     2,
     14,
-    43,
-    48,
-    67
+    38,
+    46,
+    47,
+    50,
+    64,
+    68
   ],
+  "review_method": "AI visual inspection of frames sampled across the complete MP4, plus eight full-resolution frames. MP4 and WebM fully decoded without errors. VHS screen assertions verified startup and semantic retrieval readiness.",
   "physical_terminal_qa": false,
   "human_qa": false,
-  "cause_caveat": "Previous fixed-position mark was not reproduced in the diagnostic or final take; this clean take does not prove CursorBlink caused or fixed it.",
   "official_release_profile": true,
-  "artifact_origin": "local_release_profile_build",
-  "published_release_asset": false,
-  "artifact_scope": "Recorded executable built locally from the clean v0.2.0 source commit with the official release profile. Its digest differs from the hosted executable published in the GitHub release; hosted release measurements identify their own binaries."
+  "artifact_origin": "published_release_asset",
+  "release_workflow_run_id": 34054071682,
+  "release_package_file": "quirl-v0.3.0-aarch64-apple-darwin.tar",
+  "release_package_sha256": "ab116b02c2bc41143453d09c679eb99dcb7312234ec10057d4fd347de5f343c2",
+  "release_package_provenance_sha256": "ec8e0f6c8b6f13adf2f8676135eeeea9f8f7be10f10161a0dba54247dd2e0275",
+  "native_performance_report_sha256": "082c1afceaa1a48900a3306e5552df841ded357e78392babffb0f7eb25112fa4",
+  "published_release_asset": true,
+  "artifact_scope": "Recorded the exact executable extracted from the hosted macOS ARM package subsequently published in the immutable v0.3.0 GitHub release. The public archive SHA-256 matches the verified recording package, and its executable matches the original passing native performance report. No local rebuild was used.",
+  "runtime_assets": {
+    "original_manifest_sha256": "5c14f0cad6c9d3d0f08b5b44af33531470b329b98ac228ae930885f7145664c7",
+    "local_manifest_sha256": "bff0e0e54ef93c591dbedcc8011f2c2c48c55e35a2082d2dba787ad12d4dcafe",
+    "source": "Verified version-matched runtime assets from the same release workflow; only asset URLs were changed to private local fixture paths."
+  },
+  "session_scope": "Isolated temporary HOME, config, history, plugin directories, and cache. Real PTY and key input through VHS/ttyd. No authenticated AI planning was invoked.",
+  "presentation_notes": "The full-resolution 47-second frame shows the running status and submitted command without a new shell prompt. The completed frame restores the prompt after output and status. Ctrl-L retains terminal history in this version. A transient diagnostic appears while the Bash island is incomplete; the completed command succeeds. Visible timings describe this local recording session, not release benchmark measurements.",
+  "release_url": "https://github.com/niklas-heer/quirl/releases/tag/v0.3.0",
+  "release_asset_url": "https://github.com/niklas-heer/quirl/releases/download/v0.3.0/quirl-v0.3.0-aarch64-apple-darwin.tar"
 }

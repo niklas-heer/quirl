@@ -216,9 +216,10 @@ Background graphs remain rejected before spawn; use `ui.surface = "simple"`
 for background jobs. The simple surface also remains available for terminal
 extensions outside the embedded implementation.
 
-This behavior is unreleased. Version 0.2.0 and earlier require the simple surface
-for general interactive programs. See [ADR 0038](/docs/architecture/decisions/0038-embedded-foreground-terminals)
-for process ownership, protocol, resource limits, and failure invariants.
+This behavior is available in Quirl 0.3.0. Version 0.2.0 and earlier require
+the simple surface for general interactive programs. See
+[ADR 0038](/docs/architecture/decisions/0038-embedded-foreground-terminals) for process ownership,
+protocol, resource limits, and failure invariants.
 
 ### 3.4 Transcript, scrolling, selection, and copy
 
@@ -490,8 +491,8 @@ git che▌
   Enter executes. An already complete filename leaves Enter bound to execution,
   even when other files share its prefix; Tab still offers those alternatives.
   Up and Down navigate selectable menus; untouched informational
-  completion keeps Up bound to history. These navigation changes follow 0.2.0.
-  Ctrl-R remains the explicit history entrypoint in either state.
+  completion keeps Up bound to history. These navigation changes are available
+  in 0.3.0. Ctrl-R remains the explicit history entrypoint in either state.
 - Streaming: catalog and extension completion run on separate workers. Catalog
   results normally paint first; later extension results merge without moving a
   still-present selected value. `streaming…` shows while either source remains

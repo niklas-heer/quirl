@@ -38,7 +38,7 @@ export function HeroDemo() {
       playsInline
       width={1200}
       height={720}
-      aria-label="Quirl v0.2.0 demo: native shell commands, typed data pipelines, local command search, explicit Bash compatibility, and sandboxed Lua"
+      aria-label="Quirl v0.3.0 demo: native shell commands, typed data pipelines, local command search, explicit Bash compatibility, and sandboxed Lua"
       aria-describedby="demo-recording-context"
     >
       <source src="/quirl-demo.webm" type="video/webm" />
