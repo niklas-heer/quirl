@@ -1,0 +1,62 @@
+{
+  "schema_version": 2,
+  "quirl_version": "0.3.0",
+  "assets": [
+    {
+      "logical_name": "command-model",
+      "file": "quirl-command-model-v0.3.0-79fbfeb7b6935200a6dd587d0efa9a13a338e8bf2e949b4afe7566df09cee5f5.tar",
+      "format": "tar",
+      "format_version": 1,
+      "byte_size": 8136192,
+      "sha256": "79fbfeb7b6935200a6dd587d0efa9a13a338e8bf2e949b4afe7566df09cee5f5",
+      "url": "https://quirl.vercel.app/reference/v0.3.0/quirl-command-model-v0.3.0-79fbfeb7b6935200a6dd587d0efa9a13a338e8bf2e949b4afe7566df09cee5f5.tar",
+      "compatibility": {
+        "quirl_version_requirement": "=0.3.0",
+        "operating_systems": [
+          "linux",
+          "macos"
+        ],
+        "architectures": [
+          "aarch64",
+          "x86_64"
+        ]
+      },
+      "source_revision": "dfb43e54320d166ebe195bb5a0255b8aacbb11e5",
+      "source_date_epoch": 1788721802,
+      "notices": []
+    },
+    {
+      "logical_name": "completion-database",
+      "file": "quirl-completion-database-v0.3.0-8ed8f724753201bade47df6d30f22676cfa1d25a7063cae7a47a4b0371ecbf71.sqlite3",
+      "format": "sqlite3",
+      "format_version": 1,
+      "byte_size": 1691648,
+      "sha256": "8ed8f724753201bade47df6d30f22676cfa1d25a7063cae7a47a4b0371ecbf71",
+      "url": "https://quirl.vercel.app/reference/v0.3.0/quirl-completion-database-v0.3.0-8ed8f724753201bade47df6d30f22676cfa1d25a7063cae7a47a4b0371ecbf71.sqlite3",
+      "compatibility": {
+        "quirl_version_requirement": "=0.3.0",
+        "operating_systems": [
+          "linux",
+          "macos"
+        ],
+        "architectures": [
+          "aarch64",
+          "x86_64"
+        ]
+      },
+      "source_revision": "dfb43e54320d166ebe195bb5a0255b8aacbb11e5",
+      "source_date_epoch": 1788721802,
+      "notices": [
+        {
+          "name": "Carapace",
+          "spdx_license": "MIT",
+          "file": "quirl-carapace-license-25dbdc5c4265ee2983e2b2cd0b5073df0a24aecc0de14a49d01ec9c702f7f22c.txt",
+          "byte_size": 1064,
+          "sha256": "25dbdc5c4265ee2983e2b2cd0b5073df0a24aecc0de14a49d01ec9c702f7f22c",
+          "url": "https://quirl.vercel.app/reference/v0.3.0/quirl-carapace-license-25dbdc5c4265ee2983e2b2cd0b5073df0a24aecc0de14a49d01ec9c702f7f22c.txt",
+          "text": "MIT License\n\nCopyright (c) 2020 rsteube\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n"
+        }
+      ]
+    }
+  ]
+}
