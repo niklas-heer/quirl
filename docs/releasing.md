@@ -133,7 +133,13 @@ or fallback PAT. Do not store checksums, versions, URLs, or policy as variables;
 
 For the checked-in workflows, define `HOMEBREW_APP_CLIENT_ID` as a repository
 variable and store `HOMEBREW_APP_PRIVATE_KEY` on the protected `homebrew-tap`
-environment. Give the `release` environment a required reviewer, enable
+environment. The release workflow calls the same-repository Homebrew workflow
+with `secrets: inherit`; without that forwarding, the protected environment's
+private key was unavailable in the reusable call for v0.2.0 even though the
+standalone workflow worked. The tap job retains its protected environment and
+checks only whether the required variable and secret are present before creating
+its narrowly scoped token; it never prints either credential. Give the `release`
+environment a required reviewer, enable
 immutable releases, and protect release tags from mutation. The preparation
 workflow uses the repository's built-in token with job-local `contents: write`
 and `pull-requests: write`; the publication job is the only other job that

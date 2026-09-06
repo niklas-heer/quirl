@@ -159,6 +159,24 @@ jobs:
           name: homebrew-formula
           path: homebrew-tap/Formula
 
+      - name: Verify protected tap credentials are configured
+        env:
+          TAP_APP_CLIENT_ID: ${{ vars.HOMEBREW_APP_CLIENT_ID }}
+          TAP_APP_PRIVATE_KEY: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -z "$TAP_APP_CLIENT_ID"
+          then
+            echo "::error::Set the HOMEBREW_APP_CLIENT_ID repository variable before publishing to the tap."
+            exit 1
+          fi
+          if test -z "$TAP_APP_PRIVATE_KEY"
+          then
+            echo "::error::Set HOMEBREW_APP_PRIVATE_KEY on the protected homebrew-tap environment and forward secrets from reusable workflow callers."
+            exit 1
+          fi
+
       - name: Create a narrowly scoped tap token
         id: tap-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0

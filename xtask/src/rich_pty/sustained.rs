@@ -10,8 +10,9 @@
 //! The harness clears its own retained wire bytes only after settling a turn.
 //!
 //! Work is fixed at 128 output bursts, 64 error/pipeline/editor-cancel rounds,
-//! and four foreground interruptions. Admission stops after 120 seconds, plus
-//! the current bounded PTY operation and cleanup. Linux samples bounded /proc
+//! and four foreground interruptions. Admission stops after 240 seconds, plus
+//! the current bounded PTY operation and cleanup. Each screen/readiness/exit
+//! observation has its own five-second ceiling within that aggregate budget. Linux samples bounded /proc
 //! files at settled prompts; RSS has allocator headroom and is a regression
 //! envelope, not proof of zero leaks. Other platforms still check responsiveness
 //! and owned child cleanup. Accelerated churn does not establish real uptime.
@@ -36,7 +37,12 @@ use unicode_width::UnicodeWidthStr;
 
 const WARMUP_BURSTS: usize = 64;
 const MEASURED_ROUNDS: usize = 64;
-const RUN_LIMIT: Duration = Duration::from_secs(120);
+// Hosted macOS debug runs made steady sub-second progress but exhausted the
+// former aggregate 120-second budget after 114/128 bursts or 58/64 rounds.
+// Keep the workload and leak envelope intact while separating total execution
+// allowance from the much tighter bound that detects an unresponsive command.
+const RUN_LIMIT: Duration = Duration::from_secs(240);
+const OBSERVATION_LIMIT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const PROC_BYTES_MAX: usize = 32 * 1024;
 #[cfg(target_os = "linux")]
@@ -102,10 +108,11 @@ pub(super) fn check_sustained_session(binary: &Path) -> Result<(), TaskError> {
     let start = session.pty.output().len();
     ensure_time(started)?;
     session.pty.send(key::CTRL_D)?;
+    let exit_deadline = observation_deadline(deadline, Instant::now())?;
     ensure_status(
         session
             .pty
-            .wait_exit_within(deadline.saturating_duration_since(Instant::now()))?,
+            .wait_exit_within(exit_deadline.saturating_duration_since(Instant::now()))?,
         0,
         "sustained session",
     )?;
@@ -304,6 +311,7 @@ fn wait_screen(
 }
 
 fn wait_ready(session: &mut Session, deadline: Instant, start: usize) -> Result<(), TaskError> {
+    let deadline = observation_deadline(deadline, Instant::now())?;
     super::wait_for_rich_input_until(session, start, deadline)
 }
 
@@ -313,11 +321,18 @@ fn wait_for(
     description: &str,
     predicate: impl Fn(&Session) -> bool,
 ) -> Result<(), TaskError> {
+    let run_deadline = deadline;
+    let deadline = observation_deadline(run_deadline, Instant::now())?;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            let limit = if deadline == run_deadline {
+                "240-second aggregate work limit"
+            } else {
+                "5-second observation limit"
+            };
             return Err(screen_error(
-                &format!("sustained 120-second work limit while waiting for {description}"),
+                &format!("sustained {limit} while waiting for {description}"),
                 session.pty.screen(),
             ));
         }
@@ -330,6 +345,13 @@ fn wait_for(
     }
 }
 
+fn observation_deadline(run_deadline: Instant, now: Instant) -> Result<Instant, TaskError> {
+    let deadline = now
+        .checked_add(OBSERVATION_LIMIT)
+        .ok_or_else(|| io::Error::other("sustained observation deadline overflowed"))?;
+    Ok(deadline.min(run_deadline))
+}
+
 fn clear_wire(session: &mut Session, wire_bytes: &mut u64) {
     *wire_bytes =
         wire_bytes.saturating_add(u64::try_from(session.pty.output().len()).unwrap_or(u64::MAX));
@@ -338,9 +360,10 @@ fn clear_wire(session: &mut Session, wire_bytes: &mut u64) {
 
 fn ensure_time(started: Instant) -> Result<(), TaskError> {
     if started.elapsed() >= RUN_LIMIT {
-        return Err(
-            io::Error::other("sustained session exceeded its 120-second work limit").into(),
-        );
+        return Err(io::Error::other(
+            "sustained session exceeded its 240-second aggregate work limit",
+        )
+        .into());
     }
     Ok(())
 }
@@ -420,6 +443,28 @@ fn parse_resident_bytes(status: &str) -> Result<u64, TaskError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_budget_detects_stalls_before_the_whole_workload_expires() {
+        let now = Instant::now();
+        let overall = now.checked_add(RUN_LIMIT).unwrap();
+        assert_eq!(
+            observation_deadline(overall, now).unwrap(),
+            now.checked_add(Duration::from_secs(5)).unwrap()
+        );
+    }
+
+    #[test]
+    fn observation_budget_never_extends_a_near_or_expired_aggregate_deadline() {
+        let now = Instant::now();
+        for overall in [
+            now.checked_add(Duration::from_secs(2)).unwrap(),
+            now,
+            now.checked_sub(Duration::from_secs(1)).unwrap(),
+        ] {
+            assert_eq!(observation_deadline(overall, now).unwrap(), overall);
+        }
+    }
 
     #[test]
     fn sustained_result_oracle_rejects_echo_and_nonedge_hashes() {

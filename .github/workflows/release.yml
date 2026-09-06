@@ -341,5 +341,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/homebrew.yml
+    # The same-repository reusable job resolves its protected environment secret
+    # only when the caller forwards the secrets context. Approval stays there.
+    secrets: inherit
     with:
       tag: ${{ inputs.tag }}

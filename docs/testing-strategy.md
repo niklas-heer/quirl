@@ -418,10 +418,13 @@ separate UI retention tests exercise that limit.
 Linux samples descriptors, threads, resident memory, and direct children from
 bounded `/proc` reads at settled prompts. The warmed growth envelope is eight
 descriptors, eight threads, and 32 MiB RSS; successful exit must reap owned
-children. Other platforms verify responsiveness and child cleanup. A 120-second
-run admission limit plus bounded current operations prevents an indefinite
-regression hang. This checks accelerated child scrollback eviction and session churn, not
-100-hour continuous uptime or proof of zero leaks.
+children. Other platforms verify responsiveness and child cleanup. The fixed
+workload has a 240-second aggregate admission budget, accommodating slower hosted
+macOS debug runners without reducing any work or resource checks. Every screen,
+input-readiness, and exit observation must still complete within five seconds
+and the remaining aggregate budget, so a stalled command fails promptly. This
+checks accelerated child scrollback eviction and session churn, not 100-hour
+continuous uptime or proof of zero leaks.
 
 No finite generated workload emulates every terminal or usage pattern. Keep
 the focused process, job-control, sandbox, protocol, and release tests. Real
