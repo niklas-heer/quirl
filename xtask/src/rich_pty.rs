@@ -1,6 +1,7 @@
 //! End-to-end rich-terminal checks driven by the Rust PTY harness.
 
 mod clipboard;
+mod generic_terminal;
 mod resize_input;
 mod soak_gallery;
 mod sustained;
@@ -73,6 +74,7 @@ const CHECK_NAMES: &[&str] = &[
     "spinner-animates-during-silent-command",
     "full-screen-program-takeover",
     "package-tui-terminal-takeover",
+    "generic-terminal-session",
     "full-screen-program-spawn-failure-restores-terminal",
     "ctrl-l-forces-full-repaint",
     "local-completion-discovery",
@@ -509,7 +511,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 39] {
+fn checks() -> [CheckCase; 40] {
     [
         CheckCase {
             name: "rich-editing",
@@ -632,6 +634,10 @@ fn checks() -> [CheckCase; 39] {
             run: check_package_tui_terminal_takeover,
         },
         CheckCase {
+            name: "generic-terminal-session",
+            run: generic_terminal::check_generic_terminal_session,
+        },
+        CheckCase {
             name: "full-screen-program-spawn-failure-restores-terminal",
             run: check_full_screen_program_spawn_failure_restores_terminal,
         },
@@ -706,13 +712,79 @@ fn cancel_rich_and_resume(session: &mut Session) -> Result<(), TaskError> {
 }
 
 fn wait_for_rich_input_since(session: &mut Session, start: usize) -> Result<(), TaskError> {
-    // A rendered output/footer can precede the next editor's terminal lease.
-    // Require its fresh mouse-mode enable before sending more input; screen
-    // echo or an earlier prompt must not make a command look completed.
-    session
-        .pty
-        .wait_for_since(b"\x1b[?1000h", start, default_timeout())?;
-    Ok(())
+    // Child entry also enables raw input, and completion paints a Quirl frame
+    // before resuming its editor. Require all three signals together: a fresh
+    // enable followed by frame finalization, Quirl's ready UI, and raw termios.
+    // Scan each received byte once plus a 16-byte marker overlap per turn.
+    let deadline = Instant::now()
+        .checked_add(default_timeout())
+        .ok_or_else(|| io::Error::other("editor readiness deadline overflow"))?;
+    wait_for_rich_input_until(session, start, deadline)
+}
+
+fn wait_for_rich_input_until(
+    session: &mut Session,
+    start: usize,
+    deadline: Instant,
+) -> Result<(), TaskError> {
+    let mut scan_start = start;
+    let mut enabled = None;
+    let mut cursor_shown = None;
+    loop {
+        let output = session.pty.output();
+        let fresh = output.get(scan_start..).unwrap_or_default();
+        for (marker, observed) in [
+            (&b"\x1b[?1000h"[..], &mut enabled),
+            (&b"\x1b[?25h"[..], &mut cursor_shown),
+        ] {
+            if let Some(offset) = fresh
+                .windows(marker.len())
+                .rposition(|bytes| bytes == marker)
+            {
+                *observed = Some(scan_start.saturating_add(offset));
+            }
+        }
+        scan_start = output.len().saturating_sub(16).max(start);
+        if enabled
+            .zip(cursor_shown)
+            .is_some_and(|(enabled, cursor)| cursor > enabled)
+            && rich_editor_frame_ready(session.pty.screen())
+            && !session
+                .pty
+                .terminal_modes()?
+                .local_flags
+                .intersects(LocalFlags::ICANON | LocalFlags::ECHO)
+        {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::other(format!(
+                "timed out waiting for a completed raw Quirl editor; screen=\n{}",
+                session.pty.screen().text()
+            ))
+            .into());
+        }
+        session
+            .pty
+            .drain_for(remaining.min(Duration::from_millis(20)))?;
+    }
+}
+
+fn rich_editor_frame_ready(screen: &VirtualScreen) -> bool {
+    let bottom = screen.bottom_line();
+    screen.has_completed_frame()
+        && ["NORMAL", "DATA", "AI"]
+            .iter()
+            .any(|mode| bottom.contains(mode))
+        && (bottom.contains("Alt-Q Quirl") || bottom.contains("result kept in viewport"))
+        && screen.lines().iter().any(|line| {
+            let text = line.trim_start();
+            text.starts_with('>')
+                || text.starts_with('❯')
+                || text.starts_with('▦')
+                || text.starts_with('✧')
+        })
 }
 
 fn execute_and_resume(session: &mut Session, command: &str) -> Result<(), TaskError> {
@@ -1487,10 +1559,11 @@ fn check_automatic_command_intelligence(binary: &Path) -> Result<(), TaskError> 
     let handoff_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session.pty.wait_for_screen_text("HANDOFF_STARTED")?;
-    if session.pty.foreground_group()? == quirl_process {
-        return Err(
-            io::Error::other("foreground command did not receive terminal ownership").into(),
-        );
+    if session.pty.foreground_group()? != quirl_process {
+        return Err(io::Error::other(
+            "Quirl lost outer terminal ownership during the child session",
+        )
+        .into());
     }
     wait_for_rich_input_since(&mut session, handoff_start)?;
     // Readiness follows viewport clearing but can precede a complete repaint.
@@ -2676,7 +2749,6 @@ complete -c ghq -n '__fish_seen_subcommand_from list' -s p -l full-path -d 'Prin
             text.contains("clone git@github.com:niklas-heer/homebrew-tap.git")
                 && text.contains("progress 20%")
                 && !text.contains("clone complete")
-                && screen.bottom_line().contains("running")
         })?;
     if finished.exists() {
         return Err(io::Error::other(
@@ -2739,7 +2811,6 @@ fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), TaskErro
         .pty
         .wait_for_screen("first progress frame live", |screen| {
             screen.lines().iter().any(|line| line.trim() == "33%")
-                && screen.bottom_line().contains("running")
         })?;
     if session.pty.screen().text().contains("100%done") {
         return Err(io::Error::other(
@@ -2751,7 +2822,6 @@ fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), TaskErro
         .pty
         .wait_for_screen("second progress frame live", |screen| {
             screen.lines().iter().any(|line| line.trim() == "66%")
-                && screen.bottom_line().contains("running")
         })?;
     session.pty.wait_for_screen(
         "progress fixture completed inside persistent viewport",
@@ -2822,21 +2892,11 @@ fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), Tas
     )
 }
 
-#[allow(
-    clippy::indexing_slicing,
-    reason = "captured output offsets come from successful marker searches"
-)]
 fn check_full_screen_program_takeover(binary: &Path) -> Result<(), TaskError> {
-    // Failure model: the rich viewport normally captures a foreground
-    // command's stdout and stderr through a pipe and replays it inside its
-    // own transcript block. A full-screen program (an editor, pager, or
-    // similar) instead needs the real terminal: its own alternate screen,
-    // absolute cursor addressing, and live keystrokes. A fixture named
-    // `vim` proves the fix reaches the real terminal rather than a
-    // transcript-safe imitation of it: raw `\x1b[?1049h`/`\x1b[?1049l`
-    // bytes on the wire can only come from a real inherited terminal, since
-    // captured output is escaped before it ever reaches the transcript (see
-    // `check_streamed_progress_without_newline`'s literal-escape assertion).
+    // Child alternate-screen controls are interpreted by the bounded emulator.
+    // Observe its rendered ready frame, then prove key delivery through a file
+    // before the child exits: a fast alternate-screen close can legitimately
+    // remove the final child frame before the next parent paint.
     let fixtures = TempDirectory::new("quirl-full-screen-takeover")?;
     let binary_dir = fixtures.path.join("bin");
     create_private_directory(&binary_dir)?;
@@ -2846,7 +2906,7 @@ fn check_full_screen_program_takeover(binary: &Path) -> Result<(), TaskError> {
          printf '\\033[?1049h'\n\
          printf 'FIXTURE_READY\\n'\n\
          read line\n\
-         printf 'GOT:%s\\n' \"$line\"\n\
+         printf '%s\\n' \"$line\" > full-screen-answer\n\
          printf '\\033[?1049l'\n",
     )?;
     let mut session = Session::new(
@@ -2857,29 +2917,21 @@ fn check_full_screen_program_takeover(binary: &Path) -> Result<(), TaskError> {
         },
     )?;
     session.pty.wait_for(STARTUP_MARKER)?;
-    let output_start = session.pty.output().len();
     session.pty.type_text("vim")?;
     session.pty.send(key::ENTER)?;
-    session.pty.wait_for(b"FIXTURE_READY")?;
-    if !contains(&session.pty.output()[output_start..], b"\x1b[?1049h") {
-        return Err(io::Error::other(
-            "full-screen fixture never entered a real alternate screen; \
-             its output is still being captured instead of inherited",
-        )
-        .into());
-    }
+    session.pty.wait_for_screen_text("FIXTURE_READY")?;
+    let output_start = session.pty.output().len();
     session.pty.type_text("hello")?;
     session.pty.send(key::ENTER)?;
-    session.pty.wait_for(b"GOT:hello")?;
-    session
-        .pty
-        .wait_for_since(b"\x1b[?1049l", output_start, default_timeout())?;
     session
         .pty
         .wait_for_screen("rich viewport reacquired after takeover", |screen| {
             screen.bottom_line().contains("NORMAL")
         })?;
     wait_for_rich_input_since(&mut session, output_start)?;
+    if read_bounded_fixture(&session.private.path.join("full-screen-answer"), 256)? != b"hello\n" {
+        return Err(io::Error::other("full-screen child did not receive the typed answer").into());
+    }
     execute_and_resume(&mut session, "/usr/bin/printf AFTER_%s TAKEOVER")?;
     ensure_status(
         send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
@@ -2889,9 +2941,9 @@ fn check_full_screen_program_takeover(binary: &Path) -> Result<(), TaskError> {
 }
 
 fn check_package_tui_terminal_takeover(binary: &Path) -> Result<(), TaskError> {
-    // Failure model: a package launcher or unrecognized direct TUI such as tdx
-    // bypasses the terminal classifier. Its child sees piped stdout/stderr and silently
-    // selects a static report. These private, network-free fixtures require all
+    // Failure model: package launchers and direct commands must receive the
+    // same terminal endpoint policy; piped stdout/stderr can silently select
+    // a static report. These private, network-free fixtures require all
     // three inherited terminal descriptors before entering an alternate screen.
     // Each launch has the existing bounded PTY waits and Session cleanup; no
     // package installation, timing sleeps, or extra Enter retries are involved.
@@ -2908,7 +2960,8 @@ fn check_package_tui_terminal_takeover(binary: &Path) -> Result<(), TaskError> {
          printf '\\033[?1049hPACKAGE_TUI:%s\\n' \"$2\"\n\
          IFS= read -r answer || exit 43\n\
          [ \"$answer\" = quit ] || exit 44\n\
-         printf 'PACKAGE_QUIT:%s\\n\\033[?1049l' \"$2\"\n",
+         printf '%s\\n' \"$answer\" > \"package-answer-$2\"\n\
+         printf '\\033[?1049l'\n",
     )?;
     for launcher in ["bunx", "npx"] {
         write_executable(
@@ -2923,7 +2976,11 @@ fn check_package_tui_terminal_takeover(binary: &Path) -> Result<(), TaskError> {
         &binary_dir.join("tdx"),
         "#!/bin/sh\n\
          if [ \"$#\" -eq 1 ] && [ \"$1\" = list ]; then\n\
-           if [ -t 1 ] || [ -t 2 ]; then exit 46; fi\n\
+           if ! [ -t 0 ] || ! [ -t 1 ] || ! [ -t 2 ]; then exit 46; fi\n\
+           printf 'TDX_LIST_TERMINAL\\n'; exit 0\n\
+         fi\n\
+         if [ \"$#\" -eq 1 ] && [ \"$1\" = capture ]; then\n\
+           [ ! -t 1 ] || exit 47\n\
            printf 'TDX_LIST_CAPTURED\\n'; exit 0\n\
          fi\n\
          exec \"${0%/*}/tokscale\" --fixture tdx\n",
@@ -2944,7 +3001,12 @@ fn check_package_tui_terminal_takeover(binary: &Path) -> Result<(), TaskError> {
         };
         check_package_tui_launch(&mut session, &source, launcher)?;
     }
-    execute_and_resume_with_marker(&mut session, "tdx list", b"TDX_LIST_CAPTURED")?;
+    execute_and_resume_with_marker(&mut session, "tdx list", b"TDX_LIST_TERMINAL")?;
+    let redirected = session.private.path.join("tdx-list.txt");
+    execute_and_resume(&mut session, "tdx capture > tdx-list.txt")?;
+    if read_bounded_fixture(&redirected, 256)? != b"TDX_LIST_CAPTURED\n" {
+        return Err(io::Error::other("redirected TUI fixture output differs").into());
+    }
     let cleanup_start = session.pty.output().len();
     ensure_status(
         send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
@@ -2959,7 +3021,6 @@ fn check_package_tui_launch(
     source: &str,
     launcher: &str,
 ) -> Result<(), TaskError> {
-    let output_start = session.pty.output().len();
     session.pty.type_text(source)?;
     session.pty.send(key::ENTER)?;
     let ready = format!("PACKAGE_TUI:{launcher}");
@@ -2976,20 +3037,20 @@ fn check_package_tui_launch(
         ))
         .into());
     }
-    session
-        .pty
-        .wait_for_since(b"\x1b[?1049h", output_start, default_timeout())?;
+    let output_start = session.pty.output().len();
     session.pty.type_text("quit")?;
     session.pty.send(key::ENTER)?;
-    session.pty.wait_for_since(
-        format!("PACKAGE_QUIT:{launcher}").as_bytes(),
-        output_start,
-        default_timeout(),
-    )?;
-    session
-        .pty
-        .wait_for_since(b"\x1b[?1049l", output_start, default_timeout())?;
     wait_for_rich_input_since(session, output_start)?;
+    if read_bounded_fixture(
+        &session
+            .private
+            .path
+            .join(format!("package-answer-{launcher}")),
+        256,
+    )? != b"quit\n"
+    {
+        return Err(io::Error::other("package child did not receive the typed answer").into());
+    }
     execute_and_resume_with_marker(
         session,
         &format!("/usr/bin/printf AFTER_PACKAGE_%s {launcher}"),
@@ -3000,14 +3061,9 @@ fn check_package_tui_launch(
 fn check_full_screen_program_spawn_failure_restores_terminal(
     binary: &Path,
 ) -> Result<(), TaskError> {
-    // Failure model: `needs_real_terminal` decides to hand a command the
-    // real terminal from its parsed source text alone, before the
-    // executable is known to exist. When the recognized full-screen program
-    // is missing from PATH, the spawn fails after the alternate screen has
-    // already been released for it. `resume_after_terminal_takeover` must
-    // still run — the rich viewport has to be reacquired and repainted
-    // before the spawn error is shown, never left stranded on the
-    // takeover's half-cleared real-terminal frame.
+    // Failure model: foreground terminal preparation can succeed before the
+    // executable is known to exist. A failed spawn must still release its
+    // resources and restore a usable editor before the next command arrives.
     let fixtures = TempDirectory::new("quirl-full-screen-spawn-failure")?;
     let binary_dir = fixtures.path.join("bin");
     create_private_directory(&binary_dir)?;

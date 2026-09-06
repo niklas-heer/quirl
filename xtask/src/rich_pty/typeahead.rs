@@ -1,15 +1,15 @@
-//! Cooked-mode type-ahead must survive the foreground-to-editor handoff.
+//! Unread child-terminal type-ahead must survive the foreground-to-editor handoff.
 //!
-//! The kernel may echo queued keys directly into the viewport while a command
-//! runs, outside ratatui's frame cache. A gated child proves this ordering without
-//! relying on delays: observe its output and cooked ECHO, send the next input,
-//! observe the echoed bytes, then release the child. Assert both rendered blanks
+//! The child terminal echoes queued keys through the emulator while the outer
+//! terminal stays raw. A gated child proves this ordering without relying on
+//! delays: observe its output, send the next input, observe the echoed cells,
+//! then release the child. Assert both rendered blanks
 //! and exact executed argument bytes. Each fixture emits 45 short lines, polls
 //! its private gate at most 1,000 times, and remains under the PTY owner's wait,
 //! output and cleanup limits; failure drops the child owner before its files.
 
 use super::{
-    LocalFlags, STARTUP_MARKER, Session, SessionOptions, TaskError, default_timeout, ensure_status,
+    LocalFlags, STARTUP_MARKER, Session, SessionOptions, TaskError, ensure_status,
     ensure_terminal_restored, key, read_bounded_fixture, wait_for_file, wait_for_rich_input_since,
     write_fixture,
 };
@@ -59,14 +59,16 @@ fn check_caption(session: &mut Session, label: &str, caption: &str) -> Result<()
             screen.lines().iter().any(|line| line.starts_with(&marker))
         })?;
     let flags = session.pty.terminal_modes()?.local_flags;
-    if !flags.contains(LocalFlags::ICANON | LocalFlags::ECHO) {
-        return Err(io::Error::other("type-ahead fixture did not own cooked echo mode").into());
+    if flags.intersects(LocalFlags::ICANON | LocalFlags::ECHO) {
+        return Err(io::Error::other("outer terminal did not retain raw input ownership").into());
     }
     let start = session.pty.output().len();
     session.pty.send(caption.as_bytes())?;
     session
         .pty
-        .wait_for_since(caption.as_bytes(), start, default_timeout())?;
+        .wait_for_screen("child terminal echoed the unread type-ahead", |screen| {
+            screen.lines().iter().any(|line| line == caption)
+        })?;
     fs::write(
         session.private.path.join(format!("{label}.gate")),
         b"release",

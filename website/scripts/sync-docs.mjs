@@ -82,6 +82,7 @@ const documents = [
   ['docs/decisions/0035-cold-interactive-startup.md', 'architecture/decisions/0035-cold-interactive-startup.mdx'],
   ['docs/decisions/0036-advisory-release-binary-size.md', 'architecture/decisions/0036-advisory-release-binary-size.mdx'],
   ['docs/decisions/0037-navigation-completion-space.md', 'architecture/decisions/0037-navigation-completion-space.mdx'],
+  ['docs/decisions/0038-embedded-foreground-terminals.md', 'architecture/decisions/0038-embedded-foreground-terminals.mdx'],
 ];
 
 const pageBySource = new Map(documents);

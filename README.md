@@ -169,6 +169,13 @@ unfinished escape/paste sequence lasting 30 seconds also ends the session.
 See [the interactive surface](docs/tui-design.md) for editing and recovery
 behavior, including the separate terminal transport limits.
 
+Unreleased Unix source builds give native foreground programs an embedded PTY,
+including wrappers and newly installed TUIs. Screen redraws, keyboard input,
+local terminal queries, resize, and Ctrl-C use the same path without an app list.
+Unused type-ahead returns as editable prompt text. See
+[the foreground terminal contract](docs/tui-design.md#33-foreground-terminal-execution)
+for bounds and unsupported terminal extensions.
+
 Important current limits:
 
 - A source checkout is not a supported release merely because its workspace

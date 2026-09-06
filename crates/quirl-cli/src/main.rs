@@ -27,6 +27,8 @@ mod projects;
 mod protocol;
 mod recovery;
 mod script;
+#[cfg(unix)]
+mod terminal_worker;
 
 use agent::AgentCommand;
 use ai::AiCommand;
@@ -309,6 +311,13 @@ enum DataOutputFormat {
 }
 
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    if terminal_worker::worker_requested() {
+        return match terminal_worker::run_worker() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     if lua_worker::worker_requested() {
         return match lua_worker::run_worker() {
             Ok(()) => ExitCode::SUCCESS,
@@ -1425,159 +1434,6 @@ fn execute_command_or_dialect_island(
     .map(|outcome| command_outcome_projection(&outcome))
 }
 
-/// Curated executables that always take over the whole terminal — full-screen
-/// editors, pagers, and other TUI programs — rather than write a plain
-/// stream of output.
-///
-/// The rich viewport normally captures a foreground command's output and
-/// replays it inside its own transcript block, which works well for
-/// programs that print a stream of text. A program in this list instead
-/// needs direct control of the real terminal: cursor addressing, its own
-/// alternate screen, and live keystrokes as the user types them. A captured,
-/// replayed transcript cannot provide any of that — the program either
-/// blocks on input it never receives, or (like Vim) detects that its output
-/// is not a terminal and refuses to draw at all.
-const FULL_SCREEN_PROGRAMS: &[&str] = &[
-    "vim", "vi", "nvim", "view", "nvi", "emacs", "nano", "pico", "less", "more", "most", "man",
-    "top", "htop", "btop", "gotop", "tmux", "screen", "watch", "mc", "ncdu", "fzf", "tig",
-    "lazygit", "k9s", "tokscale",
-];
-
-/// Packages whose default UI requires inherited terminal descriptors even
-/// when invoked through a package launcher. Match package boundaries, not
-/// substrings: unrelated packages must retain ordinary captured output.
-const TERMINAL_PACKAGES: &[&str] = &["tokscale", "@tokscale/cli"];
-
-/// Return whether `source` is a single foreground external command whose
-/// executable is a known [`FULL_SCREEN_PROGRAMS`] entry, an interactive tdx
-/// invocation, or a supported launcher invocation of a [`TERMINAL_PACKAGES`] entry.
-///
-/// Deliberately conservative: multi-stage pipelines, boolean or sequential
-/// lists, background commands, and commands with redirects all return
-/// `false` and fall back to the rich viewport's captured, replayed
-/// rendering. A pipeline stage still needs its output captured by the other
-/// side of the pipe, and a redirect target is a request the takeover path
-/// has no way to honor, so neither is safe to reinterpret as "give this
-/// command the real terminal."
-fn needs_real_terminal(source: &str) -> bool {
-    let Ok(list) = parse_command_list(source) else {
-        return false;
-    };
-    let ([pipeline], []) = (list.pipelines.as_slice(), list.connectors.as_slice()) else {
-        return false;
-    };
-    if pipeline.background {
-        return false;
-    }
-    let [command] = pipeline.commands.as_slice() else {
-        return false;
-    };
-    if !command.redirects.is_empty() {
-        return false;
-    }
-    let Some((executable, arguments)) = command.words.split_first() else {
-        return false;
-    };
-    let executable = executable.strip_prefix('^').unwrap_or(executable);
-    let name = executable.rsplit('/').next().unwrap_or(executable);
-    FULL_SCREEN_PROGRAMS.contains(&name)
-        || (name == "tdx" && terminal_tdx_invocation(arguments))
-        || terminal_package_invocation(name, arguments)
-}
-
-/// Recognize tdx's interactive entrypoints without executing or expanding args.
-///
-/// Its default, file, last-file, and numbered-recent-file views need terminal
-/// ownership. Scriptable commands and unknown options retain captured output.
-/// Scan the already bounded native argv once with constant additional memory;
-/// option values must never be mistaken for commands or interactive flags.
-fn terminal_tdx_invocation(arguments: &[String]) -> bool {
-    let mut arguments = arguments.iter().map(String::as_str);
-    let mut literal = false;
-    let mut file_selected = false;
-    let mut command = None;
-    let mut selection = None;
-    while let Some(argument) = arguments.next() {
-        if !literal && argument.starts_with('-') {
-            let (flag, inline) = argument
-                .split_once('=')
-                .map_or((argument, None), |(flag, value)| (flag, Some(value)));
-            match flag {
-                "--" if inline.is_none() => literal = true,
-                "-r" | "--read-only" | "--show-headings" if inline.is_none() => {}
-                "-f" | "--file" => {
-                    let Some(value) = inline.or_else(|| arguments.next()) else {
-                        return false;
-                    };
-                    if value.is_empty() || file_selected {
-                        return false;
-                    }
-                    file_selected = true;
-                }
-                "-m" | "--max-visible" => {
-                    let Some(value) = inline.or_else(|| arguments.next()) else {
-                        return false;
-                    };
-                    if !value.parse::<i64>().is_ok_and(|value| value >= 0) {
-                        return false;
-                    }
-                }
-                _ => return false,
-            }
-            continue;
-        }
-        if command.is_none() && !file_selected && argument.ends_with(".md") {
-            file_selected = true;
-        } else if command.is_none() {
-            command = Some(argument);
-        } else if selection.is_none() {
-            selection = Some(argument);
-        } else {
-            return false;
-        }
-    }
-    match (command, selection) {
-        (None | Some("last"), None) => true,
-        (Some("recent"), Some(index)) => index.parse::<i64>().is_ok_and(|index| index > 0),
-        _ => false,
-    }
-}
-
-/// Inspect only documented, valueless launcher flags before the package.
-/// Unknown options can consume an argument, so guessing past one could mistake
-/// an option value for the executed package. Native parsing already bounds the
-/// source; this scan performs no expansion, package resolution, or filesystem I/O.
-fn terminal_package_invocation(launcher: &str, arguments: &[String]) -> bool {
-    if !matches!(launcher, "bunx" | "npx") {
-        return false;
-    }
-    let mut after_separator = false;
-    for argument in arguments {
-        if !after_separator {
-            if argument == "--" {
-                after_separator = true;
-                continue;
-            }
-            let valueless_flag = match launcher {
-                "bunx" => argument == "--bun",
-                "npx" => matches!(argument.as_str(), "--yes" | "-y" | "--no-install"),
-                _ => false,
-            };
-            if valueless_flag {
-                continue;
-            }
-        }
-        return TERMINAL_PACKAGES.iter().any(|package| {
-            argument == package
-                || argument
-                    .strip_prefix(package)
-                    .and_then(|suffix| suffix.strip_prefix('@'))
-                    .is_some_and(|version| !version.is_empty())
-        });
-    }
-    false
-}
-
 /// Return whether a parsed native command list directly invokes Git.
 ///
 /// This is only a cheap refresh hint after execution, not a security decision:
@@ -1622,6 +1478,23 @@ fn execute_command_or_dialect_island_with_extensions(
         .with_help(
             "Set ui.surface = \"simple\" for background jobs until rich PTY-backed jobs are available",
         ));
+    }
+    // Trusted foreground terminal sessions have no arbitrary host-call deadline.
+    // Sandboxed, scripting, plugin, and noninteractive requests still use the
+    // common bounded ExecutionPlan below.
+    #[cfg(unix)]
+    if output_mode == ExecutionOutputMode::RichViewport
+        && installed.is_none()
+        && interactive_dialect_island(source).is_none()
+        && let Some(observer) = observer
+    {
+        let outcome = executor.execute_terminal_streaming(source, observer)?;
+        return ExecutionOutcome::from_command(
+            outcome,
+            ExecutionOutputTarget::Capture {
+                max_bytes_per_stream: DEFAULT_CAPTURE_BYTES,
+            },
+        );
     }
     let request = if let Some((language, body)) = interactive_dialect_island(source) {
         let mode = match language {
@@ -2455,25 +2328,8 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         let started = Instant::now();
                         let journal = recovery_journal(&mut recovery)?;
                         let output_mode = line_editor.command_output_mode();
-                        // A known full-screen program (an editor, pager, or
-                        // similar) cannot work through the rich viewport's
-                        // captured, replayed rendering: it needs the real
-                        // terminal for its own alternate screen, cursor
-                        // addressing, and live keystrokes. Route it through
-                        // the same inherited-stdio path the simple surface
-                        // always uses, and hand it the real terminal for the
-                        // duration of the call.
-                        let takeover = output_mode == ExecutionOutputMode::RichViewport
-                            && needs_real_terminal(command);
-                        let execution_output_mode = if takeover {
-                            ExecutionOutputMode::Interactive
-                        } else {
-                            output_mode
-                        };
+                        let execution_output_mode = output_mode;
                         let streaming = line_editor.begin_command_stream(command, &prompt)?;
-                        if takeover {
-                            line_editor.release_terminal_for_takeover()?;
-                        }
                         let mut streamed_any = false;
                         let execution = if streaming {
                             let mut observer = |activity: ObservedActivity<'_>| match activity {
@@ -2483,6 +2339,16 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 }
                                 ObservedActivity::Tick => {
                                     line_editor.tick_command_stream(started, &prompt)
+                                }
+                                #[cfg(unix)]
+                                ObservedActivity::Foreground { request, outcome } => {
+                                    *outcome = Some(terminal_worker::execute(
+                                        &mut line_editor,
+                                        request,
+                                        &prompt,
+                                    )?);
+                                    streamed_any = true;
+                                    Ok(())
                                 }
                             };
                             execute_with_recovery(
@@ -2503,13 +2369,6 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 None,
                             )
                         };
-                        if takeover {
-                            // Reacquire the rich viewport even if the child
-                            // failed to start; the terminal must never stay
-                            // stranded on the takeover's (possibly partial)
-                            // frame.
-                            line_editor.resume_after_terminal_takeover(&prompt)?;
-                        }
                         let transcript_result = match execution {
                             Ok(report) => {
                                 last_status = report.status;
@@ -3548,25 +3407,6 @@ impl SessionEditor {
         Ok(true)
     }
 
-    /// Release the terminal for a full-screen foreground child.
-    ///
-    /// A no-op for the simple surface, which never captures a foreground
-    /// child's terminal in the first place.
-    fn release_terminal_for_takeover(&mut self) -> Result<(), ShellError> {
-        if let Self::Rich(editor) = self {
-            editor.release_terminal_for_takeover()?;
-        }
-        Ok(())
-    }
-
-    /// Reacquire the terminal after [`Self::release_terminal_for_takeover`].
-    fn resume_after_terminal_takeover(&mut self, prompt: &QuirlPrompt) -> Result<(), ShellError> {
-        if let Self::Rich(editor) = self {
-            editor.resume_after_terminal_takeover(prompt)?;
-        }
-        Ok(())
-    }
-
     fn append_command_stream(
         &mut self,
         stream: OutputStream,
@@ -4405,135 +4245,6 @@ mod tests {
             Cli::try_parse_from(["quirl", "ai", "run", "--provider", "local", "show", "cwd"])
                 .is_err()
         );
-    }
-
-    #[test]
-    fn needs_real_terminal_matches_only_plain_full_screen_invocations() {
-        assert!(needs_real_terminal("vim"));
-        assert!(needs_real_terminal("vim notes.txt"));
-        assert!(needs_real_terminal("less README.md"));
-        assert!(needs_real_terminal("/usr/bin/vim notes.txt"));
-
-        // Not a full-screen program at all.
-        assert!(!needs_real_terminal("git push"));
-        assert!(!needs_real_terminal("ls -la"));
-
-        // A pipeline or redirect still needs its side of the byte stream
-        // captured, so neither is safe to reinterpret as a terminal handoff.
-        assert!(!needs_real_terminal("git log | less"));
-        assert!(!needs_real_terminal("vim > out.txt"));
-
-        // A backgrounded full-screen program cannot own the terminal either.
-        assert!(!needs_real_terminal("vim &"));
-
-        // A boolean or sequential list is not a single foreground command.
-        assert!(!needs_real_terminal("true; vim"));
-
-        // Invalid native syntax must not panic the heuristic.
-        assert!(!needs_real_terminal("vim '"));
-    }
-
-    #[test]
-    fn tdx_interactive_views_receive_the_terminal_without_capturing_script_commands() {
-        for source in [
-            "tdx",
-            "^tdx",
-            "/opt/homebrew/bin/tdx",
-            "tdx todo.md",
-            "tdx 'my tasks.md' --read-only",
-            "tdx -r --show-headings -m 10",
-            "tdx --file tasks",
-            "tdx --file=list",
-            "tdx --max-visible=0 todo.md",
-            "tdx -- todo.md",
-            "tdx last",
-            "tdx recent 2",
-            "tdx -f todo.md recent 1",
-        ] {
-            assert!(needs_real_terminal(source), "{source}");
-        }
-        for source in [
-            "tdx list",
-            "tdx todo.md list --json",
-            "tdx --file tasks list",
-            "tdx add 'last'",
-            "tdx toggle 1",
-            "tdx edit 1 'recent'",
-            "tdx delete 1",
-            "tdx recent",
-            "tdx recent clear",
-            "tdx recent 0",
-            "tdx recent invalid",
-            "tdx help",
-            "tdx --help",
-            "tdx --version",
-            "tdx --debug-config",
-            "tdx --file",
-            "tdx --file=",
-            "tdx one.md --file two.md",
-            "tdx --max-visible -1",
-            "tdx --read-only=true",
-            "tdx --json",
-            "tdx --unknown last",
-            "tdx -- --read-only",
-            "tdx last --help",
-            "tdx | cat",
-            "tdx > out.txt",
-            "tdx 2> errors.txt",
-            "tdx < in.txt",
-            "tdx &",
-            "true && tdx",
-            "tdx; echo done",
-            "echo tdx",
-            "tdx-other",
-        ] {
-            assert!(!needs_real_terminal(source), "{source}");
-        }
-    }
-
-    #[test]
-    fn terminal_packages_keep_tty_detection_through_supported_launchers() {
-        for source in [
-            "tokscale",
-            "^tokscale",
-            "bunx tokscale@latest",
-            "bunx --bun tokscale@4.15.1",
-            "bunx @tokscale/cli@latest",
-            "npx -y tokscale",
-            "npx --yes --no-install @tokscale/cli@4.15.1",
-            "npx -- tokscale@latest --light",
-            "/opt/homebrew/bin/bunx tokscale@latest",
-            "^/opt/homebrew/bin/bunx tokscale@latest",
-        ] {
-            assert!(needs_real_terminal(source), "{source}");
-        }
-    }
-
-    #[test]
-    fn package_takeover_never_guesses_option_values_or_changes_command_graphs() {
-        for source in [
-            "bunx",
-            "bunx --bun",
-            "bunx --",
-            "bunx prettier file.ts",
-            "bunx tokscale-tools",
-            "bunx tokscale@",
-            "bunx @tokscale/cli-extra@latest",
-            "bunx --package tokscale something-else",
-            "npx --cache tokscale another-package",
-            "npx -c tokscale",
-            "echo bunx tokscale@latest",
-            "bunx tokscale@latest | cat",
-            "bunx tokscale@latest > report.txt",
-            "bunx tokscale@latest 2> errors.txt",
-            "bunx tokscale@latest < input.txt",
-            "bunx tokscale@latest &",
-            "true && bunx tokscale@latest",
-            "bunx tokscale@latest; echo done",
-            "bunx 'tokscale",
-        ] {
-            assert!(!needs_real_terminal(source), "{source}");
-        }
     }
 
     #[test]

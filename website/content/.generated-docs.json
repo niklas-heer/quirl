@@ -66,5 +66,6 @@
   "architecture/decisions/0034-release-binary-budget.mdx",
   "architecture/decisions/0035-cold-interactive-startup.mdx",
   "architecture/decisions/0036-advisory-release-binary-size.mdx",
-  "architecture/decisions/0037-navigation-completion-space.mdx"
+  "architecture/decisions/0037-navigation-completion-space.mdx",
+  "architecture/decisions/0038-embedded-foreground-terminals.mdx"
 ]

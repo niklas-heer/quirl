@@ -14,9 +14,12 @@ which versions are published.
 
 ### Fixed
 
-- Rich Normal mode hands tdx's interactive views the real terminal, preserving
-  screen redraws and input instead of appending each frame to captured output.
-  Scriptable tdx commands such as `list` keep ordinary transcript output.
+- Rich Normal mode on Unix runs foreground programs in an embedded terminal,
+  including unknown tools, wrappers, `tdx`, and `bunx tokscale@latest`. Screen
+  redraws, keyboard input, local terminal queries, resizing, and Ctrl-C work
+  without an application allowlist. Explicit pipes and redirections retain their
+  semantics; completed primary-screen output remains in the transcript and
+  unread type-ahead returns as editable prompt text.
 - Native Unix commands expand unquoted `~` and `~/` from the session home,
   including `cd` arguments and redirection paths, while preserving quoted and
   escaped literal tildes and enforcing the existing expansion limit.
@@ -26,11 +29,6 @@ which versions are published.
   candidates follow the session's current `HOME` value.
 - Completion and documentation panels reserve space below the editor, scrolling
   older transcript lines upward instead of covering recent command output.
-- Rich Normal mode gives Tokscale a real terminal when launched directly or
-  through `bunx`/`npx`, including versioned packages. Its interactive UI now
-  receives keyboard input instead of falling back to a static table. Other
-  package commands retain captured output; redirects, pipelines, and background
-  commands keep their existing routing.
 
 ## [0.2.0] - 2026-09-05
 

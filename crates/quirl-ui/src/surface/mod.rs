@@ -1,3 +1,4 @@
+pub mod child_terminal;
 pub(crate) mod completion;
 mod degrade;
 mod editor;
@@ -930,27 +931,91 @@ impl RichSurface {
         self.draw_execution(prompt)
     }
 
-    /// Give a full-screen foreground child direct control of the real
-    /// terminal instead of the rich viewport's captured, replayed rendering.
+    /// Begin a bounded embedded terminal while retaining the physical viewport.
     ///
-    /// Call this after [`Self::begin_command_stream`] and only for a command
-    /// recognized as a full-screen program (an editor, pager, or similar):
-    /// unlike a plain output stream, that class of program needs its own
-    /// alternate screen, cursor addressing, and live keystrokes, none of
-    /// which the captured transcript can provide. The caller must invoke
-    /// [`Self::resume_after_terminal_takeover`] once the child returns
-    /// control, even on an early error path, or the terminal is left showing
-    /// the child's last frame instead of Quirl's UI.
-    pub fn release_terminal_for_takeover(&mut self) -> Result<(), ShellError> {
-        self.terminal.leave_alternate_screen()
+    /// The caller must pair this with `finish_embedded_terminal`, including on
+    /// process, protocol, or rendering errors. Physical input stays raw so
+    /// control keys belong to the child terminal instead of the shell process.
+    pub fn begin_embedded_terminal(
+        &mut self,
+    ) -> Result<child_terminal::ChildTerminalSize, ShellError> {
+        let size = Self::embedded_terminal_size()?;
+        self.terminal.resume_input()?;
+        Ok(size)
     }
 
-    /// Reacquire the rich viewport after [`Self::release_terminal_for_takeover`].
-    pub fn resume_after_terminal_takeover(
+    /// Measure the child grid, bounded to 512 columns and 256 rows.
+    pub fn embedded_terminal_size() -> Result<child_terminal::ChildTerminalSize, ShellError> {
+        let (columns, rows) =
+            crate::terminal_size().map_err(terminal_error("measure child terminal"))?;
+        Ok(child_terminal::ChildTerminalSize {
+            rows: rows.clamp(1, 256),
+            columns: columns.clamp(2, 512),
+        })
+    }
+
+    /// Draw only interpreted terminal cells; child escape sequences never reach the backend.
+    /// An optional stopped-job notice occupies the last visible row.
+    pub fn draw_embedded_terminal(
         &mut self,
+        child: &child_terminal::ChildTerminal,
+        notice: Option<&str>,
+    ) -> Result<(), ShellError> {
+        let size = crate::terminal_size().map_err(terminal_error("measure child viewport"))?;
+        validate_rich_terminal_size(size)?;
+        let terminal = self.terminal.terminal.as_mut().ok_or_else(|| {
+            ShellError::new(ErrorCode::Io, "the child viewport is unavailable")
+                .with_help("Restart Quirl using the simple surface")
+        })?;
+        let area = Rect::new(0, 0, size.0, size.1);
+        if resize_fixed_terminal(terminal, self.terminal.last_size, area)
+            .map_err(terminal_error("resize child viewport"))?
+        {
+            self.terminal.last_size = Some(size);
+        }
+        terminal
+            .draw(|frame| {
+                child.render(frame, frame.area());
+                if let Some(notice) = notice {
+                    let area = frame.area();
+                    frame.render_widget(
+                        ratatui::widgets::Paragraph::new(notice),
+                        Rect::new(0, area.height.saturating_sub(1), area.width, 1),
+                    );
+                }
+            })
+            .map_err(terminal_error("draw child terminal"))?;
+        Ok(())
+    }
+
+    /// Poll at most one physical input event, clamping `wait` to 20 ms.
+    /// Use zero while output is flowing so keyboard polling does not throttle it.
+    pub fn poll_embedded_terminal_event(
+        wait: Duration,
+    ) -> Result<Option<event::Event>, ShellError> {
+        if event::poll(wait.min(Duration::from_millis(20)))
+            .map_err(terminal_error("poll child input"))?
+        {
+            event::read()
+                .map(Some)
+                .map_err(terminal_error("read child input"))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Restore command-execution modes and append the bounded terminal snapshot.
+    /// Existing transcript retention limits apply independently of child output volume.
+    pub fn finish_embedded_terminal(
+        &mut self,
+        snapshot: Vec<String>,
         prompt: &QuirlPrompt,
     ) -> Result<(), ShellError> {
-        self.terminal.reenter_alternate_screen()?;
+        self.terminal.pause_for_execution()?;
+        for line in snapshot {
+            self.append_transcript_line(&line);
+        }
+        self.terminal.force_repaint()?;
         self.draw_execution(prompt)
     }
 
@@ -1340,6 +1405,34 @@ impl RichSurface {
             .with_help("Use a shorter generated command"));
         }
         self.pending_prefill = Some(command.to_owned());
+        Ok(())
+    }
+
+    /// Append reviewed terminal text to the next editable prompt without submitting it.
+    ///
+    /// Sequential foreground pipelines may each return unread typing. Preserve
+    /// their order and reject cumulative input beyond the editor's 64 KiB ceiling
+    /// before changing an existing prefill. The caller must remove VT controls.
+    pub fn append_recovered_input(&mut self, text: &str) -> Result<(), ShellError> {
+        let observed = self
+            .pending_prefill
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(text.len());
+        if observed > editor::MAX_EDITOR_BUFFER_BYTES {
+            return Err(ShellError::new(
+                ErrorCode::ResourceLimit,
+                "recovered typing exceeded the editor byte limit",
+            )
+            .with_context(format!(
+                "limit: {}; observed: {observed}",
+                editor::MAX_EDITOR_BUFFER_BYTES
+            ))
+            .with_help("Enter a shorter command after the foreground programs finish"));
+        }
+        self.pending_prefill
+            .get_or_insert_with(String::new)
+            .push_str(text);
         Ok(())
     }
 
@@ -3189,48 +3282,6 @@ impl SurfaceTerminal {
         Ok(())
     }
 
-    /// Release the alternate screen so a full-screen foreground child draws
-    /// directly on the real terminal instead of the rich viewport's buffer.
-    ///
-    /// Callers must already have called [`Self::pause_for_execution`], and
-    /// must pair a successful call with [`Self::reenter_alternate_screen`]
-    /// once the child returns control — even on an early error path — or the
-    /// terminal is left showing the child's last frame instead of Quirl's UI.
-    /// A no-op when the alternate screen is not currently owned, so callers
-    /// do not need to track whether a previous takeover already left it.
-    fn leave_alternate_screen(&mut self) -> Result<(), ShellError> {
-        if !self.alternate_screen {
-            return Ok(());
-        }
-        if let Err(error) = execute!(io::stderr(), LeaveAlternateScreen) {
-            self.reset_best_effort();
-            return Err(terminal_error(
-                "leave the alternate terminal screen for a foreground takeover",
-            )(error));
-        }
-        self.alternate_screen = false;
-        Ok(())
-    }
-
-    /// Reacquire the alternate screen after [`Self::leave_alternate_screen`].
-    ///
-    /// The takeover child may have written anything to the real terminal, so
-    /// the caller must force a full repaint afterward rather than relying on
-    /// ratatui's diff against its stale pre-takeover buffer.
-    fn reenter_alternate_screen(&mut self) -> Result<(), ShellError> {
-        if self.alternate_screen {
-            return Ok(());
-        }
-        if let Err(error) = execute!(io::stderr(), EnterAlternateScreen) {
-            self.reset_best_effort();
-            return Err(terminal_error(
-                "reenter the alternate terminal screen after a foreground takeover",
-            )(error));
-        }
-        self.alternate_screen = true;
-        self.force_repaint()
-    }
-
     /// Wipe the real screen and force ratatui to repaint every cell on its
     /// next draw, without `Terminal::clear`'s blocking cursor-position query.
     ///
@@ -3243,11 +3294,11 @@ impl SurfaceTerminal {
     /// terminal-corrupting hang this call exists to recover from.
     /// `Terminal::resize` clears the same fixed viewport using only the
     /// already-known terminal size and local cursor-set/erase commands, with
-    /// no read from the terminal at all, so use it here and for the
-    /// full-screen takeover resume path instead.
+    /// no read from the terminal at all, so use it here when restoring the editor after foreground execution.
     fn force_repaint(&mut self) -> Result<(), ShellError> {
         let size =
             crate::terminal_size().map_err(terminal_error("measure the terminal for repaint"))?;
+        validate_rich_terminal_size(size)?;
         if let Some(terminal) = self.terminal.as_mut() {
             terminal
                 .resize(Rect::new(0, 0, size.0, size.1))
@@ -4058,6 +4109,45 @@ mod tests {
         let error = surface.prefill_command(&oversized).unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert_eq!(surface.pending_prefill.as_deref(), Some("'quirl' 'status'"));
+    }
+
+    #[test]
+    fn sequential_terminal_handoffs_preserve_order_and_reject_cumulative_overflow() {
+        let mut surface = RichSurface::new(
+            Arc::new(Catalog::builtin()),
+            None,
+            Arc::new(crate::StablePickerRanker),
+            &QuirlConfig::default(),
+            PathBuf::new(),
+        )
+        .unwrap();
+        surface.append_recovered_input("printf '").unwrap();
+        surface.append_recovered_input("世界'\n").unwrap();
+        let expected = "printf '世界'\n";
+        assert_eq!(surface.pending_prefill.as_deref(), Some(expected));
+        let remaining = editor::MAX_EDITOR_BUFFER_BYTES - expected.len();
+        surface
+            .append_recovered_input(&"x".repeat(remaining))
+            .unwrap();
+        assert_eq!(
+            surface.pending_prefill.as_ref().unwrap().len(),
+            editor::MAX_EDITOR_BUFFER_BYTES
+        );
+        assert_eq!(
+            surface.append_recovered_input("x").unwrap_err().code,
+            ErrorCode::ResourceLimit
+        );
+        assert!(
+            surface
+                .pending_prefill
+                .as_ref()
+                .unwrap()
+                .starts_with(expected)
+        );
+        assert_eq!(
+            surface.pending_prefill.as_ref().unwrap().len(),
+            editor::MAX_EDITOR_BUFFER_BYTES
+        );
     }
 
     #[test]

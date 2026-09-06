@@ -11,6 +11,7 @@
 mod file_read;
 mod panel;
 mod surface;
+pub use surface::child_terminal;
 mod theme;
 
 pub use panel::{

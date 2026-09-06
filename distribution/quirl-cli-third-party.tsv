@@ -9,6 +9,7 @@ anstyle	1.0.14	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-la
 anstyle-parse	1.0.0	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-cli/anstyle.git
 anstyle-query	1.1.5	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-cli/anstyle.git
 anyhow	1.0.104	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/anyhow
+arrayvec	0.7.8	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/bluss/arrayvec
 autocfg	1.5.1	linux,macos	Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/cuviper/autocfg
 base64	0.13.1	linux,macos	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/marshallpierce/rust-base64
 base64	0.22.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/marshallpierce/rust-base64
@@ -23,6 +24,7 @@ bytes	1.12.1	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-ind
 castaway	0.2.4	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/sagebind/castaway
 cc	1.4.3	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-lang/cc-rs
 cfg-if	1.0.4	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-lang/cfg-if
+cfg_aliases	0.1.1	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/katharostech/cfg_aliases
 cfg_aliases	0.2.2	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/katharostech/cfg_aliases
 chrono	0.4.45	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/chronotope/chrono
 clap	4.6.6	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/clap-rs/clap
@@ -56,6 +58,7 @@ derive_more	2.1.1	linux,macos	MIT	registry+https://github.com/rust-lang/crates.i
 derive_more-impl	2.1.1	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/JelteF/derive_more
 digest	0.10.7	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/RustCrypto/traits
 document-features	0.2.12	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/slint-ui/document-features
+downcast-rs	1.2.1	linux,macos	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/marcianx/downcast-rs
 either	1.17.0	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rayon-rs/either
 equivalent	1.0.2	linux,macos	Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/indexmap-rs/equivalent
 erased-serde	0.4.10	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/erased-serde
@@ -122,6 +125,7 @@ monostate	0.1.18	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-
 monostate-impl	0.1.18	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/monostate
 moxcms	0.8.1	linux,macos	BSD-3-Clause OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/awxkee/moxcms.git
 ndarray	0.15.6	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-ndarray/ndarray
+nix	0.28.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/nix-rust/nix
 nix	0.30.1	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/nix-rust/nix
 nom	7.1.3	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/Geal/nom
 nu-ansi-term	0.50.3	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/nushell/nu-ansi-term
@@ -142,6 +146,7 @@ percent-encoding	2.3.2	linux,macos	MIT OR Apache-2.0	registry+https://github.com
 pkg-config	0.3.34	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rust-lang/pkg-config-rs
 png	0.18.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/image-rs/image-png
 portable-atomic	1.15.0	linux,macos	Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/taiki-e/portable-atomic
+portable-pty	0.9.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/wezterm/wezterm
 ppv-lite86	0.2.21	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/cryptocorrosion/cryptocorrosion
 proc-macro2	1.0.107	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/dtolnay/proc-macro2
 pxfm	0.1.30	linux,macos	BSD-3-Clause OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/awxkee/pxfm
@@ -183,7 +188,9 @@ serde_derive	1.0.229	linux,macos	MIT OR Apache-2.0	registry+https://github.com/r
 serde_json	1.0.151	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/serde-rs/json
 serde_spanned	1.1.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/toml-rs/toml
 serde_yaml_ng	0.10.0	linux,macos	MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/acatton/serde-yaml-ng
+serial2	0.2.38	linux,macos	BSD-2-Clause OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/de-vri-es/serial2-rs
 sha2	0.10.9	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/RustCrypto/hashes
+shell-words	1.1.1	linux,macos	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/tmiasko/shell-words
 shlex	2.0.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/comex/rust-shlex
 signal-hook	0.3.18	linux,macos	Apache-2.0/MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/vorner/signal-hook
 signal-hook-mio	0.2.5	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/vorner/signal-hook
@@ -232,7 +239,10 @@ utf8-zero	0.8.1	linux,macos	MIT OR Apache-2.0	registry+https://github.com/rust-l
 utf8parse	0.2.2	linux,macos	Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/alacritty/vte
 vcpkg	0.2.15	linux,macos	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/mcgoo/vcpkg-rs
 version_check	0.9.5	linux,macos	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/SergioBenitez/version_check
+vt100	0.15.2	linux,macos	MIT	vendored+vendor/vt100	https://github.com/doy/vt100-rust
+vte	0.11.1	linux,macos	Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/alacritty/vte
 vte	0.14.1	linux,macos	Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/alacritty/vte
+vte_generate_state_changes	0.1.2	linux,macos	Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/alacritty/vte
 walkdir	2.5.0	linux,macos	Unlicense/MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/BurntSushi/walkdir
 wasmparser	0.256.0	linux,macos	Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index	https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasmparser
 webpki-roots	1.0.9	linux,macos	CDLA-Permissive-2.0	registry+https://github.com/rust-lang/crates.io-index	https://github.com/rustls/webpki-roots

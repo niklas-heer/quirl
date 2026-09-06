@@ -19,6 +19,8 @@
 mod builtin;
 mod developer_context;
 pub mod local_completion;
+#[cfg(unix)]
+pub mod pty;
 
 pub use developer_context::{DeveloperContextProbe, DeveloperContextSnapshot};
 
@@ -44,7 +46,6 @@ pub const SESSION_ENVIRONMENT_VARIABLES_MAX: usize = 65_536;
 /// Maximum key and value bytes retained by one native executor's environment snapshot.
 pub const SESSION_ENVIRONMENT_BYTES_MAX: usize = 16 * 1024 * 1024;
 /// One observation delivered to an [`OutputObserver`] during native execution.
-#[derive(Debug, Clone, Copy)]
 pub enum ObservedActivity<'a> {
     /// One bounded retained-output chunk read from the foreground child.
     Output {
@@ -61,6 +62,34 @@ pub enum ObservedActivity<'a> {
     /// this a plain "still running" signal rather than a timing source
     /// callers might otherwise be tempted to accumulate against.
     Tick,
+    /// Offer an expanded foreground pipeline to an optional terminal owner.
+    ///
+    /// This occurs before spawning, after stateful built-ins and expansions.
+    /// Leave `outcome` empty to retain captured execution. An accepting owner
+    /// must enforce the deadline/cancellation and finish child cleanup before
+    /// returning. It must never evaluate the expanded arguments again.
+    #[cfg(unix)]
+    Foreground {
+        /// Validated expanded arguments and private execution context.
+        request: TerminalPipelineRequest<'a>,
+        /// Filled only after delegated execution and cleanup complete.
+        outcome: &'a mut Option<quirl_core::CommandOutcome>,
+    },
+}
+
+/// Borrowed, already-expanded foreground graph offered to a terminal owner.
+#[cfg(unix)]
+pub struct TerminalPipelineRequest<'a> {
+    /// Expanded graph; each word and redirection target is literal data.
+    pub pipeline: &'a quirl_syntax::Pipeline,
+    /// Private shell environment, bounded by the session environment limits.
+    pub environment: &'a [(OsString, OsString)],
+    /// Absolute request deadline, including earlier pipelines. Trusted local
+    /// interactive execution has no overall deadline and supplies `None`.
+    pub deadline: Option<std::time::Instant>,
+    /// Request cancellation checked every bounded event turn when present.
+    /// Trusted local execution instead receives terminal input and host shutdown.
+    pub cancelled: Option<&'a std::sync::atomic::AtomicBool>,
 }
 
 /// Callback invoked with one bounded retained-output chunk, or a liveness
@@ -412,6 +441,75 @@ fn validate_native_plan(graph: &quirl_syntax::CommandList) -> Result<(), quirl_c
                 .with_help("Use an input file, a here-string, or an explicit Bash/Zsh island"));
             }
         }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_prepared_terminal_pipeline(
+    pipeline: &quirl_syntax::Pipeline,
+) -> Result<(), quirl_core::ShellError> {
+    use quirl_core::{ErrorCode, ShellError};
+    let invalid = || {
+        ShellError::new(ErrorCode::Validation, "invalid prepared terminal pipeline")
+            .with_help("Retry the command with a matching Quirl executable")
+    };
+    if pipeline.background
+        || pipeline.commands.is_empty()
+        || pipeline.commands.len() > NATIVE_PIPELINE_STAGES_MAX
+    {
+        return Err(invalid());
+    }
+    let mut bytes = 0usize;
+    let mut items = 0usize;
+    for command in &pipeline.commands {
+        if command.words.first().is_none_or(String::is_empty) || !command.word_ir.is_empty() {
+            return Err(invalid());
+        }
+        for word in &command.words {
+            claim_prepared_item(&mut bytes, &mut items, word.len())?;
+            if word.contains('\0') {
+                return Err(interior_nul_error("prepared terminal argument"));
+            }
+        }
+        for redirect in &command.redirects {
+            use quirl_syntax::RedirectKind;
+            claim_prepared_item(&mut bytes, &mut items, redirect.path.len())?;
+            let supported = match redirect.kind {
+                RedirectKind::Input | RedirectKind::HereString => redirect.fd == 0,
+                RedirectKind::Output | RedirectKind::Append => matches!(redirect.fd, 1 | 2),
+                RedirectKind::DuplicateOutput => redirect.fd == 2 && redirect.path == "1",
+                RedirectKind::DuplicateInput => false,
+            };
+            if !supported || !redirect.target.parts.is_empty() {
+                return Err(invalid());
+            }
+            if redirect.path.contains('\0') {
+                return Err(interior_nul_error("prepared terminal redirect"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn claim_prepared_item(
+    bytes: &mut usize,
+    items: &mut usize,
+    length: usize,
+) -> Result<(), quirl_core::ShellError> {
+    use quirl_core::{ErrorCode, ShellError};
+    *bytes = bytes.saturating_add(length);
+    *items = items.saturating_add(1);
+    if *bytes > EXPANSION_BYTES_MAX || *items > 65_536 {
+        return Err(ShellError::new(
+            ErrorCode::ResourceLimit,
+            "prepared terminal pipeline exceeds its limit",
+        )
+        .with_context(format!(
+            "bytes {bytes}/{EXPANSION_BYTES_MAX}; items {items}/65536"
+        ))
+        .with_help("Split the command into smaller pipelines"));
     }
     Ok(())
 }
@@ -1480,8 +1578,10 @@ mod platform {
 
         /// Execute a captured foreground command while reporting bounded output chunks.
         ///
-        /// The observer runs on the executor's owning thread after the complete process graph
-        /// has been committed. Each chunk is at most 8 KiB and is also charged to the request's
+        /// The observer can accept an expanded foreground graph before spawning;
+        /// otherwise output and heartbeat observations run on the executor's
+        /// owning thread after the complete process graph has been committed.
+        /// Each chunk is at most 8 KiB and is also charged to the request's
         /// retained-output limit. Observer failure terminates and reaps the foreground graph
         /// before the error is returned. FIFO and drain limits are the same as
         /// [`Self::execute_capture_request`].
@@ -1498,6 +1598,26 @@ mod platform {
             self.execute_inner_with_observer(&request.command, true, Some(context), Some(&observer))
         }
 
+        /// Execute trusted local input with optional foreground terminal delegation.
+        ///
+        /// Source, graph, expansion, and fallback capture retain their native
+        /// bounds. Long-running foreground terminal applications have no overall
+        /// wall deadline; the accepting observer must bound each event turn and
+        /// own terminal input, host shutdown, and child cleanup. Sandboxed callers
+        /// must use [`Self::execute_capture_request_streaming`] with an explicit
+        /// request deadline and cancellation flag instead.
+        pub fn execute_terminal_streaming(
+            &mut self,
+            input: &str,
+            observer: &mut OutputObserver<'_>,
+        ) -> Result<CommandOutcome, ShellError> {
+            let observer = OutputObserverHandle {
+                callback: RefCell::new(observer),
+                last_tick: Cell::new(Instant::now()),
+            };
+            self.execute_inner_with_observer(input, true, None, Some(&observer))
+        }
+
         /// Execute a foreground command with inherited streams under the
         /// caller's cancellation and deadline. No stdout or stderr is retained
         /// in the result. Shell-generated human/file job text has an independent
@@ -1512,6 +1632,22 @@ mod platform {
         ) -> Result<CommandOutcome, ShellError> {
             let context = RequestContext::new(&request)?;
             self.execute_inner_with_request(&request.command, false, Some(context))
+        }
+
+        /// Execute one expanded foreground graph on this process's terminal.
+        ///
+        /// The terminal worker uses this after a bounded protocol decode. Words
+        /// and redirect paths are literal and are never expanded again. The
+        /// graph must contain 1..=64 stages and at most 1 MiB of argument/path
+        /// bytes. Background work and empty commands fail before any effects.
+        /// Child groups and stopped jobs remain owned by this executor.
+        pub fn execute_prepared_terminal_pipeline(
+            &mut self,
+            pipeline: quirl_syntax::Pipeline,
+        ) -> Result<CommandOutcome, ShellError> {
+            super::validate_prepared_terminal_pipeline(&pipeline)?;
+            self.environment.ensure_valid()?;
+            self.spawn_pipeline(&pipeline, "<terminal pipeline>", false, None, None)
         }
 
         /// Refresh and return snapshots for every job owned by this executor.
@@ -1750,6 +1886,25 @@ mod platform {
                 }
                 if let Some(result) = self.execute_control_builtin(command, capture, request)? {
                     return Ok(result);
+                }
+            }
+            if capture
+                && !pipeline.background
+                && let Some(observer) = observer
+            {
+                let environment = self.environment_snapshot()?;
+                let mut outcome = None;
+                (observer.callback.borrow_mut())(ObservedActivity::Foreground {
+                    request: super::TerminalPipelineRequest {
+                        pipeline,
+                        environment: &environment,
+                        deadline: request.map(|request| request.deadline),
+                        cancelled: request.map(|request| request.request.cancelled.as_ref()),
+                    },
+                    outcome: &mut outcome,
+                })?;
+                if let Some(outcome) = outcome {
+                    return Ok(outcome);
                 }
             }
             self.spawn_pipeline(pipeline, source, capture, request, observer)
@@ -4803,6 +4958,158 @@ mod platform {
                 std::process::id(),
                 NEXT_TEMP_PATH.fetch_add(1, Ordering::Relaxed)
             ))
+        }
+
+        fn terminal_test_request(command: &str) -> ProcessRequest {
+            ProcessRequest {
+                command: command.into(),
+                deadline: Duration::from_secs(5),
+                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_output_bytes: 64 * 1024,
+            }
+        }
+
+        fn literal_terminal_plan(source: &str) -> Pipeline {
+            let mut pipeline = parse_command_list(source).unwrap().pipelines.remove(0);
+            for command in &mut pipeline.commands {
+                command.word_ir.clear();
+                for redirect in &mut command.redirects {
+                    redirect.target.parts.clear();
+                }
+            }
+            pipeline
+        }
+
+        #[test]
+        fn terminal_delegation_follows_parent_builtins_expansion_and_conditional_status() {
+            let mut executor = NativeExecutor::default();
+            let mut seen = Vec::new();
+            let result = executor.execute_capture_request_streaming(
+                terminal_test_request("export PTY_VALUE='literal $HOME'; delegated \"$PTY_VALUE\" && skipped || recovered $?"),
+                &mut |activity| {
+                    if let ObservedActivity::Foreground { request, outcome } = activity {
+                            assert!(request.deadline.unwrap() > Instant::now());
+                            assert!(!request.cancelled.unwrap().load(Ordering::Relaxed));
+                        assert!(request.environment.iter().any(|(name, value)| name == "PTY_VALUE" && value == "literal $HOME"));
+                        let words = request.pipeline.commands[0].words.clone();
+                        let status = if words[0] == "delegated" { 7 } else { 0 };
+                        seen.push(words);
+                        *outcome = Some(super::outcome(status, None, None));
+                    }
+                    Ok(())
+                },
+            ).unwrap();
+            assert_eq!(result.status, 0);
+            assert_eq!(
+                seen,
+                vec![vec!["delegated", "literal $HOME"], vec!["recovered", "7"]]
+            );
+        }
+
+        #[test]
+        fn trusted_terminal_delegation_has_no_implicit_request_deadline() {
+            let mut offered = false;
+            let result = NativeExecutor::default()
+                .execute_terminal_streaming("delegated", &mut |activity| {
+                    if let ObservedActivity::Foreground { request, outcome } = activity {
+                        assert!(request.deadline.is_none());
+                        assert!(request.cancelled.is_none());
+                        offered = true;
+                        *outcome = Some(super::outcome(19, None, None));
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            assert!(offered);
+            assert_eq!(result.status, 19);
+
+            let request = terminal_test_request("must-not-start");
+            request.cancelled.store(true, Ordering::Relaxed);
+            let error = NativeExecutor::default()
+                .execute_capture_request_streaming(request, &mut |_| {
+                    panic!("a cancelled request must not reach its observer");
+                })
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::ResourceLimit);
+        }
+
+        #[test]
+        fn declining_terminal_delegation_preserves_captured_execution() {
+            let mut offered = 0;
+            let mut observed = Vec::new();
+            let result = NativeExecutor::default()
+                .execute_capture_request_streaming(
+                    terminal_test_request("printf CAPTURED_TERMINAL_FALLBACK"),
+                    &mut |activity| {
+                        match activity {
+                            ObservedActivity::Foreground { .. } => offered += 1,
+                            ObservedActivity::Output { bytes, .. } => {
+                                observed.extend_from_slice(bytes)
+                            }
+                            ObservedActivity::Tick => {}
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(offered, 1);
+            assert_eq!(result.stdout.as_deref(), Some("CAPTURED_TERMINAL_FALLBACK"));
+            assert_eq!(observed, b"CAPTURED_TERMINAL_FALLBACK");
+        }
+
+        #[test]
+        fn prepared_terminal_words_are_never_expanded_again() {
+            let path = temporary_path("prepared-literal");
+            let literal = "$HOME ~ * $(printf SHOULD_NOT_RUN)";
+            let pipeline =
+                literal_terminal_plan(&format!("printf '%s' '{literal}' > '{}'", path.display()));
+            NativeExecutor::default()
+                .execute_prepared_terminal_pipeline(pipeline)
+                .unwrap();
+            let actual = fs::read_to_string(&path).unwrap();
+            fs::remove_file(path).unwrap();
+            assert_eq!(actual, literal);
+        }
+
+        #[test]
+        fn malformed_prepared_terminal_redirects_fail_before_any_pipeline_effect() {
+            let path = temporary_path("prepared-no-effects");
+            let valid =
+                literal_terminal_plan(&format!("printf first > '{}' | cat 2>&1", path.display()));
+            super::super::validate_prepared_terminal_pipeline(&valid).unwrap();
+            for invalid in [
+                quirl_syntax::Redirect {
+                    fd: 2,
+                    kind: RedirectKind::DuplicateOutput,
+                    path: "0".into(),
+                    target: quirl_syntax::Word { parts: vec![] },
+                },
+                quirl_syntax::Redirect {
+                    fd: 1,
+                    kind: RedirectKind::Input,
+                    path: "/dev/null".into(),
+                    target: quirl_syntax::Word { parts: vec![] },
+                },
+            ] {
+                let mut pipeline = valid.clone();
+                pipeline.commands[1].redirects[0] = invalid;
+                let error = NativeExecutor::default()
+                    .execute_prepared_terminal_pipeline(pipeline)
+                    .unwrap_err();
+                assert_eq!(error.code, ErrorCode::Validation);
+                assert!(!path.exists());
+            }
+            let mut oversized = valid;
+            oversized.commands[0].words = vec![String::new(); 65_537];
+            oversized.commands[0].words[0] = "printf".into();
+            assert_eq!(
+                NativeExecutor::default()
+                    .execute_prepared_terminal_pipeline(oversized)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::ResourceLimit
+            );
+            assert!(!path.exists());
         }
 
         fn spawn_test_pipeline_stage(guard: &mut PipelineConstructionGuard, script: &str) -> Pid {

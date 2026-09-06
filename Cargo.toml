@@ -67,6 +67,8 @@ wasmparser = { version = "0.256", default-features = false, features = ["std", "
 xshell = "0.2.7"
 
 [patch.crates-io]
+# Bounded embedded terminal: preserve wide-cell and scrollback invariants on resize.
+vt100 = { path = "vendor/vt100" }
 # mlua-sys 0.11.0 caps lua-src below 551 even though its Lua 5.5 bindings are
 # compatible. Keep this source-identical patch until upstream accepts
 # lua-src 551.x, then remove the patch and vendor/mlua-sys together.

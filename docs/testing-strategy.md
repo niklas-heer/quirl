@@ -118,8 +118,20 @@ not start an external `tput` process, including during redirected prompt probes.
 
 The `command-typeahead-redraw` PTY regression holds a foreground command behind
 a private gate while sending the next input. It verifies the rendered spaces
-and the accepted input after control returns to the editor, covering kernel
-echo that bypasses the renderer's cached frame during cooked-mode execution.
+and the exact accepted argument bytes after control returns to the editor.
+The outer terminal remains raw while the private child terminal echoes input;
+a bounded completion handshake recovers unread child input, including an
+unfinished canonical line, as editable text requiring explicit Enter.
+
+`generic-terminal-session` uses an unknown executable, a wrapper, and a launcher
+to verify all three terminal descriptors, local cursor-query replies, alternate
+screen redraws, resize, keyboard input, Ctrl-C, nonzero exit, stopped-program
+resume/cancel, output retention, and explicit pipe/file endpoints. Readiness
+requires a fresh input lease, a completed Quirl editor frame, and actual outer
+raw mode; child-terminal initialization alone is insufficient. Bash fixtures
+use a bounded timed read so newer Bash dispatches WINCH traps while awaiting
+input. Assertions inspect reconstructed screen cells when redraw bytes split
+text across cursor/style sequences.
 
 Pipe-task descriptor assertions run in isolated, bounded helper processes.
 `BrokenPipe` and EOF require every copy of an endpoint to close; unrelated tests
@@ -381,13 +393,15 @@ bounds; backpressure must not be hidden by increasing timeouts.
 
 `sustained-session` keeps one shell alive across 128 output bursts (over 64 MiB),
 64 error/pipeline/editor-cancellation rounds, and four foreground interruptions.
-The first 32 MiB warms retained transcript capacity before measured churn.
+The first 32 MiB warms child scrollback and session state before measured churn.
+Compact terminal snapshots mean this does not establish parent transcript wrap;
+separate UI retention tests exercise that limit.
 Linux samples descriptors, threads, resident memory, and direct children from
 bounded `/proc` reads at settled prompts. The warmed growth envelope is eight
 descriptors, eight threads, and 32 MiB RSS; successful exit must reap owned
 children. Other platforms verify responsiveness and child cleanup. A 120-second
 run admission limit plus bounded current operations prevents an indefinite
-regression hang. This checks accelerated retention after capacity wrap, not
+regression hang. This checks accelerated child scrollback eviction and session churn, not
 100-hour continuous uptime or proof of zero leaks.
 
 No finite generated workload emulates every terminal or usage pattern. Keep

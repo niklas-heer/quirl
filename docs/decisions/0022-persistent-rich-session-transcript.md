@@ -5,6 +5,8 @@
 - Supersedes in part: [ADR 0012](0012-ratatui-interactive-surface.md)
 - Extends: [ADR 0016](0016-runtime-layering-contract.md), [ADR 0017](0017-shared-execution-contract.md), [ADR 0020](0020-owned-unix-process-group-anchor.md)
 
+> The Unix foreground execution portion is superseded by [ADR 0038](0038-embedded-foreground-terminals.md). Transcript retention and simple-mode contracts remain in force.
+
 ## Context
 
 ADR 0012 made Ratatui the capable-TTY default, but coupled that decision to a

@@ -28,10 +28,10 @@ Quirl's default capable-terminal shell is a **Ratatui-rendered full-screen
 session**: a dirty-tracked UI on the alternate screen. It owns a bounded
 command transcript, scrolling and selection, the prompt, a syntax-highlighted
 editor line, a completion popup with a documentation pane, a diagnostics row,
-and a persistent bottom status bar. Ordinary foreground commands on the rich
-surface return bounded captured outcomes to that transcript without leaving
-the alternate screen. The normal screen is restored when the rich session
-suspends, exits, or hands the real terminal to a supported full-screen command.
+and a persistent bottom status bar. Native foreground programs on Unix receive an embedded PTY without leaving
+the alternate screen. Their interpreted screen is bounded, and the final primary
+screen joins the transcript. The normal screen is restored when the rich session
+suspends or exits.
 
 What is **kept** from today's implementation:
 
@@ -77,12 +77,9 @@ Goals:
 
 Non-goals:
 
-- No embedded interactive terminal in the current stage. The rich surface
-  captures ordinary noninteractive foreground commands; faithfully embedding `vim`,
-  `less`, `top`, REPLs, or another alternate-screen child inside the transcript
-  requires the future PTY/VT contract in ADR 0022. Curated standalone full-screen
-  commands instead take over the real terminal (§3.3); arbitrary interactive
-  workflows remain on the simple surface.
+- No graphics, clipboard forwarding, or arbitrary terminal extensions. The
+  embedded terminal supports bounded VT text, input, and local query replies
+  under [ADR 0038](/docs/architecture/decisions/0038-embedded-foreground-terminals).
 - No rich-surface background jobs in the current stage. They are rejected
   before spawn because their uncaptured asynchronous output could race and
   corrupt later frames. Use the simple surface for background-job workflows.
@@ -150,18 +147,17 @@ impl SurfaceTerminal {
 ```
 
 Accepting an ordinary foreground command does not call `release_session`. The
-rich session retains terminal ownership while the CLI runs a bounded streaming
-capture request, admits sanitized lines as they arrive, and commits the final
-status after both readers drain. A background
-pipeline is rejected before spawn. `release_session` remains the single cleanup
+rich session retains terminal ownership while Unix native programs run in a private
+PTY. It interprets bounded screen updates and commits status after drain and
+cleanup. Background graphs are rejected before spawn. `release_session` remains the single cleanup
 path for suspension, EOF, fatal errors, explicit compatibility handoff, and
 normal exit.
 
 Rules:
 
-- Draw to **stderr**, not stdout. A rich ordinary foreground child inherits neither
-  stream; its bounded captured stdout and stderr cross the terminal-text filter
-  before transcript admission. Non-interactive Quirl invocations keep stable,
+- Draw to **stderr**, not stdout. Native foreground children inherit their private
+  PTY. Only interpreted cells reach the physical renderer, and the final primary
+  screen crosses transcript admission. Non-interactive Quirl invocations keep stable,
   undecorated, control-sequence-free stdout (§12).
 - The bounded active region (context, editor, diagnostics, completion, and
   panels) reserves its own rows above the status bar. Opening a panel moves
@@ -180,61 +176,49 @@ Rules:
   synchronized-output negotiation remain future progressive enhancements;
   `Shift-Tab` works today through crossterm's Shift-Tab/BackTab events.
 
-### 3.3 The ordinary-foreground-command cycle (transcript contract)
+### 3.3 Foreground terminal execution
 
-```
-┌──────────────────────────── rich session ──────────────────────────────────┐
-│ 1. enter raw mode + alternate screen once; build the FrameModel            │
-│ 2. edit loop: keys → EditorState; async events → completion/segments       │
-│ 3. on Accept: freeze the command; pause input, not the alternate screen    │
-│ 4. classify foreground rich execution → bounded streaming capture; reject &│
-│ 5. sanitize ≤8 KiB chunks; admit complete progress lines and redraw         │
-│ 6. drain/reap; append final status, redraw, and return to step 2             │
-│ 7. on suspend/EOF/fatal error/exit: restore the main screen and raw state   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+Every native external foreground pipeline on Unix receives a private PTY. There
+is no executable or package allowlist: `tdx`, `bunx tokscale@latest`, wrappers,
+REPLs, pagers, and new terminal applications detect terminal descriptors through
+the same path. Programs receive `TERM=xterm-256color` and `TERM_PROGRAM=quirl`.
 
-Ordinary native stdout and stderr appear while the child runs. Reader threads
-retain at most 1 MiB per stream and publish only retained chunks of at most
-8 KiB; the executor's owning thread performs every UI callback after process
-graph construction. The same capture owner drains and reaps on success,
-failure, cancellation, observer failure, and resource overflow. Command input
-remains paused, and concurrent stdout/stderr delivery is not a byte-ordering
-guarantee.
+Quirl keeps expansion, conditional command lists, `cd`, `export`, and extension
+hooks in the parent. A private worker executes the already-expanded external
+pipeline without expanding arguments again. Explicit pipes and redirects stay
+pipes and files; unredirected endpoints share the child terminal. Native child
+stdout/stderr therefore share terminal ordering rather than separate captured
+buffers. Script, structured-data, plugin, and explicit dialect-island contracts
+are unchanged.
 
-Stage 1 rejects every command graph containing a background pipeline before
-spawn. The existing process engine intentionally leaves background streams
-uncaptured; accepting such a graph would let asynchronous bytes escape the
-transcript boundary and corrupt a later frame. Background job execution remains
-available on the simple surface.
+While the program runs, its screen occupies the viewport and keys belong to it.
+Cursor movement, erasing, colors, alternate screens, application-cursor keys,
+bracketed paste, supported mouse reports, and resizing are interpreted locally.
+Ctrl-C reaches the child terminal's foreground group. A stopped program remains
+owned: Enter resumes it, and Ctrl-C cancels it from the suspension notice.
+Quirl's prompt shortcuts resume after the child finishes. A completion handshake
+preserves unread child input as editable prompt text, including partial canonical
+lines; it requires Enter and is never automatically executed. Terminal replies
+and key-control sequences are removed with a visible notice before recovered
+text reaches the prompt.
 
-A curated set of full-screen commands, including `vim`, `less`, `man`, and
-`top`, uses a separate whole-terminal takeover. Only a single foreground
-command without redirects, pipelines, or command-list connectors qualifies.
-Quirl releases its terminal guards, executes with inherited streams, then
-reacquires and repaints the rich viewport on success or failure. The child's
-screen contents are not captured into the transcript. Unlisted interactive
-programs and more complex interactive workflows should use the simple surface.
-Embedded PTY input, VT parsing, child screen state, and replay remain future
-work under ADR 0022; this takeover delegates those responsibilities to the
-actual terminal.
+The screen is bounded to 512 columns × 256 rows plus 256 scrollback rows. Output
+is streamed in 8 KiB reads with bounded work per turn and no cumulative output
+ceiling. The input queue holds a 64 KiB paste plus its 12 framing bytes. Supported terminal queries receive local
+answers; OSC/DCS, clipboard requests, window operations, and unsupported controls
+never reach the physical terminal. This is a text terminal, not a guarantee of
+every terminal extension or graphics protocol.
 
-The post-0.2.0 source also recognizes `tokscale` directly and through
-`bunx tokscale@latest` or `npx tokscale@latest`, including pinned versions and
-the `@tokscale/cli` package. This preserves terminal detection, keyboard input,
-and alternate-screen rendering instead of triggering Tokscale's static report.
+After drain and cleanup, the primary screen and retained scrollback join the
+existing bounded transcript, then Quirl restores its editor and reports exit
+status. Alternate-screen repaint frames do not accumulate as ordinary output.
+Background graphs remain rejected before spawn; use `ui.surface = "simple"`
+for background jobs. The simple surface also remains available for terminal
+extensions outside the embedded implementation.
 
-The same handoff supports `tdx`, its positional Markdown file or `--file`
-selection, `last`, and numbered `recent` views, including their read-only and
-display options. Its scriptable commands (`list`, `add`, `toggle`, `edit`,
-`delete`, and unnumbered `recent`) retain captured transcript output. Unknown
-options remain captured rather than guessing their argument meanings.
-Recognized launcher flags before the package are Bun's `--bun` and npx's
-`--yes`/`-y` and `--no-install`; `--` may delimit the package. Unknown launcher
-options are not skipped because their values could be mistaken for the package.
-Other packages retain captured output, and the same command-graph exclusions
-apply. Released 0.2.0 and earlier builds need `ui.surface = "simple"` for these
-wrapped TUI sessions until this fix is included in a release.
+This behavior is unreleased. Version 0.2.0 and earlier require the simple surface
+for general interactive programs. See [ADR 0038](/docs/architecture/decisions/0038-embedded-foreground-terminals)
+for process ownership, protocol, resource limits, and failure invariants.
 
 ### 3.4 Transcript, scrolling, selection, and copy
 
@@ -556,20 +540,17 @@ transcript entry, and a fresh editor remains at the top:
  NORMAL   Alt-Q Quirl · PgUp scroll · copy selection               quirl
 ```
 
-The header records the terminal-safe accepted command, exit status, and
-duration. Stdout, stderr, and a structured error stay distinguishable even
-when the theme presents them with compact shared chrome. A capture-limit error
-replaces a success footer and states the configured and observed byte counts;
-it never shows a partial capture as successful.
+The header records the terminal-safe accepted command, exit status, and duration.
+Native PTY stdout and stderr share a terminal; structured errors remain separate.
+Captured script/plugin requests retain their own stream and byte-limit contracts.
 
-The current rich path admits stdout and stderr incrementally through bounded
-8 KiB chunks while the process owner retains lifecycle and capture limits. A
-spinner and elapsed-time notice repaint on liveness ticks even when a command
-is silent; carriage-return progress replaces one live transcript line. Status
-is committed only after both readers drain, and overflow or cleanup failure is
-never presented as success. Interactive child input remains a separate terminal
-takeover boundary. `prompt.transient` remains for compatibility and still
-applies to the simple surface; the rich surface always records accepted
+Before a child produces output, the running notice and elapsed-time spinner keep
+the shell visible. Once output arrives, the child's bounded terminal screen owns
+the viewport and input. Repaints replace cells instead of appending duplicate
+frames. After cleanup, the retained primary screen enters the transcript. A
+history-eviction notice reports output older than the child scrollback bound.
+Resource or cleanup failures are never presented as success. `prompt.transient`
+continues to apply to the simple surface; the rich surface records accepted
 commands in its bounded transcript.
 
 ### 5.6 Picker overlays
@@ -623,7 +604,7 @@ or change the grammar mode.
 The shipped `Alt-Q p` command palette always requests a terminal-height
 region and positions its bounded adaptive content against the bottom edge. It
 does not perform another screen transition. The existing terminal guard retains
-the shared alternate screen across ordinary foreground captured execution and releases it
+the shared alternate screen across embedded foreground execution and releases it
 for suspension, explicit compatibility handoff, fatal error cleanup, or exit.
 
 `Alt-Q g` opens the Git-project picker from the last complete bounded
@@ -872,12 +853,11 @@ In-crate `#[cfg(test)]` modules, behavior-sentence names, run by `cargo xtask ch
   alternate-screen exit;
   suspension, EOF, fatal render failure, and normal exit each restore the main
   screen exactly once.
-- **Execution separation**: rich ordinary foreground commands select the 1
-  MiB-per-stream streaming capture path and commit status only after drain. Rich mode
-  rejects a background pipeline before spawn. Simple mode inherits streams and
-  retains background-job compatibility. Curated full-screen takeover checks
-  require real-terminal handoff and rich-frame restoration on success and spawn
-  failure; they do not claim embedded PTY emulation.
+- **Execution separation**: unknown programs, wrappers, and launchers receive three
+  terminal descriptors and locally interpreted redraws. Real PTY tests cover
+  queries, input, resize, interruption, failure, output retention, pipes, and
+  redirects. Rich mode rejects background graphs before spawn; simple mode
+  retains inherited streams and background-job compatibility.
 
 Sandbox/budget claims need adversarial proof per AGENTS.md; any new Lua-facing
 surface (status items) gets deny-unknown-fields structs at the boundary.
@@ -887,8 +867,8 @@ completion/picker/compact/adversarial frames; shared keymap and Shift-Tab
 conformance; stale/cancelled asynchronous completion tests; 4 KiB highlighting;
 and explicit editor, completion, picker, PATH, undo, and history bounds. The
 fixed `cargo xtask rich-pty` matrix covers deletion, wrapping, Alt-Q leader
-repaint, completion, repeated captured execution, transcript scrolling/copy,
-Ctrl-D, takeover restoration, and semantic hints with `NO_COLOR` on real Unix
+repaint, completion, repeated foreground execution, transcript scrolling/copy,
+Ctrl-D, embedded-terminal restoration, and semantic hints with `NO_COLOR` on real Unix
 PTYs. It also checks paste, committed Unicode, Vi repetition, and terminal-input
 limits. The seeded session soak adds replayable navigation and colored SVG cell
 models. These checks do not establish every degradation permutation, native
@@ -973,10 +953,9 @@ turning the surface into an unbounded watch application.
    repeated captured ordinary foreground commands without screen exit, resize,
    suspend/resume, EOF, and failure cleanup evidence on Ghostty, Terminal.app,
    iTerm2, and a Linux VTE terminal before calling the behavior release-proven.
-2. **Embedded interactive PTY/VT applications**: a separate ADR must define
-   terminal emulation, input/signal ownership, bounded replay, resize ordering,
-   and cleanup before the rich surface advertises `vim`, `less`, `top`, or
-   interactive REPL compatibility.
+2. **Embedded interactive PTY/VT applications**: [ADR 0038](/docs/architecture/decisions/0038-embedded-foreground-terminals)
+   records the implemented Unix foreground contract. Background jobs, graphics,
+   and additional terminal extensions remain separate work.
 3. **Data-mode lexer spans**: extend `highlight()` when the data grammar
    exposes tokens; until then plain styling (§5.4).
 4. **Status items from plugins**: reuse `ContributionKind` or add a

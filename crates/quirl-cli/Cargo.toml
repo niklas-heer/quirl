@@ -41,4 +41,5 @@ unicode-width.workspace = true
 ureq.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+crossterm.workspace = true
 nix = { workspace = true, features = ["fs"] }

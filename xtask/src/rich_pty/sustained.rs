@@ -2,8 +2,10 @@
 //!
 //! Failure model: repeated commands can retain descriptors, reader threads,
 //! children, history, or transcript allocations even though short fresh sessions
-//! pass. Warmup emits 32 MiB, exceeding the 16 MiB transcript budget, before a
-//! further 32 MiB of measured churn. Each turn uses unique screen/output oracles
+//! pass. Warmup emits 32 MiB through bounded child-terminal scrollback before a
+//! further 32 MiB of measured churn. Child snapshots retain only recent rows, so
+//! these source bytes do not prove that the parent transcript budget wrapped.
+//! Each turn uses unique screen/output oracles
 //! and fresh input readiness; cancellation must not execute the editable command.
 //! The harness clears its own retained wire bytes only after settling a turn.
 //!
@@ -51,7 +53,7 @@ struct Resources {
     children: u64,
 }
 
-/// Exercise transcript wrap, error recovery, pipelines, and cancellation in one shell.
+/// Exercise child scrollback eviction, error recovery, and cancellation in one shell.
 pub(super) fn check_sustained_session(binary: &Path) -> Result<(), TaskError> {
     let started = Instant::now();
     let deadline = started
@@ -136,12 +138,21 @@ fn install_fixtures(session: &Session) -> Result<(), TaskError> {
 
 fn burst(session: &mut Session, deadline: Instant, index: usize) -> Result<(), TaskError> {
     let marker = format!("SUSTAIN_BURST_{index}");
-    execute_marker(
+    let started = Instant::now();
+    let result = execute_marker(
         session,
         deadline,
         &format!("./sustained-burst {index}"),
         &marker,
-    )
+    );
+    if index < 3 || index.checked_rem(16) == Some(15) || result.is_err() {
+        println!(
+            "sustained burst {index}: completed={} elapsed_ms={}",
+            result.is_ok(),
+            started.elapsed().as_millis()
+        );
+    }
+    result
 }
 
 fn execute_marker(
@@ -153,9 +164,12 @@ fn execute_marker(
     session.pty.type_text(command)?;
     let start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
-    wait_screen(session, deadline, "sustained command result", |screen| {
-        has_output(screen, marker)
-    })?;
+    wait_screen(
+        session,
+        deadline,
+        &format!("sustained command result {marker}"),
+        |screen| has_output(screen, marker),
+    )?;
     wait_ready(session, deadline, start)
 }
 
@@ -231,7 +245,7 @@ fn interrupt_child(
     session.pty.send(key::ENTER)?;
     let marker = format!("SUSTAIN_JOB_{round}");
     wait_screen(session, deadline, "sustained child running", |screen| {
-        has_output(screen, &marker) && screen.bottom_line().contains("running")
+        has_output(screen, &marker)
     })?;
     let bytes = read_bounded_fixture(&session.private.path.join("sustained-job.pid"), 32)?;
     let raw = std::str::from_utf8(&bytes)?.trim().parse::<i32>()?;
@@ -239,8 +253,16 @@ fn interrupt_child(
         return Err(io::Error::other("invalid sustained child pid").into());
     }
     let child = Pid::from_raw(raw);
-    if getpgid(Some(child))? != session.pty.foreground_group()? {
-        return Err(io::Error::other("sustained fixture did not own the foreground group").into());
+    let outer_group = session.pty.foreground_group()?;
+    let quirl = session
+        .pty
+        .child_pid()
+        .ok_or_else(|| io::Error::other("Quirl exited while its sustained child was running"))?;
+    if outer_group != quirl || getpgid(Some(child))? == outer_group {
+        return Err(io::Error::other(
+            "sustained child did not retain a separate private terminal group",
+        )
+        .into());
     }
     session.pty.send(key::CTRL_C)?;
     wait_ready(session, deadline, start)?;
@@ -282,13 +304,7 @@ fn wait_screen(
 }
 
 fn wait_ready(session: &mut Session, deadline: Instant, start: usize) -> Result<(), TaskError> {
-    wait_for(session, deadline, "fresh input readiness", |session| {
-        session
-            .pty
-            .output()
-            .get(start..)
-            .is_some_and(|bytes| contains(bytes, b"\x1b[?1000h"))
-    })
+    super::wait_for_rich_input_until(session, start, deadline)
 }
 
 fn wait_for(

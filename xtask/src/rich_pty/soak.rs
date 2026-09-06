@@ -44,7 +44,6 @@ const SUMMARY_RESERVE_BYTES: u64 = 2 * 1024 * 1024;
 const FAILURES_MAX: u64 = 20;
 const INPUT_BYTES_MAX: usize = 1024;
 const FEATURE_COUNT: usize = 12;
-const READY_INPUT: &[u8] = b"\x1b[?1000h";
 
 /// Validated bounds and deterministic replay selection for one soak run.
 pub(crate) struct SoakOptions {
@@ -381,25 +380,7 @@ impl Driver<'_> {
             .checked_add(ACTION_TIMEOUT)
             .unwrap_or(self.deadline)
             .min(self.deadline);
-        while !self
-            .session
-            .pty
-            .output()
-            .get(output_start..)
-            .unwrap_or_default()
-            .windows(READY_INPUT.len())
-            .any(|window| window == READY_INPUT)
-        {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(io::Error::other(
-                    "command output appeared without restoring editor input",
-                )
-                .into());
-            }
-            self.session.pty.drain_for(remaining.min(POLL_INTERVAL))?;
-        }
-        Ok(())
+        super::wait_for_rich_input_until(&mut self.session, output_start, deadline)
     }
 
     fn checkpoint(&mut self, label: &'static str) -> Result<(), TaskError> {

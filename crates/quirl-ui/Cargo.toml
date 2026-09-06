@@ -26,6 +26,8 @@ serde_json.workspace = true
 syntect.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+# The child-terminal admission gate bounds controls before this screen parser.
+vt100 = { version = "=0.15.2", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 # Reuse workspace platform constants for nonblocking regular-file admission;

@@ -1978,6 +1978,7 @@ name = "quirl-cli"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "crossterm",
  "getrandom 0.3.4",
  "indexmap",
  "model2vec-rs",
@@ -2091,10 +2092,13 @@ dependencies = [
 name = "quirl-process"
 version = "0.2.0"
 dependencies = [
+ "filedescriptor",
  "nix 0.30.1",
  "os_pipe",
+ "portable-pty",
  "quirl-core",
  "quirl-syntax",
+ "rustix",
  "serde",
  "serde_json",
  "windows-sys 0.61.2",
@@ -2127,6 +2131,7 @@ dependencies = [
  "syntect",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+ "vt100",
 ]
 
 [[package]]
@@ -3254,8 +3259,6 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vt100"
 version = "0.15.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84cd863bf0db7e392ba3bd04994be3473491b31e66340672af5d11943c6274de"
 dependencies = [
  "itoa",
  "log",
