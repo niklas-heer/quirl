@@ -526,30 +526,21 @@ impl ProjectRefresh {
     /// The validation uses `symlink_metadata` for the directory and marker, so this
     /// cheap foreground path never follows a link before affecting frecency.
     pub(crate) fn record_opened_if_repository(&self, path: &Path) -> Result<bool, ShellError> {
-        validate_path_bound(path)?;
-        let metadata = match path.symlink_metadata() {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(scan_io_error(path, error)),
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() || !probe_git_marker(path)? {
+        self.record_repository(path, true)
+    }
+
+    /// Publish a completed clone immediately, without recording a directory visit.
+    pub(crate) fn record_cloned(&self, path: &Path) -> Result<bool, ShellError> {
+        self.record_repository(path, false)
+    }
+
+    fn record_repository(&self, path: &Path, opened: bool) -> Result<bool, ShellError> {
+        let Some(repository) = admitted_repository(path)? else {
             return Ok(false);
-        }
-        match fs::canonicalize(path) {
-            Ok(canonical) if canonical == path => {}
-            Ok(_) => return Ok(false),
-            Err(error) => return Err(scan_io_error(path, error)),
-        }
-        let mut database = ProjectDatabase::open(&self.database_path)?;
-        let repository = DiscoveredRepository {
-            path: path.to_path_buf(),
-            inferred_root: path.parent().unwrap_or(path).to_path_buf(),
-            inferred_root_confidence: 400,
-            source: ProjectSource::Visited,
-            observed_activity_unix_ms: repository_activity_unix_ms(path, unix_time_ms()),
         };
+        let mut database = ProjectDatabase::open(&self.database_path)?;
         database.upsert_targeted(&repository)?;
-        if !database.record_opened(path)? {
+        if opened && !database.record_opened(path)? {
             return Ok(false);
         }
         let mut next = database.snapshot()?;
@@ -584,6 +575,44 @@ impl ProjectRefresh {
         self.cancelled.store(true, Ordering::Release);
         self.requests.1.notify_all();
     }
+}
+
+/// Revalidate a canonical checkout before a previously offered project is opened.
+pub(crate) fn validate_project_directory(path: &Path) -> Result<bool, ShellError> {
+    validate_path_bound(path)?;
+    let metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(scan_io_error(path, error)),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || !probe_git_marker(path)? {
+        return Ok(false);
+    }
+    fs::canonicalize(path)
+        .map(|canonical| canonical == path)
+        .map_err(|error| scan_io_error(path, error))
+}
+
+fn admitted_repository(path: &Path) -> Result<Option<DiscoveredRepository>, ShellError> {
+    if !validate_project_directory(path)? {
+        return Ok(None);
+    }
+    Ok(Some(DiscoveredRepository {
+        path: path.to_path_buf(),
+        inferred_root: path.parent().unwrap_or(path).to_path_buf(),
+        inferred_root_confidence: 400,
+        source: ProjectSource::Visited,
+        observed_activity_unix_ms: repository_activity_unix_ms(path, unix_time_ms()),
+    }))
+}
+
+/// Admit an explicit CLI clone to the shared cache without starting a scanner.
+pub(crate) fn record_clone_default(path: &Path) -> Result<bool, ShellError> {
+    let Some(repository) = admitted_repository(path)? else {
+        return Ok(false);
+    };
+    ProjectDatabase::open(&default_database_path()?)?.upsert_targeted(&repository)?;
+    Ok(true)
 }
 
 fn snapshot_is_stale(snapshot: &ProjectSnapshot, stale_ms: u64, now_unix_ms: u64) -> bool {
@@ -2844,6 +2873,47 @@ mod tests {
         assert_eq!(retained.last_complete_unix_ms, Some(123));
         assert!(retained.startup_error.is_none());
         assert!(!changed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn completed_clone_is_published_without_a_visit_and_survives_reconciliation() {
+        let temporary = TestDirectory::new("clone-published");
+        let repository = fs::canonicalize(temporary.path())
+            .unwrap()
+            .join("managed/project");
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        let database_path = temporary.path().join("projects.sqlite3");
+        let scan_root = temporary.path().join("other");
+        fs::create_dir(&scan_root).unwrap();
+        let config = ProjectDiscoveryConfig::for_root(scan_root, test_limits());
+        let (mut gate, hook) = StartupGate::new();
+        let refresh = ProjectRefresh::start_at_inner(
+            database_path.clone(),
+            config.clone(),
+            ProjectStartupHooks {
+                after_cache: Some(hook),
+                ..ProjectStartupHooks::default()
+            },
+        )
+        .unwrap();
+        gate.wait();
+        assert!(refresh.record_cloned(&repository).unwrap());
+        let published = refresh.snapshot().unwrap();
+        assert_eq!(published.repositories.len(), 1);
+        assert_eq!(published.repositories[0].path, repository);
+        assert_eq!(published.repositories[0].open_count, 0);
+        assert!(published.repositories[0].last_opened_unix_ms.is_none());
+        assert!(refresh.take_changed());
+        refresh.cancel();
+        gate.release();
+        drop(refresh);
+        let mut database = ProjectDatabase::open(&database_path).unwrap();
+        database
+            .persist_scan(&discover_repositories(&config, &AtomicBool::new(false)))
+            .unwrap();
+        assert_eq!(database.snapshot().unwrap().repositories.len(), 1);
+        fs::remove_dir(repository.join(".git")).unwrap();
+        assert!(!validate_project_directory(&repository).unwrap());
     }
 
     #[test]

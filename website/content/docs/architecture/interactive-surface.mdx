@@ -623,6 +623,41 @@ first; with a query, fuzzy relevance remains primary and cached activity order
 breaks equal-score ties. Selecting a repository updates its Quirl open signals.
 See [ADR 0030](/docs/architecture/decisions/0030-bounded-project-discovery).
 
+Managed cloning connects this picker to `quirl projects clone <repository>
+[--root path]`. HTTP(S), SSH, and scp-style remotes map to
+`<root>/<host>/<repository-path>`, including nested namespaces. Root precedence
+is `--root`, `GHQ_ROOT`, Git's `ghq.root`, then `~/Projects`;
+`quirl projects root` prints the effective path. With multiple `ghq.root` values,
+Quirl reuses a matching checkout in any configured root and creates new checkouts
+under the first root. GHQ need not be installed.
+Existing checkouts with a matching origin are reused without pulling or
+modifying them. A conflicting destination produces an error.
+Nondefault ports use a `host__port_NNN` directory component, and SSH aliases keep
+the alias supplied in the remote. Managed cloning accepts a deliberately bounded
+remote syntax: local paths, `file:` and `git:` transports, IPv6 literals, encoded
+paths, and HTTP URLs containing credentials use ordinary `git clone` instead.
+Use Git's credential helper for managed HTTP authentication.
+
+When an interactive rich Normal-mode input is exactly a literal `git clone URL`,
+Quirl can offer the concrete managed destination before execution. The default
+keeps the original command. Other choices use the managed location once, opt in
+to managing future eligible clones, or stop suggestions. A persisted opt-in
+never changes commands with an explicit destination, options, redirections,
+expansions, or additional commands, and it does not affect scripts. Explicit
+executable paths such as `/usr/bin/git` and forced external `^git` also execute
+unchanged. Cloning uses
+Git's normal terminal authentication and cancellation behavior. After a successful
+clone, the project is available immediately in the picker; opening it is an
+explicit **Alt-Q u** action that preserves unfinished input. Choosing the original
+command, using the managed location once, or dismissing suggestions saves `off`;
+cancelling leaves `ask`. `quirl projects policy` prints the saved policy, and an
+optional `ask`, `managed`, or `off` argument changes it. Missing state defaults to
+`ask`. Preferences live in `$XDG_STATE_HOME/quirl/clone-policy.json`, falling back
+to `~/.local/state/quirl/clone-policy.json`, separately from Lua configuration.
+Explicit `quirl projects clone` remains available regardless of this policy.
+Existing repositories are never automatically moved. See
+[ADR 0039](/docs/architecture/decisions/0039-managed-project-cloning).
+
 The picker engine, ranking, and typed-value return stay in `quirl-picker`;
 the surface uses it through the `PickerRanker` composition adapter. Source
 items are capped at 4 096 and 2 MiB retained data, queries at 1 024 bytes, and

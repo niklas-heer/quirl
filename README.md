@@ -113,6 +113,25 @@ checksummed native archives, source builds, downloadable completion/model assets
 and uninstall instructions. The supported release is the immutable
 [`v0.2.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.2.0).
 
+Current development builds also organize new checkouts with **Projects**:
+
+```console
+quirl projects clone https://github.com/niklas-heer/quirl.git
+quirl projects root
+```
+
+The default destination is `~/Projects/github.com/niklas-heer/quirl`. Quirl
+respects `GHQ_ROOT` and Git's `ghq.root`, or accepts `--root ~/Work` for one
+command. Each checkout stays a separate repository. Rich Normal mode can offer
+this location when you type a simple `git clone URL`; Enter keeps your original
+command unless you explicitly select another choice. Existing matching projects
+are reused without pulling, and completed clones appear in **Alt-Q g**. Use
+**Alt-Q u** to open the latest cloned project while retaining unfinished input.
+`quirl projects policy ask` restores the one-time offer, `managed` explicitly
+opts in for future eligible clones, and `off` disables suggestions. With no
+argument, `quirl projects policy` prints the saved setting. These additions are
+unreleased; see the [managed cloning design](docs/decisions/0039-managed-project-cloning.md).
+
 For development, the repository pins Rust 1.97.1; no system Lua installation is
 required:
 

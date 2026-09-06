@@ -83,6 +83,7 @@ const documents = [
   ['docs/decisions/0036-advisory-release-binary-size.md', 'architecture/decisions/0036-advisory-release-binary-size.mdx'],
   ['docs/decisions/0037-navigation-completion-space.md', 'architecture/decisions/0037-navigation-completion-space.mdx'],
   ['docs/decisions/0038-embedded-foreground-terminals.md', 'architecture/decisions/0038-embedded-foreground-terminals.mdx'],
+  ['docs/decisions/0039-managed-project-cloning.md', 'architecture/decisions/0039-managed-project-cloning.mdx'],
 ];
 
 const pageBySource = new Map(documents);

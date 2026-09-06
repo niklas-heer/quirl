@@ -2,6 +2,7 @@
 
 mod clipboard;
 mod generic_terminal;
+mod project_clone;
 mod resize_input;
 mod soak_gallery;
 mod sustained;
@@ -75,6 +76,9 @@ const CHECK_NAMES: &[&str] = &[
     "full-screen-program-takeover",
     "package-tui-terminal-takeover",
     "generic-terminal-session",
+    "project-clone-default",
+    "project-clone-navigation",
+    "project-clone-always",
     "full-screen-program-spawn-failure-restores-terminal",
     "ctrl-l-forces-full-repaint",
     "local-completion-discovery",
@@ -511,7 +515,7 @@ pub(super) fn run(_root: &Path, binary: &Path, selected: &[String]) -> Result<()
     Ok(())
 }
 
-fn checks() -> [CheckCase; 40] {
+fn checks() -> [CheckCase; 43] {
     [
         CheckCase {
             name: "rich-editing",
@@ -636,6 +640,18 @@ fn checks() -> [CheckCase; 40] {
         CheckCase {
             name: "generic-terminal-session",
             run: generic_terminal::check_generic_terminal_session,
+        },
+        CheckCase {
+            name: "project-clone-default",
+            run: project_clone::check_project_clone_default,
+        },
+        CheckCase {
+            name: "project-clone-navigation",
+            run: project_clone::check_project_clone_navigation,
+        },
+        CheckCase {
+            name: "project-clone-always",
+            run: project_clone::check_project_clone_always,
         },
         CheckCase {
             name: "full-screen-program-spawn-failure-restores-terminal",
@@ -777,7 +793,9 @@ fn rich_editor_frame_ready(screen: &VirtualScreen) -> bool {
         && ["NORMAL", "DATA", "AI"]
             .iter()
             .any(|mode| bottom.contains(mode))
-        && (bottom.contains("Alt-Q Quirl") || bottom.contains("result kept in viewport"))
+        && (bottom.contains("Alt-Q Quirl")
+            || bottom.contains("result kept in viewport")
+            || bottom.contains("Alt-Q u open project"))
         && screen.lines().iter().any(|line| {
             let text = line.trim_start();
             text.starts_with('>')
@@ -855,9 +873,7 @@ fn execute_and_resume_with_marker(
                 && screen.bottom_line().contains("NORMAL")
         },
     )?;
-    session
-        .pty
-        .wait_for_since(b"\x1b[?1000h", output_start, default_timeout())?;
+    wait_for_rich_input_since(session, output_start)?;
     ensure_alternate_screen_unchanged(session, output_start, "marked command")
 }
 

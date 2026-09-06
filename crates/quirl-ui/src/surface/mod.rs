@@ -7,12 +7,14 @@ mod explorer;
 mod frame;
 pub(crate) mod highlight;
 mod overlay;
+mod project_clone;
 mod runtime;
 mod screen_selection;
 mod statusbar;
 mod transcript;
 
 pub use degrade::{SurfaceKind, select_surface};
+pub use project_clone::ProjectCloneChoice;
 pub use runtime::{
     ACTIVITY_MESSAGE_BYTES_MAX, COMPLETION_HOME_BYTES_MAX, DATA_ITEMS_MAX, DATA_RETAINED_BYTES_MAX,
     ENVIRONMENT_ITEMS_MAX, ENVIRONMENT_RETAINED_BYTES_MAX, InteractiveActivityProvider,
@@ -558,6 +560,15 @@ pub enum InteractiveSignal {
         /// UTF-8 byte cursor within `buffer`.
         cursor: usize,
     },
+    /// Open a cloned project after the host revalidates its directory and Git marker.
+    OpenProject {
+        /// Absolute directory offered after the successful clone.
+        path: PathBuf,
+        /// Editor text to retain even if the destination is no longer valid.
+        buffer: String,
+        /// UTF-8 byte cursor within `buffer`.
+        cursor: usize,
+    },
     /// The host should suspend the shell after performing platform job control.
     Suspend,
 }
@@ -591,6 +602,7 @@ pub struct RichSurface {
     deferred_catalog_picker: Option<DeferredCatalogPicker>,
     explorer: Option<DirectoryExplorer>,
     pending_input: Option<(String, usize)>,
+    pending_project_open: Option<PathBuf>,
     picker_layout: PickerLayout,
     picker_preview: bool,
     expand_completion_pending: bool,
@@ -689,6 +701,7 @@ impl RichSurface {
             deferred_catalog_picker: None,
             explorer: None,
             pending_input: None,
+            pending_project_open: None,
             picker_layout: PickerLayout::from_config(&config.picker.layout),
             picker_preview: config.picker.preview,
             expand_completion_pending: false,
@@ -771,6 +784,7 @@ impl RichSurface {
             deferred_catalog_picker: None,
             explorer: None,
             pending_input: None,
+            pending_project_open: None,
             picker_layout: PickerLayout::from_config(&config.picker.layout),
             picker_preview: config.picker.preview,
             expand_completion_pending: false,
@@ -1719,6 +1733,16 @@ impl RichSurface {
                         }
                     }
                     if self.leader_active {
+                        if key.code == KeyCode::Char('u')
+                            && let Some(signal) = self.take_project_open_signal(
+                                editor.buffer().to_owned(),
+                                editor.cursor(),
+                            )
+                        {
+                            self.dismiss_picker();
+                            self.terminal.pause_for_execution()?;
+                            return Ok(signal);
+                        }
                         self.return_to_tail_for_input();
                         self.handle_leader_key(key.code, prompt, editor.buffer(), editor.cursor())?;
                         continue;
@@ -1931,6 +1955,7 @@ impl RichSurface {
                                 continue;
                             }
                             let buffer = editor.buffer().to_owned();
+                            self.pending_project_open = None;
                             self.append_history(&buffer)?;
                             self.terminal.pause_for_execution()?;
                             return Ok(InteractiveSignal::Success(buffer));
@@ -2209,7 +2234,7 @@ impl RichSurface {
 
     fn open_leader(&mut self, replace_end: usize) {
         self.leader_active = true;
-        let entries = [
+        let mut entries = vec![
             ("n", "Normal mode", "Native commands and pipelines"),
             ("d", "Data mode", "Typed data expressions and pipelines"),
             ("i", "AI mode", "Describe your intent in everyday language"),
@@ -2227,6 +2252,9 @@ impl RichSurface {
             ),
             ("o", "Output", "Scroll and copy retained command output"),
         ];
+        if self.pending_project_open.is_some() {
+            entries.push(("u", "Open project", "Enter the repository just cloned"));
+        }
         let items = entries
             .into_iter()
             .map(|(key, name, detail)| completion::CompletionItem {

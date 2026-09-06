@@ -924,6 +924,49 @@ Options:
 - `--format` — Choose accessible text or stable machine JSON
 - `--locked` — Forbid changes to versions, checksums, API versions, and capabilities
 
+## `quirl projects clone <repository> [--root path]`
+
+Clone a Git project into a GHQ-compatible directory
+
+Clones an HTTP(S), SSH, or scp-style repository into &lt;root&gt;/&lt;host&gt;/&lt;repository-path&gt;, preserving nested namespaces and removing the final .git suffix. Resolves the root from --root, GHQ_ROOT, Git's ghq.root configuration, then ~/Projects. With multiple ghq.root values, reuses a matching checkout in any configured root or creates a new checkout under the first root. Uses Git's normal authentication and foreground terminal behavior. An existing checkout is reused only when its origin matches; conflicting destinations are errors, and reuse never pulls or overwrites files. Successful checkouts become available to the project picker. Nondefault ports use a host__port_NNN directory component. SSH host aliases are preserved without resolving SSH configuration. Embedded HTTP credentials, encoded paths, IPv6 literals, local paths, and unsupported transports require ordinary git clone with an explicit destination; use Git's credential helper for managed HTTP authentication.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
+Options:
+
+- `repository` — Positional `repository` declared by the builtin command signature.
+- `--root` — Override the parent directory for this managed clone
+
+## `quirl projects policy [ask|managed|off]`
+
+Inspect or set interactive managed-clone suggestions
+
+Without an argument, prints the saved policy; missing state defaults to ask. ask enables a one-time offer for a standalone literal git clone URL in rich Normal mode. managed explicitly opts in to the managed location for future eligible clones. off disables offers and automatic destination changes. Options, explicit destinations, expansions, compound commands, and scripts are always unchanged. Choosing the original command, using a managed location once, or dismissing suggestions saves off; cancelling keeps ask. Explicit quirl projects clone remains available under every policy. Stores a strict, versioned preference atomically in the XDG state directory, separately from Lua configuration.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
+Options:
+
+- `ask|managed|off` — Positional `ask|managed|off` declared by the builtin command signature.
+
+## `quirl projects root [--root path]`
+
+Print the effective parent directory for managed Git projects
+
+Resolves and prints the managed-clone root without creating directories, cloning a repository, or changing the shell's working directory. Resolution prefers --root, then GHQ_ROOT, Git's ghq.root configuration, then ~/Projects. With multiple ghq.root values, prints the first root used for new clones. The root holds separate Git checkouts in &lt;host&gt;/&lt;repository-path&gt; subdirectories; GHQ itself is not required.
+
+- Input: `Nothing`
+- Output: `Bytes`
+- Live streaming: `false`
+
+Options:
+
+- `--root` — Override the root used for this resolution
+
 ## `quirl recover <list|show> [--format text|json]`
 
 Inspect recoverable command-failure snapshots

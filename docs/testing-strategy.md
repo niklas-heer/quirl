@@ -10,7 +10,7 @@ cargo xtask check
 It checks Rust and Quirl formatting, denies every Clippy warning, rejects
 undocumented public Rust APIs, builds workspace Rustdoc with warnings denied,
 runs the full workspace, executes 128 deterministic generated C1 differential
-cases against each available reference shell, runs the fixed real-PTY matrix
+cases against each available reference shell, runs the fixed 43-check real-PTY matrix
 and a seeded 12-journey keyboard session on Unix, and runs guest-side Lua tests.
 
 ## Local Linux validation with Docker or Colima
@@ -132,6 +132,25 @@ raw mode; child-terminal initialization alone is insufficient. Bash fixtures
 use a bounded timed read so newer Bash dispatches WINCH traps while awaiting
 input. Assertions inspect reconstructed screen cells when redraw bytes split
 text across cursor/style sequences.
+
+The managed-clone journeys `project-clone-default`, `project-clone-navigation`,
+and `project-clone-always` exercise the original-command default, managed clone
+and existing-checkout navigation, persistent opt-in, and explicit-destination
+preservation. They use isolated Git fixtures and private project/state roots to
+check exact destinations, policy state, project-picker publication, and restoration
+of unfinished input. Service tests cover remote validation, root precedence,
+conflicts and symlinks, retained partial data, and one absolute metadata-planning
+deadline shared across sequential Git probes. Recognizer tests exclude executable
+paths, forced external commands, expansions, options, and compound source. These
+are the required verification scope; an execution claim belongs to the exact
+artifact's completed test report.
+
+For optional visual evidence from these journeys, set
+`QUIRL_PROJECT_CLONE_ARTIFACT_DIR` to an existing absolute directory (at most
+4,096 bytes in the path). The fixture writes reconstructed `.svg` screens and
+`.screen.txt` text for its fixed navigation checkpoints. Files use create-new
+semantics: an existing capture is an error, so choose a fresh directory for each
+run. This export records the tested terminal state without changing assertions.
 
 Pipe-task descriptor assertions run in isolated, bounded helper processes.
 `BrokenPipe` and EOF require every copy of an endpoint to close; unrelated tests

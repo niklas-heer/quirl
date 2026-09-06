@@ -970,6 +970,7 @@ mod platform {
     pub struct NativeExecutor {
         jobs: Vec<Job>,
         next_job_id: u32,
+        previous_status: i32,
         substitution_depth: u8,
         noninteractive_host: bool,
         environment: SessionEnvironment,
@@ -1448,6 +1449,7 @@ mod platform {
             Self {
                 jobs: Vec::new(),
                 next_job_id: 1,
+                previous_status: 0,
                 substitution_depth: 0,
                 noninteractive_host: false,
                 environment: SessionEnvironment::default(),
@@ -1473,6 +1475,27 @@ mod platform {
             let mut executor = Self::default();
             executor.noninteractive_host = true;
             executor
+        }
+
+        /// Set the host's previously committed command status for future lists.
+        ///
+        /// The value must be in `0..=255`; rejection leaves the previous value
+        /// unchanged. Execution does not publish a new status automatically, so
+        /// internal metadata probes cannot replace the host's last user result.
+        /// Within a list, each executed pipeline supplies the next pipeline's
+        /// status normally. Hosts should set this immediately before executing
+        /// each user command; the default is zero.
+        pub fn set_previous_status(&mut self, status: i32) -> Result<(), ShellError> {
+            if !(0..=255).contains(&status) {
+                return Err(ShellError::new(
+                    ErrorCode::InvalidArgument,
+                    "the previous command status must be between 0 and 255",
+                )
+                .with_context(format!("observed status: {status}"))
+                .with_help("Pass the normalized exit status of the previous user command"));
+            }
+            self.previous_status = status;
+            Ok(())
         }
 
         /// Replace one variable in this executor's private environment snapshot.
@@ -1784,7 +1807,7 @@ mod platform {
                 return Ok(outcome(0, None, None));
             }
 
-            let mut last = outcome(0, None, None);
+            let mut last = outcome(self.previous_status, None, None);
             let mut captured_stdout = String::new();
             let mut captured_stderr = String::new();
             for (index, pipeline) in graph.pipelines.iter().enumerate() {
@@ -2100,7 +2123,13 @@ mod platform {
                         ));
                     }
                     self.substitution_depth = self.substitution_depth.saturating_add(1);
+                    // Substitution inherits this pipeline's status, including
+                    // updates earlier in the same list. Restore the host seed
+                    // before propagating errors so nested work cannot publish it.
+                    let host_previous_status = self.previous_status;
+                    self.previous_status = previous_status;
                     let nested = self.execute_inner_with_request(source, true, request);
+                    self.previous_status = host_previous_status;
                     self.substitution_depth = self.substitution_depth.saturating_sub(1);
                     let nested = nested?;
                     let stdout = nested.stdout.unwrap_or_default();
@@ -7465,6 +7494,7 @@ mod platform {
     pub struct NativeExecutor {
         jobs: Vec<Job>,
         next_job_id: u32,
+        previous_status: i32,
         noninteractive_host: bool,
         environment: SessionEnvironment,
     }
@@ -7498,6 +7528,7 @@ mod platform {
             Self {
                 jobs: Vec::new(),
                 next_job_id: 1,
+                previous_status: 0,
                 noninteractive_host: false,
                 environment: SessionEnvironment::default(),
             }
@@ -7521,6 +7552,27 @@ mod platform {
             let mut executor = Self::default();
             executor.noninteractive_host = true;
             executor
+        }
+
+        /// Set the host's previously committed command status for future lists.
+        ///
+        /// The value must be in `0..=255`; rejection leaves the previous value
+        /// unchanged. Execution does not publish a new status automatically, so
+        /// internal metadata probes cannot replace the host's last user result.
+        /// Within a list, each executed pipeline supplies the next pipeline's
+        /// status normally. Hosts should set this immediately before executing
+        /// each user command; the default is zero.
+        pub fn set_previous_status(&mut self, status: i32) -> Result<(), ShellError> {
+            if !(0..=255).contains(&status) {
+                return Err(ShellError::new(
+                    ErrorCode::InvalidArgument,
+                    "the previous command status must be between 0 and 255",
+                )
+                .with_context(format!("observed status: {status}"))
+                .with_help("Pass the normalized exit status of the previous user command"));
+            }
+            self.previous_status = status;
+            Ok(())
         }
 
         /// Replace one variable in this executor's private environment snapshot.
@@ -7764,7 +7816,7 @@ mod platform {
                 request.ensure_active()?;
             }
             let mut last = CommandOutcome {
-                status: 0,
+                status: self.previous_status,
                 stdout: None,
                 stderr: None,
             };
@@ -9241,6 +9293,102 @@ mod backend_contract_tests {
             .unwrap();
         assert_eq!(output.status, 0);
         assert_eq!(output.stdout.as_deref(), Some("1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn separately_submitted_commands_observe_the_host_previous_status() {
+        let mut executor = NativeExecutor::default();
+        executor.set_previous_status(130).unwrap();
+        let output = executor.execute_capture("printf '%s' $?").unwrap();
+        assert_eq!(output.stdout.as_deref(), Some("130"));
+        executor.set_previous_status(output.status).unwrap();
+        assert_eq!(
+            executor
+                .execute_capture("printf '%s' $?")
+                .unwrap()
+                .stdout
+                .as_deref(),
+            Some("0")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_execution_does_not_publish_over_the_host_status() {
+        let mut executor = NativeExecutor::default();
+        executor.set_previous_status(130).unwrap();
+        assert_eq!(executor.execute_capture("true").unwrap().status, 0);
+        assert_eq!(
+            executor
+                .execute_capture("printf '%s' $?")
+                .unwrap()
+                .stdout
+                .as_deref(),
+            Some("130")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_previous_status_updates_preserve_the_valid_seed() {
+        let mut executor = NativeExecutor::default();
+        executor.set_previous_status(255).unwrap();
+        for invalid in [-1, 256, i32::MIN, i32::MAX] {
+            assert_eq!(
+                executor.set_previous_status(invalid).unwrap_err().code,
+                ErrorCode::InvalidArgument
+            );
+        }
+        assert_eq!(
+            executor
+                .execute_capture("printf '%s' $?")
+                .unwrap()
+                .stdout
+                .as_deref(),
+            Some("255")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_lists_and_substitutions_inherit_the_current_pipeline_status() {
+        let mut executor = NativeExecutor::default();
+        executor.set_previous_status(130).unwrap();
+        let output = executor
+            .execute_capture(
+                "printf '%s:' $(printf '%s' $?); false; printf '%s:%s' $? $(printf '%s' $?)",
+            )
+            .unwrap();
+        assert_eq!(output.stdout.as_deref(), Some("130:1:1"));
+        assert_eq!(
+            executor
+                .execute_capture("printf '%s' $?")
+                .unwrap()
+                .stdout
+                .as_deref(),
+            Some("130")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_substitution_restores_the_host_previous_status() {
+        let mut executor = NativeExecutor::default();
+        executor.set_previous_status(130).unwrap();
+        assert!(
+            executor
+                .execute_capture("false; printf '%s' $(quirl_missing_status_fixture_executable)")
+                .is_err()
+        );
+        assert_eq!(
+            executor
+                .execute_capture("printf '%s' $?")
+                .unwrap()
+                .stdout
+                .as_deref(),
+            Some("130")
+        );
     }
 
     #[cfg(unix)]

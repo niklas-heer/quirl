@@ -1463,6 +1463,56 @@ impl Catalog {
                     Provenance::Builtin,
                 ),
                 command(
+                    "quirl projects clone",
+                    "quirl projects clone <repository> [--root path]",
+                    "Clone a Git project into a GHQ-compatible directory",
+                    "Clones an HTTP(S), SSH, or scp-style repository into <root>/<host>/<repository-path>, preserving nested namespaces and removing the final .git suffix. Resolves the root from --root, GHQ_ROOT, Git's ghq.root configuration, then ~/Projects. With multiple ghq.root values, reuses a matching checkout in any configured root or creates a new checkout under the first root. Uses Git's normal authentication and foreground terminal behavior. An existing checkout is reused only when its origin matches; conflicting destinations are errors, and reuse never pulls or overwrites files. Successful checkouts become available to the project picker. Nondefault ports use a host__port_NNN directory component. SSH host aliases are preserved without resolving SSH configuration. Embedded HTTP credentials, encoded paths, IPv6 literals, local paths, and unsupported transports require ordinary git clone with an explicit destination; use Git's credential helper for managed HTTP authentication.",
+                    vec![option(
+                        &["--root"],
+                        Some("path"),
+                        "Override the parent directory for this managed clone",
+                    )],
+                    &[
+                        "quirl projects clone https://github.com/niklas-heer/quirl.git",
+                        "quirl projects clone git@gitlab.com:team/service.git --root ~/Work",
+                    ],
+                    &[
+                        Effect::ReadFilesystem,
+                        Effect::WriteFilesystem,
+                        Effect::SpawnProcess,
+                    ],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl projects policy",
+                    "quirl projects policy [ask|managed|off]",
+                    "Inspect or set interactive managed-clone suggestions",
+                    "Without an argument, prints the saved policy; missing state defaults to ask. ask enables a one-time offer for a standalone literal git clone URL in rich Normal mode. managed explicitly opts in to the managed location for future eligible clones. off disables offers and automatic destination changes. Options, explicit destinations, expansions, compound commands, and scripts are always unchanged. Choosing the original command, using a managed location once, or dismissing suggestions saves off; cancelling keeps ask. Explicit quirl projects clone remains available under every policy. Stores a strict, versioned preference atomically in the XDG state directory, separately from Lua configuration.",
+                    vec![],
+                    &[
+                        "quirl projects policy",
+                        "quirl projects policy ask",
+                        "quirl projects policy managed",
+                        "quirl projects policy off",
+                    ],
+                    &[Effect::ReadFilesystem, Effect::WriteFilesystem],
+                    Provenance::Builtin,
+                ),
+                command(
+                    "quirl projects root",
+                    "quirl projects root [--root path]",
+                    "Print the effective parent directory for managed Git projects",
+                    "Resolves and prints the managed-clone root without creating directories, cloning a repository, or changing the shell's working directory. Resolution prefers --root, then GHQ_ROOT, Git's ghq.root configuration, then ~/Projects. With multiple ghq.root values, prints the first root used for new clones. The root holds separate Git checkouts in <host>/<repository-path> subdirectories; GHQ itself is not required.",
+                    vec![option(
+                        &["--root"],
+                        Some("path"),
+                        "Override the root used for this resolution",
+                    )],
+                    &["quirl projects root", "quirl projects root --root ~/Work"],
+                    &[Effect::ReadFilesystem, Effect::SpawnProcess],
+                    Provenance::Builtin,
+                ),
+                command(
                     "quirl pick",
                     "quirl pick [--source stdin|history|files|actions|projects] [--query text] [--multi] [--limit count] [--root path] [--refresh] [--format text|json]",
                     "Select typed values with Quirl's shared fuzzy engine",
@@ -1807,8 +1857,9 @@ impl Catalog {
         let query_start = segment_start.saturating_add(leading_whitespace);
         let query = segment.trim_start();
 
-        if let Some((command, option, token_start, token, values)) =
-            self.static_value_context(query, query_start)
+        if let Some((command, option, token_start, token, values)) = self
+            .static_value_context(query, query_start)
+            .or_else(|| self.first_positional_value_context(query, query_start))
         {
             let argument_index = command
                 .options
@@ -2310,6 +2361,48 @@ impl Catalog {
             command,
             leading_whitespace.saturating_add(token_start),
             token,
+        ))
+    }
+
+    // Complete only the first literal positional directly after an exact command
+    // path. Later operands need the syntax layer's argument ownership; guessing
+    // through flags or quoted values here would produce misleading replacements.
+    fn first_positional_value_context<'catalog, 'query>(
+        &'catalog self,
+        query: &'query str,
+        leading_whitespace: usize,
+    ) -> Option<(
+        &'catalog CommandSpec,
+        &'catalog ArgumentSpec,
+        usize,
+        &'query str,
+        &'catalog [String],
+    )> {
+        let token_start = query.rfind(char::is_whitespace).map_or(0, |index| {
+            index.saturating_add(whitespace_width_at(query, index))
+        });
+        let token = query.get(token_start..)?;
+        if token.starts_with('-') {
+            return None;
+        }
+        let command_path = query.get(..token_start)?.trim_end();
+        let command = self
+            .commands
+            .iter()
+            .find(|command| command.path == command_path)?;
+        let argument = command
+            .options
+            .iter()
+            .find(|argument| argument.kind == ArgumentKind::Positional)?;
+        let CompletionSource::Static { values } = argument.values.as_ref()? else {
+            return None;
+        };
+        Some((
+            command,
+            argument,
+            leading_whitespace.saturating_add(token_start),
+            token,
+            values,
         ))
     }
 
@@ -2817,7 +2910,7 @@ fn positional_argument(
         value_type: value.to_owned(),
         required,
         repeatable: token.contains("..."),
-        values: None,
+        values: static_values(value),
         conflicts: Vec::new(),
         documentation: format!("Positional `{value}` declared by the builtin command signature."),
         examples: examples
@@ -3193,6 +3286,65 @@ mod tests {
         assert!(json.contains("\"arguments\""));
         assert!(json.contains("confidence"));
         assert!(json.contains("git commit"));
+    }
+
+    #[test]
+    fn managed_project_commands_share_root_completion_and_explicit_effects() {
+        let catalog = Catalog::builtin();
+        for path in ["quirl projects clone", "quirl projects root"] {
+            let command = catalog.find(path).unwrap();
+            assert!(command.details.contains("GHQ_ROOT"));
+            assert!(command.details.contains("ghq.root"));
+            assert!(command.effects.contains(&Effect::SpawnProcess));
+            let input = format!("{path} --ro");
+            let completions = catalog.complete(&input, input.len());
+            assert!(completions.iter().any(|item| item.value == "--root"));
+        }
+        let clone = catalog.find("quirl projects clone").unwrap();
+        assert!(clone.effects.contains(&Effect::WriteFilesystem));
+        assert!(!clone.effects.contains(&Effect::ChangeDirectory));
+        let root = catalog.find("quirl projects root").unwrap();
+        assert!(!root.effects.contains(&Effect::WriteFilesystem));
+        assert!(!root.effects.contains(&Effect::ChangeDirectory));
+    }
+
+    #[test]
+    fn managed_clone_policy_exposes_only_explicit_policy_values() {
+        let catalog = Catalog::builtin();
+        let command = catalog.find("quirl projects policy").unwrap();
+        assert!(!command.effects.contains(&Effect::SpawnProcess));
+        assert!(command.effects.contains(&Effect::WriteFilesystem));
+        let argument = command
+            .options
+            .iter()
+            .find(|argument| argument.kind == ArgumentKind::Positional)
+            .unwrap();
+        assert!(!argument.required);
+        let input = "quirl projects policy ";
+        let completions = catalog.complete(input, input.len());
+        for value in ["ask", "managed", "off"] {
+            assert!(
+                completions.iter().any(|item| item.value == value),
+                "{value}"
+            );
+        }
+        for input in [
+            "quirl projects policy managed ",
+            "quirl projects policy --unknown ",
+            "quirl projects policy 'ma",
+        ] {
+            assert!(
+                !catalog
+                    .complete(input, input.len())
+                    .iter()
+                    .any(|item| { ["ask", "managed", "off"].contains(&item.value.as_str()) })
+            );
+        }
+        let input = "quirl projects policy ma";
+        let completions = catalog.complete(input, input.len());
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].value, "managed");
+        assert_eq!(completions[0].replace_start, "quirl projects policy ".len());
     }
 
     #[test]

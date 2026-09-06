@@ -6,6 +6,7 @@ mod ai_bootstrap;
 mod assets;
 mod author;
 mod bounded_file;
+mod clone_workflow;
 mod codex;
 mod config;
 mod coordination;
@@ -23,6 +24,7 @@ mod package;
 mod pick;
 mod platform;
 mod plugin;
+mod project_clone;
 mod projects;
 mod protocol;
 mod recovery;
@@ -108,6 +110,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Clone and locate Git projects using GHQ-compatible directories.
+    Projects {
+        #[command(subcommand)]
+        command: project_clone::ProjectsCommand,
+    },
     /// Create a checked embedded-language script from Quirl's template.
     New {
         #[command(flatten)]
@@ -381,6 +388,7 @@ fn product_build_identity() -> String {
 
 fn run(cli: Cli) -> Result<i32, ShellError> {
     match cli.command {
+        Some(Command::Projects { command }) => project_clone::run(command),
         Some(Command::New { command }) => author::create(command),
         Some(Command::Run {
             file,
@@ -1623,7 +1631,7 @@ impl InteractiveSignalCancellation {
                         }
                         return Err(ShellError::new(
                             ErrorCode::Io,
-                            "could not install interactive data cancellation handlers",
+                            "could not install interactive cancellation handlers",
                         )
                         .with_context(error.to_string())
                         .with_help("Retry after restoring the process signal state"));
@@ -2325,13 +2333,53 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                         }
                     }
                     InteractiveLine::Command(command) => {
+                        let prepared = match clone_workflow::prepare(
+                            command,
+                            &mut executor,
+                            &mut line_editor,
+                            &prompt,
+                        ) {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                last_status = 1;
+                                line_editor.append_command_error(
+                                    command,
+                                    &error,
+                                    Duration::ZERO,
+                                )?;
+                                continue;
+                            }
+                        };
+                        let (clone_plan, managed_source, existing_clone) = match prepared {
+                            clone_workflow::PreparedClone::Original => (None, None, false),
+                            clone_workflow::PreparedClone::Managed { plan, source } => {
+                                (Some(plan), Some(source), false)
+                            }
+                            clone_workflow::PreparedClone::Existing(plan) => {
+                                (Some(plan), None, true)
+                            }
+                            clone_workflow::PreparedClone::Cancelled => {
+                                last_status = 130;
+                                continue;
+                            }
+                        };
+                        let command = managed_source.as_deref().unwrap_or(command);
+                        // Metadata probes are control-plane work. The next user
+                        // command must expand $? from the shell's visible status.
+                        executor.set_previous_status(last_status)?;
                         let started = Instant::now();
                         let journal = recovery_journal(&mut recovery)?;
                         let output_mode = line_editor.command_output_mode();
                         let execution_output_mode = output_mode;
                         let streaming = line_editor.begin_command_stream(command, &prompt)?;
                         let mut streamed_any = false;
-                        let execution = if streaming {
+                        let execution = if existing_clone {
+                            Ok(ExecutionReport {
+                                status: 0,
+                                stdout: b"Matching project already exists; no clone or update was performed.\n".to_vec(),
+                                stderr: Vec::new(),
+                            })
+                        } else if streaming {
                             let mut observer = |activity: ObservedActivity<'_>| match activity {
                                 ObservedActivity::Output { stream, bytes } => {
                                     streamed_any |= !bytes.is_empty();
@@ -2369,6 +2417,14 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 None,
                             )
                         };
+                        let execution = execution.and_then(|report| {
+                            if report.status == 0
+                                && let Some(plan) = &clone_plan
+                            {
+                                project_clone::verify_completed(plan, &mut executor)?;
+                            }
+                            Ok(report)
+                        });
                         let transcript_result = match execution {
                             Ok(report) => {
                                 last_status = report.status;
@@ -2405,7 +2461,11 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 }
                             }
                             Err(error) => {
-                                last_status = 1;
+                                last_status = if project_clone::was_cancelled(&error) {
+                                    130
+                                } else {
+                                    1
+                                };
                                 if streaming {
                                     let rendered = render_error(&error, false);
                                     for chunk in rendered.as_bytes().chunks(8 * 1024) {
@@ -2444,6 +2504,17 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                             let _ = refresh.hint_git_command(&history_directory);
                         }
                         transcript_result?;
+                        if let Some(plan) = clone_plan {
+                            if last_status == 0 {
+                                publish_cloned_project(
+                                    &mut line_editor,
+                                    project_refresh.as_deref(),
+                                    &plan.destination,
+                                )?;
+                            } else {
+                                line_editor.emit_output("Projects", b"Managed clone did not complete; any partial destination was preserved for inspection.\n", &[], last_status, Duration::ZERO)?;
+                            }
+                        }
                     }
                     InteractiveLine::Data(source) => {
                         let planned = match prepare_extension_plan(
@@ -2729,6 +2800,30 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                             Some(elapsed),
                         )?;
                     }
+                }
+            }
+            Ok(InteractiveSignal::OpenProject {
+                path,
+                buffer,
+                cursor,
+            }) => {
+                line_editor.restore_input(buffer, cursor)?;
+                let opened = projects::validate_project_directory(&path).and_then(|valid| {
+                    if valid {
+                        change_directory(&path)
+                    } else {
+                        Err(ShellError::new(
+                            ErrorCode::Validation,
+                            "the offered project is no longer a canonical Git checkout",
+                        )
+                        .with_help("Open the project picker again to select an existing checkout"))
+                    }
+                });
+                if let Err(error) = opened {
+                    last_status = 1;
+                    line_editor.append_command_error("Open project", &error, Duration::ZERO)?;
+                } else if let Some(refresh) = &project_refresh {
+                    let _ = refresh.record_opened_if_repository(&path);
                 }
             }
             Ok(InteractiveSignal::ChangeDirectory {
@@ -3280,6 +3375,43 @@ fn native_prompt_provider(
 enum SessionEditor {
     Rich(Box<RichSurface>),
     Simple(Box<reedline::Reedline>),
+}
+
+fn publish_cloned_project(
+    editor: &mut SessionEditor,
+    refresh: Option<&projects::ProjectRefresh>,
+    destination: &Path,
+) -> Result<(), ShellError> {
+    let indexed = match refresh {
+        Some(refresh) => refresh.record_cloned(destination),
+        None => projects::record_clone_default(destination),
+    };
+    if let Err(error) = indexed {
+        let warning = format!(
+            "Project cloned, but its rebuildable index could not be updated: {}\n",
+            error.message
+        );
+        editor.emit_output("Projects", warning.as_bytes(), &[], 0, Duration::ZERO)?;
+    }
+    match projects::validate_project_directory(destination) {
+        Ok(true) => {
+            if let SessionEditor::Rich(surface) = editor {
+                surface.offer_project_open(destination.to_path_buf())?;
+            }
+        }
+        Ok(false) | Err(_) => {
+            // A post-clone filesystem change must not terminate the shell or
+            // invite another clone over the completed checkout.
+            editor.emit_output(
+                "Projects",
+                b"Project cloned, but its directory could not be revalidated for Open; inspect the checkout or refresh the project picker.\n",
+                &[],
+                0,
+                Duration::ZERO,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 impl SessionEditor {
