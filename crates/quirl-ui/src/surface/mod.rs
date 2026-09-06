@@ -632,10 +632,8 @@ pub struct RichSurface {
     output_cursor_line: usize,
     output_anchor_line: Option<usize>,
     output_notice: Option<String>,
-    /// Set from `begin_command_stream` until `finish_command_stream`: the
-    /// prompt row must not look identical to an idle, ready-for-input prompt
-    /// while a foreground command still owns execution, so its indicator is
-    /// replaced with this animated spinner glyph.
+    /// Activity glyph for foreground progress and interactive AI planning.
+    /// Execution frames never display the editor's prompt or input cursor.
     busy_glyph: Option<char>,
     transcript_area: Rect,
     visible_screen: VisibleScreen,
@@ -926,6 +924,8 @@ impl RichSurface {
     }
 
     /// Finish the active command record after every captured reader has been drained.
+    /// This repaints the result without a prompt; `read_line` restores the next
+    /// editable prompt only when the composition root resumes input.
     pub fn finish_command_stream(
         &mut self,
         status: i32,
@@ -1077,6 +1077,7 @@ impl RichSurface {
         let model = FrameModel {
             context_left: &context_left,
             context_right: &context_right,
+            input_active: false,
             editor: &editor,
             completion: &self.completion,
             mode: prompt.mode,
@@ -1527,6 +1528,7 @@ impl RichSurface {
                 let model = FrameModel {
                     context_left: &context_left,
                     context_right: &context_right,
+                    input_active: true,
                     editor: &editor,
                     completion: &self.completion,
                     mode: prompt.mode,

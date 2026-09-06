@@ -412,7 +412,7 @@ impl Drop for DirectoryPermissionsGuard {
     }
 }
 
-/// Best-effort cleanup for the deliberately blocked construction child.
+/// Best-effort cleanup for a deliberately blocked fixture child.
 ///
 /// The child belongs to Quirl rather than xtask and may be in a process group
 /// that is neither the PTY foreground group nor the PTY session leader. Reading
@@ -432,12 +432,13 @@ impl ObservedProcessGroupCleanup {
     }
 
     fn observed_pid(&self) -> io::Result<Pid> {
-        let contents = fs::read_to_string(&self.pid_path)?;
+        let bytes = read_bounded_fixture(&self.pid_path, 32)?;
+        let contents = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
         let process_id = contents.trim().parse::<i32>().map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "construction child identifier in {} was invalid: {error}",
+                    "fixture child identifier in {} was invalid: {error}",
                     self.pid_path.display()
                 ),
             )
@@ -2867,17 +2868,24 @@ fn check_streamed_progress_without_newline(binary: &Path) -> Result<(), TaskErro
 }
 
 fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), TaskError> {
-    // Failure model: a command that produces no output of its own (a bare
-    // `sleep`) must still show Quirl is alive and waiting on it. Without a
-    // liveness tick independent of child output, the viewport would sit
-    // frozen on the very first frame for the command's whole duration,
-    // indistinguishable from a hang. This is distinct from
-    // `check_streamed_progress_without_newline`, which proves a child's own
-    // `\r` progress reaches the screen live; this proves Quirl's own
-    // heartbeat does, with zero bytes from the child at all.
+    // A silent child must keep a live status without presenting the next
+    // command prompt. A private gate holds it until both running frames have
+    // been inspected, so scheduler delays cannot turn these into post-exit
+    // assertions. The execution deadline and Session cleanup bound failures.
+    // Its final output deliberately has no newline: restoring the prompt must
+    // follow both process completion and draining the last terminal bytes.
     let mut session = Session::new(binary, SessionOptions::default())?;
+    let release = session.private.path.join("silent-release");
+    let command = session.private.path.join("silent-command");
+    write_executable(
+        &command,
+        &format!(
+            "#!/bin/sh\nwhile [ ! -f {} ]; do /bin/sleep 0.02; done\nprintf 'FINAL_%s' DRAINED\n",
+            shell_quote(&release)
+        ),
+    )?;
     session.pty.wait_for(STARTUP_MARKER)?;
-    session.pty.type_text("/bin/sleep 2")?;
+    session.pty.type_text(&shell_quote(&command))?;
     let execution_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
     session
@@ -2885,12 +2893,14 @@ fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), Tas
         .wait_for_screen("spinner shows the command is running", |screen| {
             screen.bottom_line().contains("running")
         })?;
+    ensure_no_idle_prompt(session.pty.screen())?;
     let first = session.pty.screen().bottom_line();
     session
         .pty
         .wait_for_screen("spinner advances without any child output", |screen| {
             screen.bottom_line().contains("running") && screen.bottom_line() != first
         })?;
+    ensure_no_idle_prompt(session.pty.screen())?;
     let second = session.pty.screen().bottom_line();
     if second == first {
         return Err(io::Error::other(
@@ -2899,9 +2909,14 @@ fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), Tas
         )
         .into());
     }
+    fs::write(release, b"finish\n")?;
     session.pty.wait_for_screen(
         "silent command completed inside persistent viewport",
-        |screen| screen.text().contains("── exit 0") && screen.bottom_line().contains("NORMAL"),
+        |screen| {
+            screen.text().contains("FINAL_DRAINED")
+                && screen.text().contains("── exit 0")
+                && screen.bottom_line().contains("NORMAL")
+        },
     )?;
     wait_for_rich_input_since(&mut session, execution_start)?;
     ensure_status(
@@ -2909,6 +2924,26 @@ fn check_spinner_animates_during_silent_command(binary: &Path) -> Result<(), Tas
         0,
         "spinner animates during silent command",
     )
+}
+
+fn ensure_no_idle_prompt(screen: &VirtualScreen) -> Result<(), TaskError> {
+    if screen.cursor_visible() {
+        return Err(screen_error(
+            "silent foreground command displayed an input cursor before completion",
+            screen,
+        ));
+    }
+    if screen
+        .lines()
+        .iter()
+        .any(|line| matches!(line.trim(), ">" | "❯"))
+    {
+        return Err(screen_error(
+            "foreground command displayed the next empty prompt before completion",
+            screen,
+        ));
+    }
+    Ok(())
 }
 
 fn check_full_screen_program_takeover(binary: &Path) -> Result<(), TaskError> {
@@ -3695,23 +3730,76 @@ fn check_noninteractive_dialect_islands(binary: &Path) -> Result<(), TaskError> 
         "bash { read value || printf ISLAND_%s STDIN_CLOSED; }",
         b"ISLAND_STDIN_CLOSED",
     )?;
-    session.pty.type_text("bash { sleep 30; }")?;
+    // Enter does not prove execution has started: scheduling or editor work can
+    // consume a fixed delay before the island installs its cancellation guard.
+    // Capture-mode stdout is buffered, so only a private child-written record
+    // establishes readiness. The delayed newline exercises a partial record
+    // beyond the former 200 ms assumption. An exec preserves the group leader,
+    // and the cleanup guard contains any failure before cancellation is proven.
+    let pid_path = session.private.path.join("dialect-island.pid");
+    let mut child_cleanup = ObservedProcessGroupCleanup::new(pid_path.clone());
+    session.pty.type_text(&format!(
+        "bash {{ printf '%s' $$ > {}; /bin/sleep 0.3; printf '\\n' >> {}; exec /bin/sleep 30; }}",
+        shell_quote(&pid_path),
+        shell_quote(&pid_path)
+    ))?;
     let island_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
-    session.pty.drain_for(Duration::from_millis(200))?;
+    wait_for_fixture_child(&mut session, &pid_path)?;
+    let child = child_cleanup.observed_pid()?;
     session.pty.send(b"\x1a")?;
     session.pty.wait_for_screen(
         "cancelled dialect island in persistent viewport",
-        |screen| screen.text().contains("cancelled") && screen.bottom_line().contains("NORMAL"),
+        |screen| {
+            let text = screen.text();
+            text.contains("cancelled")
+                && text.contains("exit 130")
+                && screen.bottom_line().contains("NORMAL")
+        },
     )?;
     wait_for_rich_input_since(&mut session, island_start)?;
+    match nix::sys::signal::killpg(child, None) {
+        Err(Errno::ESRCH) => child_cleanup.disarm(),
+        Err(error) => return Err(error.into()),
+        Ok(()) => return Err(io::Error::other("cancelled dialect island leaked its group").into()),
+    }
     execute_and_resume_with_marker(
         &mut session,
         "/usr/bin/printf AFTER_%s ISLAND_CTRLZ",
         b"AFTER_ISLAND_CTRLZ",
     )?;
-    send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
-    Ok(())
+    let cleanup_start = session.pty.output().len();
+    ensure_status(
+        send_ctrl_d_and_wait_for_exit(&mut session.pty)?,
+        0,
+        "dialect island recovery",
+    )?;
+    ensure_terminal_restored(&session, cleanup_start, "dialect island recovery")
+}
+
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "the fixture readiness poll is bounded by the existing PTY deadline"
+)]
+fn wait_for_fixture_child(session: &mut Session, pid_path: &Path) -> Result<(), TaskError> {
+    let deadline = Instant::now() + default_timeout();
+    while Instant::now() < deadline {
+        match read_bounded_fixture(pid_path, 32) {
+            Ok(bytes) if bytes.ends_with(b"\n") => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        session.pty.drain_for(Duration::from_millis(20))?;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "dialect island did not publish readiness at {}",
+            pid_path.display()
+        ),
+    )
+    .into())
 }
 
 fn check_fallbacks(binary: &Path) -> Result<(), TaskError> {
@@ -4092,6 +4180,29 @@ mod tests {
         let directory = TempDirectory::new("quirl-private-test").unwrap();
         let mode = fs::metadata(&directory.path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn fixture_child_identifier_rejects_invalid_and_oversized_records() {
+        let directory = TempDirectory::new("quirl-child-identifier-test").unwrap();
+        let pid_path = directory.path.join("child.pid");
+        let mut cleanup = ObservedProcessGroupCleanup::new(pid_path.clone());
+        // These are parser fixtures, never process groups owned by this test.
+        cleanup.disarm();
+        fs::write(&pid_path, b"1234\n").unwrap();
+        assert_eq!(cleanup.observed_pid().unwrap(), Pid::from_raw(1234));
+        for invalid in [
+            &b"0\n"[..],
+            b"1\n",
+            b"-1234\n",
+            b"2147483648\n",
+            b"1234oops\n",
+            b"\xff\n",
+            b"1234                            \n",
+        ] {
+            fs::write(&pid_path, invalid).unwrap();
+            assert!(cleanup.observed_pid().is_err());
+        }
     }
 
     #[test]

@@ -28,6 +28,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub struct FrameModel<'a> {
     pub context_left: &'a str,
     pub context_right: &'a str,
+    /// Only editor-owned frames show a prompt or place the shell input cursor.
+    /// Execution and output-drain frames show transcript and status instead.
+    pub input_active: bool,
     pub editor: &'a EditorState,
     pub completion: &'a CompletionState,
     pub mode: Mode,
@@ -51,15 +54,17 @@ pub struct FrameModel<'a> {
     pub transcript_truncated: bool,
     pub output_focus: bool,
     pub output_notice: Option<&'a str>,
-    /// Set while a foreground command still owns execution: the input row's
-    /// indicator is replaced with this animated glyph instead of rendering
-    /// identically to an idle, ready-for-input prompt.
+    /// Animated activity glyph for the editable AI-planning surface. Foreground
+    /// execution owns no input row, regardless of this glyph's presence.
     pub busy_glyph: Option<char>,
 }
 
 impl FrameModel<'_> {
     /// Return the transcript rectangle produced by the same partition used for drawing.
     pub(super) fn transcript_area(&self, area: Rect) -> Rect {
+        if !self.input_active {
+            return output_layout(area).transcript;
+        }
         if self.environment.is_some() {
             return Rect::default();
         }
@@ -81,20 +86,28 @@ impl FrameModel<'_> {
         if area.height == 0 || area.width == 0 {
             return;
         }
-        if let Some(environment) = self.environment {
+        if self.input_active
+            && let Some(environment) = self.environment
+        {
             environment.render(frame, area, self.theme, self.mode, self.symbols);
             return;
         }
         let input = self.input_render(usize::from(area.width));
-        let layout = frame_layout(
-            area,
-            u16::try_from(input.lines.len()).unwrap_or(u16::MAX),
-            self.diagnostic.is_some() && !self.compact,
-            self.intent_activity_rows(area.width),
-            self.transcript.map_or(0, Transcript::line_count),
-            self.transcript.is_none_or(Transcript::follows_tail),
-            self.information_rows(area),
-        );
+        // Rendering a result is not admission of the next command. Only the
+        // editor owner may restore context, editable input, or its cursor.
+        let layout = if self.input_active {
+            frame_layout(
+                area,
+                u16::try_from(input.lines.len()).unwrap_or(u16::MAX),
+                self.diagnostic.is_some() && !self.compact,
+                self.intent_activity_rows(area.width),
+                self.transcript.map_or(0, Transcript::line_count),
+                self.transcript.is_none_or(Transcript::follows_tail),
+                self.information_rows(area),
+            )
+        } else {
+            output_layout(area)
+        };
         if let Some(transcript) = self.transcript {
             self.render_transcript(frame, layout.transcript, transcript);
         }
@@ -140,7 +153,7 @@ impl FrameModel<'_> {
             completion: self.completion,
             mode: self.mode,
             width: area.width,
-            hints: self.hints,
+            hints: self.hints && self.input_active,
             notice: self
                 .diagnostic
                 .filter(|_| self.compact)
@@ -172,7 +185,17 @@ impl FrameModel<'_> {
                 .output_notice
                 .is_some_and(|notice| notice.lines().any(|line| line.starts_with("COMMAND\t"))),
         };
-        frame.render_widget(Paragraph::new(status.line(self.theme)), layout.status);
+        let status_line = if self.input_active {
+            status.line(self.theme)
+        } else {
+            // Progress remains visible even below the normal status bar's
+            // minimum hint width; no execution frame advertises editing keys.
+            Line::styled(
+                escape_terminal_line(self.output_notice.unwrap_or("finishing command")),
+                self.theme.status(),
+            )
+        };
+        frame.render_widget(Paragraph::new(status_line), layout.status);
 
         if layout.input.height == 0 {
             return;
@@ -964,6 +987,27 @@ struct FrameLayout {
     status: Rect,
 }
 
+/// Output-only frames reserve one status row and never imply editor ownership.
+fn output_layout(area: Rect) -> FrameLayout {
+    let status_height = u16::from(area.height > 0);
+    let status_y = area.bottom().saturating_sub(status_height);
+    let empty = Rect::new(area.x, status_y, area.width, 0);
+    FrameLayout {
+        transcript: Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            area.height.saturating_sub(status_height),
+        ),
+        context: None,
+        input: empty,
+        intent_activity: None,
+        diagnostic: None,
+        information: empty,
+        status: Rect::new(area.x, status_y, area.width, status_height),
+    }
+}
+
 fn frame_layout(
     area: Rect,
     input_rows: u16,
@@ -980,16 +1024,7 @@ fn frame_layout(
     let status = Rect::new(area.x, status_y, area.width, 1);
     let rows_above_status = status_y.saturating_sub(area.y);
     if transcript_line_count > 0 && !follows_tail {
-        let transcript = Rect::new(area.x, area.y, area.width, rows_above_status);
-        return FrameLayout {
-            transcript,
-            context: None,
-            input: Rect::new(area.x, status_y, area.width, 0),
-            intent_activity: None,
-            diagnostic: None,
-            information: Rect::new(area.x, status_y, area.width, 0),
-            status,
-        };
+        return output_layout(area);
     }
 
     let context_height = u16::from(rows_above_status >= 2);
@@ -1438,6 +1473,158 @@ mod tests {
     use quirl_catalog::Catalog;
     use ratatui::{Terminal, backend::TestBackend, style::Color};
 
+    // Failure model: starting or draining a foreground command can repaint
+    // before the composition root resumes input. Neither an empty synthetic
+    // editor nor recovered type-ahead may become a visible prompt in that gap.
+    // This helper uses the same model as both streaming and terminal restoration.
+    fn render_execution_transition(
+        terminal: &mut Terminal<TestBackend>,
+        transcript: &Transcript,
+        input_active: bool,
+        finished: bool,
+        mode: Mode,
+    ) {
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.insert_paste("PENDING_INPUT");
+        let completion = CompletionState::new(Catalog::builtin(), None);
+        let runtime = RuntimeSurfaceState::new();
+        terminal
+            .draw(|frame| {
+                let model = FrameModel {
+                    context_left: "NEXT_CONTEXT",
+                    context_right: "NEXT_TIMING",
+                    input_active,
+                    editor: &editor,
+                    completion: &completion,
+                    mode,
+                    diagnostic: None,
+                    highlight_spans: &[],
+                    theme: Theme::new(true),
+                    unicode: true,
+                    symbols: SurfaceSymbols::Unicode,
+                    semantic_hints: true,
+                    hints: true,
+                    timings: None,
+                    compact: false,
+                    picker_query: None,
+                    picker_layout: PickerLayout::Adaptive,
+                    picker_preview: true,
+                    detail_scroll: 0,
+                    environment: None,
+                    runtime: &runtime,
+                    transcript: Some(transcript),
+                    transcript_truncated: false,
+                    output_focus: false,
+                    output_notice: Some(if finished {
+                        "result kept"
+                    } else {
+                        "running 1.0s"
+                    }),
+                    busy_glyph: (!finished).then_some('◷'),
+                };
+                let area = model.transcript_area(frame.area());
+                if !input_active {
+                    assert_eq!(area.height, frame.area().height.saturating_sub(1));
+                }
+                model.render(frame);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn running_and_drained_frames_hide_prompt_until_input_actually_resumes() {
+        for mode in [Mode::Command, Mode::Data, Mode::Natural] {
+            for (width, height) in [(80, 10), (40, 4), (12, 1)] {
+                let mut transcript =
+                    Transcript::new(crate::surface::transcript::TranscriptLimits {
+                        line_count_max: 64,
+                        retained_bytes_max: 4_096,
+                    });
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                // Silent commands must not look like a ready, empty shell.
+                render_execution_transition(&mut terminal, &transcript, false, false, mode);
+                assert!(!terminal.backend().cursor_visible());
+                for y in 0..height.saturating_sub(1) {
+                    assert!(row(&terminal, y).trim().is_empty());
+                }
+                transcript.append_line("FINAL_OUTPUT");
+                for finished in [false, true] {
+                    render_execution_transition(&mut terminal, &transcript, false, finished, mode);
+                    let screen = (0..height)
+                        .map(|y| row(&terminal, y))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(!screen.contains("NEXT_CONTEXT"));
+                    assert!(!screen.contains("NEXT_TIMING"));
+                    assert!(!screen.contains("PENDING_INPUT"));
+                    assert!(!terminal.backend().cursor_visible());
+                    if height > 1 {
+                        assert!(screen.contains("FINAL_OUTPUT"));
+                        assert!(
+                            screen.contains(if finished { "result kept" } else { "running" }),
+                            "mode={mode:?} width={width} height={height} finished={finished}: {screen}"
+                        );
+                    }
+                }
+                if height >= 4 {
+                    render_execution_transition(&mut terminal, &transcript, true, true, mode);
+                    let screen = (0..height)
+                        .map(|y| row(&terminal, y))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    // A four-row AI editor reserves a conversation row and
+                    // scrolls history away; the retained output is unchanged.
+                    if height >= 8 {
+                        assert!(screen.contains("FINAL_OUTPUT"));
+                    }
+                    assert_eq!(transcript.line_count(), 1);
+                    assert!(screen.contains("NEXT_CONTEXT"));
+                    assert!(screen.contains("PENDING_INPUT"));
+                    assert!(terminal.backend().cursor_visible());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_child_cursor_disappears_during_snapshot_drain_before_prompt_restoration() {
+        use crate::surface::child_terminal::{ChildTerminal, ChildTerminalSize};
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        let mut child = ChildTerminal::new(ChildTerminalSize {
+            rows: 8,
+            columns: 80,
+        })
+        .unwrap();
+        child.process(b"CHILD_OUTPUT").unwrap();
+        terminal
+            .draw(|frame| child.render(frame, frame.area()))
+            .unwrap();
+        assert!(row(&terminal, 0).contains("CHILD_OUTPUT"));
+        assert!(terminal.backend().cursor_visible());
+        let mut transcript = Transcript::new(crate::surface::transcript::TranscriptLimits {
+            line_count_max: 64,
+            retained_bytes_max: 4_096,
+        });
+        for line in child.finish_snapshot().unwrap() {
+            transcript.append_line(&line);
+        }
+        render_execution_transition(&mut terminal, &transcript, false, false, Mode::Command);
+        assert!(row(&terminal, 0).contains("CHILD_OUTPUT"));
+        assert!(!terminal.backend().cursor_visible());
+        transcript.append_line("FINAL_OUTPUT");
+        render_execution_transition(&mut terminal, &transcript, false, true, Mode::Command);
+        assert!(!terminal.backend().cursor_visible());
+        render_execution_transition(&mut terminal, &transcript, true, true, Mode::Command);
+        assert!(terminal.backend().cursor_visible());
+        let screen = (0..8)
+            .map(|y| row(&terminal, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("CHILD_OUTPUT"));
+        assert!(screen.contains("FINAL_OUTPUT"));
+        assert!(screen.contains("PENDING_INPUT"));
+    }
+
     #[test]
     fn transcript_tables_use_theme_roles_without_embedded_ansi() {
         let theme = Theme::new(true);
@@ -1496,6 +1683,7 @@ mod tests {
                 FrameModel {
                     context_left: "~/P/q  on main",
                     context_right: "12ms",
+                    input_active: true,
                     editor: &editor,
                     completion: &completion,
                     mode,
@@ -1583,6 +1771,7 @@ mod tests {
                 FrameModel {
                     context_left: "~/project",
                     context_right: "",
+                    input_active: true,
                     editor,
                     completion,
                     mode: Mode::Command,
@@ -1636,6 +1825,7 @@ mod tests {
                 FrameModel {
                     context_left: "~/project",
                     context_right: "",
+                    input_active: true,
                     editor: &editor,
                     completion: &completion,
                     mode: Mode::Natural,
@@ -1707,6 +1897,7 @@ mod tests {
                 FrameModel {
                     context_left: "~/project",
                     context_right: "",
+                    input_active: true,
                     editor: &editor,
                     completion: &completion,
                     mode: Mode::Natural,
@@ -1762,6 +1953,7 @@ mod tests {
                 FrameModel {
                     context_left: "~/project",
                     context_right: "",
+                    input_active: true,
                     editor: &editor,
                     completion: &completion,
                     mode: Mode::Command,
@@ -1824,6 +2016,7 @@ mod tests {
                 FrameModel {
                     context_left: "project",
                     context_right: "",
+                    input_active: true,
                     editor: &editor,
                     completion: &completion,
                     mode: Mode::Command,
@@ -1870,6 +2063,7 @@ mod tests {
                 FrameModel {
                     context_left: "~/project",
                     context_right: "",
+                    input_active: true,
                     editor: &editor,
                     completion: &completion,
                     mode: Mode::Natural,
@@ -1966,6 +2160,7 @@ mod tests {
                 FrameModel {
                     context_left: "~/project",
                     context_right: "",
+                    input_active: true,
                     editor: &editor,
                     completion: &completion,
                     mode: Mode::Command,
@@ -2078,6 +2273,7 @@ mod tests {
         let model = FrameModel {
             context_left: "~/project",
             context_right: "",
+            input_active: true,
             editor: &editor,
             completion: &completion,
             mode: Mode::Command,
@@ -2167,6 +2363,7 @@ mod tests {
         let model = FrameModel {
             context_left: "~/project",
             context_right: "",
+            input_active: true,
             editor: &editor,
             completion: &completion,
             mode: Mode::Command,
@@ -2227,6 +2424,7 @@ mod tests {
                     FrameModel {
                         context_left: "~/workspace",
                         context_right: "2ms",
+                        input_active: true,
                         editor: &editor,
                         completion: &completion,
                         mode: Mode::Command,
@@ -2323,6 +2521,7 @@ mod tests {
                 FrameModel {
                     context_left: "~",
                     context_right: "",
+                    input_active: true,
                     editor: &editor,
                     completion: &completion,
                     mode: Mode::Command,
@@ -2453,6 +2652,7 @@ mod tests {
                     FrameModel {
                         context_left: "~/workspace",
                         context_right: "",
+                        input_active: true,
                         editor: &editor,
                         completion,
                         mode: Mode::Command,
@@ -2626,6 +2826,7 @@ mod tests {
                 let model = FrameModel {
                     context_left: "~/project",
                     context_right: "",
+                    input_active: true,
                     editor: &editor,
                     completion: &completion,
                     mode: Mode::Command,
@@ -2686,6 +2887,7 @@ mod tests {
                 let model = FrameModel {
                     context_left: "~/project",
                     context_right: "",
+                    input_active: true,
                     editor: &editor,
                     completion: &completion,
                     mode: Mode::Command,
@@ -2812,6 +3014,7 @@ mod tests {
                 FrameModel {
                     context_left: "~/P/q",
                     context_right: "",
+                    input_active: true,
                     editor: &editor,
                     completion: &completion,
                     mode: Mode::Command,

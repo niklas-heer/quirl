@@ -37,7 +37,8 @@ which versions are published.
 
 - Interactive native commands retain the previous command's exit status in `$?`
   across prompt turns, including status 130 after cancellation. Internal project
-  metadata probes do not replace the user-visible status.
+  metadata probes do not replace the user-visible status. Cancelled Bash and
+  Zsh islands also report 130; deadlines remain ordinary failures.
 - Rich Normal mode on Unix runs foreground programs in an embedded terminal,
   including unknown tools, wrappers, `tdx`, and `bunx tokscale@latest`. Screen
   redraws, keyboard input, local terminal queries, resizing, and Ctrl-C work
@@ -55,6 +56,9 @@ which versions are published.
   next edit or explicit completion request.
 - Completion and documentation panels reserve space below the editor, scrolling
   older transcript lines upward instead of covering recent command output.
+- Foreground execution shows output and progress without an empty command
+  prompt or shell input cursor. The next prompt appears only after execution
+  finishes and its output has been drained.
 - Plain shell startup skips constructing the command-line option tree. Invocations
   with arguments retain full validation, and redirected stdin keeps its existing
   execution behavior.

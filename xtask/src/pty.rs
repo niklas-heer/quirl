@@ -302,6 +302,11 @@ impl VirtualScreen {
             .unwrap_or_default()
     }
 
+    /// Whether the terminal currently displays its text input cursor.
+    pub(super) fn cursor_visible(&self) -> bool {
+        self.cursor_visible
+    }
+
     /// Whether current cells end at Ratatui's completed visible-cursor frame.
     /// Ratatui emits an attribute reset, cursor show, and final cursor position
     /// after its cell diff. Later drawing or cursor movement invalidates this

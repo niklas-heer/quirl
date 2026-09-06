@@ -1432,6 +1432,19 @@ fn execution_interruption_reason(error: &ShellError) -> Option<&'static str> {
     }
 }
 
+fn interactive_execution_error_status(error: &ShellError) -> i32 {
+    // Legacy engine cancellation diagnostics use the shared interruption
+    // classification; managed operations also carry an explicit exit status.
+    // Deadlines and other resource limits remain ordinary failures.
+    if error.details.exit_status == Some(130)
+        || execution_interruption_reason(error) == Some("execution cancelled")
+    {
+        130
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 fn execute_command_or_dialect_island(
     executor: &mut NativeExecutor,
@@ -2468,11 +2481,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                                 }
                             }
                             Err(error) => {
-                                last_status = if project_clone::was_cancelled(&error) {
-                                    130
-                                } else {
-                                    1
-                                };
+                                last_status = interactive_execution_error_status(&error);
                                 if streaming {
                                     let rendered = render_error(&error, false);
                                     for chunk in rendered.as_bytes().chunks(8 * 1024) {
@@ -5347,6 +5356,21 @@ mod tests {
             "captured output exceeded its limit",
         );
         assert_eq!(execution_interruption_reason(&capture), None);
+    }
+
+    #[test]
+    fn interactive_error_status_distinguishes_cancellation_from_other_failures() {
+        let mut error = ShellError::new(ErrorCode::ResourceLimit, "execution was cancelled");
+        assert_eq!(interactive_execution_error_status(&error), 130);
+        error.message = "execution exceeded its absolute deadline".to_owned();
+        assert_eq!(interactive_execution_error_status(&error), 1);
+        error.message = "captured output exceeded its limit".to_owned();
+        assert_eq!(interactive_execution_error_status(&error), 1);
+        error.code = ErrorCode::Io;
+        error.message = "cannot read cancellation marker".to_owned();
+        assert_eq!(interactive_execution_error_status(&error), 1);
+        error.details.exit_status = Some(130);
+        assert_eq!(interactive_execution_error_status(&error), 130);
     }
 
     #[test]

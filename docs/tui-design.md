@@ -521,16 +521,18 @@ until then data mode renders with the plain style rather than wrong guesses.
 
 ### 5.5 Completed ordinary foreground command
 
-On Accept the alternate screen remains active. After bounded execution
-completes, the accepted command and its complete result are admitted as one
-transcript entry, and a fresh editor remains at the top:
+On Accept the alternate screen remains active. Execution frames display output
+and progress without a new shell prompt, context row, or input cursor. After
+execution, output draining, and child cleanup complete, the next editor appears
+below the completed transcript:
 
 ```
- ~/projects/quirl  main                                            2.31s
-▌
-  ┌ cargo build --release                                  ✔ 0 · 2.31s
-  │ Compiling quirl-core v0.1.0 ...
-  └ Finished `release` profile
+❯ cargo build --release
+  Compiling quirl-core ...
+  Finished `release` profile
+── exit 0 · 2310ms ──
+~/projects/quirl  main                                             2.31s
+> ▌
 
  NORMAL   Alt-Q Quirl · PgUp scroll · copy selection               quirl
 ```
@@ -540,8 +542,9 @@ Native PTY stdout and stderr share a terminal; structured errors remain separate
 Captured script/plugin requests retain their own stream and byte-limit contracts.
 
 Before a child produces output, the running notice and elapsed-time spinner keep
-the shell visible. Once output arrives, the child's bounded terminal screen owns
-the viewport and input. Repaints replace cells instead of appending duplicate
+progress visible without implying readiness for another command. Once output
+arrives, the child's bounded terminal screen owns the viewport and input.
+Repaints replace cells instead of appending duplicate
 frames. After cleanup, the retained primary screen enters the transcript. A
 history-eviction notice reports output older than the child scrollback bound.
 Resource or cleanup failures are never presented as success. `prompt.transient`

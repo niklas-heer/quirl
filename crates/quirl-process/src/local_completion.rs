@@ -2077,6 +2077,10 @@ compdef _qtool qtool
         );
         let process = LocalCompletionProcess::new(1).unwrap();
         let mut first = request(LocalCompletionProvider::Fish, shell.clone());
+        // Slot exclusion is the oracle, not provider latency. The first
+        // request must outlive the bounded startup wait, and every assertion
+        // follows cancellation and join so a failed handshake cannot leak it.
+        first.deadline = Duration::from_secs(30);
         first.environment = vec![(
             "READY_FILE".to_owned(),
             ready.to_string_lossy().into_owned(),
@@ -2085,23 +2089,22 @@ compdef _qtool qtool
         let worker_process = process.clone();
         let worker = thread::spawn(move || worker_process.complete(first));
         let wait_started = Instant::now();
-        while !ready.exists() && wait_started.elapsed() < Duration::from_secs(5) {
+        while !ready.exists()
+            && !worker.is_finished()
+            && wait_started.elapsed() < Duration::from_secs(5)
+        {
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(ready.exists());
-        let second = request(LocalCompletionProvider::Fish, shell);
-        let error = process.complete(second).unwrap_err();
+        let reached = ready.exists();
+        let overlapping =
+            reached.then(|| process.complete(request(LocalCompletionProvider::Fish, shell)));
+        cancelled.store(true, Ordering::Relaxed);
+        let outcome = worker.join().unwrap();
+        assert!(reached, "provider did not become ready: {outcome:?}");
+        let error = overlapping.unwrap().unwrap_err();
         assert_eq!(error.code, ErrorCode::ResourceLimit);
         assert!(error.message.contains("slots"));
-        cancelled.store(true, Ordering::Relaxed);
-        assert!(
-            worker
-                .join()
-                .unwrap()
-                .unwrap_err()
-                .message
-                .contains("cancelled")
-        );
+        assert!(outcome.unwrap_err().message.contains("cancelled"));
     }
 
     #[cfg(unix)]
