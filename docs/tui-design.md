@@ -3,9 +3,9 @@
 Status: **Implemented baseline and forward design specification.** This
 document turns the §10/§12 vision in
 [language-design.md](language-design.md) into an
-implementation contract. [ADR 0012](decisions/0012-ratatui-interactive-surface.md)
+implementation contract. [ADR 0012](decisions/2026-08-16_192326034_ratatui-is-the-default-capable-terminal-surface.md)
 accepts Ratatui as the capable-TTY default and retains Reedline as the simple
-fallback. [ADR 0022](decisions/0022-persistent-rich-session-transcript.md)
+fallback. [ADR 0022](decisions/2026-08-17_192326098_the-rich-surface-owns-a-persistent-session-transcript.md)
 supersedes ADR 0012's per-command screen release with a persistent, bounded
 rich-session transcript. Sections marked as future work remain design targets
 rather than claims about the current binary.
@@ -74,7 +74,7 @@ Non-goals:
 
 - No graphics, clipboard forwarding, or arbitrary terminal extensions. The
   embedded terminal supports bounded VT text, input, and local query replies
-  under [ADR 0038](decisions/0038-embedded-foreground-terminals.md).
+  under [ADR 0038](decisions/2026-09-06_192326212_embedded-foreground-terminals.md).
 - No rich-surface background jobs in the current stage. They are rejected
   before spawn because their uncaptured asynchronous output could race and
   corrupt later frames. Use the simple surface for background-job workflows.
@@ -213,7 +213,7 @@ extensions outside the embedded implementation.
 
 This behavior is available in Quirl 0.3.0. Version 0.2.0 and earlier require
 the simple surface for general interactive programs. See
-[ADR 0038](decisions/0038-embedded-foreground-terminals.md) for process ownership,
+[ADR 0038](decisions/2026-09-06_192326212_embedded-foreground-terminals.md) for process ownership,
 protocol, resource limits, and failure invariants.
 
 ### 3.4 Transcript, scrolling, selection, and copy
@@ -227,7 +227,7 @@ the editor. The visible transcript shrinks from its older end, keeping the most
 recent output readable above the input; no panel paints over those rows. Closing
 a panel restores the larger transcript viewport. Scrolling away from the tail
 hides input panels and gives history the available body. See
-[ADR 0037](decisions/0037-navigation-completion-space.md).
+[ADR 0037](decisions/2026-09-05_192326206_reserve-space-for-path-navigation-and-completion.md).
 
 One active transcript record accumulates terminal-safe lines equivalent to:
 
@@ -405,7 +405,7 @@ JPEG, PNG, and WebP render as bounded color half-block thumbnails; terminals
 honoring `NO_COLOR` retain image metadata without emitting pixel colors. Other
 binary data uses a hex view. Every preview is bounded and never executes file
 content. The exact state, resource, and terminal invariants are recorded in
-[ADR 0028](decisions/0028-bounded-miller-column-explorer.md).
+[ADR 0028](decisions/2026-09-01_192326140_own-a-bounded-miller-column-directory-explorer.md).
 
 ---
 
@@ -620,7 +620,7 @@ of its last Quirl open and bounded repository-activity timestamp, then by open
 count and stable path. An empty query therefore presents recent active work
 first; with a query, fuzzy relevance remains primary and cached activity order
 breaks equal-score ties. Selecting a repository updates its Quirl open signals.
-See [ADR 0030](decisions/0030-bounded-project-discovery.md).
+See [ADR 0030](decisions/2026-09-02_192326153_bounded-automatic-project-discovery.md).
 
 Managed cloning connects this picker to `quirl projects clone <repository>
 [--root path]`. HTTP(S), SSH, and scp-style remotes map to
@@ -655,7 +655,7 @@ optional `ask`, `managed`, or `off` argument changes it. Missing state defaults 
 to `~/.local/state/quirl/clone-policy.json`, separately from Lua configuration.
 Explicit `quirl projects clone` remains available regardless of this policy.
 Existing repositories are never automatically moved. See
-[ADR 0039](decisions/0039-managed-project-cloning.md).
+[ADR 0039](decisions/2026-09-06_192326220_managed-project-cloning.md).
 
 The picker engine, ranking, and typed-value return stay in `quirl-picker`;
 the surface uses it through the `PickerRanker` composition adapter. Source
@@ -947,7 +947,7 @@ ADR 0013 added bounded built-in and custom semantic themes as config schema v3.
 Schema v4 changes only polished defaults: a compact banner,
 automatic completion after one character, and `rust_version` in the right
 prompt. Current schema v5 adds bounded project-discovery settings under
-[ADR 0030](decisions/0030-bounded-project-discovery.md). Unversioned v0 and
+[ADR 0030](decisions/2026-09-02_192326153_bounded-automatic-project-discovery.md). Unversioned v0 and
 explicit v1/v2/v3/v4 documents migrate to v5 before validation, retaining the
 Tokyo Night theme default.
 
@@ -987,7 +987,7 @@ turning the surface into an unbounded watch application.
    repeated captured ordinary foreground commands without screen exit, resize,
    suspend/resume, EOF, and failure cleanup evidence on Ghostty, Terminal.app,
    iTerm2, and a Linux VTE terminal before calling the behavior release-proven.
-2. **Embedded interactive PTY/VT applications**: [ADR 0038](decisions/0038-embedded-foreground-terminals.md)
+2. **Embedded interactive PTY/VT applications**: [ADR 0038](decisions/2026-09-06_192326212_embedded-foreground-terminals.md)
    records the implemented Unix foreground contract. Background jobs, graphics,
    and additional terminal extensions remain separate work.
 3. **Data-mode lexer spans**: extend `highlight()` when the data grammar

@@ -28,5 +28,5 @@ or high-risk confirmation.
 
 See
 [`spikes/retrieval-models/TRAINING_RESULTS.md`](../../../spikes/retrieval-models/TRAINING_RESULTS.md)
-and [ADR 0025](../../../docs/decisions/0025-fine-tuned-command-retrieval-model.md)
+and [ADR 0025](../../../docs/decisions/2026-08-18_192326118_fine-tuned-command-retrieval-model.md)
 for methodology, measurements, and limitations.

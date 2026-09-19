@@ -8,7 +8,7 @@ to approve a traversal dependency change. `pending` is not a zero or estimate.
 
 This record compares project-discovery implementations without weakening the
 filesystem, cancellation, or publication contract in
-[ADR 0030](../decisions/0030-bounded-project-discovery.md). A faster walker is
+[ADR 0030](../decisions/2026-09-02_192326153_bounded-automatic-project-discovery.md). A faster walker is
 not interchangeable unless it discovers the same repositories, applies the
 same exclusions and filesystem boundaries, reports the same incomplete cases,
 and preserves the previous complete SQLite generation after failure.

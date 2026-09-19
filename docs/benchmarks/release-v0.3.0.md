@@ -23,7 +23,7 @@ All values below are milliseconds except executable bytes. Limits were startup P
 | macOS ARM64 | 10,612,336 | 10.456500 | 13.393500 | 1.814000 | Pass |
 | macOS x86_64 | 12,846,664 | 15.887156 | 15.620783 | 1.153274 | Pass |
 
-Size follows [ADR 0036](../decisions/0036-advisory-release-binary-size.md): the project has no default executable-size ceiling. All four sizes exceeded the advisory 8 MiB threshold and retained warnings. Schema 8 records `hard_ceiling_bytes`, `enforced_limit_bytes`, and `hard_gate_passed` as `null`; exact measured bytes remain present. No caller maximum was requested. Latency, identity, sample completeness, stream retention, and cleanup remained enforced.
+Size follows [ADR 0036](../decisions/2026-09-05_192326199_track-release-binary-size-without-a-project-hard-ceiling.md): the project has no default executable-size ceiling. All four sizes exceeded the advisory 8 MiB threshold and retained warnings. Schema 8 records `hard_ceiling_bytes`, `enforced_limit_bytes`, and `hard_gate_passed` as `null`; exact measured bytes remain present. No caller maximum was requested. Latency, identity, sample completeness, stream retention, and cleanup remained enforced.
 
 For actual timing measurements, schema 8's per-metric `release_gate_accepted` records valid measurement evidence. Numerical acceptance is separately represented by `target_result` and the overall `performance_gate_passed`; a valid measurement that misses a budget still fails the overall gate. All four published reports pass both validity and numerical checks.
 

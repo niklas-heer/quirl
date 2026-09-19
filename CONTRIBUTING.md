@@ -17,7 +17,7 @@ well-tested changes that extend an existing pattern are especially welcome.
 Quirl targets Linux and macOS for interactive use. Windows portability is kept
 contract-tested on a best-effort basis, but native Windows terminal behavior is
 not a release gate. The exact boundary is recorded in
-[ADR 0010](docs/decisions/0010-unix-first-release-scope.md).
+[ADR 0010](docs/decisions/2026-08-16_192326022_freeze-the-1-0-release-scope-around-unix-and-explicit-dialec.md).
 
 ## Set up the workspace
 

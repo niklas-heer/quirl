@@ -130,7 +130,7 @@ are reused without pulling, and completed clones appear in **Alt-Q g**. Use
 `quirl projects policy ask` restores the one-time offer, `managed` explicitly
 opts in for future eligible clones, and `off` disables suggestions. With no
 argument, `quirl projects policy` prints the saved setting. See the
-[managed cloning design](docs/decisions/0039-managed-project-cloning.md).
+[managed cloning design](docs/decisions/2026-09-06_192326220_managed-project-cloning.md).
 
 For development, the repository pins Rust 1.97.1; no system Lua installation is
 required:
@@ -175,8 +175,8 @@ active Rust toolchain to the default right prompt. Legacy unversioned and
 explicit v1/v2/v3/v4 configurations migrate deterministically to v5. Tokyo Night
 is the default. `quirl config web` exposes the same validated palettes through
 a bounded, no-JavaScript preview gallery. See
-[ADR 0013](docs/decisions/0013-lua-config-themes.md) and
-[ADR 0015](docs/decisions/0015-bounded-theme-preview-gallery.md).
+[ADR 0013](docs/decisions/2026-08-16_192326040_themes-are-bounded-semantic-palettes-in-lua-configuration.md) and
+[ADR 0015](docs/decisions/2026-08-16_192326051_the-local-configuration-form-previews-validated-theme-data.md).
 
 Quirl 0.3.0 supports `editor.keymap = "emacs"` (the default), `"vim"`,
 and `"helix"` in Lua configuration. Both terminal surfaces accept bracketed

@@ -1,0 +1,69 @@
++++
+schema_version = 1
+id = "01M2XHZ6YYD5SQD5S3ZGS2J76Y"
+title = "External history tools integrate through a bounded provider boundary"
+date = "2026-08-16"
+status = "proposed"
+tags = ["tooling", "architecture"]
+supersedes = []
+superseded_by = []
+depends_on = ["01M2XHZ6YCQYD63A7TCY0C1316", "01M2XHZ6Z9746X4SH1P1PET9C7"]
+related_to = []
++++
+- Extends: [ADR 0011](2026-08-16_192326028_deterministic-testing-and-bounded-engineering.md), [ADR 0016](2026-08-16_192326057_reconcile-runtime-layering-and-ownership-contracts.md)
+
+## Context
+
+Quirl owns a durable, bounded, Reedline-compatible history file and a typed
+Ctrl-R picker. Tools such as Atuin instead keep structured history in their own
+database and require pre-execution and post-execution lifecycle calls. Atuin's
+generated shell initialization does not support a `quirl` target, and pointing
+`QUIRL_HISTORY` at its SQLite database would corrupt one or both stores.
+
+The existing extension event callbacks are not a sufficient first-class
+adapter: result and error paths do not yet share a correlation identifier,
+callbacks have short synchronous deadlines, and a callback failure must not
+interfere with terminal cleanup or command completion.
+
+## Proposed decision
+
+External history remains opt-in and dual-writes Quirl's native history as the
+offline fallback. A provider implementation belongs in the CLI composition
+root and invokes a fixed executable directly with explicit arguments, never
+through a compatibility shell and never by reading a provider's private
+database.
+
+The UI receives typed, bounded history snapshots and keeps ownership of its
+picker. The first Atuin adapter will use `ATUIN_SHELL=quirl`, a session ID, the
+documented `history start --hook` / `history end --hook` lifecycle, and bounded
+non-interactive search output. It will not embed Atuin's full-screen TUI inside
+Quirl's active terminal surface.
+
+The adapter must enforce these invariants:
+
+- Missing, old, locked, slow, malformed, or oversized providers never stop
+  command execution or lose native history.
+- Start, end, and search have explicit wall deadlines, output-byte limits,
+  record-count limits, and per-record limits. Timed-out children are killed and
+  reaped.
+- A returned provider history ID receives at most one end attempt; an empty ID
+  means the provider filtered the command.
+- Execution correlation covers success, shell errors, interruption, and
+  cancellation. Status and duration are recorded from the completed outcome,
+  not inferred later.
+- Search uses a capacity-one, newest-request-wins worker. Cached native history
+  supplies autosuggestions; no external process runs per keystroke.
+- Provider output is terminal-escaped and merged newest-first with stable
+  deduplication. A failure produces at most one safe notice per failure state.
+
+## Consequences
+
+- Quirl does not currently claim Atuin support; this ADR defines the boundary
+  that must land before that claim is made.
+- The implementation needs deterministic fake-provider tests for arguments,
+  environment, multiline records, filtering, nonzero exits, timeouts, reaping,
+  queue overflow, malformed output, and missing executables.
+- The prerequisite native-history work is implemented independently: rich,
+  simple, Reedline-picker, and non-interactive picker reads share explicit
+  scanned-byte, retained-byte, entry-count, and per-entry bounds. This does not
+  accept this ADR or implement an external provider.

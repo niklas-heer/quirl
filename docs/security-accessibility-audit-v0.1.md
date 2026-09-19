@@ -46,9 +46,9 @@ remains within ADR 0010's best-effort evidence scope.
 Linux and macOS are the supported interactive platforms. Windows evidence in
 this audit covers cross-compilation and portable contract behavior only; it is
 not a claim of native terminal validation or a Windows release gate. See
-[ADR 0010](decisions/0010-unix-first-release-scope.md).
+[ADR 0010](decisions/2026-08-16_192326022_freeze-the-1-0-release-scope-around-unix-and-explicit-dialec.md).
 The rich/default and simple/fallback terminal split follows
-[ADR 0012](decisions/0012-ratatui-interactive-surface.md).
+[ADR 0012](decisions/2026-08-16_192326034_ratatui-is-the-default-capable-terminal-surface.md).
 
 The historical P14 candidate ran on actual Apple Mac14,9 hardware with an Apple
 M2 Pro, macOS 15.7.9 (24G830), Darwin 24.6.0, and the

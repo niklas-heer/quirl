@@ -27,7 +27,7 @@ untagged source remains candidate or development work:
 - Projects can organize clones as `~/Projects/host/owner/repository`, respect
   GHQ roots, reuse matching checkouts, and open completed clones while preserving
   unfinished input. Plain `git clone URL` keeps its original behavior unless the
-  user opts in through the [managed cloning offer](decisions/0039-managed-project-cloning.md).
+  user opts in through the [managed cloning offer](decisions/2026-09-06_192326220_managed-project-cloning.md).
 - Data mode is a focused, bounded runtime rather than a general type system. It
   supports the sources, bridges, transforms, materialization points, limits,
   and exclusions documented in [the data runtime](data-runtime.md); bytes and
@@ -366,7 +366,7 @@ bash ./legacy-deploy.sh   # explicit always wins
 - Bash- or Zsh-only constructs produce a mismatch diagnostic and the exact dialect form; Quirl never silently reinterprets them.
 - Here-documents, process substitution, loops, functions, conditionals, and
   dialect control syntax are intentionally C2 islands for 1.0, not an unfinished
-  native-syntax promise. See [ADR 0010](decisions/0010-unix-first-release-scope.md).
+  native-syntax promise. See [ADR 0010](decisions/2026-08-16_192326022_freeze-the-1-0-release-scope-around-unix-and-explicit-dialec.md).
 - `source` accepts Quirl modules and a portable subset. `source --bash` and `source --zsh` import only representable state.
 - Behavior is versioned in a machine-readable matrix and backed by differential tests.
 
@@ -493,7 +493,7 @@ Diagnostic rendering supports human, compact, JSON, and GitHub Actions formats f
 
 Quirl needs one canonical general-purpose language for scripts, configuration, custom commands, prompt components, keymaps, and trusted UI extensions. The concise command/data notation remains the interactive shell surface; it does not grow into a second general-purpose language.
 
-> **Accepted: Lua.** Rust remains Quirl’s implementation language; Lua is the sole first-class language for configuration, scripts, and trusted plugins. The selection evidence measured Lua 5.4; the production source tree now pins Lua 5.5.1 under [ADR 0027](decisions/0027-lua-5-5-1-runtime.md). Familiarity, a small runtime, longevity, and the mature `mlua` bridge outweigh Luau’s stronger analyzer for this extension-only role. Read the [decision report](embedded-language-decision.md) and [ADR 0001](decisions/0001-lua-extension-language.md).
+> **Accepted: Lua.** Rust remains Quirl’s implementation language; Lua is the sole first-class language for configuration, scripts, and trusted plugins. The selection evidence measured Lua 5.4; the production source tree now pins Lua 5.5.1 under [ADR 0027](decisions/2026-08-26_192326132_advance-the-embedded-runtime-to-lua-5-5-1.md). Familiarity, a small runtime, longevity, and the mature `mlua` bridge outweigh Luau’s stronger analyzer for this extension-only role. Read the [decision report](embedded-language-decision.md) and [ADR 0001](decisions/2026-08-15_192325970_lua-is-quirl-s-extension-language.md).
 
 The first Lua slice embedded restricted Lua 5.4. The current release embeds restricted Lua 5.5.1; generates LuaLS/JSON/Markdown SDK views; validates configuration with Rust schemas; atomically reloads config and plugins at safe prompt boundaries; and applies keymap, prompt, picker, and extension settings to the editor. The rejected prototype runtime and all executable/dependency paths are removed.
 
@@ -839,7 +839,7 @@ The parser boundary preserves compatibility without leaking it into the value ru
 
 | Principle | Implication |
 | --- | --- |
-| Rust core | Implemented boundaries ([ADR 0002](decisions/0002-crate-layering.md)): foundations `quirl-core`, `quirl-catalog`, `quirl-syntax`; `quirl-data` and `quirl-lua` on core only; `quirl-ui`; `quirl-cli` as sole composition root. Candidate crates as the surface grows: `quirl-compat`, `quirl-plan`, `quirl-process`, `quirl-picker`, `quirl-config`, `quirl-docs`, `quirl-plugin`, `quirl-lsp`. Adding a layer or inverting an edge requires a new ADR. |
+| Rust core | Implemented boundaries ([ADR 0002](decisions/2026-08-15_192325976_enforce-one-way-crate-layering.md)): foundations `quirl-core`, `quirl-catalog`, `quirl-syntax`; `quirl-data` and `quirl-lua` on core only; `quirl-ui`; `quirl-cli` as sole composition root. Candidate crates as the surface grows: `quirl-compat`, `quirl-plan`, `quirl-process`, `quirl-picker`, `quirl-config`, `quirl-docs`, `quirl-plugin`, `quirl-lsp`. Adding a layer or inverting an edge requires a new ADR. |
 | Conch lesson | Compatibility and data ASTs lower to executor interfaces without the executor knowing their surface grammar. |
 | Flyline lesson | Ratatui supplies responsive prompt widgets, fuzzy suggestions, tooltips, selection, panels while preserving scrollback and a plain fallback. |
 | Nu lesson | Built-ins exchange typed streams. External commands remain byte-oriented and cross visible adapters with bounded buffering. |
@@ -1016,7 +1016,7 @@ and accessible text output, per the release criterion in §10.
   8 MiB. Size is advisory by default; a caller may explicitly enforce a maximum.
   Missing evidence still fails, and artifact architecture must match the
   harness. Latency and cleanup gates remain unchanged. See
-  [ADR 0036](decisions/0036-advisory-release-binary-size.md).
+  [ADR 0036](decisions/2026-09-05_192326199_track-release-binary-size-without-a-project-hard-ceiling.md).
 - **Security and accessibility claims are adversarial.** Bounds, symlink and
   path containment, capability smuggling, cancellation, hostile C0/C1 terminal
   text, JSON semantic preservation, `NO_COLOR`, `TERM=dumb`, plain fallbacks,

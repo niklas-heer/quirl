@@ -4,7 +4,7 @@
 
 > **Outcome:** Quirl’s extension language is **Lua**. This selection report
 > evaluated Lua 5.4; the current runtime is Lua 5.5.1 under
-> [ADR 0027](decisions/0027-lua-5-5-1-runtime.md).
+> [ADR 0027](decisions/2026-08-26_192326132_advance-the-embedded-runtime-to-lua-5-5-1.md).
 
 Rust owns Quirl’s shell, executor, built-ins, value model, and performance-critical logic. Lua is the deliberately small, recognizable extension language for configuration, scripts, and trusted plugins. Quirl supplies a modern experience with generated annotations, completion, linting, formatting, schema validation, and strict Rust boundary checks. The historical measurements below remain Lua 5.4 evidence and are not attributed to the Lua 5.5.1 runtime.
 
@@ -153,7 +153,7 @@ Choose Lua for configuration, scripts, and trusted plugins. Its familiarity, tin
 | Security boundary | Trusted Lua receives explicit handles and budgets. Untrusted extensions remain out of process or WebAssembly. |
 | Do not default to | Keep TypeScript + QuickJS-NG as an optional runner, or revisit it only when TypeScript has a stable programmatic API and a compelling package story. |
 
-The durable record is [ADR 0001: Lua is Quirl’s extension language](decisions/0001-lua-extension-language.md). Revisit Luau only if real plugins demonstrate that annotations and schema validation are insufficient.
+The durable record is [ADR 0001: Lua is Quirl’s extension language](decisions/2026-08-15_192325970_lua-is-quirl-s-extension-language.md). Revisit Luau only if real plugins demonstrate that annotations and schema validation are insufficient.
 
 ## 10. Method and sources
 

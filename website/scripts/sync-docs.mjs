@@ -47,45 +47,45 @@ const documents = [
   ['docs/benchmarks/project-discovery.md', 'research/benchmarks/project-discovery.mdx'],
   ['docs/benchmarks/embedded-language-selection.md', 'research/benchmarks/embedded-language-selection.mdx'],
   ['docs/benchmarks/steel-lua-fennel.md', 'research/benchmarks/steel-lua-fennel.mdx'],
-  ['docs/decisions/0001-lua-extension-language.md', 'architecture/decisions/0001-lua-extension-language.mdx'],
-  ['docs/decisions/0002-crate-layering.md', 'architecture/decisions/0002-crate-layering.mdx'],
-  ['docs/decisions/0003-preview-runtime-layers.md', 'architecture/decisions/0003-preview-runtime-layers.mdx'],
-  ['docs/decisions/0004-phase-2-contract-and-language-service-layers.md', 'architecture/decisions/0004-phase-2-contract-and-language-service-layers.mdx'],
-  ['docs/decisions/0005-plugin-platform-layer.md', 'architecture/decisions/0005-plugin-platform-layer.mdx'],
-  ['docs/decisions/0006-platform-process-and-recovery-boundaries.md', 'architecture/decisions/0006-platform-process-and-recovery-boundaries.mdx'],
-  ['docs/decisions/0007-semantic-catalog-v4.md', 'architecture/decisions/0007-semantic-catalog-v4.mdx'],
-  ['docs/decisions/0008-protocol-freeze-and-migrations.md', 'architecture/decisions/0008-protocol-freeze-and-migrations.mdx'],
-  ['docs/decisions/0009-isolated-process-adapter-v1.md', 'architecture/decisions/0009-isolated-process-adapter-v1.mdx'],
-  ['docs/decisions/0010-unix-first-release-scope.md', 'architecture/decisions/0010-unix-first-release-scope.mdx'],
-  ['docs/decisions/0011-deterministic-testing-and-bounded-engineering.md', 'architecture/decisions/0011-deterministic-testing-and-bounded-engineering.mdx'],
-  ['docs/decisions/0012-ratatui-interactive-surface.md', 'architecture/decisions/0012-ratatui-interactive-surface.mdx'],
-  ['docs/decisions/0013-lua-config-themes.md', 'architecture/decisions/0013-lua-config-themes.mdx'],
-  ['docs/decisions/0014-external-history-provider-boundary.md', 'architecture/decisions/0014-external-history-provider-boundary.mdx'],
-  ['docs/decisions/0015-bounded-theme-preview-gallery.md', 'architecture/decisions/0015-bounded-theme-preview-gallery.mdx'],
-  ['docs/decisions/0016-runtime-layering-contract.md', 'architecture/decisions/0016-runtime-layering-contract.mdx'],
-  ['docs/decisions/0017-shared-execution-contract.md', 'architecture/decisions/0017-shared-execution-contract.mdx'],
-  ['docs/decisions/0018-typed-lua-runner-abi.md', 'architecture/decisions/0018-typed-lua-runner-abi.mdx'],
-  ['docs/decisions/0019-isolated-lua-worker-deadlines.md', 'architecture/decisions/0019-isolated-lua-worker-deadlines.mdx'],
-  ['docs/decisions/0020-owned-unix-process-group-anchor.md', 'architecture/decisions/0020-owned-unix-process-group-anchor.mdx'],
-  ['docs/decisions/0021-sqlite-local-command-intelligence.md', 'architecture/decisions/0021-sqlite-local-command-intelligence.mdx'],
-  ['docs/decisions/0022-persistent-rich-session-transcript.md', 'architecture/decisions/0022-persistent-rich-session-transcript.mdx'],
-  ['docs/decisions/0023-rust-1.97-compatibility.md', 'architecture/decisions/0023-rust-1.97-compatibility.mdx'],
-  ['docs/decisions/0024-kdl-native-command-catalog.md', 'architecture/decisions/0024-kdl-native-command-catalog.mdx'],
-  ['docs/decisions/0025-fine-tuned-command-retrieval-model.md', 'architecture/decisions/0025-fine-tuned-command-retrieval-model.mdx'],
-  ['docs/decisions/0026-rust-native-releases-and-runtime-assets.md', 'architecture/decisions/0026-rust-native-releases-and-runtime-assets.mdx'],
-  ['docs/decisions/0027-lua-5-5-1-runtime.md', 'architecture/decisions/0027-lua-5-5-1-runtime.mdx'],
-  ['docs/decisions/0028-bounded-miller-column-explorer.md', 'architecture/decisions/0028-bounded-miller-column-explorer.mdx'],
-  ['docs/decisions/0029-codex-command-planner.md', 'architecture/decisions/0029-codex-command-planner.mdx'],
-  ['docs/decisions/0030-bounded-project-discovery.md', 'architecture/decisions/0030-bounded-project-discovery.mdx'],
-  ['docs/decisions/0031-level-triggered-terminal-input.md', 'architecture/decisions/0031-level-triggered-terminal-input.mdx'],
-  ['docs/decisions/0032-bounded-terminal-input.md', 'architecture/decisions/0032-bounded-terminal-input.mdx'],
-  ['docs/decisions/0033-bounded-simple-editor.md', 'architecture/decisions/0033-bounded-simple-editor.mdx'],
-  ['docs/decisions/0034-release-binary-budget.md', 'architecture/decisions/0034-release-binary-budget.mdx'],
-  ['docs/decisions/0035-cold-interactive-startup.md', 'architecture/decisions/0035-cold-interactive-startup.mdx'],
-  ['docs/decisions/0036-advisory-release-binary-size.md', 'architecture/decisions/0036-advisory-release-binary-size.mdx'],
-  ['docs/decisions/0037-navigation-completion-space.md', 'architecture/decisions/0037-navigation-completion-space.mdx'],
-  ['docs/decisions/0038-embedded-foreground-terminals.md', 'architecture/decisions/0038-embedded-foreground-terminals.mdx'],
-  ['docs/decisions/0039-managed-project-cloning.md', 'architecture/decisions/0039-managed-project-cloning.mdx'],
+  ['docs/decisions/2026-08-15_192325970_lua-is-quirl-s-extension-language.md', 'architecture/decisions/0001-lua-extension-language.mdx'],
+  ['docs/decisions/2026-08-15_192325976_enforce-one-way-crate-layering.md', 'architecture/decisions/0002-crate-layering.mdx'],
+  ['docs/decisions/2026-08-15_192325982_preview-runtime-layers.md', 'architecture/decisions/0003-preview-runtime-layers.mdx'],
+  ['docs/decisions/2026-08-15_192325988_phase-2-contract-and-language-service-layers.md', 'architecture/decisions/0004-phase-2-contract-and-language-service-layers.mdx'],
+  ['docs/decisions/2026-08-15_192325993_plugin-platform-state-and-isolation-boundary.md', 'architecture/decisions/0005-plugin-platform-layer.mdx'],
+  ['docs/decisions/2026-08-15_192325999_platform-process-and-recovery-boundaries.md', 'architecture/decisions/0006-platform-process-and-recovery-boundaries.mdx'],
+  ['docs/decisions/2026-08-15_192326005_make-the-semantic-catalog-the-authoritative-command-contract.md', 'architecture/decisions/0007-semantic-catalog-v4.mdx'],
+  ['docs/decisions/2026-08-15_192326011_freeze-public-protocols-with-owner-defined-descriptors.md', 'architecture/decisions/0008-protocol-freeze-and-migrations.mdx'],
+  ['docs/decisions/2026-08-16_192326016_execute-the-narrow-isolated-process-adapter-v1-handshake.md', 'architecture/decisions/0009-isolated-process-adapter-v1.mdx'],
+  ['docs/decisions/2026-08-16_192326022_freeze-the-1-0-release-scope-around-unix-and-explicit-dialec.md', 'architecture/decisions/0010-unix-first-release-scope.mdx'],
+  ['docs/decisions/2026-08-16_192326028_deterministic-testing-and-bounded-engineering.md', 'architecture/decisions/0011-deterministic-testing-and-bounded-engineering.mdx'],
+  ['docs/decisions/2026-08-16_192326034_ratatui-is-the-default-capable-terminal-surface.md', 'architecture/decisions/0012-ratatui-interactive-surface.mdx'],
+  ['docs/decisions/2026-08-16_192326040_themes-are-bounded-semantic-palettes-in-lua-configuration.md', 'architecture/decisions/0013-lua-config-themes.mdx'],
+  ['docs/decisions/2026-08-16_192326046_external-history-tools-integrate-through-a-bounded-provider.md', 'architecture/decisions/0014-external-history-provider-boundary.mdx'],
+  ['docs/decisions/2026-08-16_192326051_the-local-configuration-form-previews-validated-theme-data.md', 'architecture/decisions/0015-bounded-theme-preview-gallery.mdx'],
+  ['docs/decisions/2026-08-16_192326057_reconcile-runtime-layering-and-ownership-contracts.md', 'architecture/decisions/0016-runtime-layering-contract.mdx'],
+  ['docs/decisions/2026-08-16_192326063_share-one-bounded-execution-contract.md', 'architecture/decisions/0017-shared-execution-contract.mdx'],
+  ['docs/decisions/2026-08-16_192326069_version-the-typed-lua-runner-abi.md', 'architecture/decisions/0018-typed-lua-runner-abi.mdx'],
+  ['docs/decisions/2026-08-17_192326076_isolate-executable-lua-behind-supervised-workers.md', 'architecture/decisions/0019-isolated-lua-worker-deadlines.mdx'],
+  ['docs/decisions/2026-08-17_192326083_owned-unix-process-group-anchors.md', 'architecture/decisions/0020-owned-unix-process-group-anchor.mdx'],
+  ['docs/decisions/2026-08-17_192326090_sqlite-local-command-intelligence.md', 'architecture/decisions/0021-sqlite-local-command-intelligence.mdx'],
+  ['docs/decisions/2026-08-17_192326098_the-rich-surface-owns-a-persistent-session-transcript.md', 'architecture/decisions/0022-persistent-rich-session-transcript.mdx'],
+  ['docs/decisions/2026-08-18_192326104_rust-1-97-compatibility-and-selective-adoption.md', 'architecture/decisions/0023-rust-1.97-compatibility.mdx'],
+  ['docs/decisions/2026-08-18_192326111_compile-curated-native-command-specifications-from-kdl.md', 'architecture/decisions/0024-kdl-native-command-catalog.mdx'],
+  ['docs/decisions/2026-08-18_192326118_fine-tuned-command-retrieval-model.md', 'architecture/decisions/0025-fine-tuned-command-retrieval-model.mdx'],
+  ['docs/decisions/2026-08-18_192326126_rust-native-releases-and-runtime-assets.md', 'architecture/decisions/0026-rust-native-releases-and-runtime-assets.mdx'],
+  ['docs/decisions/2026-08-26_192326132_advance-the-embedded-runtime-to-lua-5-5-1.md', 'architecture/decisions/0027-lua-5-5-1-runtime.mdx'],
+  ['docs/decisions/2026-09-01_192326140_own-a-bounded-miller-column-directory-explorer.md', 'architecture/decisions/0028-bounded-miller-column-explorer.mdx'],
+  ['docs/decisions/2026-09-02_192326146_codex-cli-provides-the-first-hosted-command-planner.md', 'architecture/decisions/0029-codex-command-planner.mdx'],
+  ['docs/decisions/2026-09-02_192326153_bounded-automatic-project-discovery.md', 'architecture/decisions/0030-bounded-project-discovery.mdx'],
+  ['docs/decisions/2026-09-05_192326160_keep-queued-terminal-input-observable-across-resize-events.md', 'architecture/decisions/0031-level-triggered-terminal-input.mdx'],
+  ['docs/decisions/2026-09-05_192326169_bound-terminal-input-before-editor-admission.md', 'architecture/decisions/0032-bounded-terminal-input.mdx'],
+  ['docs/decisions/2026-09-05_192326177_bound-and-safely-render-the-simple-editor.md', 'architecture/decisions/0033-bounded-simple-editor.mdx'],
+  ['docs/decisions/2026-09-05_192326185_preserve-features-with-a-12-mib-release-binary-ceiling.md', 'architecture/decisions/0034-release-binary-budget.mdx'],
+  ['docs/decisions/2026-09-05_192326192_keep-cold-interactive-startup-free-of-project-database-loadi.md', 'architecture/decisions/0035-cold-interactive-startup.mdx'],
+  ['docs/decisions/2026-09-05_192326199_track-release-binary-size-without-a-project-hard-ceiling.md', 'architecture/decisions/0036-advisory-release-binary-size.mdx'],
+  ['docs/decisions/2026-09-05_192326206_reserve-space-for-path-navigation-and-completion.md', 'architecture/decisions/0037-navigation-completion-space.mdx'],
+  ['docs/decisions/2026-09-06_192326212_embedded-foreground-terminals.md', 'architecture/decisions/0038-embedded-foreground-terminals.mdx'],
+  ['docs/decisions/2026-09-06_192326220_managed-project-cloning.md', 'architecture/decisions/0039-managed-project-cloning.mdx'],
 ];
 
 const pageBySource = new Map(documents);
@@ -104,6 +104,23 @@ function firstHeading(markdown, sourcePath) {
     .split('-')
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' ');
+}
+
+/**
+ * vrdx decision records carry TOML metadata between `+++` lines instead of an H1.
+ * Use it for the page title and show the lifecycle, rather than printing the block.
+ */
+function extractDecisionMetadata(body) {
+  if (!body.startsWith('+++\n')) return null;
+  const end = body.indexOf('\n+++\n', 3);
+  if (end === -1) return null;
+
+  const block = body.slice(4, end + 1);
+  const field = (name) => block.match(new RegExp(`^${name} = "([^"]*)"`, 'm'))?.[1] ?? '';
+  const title = field('title');
+  if (!title) return null;
+
+  return { title, date: field('date'), status: field('status'), body: body.slice(end + 5) };
 }
 
 function rewriteLinks(markdown, sourcePath) {
@@ -132,8 +149,16 @@ function evidenceNotice(sourcePath) {
 function renderDocument(sourcePath) {
   const absoluteSource = join(repositoryRoot, sourcePath);
   let body = readFileSync(absoluteSource, 'utf8').replaceAll('\r\n', '\n');
-  const title = firstHeading(body, sourcePath);
-  body = body.replace(/^#\s+.+\n+/, '');
+  const decision = extractDecisionMetadata(body);
+  let title;
+  if (decision) {
+    title = decision.title;
+    const status = decision.status.charAt(0).toUpperCase() + decision.status.slice(1);
+    body = `*${status} · ${decision.date}*\n\n${decision.body}`;
+  } else {
+    title = firstHeading(body, sourcePath);
+    body = body.replace(/^#\s+.+\n+/, '');
+  }
   body = rewriteLinks(body, sourcePath);
   // Shiki has no Quirl grammar yet. Keep the source label in a visible title
   // while using plain-text highlighting until a grammar is published.

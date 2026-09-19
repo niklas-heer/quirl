@@ -63,4 +63,4 @@ are the supported interactive platforms. Windows remains a best-effort portable
 process target, so native Windows terminal and suspend validation is not a 1.0
 release gate. Differential conformance, performance, accessibility, and
 security evidence remain independently tracked from schema identity. See
-[ADR 0010](decisions/0010-unix-first-release-scope.md).
+[ADR 0010](decisions/2026-08-16_192326022_freeze-the-1-0-release-scope-around-unix-and-explicit-dialec.md).

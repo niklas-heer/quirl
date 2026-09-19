@@ -54,7 +54,7 @@ rather than replace, real terminal checks on supported hardware.
 The workspace Cargo configuration omits unused full-text and spatial modules
 from bundled SQLite. Quirl's internal catalog, history, and intelligence stores
 use ordinary tables. Keep those build settings when reproducing release-size
-measurements. [ADR 0036](decisions/0036-advisory-release-binary-size.md)
+measurements. [ADR 0036](decisions/2026-09-05_192326199_track-release-binary-size-without-a-project-hard-ceiling.md)
 makes executable size advisory by default: retain exact byte counts and the
 warning above 8 MiB, and investigate growth without a clear user benefit.
 An explicit `--max-binary-bytes` still enforces the caller's requested maximum.
@@ -164,7 +164,7 @@ admission runs off the input thread and publishes cached repositories before
 discovery. Draw/provider ordering checks require the initial rich prompt context
 request to follow a successful flush, and reject enqueueing after a draw failure.
 These ordering checks complement the enforcing native latency measurements; see
-[ADR 0035](decisions/0035-cold-interactive-startup.md).
+[ADR 0035](decisions/2026-09-05_192326192_keep-cold-interactive-startup-free-of-project-database-loadi.md).
 
 ## Layers
 
@@ -530,4 +530,4 @@ and dismissal erases the expanded viewport before restoring the compact prompt.
   PTY model when the claim concerns visibility or terminal state.
 
 The rationale and non-goals are recorded in
-[ADR 0011](decisions/0011-deterministic-testing-and-bounded-engineering.md).
+[ADR 0011](decisions/2026-08-16_192326028_deterministic-testing-and-bounded-engineering.md).

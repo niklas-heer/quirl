@@ -116,7 +116,7 @@ candidate recall, complete command construction, correct argument values,
 execution safety, adversarial metadata, outage behavior, or sustained service
 availability. It has no same-machine local-retrieval baseline and no other-model
 baseline. The historical 118.6 ms local cold median in
-[ADR 0025](../decisions/0025-fine-tuned-command-retrieval-model.md) uses a different
+[ADR 0025](../decisions/2026-08-18_192326118_fine-tuned-command-retrieval-model.md) uses a different
 workload and is not a controlled comparison. A 452 ms median network request
 does not establish an improvement to ordinary local completion latency.
 

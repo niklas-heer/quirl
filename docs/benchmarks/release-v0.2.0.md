@@ -23,7 +23,7 @@ All values below are milliseconds except executable bytes. Limits were startup P
 | macOS ARM64 | 10,395,728 | 11.200625 | 12.819000 | 2.654500 | Pass |
 | macOS x86_64 | 12,562,680 | 18.476857 | 19.794755 | 1.164514 | Pass |
 
-Size follows [ADR 0036](../decisions/0036-advisory-release-binary-size.md): the project has no default executable-size ceiling. All four sizes exceeded the advisory 8 MiB threshold and retained warnings. Schema 8 records `hard_ceiling_bytes`, `enforced_limit_bytes`, and `hard_gate_passed` as `null`; measured bytes remain present and `release_gate_accepted` is `true`. No caller maximum was requested. Latency, identity, sample-completeness, stream-retention, and cleanup gates remained enforced.
+Size follows [ADR 0036](../decisions/2026-09-05_192326199_track-release-binary-size-without-a-project-hard-ceiling.md): the project has no default executable-size ceiling. All four sizes exceeded the advisory 8 MiB threshold and retained warnings. Schema 8 records `hard_ceiling_bytes`, `enforced_limit_bytes`, and `hard_gate_passed` as `null`; measured bytes remain present and `release_gate_accepted` is `true`. No caller maximum was requested. Latency, identity, sample-completeness, stream-retention, and cleanup gates remained enforced.
 
 ## Runners and toolchain
 

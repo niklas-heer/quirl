@@ -1,0 +1,95 @@
++++
+schema_version = 1
+id = "01M2XHZ6YJMPJN19F5HPM9C4QB"
+title = "Ratatui is the default capable-terminal surface"
+date = "2026-08-16"
+status = "accepted"
+tags = ["shell"]
+supersedes = []
+superseded_by = []
+depends_on = ["01M2XHZ6WRQNS9VTHY13TCBSBE", "01M2XHZ6XVXTAP30HMCW9N5TMV", "01M2XHZ6Y69RDWA9BNV5SMG7Y8"]
+related_to = []
++++
+- Amended: 2026-08-17 (full-screen editing and always-on command intelligence)
+- Extends: [ADR 0002](2026-08-15_192325976_enforce-one-way-crate-layering.md), [ADR 0008](2026-08-15_192326011_freeze-public-protocols-with-owner-defined-descriptors.md), [ADR 0010](2026-08-16_192326022_freeze-the-1-0-release-scope-around-unix-and-explicit-dialec.md)
+
+## Context
+
+Quirl's Reedline editor established durable history, semantic completion, modal
+keymaps, and simple-terminal behavior, but Reedline's prompt and menu painter
+cannot provide the persistent context, diagnostics, completion documentation,
+and status regions specified by the product design without taking ownership of
+the renderer.
+
+Quirl must preserve ordinary terminal scrollback and release the terminal before
+foreground execution, suspension, or PTY handoff. It must also retain a stable
+line-oriented path for dumb, redirected, very short, or explicitly simple
+terminals. Removing Reedline at the same time as introducing the rich renderer
+would combine two independently risky changes.
+
+The rich surface also adds public configuration. The prior config contract was
+v1, while unversioned configuration is the legacy v0 form. ADR 0008 requires a
+version change and a deterministic migration rather than silently changing v1.
+
+## Decision
+
+Quirl uses a Ratatui full-screen viewport on the terminal's alternate screen as
+the default interactive surface on
+capable Linux and macOS TTYs. `ui.surface = "auto"` is the default and selects
+the rich surface when stderr is a TTY, `TERM` is not `dumb`, and terminal height
+is at least five rows. Rich frames are limited to 512 columns by 256 rows and
+revalidated before every resized draw. `ui.surface = "simple"`, a non-TTY
+stderr, `TERM=dumb`, or a shorter terminal selects the Reedline surface. `ui.surface = "rich"`
+requests rich behavior but still obeys the hard terminal-capability checks.
+`NO_COLOR` keeps the rich layout and disables color styling.
+
+The rich surface:
+
+- owns the complete alternate screen while editing, keeps its status bar on the
+  physical bottom row, and returns to the unchanged normal screen before any
+  command output is produced;
+- owns its editor state, grapheme-aware motion/deletion, bounded undo/redo,
+  bracketed paste, prefix history, autosuggestions, and Emacs/Vim/Helix modes;
+- renders prompt context, syntax spans, advisory diagnostics, a persistent
+  textual status line, catalog/plugin completion documentation, and typed
+  history/file/directory/palette overlays;
+- uses the existing bounded completion worker and catalog rather than defining
+  a second completion protocol;
+- automatically opens catalog-backed information for an exact command and
+  catalog-backed options for a flag prefix. This contextual minimum is always
+  active on the rich surface; `completion.auto` continues to govern broader
+  fuzzy completion on ordinary token prefixes;
+- drops the viewport, restores cooked mode and cursor state, and disables
+  bracketed paste before execution, suspension, mode handoff, or exit. Alternate
+  screen exit is part of the same RAII cleanup transaction and is retried by
+  drop after a reported cleanup failure; and
+- escapes Quirl-owned and extension-owned terminal text before rendering.
+
+The Reedline editor remains the `simple` fallback for this release. This ADR
+does **not** accept the former M5 proposal to remove Reedline or claim feature
+parity between the two editor cores. Retirement requires separate conformance,
+real-terminal, accessibility, and dependency-removal evidence.
+
+Configuration moves to schema v2. It adds `prompt.transient`, `ui.surface`,
+`ui.statusline.hints`, `completion.auto`, and `completion.min_chars`. Missing
+fields receive v2 defaults. Legacy v0 and explicit v1 documents migrate to v2
+before authoritative validation; versions newer than v2 fail closed.
+
+The crate boundary remains unchanged: `quirl-ui` owns both terminal surfaces,
+`quirl-lua` owns the config schema and migration, and `quirl-cli` selects and
+composes the active surface.
+
+## Consequences
+
+- Capable TTY users receive the rich full-screen editing surface without opting
+  in, while simple terminals retain a tested fallback and the same execution
+  grammar.
+- Foreground applications and child output continue to own the terminal while
+  they run. The alternate screen exists only for one bounded editing session;
+  execution, suspension, EOF, errors, and normal exit expose normal scrollback.
+- Config v2 and its v0/v1 migration become reviewed protocol-freeze evidence.
+- Ratatui and Reedline coexist temporarily, increasing dependency and
+  conformance work but keeping fallback retirement independently reversible.
+- Real Linux/macOS terminal testing must cover rich selection, resize,
+  release/re-entry, suspension, `NO_COLOR`, and automatic fallback before
+  release sign-off.

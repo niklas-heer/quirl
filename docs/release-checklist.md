@@ -6,12 +6,12 @@ new candidate; they are not the status display for an already published
 version. Each run applies to one exact candidate commit and artifact. A pass
 from an older commit is useful history, not release evidence. Linux and macOS
 are the supported interactive platforms. Windows is explicitly outside this
-release gate under [ADR 0010](decisions/0010-unix-first-release-scope.md).
+release gate under [ADR 0010](decisions/2026-08-16_192326022_freeze-the-1-0-release-scope-around-unix-and-explicit-dialec.md).
 The capable-TTY default and retained Reedline fallback are governed by
-[ADR 0012](decisions/0012-ratatui-interactive-surface.md); shared theme behavior
-is governed by [ADR 0013](decisions/0013-lua-config-themes.md). Rust-native
+[ADR 0012](decisions/2026-08-16_192326034_ratatui-is-the-default-capable-terminal-surface.md); shared theme behavior
+is governed by [ADR 0013](decisions/2026-08-16_192326040_themes-are-bounded-semantic-palettes-in-lua-configuration.md). Rust-native
 release and downloadable-asset ownership is governed by
-[ADR 0026](decisions/0026-rust-native-releases-and-runtime-assets.md); the
+[ADR 0026](decisions/2026-08-18_192326126_rust-native-releases-and-runtime-assets.md); the
 operator procedure is [documented separately](releasing.md).
 
 This checklist uses two explicit revisions:
@@ -304,7 +304,7 @@ Use the direct command above to capture canonical JSON evidence.
   records an advisory warning. Investigate growth without a clear user benefit.
   There is no default project size ceiling; an explicit `--max-binary-bytes`
   remains enforceable. Missing size or identity evidence still blocks release.
-  See [ADR 0036](decisions/0036-advisory-release-binary-size.md).
+  See [ADR 0036](decisions/2026-09-05_192326199_track-release-binary-size-without-a-project-hard-ceiling.md).
 - [ ] Rich-surface draw and edit latency are measured on the selected
   candidate; `QUIRL_UI_TIMINGS=1` is diagnostic evidence, not a substitute for
   the enforcing PTY harness.

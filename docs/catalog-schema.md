@@ -15,12 +15,12 @@ The native KDL database is not the CLI intelligence cache. It is a build
 artifact that contributes external command facts to composition. The CLI cache
 continues to hold the exact composed schema-v4 snapshot, normalized query rows,
 discovery state, and optional embeddings described by
-[ADR 0021](decisions/0021-sqlite-local-command-intelligence.md). Legacy catalog
+[ADR 0021](decisions/2026-08-17_192326090_sqlite-local-command-intelligence.md). Legacy catalog
 JSON v2/v3 exists only as a read-only migration input for that cache. KDL does
 not replace `Catalog::builtin()`, and neither SQLite database is human-authored.
 
 The accepted trust and ownership decision is
-[ADR 0024](decisions/0024-kdl-native-command-catalog.md).
+[ADR 0024](decisions/2026-08-18_192326111_compile-curated-native-command-specifications-from-kdl.md).
 
 ## Strict KDL native command schema
 
@@ -541,7 +541,7 @@ for mechanically projected positional shapes, whose provenance is
 `high`/`declared`, not `exact`.
 
 These composed-cache rules remain governed by
-[ADR 0007](decisions/0007-semantic-catalog-v4.md) and
-[ADR 0021](decisions/0021-sqlite-local-command-intelligence.md). The native KDL
+[ADR 0007](decisions/2026-08-15_192326005_make-the-semantic-catalog-the-authoritative-command-contract.md) and
+[ADR 0021](decisions/2026-08-17_192326090_sqlite-local-command-intelligence.md). The native KDL
 compiler supplies attributable external facts without creating a parallel
 Quirl builtin contract or a second mutable cache.

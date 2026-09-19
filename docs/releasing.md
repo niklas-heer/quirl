@@ -1,7 +1,7 @@
 # Release and downloadable-asset operations
 
 Release policy lives in Quirl's Rust `xtask`. Workflow files are orchestration
-only. [ADR 0026](decisions/0026-rust-native-releases-and-runtime-assets.md)
+only. [ADR 0026](decisions/2026-08-18_192326126_rust-native-releases-and-runtime-assets.md)
 defines the identity, immutability, recovery, and storage contracts.
 
 The 0.1 distribution is the native GitHub Release plus Homebrew tap. Product

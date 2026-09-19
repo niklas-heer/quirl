@@ -158,13 +158,13 @@ crate layering. Do not add a dependency for trivial convenience.
 ## Architecture: respect the layering
 
 Dependency direction is strict and one-way, codified in
-[ADR 0016](docs/decisions/0016-runtime-layering-contract.md). The ADR contains
+[ADR 0016](docs/decisions/2026-08-16_192326057_reconcile-runtime-layering-and-ownership-contracts.md). The ADR contains
 the complete allowed edge table; in summary:
 
 - `quirl-catalog`, `quirl-core`, and `quirl-syntax` are foundation peers with
   no dependencies on other Quirl crates.
 - Contract, data, Lua, picker, plugin, process, LSP, and UI crates use only the
-  inward Quirl edges listed in ADR 0016. In particular, `quirl-picker` may
+  inward Quirl edges listed in the runtime-layering decision. In particular, `quirl-picker` may
   depend on core, and `quirl-process` may depend on core and syntax.
 - `quirl-cli` is the sole product composition root and the only product crate
   permitted to assemble every layer.
@@ -235,11 +235,11 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
   their dependencies into `crates/`.
 - `quirl-bench` is research tooling (`publish = false`), not product code.
 - Unsafe Rust is prohibited in `crates/` except for the private `cfg(windows)`
-  Job Object FFI wrapper in `quirl-process` sanctioned by ADR 0016. Every unsafe
-  block there requires a local safety explanation; expanding that audited
-  boundary requires a new ADR and security review.
-- No feature flags on the main crates; keep it that way unless an ADR says
-  otherwise.
+  Job Object FFI wrapper in `quirl-process` sanctioned by the runtime-layering
+  decision. Every unsafe block there requires a local safety explanation;
+  expanding that audited boundary requires a new decision record and security review.
+- No feature flags on the main crates; keep it that way unless a decision record
+  says otherwise.
 
 ## Testing
 
@@ -265,10 +265,12 @@ All Lua embedding lives in `quirl-lua`. Rules that must hold:
   separately each day.
 - Conventional commits (`feat`, `fix`, `docs`, `refactor`, `chore`, `bench`),
   present tense, optionally scoped, e.g. `feat(lua): add completion budgets`.
-- Significant design choices go through an ADR in `docs/decisions/`.
-  ADR 0001 is the standing contract: Lua is the only extension language,
-  Rust validates everything at the boundary. ADR 0016 fixes the crate
-  dependency and runtime-ownership graph. `docs/language-design.md` is the
+- Significant design choices go through a decision record in `docs/decisions/`,
+  in [vrdx](https://github.com/niklas-heer/vrdx) format: add one with
+  `vrdx --dir docs/decisions new "<title>"`, then edit its status and relationships.
+  "Lua is Quirl's extension language" is the standing contract: Lua is the only
+  extension language, Rust validates everything at the boundary. "Reconcile runtime
+  layering and ownership contracts" fixes the crate dependency and runtime-ownership graph. `docs/language-design.md` is the
   product specification; its §13 delivery sequence and acceptance gates define
   what each phase must prove.
 
