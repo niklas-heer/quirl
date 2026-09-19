@@ -1,0 +1,165 @@
+{
+  "jev": {
+    "requests": 144,
+    "valid": 143,
+    "acceptable": 143,
+    "latency_ms": {
+      "p50": 451.78999999999996,
+      "p95": 545.57,
+      "minimum": 280.7,
+      "maximum": 922.45
+    },
+    "sets": {
+      "initial": {
+        "total": 76,
+        "acceptable": 76
+      },
+      "challenge": {
+        "total": 36,
+        "acceptable": 35
+      },
+      "reversed": {
+        "total": 32,
+        "acceptable": 32
+      }
+    },
+    "known_input_tokens": 306157,
+    "known_estimated_usd": 0.012858594000000001
+  },
+  "luna": {
+    "requests": 144,
+    "valid": 144,
+    "acceptable": 139,
+    "latency_ms": {
+      "p50": 3981.825,
+      "p95": 5855.83,
+      "minimum": 2861.52,
+      "maximum": 8756.38
+    },
+    "sets": {
+      "initial": {
+        "total": 76,
+        "acceptable": 74
+      },
+      "challenge": {
+        "total": 36,
+        "acceptable": 35
+      },
+      "reversed": {
+        "total": 32,
+        "acceptable": 30
+      }
+    },
+    "usage": {
+      "input_tokens": 1333215,
+      "cached_input_tokens": 0,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 2486,
+      "reasoning_output_tokens": 177
+    },
+    "estimated_api_equivalent_usd": 0.26962620000000004,
+    "estimated_published_credits": 6.740655,
+    "turn_ms": {
+      "p50": 3375.2749999999996,
+      "p95": 5241.15,
+      "minimum": 2282.35,
+      "maximum": 8163.24
+    },
+    "outside_turn_ms": {
+      "p50": 594.435,
+      "p95": 965.1899999999996,
+      "minimum": 450.74000000000024,
+      "maximum": 1424.13
+    },
+    "warnings": 0
+  },
+  "paired_cost": {
+    "cases": 143,
+    "luna_usd": 0.26759720000000004,
+    "jev_usd": 0.012858594000000001,
+    "ratio_luna_over_jev": 20.810766713685805
+  },
+  "median_workflow_latency_ratio": 8.813442085924876,
+  "disagreements": [
+    {
+      "set": "initial",
+      "id": "command-49",
+      "jev": "NONE",
+      "luna": "open",
+      "jev_acceptable": true,
+      "luna_acceptable": false
+    },
+    {
+      "set": "initial",
+      "id": "command-53",
+      "jev": "CLARIFY",
+      "luna": "git remote set-url",
+      "jev_acceptable": true,
+      "luna_acceptable": false
+    },
+    {
+      "set": "initial",
+      "id": "flag-10",
+      "jev": "-r",
+      "luna": "-R",
+      "jev_acceptable": true,
+      "luna_acceptable": true
+    },
+    {
+      "set": "challenge",
+      "id": "stress-flag-11",
+      "jev": null,
+      "luna": "--type-not",
+      "jev_acceptable": null,
+      "luna_acceptable": true
+    },
+    {
+      "set": "challenge",
+      "id": "stress-command-05",
+      "jev": "grep",
+      "luna": "rg",
+      "jev_acceptable": true,
+      "luna_acceptable": true
+    },
+    {
+      "set": "challenge",
+      "id": "stress-command-07",
+      "jev": "tree",
+      "luna": "NONE",
+      "jev_acceptable": true,
+      "luna_acceptable": false
+    },
+    {
+      "set": "challenge",
+      "id": "stress-command-09",
+      "jev": "gzip",
+      "luna": "CLARIFY",
+      "jev_acceptable": true,
+      "luna_acceptable": true
+    },
+    {
+      "set": "reversed",
+      "id": "command-36",
+      "jev": "grep",
+      "luna": "rg",
+      "jev_acceptable": true,
+      "luna_acceptable": true
+    },
+    {
+      "set": "reversed",
+      "id": "command-49",
+      "jev": "NONE",
+      "luna": "open",
+      "jev_acceptable": true,
+      "luna_acceptable": false
+    },
+    {
+      "set": "reversed",
+      "id": "command-53",
+      "jev": "CLARIFY",
+      "luna": "git remote set-url",
+      "jev_acceptable": true,
+      "luna_acceptable": false
+    }
+  ]
+}

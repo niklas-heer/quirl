@@ -53,3 +53,45 @@ The benchmark assumes a trusted checked-in catalog and hand-authored fixtures.
 Do not use it as a general reader for untrusted SQLite or JSON files. No
 dependencies need to be installed. The model and published token price are pinned
 in the experiment code; recheck availability and pricing before another run.
+
+## Compare with Luna through the local Codex CLI
+
+`luna.py` replays the same 144 frozen cases and candidate orders, including the
+32 repeat cases. It applies the previously recorded directory-size label
+correction before scoring. It uses an existing authenticated Codex CLI; it does
+not read an API key or log in for you.
+
+```sh
+python3 spikes/jev-command-search/luna.py \
+  --output target/luna-command-search-low --effort low
+python3 spikes/jev-command-search/compare.py target/luna-command-search-low
+```
+
+Each case starts a fresh, ephemeral `codex exec` in an isolated temporary
+directory, disables tool features and host skill discovery, and uses a read-only
+sandbox with user configuration and project documents excluded. Luna receives
+the original state, decision instructions, and ordered options. Its output
+schema requests only `{"choice":"..."}`, with an enum of the admitted options;
+it is not asked to generate a probability distribution. All results are
+validated without executing choices.
+
+The harness records both complete CLI process duration and the JSONL
+`turn.started` to `turn.completed` interval. The latter still includes backend,
+network, and CLI work; it is not pure model inference time. A new CLI process
+per case is different from Jev's reused HTTP connection and Quirl's persistent
+interactive app-server. Token usage includes Codex's surrounding context.
+The CLI's model alias and its `low` reasoning setting are explicit; there is
+no silent model fallback or auto-retry. The results do not report a resolved
+Luna model snapshot.
+
+The output directory must not exist. Bounds are 144 cases, 200 KB per prompt,
+1 MB each for stdout/stderr, 100 events, 30 seconds per CLI process, and a
+20-minute budget checked between cases. Every exit kills/reaps the process
+group. Three consecutive errors stop the run. `--limit` supports small pilot
+runs, but the comparison script requires a complete 144-case run.
+
+Cost figures use the recorded input, cached-input, and output token counts at
+published API rates. They are API-equivalent estimates, not a ChatGPT invoice.
+`compare.py` also estimates published credit consumption and compares costs on
+the 143 cases with retained usage from both providers. A one-case preliminary
+connectivity/schema pilot is excluded from the saved scored run.

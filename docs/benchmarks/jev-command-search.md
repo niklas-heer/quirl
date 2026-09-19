@@ -3,6 +3,9 @@
 Measured 2026-09-19 with `jev-1.13.0` through TypeSafe's official HTTPS API.
 This is research evidence, not a decision to add Jev to Quirl.
 
+The follow-up [Luna comparison](jev-luna-command-search.md) replays the same
+cases through the local Codex CLI and compares quality, timing, and token costs.
+
 ## Result
 
 Jev handled this small command-discovery benchmark well. Of 112 distinct

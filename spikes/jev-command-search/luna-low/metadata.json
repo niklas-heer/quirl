@@ -1,0 +1,35 @@
+{
+  "model": "gpt-5.6-luna",
+  "reasoning_effort": "low",
+  "cli_version": "codex-cli 0.155.1",
+  "evidence_sha256": "db1a9f65cec9d21e50ed5e912e4f1d9a3458d694c0005e209dd193d5d065b549",
+  "case_count": 144,
+  "disabled_features": [
+    "shell_tool",
+    "unified_exec",
+    "apps",
+    "browser_use",
+    "computer_use",
+    "multi_agent",
+    "plugins",
+    "hooks",
+    "shell_snapshot",
+    "image_generation",
+    "view_image",
+    "sleep_tool",
+    "goals",
+    "skill_search"
+  ],
+  "authentication": "existing ChatGPT CLI login",
+  "prompt_prefix": "Select exactly one option for this classification task. Do not use tools, inspect files, or execute any command. Return only the schema-constrained choice.\n",
+  "max_request_seconds": 30,
+  "stream_bytes_max": 1000000,
+  "comparison": "CLI process per case; Jev used a persistent HTTPS connection",
+  "pricing": {
+    "input_per_million_usd": 0.2,
+    "cached_input_per_million_usd": 0.02,
+    "output_per_million_usd": 1.2,
+    "source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+    "interpretation": "API-equivalent estimate, not the ChatGPT bill"
+  }
+}

@@ -1,0 +1,143 @@
+{
+  "total": 144,
+  "correct": 139,
+  "errors": 0,
+  "p50_ms": 3981.825,
+  "p95_ms": 5855.83,
+  "usage": {
+    "input_tokens": 1333215,
+    "cached_input_tokens": 0,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2486,
+    "reasoning_output_tokens": 177
+  },
+  "estimated_api_equivalent_usd": 0.26962620000000004,
+  "misses": [
+    {
+      "set": "initial",
+      "id": "command-49",
+      "category": "unsupported",
+      "expected": [
+        "NONE"
+      ],
+      "original_expected": [
+        "NONE"
+      ],
+      "prompt_sha256": "bf69d50aa8e0907d43ea214d5154e62148857793878f9597f8882d265f6bafcf",
+      "process_ms": 5585.31,
+      "stderr_bytes": 0,
+      "final_text": "{\"choice\":\"open\"}",
+      "usage": {
+        "input_tokens": 9441,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 61,
+        "reasoning_output_tokens": 44
+      },
+      "turn_ms": 4579.46,
+      "choice": "open",
+      "correct": false
+    },
+    {
+      "set": "initial",
+      "id": "command-53",
+      "category": "ambiguous",
+      "expected": [
+        "CLARIFY"
+      ],
+      "original_expected": [
+        "CLARIFY"
+      ],
+      "prompt_sha256": "7759f1379dd7ed916dfb60af710e2ddce76ace5ad0236b5461b02d0ab6f82f02",
+      "process_ms": 3525.08,
+      "stderr_bytes": 0,
+      "final_text": "{\"choice\":\"git remote set-url\"}",
+      "usage": {
+        "input_tokens": 9436,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 18,
+        "reasoning_output_tokens": 0
+      },
+      "turn_ms": 2996.84,
+      "choice": "git remote set-url",
+      "correct": false
+    },
+    {
+      "set": "challenge",
+      "id": "stress-command-07",
+      "category": "unsupported",
+      "expected": [
+        "tree",
+        "eza"
+      ],
+      "original_expected": [
+        "NONE"
+      ],
+      "prompt_sha256": "9beb05c546cad25d6c4646062045e67c2cdf1b046893d41f25e3f909705ff504",
+      "process_ms": 4780.04,
+      "stderr_bytes": 0,
+      "final_text": "{\"choice\":\"NONE\"}",
+      "usage": {
+        "input_tokens": 9450,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 15,
+        "reasoning_output_tokens": 0
+      },
+      "turn_ms": 3520.54,
+      "choice": "NONE",
+      "correct": false
+    },
+    {
+      "set": "reversed",
+      "id": "command-49",
+      "category": "unsupported",
+      "expected": [
+        "NONE"
+      ],
+      "original_expected": [
+        "NONE"
+      ],
+      "prompt_sha256": "b329cfdf2e3ad664cebe48e0134c5814cf2d79363e98b230754d623a50af06ba",
+      "process_ms": 3924.13,
+      "stderr_bytes": 0,
+      "final_text": "{\"choice\":\"open\"}",
+      "usage": {
+        "input_tokens": 9441,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 15,
+        "reasoning_output_tokens": 0
+      },
+      "turn_ms": 3218.56,
+      "choice": "open",
+      "correct": false
+    },
+    {
+      "set": "reversed",
+      "id": "command-53",
+      "category": "ambiguous",
+      "expected": [
+        "CLARIFY"
+      ],
+      "original_expected": [
+        "CLARIFY"
+      ],
+      "prompt_sha256": "b1a9586239a18d4a0d6fd6ecbd3d243eac4190d343ede2d635b616461dc68a11",
+      "process_ms": 4257.06,
+      "stderr_bytes": 0,
+      "final_text": "{\"choice\":\"git remote set-url\"}",
+      "usage": {
+        "input_tokens": 9437,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 69,
+        "reasoning_output_tokens": 49
+      },
+      "turn_ms": 3557.13,
+      "choice": "git remote set-url",
+      "correct": false
+    }
+  ]
+}
