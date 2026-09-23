@@ -62,6 +62,19 @@ verify it against `SHA256SUMS`, and compare the entry in
 `release-manifest-v1.json` before putting `quirl` on `PATH`. Never use an asset
 from a mutable branch URL as a release binary.
 
+## Nix flake
+
+With [Nix](https://nixos.org) flakes on Linux or Apple Silicon macOS, build and
+install the latest `main` from source:
+
+```sh
+nix profile add github:niklas-heer/quirl
+quirl --version
+```
+
+`main` may be ahead of the supported release. Like Homebrew, the flake installs
+only the binary; completion and model assets download on demand.
+
 ## Binary requirements
 
 The native package needs only a supported Linux or macOS host. It does not

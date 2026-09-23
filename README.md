@@ -109,8 +109,8 @@ and bounded command-catalog context to OpenAI. It keeps proposals for review;
 nothing runs automatically. Normal commands and the example above work offline.
 
 See [installation](website/content/docs/getting-started/installation.mdx) for
-checksummed native archives, source builds, downloadable completion/model assets,
-and uninstall instructions. The supported release is the immutable
+checksummed native archives, the Nix flake, source builds, downloadable
+completion/model assets, and uninstall instructions. The supported release is the immutable
 [`v0.3.0` GitHub Release](https://github.com/niklas-heer/quirl/releases/tag/v0.3.0).
 
 Quirl 0.3.0 organizes new checkouts with **Projects**:

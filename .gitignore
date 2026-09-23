@@ -22,3 +22,4 @@ docs/.quirl.lua.xtask-*
 #.idea/
 
 .DS_Store
+/result
