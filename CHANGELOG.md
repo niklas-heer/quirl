@@ -12,6 +12,8 @@ which versions are published.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-30
+
 ### Added
 
 - Tab completes like Zsh. A unique match is inserted at once with a trailing

@@ -1,45 +1,58 @@
-# Quirl 0.3.0
+# Quirl 0.4.0
 
 ### Added
 
-- Managed Git project cloning through `quirl projects clone`, using GHQ-compatible
-  `<root>/<host>/<repository-path>` directories and existing `GHQ_ROOT` or
-  `ghq.root` settings. `quirl projects root` shows the effective parent directory.
-  Existing matching checkouts are reused without pulling or overwriting them.
-- Rich Normal mode offers an optional managed location for a straightforward
-  `git clone URL`. The original command remains the default; users can choose a
-  managed location once, opt in for future eligible clones, or dismiss further
-  suggestions. Explicit destinations and scripts keep their Git behavior.
-  Completed projects are immediately available in the project picker, with an
-  explicit **Alt-Q u** action to open them. `quirl projects policy` inspects or
-  sets `ask`, `managed`, or `off` without editing Lua configuration.
+- Tab completes like Zsh. A unique match is inserted at once with a trailing
+  space, or a `/` for directories. Ambiguous matches extend the word by their
+  shared prefix while the menu lists the alternatives. Accepting a menu entry
+  adds the separating space too. Further Tabs cycle through the menu and put
+  each candidate on the line, like Zsh's menu completion.
+- Explicit Tab asks the installed Zsh's own completion functions for argument
+  values. Git branches, Make targets, SSH hosts, process IDs, and every other
+  Zsh-supported argument now complete in Quirl, with Zsh's descriptions in the
+  menu. Requests run inside the existing bounded completion boundary without
+  user startup files, and automatic as-you-type completion never starts a
+  shell. Results keep Zsh's display order: groups in creation order, each
+  sorted unless Zsh added it unsorted. When Zsh answers, its choice replaces the plain file listing,
+  so `git add` offers changed files only. Set `QUIRL_ZSH_COMPLETION=off` to
+  disable the live source.
+- `quirl complete` includes the same live Zsh argument candidates.
+- `$NAME` and `${NAME` complete environment variable names, showing each
+  value. As with Zsh's `AUTO_PARAM_SLASH`, a variable that names a directory
+  completes with a trailing `/`.
+
+### Changed
+
+- Completion ranks exact-case prefixes above case-insensitive prefixes and
+  fuzzy matches, and shows only the best tier, alphabetically with an exact
+  match first. Command completion advances one word at a time: `gi` offers
+  `git`, not every `git …` subcommand.
+- Ctrl-C at the rich prompt leaves the abandoned input in the transcript,
+  marked `^C`, and sets `$?` to 130, as in Zsh. It no longer prints a separate
+  cancellation block.
 
 ### Fixed
 
-- Interactive native commands retain the previous command's exit status in `$?`
-  across prompt turns, including status 130 after cancellation. Internal project
-  metadata probes do not replace the user-visible status. Cancelled Bash and
-  Zsh islands also report 130; deadlines remain ordinary failures.
-- Rich Normal mode on Unix runs foreground programs in an embedded terminal,
-  including unknown tools, wrappers, `tdx`, and `bunx tokscale@latest`. Screen
-  redraws, keyboard input, local terminal queries, resizing, and Ctrl-C work
-  without an application allowlist. Explicit pipes and redirections retain their
-  semantics; completed primary-screen output remains in the transcript and
-  unread type-ahead returns as editable prompt text.
-- Native Unix commands expand unquoted `~` and `~/` from the session home,
-  including `cd` arguments and redirection paths, while preserving quoted and
-  escaped literal tildes and enforcing the existing expansion limit.
-- Filesystem completion accepts Enter immediately and opens children after a
-  directory selection. Escape then Enter executes the selected directory;
-  already complete filenames still execute on the first Enter. Home-directory
-  candidates follow the session's current `HOME` value.
-  Background catalog loading preserves an Escape-dismissed popup until the
-  next edit or explicit completion request.
-- Completion and documentation panels reserve space below the editor, scrolling
-  older transcript lines upward instead of covering recent command output.
-- Foreground execution shows output and progress without an empty command
-  prompt or shell input cursor. The next prompt appears only after execution
-  finishes and its output has been drained.
-- Plain shell startup skips constructing the command-line option tree. Invocations
-  with arguments retain full validation, and redirected stdin keeps its existing
-  execution behavior.
+- A command could hang forever on macOS when another thread started a
+  process at the same moment: a pipe that was briefly inheritable leaked into
+  the other child, so the reader never saw end-of-file. Process launches and
+  pipe and terminal creation are now serialized process-wide.
+- Catalog discovery no longer fails on typical Homebrew installations.
+  Fingerprinting and importing completion sources used to charge the same
+  bytes twice against one budget. An unreadable or oversized completion
+  source is now skipped with a diagnostic instead of disabling all discovered
+  completions.
+- `quirl index build` follows symlinked completion files, as automatic
+  discovery already did, and tolerates man pages whose searchable description
+  exceeds 16 KiB.
+- The completion cache can live below root-owned system links such as macOS's
+  `/tmp` and `/var`. Links owned by other users are still rejected.
+- Command completion no longer offers shell expressions such as `$1` or
+  `2>/dev/null` that Bash completion scripts register as computed names.
+- Valid flags such as `git log --oneline` no longer draw an "unknown flag"
+  warning when a command's options come from an imported, possibly partial,
+  declaration. Only built-in, Lua-declared, and plugin-declared option lists
+  are treated as complete.
+- BSD man pages (mdoc) produce readable option summaries: nested `Fl Fl`
+  becomes `--name`, and enclosure macros, `Ns`, standards references, escaped
+  literals, and delimiters render as `mandoc` shows them.
