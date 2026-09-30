@@ -388,7 +388,7 @@ fn read_process_table() -> Result<String, ShellError> {
         command
     };
     command.stdout(Stdio::piped()).stderr(Stdio::null());
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = quirl_process::spawn_serialized(&mut command).map_err(|error| {
         ShellError::new(
             ErrorCode::ProcessSpawn,
             "the process panel could not start the platform process lister",

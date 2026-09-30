@@ -21,8 +21,11 @@ mod developer_context;
 pub mod local_completion;
 #[cfg(unix)]
 pub mod pty;
+mod spawn_lock;
 
 pub use developer_context::{DeveloperContextProbe, DeveloperContextSnapshot};
+use spawn_lock::spawn_guard_scope;
+pub use spawn_lock::{spawn_guard, spawn_serialized};
 
 use std::path::Path;
 
@@ -1329,7 +1332,7 @@ mod platform {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .process_group(requested_group.unwrap_or(0));
-        let mut child = command.spawn().map_err(|error| {
+        let mut child = crate::spawn_serialized(&mut command).map_err(|error| {
             ShellError::new(
                 ErrorCode::ProcessSpawn,
                 "could not start process-group anchor",
@@ -2531,7 +2534,7 @@ mod platform {
                 };
                 process.stdin(input.stdio).stdout(stdout).stderr(stderr);
                 process.process_group(spawned.process_group.unwrap_or(0));
-                let mut child = process.spawn().map_err(|error| {
+                let mut child = crate::spawn_serialized(&mut process).map_err(|error| {
                     ShellError::new(
                         ErrorCode::ProcessSpawn,
                         format!("could not start `{executable}`"),
@@ -3485,7 +3488,7 @@ mod platform {
                 let mut bytes = Vec::with_capacity(observed_bytes);
                 bytes.extend_from_slice(value.as_bytes());
                 bytes.push(b'\n');
-                let (reader, writer) = pipe().map_err(|error| {
+                let (reader, writer) = crate::spawn_guard_scope(pipe).map_err(|error| {
                     ShellError::new(ErrorCode::Io, "could not create here-string input")
                         .with_context(error.to_string())
                         .with_help("Retry the command or use an input file")
@@ -3539,7 +3542,7 @@ mod platform {
             return Ok((Stdio::from(file), None, None, Some(duplicate)));
         }
         if !last || capture {
-            let (reader, writer) = pipe().map_err(|error| {
+            let (reader, writer) = crate::spawn_guard_scope(pipe).map_err(|error| {
                 ShellError::new(ErrorCode::Io, "could not create a byte pipeline")
                     .with_context(error.to_string())
                     .with_help("Retry after closing unused processes or file descriptors")
@@ -8580,7 +8583,7 @@ impl ContainedChild {
     pub fn spawn(command: &mut std::process::Command) -> Result<Self, quirl_core::ShellError> {
         let containment = ChildProcessTree::new()?;
         containment.configure(command);
-        let mut child = command.spawn().map_err(|error| {
+        let mut child = spawn_serialized(command).map_err(|error| {
             quirl_core::ShellError::new(
                 quirl_core::ErrorCode::ProcessSpawn,
                 "could not start contained child process",

@@ -832,7 +832,7 @@ pub(crate) fn execute_out_of_process_adapter(
         .stderr(Stdio::piped());
     let containment = ChildProcessTree::new()?;
     containment.configure(&mut command);
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = quirl_process::spawn_serialized(&mut command).map_err(|error| {
         ShellError::new(
             ErrorCode::ProcessSpawn,
             format!(

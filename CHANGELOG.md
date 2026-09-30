@@ -44,6 +44,10 @@ which versions are published.
 
 ### Fixed
 
+- A command could hang forever on macOS when another thread started a
+  process at the same moment: a pipe that was briefly inheritable leaked into
+  the other child, so the reader never saw end-of-file. Process launches and
+  pipe and terminal creation are now serialized process-wide.
 - Catalog discovery no longer fails on typical Homebrew installations.
   Fingerprinting and importing completion sources used to charge the same
   bytes twice against one budget. An unreadable or oversized completion

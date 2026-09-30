@@ -885,9 +885,9 @@ fn open_document(path: &Path) -> Result<(), ShellError> {
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut command = Command::new("xdg-open");
 
-    let status = command
-        .arg(path)
-        .status()
+    command.arg(path);
+    let status = quirl_process::spawn_serialized(&mut command)
+        .and_then(|mut child| child.wait())
         .map_err(|error| io_error("open", path, error))?;
     if status.success() {
         Ok(())

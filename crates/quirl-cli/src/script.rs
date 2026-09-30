@@ -1554,7 +1554,7 @@ fn run_reference_script(
         .stderr(Stdio::piped());
     let containment = ChildProcessTree::new()?;
     containment.configure(&mut command);
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = quirl_process::spawn_serialized(&mut command).map_err(|error| {
         ShellError::new(
             ErrorCode::ProcessSpawn,
             format!("could not start reference interpreter `{executable}`"),

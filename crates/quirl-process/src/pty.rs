@@ -274,6 +274,9 @@ impl PtySession {
         environment.ensure_valid()?;
         let reaper = reaper()?;
         let permit = Permit::acquire()?;
+        // The PTY pair gains close-on-exec only after creation; keep other
+        // spawns from inheriting it until this child has been started.
+        let spawn_guard = crate::spawn_guard();
         let pair = native_pty_system()
             .openpty(size)
             .map_err(|cause| io_error("could not allocate a controlling PTY", cause))?;
@@ -298,6 +301,7 @@ impl PtySession {
             .slave
             .spawn_command(command)
             .map_err(|cause| io_error("could not spawn the PTY executable", cause))?;
+        drop(spawn_guard);
         let child = ChildOwner::new(child, permit, reaper, Scope::Group)?;
         drop(pair.slave);
         Ok(Self {
@@ -673,14 +677,15 @@ impl ChildOwner {
         // permission failure. The probe owns only its direct child, avoiding
         // recursive group verification during probe cleanup.
         ensure_deadline(deadline)?;
-        let mut child = Command::new("/bin/ps")
+        let mut probe = Command::new("/bin/ps");
+        probe
             .args(["-axo", "pgid=,stat="])
             .env_clear()
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        let mut child = crate::spawn_serialized(&mut probe)
             .map_err(|cause| io_error("could not verify PTY group cleanup", cause))?;
         let stdout = child.stdout.take();
         let mut owner = Self::new(
