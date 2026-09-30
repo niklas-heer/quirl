@@ -26,7 +26,7 @@ export default function HomePage() {
       <section className="hero">
         <div className="pill">
           <span className="dot" />
-          v0.3.0 · Linux and macOS
+          v0.4.0 · Linux and macOS
         </div>
         <p className="kicker">A well-stirred shell</p>
         <h1 className="glitch-h1">
@@ -289,12 +289,12 @@ export default function HomePage() {
             <CassetteReels />
           </div>
           <div className="cassette-body">
-            <h2>The 0.3 release is here.</h2>
+            <h2>The 0.4 release is here.</h2>
             <p>
-              Quirl 0.3.0 is available for Linux and macOS through Homebrew
-              and immutable native release archives. The docs separate
-              current usage and runtime contracts from long-term direction
-              and exact-artifact evidence.
+              Quirl 0.4.0 completes the way Zsh does, from unique matches and
+              shared prefixes to live Git branches, Make targets, and SSH hosts.
+              It is available for Linux and macOS through Homebrew and
+              immutable native release archives.
             </p>
             <Link href="/docs" className="text-link">
               Explore everything →

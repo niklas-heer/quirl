@@ -66,7 +66,7 @@ export default function OpenGraphImage() {
             padding: '7px 11px',
           }}
         >
-          v0.3.0
+          v0.4.0
         </span>
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', maxWidth: 850 }}>
