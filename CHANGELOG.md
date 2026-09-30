@@ -12,6 +12,19 @@ which versions are published.
 
 ## [Unreleased]
 
+### Fixed
+
+- Catalog discovery no longer fails on typical Homebrew installations.
+  Fingerprinting and importing completion sources used to charge the same
+  bytes twice against one budget. An unreadable or oversized completion
+  source is now skipped with a diagnostic instead of disabling all discovered
+  completions.
+- `quirl index build` follows symlinked completion files, as automatic
+  discovery already did, and tolerates man pages whose searchable description
+  exceeds 16 KiB.
+- The completion cache can live below root-owned system links such as macOS's
+  `/tmp` and `/var`. Links owned by other users are still rejected.
+
 ## [0.3.0] - 2026-09-06
 
 ### Added

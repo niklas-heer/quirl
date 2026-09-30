@@ -3390,12 +3390,25 @@ fn sort_and_limit(results: &mut Vec<SearchResult>, limit: usize) {
     results.truncate(limit);
 }
 
+/// Build a searchable document body, truncated to [`DOCUMENT_BYTES_MAX`].
+///
+/// Imported man pages can describe a command in tens of kilobytes. Search
+/// needs the leading fields and prose, not the whole page, so an oversized
+/// body is cut at a character boundary instead of failing the index build.
 fn tagged_document_body(fields: &[(&str, String)]) -> String {
-    fields
+    let mut body = fields
         .iter()
         .map(|(label, value)| format!("{label}: {}", normalize_document_field(value)))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if body.len() > DOCUMENT_BYTES_MAX {
+        let mut end = DOCUMENT_BYTES_MAX;
+        while !body.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        body.truncate(end);
+    }
+    body
 }
 
 fn normalize_document_field(value: &str) -> String {
@@ -3753,6 +3766,13 @@ mod tests {
             Some(false),
         )
         .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn oversized_document_fields_are_truncated_at_a_character_boundary() {
+        let body = tagged_document_body(&[("intent", "é".repeat(DOCUMENT_BYTES_MAX))]);
+        assert!(body.len() <= DOCUMENT_BYTES_MAX);
+        assert!(body.starts_with("intent: é"));
     }
 
     #[test]

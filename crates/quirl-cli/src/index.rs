@@ -48,6 +48,11 @@ const INDEX_FILES_MAX: usize = 4_096;
 const INDEX_PATH_BYTES_MAX: usize = 1024 * 1024;
 const INDEX_SOURCE_BYTES_TOTAL_MAX: usize = 16 * 1024 * 1024;
 const INDEX_MAN_SOURCE_BYTES_TOTAL_MAX: usize = 16 * 1024 * 1024;
+// Fingerprinting scans every discovered source once before import reads the
+// changed ones again. It gets its own scan budget so a cache check never
+// consumes the import budget and a typical Homebrew installation fits both.
+const INDEX_FINGERPRINT_BYTES_TOTAL_MAX: usize =
+    INDEX_SOURCE_BYTES_TOTAL_MAX + INDEX_MAN_SOURCE_BYTES_TOTAL_MAX;
 const INDEX_RECORDS_MAX: usize = 65_536;
 const INDEX_RETAINED_BYTES_MAX: usize = 16 * 1024 * 1024;
 const INDEX_DIAGNOSTICS_MAX: usize = 4_096;
@@ -438,6 +443,7 @@ struct IndexBounds {
     path_bytes_max: usize,
     source_bytes_max: usize,
     man_source_bytes_max: usize,
+    fingerprint_bytes_max: usize,
     records_max: usize,
     retained_bytes_max: usize,
     diagnostics_max: usize,
@@ -451,6 +457,7 @@ impl IndexBounds {
         path_bytes_max: INDEX_PATH_BYTES_MAX,
         source_bytes_max: INDEX_SOURCE_BYTES_TOTAL_MAX,
         man_source_bytes_max: INDEX_MAN_SOURCE_BYTES_TOTAL_MAX,
+        fingerprint_bytes_max: INDEX_FINGERPRINT_BYTES_TOTAL_MAX,
         records_max: INDEX_RECORDS_MAX,
         retained_bytes_max: INDEX_RETAINED_BYTES_MAX,
         diagnostics_max: INDEX_DIAGNOSTICS_MAX,
@@ -465,6 +472,7 @@ struct IndexBuildBudget {
     path_bytes: usize,
     source_bytes: usize,
     man_source_bytes: usize,
+    fingerprint_bytes: usize,
     records: usize,
     retained_bytes: usize,
     diagnostics: usize,
@@ -480,6 +488,7 @@ impl IndexBuildBudget {
             path_bytes: 0,
             source_bytes: 0,
             man_source_bytes: 0,
+            fingerprint_bytes: 0,
             records: 0,
             retained_bytes: 0,
             diagnostics: 0,
@@ -2405,7 +2414,10 @@ fn catalog_from_files_checked(
     let mut diagnostics = Vec::new();
     for path in fish_files {
         check_active()?;
-        let source = read_completion(path, budget)?;
+        let Some(source) = read_import_source(path, budget, &mut diagnostics, read_completion)?
+        else {
+            continue;
+        };
         merge_bounded_report(
             &mut catalog,
             &mut diagnostics,
@@ -2415,7 +2427,10 @@ fn catalog_from_files_checked(
     }
     for path in bash_files {
         check_active()?;
-        let source = read_completion(path, budget)?;
+        let Some(source) = read_import_source(path, budget, &mut diagnostics, read_completion)?
+        else {
+            continue;
+        };
         merge_bounded_report(
             &mut catalog,
             &mut diagnostics,
@@ -2425,7 +2440,10 @@ fn catalog_from_files_checked(
     }
     for path in zsh_files {
         check_active()?;
-        let source = read_completion(path, budget)?;
+        let Some(source) = read_import_source(path, budget, &mut diagnostics, read_completion)?
+        else {
+            continue;
+        };
         merge_bounded_report(
             &mut catalog,
             &mut diagnostics,
@@ -2435,7 +2453,10 @@ fn catalog_from_files_checked(
     }
     for path in help_files {
         check_active()?;
-        let source = read_documentation(path, budget)?;
+        let Some(source) = read_import_source(path, budget, &mut diagnostics, read_documentation)?
+        else {
+            continue;
+        };
         merge_bounded_report(
             &mut catalog,
             &mut diagnostics,
@@ -2465,6 +2486,31 @@ fn catalog_from_files_checked(
         )?;
     }
     Ok((catalog, diagnostics))
+}
+
+/// Reads one import source, turning a per-file failure into a diagnostic.
+///
+/// Skipping keeps the remaining sources useful when one declaration file is
+/// unreadable or the aggregate import budget is exhausted; the diagnostic
+/// records which file was omitted and why.
+fn read_import_source(
+    path: &Path,
+    budget: &mut IndexBuildBudget,
+    diagnostics: &mut Vec<ImportDiagnostic>,
+    read: fn(&Path, &mut IndexBuildBudget) -> Result<String, ShellError>,
+) -> Result<Option<String>, ShellError> {
+    match read(path, budget) {
+        Ok(source) => Ok(Some(source)),
+        Err(error) => {
+            push_index_diagnostic(
+                diagnostics,
+                budget,
+                path,
+                format_index_error("skipped unreadable completion source", &error),
+            )?;
+            Ok(None)
+        }
+    }
 }
 
 fn merge_bounded_report(
@@ -2616,7 +2662,10 @@ fn completion_files(
     required_extension: Option<&str>,
     budget: &mut IndexBuildBudget,
 ) -> Result<Vec<PathBuf>, ShellError> {
-    completion_files_checked(roots, required_extension, budget, false, || Ok(()))
+    // Package managers such as Homebrew install completion files as symlinks
+    // into versioned prefixes, so explicit builds resolve them exactly like
+    // automatic discovery does.
+    completion_files_checked(roots, required_extension, budget, true, || Ok(()))
 }
 
 fn completion_files_checked(
@@ -3037,20 +3086,20 @@ fn discover_sources(
     deadline: RefreshDeadline,
     cancelled: &AtomicBool,
 ) -> Result<DiscoverySnapshot, ShellError> {
-    let fish_files =
+    let mut fish_files =
         completion_files_checked(&config.fish_roots, Some("fish"), budget, true, || {
             ensure_refresh_active(deadline, cancelled, "while scanning fish sources")
         })?;
     ensure_refresh_active(deadline, cancelled, "after fish discovery")?;
-    let bash_files = completion_files_checked(&config.bash_roots, None, budget, true, || {
+    let mut bash_files = completion_files_checked(&config.bash_roots, None, budget, true, || {
         ensure_refresh_active(deadline, cancelled, "while scanning Bash sources")
     })?;
     ensure_refresh_active(deadline, cancelled, "after Bash discovery")?;
-    let zsh_files = completion_files_checked(&config.zsh_roots, None, budget, true, || {
+    let mut zsh_files = completion_files_checked(&config.zsh_roots, None, budget, true, || {
         ensure_refresh_active(deadline, cancelled, "while scanning Zsh sources")
     })?;
     ensure_refresh_active(deadline, cancelled, "after Zsh discovery")?;
-    let help_files = completion_files_checked(&config.help_roots, None, budget, true, || {
+    let mut help_files = completion_files_checked(&config.help_roots, None, budget, true, || {
         ensure_refresh_active(deadline, cancelled, "while scanning help sources")
     })?;
     let executables = discover_path_executables(&config.path_roots, budget, deadline, cancelled)?;
@@ -3077,17 +3126,40 @@ fn discover_sources(
             .saturating_add(man_files.len())
             .saturating_add(executables.len()),
     );
+    // One unreadable, non-UTF-8, or oversized declaration file must not
+    // disable every other source. It is skipped with a bounded diagnostic and
+    // removed from the import list so fingerprints and imports stay aligned.
     for (kind, files) in [
-        (DiscoverySourceKind::Fish, fish_files.as_slice()),
-        (DiscoverySourceKind::Bash, bash_files.as_slice()),
-        (DiscoverySourceKind::Zsh, zsh_files.as_slice()),
-        (DiscoverySourceKind::Help, help_files.as_slice()),
-        (DiscoverySourceKind::PathExecutable, executables.as_slice()),
+        (DiscoverySourceKind::Fish, &mut fish_files),
+        (DiscoverySourceKind::Bash, &mut bash_files),
+        (DiscoverySourceKind::Zsh, &mut zsh_files),
+        (DiscoverySourceKind::Help, &mut help_files),
     ] {
-        for path in files {
+        let mut admitted = Vec::with_capacity(files.len());
+        for path in files.drain(..) {
             ensure_refresh_active(deadline, cancelled, "while fingerprinting sources")?;
-            sources.push(observe_source(kind, path, budget)?);
+            match observe_source(kind, &path, budget) {
+                Ok(source) => {
+                    sources.push(source);
+                    admitted.push(path);
+                }
+                Err(error) => push_discovery_diagnostic(
+                    &mut diagnostics,
+                    budget,
+                    &path,
+                    format_index_error("skipped completion source during fingerprinting", &error),
+                )?,
+            }
         }
+        *files = admitted;
+    }
+    for path in &executables {
+        ensure_refresh_active(deadline, cancelled, "while fingerprinting sources")?;
+        sources.push(observe_source(
+            DiscoverySourceKind::PathExecutable,
+            path,
+            budget,
+        )?);
     }
     let mut admitted_man_files = Vec::with_capacity(man_files.len());
     for path in man_files {
@@ -3211,12 +3283,15 @@ fn observe_source(
         .unwrap_or(0);
     let content_fingerprint = match kind {
         DiscoverySourceKind::PathExecutable => None,
-        DiscoverySourceKind::Fish | DiscoverySourceKind::Bash | DiscoverySourceKind::Zsh => {
-            Some(fingerprint_bytes(read_completion(path, budget)?.as_bytes()))
-        }
-        DiscoverySourceKind::Help | DiscoverySourceKind::Man => Some(fingerprint_bytes(
-            read_documentation(path, budget)?.as_bytes(),
-        )),
+        DiscoverySourceKind::Fish | DiscoverySourceKind::Bash | DiscoverySourceKind::Zsh => Some(
+            fingerprint_source(path, COMPLETION_READ_LIMIT, "completion source", budget)?,
+        ),
+        DiscoverySourceKind::Help | DiscoverySourceKind::Man => Some(fingerprint_source(
+            path,
+            DOCUMENTATION_READ_LIMIT,
+            "documentation source",
+            budget,
+        )?),
     };
     let mut identity = Vec::new();
     identity.extend_from_slice(path.as_os_str().as_encoded_bytes());
@@ -3232,6 +3307,36 @@ fn observe_source(
         modified_unix_nanos,
         fingerprint: fingerprint_bytes(&identity),
     })
+}
+
+/// Hashes one source against the separate fingerprint scan budget.
+///
+/// The bytes are dropped immediately; only an unchanged cache avoids the
+/// second, import-budgeted read.
+fn fingerprint_source(
+    path: &Path,
+    bytes_max: usize,
+    context: &str,
+    budget: &mut IndexBuildBudget,
+) -> Result<String, ShellError> {
+    let help = "Keep index sources readable UTF-8 regular files within the per-file limit";
+    let bytes = read_index_bytes(path, bytes_max, context, help)?;
+    if let Err(error) = std::str::from_utf8(&bytes) {
+        return Err(ShellError::new(
+            ErrorCode::Validation,
+            format!("{} is not UTF-8 {context} text", path.display()),
+        )
+        .with_context(error.to_string())
+        .with_help(help));
+    }
+    let scanned = budget.fingerprint_bytes.saturating_add(bytes.len());
+    ensure_index_limit(
+        "fingerprinted source bytes",
+        budget.bounds.fingerprint_bytes_max,
+        scanned,
+    )?;
+    budget.fingerprint_bytes = scanned;
+    Ok(fingerprint_bytes(&bytes))
 }
 
 fn external_commands(executables: &[PathBuf], sources: &[DiscoverySource]) -> Vec<CommandSpec> {
@@ -3322,7 +3427,7 @@ fn default_bash_roots() -> Vec<PathBuf> {
     ]
 }
 
-fn default_zsh_roots() -> Vec<PathBuf> {
+pub(crate) fn default_zsh_roots() -> Vec<PathBuf> {
     if let Some(roots) = configured_completion_roots("QUIRL_ZSH_PATH") {
         return roots;
     }
@@ -3894,7 +3999,16 @@ pub(crate) fn create_index_directories(directory: &Path) -> Result<(), ShellErro
     let mut missing = Vec::new();
     let mut cursor = directory;
     loop {
-        match fs::symlink_metadata(cursor) {
+        // The index directory itself must not be a link. A missing index
+        // directory may be created below a root-owned system link.
+        let observed = fs::symlink_metadata(cursor).and_then(|metadata| {
+            if !missing.is_empty() && is_system_directory_link(cursor, &metadata) {
+                fs::metadata(cursor)
+            } else {
+                Ok(metadata)
+            }
+        });
+        match observed {
             Ok(metadata) if metadata.file_type().is_dir() => {
                 #[cfg(unix)]
                 if metadata.mode() & 0o022 != 0 {
@@ -3966,11 +4080,30 @@ fn validate_existing_directory_ancestors(directory: &Path) -> Result<(), ShellEr
     {
         let metadata = fs::symlink_metadata(ancestor)
             .map_err(|error| index_io_error("inspect", ancestor, error))?;
-        if !metadata.file_type().is_dir() {
+        if !metadata.file_type().is_dir() && !is_system_directory_link(ancestor, &metadata) {
             return Err(nonregular_index_input(ancestor));
         }
     }
     Ok(())
+}
+
+/// Whether `path` is a root-owned link to a directory, such as macOS's
+/// `/tmp -> private/tmp` and `/var -> private/var`.
+///
+/// Only root can redirect such a link, so following it grants no other user
+/// control over where Quirl writes. Links owned by anyone else stay rejected.
+fn is_system_directory_link(path: &Path, metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        metadata.file_type().is_symlink()
+            && metadata.uid() == 0
+            && fs::metadata(path).is_ok_and(|target| target.is_dir())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, metadata);
+        false
+    }
 }
 
 #[cfg(unix)]
@@ -5171,6 +5304,135 @@ mod tests {
     }
 
     #[test]
+    fn fingerprinting_sources_does_not_consume_the_import_budget() {
+        // Discovery hashes every source before importing it. With an import
+        // budget exactly equal to the declaration bytes, a refresh must still
+        // import the file instead of charging its bytes twice.
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        let declaration = "complete -c budgeted -l verbose\n";
+        fs::write(config.fish_roots[0].join("budgeted.fish"), declaration).unwrap();
+        let bounds = IndexBounds {
+            source_bytes_max: declaration.len(),
+            ..IndexBounds::PRODUCTION
+        };
+        let mut budget = IndexBuildBudget::new(bounds);
+
+        let snapshot = discover_sources(
+            &config,
+            &mut budget,
+            RefreshDeadline::starting_now(Duration::from_secs(5)),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let (catalog, diagnostics) = catalog_from_files_checked(
+            &snapshot.fish_files,
+            &[],
+            &[],
+            &[],
+            &[],
+            &mut budget,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(catalog.find("budgeted").is_some());
+        assert_eq!(budget.source_bytes, declaration.len());
+        assert_eq!(budget.fingerprint_bytes, declaration.len());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn one_invalid_completion_source_is_skipped_without_losing_the_others() {
+        let directory = temporary_directory();
+        let config = discovery_config(&directory);
+        fs::write(config.fish_roots[0].join("broken.fish"), [0xff, 0xfe, 0x00]).unwrap();
+        fs::write(
+            config.fish_roots[0].join("valid.fish"),
+            "complete -c valid -l verbose\n",
+        )
+        .unwrap();
+        let oversized = "complete -c oversized -l verbose\n";
+        fs::write(config.fish_roots[0].join("zz-oversized.fish"), oversized).unwrap();
+        let bounds = IndexBounds {
+            source_bytes_max: "complete -c valid -l verbose\n".len() + 3,
+            ..IndexBounds::PRODUCTION
+        };
+        let mut budget = IndexBuildBudget::new(bounds);
+
+        let snapshot = discover_sources(
+            &config,
+            &mut budget,
+            RefreshDeadline::starting_now(Duration::from_secs(5)),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let (catalog, diagnostics) = catalog_from_files_checked(
+            &snapshot.fish_files,
+            &[],
+            &[],
+            &[],
+            &[],
+            &mut budget,
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert!(catalog.find("valid").is_some());
+        assert!(catalog.find("oversized").is_none());
+        assert_eq!(snapshot.fish_files.len(), 2);
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.origin.ends_with("broken.fish"))
+        );
+        assert!(diagnostics.iter().any(
+            |diagnostic| diagnostic.origin.ends_with("zz-oversized.fish")
+                && diagnostic.message.contains("source bytes limit")
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_directories_follow_only_root_owned_ancestor_links() {
+        use std::os::unix::fs::symlink;
+
+        let directory = temporary_directory();
+        let volume = directory.join("volume");
+        fs::create_dir(&volume).unwrap();
+        fs::set_permissions(&volume, fs::Permissions::from_mode(0o700)).unwrap();
+        let linked_cache = directory.join("linked-cache");
+        symlink(&volume, &linked_cache).unwrap();
+
+        assert_eq!(
+            create_index_directories(&linked_cache.join("quirl"))
+                .unwrap_err()
+                .code,
+            ErrorCode::Validation
+        );
+        assert!(!volume.join("quirl").exists());
+        fs::remove_dir_all(&directory).unwrap();
+
+        // macOS ships `/tmp` as a root-owned link; a private directory below
+        // it must remain usable as an index location.
+        let system_link = Path::new("/tmp");
+        let is_root_link = fs::symlink_metadata(system_link)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink() && metadata.uid() == 0);
+        if is_root_link {
+            let private = system_link.join(format!("quirl-index-link-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&private);
+            fs::create_dir(&private).unwrap();
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+            create_index_directories(&private.join("cache/quirl")).unwrap();
+            assert!(private.join("cache/quirl").is_dir());
+            fs::remove_dir_all(private).unwrap();
+        }
+    }
+
+    #[test]
     fn completion_source_budget_cannot_starve_man_page_imports() {
         let directory = temporary_directory();
         let fish = directory.join("large.fish");
@@ -5430,6 +5692,7 @@ mod tests {
             path_bytes_max: 8,
             source_bytes_max: 4,
             man_source_bytes_max: 4,
+            fingerprint_bytes_max: 4,
             records_max: 2,
             retained_bytes_max: 128,
             diagnostics_max: 2,
