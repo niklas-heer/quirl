@@ -1,6 +1,6 @@
 use crate::{
     CATALOG_SCHEMA_VERSION, Catalog, CommandSpec, CompletionSource, Confidence, OptionSpec,
-    Provenance, ProvenanceInfo, imported_argument, imported_command,
+    Provenance, ProvenanceInfo, imported_argument, imported_command, is_literal_command_name,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path};
@@ -1626,8 +1626,16 @@ fn parse_bash_declaration(
     if remove {
         return Ok(Vec::new());
     }
+    // Scripts often register computed names (`complete -F _f $1`, `"$cmd"`).
+    // Only literal words name a command; expansions are never evaluated.
+    let declared = commands.len();
+    commands.retain(|command| is_literal_command_name(command));
     if commands.is_empty() {
-        return Err("Bash completion declaration has no command".to_owned());
+        return Err(if declared == 0 {
+            "Bash completion declaration has no command".to_owned()
+        } else {
+            "Bash completion declaration names no literal command".to_owned()
+        });
     }
     if commands.len() > MAX_COMMANDS_PER_DECLARATION {
         return Err(format!(
@@ -2531,6 +2539,23 @@ _values 'environment' staging production
                 .iter()
                 .any(|option| option.names == ["--format"])
         );
+    }
+
+    #[test]
+    fn bash_declarations_ignore_computed_command_names() {
+        let report = import_bash(
+            "complete -F _bat $bat\ncomplete -F _one \"$1\" 2>/dev/null\ncomplete -W '-a' real-tool $cmd",
+            "names.bash",
+        );
+        let paths = report
+            .commands
+            .iter()
+            .map(|command| command.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["real-tool"]);
+        assert!(!report.diagnostics.is_empty());
+        assert!(is_literal_command_name("git-lfs"));
+        assert!(!is_literal_command_name("2>/dev/null"));
     }
 
     #[test]

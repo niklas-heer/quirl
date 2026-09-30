@@ -2033,6 +2033,12 @@ impl Catalog {
         for command in &self.commands {
             for path in std::iter::once(&command.path).chain(command.aliases.iter()) {
                 let words = path.split_whitespace().collect::<Vec<_>>();
+                if !words
+                    .first()
+                    .is_some_and(|word| is_literal_command_name(word))
+                {
+                    continue;
+                }
                 let Some(prefix) = words.get(..word_count) else {
                     continue;
                 };
@@ -2596,6 +2602,39 @@ fn clamped_cursor(input: &str, cursor: usize) -> usize {
         cursor = cursor.saturating_sub(1);
     }
     cursor
+}
+
+/// Whether `name` is a plain command word rather than shell syntax such as
+/// an expansion, redirection, glob, or option.
+pub(crate) fn is_literal_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(
+                    character,
+                    '$' | '`'
+                        | '"'
+                        | '\''
+                        | '\\'
+                        | '<'
+                        | '>'
+                        | '|'
+                        | '&'
+                        | ';'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | '['
+                        | ']'
+                        | '*'
+                        | '?'
+                        | '='
+                        | '#'
+                )
+        })
 }
 
 /// Number of shell words in `query`, counting the partial word at the cursor.

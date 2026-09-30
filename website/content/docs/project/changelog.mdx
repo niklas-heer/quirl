@@ -63,6 +63,8 @@ which versions are published.
   exceeds 16 KiB.
 - The completion cache can live below root-owned system links such as macOS's
   `/tmp` and `/var`. Links owned by other users are still rejected.
+- Command completion no longer offers shell expressions such as `$1` or
+  `2>/dev/null` that Bash completion scripts register as computed names.
 - Valid flags such as `git log --oneline` no longer draw an "unknown flag"
   warning when a command's options come from an imported, possibly partial,
   declaration. Only built-in, Lua-declared, and plugin-declared option lists
