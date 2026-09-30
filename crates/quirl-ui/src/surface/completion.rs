@@ -338,6 +338,15 @@ struct InsertionRequest {
     cursor: usize,
 }
 
+/// The input captured when Tab first cycles an explicit menu. Like Zsh's
+/// menu completion, each cycle rewrites the line from this snapshot with the
+/// highlighted candidate, so candidates never accumulate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MenuCycle {
+    pub(crate) line: String,
+    pub(crate) cursor: usize,
+}
+
 pub struct CompletionState {
     pub(crate) home_directory: super::runtime::InteractiveHomeDirectory,
     worker: Option<CompletionWorker>,
@@ -362,6 +371,7 @@ pub struct CompletionState {
     explicit_quirl_request: bool,
     deferred: Option<DeferredCompletion>,
     insertion: Option<InsertionRequest>,
+    pub(crate) menu_cycle: Option<MenuCycle>,
     // Publication is asynchronous: invalidating a worker is insufficient if
     // the surface creates another automatic request for the same input. Keep
     // dismissal intent until an edit or a new explicit request supersedes it.
@@ -397,6 +407,7 @@ impl CompletionState {
             explicit_quirl_request: false,
             deferred: None,
             insertion: None,
+            menu_cycle: None,
             dismissed: false,
         }
     }
@@ -426,6 +437,7 @@ impl CompletionState {
             explicit_quirl_request: false,
             deferred: None,
             insertion: None,
+            menu_cycle: None,
             dismissed: false,
         }
     }
@@ -508,6 +520,7 @@ impl CompletionState {
     ) -> Result<(), ShellError> {
         self.dismissed = false;
         self.insertion = None;
+        self.menu_cycle = None;
         if line.len() > quirl_catalog::MAX_COMPLETION_QUERY_BYTES {
             self.cancel_for_edit();
             self.resource_notice = Some(format!(
@@ -814,6 +827,7 @@ impl CompletionState {
     pub fn dismiss(&mut self) {
         self.dismissed = true;
         self.insertion = None;
+        self.menu_cycle = None;
         // Escape must also invalidate in-flight and already published results:
         // otherwise a late provider can reopen the menu and steal the next Enter.
         self.cancel_workers();
@@ -873,6 +887,27 @@ impl CompletionState {
             (false, false, false, false) => "catalog",
         };
     }
+}
+
+/// The whole input with `item` substituted into the cycle snapshot, and the
+/// cursor after the candidate. `None` when the item does not end at the
+/// snapshot cursor or would split a UTF-8 character.
+pub(crate) fn menu_cycle_text(cycle: &MenuCycle, item: &CompletionItem) -> Option<(String, usize)> {
+    if item.replace_end != cycle.cursor || item.replace_start > cycle.cursor {
+        return None;
+    }
+    let head = cycle.line.get(..item.replace_start)?;
+    let tail = cycle.line.get(cycle.cursor..)?;
+    let mut text = String::with_capacity(
+        head.len()
+            .saturating_add(item.value.len())
+            .saturating_add(tail.len()),
+    );
+    text.push_str(head);
+    text.push_str(&item.value);
+    let cursor = text.len();
+    text.push_str(tail);
+    Some((text, cursor))
 }
 
 /// Compute the Zsh-style edit for the final matches of an explicit Tab.

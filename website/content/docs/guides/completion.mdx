@@ -19,12 +19,16 @@ source (see below), then acts once they have all answered:
 | Exactly one match | The match is inserted, followed by a space | `cat my` → `cat my\ file.txt␠` |
 | One directory | The directory is inserted with a trailing `/`, ready for the next level | `cd cr` → `cd crates/` |
 | Several matches sharing a longer prefix | The word grows to the shared prefix and the menu lists the choices | `ls Car` → `ls Cargo.` |
-| Several matches, no shared progress | The menu opens; press Tab again to move through it | `git ch` → menu |
+| Several matches, no shared progress | The menu opens | `git ch` → menu |
 | No matches | Nothing changes | |
 
-A second **Tab** moves to the next entry, **Shift-Tab** expands the list into
-the full picker, **Enter** accepts the highlighted entry, and **Esc** closes
-the menu without changing your input.
+While the menu is open, each further **Tab** puts the next candidate on the
+line, like Zsh's menu completion: `ls ` Tab Tab gives `ls Cargo.lock`, and
+another Tab gives `ls Cargo.toml`. Once cycling has started, the arrow keys
+move through the same list. **Enter** accepts the candidate (adding the
+separating space), **Esc** closes the menu and keeps what is on the line,
+**Ctrl-_** (undo) restores the line from before the candidate, and
+**Shift-Tab** expands the list into the full picker.
 
 Quirl never types a guess for you. When only a fuzzy match is available, such
 as `gco` matching `git checkout`, the menu shows it for review instead of

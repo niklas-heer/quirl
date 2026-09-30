@@ -481,7 +481,10 @@ git che▌
   assignment such as `--color=`, or a `host:` prefix. A unique file inside an
   open quote also closes the quote. Several matches first extend the word by
   their longest shared prefix (`ls Car` becomes `ls Cargo.`) while the menu
-  lists them; the next Tab advances the menu. Scattered fuzzy matches are
+  lists them. Each further Tab puts the next candidate on the line, like
+  Zsh's menu completion; the line is rebuilt from a snapshot taken at the
+  first cycling Tab, so candidates never accumulate, and each step is one
+  undoable edit. Scattered fuzzy matches are
   listed for review but never typed. Accepting a menu entry adds the same
   separating space. Matches are ranked in tiers: an exact-case prefix beats a
   case-insensitive prefix, which beats a fuzzy subsequence, and only the best
@@ -497,8 +500,11 @@ git che▌
   over site directories; `QUIRL_ZSH_PATH` replaces the site directories, and
   `QUIRL_ZSH_COMPLETION=off` disables the live source for a session.
   Automatic as-you-type completion never starts a shell, and a missing Zsh or
-  command function simply contributes nothing. Each `compadd` group keeps
-  Zsh's display order: sorted unless added with `-V` or `-o nosort`.
+  command function simply contributes nothing. Candidates keep Zsh's display
+  order: groups in creation order, calls sharing a group name merged, each
+  group sorted unless added with `-V` or `-o nosort`, and one-per-line (`-l`)
+  matches after a group's regular matches. When Zsh answers, its matches
+  replace the plain file listing.
 - Parameters: `$NAME` and `${NAME` complete environment variable names with
   their values as the summary. A variable whose value is a directory
   completes with a trailing `/`, as with Zsh's `AUTO_PARAM_SLASH`; single-quoted

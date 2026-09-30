@@ -478,6 +478,16 @@ impl EditorState {
         self.revision = self.revision.saturating_add(1);
     }
 
+    /// Move the cursor to `cursor`, clamped to the buffer and moved back to
+    /// the nearest character boundary. The buffer and history are unchanged.
+    pub fn move_cursor_to(&mut self, cursor: usize) {
+        let mut cursor = cursor.min(self.buffer.len());
+        while !self.buffer.is_char_boundary(cursor) {
+            cursor = cursor.saturating_sub(1);
+        }
+        self.cursor = cursor;
+    }
+
     pub fn clear(&mut self) {
         if !self.buffer.is_empty() {
             self.record_edit();

@@ -22,14 +22,15 @@ which versions are published.
 - Tab completes like Zsh. A unique match is inserted at once with a trailing
   space, or a `/` for directories. Ambiguous matches extend the word by their
   shared prefix while the menu lists the alternatives. Accepting a menu entry
-  adds the separating space too.
+  adds the separating space too. Further Tabs cycle through the menu and put
+  each candidate on the line, like Zsh's menu completion.
 - Explicit Tab asks the installed Zsh's own completion functions for argument
   values. Git branches, Make targets, SSH hosts, process IDs, and every other
   Zsh-supported argument now complete in Quirl, with Zsh's descriptions in the
   menu. Requests run inside the existing bounded completion boundary without
   user startup files, and automatic as-you-type completion never starts a
-  shell. Results keep Zsh's display order: each group sorted unless Zsh added
-  it unsorted. When Zsh answers, its choice replaces the plain file listing,
+  shell. Results keep Zsh's display order: groups in creation order, each
+  sorted unless Zsh added it unsorted. When Zsh answers, its choice replaces the plain file listing,
   so `git add` offers changed files only. Set `QUIRL_ZSH_COMPLETION=off` to
   disable the live source.
 - `quirl complete` includes the same live Zsh argument candidates.

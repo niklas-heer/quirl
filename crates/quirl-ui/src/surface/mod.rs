@@ -1882,15 +1882,23 @@ impl RichSurface {
                     if self.completion.open && !self.picker.active() {
                         match key.code {
                             KeyCode::Up => {
-                                self.handle_completion_up(
-                                    prompt.mode,
-                                    editor.buffer(),
-                                    editor.cursor(),
-                                );
+                                if self.completion.menu_cycle.is_some() {
+                                    self.cycle_menu(&mut editor, false);
+                                } else {
+                                    self.handle_completion_up(
+                                        prompt.mode,
+                                        editor.buffer(),
+                                        editor.cursor(),
+                                    );
+                                }
                                 continue;
                             }
                             KeyCode::Down => {
-                                self.completion.next();
+                                if self.completion.menu_cycle.is_some() {
+                                    self.cycle_menu(&mut editor, true);
+                                } else {
+                                    self.completion.next();
+                                }
                                 continue;
                             }
                             KeyCode::Tab if prompt.mode == Mode::Natural => {
@@ -1994,7 +2002,7 @@ impl RichSurface {
                         EditAction::OpenLeader => self.open_leader(editor.buffer().len()),
                         EditAction::Complete => {
                             if self.completion.open && !self.completion.automatic {
-                                self.completion.next();
+                                self.cycle_menu(&mut editor, true);
                             } else {
                                 self.completion.request(
                                     editor.buffer(),
@@ -2718,6 +2726,11 @@ impl RichSurface {
         let Some(item) = self.completion.selected_item().cloned() else {
             return Ok(());
         };
+        // A cycled candidate is already on the line; start from the snapshot
+        // so the replacement range below still describes the input.
+        if let Some(cycle) = self.completion.menu_cycle.take() {
+            replace_whole_input(editor, &cycle.line, cycle.cursor);
+        }
         let revision = editor.revision();
         // Pickers (history, jobs, projects, palette) insert a finished
         // selection; only completion of a word adds the separating space.
@@ -2745,6 +2758,39 @@ impl RichSurface {
                 .request_listing(editor.buffer(), editor.cursor(), mode)?;
         }
         Ok(())
+    }
+
+    /// Zsh menu completion: the first cycling Tab puts the highlighted
+    /// candidate on the line; later Tabs (or arrows once cycling started)
+    /// move the highlight and replace it with the next candidate.
+    fn cycle_menu(&mut self, editor: &mut EditorState, forward: bool) {
+        if self.completion.streaming || self.picker.active() {
+            if forward {
+                self.completion.next();
+            } else {
+                self.completion.previous();
+            }
+            return;
+        }
+        if self.completion.menu_cycle.is_none() {
+            self.completion.menu_cycle = Some(completion::MenuCycle {
+                line: editor.buffer().to_owned(),
+                cursor: editor.cursor(),
+            });
+        } else if forward {
+            self.completion.next();
+        } else {
+            self.completion.previous();
+        }
+        let target = self
+            .completion
+            .menu_cycle
+            .as_ref()
+            .zip(self.completion.selected_item())
+            .and_then(|(cycle, item)| completion::menu_cycle_text(cycle, item));
+        if let Some((text, cursor)) = target {
+            replace_whole_input(editor, &text, cursor);
+        }
     }
 
     /// Apply the Zsh-style edit of a finished explicit Tab request: insert a
@@ -3921,6 +3967,32 @@ fn terminal_error(action: &'static str) -> impl Fn(io::Error) -> ShellError {
     }
 }
 
+/// Rewrite the input to `text` through one undoable edit that spans only the
+/// changed middle, leaving the cursor at `cursor`.
+fn replace_whole_input(editor: &mut EditorState, text: &str, cursor: usize) {
+    let current = editor.buffer();
+    let tail = text.get(cursor..).unwrap_or_default();
+    // Both strings normally share the text after the cursor; only the span
+    // between their common prefix and that tail is rewritten.
+    let prefix = current
+        .char_indices()
+        .zip(text.chars())
+        .find(|((_, left), right)| left != right)
+        .map_or(current.len().min(text.len()), |((index, _), _)| index)
+        .min(cursor);
+    let (end, replacement) = if current.ends_with(tail) {
+        let end = current.len().saturating_sub(tail.len()).max(prefix);
+        (end, text.get(prefix..cursor).unwrap_or_default().to_owned())
+    } else {
+        (
+            current.len(),
+            text.get(prefix..).unwrap_or_default().to_owned(),
+        )
+    };
+    editor.replace(prefix, end, &replacement);
+    editor.move_cursor_to(cursor);
+}
+
 /// Append the separating space a traditional shell adds after a completed
 /// word, unless the word invites more typing or a space already follows.
 fn with_completion_suffix(
@@ -4057,6 +4129,44 @@ fn draw_before_prompt_refresh<T>(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[test]
+    fn menu_cycling_rewrites_only_the_candidate_and_stays_undoable() {
+        let cycle = completion::MenuCycle {
+            line: "ls  | wc".to_owned(),
+            cursor: 3,
+        };
+        let item = |value: &str| completion::CompletionItem {
+            value: value.to_owned(),
+            display: value.to_owned(),
+            summary: String::new(),
+            detail: String::new(),
+            replace_start: 3,
+            replace_end: 3,
+            match_indices: Vec::new(),
+            kind: completion::CompletionKind::Path,
+            source: "filesystem",
+            trust: "local",
+        };
+        let mut editor = EditorState::new("emacs", Vec::new());
+        editor.replace(0, 0, &cycle.line);
+        editor.move_cursor_to(cycle.cursor);
+
+        for value in ["Cargo.lock", "Cargo.toml", "crates/"] {
+            let (text, cursor) = completion::menu_cycle_text(&cycle, &item(value)).unwrap();
+            replace_whole_input(&mut editor, &text, cursor);
+            assert_eq!(editor.buffer(), format!("ls {value} | wc"));
+            assert_eq!(editor.cursor(), 3 + value.len());
+        }
+        editor.apply(EditAction::Undo);
+        assert_eq!(editor.buffer(), "ls Cargo.toml | wc");
+
+        let mismatched = completion::CompletionItem {
+            replace_end: 2,
+            ..item("x")
+        };
+        assert_eq!(completion::menu_cycle_text(&cycle, &mismatched), None);
+    }
 
     struct PromptFlushWriter {
         flushed: Arc<std::sync::atomic::AtomicBool>,

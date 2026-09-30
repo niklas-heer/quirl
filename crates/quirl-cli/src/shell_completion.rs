@@ -547,6 +547,11 @@ mod tests {
         .unwrap();
         fs::write(root.join("my file.txt"), b"").unwrap();
         fs::write(
+            root.join("_quirlgroups"),
+            "#compdef quirlgroups\ncompadd -J first -- zeta alpha\ncompadd -V second -- two one\ncompadd -J first -- mid\ncompadd -l -J first -- listed\n",
+        )
+        .unwrap();
+        fs::write(
             root.join("_quirldescribe"),
             "#compdef quirldescribe\nlocal -a items=('alpha:first item' 'beta:second item')\n_describe 'item' items\n",
         )
@@ -574,6 +579,17 @@ mod tests {
         assert_eq!(described.len(), 1);
         assert_eq!(described[0].value, "alpha");
         assert_eq!(described[0].summary, "first item");
+
+        // Groups keep creation order; a sorted group merges its calls and
+        // lists one-per-line matches last; an unsorted group keeps its order.
+        let grouped = completer.complete("quirlgroups ", 12);
+        assert_eq!(
+            grouped
+                .iter()
+                .map(|suggestion| suggestion.value.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "mid", "zeta", "listed", "two", "one"]
+        );
 
         // `_path_files` adds pre-quoted matches; they are escaped only once.
         let line = format!("quirltest alpha {}/my", root.display());

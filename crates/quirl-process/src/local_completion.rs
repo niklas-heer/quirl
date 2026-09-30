@@ -705,6 +705,9 @@ if (( ! ${+_comps[${completion_tokens[1]}]} )); then
     exit 78
 fi
 zmodload zsh/zutil || exit 70
+typeset -ga quirl_out_values quirl_out_descriptions quirl_out_keys
+typeset -gA quirl_group_rank
+integer -g quirl_group_count=0
 compadd () {
     if [[ ${@[1,(i)(-|--)]} == *-(O|A|D)\ * ]]; then
         builtin compadd "$@"
@@ -721,6 +724,26 @@ compadd () {
             quirl_descriptions=( "${(@P)quirl_description_reference}" )
         fi
     fi
+    local quirl_group= quirl_group_word
+    integer quirl_sorted=1
+    # Zsh lists matches by group, in the order groups are created (even by a
+    # call that adds nothing), and sorts a group unless it was added unsorted
+    # (`-V`, `-o nosort`). Calls sharing a group name, like Git's subcommand
+    # categories, form one sorted group.
+    integer quirl_group_index=${quirl_words[(I)-[JV]*]}
+    if (( quirl_group_index )); then
+        quirl_group_word=${quirl_words[quirl_group_index]}
+        if [[ $quirl_group_word == -[JV] ]]; then
+            quirl_group=${quirl_words[quirl_group_index + 1]}
+        else
+            quirl_group=${quirl_group_word[3,-1]}
+        fi
+        [[ $quirl_group_word == -V* ]] && quirl_sorted=0
+    fi
+    [[ " ${quirl_words[*]} " == *\ -o\ nosort\ * ]] && quirl_sorted=0
+    if (( ! ${+quirl_group_rank[$quirl_group]} )); then
+        quirl_group_rank[$quirl_group]=$(( ++quirl_group_count ))
+    fi
     builtin compadd -A quirl_hits -D quirl_descriptions "$@"
     local quirl_status=$?
     # `{1..0}` would count down and emit phantom records for an empty call.
@@ -729,35 +752,49 @@ compadd () {
     typeset -A quirl_apre quirl_hpre quirl_hsuf quirl_asuf
     zparseopts -E P:=quirl_apre p:=quirl_hpre S:=quirl_asuf s:=quirl_hsuf
     local quirl_candidate quirl_description quirl_hit
-    integer quirl_index
-    # Zsh sorts each group for display unless it was added unsorted (`-V`,
-    # `-o nosort`). Emit each call in that order so hosts need no group data.
-    local -a quirl_order quirl_keys
-    local quirl_options=" ${@[1,(i)(-|--)]} "
-    if [[ $quirl_options == *\ -V* || $quirl_options == *\ -o\ nosort\ * ]]; then
-        quirl_order=( {1..$#quirl_hits} )
+    integer quirl_index quirl_count
+    # Within a group, matches listed one per line (`-l`, as for recent Git
+    # commits) follow the regular matches as their own block.
+    local quirl_rank=${(l:8::0:)quirl_group_rank[$quirl_group]} quirl_position
+    if (( ${quirl_words[(I)-[[:alpha:]]#l[[:alpha:]]#]} )); then
+        quirl_rank+=$'\x1f'1
     else
-        for quirl_index in {1..$#quirl_hits}; do
-            quirl_keys+=( "${quirl_hits[$quirl_index]}"$'\x1f'"$quirl_index" )
-        done
-        quirl_order=( ${${(o)quirl_keys}##*$'\x1f'} )
+        quirl_rank+=$'\x1f'0
     fi
     # `-Q` matches (for example from `_path_files`) arrive already quoted for
     # the command line. Emit every candidate as its literal value so hosts
     # apply their own quoting exactly once.
     integer quirl_quoted=${quirl_words[(I)-[[:alpha:]]#Q*]}
-    for quirl_index in $quirl_order; do
+    for quirl_index in {1..$#quirl_hits}; do
         quirl_hit=$quirl_hits[$quirl_index]
         quirl_candidate=$IPREFIX$quirl_apre$quirl_hpre$quirl_hit$quirl_hsuf$quirl_asuf
         (( quirl_quoted )) && quirl_candidate=${(Q)quirl_candidate}
         quirl_description=${quirl_descriptions[$quirl_index]-}
         quirl_description=${${quirl_description}##$quirl_hit #}
-        printf '%08x%08x' ${#quirl_candidate} ${#quirl_description} >&3
-        print -rn -u 3 -- "$quirl_candidate$quirl_description"
+        quirl_out_values+=( "$quirl_candidate" )
+        quirl_out_descriptions+=( "$quirl_description" )
+        quirl_count=$#quirl_out_values
+        quirl_position=${(l:8::0:)quirl_count}
+        if (( quirl_sorted )); then
+            quirl_out_keys+=( "$quirl_rank"$'\x1f'"$quirl_candidate"$'\x1f'"$quirl_position" )
+        else
+            quirl_out_keys+=( "$quirl_rank"$'\x1f'"$quirl_position"$'\x1f'"$quirl_position" )
+        fi
     done
     return quirl_status
 }
-comppostfuncs=( exit )
+quirl_emit () {
+    local quirl_key quirl_candidate quirl_description
+    integer quirl_position
+    for quirl_key in "${(@o)quirl_out_keys}"; do
+        quirl_position=${quirl_key##*$'\x1f'}
+        quirl_candidate=$quirl_out_values[quirl_position]
+        quirl_description=$quirl_out_descriptions[quirl_position]
+        printf '%08x%08x' ${#quirl_candidate} ${#quirl_description} >&3
+        print -rn -u 3 -- "$quirl_candidate$quirl_description"
+    done
+}
+comppostfuncs=( quirl_emit exit )
 bindkey '^M' undefined
 bindkey '^J' undefined
 bindkey '^I' complete-word
