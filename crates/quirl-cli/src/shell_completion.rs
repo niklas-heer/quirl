@@ -546,6 +546,11 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("my file.txt"), b"").unwrap();
+        fs::write(
+            root.join("_quirldescribe"),
+            "#compdef quirldescribe\nlocal -a items=('alpha:first item' 'beta:second item')\n_describe 'item' items\n",
+        )
+        .unwrap();
         let mut roots = vec![root.clone()];
         roots.extend(zsh_function_roots(&shell_path));
         let mut completer = ZshArgumentCompleter {
@@ -563,6 +568,12 @@ mod tests {
         assert_eq!(suggestions[0].summary, "second");
         assert_eq!(suggestions[0].replace_start, 10);
         assert!(completer.complete("unknown-command b", 17).is_empty());
+
+        // `_describe` passes descriptions as a combined `-ld array` option.
+        let described = completer.complete("quirldescribe a", 15);
+        assert_eq!(described.len(), 1);
+        assert_eq!(described[0].value, "alpha");
+        assert_eq!(described[0].summary, "first item");
 
         // `_path_files` adds pre-quoted matches; they are escaped only once.
         let line = format!("quirltest alpha {}/my", root.display());

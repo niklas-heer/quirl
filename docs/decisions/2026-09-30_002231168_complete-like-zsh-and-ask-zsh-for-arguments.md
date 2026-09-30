@@ -73,5 +73,5 @@ Alternatives considered:
   that completion is streaming.
 - Without Zsh, or without a function for the command, the catalog, filesystem,
   environment, and plugin sources still answer.
-- Zsh descriptions produced through `_describe` are not captured yet, so some
-  live candidates show no summary; catalog candidates keep theirs.
+- Live candidates carry Zsh's descriptions, including those `_describe`
+  passes as combined `-ld array` options, so the menu documents them.

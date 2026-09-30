@@ -20,12 +20,13 @@ which versions are published.
   adds the separating space too.
 - Explicit Tab asks the installed Zsh's own completion functions for argument
   values. Git branches, Make targets, SSH hosts, process IDs, and every other
-  Zsh-supported argument now complete in Quirl. Requests run inside the existing
-  bounded completion boundary without user startup files, and automatic
-  as-you-type completion never starts a shell. Results keep Zsh's display
-  order: each group sorted unless Zsh added it unsorted. When Zsh answers,
-  its choice replaces the plain file listing, so `git add` offers changed
-  files only. Set `QUIRL_ZSH_COMPLETION=off` to disable the live source.
+  Zsh-supported argument now complete in Quirl, with Zsh's descriptions in the
+  menu. Requests run inside the existing bounded completion boundary without
+  user startup files, and automatic as-you-type completion never starts a
+  shell. Results keep Zsh's display order: each group sorted unless Zsh added
+  it unsorted. When Zsh answers, its choice replaces the plain file listing,
+  so `git add` offers changed files only. Set `QUIRL_ZSH_COMPLETION=off` to
+  disable the live source.
 - `quirl complete` includes the same live Zsh argument candidates.
 - `$NAME` and `${NAME` complete environment variable names, showing each
   value. As with Zsh's `AUTO_PARAM_SLASH`, a variable that names a directory

@@ -710,10 +710,13 @@ compadd () {
         builtin compadd "$@"
         return $?
     fi
-    typeset -a quirl_hits quirl_descriptions
+    typeset -a quirl_hits quirl_descriptions quirl_words
     local quirl_description_reference
-    if (( $@[(I)-d] )); then
-        quirl_description_reference=${@[$(( ${@[(i)-d]} + 1 ))]}
+    # Options precede `-` or `--`; `_describe` combines flags as `-ld array`.
+    quirl_words=( "${@[1,(i)(-|--)]}" )
+    integer quirl_description_index=${quirl_words[(I)-[[:alpha:]]#d]}
+    if (( quirl_description_index )); then
+        quirl_description_reference=${quirl_words[quirl_description_index + 1]}
         if [[ $quirl_description_reference != \(* ]]; then
             quirl_descriptions=( "${(@P)quirl_description_reference}" )
         fi
@@ -742,8 +745,6 @@ compadd () {
     # `-Q` matches (for example from `_path_files`) arrive already quoted for
     # the command line. Emit every candidate as its literal value so hosts
     # apply their own quoting exactly once.
-    local -a quirl_words
-    quirl_words=( ${@[1,(i)(-|--)]} )
     integer quirl_quoted=${quirl_words[(I)-[[:alpha:]]#Q*]}
     for quirl_index in $quirl_order; do
         quirl_hit=$quirl_hits[$quirl_index]
