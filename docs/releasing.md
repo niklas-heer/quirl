@@ -56,7 +56,11 @@ cargo xtask release aggregate --input target/release-input --output target/relea
 
 Each native workflow job also builds the benchmark harness from the same clean
 candidate and runs the enforcing performance gate against the packaged binary's
-independently calculated SHA-256. A size or latency miss stops that package from
+independently calculated SHA-256. Before measuring, the job waits up to four
+minutes for the runner's one-minute load average to fall below half its CPUs:
+on the 3-vCPU macOS ARM64 runner, measuring straight after compilation recorded
+the build's tail rather than Quirl, and the published v0.3.0 source missed the
+unchanged 21 ms first-prompt budget the same way. Budgets are not relaxed. A size or latency miss stops that package from
 reaching aggregation. The `performance-<target>` workflow artifact preserves the
 JSON report, including a failed budget, for seven days. These runner measurements
 supplement the named-terminal review in the release checklist.

@@ -99,6 +99,25 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --locked --release --target "$RELEASE_TARGET" -p quirl-bench
+          # Compilation leaves hosted runners saturated for minutes; measuring
+          # immediately recorded the build's tail, not Quirl. Wait (bounded)
+          # until the one-minute load average falls below half the CPUs.
+          cpus=$(getconf _NPROCESSORS_ONLN)
+          for second in $(seq 1 240); do
+            if [ -r /proc/loadavg ]; then
+              load=$(awk '{print $1}' /proc/loadavg)
+            else
+              load=$(sysctl -n vm.loadavg | awk '{print $2}')
+            fi
+            if awk -v load="$load" -v cpus="$cpus" 'BEGIN { exit !(load < cpus / 2) }'; then
+              echo "runner settled after ${second}s at load ${load} on ${cpus} CPUs"
+              break
+            fi
+            if [ "$second" -eq 240 ]; then
+              echo "runner still at load ${load} on ${cpus} CPUs after ${second}s; measuring anyway"
+            fi
+            sleep 1
+          done
           binary="target/$RELEASE_TARGET/release/quirl"
           if command -v sha256sum >/dev/null 2>&1; then
             digest=$(sha256sum "$binary" | awk '{print $1}')
