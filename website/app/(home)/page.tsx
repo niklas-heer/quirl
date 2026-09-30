@@ -38,9 +38,10 @@ export default function HomePage() {
           </span>
         </h1>
         <p className="lede">
-          Quirl keeps the Bash and Zsh commands you already know, then adds
-          explicit typed data pipelines and one sandboxed Lua 5.5.1 SDK for
-          configuration, scripts, prompts, completions, and plugins.
+          Quirl keeps the Bash and Zsh commands you already know and completes
+          them the way Zsh does, then adds explicit typed data pipelines and
+          one sandboxed Lua 5.5.1 SDK for configuration, scripts, prompts,
+          completions, and plugins.
         </p>
         <div className="actions">
           <Link
@@ -140,10 +141,11 @@ export default function HomePage() {
               <CassetteReels />
             </div>
             <div className="cassette-body">
-              <h3>Semantic completion</h3>
+              <h3>Completion like Zsh</h3>
               <p>
-                One catalog drives completion, contextual help, generated
-                docs, and AI-facing command metadata.
+                Tab inserts, extends, and lists exactly as Zsh does, asks your
+                installed Zsh for branches, targets, and hosts, and documents
+                every candidate from one semantic catalog.
               </p>
             </div>
           </article>
