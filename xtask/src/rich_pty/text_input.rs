@@ -433,7 +433,9 @@ fn cancel(session: &mut Session) -> Result<(), TaskError> {
     session
         .pty
         .wait_for_screen("cancelled terminal paste", |screen| {
-            screen.text().contains("interactive input cancelled")
+            screen.lines().iter().any(|line| line.trim() == ">")
+                && (screen.lines().iter().any(|line| line.trim() == ">")
+                    && screen.text().contains("130"))
                 && screen.bottom_line().contains("NORMAL")
         })?;
     Ok(())

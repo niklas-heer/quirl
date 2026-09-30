@@ -1129,6 +1129,18 @@ impl RichSurface {
         }
     }
 
+    /// Keep abandoned input visible above the next prompt, marked `^C`, the
+    /// way Zsh leaves an interrupted line in the scrollback.
+    fn append_cancelled_input(&mut self, buffer: &str) {
+        let mut lines = buffer.split('\n').peekable();
+        let mut marker = "❯";
+        while let Some(line) = lines.next() {
+            let suffix = if lines.peek().is_none() { "^C" } else { "" };
+            self.append_transcript_line(&format!("{marker} {line}{suffix}"));
+            marker = "∙";
+        }
+    }
+
     fn append_transcript_line(&mut self, line: &str) {
         let safe = quirl_core::escape_terminal_line(line);
         let outcome = self.transcript.append_line(&safe);
@@ -1971,6 +1983,7 @@ impl RichSurface {
                             editor.apply(EditAction::Delete);
                         }
                         EditAction::Cancel => {
+                            self.append_cancelled_input(editor.buffer());
                             editor.clear();
                             self.dismiss_picker();
                             return Ok(InteractiveSignal::CtrlC);

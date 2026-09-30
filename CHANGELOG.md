@@ -36,6 +36,9 @@ which versions are published.
   fuzzy matches, and shows only the best tier, alphabetically with an exact
   match first. Command completion advances one word at a time: `gi` offers
   `git`, not every `git …` subcommand.
+- Ctrl-C at the rich prompt leaves the abandoned input in the transcript,
+  marked `^C`, and sets `$?` to 130, as in Zsh. It no longer prints a separate
+  cancellation block.
 
 ### Fixed
 

@@ -227,7 +227,8 @@ fn cancel_editor(session: &mut Session, deadline: Instant, round: usize) -> Resu
         |screen| {
             screen.lines().iter().any(|line| line.trim() == ">")
                 && !screen.lines().iter().any(|line| line == &expected)
-                && screen.text().contains("interactive input cancelled")
+                && (screen.lines().iter().any(|line| line.trim() == ">")
+                    && screen.text().contains("130"))
                 && screen.bottom_line().contains("NORMAL")
         },
     )?;

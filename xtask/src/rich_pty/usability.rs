@@ -92,7 +92,9 @@ pub(super) fn check_multiline_paste_admission(binary: &Path) -> Result<(), TaskE
     session
         .pty
         .wait_for_screen("cancelled multiline paste", |screen| {
-            screen.text().contains("interactive input cancelled")
+            screen.lines().iter().any(|line| line.trim() == ">")
+                && (screen.lines().iter().any(|line| line.trim() == ">")
+                    && screen.text().contains("130"))
                 && screen.bottom_line().contains("NORMAL")
         })?;
     assert_absent(&sentinel)?;

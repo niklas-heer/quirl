@@ -2282,7 +2282,8 @@ fn check_cold_context_help(binary: &Path) -> Result<(), TaskError> {
         .pty
         .wait_for_screen("cold F1 cancellation restores empty input", |screen| {
             screen.lines().iter().any(|line| line.trim() == ">")
-                && screen.text().contains("interactive input cancelled")
+                && (screen.lines().iter().any(|line| line.trim() == ">")
+                    && screen.text().contains("130"))
                 && screen.bottom_line().contains("NORMAL")
         })?;
     execute_and_resume_with_marker(
@@ -2338,7 +2339,8 @@ fn check_cold_catalog_intents(binary: &Path) -> Result<(), TaskError> {
         session
             .pty
             .wait_for_screen("cold intent cancellation restores input", |screen| {
-                screen.text().contains("interactive input cancelled")
+                (screen.lines().iter().any(|line| line.trim() == ">")
+                    && screen.text().contains("130"))
                     && screen.bottom_line().contains("NORMAL")
             })?;
         execute_and_resume_with_marker(
@@ -3488,7 +3490,7 @@ fn check_rich_review_regressions(binary: &Path) -> Result<(), TaskError> {
     session
         .pty
         .wait_for_screen("idle prompt after cancellation", |screen| {
-            screen.text().contains("interactive input cancelled")
+            (screen.lines().iter().any(|line| line.trim() == ">") && screen.text().contains("130"))
                 && screen.bottom_line().contains("NORMAL")
         })?;
     let cleanup_start = session.pty.output().len();

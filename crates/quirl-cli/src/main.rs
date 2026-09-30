@@ -2877,13 +2877,7 @@ fn repl(extensions: Arc<Mutex<LuaExtensionHost>>) -> Result<i32, ShellError> {
                     &mut annotations,
                     &mut executor,
                 );
-                line_editor.emit_output(
-                    "^C",
-                    &[],
-                    b"interactive input cancelled\n",
-                    last_status,
-                    Duration::ZERO,
-                )?;
+                line_editor.note_cancelled_input()?;
             }
             Ok(InteractiveSignal::CtrlD) => return Ok(last_status),
             Ok(InteractiveSignal::HostCommand(command)) if command == MODE_TOGGLE_HOST_COMMAND => {
@@ -3503,6 +3497,23 @@ impl SessionEditor {
 
     fn is_rich(&self) -> bool {
         matches!(self, Self::Rich(_))
+    }
+
+    /// Report an interrupted prompt. The rich surface already keeps the
+    /// abandoned input marked `^C` in its transcript, like Zsh; the simple
+    /// surface prints a short notice because Reedline clears the line.
+    fn note_cancelled_input(&mut self) -> Result<(), ShellError> {
+        match self {
+            Self::Rich(_) => Ok(()),
+            Self::Simple(_) => io::stderr()
+                .lock()
+                .write_all(b"interactive input cancelled\n")
+                .map_err(|error| {
+                    ShellError::new(ErrorCode::Io, "could not write interactive error output")
+                        .with_context(error.to_string())
+                        .with_help("Check that standard error is still available")
+                }),
+        }
     }
 
     fn emit_output(
