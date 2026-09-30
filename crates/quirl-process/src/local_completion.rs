@@ -739,9 +739,16 @@ compadd () {
         done
         quirl_order=( ${${(o)quirl_keys}##*$'\x1f'} )
     fi
+    # `-Q` matches (for example from `_path_files`) arrive already quoted for
+    # the command line. Emit every candidate as its literal value so hosts
+    # apply their own quoting exactly once.
+    local -a quirl_words
+    quirl_words=( ${@[1,(i)(-|--)]} )
+    integer quirl_quoted=${quirl_words[(I)-[[:alpha:]]#Q*]}
     for quirl_index in $quirl_order; do
         quirl_hit=$quirl_hits[$quirl_index]
         quirl_candidate=$IPREFIX$quirl_apre$quirl_hpre$quirl_hit$quirl_hsuf$quirl_asuf
+        (( quirl_quoted )) && quirl_candidate=${(Q)quirl_candidate}
         quirl_description=${quirl_descriptions[$quirl_index]-}
         quirl_description=${${quirl_description}##$quirl_hit #}
         printf '%08x%08x' ${#quirl_candidate} ${#quirl_description} >&3

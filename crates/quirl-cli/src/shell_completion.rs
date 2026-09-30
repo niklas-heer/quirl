@@ -542,9 +542,10 @@ mod tests {
         let root = temporary_directory("functions");
         fs::write(
             root.join("_quirltest"),
-            "#compdef quirltest\n_arguments '1:flavour:((alpha\\:first beta\\:second bravo\\:third))'\n",
+            "#compdef quirltest\n_arguments '1:flavour:((alpha\\:first beta\\:second bravo\\:third))' '2:file:_files'\n",
         )
         .unwrap();
+        fs::write(root.join("my file.txt"), b"").unwrap();
         let mut roots = vec![root.clone()];
         roots.extend(zsh_function_roots(&shell_path));
         let mut completer = ZshArgumentCompleter {
@@ -562,6 +563,18 @@ mod tests {
         assert_eq!(suggestions[0].summary, "second");
         assert_eq!(suggestions[0].replace_start, 10);
         assert!(completer.complete("unknown-command b", 17).is_empty());
+
+        // `_path_files` adds pre-quoted matches; they are escaped only once.
+        let line = format!("quirltest alpha {}/my", root.display());
+        let files = completer.complete(&line, line.len());
+        let expected = quirl_ui::escape_shell_word(&format!("{}/my file.txt", root.display()));
+        assert_eq!(
+            files
+                .iter()
+                .map(|suggestion| suggestion.value.as_str())
+                .collect::<Vec<_>>(),
+            [expected.as_str()]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

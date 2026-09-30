@@ -41,7 +41,9 @@ prefixes. A file completed inside an open quote also closes the quote:
 | Lua plugins | Whatever trusted plugins register | See the plugin platform documentation |
 
 Candidates that produce the same command line are shown once, even if two
-sources describe them differently.
+sources describe them differently. The plain file listing is a fallback: when
+Zsh's function for the command answers, its choice wins, so `git add` offers
+changed files rather than every file in the directory.
 
 ### Ranking
 

@@ -1662,6 +1662,21 @@ fn merge_extension_items(
     extension: Vec<ExtensionSuggestion>,
     line: &str,
 ) {
+    // Plain file listing is only a fallback. When Zsh's own function for the
+    // command answered, its choice wins: `git add` offers changed files, not
+    // every file in the directory.
+    let zsh_answers = extension
+        .iter()
+        .filter(|item| item.origin == SuggestionOrigin::Zsh)
+        .collect::<Vec<_>>();
+    if !zsh_answers.is_empty() {
+        items.retain(|existing| {
+            existing.source != "filesystem"
+                || zsh_answers.iter().any(|answer| {
+                    existing.value == answer.value || same_completed_input(line, existing, answer)
+                })
+        });
+    }
     let mut retained_bytes = items.iter().map(completion_item_bytes).sum::<usize>();
     for item in extension
         .into_iter()
@@ -2075,6 +2090,34 @@ mod tests {
             "git status",
             CompletionKind::History
         ));
+    }
+
+    #[test]
+    fn zsh_answers_replace_the_generic_file_listing() {
+        let file = |value: &str| CompletionItem {
+            source: "filesystem",
+            ..spanned_item(value, 8, 8, CompletionKind::Path)
+        };
+        let mut items = vec![file("Cargo.toml"), file("Makefile")];
+        let answer = ExtensionSuggestion {
+            value: "Makefile".to_owned(),
+            display: "Makefile".to_owned(),
+            summary: String::new(),
+            detail: String::new(),
+            replace_start: 8,
+            replace_end: 8,
+            origin: SuggestionOrigin::Zsh,
+        };
+        merge_extension_items(&mut items, vec![answer], "git add ");
+        let values = items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(values, ["Makefile"]);
+        // Without a Zsh answer the file listing stays as the fallback.
+        let mut items = vec![file("Cargo.toml"), file("Makefile")];
+        merge_extension_items(&mut items, Vec::new(), "git add ");
+        assert_eq!(items.len(), 2);
     }
 
     #[test]
