@@ -719,12 +719,27 @@ compadd () {
         fi
     fi
     builtin compadd -A quirl_hits -D quirl_descriptions "$@"
+    local quirl_status=$?
+    # `{1..0}` would count down and emit phantom records for an empty call.
+    (( $#quirl_hits )) || return quirl_status
     setopt localoptions norcexpandparam extendedglob
     typeset -A quirl_apre quirl_hpre quirl_hsuf quirl_asuf
     zparseopts -E P:=quirl_apre p:=quirl_hpre S:=quirl_asuf s:=quirl_hsuf
     local quirl_candidate quirl_description quirl_hit
     integer quirl_index
-    for quirl_index in {1..$#quirl_hits}; do
+    # Zsh sorts each group for display unless it was added unsorted (`-V`,
+    # `-o nosort`). Emit each call in that order so hosts need no group data.
+    local -a quirl_order quirl_keys
+    local quirl_options=" ${@[1,(i)(-|--)]} "
+    if [[ $quirl_options == *\ -V* || $quirl_options == *\ -o\ nosort\ * ]]; then
+        quirl_order=( {1..$#quirl_hits} )
+    else
+        for quirl_index in {1..$#quirl_hits}; do
+            quirl_keys+=( "${quirl_hits[$quirl_index]}"$'\x1f'"$quirl_index" )
+        done
+        quirl_order=( ${${(o)quirl_keys}##*$'\x1f'} )
+    fi
+    for quirl_index in $quirl_order; do
         quirl_hit=$quirl_hits[$quirl_index]
         quirl_candidate=$IPREFIX$quirl_apre$quirl_hpre$quirl_hit$quirl_hsuf$quirl_asuf
         quirl_description=${quirl_descriptions[$quirl_index]-}
@@ -732,6 +747,7 @@ compadd () {
         printf '%08x%08x' ${#quirl_candidate} ${#quirl_description} >&3
         print -rn -u 3 -- "$quirl_candidate$quirl_description"
     done
+    return quirl_status
 }
 comppostfuncs=( exit )
 bindkey '^M' undefined

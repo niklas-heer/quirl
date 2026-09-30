@@ -17,6 +17,31 @@ which versions are published.
 
 ## [Unreleased]
 
+### Added
+
+- Tab completes like Zsh. A unique match is inserted at once with a trailing
+  space, or a `/` for directories. Ambiguous matches extend the word by their
+  shared prefix while the menu lists the alternatives. Accepting a menu entry
+  adds the separating space too.
+- Explicit Tab asks the installed Zsh's own completion functions for argument
+  values. Git branches, Make targets, SSH hosts, process IDs, and every other
+  Zsh-supported argument now complete in Quirl. Requests run inside the existing
+  bounded completion boundary without user startup files, and automatic
+  as-you-type completion never starts a shell. Results keep Zsh's display
+  order: each group sorted unless Zsh added it unsorted. Set
+  `QUIRL_ZSH_COMPLETION=off` to disable the live source.
+- `quirl complete` includes the same live Zsh argument candidates.
+- `$NAME` and `${NAME` complete environment variable names, showing each
+  value. As with Zsh's `AUTO_PARAM_SLASH`, a variable that names a directory
+  completes with a trailing `/`.
+
+### Changed
+
+- Completion ranks exact-case prefixes above case-insensitive prefixes and
+  fuzzy matches, and shows only the best tier, alphabetically with an exact
+  match first. Command completion advances one word at a time: `gi` offers
+  `git`, not every `git …` subcommand.
+
 ### Fixed
 
 - Catalog discovery no longer fails on typical Homebrew installations.

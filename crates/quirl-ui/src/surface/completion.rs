@@ -1,5 +1,5 @@
 use super::super::{
-    CompletionWorker, ExtensionCompleter, ExtensionSuggestion, SurfaceSymbols,
+    CompletionWorker, ExtensionCompleter, ExtensionSuggestion, SuggestionOrigin, SurfaceSymbols,
     extension_replacement_is_valid,
 };
 use quirl_catalog::{
@@ -23,6 +23,8 @@ const COMPLETION_ITEMS_MAX: usize = MAX_COMPLETION_RESULTS;
 const COMPLETION_ITEM_BYTES_MAX: usize = 16 * 1_024;
 const COMPLETION_RETAINED_BYTES_MAX: usize = 2 * 1_024 * 1_024;
 const PATH_COMPLETION_ENTRIES_MAX: usize = 4_096;
+const ENVIRONMENT_COMPLETION_VARIABLES_MAX: usize = 4_096;
+const ENVIRONMENT_COMPLETION_PREVIEW_CHARS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionKind {
@@ -86,6 +88,7 @@ struct ExtensionRequest {
     request_id: u64,
     line: String,
     cursor: usize,
+    explicit: bool,
 }
 
 #[derive(Debug)]
@@ -140,6 +143,7 @@ impl IntentCompletionState {
             request_id: self.request_id,
             line: line.to_owned(),
             cursor,
+            explicit: false,
         });
     }
 
@@ -199,8 +203,12 @@ impl ExtensionWorker {
                 let Some(request) = request else {
                     continue;
                 };
-                let items = completer
-                    .complete(&request.line, request.cursor)
+                let items = if request.explicit {
+                    completer.complete_explicit(&request.line, request.cursor)
+                } else {
+                    completer.complete(&request.line, request.cursor)
+                };
+                let items = items
                     .into_iter()
                     .take(COMPLETION_ITEMS_MAX)
                     .filter(|item| extension_replacement_is_valid(&request.line, item))
@@ -301,6 +309,33 @@ struct DeferredCompletion {
     cursor: usize,
     mode: Mode,
     automatic: bool,
+    insert: bool,
+}
+
+/// Edit an explicit Tab performs once every completion source has answered.
+///
+/// This mirrors Zsh's default widget: a single match is inserted with its
+/// natural suffix, and several matches first extend the word by their longest
+/// unambiguous prefix while the menu lists the alternatives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TabInsertion {
+    /// Replace `start..end` with `value`, then close the menu.
+    Unique {
+        start: usize,
+        end: usize,
+        value: String,
+        kind: CompletionKind,
+    },
+    /// Insert `text` at the cursor and keep listing the remaining matches.
+    CommonPrefix { text: String },
+}
+
+/// The exact input an explicit Tab asked to complete. Insertion is skipped if
+/// the buffer or cursor changed before the results arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InsertionRequest {
+    line: String,
+    cursor: usize,
 }
 
 pub struct CompletionState {
@@ -326,6 +361,7 @@ pub struct CompletionState {
     data_ls_alias_request: bool,
     explicit_quirl_request: bool,
     deferred: Option<DeferredCompletion>,
+    insertion: Option<InsertionRequest>,
     // Publication is asynchronous: invalidating a worker is insufficient if
     // the surface creates another automatic request for the same input. Keep
     // dismissal intent until an edit or a new explicit request supersedes it.
@@ -360,6 +396,7 @@ impl CompletionState {
             data_ls_alias_request: false,
             explicit_quirl_request: false,
             deferred: None,
+            insertion: None,
             dismissed: false,
         }
     }
@@ -388,6 +425,7 @@ impl CompletionState {
             data_ls_alias_request: false,
             explicit_quirl_request: false,
             deferred: None,
+            insertion: None,
             dismissed: false,
         }
     }
@@ -423,6 +461,7 @@ impl CompletionState {
                 request.cursor,
                 request.mode,
                 request.automatic,
+                request.insert,
             )?;
         }
         Ok(())
@@ -433,8 +472,21 @@ impl CompletionState {
         self.catalog.as_ref()
     }
 
+    /// Explicit Tab: list matches and insert a unique match or common prefix
+    /// once every source has answered.
     pub fn request(&mut self, line: &str, cursor: usize, mode: Mode) -> Result<(), ShellError> {
-        self.request_with_presentation(line, cursor, mode, false)
+        self.request_with_presentation(line, cursor, mode, false, true)
+    }
+
+    /// Explicit menu without editing the buffer, used to browse a directory
+    /// the user just accepted and to fill the expanded picker.
+    pub fn request_listing(
+        &mut self,
+        line: &str,
+        cursor: usize,
+        mode: Mode,
+    ) -> Result<(), ShellError> {
+        self.request_with_presentation(line, cursor, mode, false, false)
     }
 
     pub fn request_automatic(
@@ -443,7 +495,7 @@ impl CompletionState {
         cursor: usize,
         mode: Mode,
     ) -> Result<(), ShellError> {
-        self.request_with_presentation(line, cursor, mode, true)
+        self.request_with_presentation(line, cursor, mode, true, false)
     }
 
     fn request_with_presentation(
@@ -452,8 +504,10 @@ impl CompletionState {
         cursor: usize,
         mode: Mode,
         automatic: bool,
+        insert: bool,
     ) -> Result<(), ShellError> {
         self.dismissed = false;
+        self.insertion = None;
         if line.len() > quirl_catalog::MAX_COMPLETION_QUERY_BYTES {
             self.cancel_for_edit();
             self.resource_notice = Some(format!(
@@ -472,6 +526,7 @@ impl CompletionState {
                 cursor: clamped_utf8_cursor(line, cursor),
                 mode,
                 automatic,
+                insert,
             });
             self.open = true;
             self.streaming = true;
@@ -492,13 +547,18 @@ impl CompletionState {
         self.request_id = self.request_id.saturating_add(1);
         self.items.clear();
         self.extension_pending = None;
-        self.filesystem_pending = filesystem_completion_items(
-            self.catalog.as_deref(),
-            line,
-            cursor,
-            mode,
-            self.home_directory.snapshot().as_deref(),
-        );
+        let variables = variable_completion_items(line, cursor, mode);
+        self.filesystem_pending = if variables.is_empty() {
+            filesystem_completion_items(
+                self.catalog.as_deref(),
+                line,
+                cursor,
+                mode,
+                self.home_directory.snapshot().as_deref(),
+            )
+        } else {
+            variables
+        };
         if automatic
             && filesystem_completion_context(self.catalog.as_deref(), line, cursor, mode)
                 .is_some_and(|context| {
@@ -525,6 +585,12 @@ impl CompletionState {
         self.catalog_position_delta = catalog_request.position_delta;
         self.data_ls_alias_request = catalog_request.data_ls_alias;
         self.explicit_quirl_request = line.trim_start().starts_with("quirl");
+        if insert && mode != Mode::Natural {
+            self.insertion = Some(InsertionRequest {
+                line: line.to_owned(),
+                cursor: clamped_utf8_cursor(line, cursor),
+            });
+        }
         if let Some(worker) = &mut self.worker {
             worker.submit(CompletionRequest {
                 protocol_version: COMPLETION_PROTOCOL_VERSION,
@@ -540,6 +606,7 @@ impl CompletionState {
                 request_id: self.request_id,
                 line: line.to_owned(),
                 cursor,
+                explicit: !automatic,
             });
         }
         Ok(())
@@ -579,7 +646,7 @@ impl CompletionState {
         self.resource_notice.as_deref()
     }
 
-    pub fn poll(&mut self, _line: &str, _cursor: usize) -> bool {
+    pub fn poll(&mut self, line: &str, _cursor: usize) -> bool {
         let selected_value = self.selected_item().map(|item| item.value.clone());
         let mut changed = false;
         if let Some(response) = self
@@ -625,7 +692,7 @@ impl CompletionState {
             if let Some(extension_items) = self.extension_pending.take()
                 && !extension_items.is_empty()
             {
-                merge_extension_items(&mut self.items, extension_items);
+                merge_extension_items(&mut self.items, extension_items, line);
             }
             changed = true;
         }
@@ -637,7 +704,7 @@ impl CompletionState {
             self.extension_ready = true;
             if self.catalog_ready {
                 if !extension_items.is_empty() {
-                    merge_extension_items(&mut self.items, extension_items);
+                    merge_extension_items(&mut self.items, extension_items, line);
                 }
             } else {
                 self.extension_pending = Some(extension_items);
@@ -699,6 +766,14 @@ impl CompletionState {
         }
     }
 
+    /// Whether the menu should be drawn. An explicit Tab stays invisible
+    /// until every source has answered, so a unique match is inserted without
+    /// first flashing a menu that would immediately close. The status bar
+    /// still reports that completion is streaming.
+    pub fn visible(&self) -> bool {
+        self.open && !(self.streaming && self.insertion.is_some())
+    }
+
     pub fn selected_item(&self) -> Option<&CompletionItem> {
         self.items.get(self.selected)
     }
@@ -712,8 +787,33 @@ impl CompletionState {
                 }))
     }
 
+    /// Resolve a pending explicit Tab once all sources are ready.
+    ///
+    /// Returns `None` while results are still streaming, when the input has
+    /// changed since the request, or when the matches neither agree on one
+    /// value nor share a longer prefix. The pending request is consumed as
+    /// soon as the final result set is known.
+    pub(crate) fn take_tab_insertion(&mut self, line: &str, cursor: usize) -> Option<TabInsertion> {
+        if self.streaming {
+            return None;
+        }
+        let request = self.insertion.take()?;
+        if request.line != line || request.cursor != cursor {
+            return None;
+        }
+        let insertion = tab_insertion(&self.items, line, cursor)?;
+        if let TabInsertion::CommonPrefix { text } = &insertion {
+            // The remaining matches still extend the new, longer word.
+            for item in &mut self.items {
+                item.replace_end = item.replace_end.saturating_add(text.len());
+            }
+        }
+        Some(insertion)
+    }
+
     pub fn dismiss(&mut self) {
         self.dismissed = true;
+        self.insertion = None;
         // Escape must also invalidate in-flight and already published results:
         // otherwise a late provider can reopen the menu and steal the next Enter.
         self.cancel_workers();
@@ -749,23 +849,131 @@ impl CompletionState {
     }
 
     fn refresh_source_label(&mut self) {
-        let filesystem = self.items.iter().any(|item| item.source == "filesystem");
-        let plugins = self.items.iter().any(|item| item.source == "plugin");
+        let has = |wanted: &str| self.items.iter().any(|item| item.source == wanted);
         let catalog = self
             .items
             .iter()
-            .any(|item| !matches!(item.source, "filesystem" | "plugin"));
-        self.source_label = match (catalog, filesystem, plugins) {
-            (true, true, true) => "catalog + files + plugins",
-            (true, true, false) => "catalog + files",
-            (true, false, true) => "catalog + plugins",
-            (true, false, false) => "catalog",
-            (false, true, true) => "files + plugins",
-            (false, true, false) => "files",
-            (false, false, true) => "plugins",
-            (false, false, false) => "catalog",
+            .any(|item| !matches!(item.source, "filesystem" | "plugin" | "zsh" | "environment"));
+        if has("environment") && !catalog {
+            self.source_label = "environment";
+            return;
+        }
+        self.source_label = match (catalog, has("filesystem"), has("zsh"), has("plugin")) {
+            (true, true, true, _) => "catalog + files + zsh",
+            (true, true, false, true) => "catalog + files + plugins",
+            (true, true, false, false) => "catalog + files",
+            (true, false, true, _) => "catalog + zsh",
+            (true, false, false, true) => "catalog + plugins",
+            (true, false, false, false) => "catalog",
+            (false, true, true, _) => "files + zsh",
+            (false, true, false, true) => "files + plugins",
+            (false, true, false, false) => "files",
+            (false, false, true, _) => "zsh",
+            (false, false, false, true) => "plugins",
+            (false, false, false, false) => "catalog",
         };
     }
+}
+
+/// Compute the Zsh-style edit for the final matches of an explicit Tab.
+#[allow(
+    clippy::string_slice,
+    reason = "replacement offsets are validated as UTF-8 boundaries before slicing"
+)]
+fn tab_insertion(items: &[CompletionItem], line: &str, cursor: usize) -> Option<TabInsertion> {
+    let before = line.get(..cursor)?;
+    let mut completed = Vec::<(String, &CompletionItem)>::new();
+    for item in items {
+        if item.replace_end != cursor
+            || item.replace_start > cursor
+            || !line.is_char_boundary(item.replace_start)
+        {
+            continue;
+        }
+        let mut text = String::with_capacity(item.replace_start.saturating_add(item.value.len()));
+        text.push_str(&line[..item.replace_start]);
+        text.push_str(&item.value);
+        if !completed.iter().any(|(existing, _)| *existing == text) {
+            completed.push((text, item));
+        }
+    }
+    match completed.as_slice() {
+        [] => None,
+        [(text, item)] => {
+            // A scattered fuzzy match is shown for review, never typed for the
+            // user; only matches that extend what was typed are inserted.
+            if !text.to_lowercase().starts_with(&before.to_lowercase()) {
+                return None;
+            }
+            Some(TabInsertion::Unique {
+                start: item.replace_start,
+                end: item.replace_end,
+                value: close_open_quote(&line[item.replace_start..cursor], &item.value, item.kind),
+                kind: item.kind,
+            })
+        }
+        [(first, _), rest @ ..] => {
+            let mut common = first.as_str();
+            for (text, _) in rest {
+                let shared = common
+                    .char_indices()
+                    .zip(text.chars())
+                    .find(|((_, left), right)| left != right)
+                    .map_or(common.len().min(text.len()), |((index, _), _)| index);
+                common = &common[..shared];
+            }
+            let extension = common.strip_prefix(before)?;
+            let extension = without_dangling_escape(extension);
+            (!extension.is_empty()).then(|| TabInsertion::CommonPrefix {
+                text: extension.to_owned(),
+            })
+        }
+    }
+}
+
+/// Never stop a common prefix between a backslash and the character it
+/// escapes: `a\` followed by nothing would join the next typed character.
+fn without_dangling_escape(text: &str) -> &str {
+    let trailing = text.bytes().rev().take_while(|byte| *byte == b'\\').count();
+    if trailing % 2 == 1 {
+        text.strip_suffix('\\').unwrap_or(text)
+    } else {
+        text
+    }
+}
+
+/// A unique file completed inside an open quote also closes that quote, as
+/// Zsh does; directories stay open so completion can continue inside them.
+fn close_open_quote(replaced: &str, value: &str, kind: CompletionKind) -> String {
+    if kind == CompletionKind::Directory {
+        return value.to_owned();
+    }
+    for quote in ['"', '\''] {
+        let open = value
+            .strip_prefix(quote)
+            .is_some_and(|rest| !rest.ends_with(quote));
+        if replaced.starts_with(quote) && open {
+            let mut closed = value.to_owned();
+            closed.push(quote);
+            return closed;
+        }
+    }
+    value.to_owned()
+}
+
+/// Whether accepting `value` should also insert a separating space.
+///
+/// Directories, assignments such as `--color=`, and values that already end
+/// in whitespace invite more typing in the same word.
+pub(crate) fn completion_wants_space(value: &str, kind: CompletionKind) -> bool {
+    matches!(
+        kind,
+        CompletionKind::Command
+            | CompletionKind::Flag
+            | CompletionKind::Path
+            | CompletionKind::Value
+    ) && !value.is_empty()
+        && !value.ends_with(['/', '=', ':', ' ', '\t'])
 }
 
 #[derive(Clone, Copy)]
@@ -866,6 +1074,95 @@ pub(crate) fn filesystem_completion_items(
                 CompletionKind::Path
             },
             source: "filesystem",
+            trust: "local",
+        });
+    }
+    items.sort_by(|left, right| left.display.cmp(&right.display));
+    bounded_items(items)
+}
+
+/// Environment variable names for a `$NAME` or `${NAME` word at the cursor.
+///
+/// Mirrors Zsh's parameter completion with `AUTO_PARAM_SLASH`: a variable
+/// whose value names a directory completes with a trailing `/` so a path can
+/// continue, and any other variable completes as a finished word. Single
+/// quotes and escaped dollars are literal text and are never completed.
+pub(crate) fn variable_completion_items(
+    line: &str,
+    cursor: usize,
+    mode: Mode,
+) -> Vec<CompletionItem> {
+    if mode != Mode::Command {
+        return Vec::new();
+    }
+    let cursor = clamped_utf8_cursor(line, cursor);
+    let Some(before) = line.get(..cursor) else {
+        return Vec::new();
+    };
+    let name_bytes = before
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'_' || byte.is_ascii_alphanumeric())
+        .count();
+    let name_start = cursor.saturating_sub(name_bytes);
+    let Some(head) = before.get(..name_start) else {
+        return Vec::new();
+    };
+    let (dollar, braced) = if head.ends_with("${") {
+        (name_start.saturating_sub(2), true)
+    } else if head.ends_with('$') {
+        (name_start.saturating_sub(1), false)
+    } else {
+        return Vec::new();
+    };
+    let escaped = before
+        .get(..dollar)
+        .is_some_and(|text| text.bytes().rev().take_while(|byte| *byte == b'\\').count() % 2 == 1);
+    let segment_start = shell_segment_start(before);
+    let in_single_quotes = shell_words(
+        before.get(segment_start..).unwrap_or_default(),
+        segment_start,
+    )
+    .last()
+    .is_some_and(|word| word.start <= dollar && word.raw.starts_with('\''));
+    if escaped || in_single_quotes {
+        return Vec::new();
+    }
+    let prefix = before.get(name_start..).unwrap_or_default();
+    let mut items = Vec::new();
+    for (name, value) in std::env::vars_os().take(ENVIRONMENT_COMPLETION_VARIABLES_MAX) {
+        let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(prefix) || name.is_empty() {
+            continue;
+        }
+        let is_directory = !value.is_empty() && Path::new(value).is_dir();
+        let mut inserted = name.to_owned();
+        if braced {
+            inserted.push('}');
+        }
+        if is_directory {
+            inserted.push('/');
+        }
+        let shown_value: String = value
+            .chars()
+            .take(ENVIRONMENT_COMPLETION_PREVIEW_CHARS)
+            .collect();
+        items.push(CompletionItem {
+            display: format!("${name}"),
+            value: inserted,
+            summary: shown_value.clone(),
+            detail: format!("Environment variable\n\n{name}={shown_value}"),
+            replace_start: name_start,
+            replace_end: cursor,
+            match_indices: Vec::new(),
+            kind: if is_directory {
+                CompletionKind::Directory
+            } else {
+                CompletionKind::Value
+            },
+            source: "environment",
             trust: "local",
         });
     }
@@ -1208,6 +1505,11 @@ fn path_scan_parts(
     ))
 }
 
+/// Escape `text` as one unquoted shell word, exactly as path completion does.
+pub(crate) fn escape_unquoted_shell_word(text: &str) -> String {
+    encode_shell_path(text, PathWordStyle::Unquoted)
+}
+
 fn encode_shell_path(path: &str, style: PathWordStyle) -> String {
     match style {
         PathWordStyle::Unquoted => {
@@ -1355,16 +1657,33 @@ fn catalog_item(catalog: &Catalog, item: Completion) -> CompletionItem {
     }
 }
 
-fn merge_extension_items(items: &mut Vec<CompletionItem>, extension: Vec<ExtensionSuggestion>) {
+fn merge_extension_items(
+    items: &mut Vec<CompletionItem>,
+    extension: Vec<ExtensionSuggestion>,
+    line: &str,
+) {
     let mut retained_bytes = items.iter().map(completion_item_bytes).sum::<usize>();
     for item in extension
         .into_iter()
         .take(COMPLETION_ITEMS_MAX.saturating_sub(items.len()))
     {
-        if items.iter().any(|existing| existing.value == item.value) {
+        // Sources replace different spans: the catalog rewrites `git ch` as
+        // `git checkout` while Zsh replaces only `ch` with `checkout`. Two
+        // suggestions that produce the same input are one candidate.
+        if items.iter().any(|existing| {
+            existing.value == item.value || same_completed_input(line, existing, &item)
+        }) {
             continue;
         }
-        let kind = infer_kind(&item.value);
+        let kind = if item.origin == SuggestionOrigin::Zsh && item.value.ends_with('/') {
+            CompletionKind::Directory
+        } else {
+            infer_kind(&item.value)
+        };
+        let (source, trust) = match item.origin {
+            SuggestionOrigin::Plugin => ("plugin", "trusted"),
+            SuggestionOrigin::Zsh => ("zsh", "local"),
+        };
         let item = CompletionItem {
             value: item.value,
             display: item.display,
@@ -1374,8 +1693,8 @@ fn merge_extension_items(items: &mut Vec<CompletionItem>, extension: Vec<Extensi
             replace_end: item.replace_end,
             match_indices: Vec::new(),
             kind,
-            source: "plugin",
-            trust: "trusted",
+            source,
+            trust,
         };
         let item_bytes = completion_item_bytes(&item);
         if item_bytes > COMPLETION_ITEM_BYTES_MAX
@@ -1386,6 +1705,30 @@ fn merge_extension_items(items: &mut Vec<CompletionItem>, extension: Vec<Extensi
         retained_bytes = retained_bytes.saturating_add(item_bytes);
         items.push(item);
     }
+}
+
+/// Whether `existing` and a suggestion replacing from `start` with `value`
+/// leave the same text before the cursor.
+fn same_completed_input(
+    line: &str,
+    existing: &CompletionItem,
+    suggestion: &ExtensionSuggestion,
+) -> bool {
+    let (start, value) = (suggestion.replace_start, suggestion.value.as_str());
+    if existing.replace_end != suggestion.replace_end {
+        return false;
+    }
+    let (Some(existing_prefix), Some(prefix)) =
+        (line.get(..existing.replace_start), line.get(..start))
+    else {
+        return false;
+    };
+    existing_prefix.len().saturating_add(existing.value.len())
+        == prefix.len().saturating_add(value.len())
+        && existing_prefix
+            .bytes()
+            .chain(existing.value.bytes())
+            .eq(prefix.bytes().chain(value.bytes()))
 }
 
 fn bounded_items(items: Vec<CompletionItem>) -> Vec<CompletionItem> {
@@ -1590,6 +1933,7 @@ mod tests {
                 detail: "invalid".to_owned(),
                 replace_start: 1,
                 replace_end: 2,
+                origin: SuggestionOrigin::Plugin,
             }]
         }
     }
@@ -1610,6 +1954,7 @@ mod tests {
                 detail: "arrived asynchronously".to_owned(),
                 replace_start: 0,
                 replace_end: cursor,
+                origin: SuggestionOrigin::Plugin,
             }]
         }
     }
@@ -1627,6 +1972,144 @@ mod tests {
             source: "test",
             trust: "validated",
         }
+    }
+
+    fn spanned_item(value: &str, start: usize, end: usize, kind: CompletionKind) -> CompletionItem {
+        CompletionItem {
+            replace_start: start,
+            replace_end: end,
+            kind,
+            ..manual_item(value.to_owned())
+        }
+    }
+
+    #[test]
+    fn tab_inserts_a_unique_match_and_closes_open_quotes_like_zsh() {
+        let line = "cat my";
+        let items = [spanned_item(r"my\ file.txt", 4, 6, CompletionKind::Path)];
+        assert_eq!(
+            tab_insertion(&items, line, 6),
+            Some(TabInsertion::Unique {
+                start: 4,
+                end: 6,
+                value: r"my\ file.txt".to_owned(),
+                kind: CompletionKind::Path,
+            })
+        );
+
+        let line = "cat \"my";
+        let items = [spanned_item("\"my file.txt", 4, 7, CompletionKind::Path)];
+        let Some(TabInsertion::Unique { value, .. }) = tab_insertion(&items, line, 7) else {
+            panic!("a unique quoted file must be inserted");
+        };
+        assert_eq!(value, "\"my file.txt\"");
+
+        let items = [spanned_item("\"my dir/", 4, 7, CompletionKind::Directory)];
+        let Some(TabInsertion::Unique { value, .. }) = tab_insertion(&items, line, 7) else {
+            panic!("a unique quoted directory must be inserted");
+        };
+        assert_eq!(value, "\"my dir/", "directories keep the quote open");
+    }
+
+    #[test]
+    fn tab_extends_ambiguous_matches_by_their_common_prefix() {
+        let line = "ls Car";
+        let items = [
+            spanned_item("Cargo.lock", 3, 6, CompletionKind::Path),
+            spanned_item("Cargo.toml", 3, 6, CompletionKind::Path),
+        ];
+        assert_eq!(
+            tab_insertion(&items, line, 6),
+            Some(TabInsertion::CommonPrefix {
+                text: "go.".to_owned()
+            })
+        );
+        // Sources that replace different spans still agree on the result.
+        let line = "git ch";
+        let items = [
+            spanned_item("git checkout", 0, 6, CompletionKind::Command),
+            spanned_item("cherry", 4, 6, CompletionKind::Value),
+        ];
+        assert_eq!(
+            tab_insertion(&items, line, 6),
+            Some(TabInsertion::CommonPrefix {
+                text: "e".to_owned()
+            })
+        );
+        // No progress, nothing to insert: the menu alone answers.
+        let items = [
+            spanned_item("checkout", 4, 6, CompletionKind::Value),
+            spanned_item("chmod", 4, 6, CompletionKind::Value),
+        ];
+        assert_eq!(tab_insertion(&items, line, 6), None);
+    }
+
+    #[test]
+    fn tab_never_inserts_fuzzy_matches_or_dangling_escapes() {
+        let items = [spanned_item("git checkout", 0, 3, CompletionKind::Command)];
+        assert_eq!(tab_insertion(&items, "gco", 3), None);
+
+        let items = [
+            spanned_item(r"a\ b", 3, 4, CompletionKind::Path),
+            spanned_item(r"a\!c", 3, 4, CompletionKind::Path),
+        ];
+        assert_eq!(tab_insertion(&items, "ls a", 4), None);
+        assert_eq!(without_dangling_escape(r"x\\"), r"x\\");
+        assert_eq!(without_dangling_escape(r"x\\\"), r"x\\");
+    }
+
+    #[test]
+    fn accepted_words_gain_a_space_unless_they_invite_more_typing() {
+        assert!(completion_wants_space("checkout", CompletionKind::Value));
+        assert!(completion_wants_space(
+            r"my\ file.txt",
+            CompletionKind::Path
+        ));
+        assert!(!completion_wants_space(
+            "crates/",
+            CompletionKind::Directory
+        ));
+        assert!(!completion_wants_space("--color=", CompletionKind::Flag));
+        assert!(!completion_wants_space("host:", CompletionKind::Value));
+        assert!(!completion_wants_space(
+            "git status",
+            CompletionKind::History
+        ));
+    }
+
+    #[test]
+    fn zsh_suggestions_merge_with_catalog_items_that_complete_the_same_input() {
+        let mut items = vec![spanned_item("git checkout", 0, 6, CompletionKind::Command)];
+        let suggestion = |value: &str| ExtensionSuggestion {
+            value: value.to_owned(),
+            display: value.to_owned(),
+            summary: String::new(),
+            detail: String::new(),
+            replace_start: 4,
+            replace_end: 6,
+            origin: SuggestionOrigin::Zsh,
+        };
+        merge_extension_items(
+            &mut items,
+            vec![
+                suggestion("checkout"),
+                suggestion("cherry"),
+                suggestion("docs/"),
+            ],
+            "git ch",
+        );
+        let merged = items
+            .iter()
+            .map(|item| (item.value.as_str(), item.source, item.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            merged,
+            [
+                ("git checkout", "test", CompletionKind::Command),
+                ("cherry", "zsh", CompletionKind::Value),
+                ("docs/", "zsh", CompletionKind::Directory),
+            ]
+        );
     }
 
     #[test]
@@ -2038,9 +2521,10 @@ mod tests {
             detail: "detail".to_owned(),
             replace_start: 0,
             replace_end: 0,
+            origin: SuggestionOrigin::Plugin,
         };
         let before = state.items.len();
-        merge_extension_items(&mut state.items, vec![oversized]);
+        merge_extension_items(&mut state.items, vec![oversized], "");
         assert_eq!(state.items.len(), before);
     }
 
@@ -2157,6 +2641,7 @@ mod tests {
             request_id: 1,
             line: "first".to_owned(),
             cursor: 5,
+            explicit: false,
         });
         control.wait_for_start("first");
 
@@ -2166,6 +2651,7 @@ mod tests {
                 request_id,
                 line: "latest".to_owned(),
                 cursor: 6,
+                explicit: false,
             });
         }
         let pending = {

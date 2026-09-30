@@ -3165,6 +3165,7 @@ fn extension_suggestion(
         detail,
         replace_start,
         replace_end,
+        origin: quirl_ui::SuggestionOrigin::Plugin,
     })
 }
 
@@ -3187,6 +3188,7 @@ fn contribution_suggestion(
         value: item.value,
         replace_start,
         replace_end,
+        origin: quirl_ui::SuggestionOrigin::Plugin,
     })
 }
 

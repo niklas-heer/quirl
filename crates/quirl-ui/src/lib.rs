@@ -34,6 +34,13 @@ pub use surface::{
     set_product_identity,
 };
 
+/// Escape `text` as one unquoted shell word, the way interactive completion
+/// inserts file names: whitespace and shell metacharacters gain a backslash,
+/// and text containing a newline is single-quoted instead.
+pub fn escape_shell_word(text: &str) -> String {
+    surface::completion::escape_unquoted_shell_word(text)
+}
+
 use crossterm::{
     cursor::SetCursorStyle,
     event::{Event, KeyEvent},
@@ -2476,6 +2483,18 @@ pub struct ExtensionSuggestion {
     pub replace_start: usize,
     /// Exclusive UTF-8 byte offset of the replaced input range.
     pub replace_end: usize,
+    /// Which kind of provider produced the suggestion, shown as provenance.
+    pub origin: SuggestionOrigin,
+}
+
+/// Provenance of an [`ExtensionSuggestion`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SuggestionOrigin {
+    /// A trusted Lua plugin or configuration completion provider.
+    #[default]
+    Plugin,
+    /// The user's installed Zsh completion system, queried live.
+    Zsh,
 }
 
 /// Stateful extension completion boundary used by Reedline and the rich surface.
@@ -2486,6 +2505,18 @@ pub trait ExtensionCompleter {
     /// ranges must satisfy `start <= end <= line.len()` and fall on UTF-8
     /// boundaries. Display text is treated as untrusted and escaped by the UI.
     fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion>;
+
+    /// Produce suggestions for an explicit request, such as pressing Tab.
+    ///
+    /// Explicit requests happen once per keypress rather than per edit, so an
+    /// implementation may consult slower, still bounded sources here, such as
+    /// a live shell completion process. The same contract as [`complete`]
+    /// applies. The default delegates to [`complete`].
+    ///
+    /// [`complete`]: ExtensionCompleter::complete
+    fn complete_explicit(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
+        self.complete(line, pos)
+    }
 }
 
 const COMPLETION_VERSION_POLICY: VersionPolicy = VersionPolicy::frozen(COMPLETION_PROTOCOL_VERSION);
@@ -3723,6 +3754,7 @@ mod tests {
                 detail: "Lua plugin".to_owned(),
                 replace_start: pos.saturating_sub(4),
                 replace_end: pos,
+                origin: SuggestionOrigin::Plugin,
             }]
         }
     }
@@ -3768,6 +3800,7 @@ mod tests {
                 detail: hostile.to_owned(),
                 replace_start: 0,
                 replace_end: 0,
+                origin: SuggestionOrigin::Plugin,
             },
         )
         .unwrap();
@@ -3803,6 +3836,7 @@ mod tests {
                 detail: "safe".to_owned(),
                 replace_start: start,
                 replace_end: end,
+                origin: SuggestionOrigin::Plugin,
             };
             assert!(!extension_replacement_is_valid(line, &item));
             assert!(extension_suggestion(line, item).is_none());

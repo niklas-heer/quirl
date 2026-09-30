@@ -377,7 +377,7 @@ enum EditAction {
 
 | Key | Action | Notes |
 | --- | --- | --- |
-| `Tab` | Open/advance completion popup | preserves today's behavior |
+| `Tab` | Complete like Zsh: insert a unique match, extend by the common prefix, or open/advance the menu | see §5.2 |
 | `Shift-Tab` | Expand completion into full picker | §10 contract |
 | `Enter` | Accept (or newline if input incomplete) | |
 | `Alt-Enter` | Force newline | |
@@ -480,6 +480,34 @@ git che▌
   normal popup when terminal width < 72. Narrow mode retains the list and
   count/source status; showing the selected summary in the status bar remains
   future polish.
+- Explicit Tab follows Zsh's default completion widget once every source has
+  answered. A single match is inserted immediately, followed by a space, or
+  by nothing when it is a directory (`cd cr` becomes `cd crates/`), an
+  assignment such as `--color=`, or a `host:` prefix. A unique file inside an
+  open quote also closes the quote. Several matches first extend the word by
+  their longest shared prefix (`ls Car` becomes `ls Cargo.`) while the menu
+  lists them; the next Tab advances the menu. Scattered fuzzy matches are
+  listed for review but never typed. Accepting a menu entry adds the same
+  separating space. Matches are ranked in tiers: an exact-case prefix beats a
+  case-insensitive prefix, which beats a fuzzy subsequence, and only the best
+  non-empty tier is shown, alphabetically with an exact match first. Command
+  completion advances one word at a time, so `gi` offers `git` and `gist`,
+  and `git ch` offers `git checkout` rather than deeper subcommand paths.
+- Live Zsh arguments: an explicit Tab in an argument position also asks the
+  installed Zsh's own completion functions, through the bounded local
+  completion process boundary (no user startup files, cleared environment
+  except `PATH`, `HOME`, `USER`, and `LOGNAME`, a 1.5 s deadline, and at most
+  1,024 candidates). This supplies dynamic values such as Git branches, Make
+  targets, SSH hosts, and process IDs. Zsh's bundled functions take precedence
+  over site directories; `QUIRL_ZSH_PATH` replaces the site directories, and
+  `QUIRL_ZSH_COMPLETION=off` disables the live source for a session.
+  Automatic as-you-type completion never starts a shell, and a missing Zsh or
+  command function simply contributes nothing. Each `compadd` group keeps
+  Zsh's display order: sorted unless added with `-V` or `-o nosort`.
+- Parameters: `$NAME` and `${NAME` complete environment variable names with
+  their values as the summary. A variable whose value is a directory
+  completes with a trailing `/`, as with Zsh's `AUTO_PARAM_SLASH`; single-quoted
+  or escaped dollars are literal and never completed.
 - Always-on context: typing an exact catalog command opens its explanation;
   typing a flag prefix after a known command opens that command's options. This
   happens even when broad `completion.auto` fuzzy matching is disabled. An

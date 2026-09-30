@@ -29,6 +29,7 @@ mod projects;
 mod protocol;
 mod recovery;
 mod script;
+mod shell_completion;
 #[cfg(unix)]
 mod terminal_worker;
 
@@ -495,6 +496,9 @@ fn run(cli: Cli) -> Result<i32, ShellError> {
                 extensions
                     .complete(&input, input.len())
                     .into_iter()
+                    .chain(
+                        shell_completion::ZshArgumentCompleter::new().complete(&input, input.len()),
+                    )
                     .map(extension_completion),
             );
             match format {
@@ -3719,6 +3723,7 @@ struct SharedPickerRanker;
 struct LocalAwareCompletionAdapter {
     lua: LuaCompletionAdapter,
     local: LocalCompletionRequester,
+    zsh: shell_completion::ZshArgumentCompleter,
 }
 
 impl LocalAwareCompletionAdapter {
@@ -3726,6 +3731,7 @@ impl LocalAwareCompletionAdapter {
         Self {
             lua: LuaCompletionAdapter::new(extensions),
             local,
+            zsh: shell_completion::ZshArgumentCompleter::new(),
         }
     }
 }
@@ -3734,6 +3740,12 @@ impl ExtensionCompleter for LocalAwareCompletionAdapter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
         self.local.request(line, pos);
         self.lua.complete(line, pos)
+    }
+
+    fn complete_explicit(&mut self, line: &str, pos: usize) -> Vec<ExtensionSuggestion> {
+        let mut suggestions = self.complete(line, pos);
+        suggestions.extend(self.zsh.complete(line, pos));
+        suggestions
     }
 }
 

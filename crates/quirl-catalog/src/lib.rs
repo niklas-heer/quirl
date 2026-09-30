@@ -1980,36 +1980,71 @@ impl Catalog {
             );
         }
 
+        let word_count = completion_word_count(query);
+        let candidates = self.command_word_candidates(word_count);
         bounded_ranked_completions(
-            self.commands.iter().flat_map(|command| {
-                std::iter::once(&command.path)
-                    .chain(command.aliases.iter())
-                    .filter_map(move |candidate| {
-                        fuzzy_match(query, candidate).map(|(score, indices)| {
-                            (
-                                score,
-                                ContextualCompletion {
-                                    completion: Completion {
-                                        value: candidate.clone(),
-                                        display: command.signature.clone(),
-                                        summary: command.summary.clone(),
-                                        detail: format!(
-                                            "{} · {:?}",
-                                            command.details, command.provenance
-                                        ),
-                                        replace_start: query_start,
-                                        replace_end: cursor,
-                                        match_indices: indices,
-                                    },
-                                    command_id: command.id.clone(),
-                                    argument_index: None,
-                                },
-                            )
-                        })
-                    })
+            candidates.into_iter().filter_map(|(candidate, command)| {
+                fuzzy_match(query, &candidate).map(|(score, indices)| {
+                    let (display, summary, detail, command_id) = match command {
+                        Some(command) => (
+                            command.signature.clone(),
+                            command.summary.clone(),
+                            format!("{} · {:?}", command.details, command.provenance),
+                            command.id.clone(),
+                        ),
+                        None => (
+                            candidate.clone(),
+                            "Command group".to_owned(),
+                            format!("Subcommands of `{candidate}`"),
+                            candidate.clone(),
+                        ),
+                    };
+                    (
+                        score,
+                        ContextualCompletion {
+                            completion: Completion {
+                                value: candidate,
+                                display,
+                                summary,
+                                detail,
+                                replace_start: query_start,
+                                replace_end: cursor,
+                                match_indices: indices,
+                            },
+                            command_id,
+                            argument_index: None,
+                        },
+                    )
+                })
             }),
             limit,
         )
+    }
+
+    /// Command paths and aliases truncated to the word being completed.
+    ///
+    /// Completion advances one word at a time, like a traditional shell:
+    /// `gi` offers `git`, and `git ch` offers `git checkout` rather than every
+    /// deeper `git checkout …` path. A prefix with no command of its own, such
+    /// as `git remote` when only `git remote add` is known, is still offered
+    /// as a command group. Exact commands win over implied groups.
+    fn command_word_candidates(&self, word_count: usize) -> BTreeMap<String, Option<&CommandSpec>> {
+        let mut candidates = BTreeMap::new();
+        for command in &self.commands {
+            for path in std::iter::once(&command.path).chain(command.aliases.iter()) {
+                let words = path.split_whitespace().collect::<Vec<_>>();
+                let Some(prefix) = words.get(..word_count) else {
+                    continue;
+                };
+                let truncated = prefix.join(" ");
+                let exact = words.len() == word_count;
+                let entry = candidates.entry(truncated).or_insert(None);
+                if exact && entry.is_none() {
+                    *entry = Some(command);
+                }
+            }
+        }
+        candidates
     }
 
     /// Resolve a trimmed command path or alias, falling back to the first path prefix.
@@ -2488,6 +2523,10 @@ fn bounded_ranked_completions(
         }
     }
     let mut retained = retained.into_vec();
+    // Scattered fuzzy matches are a fallback, not noise beside real prefixes.
+    if let Some(best_tier) = retained.iter().map(|ranked| match_tier(ranked.score)).max() {
+        retained.retain(|ranked| match_tier(ranked.score) == best_tier);
+    }
     retained.sort_by(|left, right| {
         right
             .score
@@ -2559,6 +2598,17 @@ fn clamped_cursor(input: &str, cursor: usize) -> usize {
     cursor
 }
 
+/// Number of shell words in `query`, counting the partial word at the cursor.
+/// Trailing whitespace starts a new, still-empty word.
+fn completion_word_count(query: &str) -> usize {
+    let words = query.split_whitespace().count();
+    if query.is_empty() || query.ends_with(char::is_whitespace) {
+        words.saturating_add(1)
+    } else {
+        words
+    }
+}
+
 fn current_command_segment(input: &str) -> (usize, &str) {
     #[derive(Clone, Copy)]
     enum Quote {
@@ -2613,6 +2663,26 @@ fn whitespace_width_at(input: &str, index: usize) -> usize {
         .map_or(0, char::len_utf8)
 }
 
+/// Width of one ranking tier. Scores within a tier never reach the next one.
+const MATCH_TIER_WIDTH: i32 = 1_000_000;
+/// Offset that keeps within-tier scores positive for long fuzzy candidates.
+const MATCH_TIER_BASE: i32 = MATCH_TIER_WIDTH / 2;
+
+/// Match tier: an exact-case prefix beats a case-folded prefix, which beats a
+/// scattered subsequence. Completion keeps only the best non-empty tier, the
+/// way Zsh's default matcher only falls back when stricter matching fails.
+fn match_tier(score: i32) -> i32 {
+    score.div_euclid(MATCH_TIER_WIDTH)
+}
+
+fn tiered_score(tier: i32, within_tier: i32) -> i32 {
+    tier.saturating_mul(MATCH_TIER_WIDTH).saturating_add(
+        MATCH_TIER_BASE
+            .saturating_add(within_tier)
+            .clamp(0, MATCH_TIER_WIDTH - 1),
+    )
+}
+
 fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
     let query_lower = query.to_lowercase();
     let mut candidate_lower = String::new();
@@ -2624,7 +2694,7 @@ fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
         }
     }
     if query_lower.is_empty() {
-        return Some((0, vec![]));
+        return Some((tiered_score(2, 0), vec![]));
     }
     // Matching is case-insensitive, but ties (`-a` and `-A` both prefix-match
     // a lowercase "a" query identically) should still favor whichever
@@ -2639,6 +2709,7 @@ fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
             .count(),
     )
     .unwrap_or(0);
+    let candidate_len = i32::try_from(candidate.len()).unwrap_or(i32::MAX);
     if candidate_lower.starts_with(&query_lower) {
         let mut indices = original_indices
             .iter()
@@ -2646,11 +2717,16 @@ fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
             .copied()
             .collect::<Vec<_>>();
         indices.dedup();
-        let candidate_len = i32::try_from(candidate.len()).unwrap_or(i32::MAX);
+        let tier = if candidate.starts_with(query) { 2 } else { 1 };
+        // Within a prefix tier an exact match leads; the rest tie and fall
+        // back to alphabetical order, as in a Zsh completion listing.
+        let exact_bonus = if candidate_lower == query_lower {
+            1_000
+        } else {
+            0
+        };
         return Some((
-            10_000_i32
-                .saturating_sub(candidate_len)
-                .saturating_add(case_bonus),
+            tiered_score(tier, case_bonus.saturating_add(exact_bonus)),
             indices,
         ));
     }
@@ -2665,12 +2741,13 @@ fn fuzzy_match(query: &str, candidate: &str) -> Option<(i32, Vec<usize>)> {
         }
     }
     let spread = i32::try_from(indices.last().copied().unwrap_or_default()).unwrap_or(i32::MAX);
-    let candidate_len = i32::try_from(candidate.len()).unwrap_or(i32::MAX);
     Some((
-        1_000_i32
-            .saturating_sub(spread)
-            .saturating_sub(candidate_len)
-            .saturating_add(case_bonus),
+        tiered_score(
+            0,
+            case_bonus
+                .saturating_sub(spread)
+                .saturating_sub(candidate_len),
+        ),
         indices,
     ))
 }
@@ -3023,6 +3100,71 @@ mod tests {
                 Provenance::Builtin,
             )],
         }
+    }
+
+    fn word_test_catalog() -> Catalog {
+        let spec = |path: &str| {
+            command(
+                path,
+                path,
+                "Test fixture command",
+                "Test fixture command.",
+                vec![option(&["--verbose"], None, "Print more")],
+                &[],
+                &[],
+                Provenance::Builtin,
+            )
+        };
+        Catalog {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            commands: vec![
+                spec("git"),
+                spec("git checkout"),
+                spec("git cherry-pick"),
+                spec("git remote add"),
+                spec("gist"),
+                spec("plugin"),
+            ],
+        }
+    }
+
+    fn completion_values(catalog: &Catalog, input: &str) -> Vec<String> {
+        catalog
+            .complete(input, input.len())
+            .into_iter()
+            .map(|completion| completion.value)
+            .collect()
+    }
+
+    #[test]
+    fn command_completion_advances_one_word_at_a_time() {
+        let catalog = word_test_catalog();
+        assert_eq!(completion_values(&catalog, "gi"), ["gist", "git"]);
+        assert_eq!(completion_values(&catalog, "git"), ["git"]);
+        assert_eq!(
+            completion_values(&catalog, "git ch"),
+            ["git checkout", "git cherry-pick"]
+        );
+        assert_eq!(
+            completion_values(&catalog, "git "),
+            ["git checkout", "git cherry-pick", "git remote"]
+        );
+        let group = catalog
+            .complete("git rem", 7)
+            .into_iter()
+            .find(|completion| completion.value == "git remote")
+            .unwrap();
+        assert_eq!(group.summary, "Command group");
+    }
+
+    #[test]
+    fn fuzzy_matches_are_only_a_fallback_for_missing_prefixes() {
+        let catalog = word_test_catalog();
+        // `plugin` contains g-i as a subsequence but never beats real prefixes.
+        assert!(!completion_values(&catalog, "gi").contains(&"plugin".to_owned()));
+        assert_eq!(completion_values(&catalog, "pgn"), ["plugin"]);
+        // A case-folded prefix is offered only when no exact-case prefix exists.
+        assert_eq!(completion_values(&catalog, "GI"), ["gist", "git"]);
     }
 
     #[test]

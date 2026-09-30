@@ -21,6 +21,7 @@ const documents = [
   ['crates/quirl-contract/README.md', 'architecture/crates/contract.mdx'],
   ['crates/quirl-process/MANUAL_JOB_CONTROL.md', 'contributing/manual-job-control.mdx'],
   ['docs/data-runtime.md', 'guides/typed-data-runtime.mdx'],
+  ['docs/completion.md', 'guides/completion.mdx'],
   ['docs/language-service.md', 'tooling/language-service.mdx'],
   ['docs/mcp.md', 'tooling/mcp.mdx'],
   ['docs/plugin-platform.md', 'extensions/plugin-platform.mdx'],
@@ -86,6 +87,7 @@ const documents = [
   ['docs/decisions/2026-09-05_192326206_reserve-space-for-path-navigation-and-completion.md', 'architecture/decisions/0037-navigation-completion-space.mdx'],
   ['docs/decisions/2026-09-06_192326212_embedded-foreground-terminals.md', 'architecture/decisions/0038-embedded-foreground-terminals.mdx'],
   ['docs/decisions/2026-09-06_192326220_managed-project-cloning.md', 'architecture/decisions/0039-managed-project-cloning.mdx'],
+  ['docs/decisions/2026-09-30_002231168_complete-like-zsh-and-ask-zsh-for-arguments.md', 'architecture/decisions/0040-zsh-reference-completion.mdx'],
 ];
 
 const pageBySource = new Map(documents);

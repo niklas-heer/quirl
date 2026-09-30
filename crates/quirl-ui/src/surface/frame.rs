@@ -214,7 +214,7 @@ impl FrameModel<'_> {
     }
 
     fn information_rows(&self, area: Rect) -> u16 {
-        if self.completion.open {
+        if self.completion.visible() {
             if self.picker_query.is_some() && self.picker_layout == PickerLayout::Full {
                 return u16::MAX;
             }
@@ -255,7 +255,7 @@ impl FrameModel<'_> {
     }
 
     fn render_information(&self, frame: &mut Frame<'_>, area: Rect) {
-        if self.completion.open && area.height >= 2 {
+        if self.completion.visible() && area.height >= 2 {
             let popup_height = area
                 .height
                 .min(self.completion_height(area.width, area.height));

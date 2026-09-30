@@ -255,6 +255,13 @@ return quirl.config {{
                 OsString::from("XDG_STATE_HOME"),
                 private.path.join("state").into_os_string(),
             ),
+            // Keep journeys independent of whether the host has Zsh and
+            // which completion functions it ships; unit tests cover the
+            // live provider against a private function directory.
+            (
+                OsString::from("QUIRL_ZSH_COMPLETION"),
+                OsString::from("off"),
+            ),
         ]);
         let catalog_gate = private.path.join("catalog-admission.gate");
         let catalog_publications = private.path.join("catalog-publications");
@@ -942,7 +949,8 @@ fn check_discovery_preserves_command_intent(binary: &Path) -> Result<(), TaskErr
         b"PICKED_OPTION_LIKE_FILE\n",
     )?;
     session.pty.wait_for(STARTUP_MARKER)?;
-    session.pty.type_text("git st")?;
+    // `git ` has two catalog subcommands, so Tab opens a navigable menu.
+    session.pty.type_text("git ")?;
     session.pty.send(b"\t")?;
     session.pty.wait_for_screen_text("git status [--short]")?;
     session.pty.send(b"\x1b[B\x1b[A")?;
@@ -2095,20 +2103,16 @@ fn check_completion(binary: &Path) -> Result<(), TaskError> {
         .pty
         .type_text(&format!("cd {}/path-t", session.private.path.display()))?;
     session.pty.send(b"\t")?;
+    // `cd` offers only directories, so the one match is inserted directly
+    // with its trailing slash, exactly as Zsh does.
     session
         .pty
-        .wait_for_screen("absolute directory completion", |screen| {
-            let text = screen.text();
-            text.contains("path-target/") && !text.contains("path-target.txt")
-        })?;
-    session.pty.send(key::ENTER)?;
-    session
-        .pty
-        .wait_for_screen("accepted directory completion", |screen| {
+        .wait_for_screen("unique directory completion", |screen| {
             screen
                 .lines()
                 .iter()
                 .any(|line| line.starts_with("> cd ") && line.ends_with("/path-target/"))
+                && !screen.text().contains("path-target.txt")
         })?;
     let cd_start = session.pty.output().len();
     session.pty.send(key::ENTER)?;
@@ -2125,11 +2129,9 @@ fn check_completion(binary: &Path) -> Result<(), TaskError> {
 
     session.pty.type_text("cat no")?;
     session.pty.send(b"\t")?;
-    session.pty.wait_for_screen_text("notes.txt")?;
-    session.pty.send(key::ENTER)?;
     session
         .pty
-        .wait_for_screen("accepted file completion", |screen| {
+        .wait_for_screen("unique file completion", |screen| {
             screen
                 .lines()
                 .iter()
@@ -2140,19 +2142,12 @@ fn check_completion(binary: &Path) -> Result<(), TaskError> {
     session.pty.wait_for_screen_text("PATH_FILE_OK")?;
     wait_for_rich_input_since(&mut session, cat_start)?;
 
+    // The catalog's only `git st…` subcommand is inserted by one Tab.
     session.pty.type_text("git st")?;
     session.pty.send(b"\t")?;
-    session.pty.wait_for(b"git status [--short]")?;
-    session.pty.send(key::ESCAPE)?;
-    session.pty.drain_for(Duration::from_millis(200))?;
-    cancel_rich_and_resume(&mut session)?;
-    session.pty.type_text("git st")?;
-    session.pty.send(b"\t")?;
-    session.pty.wait_for(b"git status [--short]")?;
-    session.pty.send(key::ENTER)?;
     session
         .pty
-        .wait_for_screen("accepted git completion", |screen| {
+        .wait_for_screen("unique subcommand completion", |screen| {
             screen
                 .lines()
                 .iter()
@@ -2220,9 +2215,9 @@ fn check_deferred_catalog_admission(binary: &Path) -> Result<(), TaskError> {
                 && screen.bottom_line().contains("result kept in viewport")
         })?;
     wait_for_rich_input_since(&mut session, queued_start)?;
-    session.pty.type_text("git st")?;
+    session.pty.type_text("git ")?;
     session.pty.send(b"\t")?;
-    session.pty.wait_for(b"git status [--short]")?;
+    session.pty.wait_for_screen_text("git status [--short]")?;
     cancel_rich_and_resume(&mut session)?;
     send_ctrl_d_and_wait_for_exit(&mut session.pty)?;
     Ok(())
@@ -2325,7 +2320,7 @@ fn check_cold_catalog_intents(binary: &Path) -> Result<(), TaskError> {
             session.pty.type_text("doctor")?;
             session.pty.wait_for_screen_text("doctor")?;
         } else {
-            session.pty.type_text("git st")?;
+            session.pty.type_text("git ")?;
             session.pty.send(key::TAB)?;
             session.pty.wait_for_screen_text("loading catalog")?;
         }
@@ -3255,8 +3250,11 @@ fn check_local_completion_discovery(binary: &Path) -> Result<(), TaskError> {
     session
         .pty
         .wait_for_screen("local provider root completion", |screen| {
-            let text = screen.text();
-            text.contains("repo") && text.contains("manage repositories")
+            // The learned provider's only subcommand is inserted directly.
+            screen
+                .lines()
+                .iter()
+                .any(|line| line.trim() == "> ghq repo")
         })?;
     session.pty.send(key::ESCAPE)?;
     clear_editor(&mut session)?;
@@ -3272,8 +3270,11 @@ fn check_local_completion_discovery(binary: &Path) -> Result<(), TaskError> {
     session
         .pty
         .wait_for_screen("incremental nested provider completion", |screen| {
-            let text = screen.text();
-            text.contains("--json") && text.contains("emit JSON")
+            // The nested provider's only option is inserted, as in Zsh.
+            screen
+                .lines()
+                .iter()
+                .any(|line| line.contains("ghq repo --json"))
         })?;
 
     session.pty.send(key::ESCAPE)?;

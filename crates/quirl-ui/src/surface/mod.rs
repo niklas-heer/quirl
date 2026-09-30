@@ -1598,6 +1598,7 @@ impl RichSurface {
                 continue;
             }
             if self.completion.poll(editor.buffer(), editor.cursor()) {
+                self.apply_tab_insertion(&mut editor)?;
                 if self.expand_completion_pending {
                     self.expand_completion_pending = false;
                     let items = self.completion.items.clone();
@@ -1996,7 +1997,7 @@ impl RichSurface {
                                 let items = self.completion.items.clone();
                                 self.open_picker_items(items, "completions", true);
                             } else {
-                                self.completion.request(
+                                self.completion.request_listing(
                                     editor.buffer(),
                                     editor.cursor(),
                                     prompt.mode,
@@ -2705,7 +2706,20 @@ impl RichSurface {
             return Ok(());
         };
         let revision = editor.revision();
-        editor.replace(item.replace_start, item.replace_end, &item.value);
+        // Pickers (history, jobs, projects, palette) insert a finished
+        // selection; only completion of a word adds the separating space.
+        let replacement = if self.picker.active() {
+            item.value.clone()
+        } else {
+            with_completion_suffix(
+                editor.buffer(),
+                item.replace_end,
+                item.value.clone(),
+                item.kind,
+                mode,
+            )
+        };
+        editor.replace(item.replace_start, item.replace_end, &replacement);
         if editor.revision() == revision {
             return Ok(());
         }
@@ -2715,7 +2729,38 @@ impl RichSurface {
         self.dismiss_picker();
         if browse_directory {
             self.completion
-                .request(editor.buffer(), editor.cursor(), mode)?;
+                .request_listing(editor.buffer(), editor.cursor(), mode)?;
+        }
+        Ok(())
+    }
+
+    /// Apply the Zsh-style edit of a finished explicit Tab request: insert a
+    /// unique match and close the menu, or extend the word by the matches'
+    /// shared prefix while the menu keeps listing them.
+    fn apply_tab_insertion(&mut self, editor: &mut EditorState) -> Result<(), ShellError> {
+        let Some(insertion) = self
+            .completion
+            .take_tab_insertion(editor.buffer(), editor.cursor())
+        else {
+            return Ok(());
+        };
+        match insertion {
+            completion::TabInsertion::Unique {
+                start,
+                end,
+                value,
+                kind,
+            } => {
+                let replacement =
+                    with_completion_suffix(editor.buffer(), end, value, kind, Mode::Command);
+                editor.replace(start, end, &replacement);
+                self.completion.cancel_for_edit();
+                self.dismiss_picker();
+            }
+            completion::TabInsertion::CommonPrefix { text } => {
+                let cursor = editor.cursor();
+                editor.replace(cursor, cursor, &text);
+            }
         }
         Ok(())
     }
@@ -3861,6 +3906,24 @@ fn terminal_error(action: &'static str) -> impl Fn(io::Error) -> ShellError {
                 "Retry with ui.surface = \"simple\" if the terminal lacks full-screen UI support",
             )
     }
+}
+
+/// Append the separating space a traditional shell adds after a completed
+/// word, unless the word invites more typing or a space already follows.
+fn with_completion_suffix(
+    buffer: &str,
+    replace_end: usize,
+    mut value: String,
+    kind: completion::CompletionKind,
+    mode: Mode,
+) -> String {
+    let space_follows = buffer
+        .get(replace_end..)
+        .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+    if mode != Mode::Natural && !space_follows && completion::completion_wants_space(&value, kind) {
+        value.push(' ');
+    }
+    value
 }
 
 fn input_is_incomplete(buffer: &str, mode: Mode) -> bool {
