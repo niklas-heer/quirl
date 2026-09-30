@@ -24,6 +24,9 @@ which versions are published.
   exceeds 16 KiB.
 - The completion cache can live below root-owned system links such as macOS's
   `/tmp` and `/var`. Links owned by other users are still rejected.
+- BSD man pages (mdoc) produce readable option summaries: nested `Fl Fl`
+  becomes `--name`, and enclosure macros, `Ns`, standards references, escaped
+  literals, and delimiters render as `mandoc` shows them.
 
 ## [0.3.0] - 2026-09-06
 

@@ -1080,30 +1080,37 @@ fn parse_mdoc_option_header(line: &str) -> Option<Vec<String>> {
     let mut index = 0usize;
     while index < tokens.len() {
         if tokens.get(index) == Some(&"Fl") {
-            let flag = tokens
-                .get(index.saturating_add(1))?
-                .trim_matches(|character: char| {
-                    matches!(character, ',' | ';' | '|' | '[' | ']' | '(' | ')' | '"')
-                });
-            if !flag.is_empty() {
+            // `Fl Fl name` renders `--name`: every nested `Fl` adds a dash.
+            let mut dashes = 1_usize;
+            index = index.saturating_add(1);
+            while tokens.get(index) == Some(&"Fl") {
+                dashes = dashes.saturating_add(1);
+                index = index.saturating_add(1);
+            }
+            let Some(flag) = tokens.get(index).map(|token| trim_mdoc_token(token)) else {
+                break;
+            };
+            if !flag.is_empty() && !is_mdoc_macro(flag) {
                 names.push(if flag.starts_with('-') {
                     flag.to_owned()
                 } else {
-                    format!("-{flag}")
+                    format!("{}{flag}", "-".repeat(dashes))
                 });
             }
-            index = index.saturating_add(2);
-        } else {
-            index = index.saturating_add(1);
         }
+        index = index.saturating_add(1);
     }
     names.sort();
     names.dedup();
     (!names.is_empty()).then_some(names)
 }
 
+/// Placeholder for roff's zero-width `\&`, which marks the following text as
+/// literal: `\&.` is a dot to print, not a delimiter or macro.
+const MDOC_LITERAL_MARK: char = '\u{1}';
+
 fn normalize_mdoc_text(line: &str, command: Option<&str>) -> String {
-    let normalized = normalize_roff(line);
+    let normalized = normalize_roff(&line.replace("\\&", &MDOC_LITERAL_MARK.to_string()));
     let trimmed = normalized.trim();
     if trimmed.is_empty()
         || trimmed.starts_with(".\\\"")
@@ -1112,42 +1119,173 @@ fn normalize_mdoc_text(line: &str, command: Option<&str>) -> String {
     {
         return String::new();
     }
-    let mut tokens = trimmed.split_whitespace();
-    let mut words = Vec::new();
+    let mut text = MdocText::default();
+    // Only a request at the start of the line carries a leading dot.
+    let trimmed = trimmed.strip_prefix('.').unwrap_or(trimmed);
+    let mut tokens = trimmed.split_whitespace().peekable();
     while let Some(token) = tokens.next() {
-        let token = token.strip_prefix('.').unwrap_or(token);
+        if let Some(literal) = token.strip_prefix(MDOC_LITERAL_MARK) {
+            text.push_literal(&literal.replace(MDOC_LITERAL_MARK, ""));
+            continue;
+        }
+        let token = token.trim_matches(MDOC_LITERAL_MARK);
         match token {
             "Fl" => {
-                if let Some(flag) = tokens.next() {
-                    words.push(format!("-{}", trim_mdoc_token(flag)));
+                let mut dashes = 1_usize;
+                while tokens.peek() == Some(&"Fl") {
+                    tokens.next();
+                    dashes = dashes.saturating_add(1);
                 }
+                let flag = tokens
+                    .next_if(|next| !is_mdoc_macro(next))
+                    .map(trim_mdoc_token)
+                    .unwrap_or_default();
+                text.push(&format!("{}{flag}", "-".repeat(dashes)));
             }
             "Nm" => {
                 let name = tokens
-                    .next()
+                    .next_if(|next| !is_mdoc_macro(next))
                     .map(trim_mdoc_token)
                     .filter(|name| !name.is_empty())
                     .or(command);
                 if let Some(name) = name {
-                    words.push(name.to_owned());
+                    text.push(name);
                 }
             }
             "Xr" => {
                 if let Some(name) = tokens.next() {
                     let name = trim_mdoc_token(name);
-                    if let Some(section) = tokens.next() {
-                        words.push(format!("{name}({})", trim_mdoc_token(section)));
-                    } else {
-                        words.push(name.to_owned());
+                    match tokens.next_if(|section| {
+                        trim_mdoc_token(section)
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric())
+                    }) {
+                        Some(section) => {
+                            text.push(&format!("{name}({})", trim_mdoc_token(section)));
+                        }
+                        None => text.push(name),
                     }
                 }
             }
-            "Ar" | "Pa" | "Dv" | "Ev" | "Cm" | "Ic" | "Li" | "Em" | "Sy" | "Ql" | "Dq" | "Sq"
-            | "Pf" | "Nd" | "Pp" => {}
-            _ => words.push(token.to_owned()),
+            "St" => {
+                if let Some(standard) = tokens.next() {
+                    text.push(mdoc_standard_name(standard));
+                }
+            }
+            "Ns" => text.join_next = true,
+            "Pq" => text.enclose("(", ")"),
+            "Op" | "Bq" => text.enclose("[", "]"),
+            "Dq" | "Qq" => text.enclose("\"", "\""),
+            "Sq" | "Ql" => text.enclose("'", "'"),
+            "Aq" => text.enclose("<", ">"),
+            "Bx" => text.push("BSD"),
+            "Fx" => text.push("FreeBSD"),
+            "Nx" => text.push("NetBSD"),
+            "Ox" => text.push("OpenBSD"),
+            "Ux" => text.push("UNIX"),
+            "At" => text.push("AT&T UNIX"),
+            macro_name if is_mdoc_macro(macro_name) => {}
+            _ => text.push(token),
         }
     }
-    words.join(" ")
+    text.finish()
+}
+
+/// Rendered words of one mdoc line with the spacing rules of `mandoc`.
+#[derive(Default)]
+struct MdocText {
+    rendered: String,
+    closers: Vec<&'static str>,
+    join_next: bool,
+}
+
+impl MdocText {
+    fn push(&mut self, word: &str) {
+        if word.is_empty() {
+            return;
+        }
+        // Delimiters are separate tokens in mdoc source but attach to the
+        // preceding word when rendered: `Ar file ,` becomes `file,`.
+        let closing = word
+            .chars()
+            .all(|character| matches!(character, '.' | ',' | ';' | ':' | ')' | ']' | '?' | '!'));
+        // Trailing delimiters close open enclosures first, as in
+        // `Dq one . )` rendering `"one".)`.
+        if closing && !self.join_next {
+            while let Some(close) = self.closers.pop() {
+                self.rendered.push_str(close);
+            }
+        }
+        let opens = self.rendered.ends_with(['(', '[', '<', '"', '\''])
+            && self.closers.last().is_some()
+            && !self.rendered.ends_with(' ');
+        if !self.rendered.is_empty() && !closing && !self.join_next && !opens {
+            self.rendered.push(' ');
+        }
+        self.rendered.push_str(word);
+        self.join_next = false;
+    }
+
+    /// Push text escaped with `\&`, which never attaches as a delimiter.
+    fn push_literal(&mut self, word: &str) {
+        if word.is_empty() {
+            return;
+        }
+        let opens = self.rendered.ends_with(['(', '[', '<', '"', '\'']) && self.join_next;
+        if !self.rendered.is_empty() && !self.join_next && !opens {
+            self.rendered.push(' ');
+        }
+        self.rendered.push_str(word);
+        self.join_next = false;
+    }
+
+    fn enclose(&mut self, open: &'static str, close: &'static str) {
+        let needs_space = !self.rendered.is_empty() && !self.join_next;
+        if needs_space {
+            self.rendered.push(' ');
+        }
+        self.rendered.push_str(open);
+        self.closers.push(close);
+        self.join_next = true;
+    }
+
+    fn finish(mut self) -> String {
+        while let Some(close) = self.closers.pop() {
+            self.rendered.push_str(close);
+        }
+        self.rendered
+    }
+}
+
+/// Whether `token` is an mdoc macro name rather than rendered text.
+fn is_mdoc_macro(token: &str) -> bool {
+    const MACROS: &[&str] = &[
+        "Ad", "An", "Ao", "Ac", "Ap", "Aq", "Ar", "At", "Bc", "Bd", "Bf", "Bk", "Bl", "Bo", "Bq",
+        "Brc", "Bro", "Brq", "Bsx", "Bx", "Cd", "Cm", "D1", "Db", "Dc", "Dd", "Do", "Dq", "Dl",
+        "Dt", "Dv", "Dx", "Ec", "Ed", "Ef", "Ek", "El", "Em", "Eo", "Er", "Es", "Ev", "Ex", "Fa",
+        "Fc", "Fd", "Fl", "Fn", "Fo", "Fr", "Ft", "Fx", "Hf", "Ic", "In", "It", "Lb", "Li", "Lk",
+        "Lp", "Me", "Ms", "Mt", "Nd", "Nm", "No", "Ns", "Nx", "Oc", "Oo", "Op", "Os", "Ot", "Ox",
+        "Pa", "Pc", "Pf", "Po", "Pp", "Pq", "Qc", "Ql", "Qo", "Qq", "Re", "Rs", "Rv", "Sc", "Sh",
+        "Sm", "So", "Sq", "Ss", "St", "Sx", "Sy", "Ta", "Tn", "Ud", "Ux", "Va", "Vt", "Xc", "Xo",
+        "Xr",
+    ];
+    MACROS.contains(&token)
+}
+
+/// Readable name for an mdoc `St` standard identifier such as `-p1003.1-2008`.
+fn mdoc_standard_name(identifier: &str) -> &'static str {
+    let identifier = trim_mdoc_token(identifier);
+    if identifier.starts_with("-p1003") {
+        "POSIX"
+    } else if identifier.starts_with("-susv") || identifier.starts_with("-xpg") {
+        "the Single UNIX Specification"
+    } else if identifier.starts_with("-isoC") || identifier.starts_with("-ansiC") {
+        "ISO C"
+    } else if identifier.starts_with("-svid") {
+        "the System V Interface Definition"
+    } else {
+        "the relevant standard"
+    }
 }
 
 fn trim_mdoc_token(token: &str) -> &str {
@@ -1215,8 +1353,12 @@ fn normalize_roff(line: &str) -> String {
     line.replace("\\fB", "")
         .replace("\\fI", "")
         .replace("\\fR", "")
+        .replace("\\fP", "")
         .replace("\\-", "-")
         .replace("\\&", "")
+        .replace("\\e", "\\")
+        .replace("\\(aq", "'")
+        .replace("\\(dq", "\"")
 }
 
 fn split_at_spacing(line: &str) -> (&str, &str) {
@@ -2388,6 +2530,31 @@ _values 'environment' staging production
                 .options
                 .iter()
                 .any(|option| option.names == ["--format"])
+        );
+    }
+
+    #[test]
+    fn mdoc_text_renders_enclosures_delimiters_literals_and_nested_flags() {
+        let render = |line: &str| normalize_mdoc_text(line, Some("ls"));
+        assert_eq!(render(".Dq one . )"), "\"one\".)");
+        assert_eq!(render(".Pq Sq Pa \\&."), "('.')");
+        assert_eq!(render(".Pa \\&.."), "..");
+        assert_eq!(render("long"), "long");
+        assert_eq!(render(".Pq Fl l"), "(-l)");
+        assert_eq!(
+            render("This option is not defined in"),
+            "This option is not defined in"
+        );
+        assert_eq!(render(".St -p1003.1-2008 ."), "POSIX.");
+        assert_eq!(render(".Fl Fl color Ns = Ns Ar when"), "--color=when");
+        assert_eq!(render(".Xr strftime 3 ."), "strftime(3).");
+        assert_eq!(
+            parse_mdoc_option_header(".It Fl Fl acls"),
+            Some(vec!["--acls".to_owned()])
+        );
+        assert_eq!(
+            parse_mdoc_option_header(".It Fl C Ar directory"),
+            Some(vec!["-C".to_owned()])
         );
     }
 
