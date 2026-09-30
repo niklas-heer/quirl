@@ -1,4 +1,4 @@
-use quirl_catalog::{ArgumentKind, Catalog, CommandSpec, Confidence};
+use quirl_catalog::{ArgumentKind, Catalog, CommandSpec, Confidence, Provenance};
 use quirl_syntax::{
     CommandList, HighlightKind, HighlightSpan, Mode, Quoting, SimpleCommand, Word, highlight,
     parse_command_list,
@@ -524,6 +524,20 @@ fn invocation_matches(invocation: &str, words: &[String]) -> bool {
     matches && invocation_words.next().is_none()
 }
 
+/// Whether a missing option proves the flag is unknown.
+///
+/// Only contracts Quirl or an extension author declared list every option.
+/// Imported Fish, Bash, Zsh, help, and man declarations are often partial,
+/// for example Homebrew Git's `_git` wrapper, so a flag they omit may be
+/// perfectly valid and must not be flagged.
+fn options_are_authoritative(command: &CommandSpec) -> bool {
+    command.provenance.confidence >= Confidence::High
+        && matches!(
+            command.provenance.source,
+            Provenance::Builtin | Provenance::Lua | Provenance::Plugin
+        )
+}
+
 fn unknown_option<'a>(
     catalog: &'a Catalog,
     parsed: &CommandList,
@@ -537,8 +551,7 @@ fn unknown_option<'a>(
         for parsed_command in &pipeline.commands {
             let resolved = resolve_catalog_command(catalog, parsed_command);
             let short_options = resolved.and_then(|(command, _)| {
-                (command.provenance.confidence >= Confidence::High)
-                    .then(|| ShortOptionLookup::new(command))
+                options_are_authoritative(command).then(|| ShortOptionLookup::new(command))
             });
             let mut consumes_next = false;
             let mut options_terminated = false;
@@ -549,9 +562,7 @@ fn unknown_option<'a>(
                 let Some((command, invocation_word_count)) = resolved else {
                     continue;
                 };
-                if word_index < invocation_word_count
-                    || command.provenance.confidence < Confidence::High
-                {
+                if word_index < invocation_word_count || !options_are_authoritative(command) {
                     continue;
                 }
                 let token = parsed_command.words.get(word_index)?;
@@ -825,6 +836,8 @@ mod tests {
 
     static NEXT_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
 
+    /// An `ls` whose option list an extension author declared completely.
+    /// The Fish syntax is only a compact way to build the option specs.
     fn catalog_with_declared_system_ls() -> Catalog {
         let mut catalog = Catalog::builtin();
         let diagnostics = catalog.merge_report(import_fish(
@@ -834,6 +847,11 @@ mod tests {
             "ls.fish",
         ));
         assert!(diagnostics.is_empty());
+        for command in &mut catalog.commands {
+            if command.path == "ls" {
+                command.provenance.source = Provenance::Lua;
+            }
+        }
         catalog
     }
 
@@ -989,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn declarative_imports_validate_clusters_but_heuristic_imports_do_not_guess() {
+    fn imported_declarations_never_claim_a_flag_is_unknown() {
         let mut catalog = Catalog::builtin();
         catalog.commands.clear();
         for report in [
@@ -1010,17 +1028,18 @@ mod tests {
             catalog.merge_report(report);
         }
 
+        // Imported declarations are often partial (Homebrew Git's `_git`
+        // omits most `git log` flags), so an omission proves nothing.
         for input in [
             "fish-ls -aloresult",
             "bash-ls -aloresult",
             "zsh-ls -aloresult",
             "help-ls -unknown",
+            "fish-ls -alz",
+            "bash-ls -alz",
+            "zsh-ls --oneline",
         ] {
             assert_no_diagnostic(catalog.clone(), input);
-        }
-        for command in ["fish-ls", "bash-ls", "zsh-ls"] {
-            let input = format!("{command} -alz");
-            assert_unknown_flag(catalog.clone(), &input, "-alz");
         }
     }
 

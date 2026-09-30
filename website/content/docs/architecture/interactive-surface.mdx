@@ -538,7 +538,10 @@ gti status▌
 
 - Produced by the same continuous parse that drives highlighting plus catalog
   and asynchronous PATH resolution. The analyzer currently emits parse/unknown
-  command errors and high/exact-confidence unknown-flag warnings. Rendering
+  command errors and unknown-flag warnings. Flags are checked only against
+  authoritative option lists (built-in, Lua-declared, or plugin-declared);
+  imported Fish, Bash, Zsh, help, and man declarations may be partial, so a
+  flag they omit is never reported. Rendering
   supports `✘` error (red), `▲` warning (yellow), and the reserved `ℹ` hint
   (blue), with ASCII `E W H`; no hint producer has shipped yet.
 - At most one row; highest severity wins; the offending span is underlined
