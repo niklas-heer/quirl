@@ -82,6 +82,13 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.check.outputs.candidate_commit }}
 
+      - name: Stop Spotlight indexing on macOS runners
+        # Hosted macOS images index new files. On the 3-vCPU ARM64 runner,
+        # mds and mdworker used over 200% CPU for minutes after the release
+        # build, inflating first-prompt latency for unchanged Quirl code.
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+
       - name: Build and package the native binary
         id: package
         env:
