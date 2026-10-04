@@ -12,6 +12,8 @@ which versions are published.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-04
+
 ### Fixed
 
 - `eval "$(ssh-agent -s)"` in the interactive shell could lose the agent it
