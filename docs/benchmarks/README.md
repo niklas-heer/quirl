@@ -2,6 +2,7 @@
 
 Release measurements apply to one exact executable, source revision, harness, and runner. A later documentation commit records that evidence without rebuilding or relabeling the released artifact.
 
+- [Quirl 0.5.0 native release evidence](release-v0.5.0.md): all four published native executables, unchanged reports, and a preserved macOS x86_64 first attempt that a local A/B traced to runner variance.
 - [Quirl 0.4.0 native release evidence](release-v0.4.0.md): all four published native executables, unchanged reports, preserved failed candidates, and the Spotlight indexing finding on the macOS ARM64 runner.
 - [Quirl 0.3.0 native release evidence](release-v0.3.0.md): all four published native executables, unchanged reports, preserved failed candidates, and exact release identities.
 - [Quirl 0.2.0 native release evidence](release-v0.2.0.md): historical measurements of the published 0.2.0 executables.
